@@ -1,0 +1,85 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D96-chunk-gc)
+warning: unused import: `encode_row`
+  --> src/agent_sql/runtime.rs:46:48
+   |
+46 | use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+   |                                                ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: method `visible_rows` is never used
+    --> src/agent_sql/runtime.rs:1356:8
+     |
+ 643 | impl AgentRuntime {
+     | ----------------- method in this implementation
+...
+1356 |     fn visible_rows(
+     |        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (lib test) generated 5 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.75s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 1 test
+     10000         47       4000250         182375          64          163        0.56      54.79    40960000
+test cow::gc::tests::d96_pause_curve has been running for over 60 seconds
+     50000        203     178348584          63542          64          788        5.85      57.91   204800000
+    100000        398       8010625         112291          64         1569        5.82     186.68   409600000
+test cow::gc::tests::d96_pause_curve ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1379 filtered out; finished in 313.19s
+
+rc=0
+RELEASED chunk-gc
+RELEASED

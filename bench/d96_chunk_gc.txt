@@ -1,0 +1,60 @@
+D96 — REACHABILITY GC AT PAGE GRANULARITY: THE PAUSE CURVE.
+[HERE] at 178b6f786786
+
+load at start: 0:40  up 2 days,  3:43, 22 users, load averages: 21.04 27.06 33.71
+⚠ MEASURED ON A LOADED BOX under the fleet measure lock (~/wt/logs/measure-lock.sh),
+which serialises measurers but does not gate on load. Sixteen sibling agents were
+compiling concurrently. Every duration below is an UPPER BOUND, not a quiet-machine
+figure.
+max_slice_ns is therefore a CEILING under contention, not a quiet-machine figure. The
+claim it is asked to support is a SLOPE across the chunk axis, and load inflates every
+row rather than tilting the axis, so the slope survives what the level does not.
+
+     chunks     arenas  max_slice_ns  snapshot_ns  max_pages       slices   cycle_s   plant_s   bytes_recl
+     10000         47       4000250         182375          64          163        0.56      54.79    40960000
+     50000        203     178348584          63542          64          788        5.85      57.91   204800000
+    100000        398       8010625         112291          64         1569        5.82     186.68   409600000
+
+PREMISE CHECK FIRST — the row as briefed was aimed at a wall that D31 already removed.
+  The 262x space amplification is REAL and is bench/d31_before.txt: 4000 branches
+  writing one page each -> 4193.3 MB of data file holding 16.4 MB (1,048,316 B/branch).
+  That is the BEFORE number. bench/d31_after.txt reads 4097 B/branch against a 4096 B
+  page -- 'VERDICT -- AMPLIFICATION GONE' -- because ARENA_FIRST_EXTENT_PAGES is 1 and
+  next_extent_pages() grows geometrically. Extent granularity is NOT the space wall today.
+  The brief cited bench/d32_write_curve.txt, which does not exist in this tree.
+
+  And 'unreachable chunks' presupposes content addressing, which src/cow/mod.rs lists
+  as a NON-GOAL with a reason. There are no hash-shared chunks here, so there is no
+  chunk that 'no version references' in the Dolt sense.
+
+WHAT IS ACTUALLY MISSING, and what this measures: reclamation is the epoch interval
+rule over pages an owner FREED, plus wholesale extent frees at reap. Neither asks
+whether a page is REACHABLE. A page allocated in a live branch's arena and linked into
+no tree is invisible to both until the whole branch dies. grep over src/ finds no
+reachability marking of any kind. That is the class collected here.
+
+CLAIM UNDER TEST (slope, not ratio): max_slice_nanos does NOT grow with total chunks.
+Reachable tree held CONSTANT at 2000 keys across the axis, so a growing mark set cannot
+be confounded with a growing heap. Slice budget 64.
+
+Every row in the axis completed; nothing was refused.
+
+READING IT: max_slice_nanos is the pause and must be flat. snapshot_ns is the one
+term that DOES scale -- a single live_arenas() call per cycle, O(arenas) under the
+state mutex. It is reported apart from the pause rather than folded into it, because
+folding it in would flatter the number at small heaps and hide it at large ones. It
+is paid once per cycle and never per slice: per slice it would be W4 again (39.3 s
+holding the per-statement lock across O(arenas) work).
+
+cycle_s grows linearly and is SUPPOSED to: total work is O(chunks). Only the
+pause is claimed flat.
+
+WHAT THE FIRST RUN OF THIS HARNESS FOUND, kept because it is the reason the code
+changed: the sweep took ONE WHOLE EXTENT per slice, so the pause was pinned to
+ARENA_EXTENT_PAGES however small a budget was asked for. Measured at chunks=10000:
+  max_slice_ns = 72,082,584 (72 ms), max_slice_pages = 256, arenas = 47, slices = 48.
+Bounded in pages and independent of heap size -- the claim held -- but 72 ms is a long
+pause and the budget knob did nothing on that side. Each swept page costs a read_page
+and a release_page (page-table write lock, frame reset, ARC update), so the per-page
+constant is large. GcCycle::sweep_page_idx resumes part-way into an extent, which is
+what makes budget the actual pause lever. The rows above are from after that.
