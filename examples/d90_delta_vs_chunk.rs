@@ -309,6 +309,21 @@ struct Cycle {
     /// The branch and provenance slot the SESSION reported at `BEGIN`, before any merge ran.
     branch: ferrodb::branch::types::BranchId,
     prov: ferrodb::provenance::ProvId,
+    /// Which merge this was, counting from the start of the process. The arena's free-space map is
+    /// a function of this and not of `r`, so the two have to be separable.
+    seq: usize,
+}
+
+/// The bytes whose size is a question about `r`: the data pages the change landed in, plus the WAL.
+///
+/// **The arena's free-space map is deliberately NOT in here**, and leaving it in was wrong. Its
+/// image is rewritten WHOLE on every merge and grows by a fixed increment per branch that has ever
+/// existed, so it is a cost of the MERGE COUNT, not of how many rows changed. Folding it into the
+/// headline made a one-row change look like 164x in one pass and 234x in the other — the same
+/// measurement, differing only in how many merges preceded it. It is reported in its own column and
+/// analysed separately below.
+fn stored_r(c: &Cycle) -> u64 {
+    c.pages * PAGE_SIZE as u64 + c.wal_bytes
 }
 
 /// `seq` becomes the RUN id, and that is load-bearing rather than cosmetic.
@@ -468,6 +483,7 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Cycle> {
         from,
         branch,
         prov,
+        seq,
     })
 }
 
@@ -514,18 +530,24 @@ fn print_pass(label: &str, rows: &[Cycle], row_sz: usize) {
     println!();
     println!("  --- {label} ---");
     println!(
-        "  {:>6} | {:>7} {:>12} | {:>10} {:>7} | {:>6} {:>10} | {:>12} {:>10} | {:>8} {:>9}",
-        "r", "pages", "page bytes", "WAL bytes", "fsyncs", "arepl", "arena B", "STORED bytes",
-        "real B", "AMPLIF", "merge ms"
+        "  {:>6} | {:>7} {:>12} | {:>10} {:>7} | {:>12} {:>10} | {:>8} || {:>6} {:>10} | {:>9}",
+        "r", "pages", "page bytes", "WAL bytes", "fsyncs", "STORED(r)", "real B", "AMPLIF",
+        "arepl", "arena B", "merge ms*"
+    );
+    println!(
+        "         the columns LEFT of || answer \"what does changing r rows cost\". The two RIGHT of\n         \
+         it do not: arena B is the free-space map, rewritten whole per merge and sized by the\n         \
+         MERGE COUNT, and merge ms* is wall-clock taken on a loaded box (see the header)."
     );
     for c in rows {
         let page_bytes = c.pages * PAGE_SIZE as u64;
-        let stored = page_bytes + c.wal_bytes + c.arena_bytes;
+        let stored = stored_r(c);
         let real = c.r as u64 * row_sz as u64;
         println!(
-            "  {:>6} | {:>7} {:>12} | {:>10} {:>7} | {:>6} {:>10} | {:>12} {:>10} | {:>8.1} {:>9.1}",
-            c.r, c.pages, page_bytes, c.wal_bytes, c.fsyncs, c.arena_replaces, c.arena_bytes,
-            stored, real, stored as f64 / real as f64, c.merge_ms
+            "  {:>6} | {:>7} {:>12} | {:>10} {:>7} | {:>12} {:>10} | {:>8.1} || {:>6} {:>10} | {:>9.1}",
+            c.r, c.pages, page_bytes, c.wal_bytes, c.fsyncs,
+            stored, real, stored as f64 / real as f64,
+            c.arena_replaces, c.arena_bytes, c.merge_ms
         );
     }
     println!(
@@ -544,6 +566,16 @@ fn print_pass(label: &str, rows: &[Cycle], row_sz: usize) {
 fn main() {
     println!("D90 — DELTA vs CHUNK: what does a tens-of-bytes change cost in bytes stored?");
     println!("{}", ferrodb::build_provenance());
+    println!();
+    println!("WHAT IS AND IS NOT A MEASUREMENT IN THIS FILE");
+    println!("  Every byte and page below is a COUNTER read out of the engine — pages from a counting");
+    println!("  Storage under DiskManager, WAL bytes from fsync_counters(), arena bytes from");
+    println!("  atomic_replace_counters(). Counters do not move when the machine is busy, so this run");
+    println!("  is deliberately taken WITHOUT the fleet measure lock and its numbers are unaffected by");
+    println!("  whatever else was compiling. Both passes reproducing the same page counts is the check.");
+    println!("  The `merge ms*` column is the exception: it is wall-clock, it was taken on a loaded");
+    println!("  box, and it is NOT a measurement. It is there to show the sweep did work, not how");
+    println!("  fast. Do not quote it. For merge latency see D68/D71, taken under the lock.");
     println!();
     println!("PRE-REGISTERED FALSIFIERS (recorded before the first number exists):");
     println!("  (a) If AMPLIFICATION FALLS as r FALLS, the wall does not exist and the premise is");
@@ -675,12 +707,8 @@ fn main() {
     // ---- verdict, computed from the rows rather than read off them by eye ----
     println!();
     println!("=== WHICH FALSIFIER FIRED ===");
-    let amp = |c: &Cycle| {
-        (c.pages * PAGE_SIZE as u64 + c.wal_bytes + c.arena_bytes) as f64 / (c.r as u64 * row_sz as u64) as f64
-    };
-    let stored_per_r = |c: &Cycle| {
-        (c.pages * PAGE_SIZE as u64 + c.wal_bytes + c.arena_bytes) as f64 / c.r as f64
-    };
+    let amp = |c: &Cycle| stored_r(c) as f64 / (c.r as u64 * row_sz as u64) as f64;
+    let stored_per_r = |c: &Cycle| stored_r(c) as f64 / c.r as f64;
     let a_small = amp(&up[0]);
     let a_large = amp(up.last().unwrap());
     let predicted = PAGE_SIZE as f64 / row_sz as f64;
@@ -697,7 +725,7 @@ fn main() {
     // The parenthetical is the real criterion, so that is what is tested: the leading run of r
     // values over which STORED BYTES stays within 1.5x of its r=1 value. Amplification is still
     // reported, and its value AT r=1 is the one the PAGE_SIZE/ROW_SIZE prediction speaks to.
-    let stored = |c: &Cycle| (c.pages * PAGE_SIZE as u64 + c.wal_bytes + c.arena_bytes) as f64;
+    let stored = |c: &Cycle| stored_r(c) as f64;
     let s_small = stored(&up[0]);
     let flat_len = up
         .iter()
@@ -776,6 +804,64 @@ fn main() {
         println!();
         println!("  ⚠ AMPLIFICATION RISES with r — falsifier (c) is in play. Read the order control");
         println!("    above before reading this run as a statement about chunk-vs-delta.");
+    }
+
+    // ---- the arena's free-space map: a SECOND cost, on a different axis --------------------
+    //
+    // Split out because it is not an answer to this run's question and folding it in corrupted the
+    // one that is. `replace_atomically` rewrites the map WHOLE, and its image carries a record per
+    // arena that has ever been claimed — so its size tracks the number of merges, not `r`. The two
+    // passes make that visible: at r=1 the ascending pass paid one figure and the descending pass
+    // another, differing only in how many merges had already run.
+    //
+    // Reported as a per-merge growth rate, which is the shape that matters: if it is a constant
+    // number of bytes per merge, then a database that has done N merges rewrites O(N) bytes on
+    // every subsequent merge, whatever that merge changed. That is a real scaling problem and it
+    // belongs to whoever owns the free-space map, not to chunk-vs-delta.
+    {
+        println!();
+        println!("  THE ARENA FREE-SPACE MAP — a SECOND flat cost, and a different axis:");
+        println!("    `arena B` is bytes WRITTEN during the cycle, not the image's size: one");
+        println!("    `replace_atomically` rewrites the whole map, so bytes ~ replaces x image.");
+        println!();
+        // Checked against the rows, not asserted in prose: the claim is that one whole rewrite
+        // serves every r in the flat region, and a single cycle with two replaces would break it.
+        let flat_cycles: Vec<&Cycle> =
+            up.iter().chain(down.iter()).filter(|c| c.r <= flat_hi).collect();
+        let odd: Vec<&&Cycle> = flat_cycles.iter().filter(|c| c.arena_replaces != 1).collect();
+        if odd.is_empty() {
+            println!("    (1) CONFIRMED over all {} cycles with r = {} .. {}: every cycle performs EXACTLY",
+                     flat_cycles.len(), up[0].r, flat_hi);
+            println!("        one replace. One whole free-map rewrite buys a 1-row change and a");
+            println!("        {flat_hi}-row change alike — a SECOND cost independent of how small the change was.");
+        } else {
+            println!("    (1) NOT confirmed: {} of {} cycles in r = {} .. {} did not perform exactly one",
+                     odd.len(), flat_cycles.len(), up[0].r, flat_hi);
+            println!("        replace (e.g. r={} performed {}). The one-rewrite-per-merge reading is wrong.",
+                     odd[0].r, odd[0].arena_replaces);
+        }
+        let mut same: Vec<(i64, u64, u64, usize, usize)> = Vec::new();
+        for c in &up {
+            if let Some(d) = down.iter().find(|d| d.r == c.r) {
+                same.push((c.r, c.arena_bytes, d.arena_bytes, c.seq, d.seq));
+            }
+        }
+        let all_grew = same.iter().all(|(_, ub, db, _, _)| db > ub);
+        println!();
+        println!("    (2) {} though r is identical — so the size tracks merge",
+                 if all_grew { "At EVERY r the later pass wrote MORE," }
+                 else { "The later pass did NOT write more at every r," });
+        println!("        history, not r. That is why it is excluded from STORED(r):");
+        println!("             r    up B (merge #)    down B (merge #)");
+        for (r, ub, db, us, ds) in &same {
+            println!("        {r:>6}   {ub:>7} (#{us:<3})     {db:>7} (#{ds:<3}){}",
+                     if db > ub { "" } else { "   <- NOT larger; the claim above does not hold here" });
+        }
+        println!();
+        println!("    A per-merge growth constant is NOT reported: the gap between the two passes at");
+        println!("    a given r spans merges of OTHER r values that claim different numbers of");
+        println!("    extents, so no controlled estimate of it exists in this run. Sizing that cost");
+        println!("    needs its own sweep over merge count at fixed r.");
     }
 
     // ---- whole-run totals, so an UNWIRED counter cannot pass as a measured zero -------------
