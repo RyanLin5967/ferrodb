@@ -1,3 +1,17 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+Same harness, same defect as `d67_merge_contention.txt`: the writer cycles ran on
+`Session::new()`'s private storage-less runtime rather than the arena-backed one the
+`ServerContext` held. The reader side of this A/B used plain `SELECT`s, which never reach the
+agent runtime, so the READER arm is unaffected; the WRITE wall it is being A/B'd against is not.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D67b — DOES A REGISTERED READER MAKE THE WRITE WALL WORSE? The drain's A/B.
 [HERE] 2026-09-20T15:36:48Z at 0ca0dc2
 

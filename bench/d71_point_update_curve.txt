@@ -1,3 +1,27 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+⚠ A DIFFERENT DEFECT FROM THE OTHER FILES IN THIS CORRECTION, AND THE DIFFERENCE MATTERS.
+`examples/d71_point_update_curve.rs` did not build a runtime and then bypass it. It built NO
+`AgentRuntime` and NO `ServerContext` AT ALL: it ran everything on `Session::new()`, whose
+implicit `AgentRuntime::new()` is `storage: None` over an in-memory branch catalog. Nothing was
+constructed-and-ignored, so there was no internal contradiction to notice — which is precisely
+why it went unremarked.
+The consequence is still that the STAGED arm measured the in-memory overlay rather than the arena
+path `src/cli/cli.rs` ships (`with_storage`/`reopen_with_storage` over an `ArenaPageStore`). The
+PLAIN arm is UNAFFECTED: ordinary DML never touches the runtime. So the two arms of this
+comparison were not drawn from the same engine configuration.
+⚠ WHAT PLAUSIBLY SURVIVES, as a hypothesis for the re-run and not a finding: the O(table) staged
+write was attributed to the overlay walk in `visible_rows_where` (`runtime.rs`), which is above
+the storage layer and runs in both configurations. The COMPLEXITY CLASS may therefore hold while
+every absolute here, and the ~36,000-row crossover computed from two fits, do not.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D71 — THE WALL IS THE AGENT STAGING PATH, NOT THE MERGE AND NOT THE ENGINE.
 
 [HERE] `examples/d71_point_update_curve.rs`, built at 991d6e0 (+DIRTY at run time — the instrument

@@ -1,3 +1,19 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+This is a 1 ms sampling profile of `d67_merge_contention` (pid 63525). That process built a
+`ServerContext` over a real `ArenaPageStore` and then ran every agent statement on
+`Session::new()`'s private in-memory runtime. SO THE STACKS BELOW ARE STACKS OF THE STUB: any
+frame under the branch/arena/CoW path is absent because that path never ran, and any hot frame in
+the in-memory overlay is an artifact of the wrong configuration rather than of the engine.
+⚠ Do not use this profile to locate an engine wall. Re-profile a corrected run first.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 Analysis of sampling d67_merge_contention (pid 63525) every 1 millisecond
 Process:         d67_merge_contention [63525]
 Path:            /Users/USER/*/d67_merge_contention
