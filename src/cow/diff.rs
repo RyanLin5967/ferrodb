@@ -424,12 +424,24 @@ impl NodeIdentity for SubtreeHash {
 /// CowTree::diff, the O(N) path being replaced :  2188 page reads
 /// SubtreeHash::stamp, bottom-up               :  1085 page reads   <- one per node, the floor
 /// MemoIdentity(subtree_cid).warm              :  5410 page reads   <- 2.5x the control
-///   of which subtree_cid itself               :  4325 page reads   <- 2.0x it on its own
+///   of which subtree_cid itself               :  3240 page reads   <- 1.48x it on its own
+///   of which `warm`'s own walk_pages          :  1085 page reads   <- one per node
+///   of which this adapter's version check     :  1085 page reads   <- one per node
 /// ```
 ///
-/// The split is measured, by removing the version check and re-counting: the other 1085 are this
-/// adapter's own validation, exactly one per page. The verdict does not rest on them — warming
-/// cost twice the path it replaces before there was anything to validate.
+/// The split is an **equality**, not a subtraction from the total: the test counts `walk_pages`
+/// and `subtree_cid` separately through the same store and asserts
+/// `warm = walk_pages + subtree_cid + one version check per page`, so a breakdown that stops
+/// describing `warm` fails rather than merely ageing.
+///
+/// An earlier cut of this table credited 4325 reads to `subtree_cid` alone. That figure was
+/// `walk_pages + subtree_cid`: `warm` iterates `tree.walk_pages(root)`, and that walk reads every
+/// page once before the digest is called on any of them, so the 1085 it costs was being charged
+/// to the digest. Measured directly, the digest is 3240 — 1.48x the control, not 2.0x.
+///
+/// The verdict does not rest on either overhead. At 3240 reads the digest **alone** is still half
+/// again the whole O(N) path it is supposed to replace, before a single row is walked or
+/// validated.
 ///
 /// It still reports a healthy `skipped_subtrees`, so the counter does not give the cost away. Use
 /// [`SubtreeHash`] to warm a whole tree — it folds bottom-up and reads each page once — and keep
@@ -1885,10 +1897,19 @@ mod tests {
 
         let counting = CountingStore::wrap(f.store_dyn());
         let tree = CowTree::new(Arc::clone(&counting) as Arc<dyn PageStore>);
-        let nodes = tree.walk_pages(base).unwrap().len();
+        counting.take();
+        let pages = tree.walk_pages(base).unwrap();
+        let walk_reads = counting.take();
+        let nodes = pages.len();
         assert!(nodes > 100, "test needs a multi-level tree, got {nodes} pages");
 
-        counting.take();
+        // `subtree_cid`'s own cost over exactly the pages `warm` visits, measured directly
+        // rather than inferred by subtraction.
+        for p in &pages {
+            cid::subtree_cid(&tree, *p).unwrap();
+        }
+        let cid_reads = counting.take();
+
         let control = tree.diff(base, head).unwrap();
         let control_reads = counting.take();
         assert_eq!(control.deltas.len(), 4);
@@ -1910,6 +1931,21 @@ mod tests {
         println!("  CowTree::diff, the O(N) path being beaten  : {control_reads:>8} page reads");
         println!("  SubtreeHash::stamp, bottom-up              : {stamp_reads:>8} page reads");
         println!("  MemoIdentity(subtree_cid).warm             : {warm_reads:>8} page reads");
+        println!("    of which subtree_cid itself              : {cid_reads:>8} page reads");
+        println!("    of which warm's own walk_pages           : {walk_reads:>8} page reads");
+        println!("    of which the version check               : {nodes:>8} page reads");
+
+        // The split, pinned by an equality rather than by arithmetic on a quoted figure. `warm`
+        // does exactly three things per page: one `walk_pages` read (amortised — `walk_pages`
+        // reads each page once for the whole walk), one version read, and one `subtree_cid`.
+        assert_eq!(
+            warm_reads,
+            walk_reads + cid_reads + nodes,
+            "warm's {warm_reads} reads are not walk_pages ({walk_reads}) + subtree_cid \
+             ({cid_reads}) + one version check per page ({nodes}); the docs' breakdown of this \
+             number no longer describes what warm does"
+        );
+        assert_eq!(walk_reads, nodes, "walk_pages is supposed to read each page exactly once");
 
         assert!(
             diff_reads < control_reads / 10,

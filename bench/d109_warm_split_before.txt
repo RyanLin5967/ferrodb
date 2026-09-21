@@ -1,0 +1,20 @@
+running 1 test
+test cow::diff::tests::warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path ... FAILED
+
+failures:
+
+---- cow::diff::tests::warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path stdout ----
+
+thread 'cow::diff::tests::warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path' (245781362) panicked at src/cow/diff.rs:1900:9:
+assertion `left == right` failed: D109 EVIDENCE: the docs credit 4325 reads to subtree_cid itself
+  left: 3240
+ right: 4325
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cow::diff::tests::warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1577 filtered out; finished in 1.68s
+
+error: test failed, to rerun pass `--lib`
