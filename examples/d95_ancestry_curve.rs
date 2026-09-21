@@ -147,7 +147,7 @@ fn main() {
         println!("# ⚠ DEBUG BUILD — absolute numbers are meaningless; re-run with --release.");
     }
     println!(
-        "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>11}  {:>11}",
+        "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>13}  {:>11}  {:>11}",
         "depth",
         "anc_walk_ns",
         "anc_index_ns",
@@ -155,6 +155,7 @@ fn main() {
         "lca_walk_ns",
         "lca_index_ns",
         "lca_x",
+        "forkreap_ns",
         "walk_steps",
         "index_nodes",
     );
@@ -225,8 +226,27 @@ fn main() {
             lca_walk = ns_per_op(|| walk.lca(leaf_a as u32, leaf_b as u32).1);
         }
 
+        // ---- what the index costs on the WRITE path ---------------------------------------
+        //
+        // The obvious objection to any query index is that it was paid for at insert time. A
+        // fork here builds a jump table of `log2(depth)` entries, so this must come out
+        // logarithmic too — if it were linear the index would simply have moved the wall from
+        // ancestry queries onto `fork`, which is the operation this whole project keeps O(1).
+        //
+        // Insert-then-reap so the graph neither grows without bound across samples nor drifts to
+        // a different size between depths, and so the free list is exercised the way a real
+        // fork/reap cycle exercises it. The leaf is childless, so the reap really does remove it.
+        let mut churn_id = 1_000_000_000u64;
+        let fork_reap = ns_per_op(|| {
+            churn_id += 1;
+            let id = bid(churn_id);
+            g.insert_child(id, bid(leaf_a)).expect("churn fork");
+            g.reap(id).expect("churn reap") as u64
+        });
+        assert_eq!(g.len(), n, "depth {d}: churn must leave the graph the size it found it");
+
         println!(
-            "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>11}  {:>11}",
+            "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>11}  {:>11}",
             d,
             anc_walk,
             anc_index,
@@ -234,6 +254,7 @@ fn main() {
             lca_walk,
             lca_index,
             lca_walk / lca_index,
+            fork_reap,
             w_anc_steps.max(w_lca_steps),
             g.len(),
         );
