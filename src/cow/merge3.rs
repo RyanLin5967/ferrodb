@@ -1072,6 +1072,8 @@ mod tests {
     ///    barrier. Same page id, different contents, and `birth_epoch` is **not** restamped —
     ///    which is also why keying on `(page_id, birth_epoch)` would not have helped. Needs no
     ///    reap; fires on a branch's second write, which is what this test drives.
+    ///    `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write` measures that,
+    ///    route by route, rather than leaving it as an assertion in a comment.
     /// 2. `ArenaPageStore` recycles freed page ids: `release_page` pushes onto
     ///    `recycled: HashMap<ArenaId, Vec<PageId>>` and `alloc_page` pops from it before touching
     ///    the bump pointer. Measured separately: free page 1, allocate, get page 1 back.
@@ -1193,6 +1195,105 @@ mod tests {
             "merge read {} of {} pages — that is not a structural merge",
             r.stats.nodes_read,
             pages
+        );
+    }
+
+    /// **What a memo may be keyed on, measured rather than argued.**
+    ///
+    /// Two memos in `src/cow/` are keyed on `PageId` and both went stale; the proposed repair is
+    /// to key on `(PageId, birth_epoch)` instead, on the grounds that a recycled page is restamped
+    /// with a fresh epoch. That is true, and it is one of three routes. This test measures all
+    /// three so the next person does not have to take anybody's word for which are covered.
+    ///
+    /// | route | discriminates? |
+    /// |---|---|
+    /// | A — a freed page id handed out again | **yes**, `write_fresh_page` restamps |
+    /// | B — an in-place write to the page itself | **no** |
+    /// | C — an in-place write to a DESCENDANT | **no** |
+    ///
+    /// B is `ArenaPageStore::cow_page`'s in-place arm: when the branch owns the arena and the page
+    /// was born at or after its privacy barrier, the page is handed back for mutation and the
+    /// function returns *before* touching the header, so `birth_epoch` is not restamped. It needs
+    /// no reap and fires on a branch's second write.
+    ///
+    /// C is the one that cannot be repaired by choosing a better key, and it is the case that
+    /// matters for a **recursive** digest like `cow::diff::SubtreeHash` or [`cid::subtree_cid`]:
+    /// mutate a descendant in place and the ancestor's own bytes never change, so its id, epoch,
+    /// page type and checksum are all identical while the subtree id it stands for is not. Any
+    /// per-page key is blind here, by construction.
+    ///
+    /// The conclusion the callers need: `(PageId, birth_epoch)` is a real improvement over
+    /// `PageId` and is **not** a fix. The only scope that is sound for a recursive digest is a
+    /// window in which nothing writes to the stamped trees — stamp, use, discard.
+    #[test]
+    fn birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write() {
+        use crate::cow::page_header::PageHeader;
+        let key = |fx: &Fx, p: PageId| -> (PageId, u64) {
+            let h = fx.store.read_page(p).unwrap();
+            let f = h.read();
+            (p, PageHeader::read_from(&f.data).unwrap().birth_epoch.0)
+        };
+
+        // ---- A. A freed page id comes back, carrying a fresh epoch. ----
+        let fx = Fx::new();
+        let br = fx.branch(81, TRUNK);
+        let arena = fx.store.arena_for(br).unwrap();
+        let p1 = fx.store.alloc_in_arena(arena, PageType::Heap, fx.tick()).unwrap();
+        let a_before = key(&fx, p1);
+        fx.store.free_page(p1, fx.tick()).unwrap();
+        let p2 = fx.store.alloc_in_arena(arena, PageType::Heap, fx.tick()).unwrap();
+        assert_eq!(p2, p1, "this route needs the id to actually be recycled");
+        assert_ne!(
+            a_before,
+            key(&fx, p2),
+            "route A: a recycled page must carry a fresh birth_epoch, or the proposed key buys \
+             nothing at all"
+        );
+
+        // ---- B. An in-place write leaves the key untouched. ----
+        let fx = Fx::new();
+        let (base, _ob, tb) = fx.forked(&[(b"k", b"v0")]);
+        let t1 = fx.put(base, tb, b"a", b"1"); // copies out of trunk's arena
+        let b_before = key(&fx, t1);
+        let cid_before = cid::subtree_cid(&fx.tree, t1).unwrap();
+        let t2 = fx.put(t1, tb, b"k", b"vT"); // second write: in place
+        assert_eq!(t2, t1, "route B needs cow_page's in-place arm; the store took a copy instead");
+        assert_ne!(cid_before, cid::subtree_cid(&fx.tree, t2).unwrap(), "contents really changed");
+        assert_eq!(
+            b_before,
+            key(&fx, t2),
+            "route B: (PageId, birth_epoch) is UNCHANGED across an in-place write. If this now \
+             differs, cow_page restamps and this half of the hazard is gone — say so where the \
+             memos cite it."
+        );
+
+        // ---- C. And the ancestor of an in-place write is blind to it. ----
+        let fx = Fx::new();
+        let e = fx.tick();
+        let mut root = fx.tree.create(TRUNK, e).unwrap();
+        for i in 0..400u32 {
+            root = fx.put(root, TRUNK, &i.to_be_bytes(), &[7u8; 40]);
+        }
+        let wb = fx.branch(83, TRUNK);
+        let r1 = fx.put(root, wb, &10u32.to_be_bytes(), b"first");
+        assert!(
+            matches!(cid::shape_of(&fx.tree, r1).unwrap(), NodeShape::Internal(..)),
+            "route C is only meaningful with an internal root"
+        );
+        let c_before = key(&fx, r1);
+        let c_cid_before = cid::subtree_cid(&fx.tree, r1).unwrap();
+        let r2 = fx.put(r1, wb, &11u32.to_be_bytes(), b"second");
+        assert_eq!(r2, r1, "route C needs the root to be mutated in place");
+        assert_ne!(
+            c_cid_before,
+            cid::subtree_cid(&fx.tree, r2).unwrap(),
+            "the subtree digest really did change"
+        );
+        assert_eq!(
+            c_before,
+            key(&fx, r2),
+            "route C: the ancestor's (PageId, birth_epoch) is UNCHANGED while its subtree digest \
+             moved. This is why no per-page key can make a recursive digest's memo sound."
         );
     }
 }

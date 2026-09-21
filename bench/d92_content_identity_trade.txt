@@ -50,3 +50,33 @@ Reproduce: the numbers above came from a temporary #[test] driving merge3 with S
 MerkleId over the same three roots, printing MergeStats::nodes_read and MerkleId::pages_hashed.
 Both identities are deleted from merge3 by the commit that adds this file; the equivalents are
 cow::diff::PageIdentity and cow::diff::SubtreeHash.
+
+
+ADDENDUM — can the memo be repaired by re-keying instead of re-scoping?
+=======================================================================
+
+The proposed repair for the staleness defect is to key on (PageId, birth_epoch) rather than
+PageId, on the grounds that a recycled page is restamped with a fresh epoch. Measured, printing
+(page_id, birth_epoch) before and after each mutation alongside cid::subtree_cid:
+
+  route                                     key before -> after     discriminates?
+  A  a freed page id handed out again       (1, 2)   -> (1, 4)      YES
+  B  an in-place write to the page itself   (65, 5)  -> (65, 5)     NO  (contents changed)
+  C  an in-place write to a DESCENDANT      (66,403) -> (66,403)    NO  (subtree_cid changed)
+
+A is real: write_fresh_page does restamp, so the key fixes the recycle route.
+
+B is ArenaPageStore::cow_page's in-place arm — it hands a branch its own page back for mutation
+and returns BEFORE touching the header. No reap needed; fires on a branch's second write.
+
+C cannot be repaired by any choice of per-page key, and it is the case that matters for a
+RECURSIVE digest: mutate a descendant in place and the ancestor's own bytes never change, so its
+id, epoch, page type and checksum are all identical while the subtree id it stands for is not.
+
+So (PageId, birth_epoch) is a real improvement and NOT a fix. Landing it as "staleness resolved"
+would put a correctness claim over two routes that then fail silently — worse than the present
+state, where the hazard is at least documented. The only scope that is sound for a recursive
+digest is a window in which nothing writes to the stamped trees: stamp, use, discard.
+
+Pinned by cow::merge3::tests::birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write,
+which asserts all three rows and says what to do if any of them changes.
