@@ -201,7 +201,7 @@ impl PageDelta {
 
         let runs = merged
             .into_iter()
-            .map(|(start, end)| DeltaRun { at: start as u16, bytes: new_payload[start..end].to_vec() })
+            .map(|(start, end)| DeltaRun { at: (start.saturating_sub(1)) as u16, bytes: new_payload[start..end].to_vec() })
             .collect();
 
         Ok(PageDelta { base, depth, runs })
