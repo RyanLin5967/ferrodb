@@ -1,0 +1,39 @@
+ACQUIRED d77-walls  load_at_acquire=16
+CAVEAT: load 16 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=16 beside it and say it is an upper bound.
+
+D99 rev2 — D77's two walls, each measured with the others held down.
+at 9c9d26f2cd1f
+  arm label: AFTER-fix (9c9d26f)   padding catalog: mem
+  load: 14:48  up 2 days, 17:52, 22 users, load averages: 16.51 12.27 12.28
+
+READING: durations on this box are UPPER BOUNDS (build fleet). The integer
+scan_steps column is len(current) = the entries the REPLACED retain would walk,
+by HashMap::retain's contract -- arithmetic, not a measurement. The fixed code
+does one hash probe regardless.
+
+T0  clock floor: Instant's smallest non-zero gap = 41.0 ns over 200k samples.
+    Any per-call figure at or below this is a fact about the CLOCK.
+
+A1  ServerContext::catalog() vs REGISTERED READERS (connections). Branches: 0.
+      readers C     ns/catalog()      ns per 1000 C
+          1000          1886.8           1886.83
+         10000         30934.2           3093.42
+        100000        304551.4           3045.51
+
+A2  ServerContext::catalog() vs BRANCHES. Readers fixed at 8 (a small server).
+      branches M    live_count    ns/catalog()
+          1000         1001           28.24
+         10000        10001           25.63
+        100000       100001           25.61
+       1000000      1000001           24.41
+
+B1  free_arena vs BRANCHES. pending=0, persist OFF. Isolates the named scan.
+      branches M   scan_steps   verified    ns/free_arena    ns per 1000 M
+          1000         1001        100            84.0            84.00
+         10000        10001        200           125.0            12.50
+        100000       100001        200           333.0             3.33
+       1000000      1000001        200           458.0             0.46
+
+arm-rc=0

@@ -1,0 +1,35 @@
+ACQUIRED d77-walls  load_at_acquire=17
+CAVEAT: load 17 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=17 beside it and say it is an upper bound.
+
+D99 rev2 — D77's two walls, each measured with the others held down.
+at 9c9d26f2cd1f
+  arm label: AFTER-fix (9c9d26f)   padding catalog: mem
+  load: 15:26  up 2 days, 18:29, 22 users, load averages: 17.95 10.29 9.33
+
+READING: durations on this box are UPPER BOUNDS (build fleet). The integer
+scan_steps column is len(current) = the entries the REPLACED retain would walk,
+by HashMap::retain's contract -- arithmetic, not a measurement. The fixed code
+does one hash probe regardless.
+
+B2  free_arena vs PENDING. branches=1000, persist OFF. Isolates pending.retain.
+    NOT a clean control at the low end: branches are padded to 1000, so the
+    branch-axis fix moves the P=1k row too. It is a control where P dominates.
+      pending P    verified    ns/free_arena    ns per 1000 P
+          1000        100           417.0           417.00
+         10000        100          3666.0           366.60
+        100000        100         35833.0           358.33
+       1000000        100        529167.0           529.17
+
+B3  free_arena vs BRANCHES, persist ON — the configuration cli.rs ships.
+    Persistence is enabled AFTER padding. Enabling it before makes the M
+    arena_for calls in setup rewrite the whole map M times: O(M^2) setup, which
+    is what rev1 timed out inside and then reported against free_arena.
+      branches M   scan_steps   verified    ns/free_arena    map bytes
+          1000         1001         50      24987792.0        48089
+         10000        10001         50      26864500.0       480089
+        100000       100001         50      64817542.0      4800089
+       1000000      1000001         50     846991666.0     48000089
+
+arm-rc=0
