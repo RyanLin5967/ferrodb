@@ -18,6 +18,7 @@
 
 pub mod arena;
 pub mod catalog;
+pub mod cherry;
 pub mod lease_thread;
 pub mod reaper;
 pub mod record;
