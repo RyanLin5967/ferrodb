@@ -237,3 +237,98 @@ chain stats after 24 generations: DeltaStats { deltas: 22, full_by_depth: 2, ful
 # - The sweep updates existing rows. Inserts, deletes and node splits are not measured,
 #   and a split rewrites both halves, which is a whole-page cost delta encoding cannot
 #   avoid.
+
+# ===========================================================================
+# PART 3 — AMENDMENT, 2026-09-21. Appended after an adversarial review.
+# Append-only, as PART 1 requires. Nothing above this line was edited.
+# ===========================================================================
+#
+# A fresh-context agent that had not seen this work was asked one question: can
+# this measurement and these guards be TRUSTED. It attacked both. The sweep survived;
+# the guards did not, and three real defects came out of it. All three were confirmed
+# in the source before anything was changed. Fixed in commit 95a5188.
+#
+#   1. `PageDelta::apply` was NOT all-or-nothing. It checked each run's extent inside
+#      the write loop, so a refusal left the caller's buffer partly written. Harmless
+#      while the only caller applied onto a scratch Vec it dropped on the error — and a
+#      corrupted live page frame the moment it is applied in place, which is exactly how
+#      it is being wired under `cow_page`. Now validated before any byte moves.
+#   2. `materialise`'s chain guard was OFF BY ONE. `chain.len() > MAX_CHAIN_DEPTH`
+#      checked before the push accepted a chain of NINE and reported deltas_applied = 9
+#      — past the 3-page ceiling this file certifies — while naming 8 in its error and
+#      actually refusing at 10. So a number this bank reports as bounded at 8 was
+#      reachable at 9 by a route `write` happens never to take.
+#   3. A doc line claimed `DeltaStore` "refuses to drop a page that something still
+#      deltas against". There is no drop method and no pinning of any kind. That line
+#      could have been read by a wiring agent as protection that exists.
+#
+# The review also showed two things that bear directly on THIS FILE'S NUMBERS:
+#
+#   - The read-side bound had NO test at all: its guard could be deleted outright and
+#     all 1374 tests stayed green, and the instrument F-A's pass condition is stated in
+#     (`deltas_applied`) could be clamped so it could never report a violation. F-A's
+#     verdict above was therefore weaker than it read. It now rests on a test that
+#     builds over-deep chains by hand, because a guard `write` can never provoke is a
+#     guard nothing was proving.
+#   - RUN_FRAME and DELTA_HEADER described a wire format THAT DID NOT EXIST. Every byte
+#     column above is `DELTA_HEADER + sum(RUN_FRAME + len)`, and halving either constant
+#     shrank every banked number and inflated every ratio with the suite green. There is
+#     now a real `encode`/`decode`, and a test pins `encoded_len` to the encoder's actual
+#     output, so these columns describe a form that can be written down.
+#
+# ---------------------------------------------------------------------------
+# MUTATION BATTERY — run against the COMMITTED hardened file (95a5188)
+# ---------------------------------------------------------------------------
+#
+#   M7   materialise's chain refusal disabled ............ RED (killed, 2 tests)
+#   off-by-one regression, >= back to > ................... RED (killed, 2 tests)
+#   M14  RUN_FRAME 4 -> 2 ................................. RED (killed, 2 tests)
+#   M15  DELTA_HEADER 7 -> 0 .............................. RED (killed, 3 tests)
+#   M13  DELTA_BUDGET PAYLOAD_LEN/4 -> /8 ................. GREEN (survived — see below)
+#   validate_runs made a no-op (atomicity) ................ RED (killed, 4 tests)
+#   M10  apply's overrun guard disabled ................... RED (killed, 2 tests)
+#   M8   ReadCost.bytes_touched stops counting ............ RED (killed, 2 tests)
+#   M9   stored_bytes(delta) reports 0 .................... RED (killed, 2 tests)
+#   M20  stored_bytes(full) reports PAYLOAD_LEN ........... RED (killed, 4 tests)
+#   M11  stats.deltas never incremented ................... RED (killed, 2 tests)
+#   M12  budget collapse counted as a depth collapse ...... RED (killed, 2 tests)
+#   M19  depth collapse charged 0 bytes ................... RED (killed, 2 tests)
+#
+# 12 of 13 killed. THE SURVIVOR IS DELIBERATE AND IS NOT BEING FIXED.
+# DELTA_BUDGET is a policy knob with a legitimate range, and both ends of that range
+# ARE pinned: the read-amplification ceiling bounds it from above, and F-B's 10x ratio
+# bounds it from below. Halving it changes no measured behaviour here — the sweep's
+# deltas are ~52 B and are admitted either way. A test asserting the constant equals
+# PAYLOAD_LEN/4 would detect CHANGE, not DEFECT, which is a worse test than none.
+#
+# ---------------------------------------------------------------------------
+# THE NUMBERS ARE UNCHANGED, AND THAT WAS CHECKED RATHER THAN ASSUMED
+# ---------------------------------------------------------------------------
+#
+# Re-run at the hardened commit, the sweep table above reproduces BYTE-IDENTICAL
+# (diffed mechanically, not by eye). The hardening moved no measured number, which is
+# what should happen: it changed which wrong states are reachable, not the arithmetic.
+# Full lib target at 95a5188: 1548 passed, 0 failed, 3 ignored.
+#
+# ---------------------------------------------------------------------------
+# THREE LIMITS THE ORIGINAL WRITE-UP UNDERSTATED
+# ---------------------------------------------------------------------------
+#
+# 1. THE HEADLINE IS A FUNCTION OF ROW WIDTH, NOT OF THE MECHANISM. The ratio is
+#    roughly PAGE_SIZE divided by what one changed entry costs to encode, so it falls
+#    as rows get wider. At this fixture's 24-byte value that is ~79x; the reviewer
+#    measured it down to ~14x at a 256-byte value. I did not re-run that sweep myself,
+#    so treat the specific figures as unverified — but the DEPENDENCE is arithmetic and
+#    is not in doubt, and "77.6x" should never be quoted without the row width it came
+#    from. The claim that survives at every width measured is the 10x bar, not the 78x.
+# 2. THE DELTA ARM PAYS NO CONTAINER OVERHEAD. `DELTA_HEADER` is 7 bytes and budgets
+#    nothing for the 24-byte self-describing page header that any independently
+#    reclaimable unit needs. If each delta had to carry one, r=1 would fall from 78.8x
+#    to 4096/(52+24) = 53.9x. Deltas packed many-to-a-page would amortise most of that,
+#    which is why this is a bound on the concern rather than a correction to the table.
+# 3. WRITE COST WAS NOT MEASURED AT ALL. There is a ReadCost and there was no
+#    counterpart. `DeltaStore::write` materialises its base (up to 8 delta applications)
+#    and then scans a whole 4072-byte payload to diff it — on every write — replacing a
+#    single `copy_from_slice`. DeltaStats now counts `write_deltas_applied` and
+#    `write_bytes_scanned`, but no sweep of write cost has been run, and the
+#    "counters, not timings" argument applies to it exactly as it does to reads.

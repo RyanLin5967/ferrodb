@@ -104,6 +104,17 @@ pub const RUN_FRAME: usize = 4;
 /// Bytes of framing a whole delta costs: `base: u32`, `depth: u8`, `run_count: u16`.
 pub const DELTA_HEADER: usize = 7;
 
+/// A run offset is a `u16`, and `at: start as u16` is a **wrapping** cast.
+///
+/// Made unrepresentable rather than documented. This previously said only that an offset which
+/// does not fit "is a bug rather than a large page", which is true and useless: a `PAGE_SIZE`
+/// change is one constant away, and the cast would then truncate silently and corrupt every
+/// delta rather than failing. A compile error is the one failure mode that cannot be missed.
+const _: () = assert!(
+    PAYLOAD_LEN <= u16::MAX as usize,
+    "a page payload no longer fits a u16 run offset; DeltaRun::at must widen"
+);
+
 /// Largest a stored delta may be before it is refused in favour of a full page.
 ///
 /// A quarter of the payload, and the quarter is load-bearing rather than aesthetic: together with
@@ -144,8 +155,16 @@ impl DeltaRun {
 /// A page stored as its difference from another page.
 ///
 /// Every byte not named by a run is inherited from `base`. That implicit-copy default is what
-/// makes the encoding small; it is also why a delta is meaningless without its base, and why
-/// [`DeltaStore`] refuses to drop a page that something still deltas against.
+/// makes the encoding small; it is also why a delta is meaningless without its base.
+///
+/// **Nothing here keeps a base alive.** An earlier version of this comment claimed that
+/// [`DeltaStore`] "refuses to drop a page that something still deltas against", and that was
+/// false — the store has no drop, remove or free method at all, and no pinning of any kind. The
+/// sentence was aspirational and is corrected here rather than deleted, because a caller wiring
+/// this under a real page store would have read it as protection that exists. Base liveness is
+/// entirely the caller's problem, and on the real write path it is a sharp one: `cow_page` frees
+/// the page it shadows, and [`crate::branch::record::reclaimable`] answers liveness from epoch
+/// intervals with no notion of a delta referencing a base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageDelta {
     base: PageId,
@@ -222,8 +241,78 @@ impl PageDelta {
     }
 
     /// Bytes this delta costs when stored, all framing included.
+    ///
+    /// This is the number every byte column in `bench/d93_delta_encoding.txt` is built from, so
+    /// it must describe a form that really exists: [`PageDelta::encode`] produces exactly this
+    /// many bytes, and a test asserts the equality. Until that encoder was written, `RUN_FRAME`
+    /// and `DELTA_HEADER` were free parameters — halving either one shrank every banked delta and
+    /// inflated every ratio with the suite still green.
     pub fn encoded_len(&self) -> usize {
         DELTA_HEADER + self.runs.iter().map(DeltaRun::encoded_len).sum::<usize>()
+    }
+
+    /// Serialise. Big-endian throughout, matching the rest of ferrodb.
+    ///
+    /// Layout: `base u32 | depth u8 | run_count u16 | run_count * { at u16 | len u16 | bytes }`.
+    pub fn encode(&self) -> Result<Vec<u8>, FerroError> {
+        self.validate_runs()?;
+        let count = u16::try_from(self.runs.len())
+            .map_err(|_| FerroError::Cow(format!("a delta may hold at most {} runs", u16::MAX)))?;
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(&self.base.to_be_bytes());
+        out.push(self.depth);
+        out.extend_from_slice(&count.to_be_bytes());
+        for run in &self.runs {
+            let len = u16::try_from(run.bytes.len())
+                .map_err(|_| FerroError::Cow("a run is longer than a page".to_string()))?;
+            out.extend_from_slice(&run.at.to_be_bytes());
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(&run.bytes);
+        }
+        Ok(out)
+    }
+
+    /// Parse a delta produced by [`PageDelta::encode`].
+    ///
+    /// Validates the run shape rather than trusting it. This is the constructor that makes
+    /// overlapping or out-of-order runs reachable at all — `between` cannot emit them — so it
+    /// refuses them here instead of letting `apply` produce a page that depends on run order.
+    pub fn decode(bytes: &[u8]) -> Result<PageDelta, FerroError> {
+        let too_short =
+            || FerroError::Cow("delta is truncated: not enough bytes for its framing".to_string());
+        if bytes.len() < DELTA_HEADER {
+            return Err(too_short());
+        }
+        let base = PageId::from_be_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        let depth = bytes[4];
+        let count = u16::from_be_bytes(bytes[5..7].try_into().expect("2 bytes")) as usize;
+
+        let mut runs = Vec::with_capacity(count);
+        let mut cursor = DELTA_HEADER;
+        for _ in 0..count {
+            if cursor + RUN_FRAME > bytes.len() {
+                return Err(too_short());
+            }
+            let at = u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().expect("2 bytes"));
+            let len = u16::from_be_bytes(bytes[cursor + 2..cursor + 4].try_into().expect("2 bytes"))
+                as usize;
+            cursor += RUN_FRAME;
+            if cursor + len > bytes.len() {
+                return Err(too_short());
+            }
+            runs.push(DeltaRun { at, bytes: bytes[cursor..cursor + len].to_vec() });
+            cursor += len;
+        }
+        if cursor != bytes.len() {
+            return Err(FerroError::Cow(format!(
+                "delta has {} trailing bytes after its {count} runs",
+                bytes.len() - cursor
+            )));
+        }
+
+        let delta = PageDelta { base, depth, runs };
+        delta.validate_runs()?;
+        Ok(delta)
     }
 
     /// Payload bytes this delta writes when applied. The read-cost instrument.
@@ -231,7 +320,42 @@ impl PageDelta {
         self.runs.iter().map(|r| r.bytes.len()).sum()
     }
 
+    /// Check every run before any of them is written.
+    ///
+    /// Split out from [`PageDelta::apply`] so that applying is all-or-nothing, and shared with
+    /// [`PageDelta::decode`] so a delta read from disk cannot carry a shape `between` would never
+    /// emit. Runs must be ordered and disjoint: overlapping runs would make the page depend on
+    /// the order they are applied in, which is a silent wrong-page bug rather than an error.
+    fn validate_runs(&self) -> Result<(), FerroError> {
+        let mut cursor = 0usize;
+        for run in &self.runs {
+            let at = run.at as usize;
+            let end = at.checked_add(run.bytes.len()).ok_or_else(|| {
+                FerroError::Cow(format!("delta run at {at} has an overflowing length"))
+            })?;
+            if end > PAYLOAD_LEN {
+                return Err(FerroError::Cow(format!(
+                    "delta run at {at} of {} bytes runs past the payload",
+                    run.bytes.len()
+                )));
+            }
+            if at < cursor {
+                return Err(FerroError::Cow(format!(
+                    "delta run at {at} overlaps or precedes the previous run ending at {cursor}"
+                )));
+            }
+            cursor = end;
+        }
+        Ok(())
+    }
+
     /// Apply this delta onto a materialised base payload, in place.
+    ///
+    /// **All-or-nothing.** Every run is checked before any byte is written, because the previous
+    /// version checked each run inside the write loop and so left the caller's buffer partly
+    /// written when a later run was refused. That was invisible while the only caller applied
+    /// onto a scratch `Vec` it dropped on the error — and would have corrupted a live pinned page
+    /// frame the moment someone applied in place, which is exactly how this is meant to be wired.
     pub fn apply(&self, payload: &mut [u8]) -> Result<(), FerroError> {
         if payload.len() != PAYLOAD_LEN {
             return Err(FerroError::Cow(format!(
@@ -239,16 +363,10 @@ impl PageDelta {
                 payload.len()
             )));
         }
+        self.validate_runs()?;
         for run in &self.runs {
             let at = run.at as usize;
-            let end = at + run.bytes.len();
-            if end > PAYLOAD_LEN {
-                return Err(FerroError::Cow(format!(
-                    "delta run at {at} of {} bytes runs past the payload",
-                    run.bytes.len()
-                )));
-            }
-            payload[at..end].copy_from_slice(&run.bytes);
+            payload[at..at + run.bytes.len()].copy_from_slice(&run.bytes);
         }
         Ok(())
     }
@@ -301,6 +419,15 @@ pub struct DeltaStats {
     pub deltas: u64,
     pub full_by_depth: u64,
     pub full_by_budget: u64,
+    /// Deltas applied while materialising the base a write is taken against.
+    ///
+    /// There is a [`ReadCost`] and there was no counterpart for writes, which understated the
+    /// mechanism: `write` materialises its base (up to `MAX_CHAIN_DEPTH` applications) and then
+    /// diffs a whole payload, and wiring it under `cow_page` replaces a single 4072-byte
+    /// `copy_from_slice` with all of that. Counted here so the cost appears somewhere.
+    pub write_deltas_applied: u64,
+    /// Payload bytes the differ scanned across all writes. Every write scans a whole payload.
+    pub write_bytes_scanned: u64,
 }
 
 /// A page store that keeps a branch's divergence as deltas against the page it forked from.
@@ -342,6 +469,19 @@ impl DeltaStore {
         Ok(id)
     }
 
+    /// Store a delta directly, bypassing the write-time bounds.
+    ///
+    /// Test-only seam, and it earns its place: `write` refuses by construction to build a chain
+    /// past [`MAX_CHAIN_DEPTH`], so the read path's own refusal is unreachable through the public
+    /// API and was therefore untested — it could be deleted outright with the whole suite green.
+    /// Proving a guard fires means building the state it guards against.
+    #[cfg(test)]
+    fn insert_delta_unchecked(&mut self, delta: PageDelta) -> PageId {
+        let id = self.fresh_id();
+        self.pages.insert(id, Stored::Delta(delta));
+        id
+    }
+
     /// Chain depth of a stored page: zero for a full page.
     pub fn depth_of(&self, id: PageId) -> Result<u8, FerroError> {
         match self.pages.get(&id) {
@@ -377,7 +517,9 @@ impl DeltaStore {
             )));
         }
         let base_depth = self.depth_of(base)?;
-        let (base_payload, _) = self.materialise(base)?;
+        let (base_payload, base_cost) = self.materialise(base)?;
+        self.stats.write_deltas_applied += base_cost.deltas_applied as u64;
+        self.stats.write_bytes_scanned += PAYLOAD_LEN as u64;
 
         if base_depth < MAX_CHAIN_DEPTH {
             let delta = PageDelta::between(base, &base_payload, new_payload, base_depth + 1)?;
@@ -425,7 +567,12 @@ impl DeltaStore {
                     // write path can build, i.e. a bug in this file — and an unbounded read is
                     // precisely the outcome the bound exists to prevent, so it must not be
                     // reachable by falling through.
-                    if chain.len() > MAX_CHAIN_DEPTH as usize {
+                    // `>=`, checked BEFORE the push. With `>` a ninth delta was pushed and then
+                    // materialised, so a chain one past the bound read back fine and reported
+                    // `deltas_applied = 9` — past the ceiling
+                    // `the_read_amplification_bound_is_arithmetic_not_hope` certifies — while the
+                    // error text named 8 and actually refused at 10.
+                    if chain.len() >= MAX_CHAIN_DEPTH as usize {
                         return Err(FerroError::Cow(format!(
                             "chain from page {id} is deeper than MAX_CHAIN_DEPTH ({MAX_CHAIN_DEPTH})"
                         )));
@@ -739,10 +886,43 @@ mod delta_tests {
         for generation in 1..=64u64 {
             let row = (generation as usize) % 20;
             assert!(!fixture.update_row(row, generation), "fixture must not compact here");
-            let (next, _) = store.write(current, fixture.payload(0)).unwrap();
+            let (next, written) = store.write(current, fixture.payload(0)).unwrap();
             current = next;
 
+            // Charge the write what it actually stores, in BOTH directions. Asserting only an
+            // upper bound let a mutant report zero bytes for a collapse and stay green.
+            match written {
+                Written::Delta { bytes } => {
+                    assert!(bytes > 0 && bytes <= DELTA_BUDGET, "delta charged {bytes} B");
+                    assert_eq!(
+                        store.stored_bytes(current).unwrap(),
+                        bytes,
+                        "stored_bytes must agree with what the write reported"
+                    );
+                }
+                Written::Full { bytes, why } => {
+                    assert_eq!(why, Collapse::DepthLimit, "only the depth bound may fire here");
+                    assert_eq!(bytes, PAGE_SIZE, "a collapse stores a whole page");
+                    assert_eq!(
+                        store.stored_bytes(current).unwrap(),
+                        PAGE_SIZE,
+                        "a collapsed page is charged a whole page"
+                    );
+                }
+            }
+
             let (materialised, cost) = store.materialise(current).unwrap();
+            assert!(
+                cost.bytes_touched >= PAYLOAD_LEN,
+                "materialising must touch at least the base payload"
+            );
+            if cost.deltas_applied > 0 {
+                assert!(
+                    cost.bytes_touched > PAYLOAD_LEN,
+                    "applying {} deltas must count more than the base alone",
+                    cost.deltas_applied
+                );
+            }
             assert_eq!(
                 materialised,
                 fixture.payload(0),
@@ -758,6 +938,11 @@ mod delta_tests {
         }
 
         let stats = store.stats();
+        assert_eq!(
+            stats.deltas + stats.full_by_depth,
+            64,
+            "every generation must be counted exactly once: {stats:?}"
+        );
         assert!(
             stats.full_by_depth > 0,
             "the depth bound never fired, so this test proved nothing: {stats:?}"
@@ -776,6 +961,165 @@ mod delta_tests {
         );
     }
 
+    /// Build a chain of exactly `depth` deltas over a full base, bypassing the write-time bounds.
+    fn hand_built_chain(store: &mut DeltaStore, base_payload: &[u8], depth: usize) -> PageId {
+        let mut id = store.insert_full(base_payload).unwrap();
+        for d in 1..=depth {
+            let delta = PageDelta {
+                base: id,
+                depth: d as u8,
+                runs: vec![DeltaRun { at: (d * 8) as u16, bytes: vec![d as u8; 4] }],
+            };
+            id = store.insert_delta_unchecked(delta);
+        }
+        id
+    }
+
+    /// The read path's own refusal, which `write` can never provoke and which was therefore
+    /// untested: the whole suite stayed green with this guard deleted outright.
+    ///
+    /// Pins BOTH sides of the boundary, because the guard was off by one. It read
+    /// `chain.len() > MAX_CHAIN_DEPTH` *before* the push, so a chain of nine materialised happily
+    /// and reported `deltas_applied = 9` — past the ceiling
+    /// [`the_read_amplification_bound_is_arithmetic_not_hope`] certifies — while refusing only at
+    /// ten and naming eight in the message.
+    #[test]
+    fn materialise_accepts_a_chain_at_the_bound_and_refuses_one_past_it() {
+        let base = vec![0u8; PAYLOAD_LEN];
+
+        let mut store = DeltaStore::new();
+        let at_bound = hand_built_chain(&mut store, &base, MAX_CHAIN_DEPTH as usize);
+        let (_, cost) = store
+            .materialise(at_bound)
+            .expect("a chain exactly at the bound must materialise");
+        assert_eq!(
+            cost.deltas_applied, MAX_CHAIN_DEPTH as usize,
+            "a chain at the bound must apply exactly MAX_CHAIN_DEPTH deltas"
+        );
+
+        let mut store = DeltaStore::new();
+        let past_bound = hand_built_chain(&mut store, &base, MAX_CHAIN_DEPTH as usize + 1);
+        assert!(
+            store.materialise(past_bound).is_err(),
+            "a chain one past the bound must be refused, not materialised"
+        );
+    }
+
+    /// Applying is all-or-nothing. The previous version checked each run inside the write loop,
+    /// so a refusal left the caller's buffer partly written — harmless only because the one
+    /// caller applied onto a scratch `Vec`, and a live page frame the moment it is wired in.
+    #[test]
+    fn a_refused_apply_writes_no_bytes_at_all() {
+        let delta = PageDelta {
+            base: 1,
+            depth: 1,
+            runs: vec![
+                DeltaRun { at: 0, bytes: vec![0xAA; 8] },
+                // Starts inside the payload and runs off the end.
+                DeltaRun { at: (PAYLOAD_LEN - 2) as u16, bytes: vec![0xBB; 8] },
+            ],
+        };
+        let mut payload = vec![0u8; PAYLOAD_LEN];
+        assert!(delta.apply(&mut payload).is_err(), "the overrunning run must be refused");
+        assert!(
+            payload.iter().all(|&b| b == 0),
+            "apply refused but still wrote bytes; it is not all-or-nothing"
+        );
+    }
+
+    /// Overlapping or out-of-order runs make the resulting page depend on the order they are
+    /// applied in. `between` cannot emit them, but [`PageDelta::decode`] can be handed them.
+    #[test]
+    fn apply_refuses_runs_that_overlap_or_run_backwards() {
+        let mut payload = vec![0u8; PAYLOAD_LEN];
+
+        let overlapping = PageDelta {
+            base: 1,
+            depth: 1,
+            runs: vec![
+                DeltaRun { at: 10, bytes: vec![1; 4] },
+                DeltaRun { at: 12, bytes: vec![2; 4] },
+            ],
+        };
+        assert!(overlapping.apply(&mut payload).is_err(), "overlapping runs must be refused");
+
+        let backwards = PageDelta {
+            base: 1,
+            depth: 1,
+            runs: vec![
+                DeltaRun { at: 20, bytes: vec![1; 4] },
+                DeltaRun { at: 10, bytes: vec![2; 4] },
+            ],
+        };
+        assert!(backwards.apply(&mut payload).is_err(), "unordered runs must be refused");
+        assert!(payload.iter().all(|&b| b == 0), "neither refusal may write bytes");
+    }
+
+    /// `encoded_len` is what every byte column in `bench/d93_delta_encoding.txt` is built from, so
+    /// it has to describe a form that exists. Until `encode` was written, `RUN_FRAME` and
+    /// `DELTA_HEADER` were free parameters: halving either shrank every banked number and
+    /// inflated every ratio with the suite still green.
+    #[test]
+    fn encoded_len_is_exactly_the_length_of_the_real_encoding() {
+        let base = Fixture::build(600, 60);
+        let mut after = Fixture::build(600, 60);
+        for row in [3usize, 17, 44, 59] {
+            after.update_row(row, 7);
+        }
+        let delta = PageDelta::between(9, base.payload(0), after.payload(0), 1).unwrap();
+
+        let bytes = delta.encode().unwrap();
+        assert_eq!(
+            bytes.len(),
+            delta.encoded_len(),
+            "encoded_len does not describe what encode actually produces"
+        );
+
+        let decoded = PageDelta::decode(&bytes).unwrap();
+        assert_eq!(decoded, delta, "a delta must survive a round trip through its encoding");
+
+        let mut rebuilt = base.payload(0).to_vec();
+        decoded.apply(&mut rebuilt).unwrap();
+        assert_eq!(rebuilt, after.payload(0), "a decoded delta must rebuild the same page");
+    }
+
+    #[test]
+    fn decode_refuses_a_delta_that_is_truncated_or_has_trailing_bytes() {
+        let base = Fixture::build(600, 60);
+        let mut after = Fixture::build(600, 60);
+        after.update_row(11, 3);
+        let delta = PageDelta::between(9, base.payload(0), after.payload(0), 1).unwrap();
+        let bytes = delta.encode().unwrap();
+
+        assert!(PageDelta::decode(&[]).is_err(), "an empty buffer is not a delta");
+        assert!(
+            PageDelta::decode(&bytes[..bytes.len() - 1]).is_err(),
+            "a truncated delta must be refused, not silently short-read"
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(
+            PageDelta::decode(&trailing).is_err(),
+            "trailing bytes mean the framing disagrees with the buffer"
+        );
+
+        // A hand-built encoding whose runs overlap must be refused at the door. `encode`
+        // validates too, so these bytes are assembled by hand.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.push(1);
+        raw.extend_from_slice(&2u16.to_be_bytes());
+        for (at, len) in [(10u16, 4u16), (11u16, 4u16)] {
+            raw.extend_from_slice(&at.to_be_bytes());
+            raw.extend_from_slice(&len.to_be_bytes());
+            raw.extend_from_slice(&vec![1u8; len as usize]);
+        }
+        assert!(
+            PageDelta::decode(&raw).is_err(),
+            "decode must refuse overlapping runs rather than hand them to apply"
+        );
+    }
+
     /// Drive one page until `compact()` fires, returning the payload just before the compacting
     /// update and the payload just after it.
     fn drive_to_compaction(fixture: &mut Fixture) -> (u64, Vec<u8>, Vec<u8>) {
@@ -789,7 +1133,7 @@ mod delta_tests {
     }
 
     /// Size of the delta across the first compacting update, and what the store did with it.
-    fn compaction_cost(mut fixture: Fixture) -> (u64, usize, Written) {
+    fn compaction_cost(mut fixture: Fixture) -> (u64, usize, Written, DeltaStats) {
         let (generation, before, after) = drive_to_compaction(&mut fixture);
         let delta = PageDelta::between(1, &before, &after, 1).unwrap();
 
@@ -801,8 +1145,13 @@ mod delta_tests {
 
         let mut store = DeltaStore::new();
         let base = store.insert_full(&before).unwrap();
-        let (_, written) = store.write(base, &after).unwrap();
-        (generation, delta.encoded_len(), written)
+        let (id, written) = store.write(base, &after).unwrap();
+        assert_eq!(
+            store.stored_bytes(id).unwrap(),
+            PAGE_SIZE,
+            "a collapsed page must be charged a whole page, not its payload"
+        );
+        (generation, delta.encoded_len(), written, store.stats())
     }
 
     /// F-C. Compaction is the regime where the mechanism does not help, and the store must say so
@@ -814,9 +1163,23 @@ mod delta_tests {
     /// cannot quietly stop being true.
     #[test]
     fn a_compacting_update_blows_the_budget_and_is_stored_whole() {
-        let (generation, bytes, written) = compaction_cost(Fixture::build(60, 60));
+        let (generation, bytes, written, stats) = compaction_cost(Fixture::build(60, 60));
         println!(
             "equal-width compaction at generation {generation}: {bytes} B delta, budget {DELTA_BUDGET} B"
+        );
+        // The two collapse counters must not be interchangeable: this collapse is a BUDGET
+        // collapse, and asserting only `full_by_depth > 0` elsewhere let one stand in for the
+        // other. Both are pinned here, on the one path that produces a budget collapse.
+        assert_eq!(
+            stats,
+            DeltaStats {
+                deltas: 0,
+                full_by_depth: 0,
+                full_by_budget: 1,
+                write_deltas_applied: 0,
+                write_bytes_scanned: PAYLOAD_LEN as u64,
+            },
+            "a compacting write must count as exactly one budget collapse"
         );
         assert!(
             bytes > DELTA_BUDGET,
@@ -835,13 +1198,13 @@ mod delta_tests {
     /// their original offsets untouched.
     #[test]
     fn a_width_change_makes_compaction_strictly_worse() {
-        let (_, equal_width, _) = compaction_cost(Fixture::build(60, 60));
+        let (_, equal_width, _, _) = compaction_cost(Fixture::build(60, 60));
 
         let mut widened = Fixture::build(60, 60);
         // One row grows by eight bytes. Every cell below it is now misaligned with the offsets
         // `fill_leaf` chose, and compaction makes that visible in all of them at once.
         widened.update_row_with_len(0, 1, VALUE_LEN + 8);
-        let (_, changed_width, _) = compaction_cost(widened);
+        let (_, changed_width, _, _) = compaction_cost(widened);
 
         println!(
             "compaction delta: {equal_width} B equal-width vs {changed_width} B after a width change"
