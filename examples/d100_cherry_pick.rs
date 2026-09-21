@@ -10,8 +10,11 @@
 //!   AXIS 2b: THE SAME as axis 2 against a log with no by-cell index, so axis 2's slope has
 //!            something to be compared against rather than being read on its own.
 //!
-//! Axis 2 is the control for axis 1. If per-pick cost is flat in the log size, the index is doing
-//! the work the design claims; if it rises, the pick is scanning something.
+//! Axis 2 is the control for axis 1. **Read it against axis 2b and never on its own**: axis 2's
+//! per-pick cost is not flat in the log size (5.16x across 100x, measured), so "it rose, therefore
+//! the pick is scanning" is not a reading this harness supports. What separates the two
+//! hypotheses is the gap to the unindexed arm over the same range — 5.16x against 41.2x. The
+//! residual rise in axis 2 is real and its cause is not established here.
 //!
 //! Every reported number is wall time from `std::time::Instant`, median over the reps named in
 //! the output. Two columns are reported and they are not the same measurement:
@@ -140,6 +143,28 @@ fn sel_row(sel: &[OpSelector]) -> RowId {
     RowId((sel[0].seq - 1) / 2)
 }
 
+/// `k` picked ops spread EVENLY over the table, which axis 2 and axis 2b both select with.
+///
+/// **Not `s[..k]`, and that is the whole reason axis 2b is worth running.** `ScanCherryLog`
+/// answers `ops_on_cell` with a `find` over `cells` in row order, so picking the FIRST `k` rows
+/// terminates every scan within `k` comparisons *no matter how long the log is*. The unindexed
+/// arm then costs the same at 1e3 and at 1e5 log ops, and the A/B that exists to show what the
+/// index buys measures nothing at all.
+///
+/// Measured with `s[..100]`, at 100,000 log ops: the "scanning" arm came in at **50.375 us**
+/// against the indexed arm's **52.250 us** — the scan the arm was built to expose was never
+/// performed, and the harness's own "N x FASTER" line was reading noise. This is the same defect
+/// as the refusal arm's: a fixture whose stated premise does not hold, in a detector that had
+/// only ever been observed quiet.
+///
+/// Striding puts the average matched cell in the middle of the list, so the scan's cost is
+/// proportional to the log size — which is the thing the arm claims to show. Both arms select
+/// identically, so the A/B still isolates exactly one variable.
+fn spread(s: &[u64], k: usize) -> Vec<OpSelector> {
+    let stride = (s.len() / k).max(1);
+    s.iter().step_by(stride).take(k).copied().map(OpSelector::new).collect()
+}
+
 fn median(mut us: Vec<f64>) -> f64 {
     us.sort_by(|a, b| a.partial_cmp(b).unwrap());
     us[us.len() / 2]
@@ -245,6 +270,15 @@ fn main() {
     // The control. A pick that scanned the log would rise here; one that reads the by-cell key
     // should be flat, because the number of entries on any one cell does not change with the
     // log's size.
+    //
+    // **It is not flat, and the number is reported rather than explained.** With the strided
+    // selection this arm measures 0.3588 -> 1.8521 us per pick across 100x the log, a 5.16x
+    // rise. That is not the scan signature — axis 2b rises 41.2x over the same range — but it is
+    // not the constant the paragraph above predicts either. The `ops_on_cell` key is a
+    // `BTreeMap` whose depth and cache behaviour both move with the number of distinct cells,
+    // and this harness does not separate those from the lookup itself, so the cause is UNVERIFIED
+    // and stated as open. Reading "it rose, therefore the pick is scanning" off this arm alone
+    // would be wrong.
     println!();
     println!("AXIS 2 — log size, picked held at 100  [THE CONTROL FOR AXIS 1]");
     println!(
@@ -254,7 +288,7 @@ fn main() {
     let mut axis2: Vec<(usize, f64)> = Vec::new();
     for &rows in &[500usize, 5_000, 50_000] {
         let (l, b, s, _) = build(rows);
-        let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
+        let sel = spread(&s, 100);
         let (whole, plan) = measure(&l, &sel, &b, 201);
         println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
         axis2.push((2 * rows, plan));
@@ -275,6 +309,10 @@ fn main() {
     // Same process, same machine, same selection, same `op_at`. The ONLY difference is that
     // `ops_on_cell` scans instead of being keyed. A detector that has only ever been observed
     // quiet is not a clean result — this is the arm that makes it fire.
+    //
+    // It only fires because the selection is STRIDED across the table; see `spread`. Picking the
+    // first 100 rows, which is what this did originally, bounds every scan at 100 comparisons
+    // and makes this arm a copy of axis 2 wearing a different name.
     println!();
     println!("AXIS 2b — THE SAME AXIS WITH NO BY-CELL INDEX (ops_on_cell scans)");
     println!(
@@ -285,7 +323,7 @@ fn main() {
     for &rows in &[500usize, 5_000, 50_000] {
         let (l, b, s, cells) = build(rows);
         let scan = ScanCherryLog { inner: l, cells };
-        let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
+        let sel = spread(&s, 100); // the SAME selection axis 2 used, so one variable differs
         let (whole, plan) = measure(&scan, &sel, &b, 201);
         println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
         axis2b.push((2 * rows, plan));
