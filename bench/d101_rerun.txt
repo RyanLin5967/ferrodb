@@ -1,0 +1,23 @@
+================================================================================
+D101 RE-RUN — the five harnesses, on the runtime they build.
+[HERE] 2026-09-21T05:21:29Z  worktree=/Users/idide/wt/ferrodb-D101-stub-runtime-guard  sha=fc443c4
+ACQUIRED d101-rerun  load_at_acquire=27
+CAVEAT: load 27 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=27 beside it and say it is an upper bound.
+⚠ Durations are UPPER BOUNDS. Counters (fsyncs, bytes/fsync) are not.
+================================================================================
+
+#### D68 — merge latency vs TABLE SIZE at fixed delta (banked: bench/d68_merge_is_o_table.txt)
+# load before: 27.65 22.61 23.54
+# cmd: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d68_merge_is_o_table
+D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).
+One thread: no contention, so the slope is the merge's own cost.
+PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.
+
+delta (rows written per branch) = 4
+
+  table    n   total ms | begin ms  writes ms  MERGE ms | merge fsyncs  bytes/fsync
+           merge latency: first 2 = 59.970 ms, last 2 = 154.858 ms  -> 2.58x drift
+           CONTROL writes: first 2 = 30.356 ms, last 2 = 36.569 ms  -> 1.20x drift (this one must stay ~1.0 or the machine moved)
+    1000   25    100.093 |   12.508     36.445    48.008 |         1.12        946.9
