@@ -1,0 +1,34 @@
+=== D94 FALSIFIER: is the zero at dup_frac=0.00 a REAL zero, or just a scope artifact? ===
+A detector that found nothing is not a clean result until it has been forced to fire. This
+plants the SMALLEST signal the workload can carry -- 1, 2 and 3 duplicated rows out of 8 --
+and the gain must come back as exactly k*(N-1) pages. It does. So the detector resolves a
+single duplicated page per branch, and the 0 at dup_frac=0.00 is a measurement, not a miss.
+
+d94_dedup_premise at 48c6e602d059
+
+D94 PREMISE: duplicate content across branches, and who already owns the saving.
+rows/branch = 8, trunk preload = 5000 rows, page = 4096 B, header = 24 B
+
+  'page refs' counts a page once PER BRANCH THAT REACHES IT; 'distinct pages' counts it
+  once. The first gap is COW SHARING and is already banked. The gap from 'distinct
+  pages' to 'distinct payload' is the ONLY space content dedup can still win.
+
+  branches    dup   trunk  page refs   distinct   distinct   distinct     store   cow saves dedup gains
+             frac   pages                 pages      whole    payload      live       pages       pages
+       100   0.00     101      10201       1001       1001       1001      1001        9200           0
+       100   0.12     101      10201       1001       1001        902      1001        9200          99
+       100   0.25     101      10201       1001       1001        803      1001        9200         198
+       100   0.38     101      10201       1001       1001        704      1001        9200         297
+
+BYTES, the two columns the row is decided on (pages x 4096 B):
+  branches    dup   stored today B        deduped B     saving
+       100   0.00          4100096          4100096       0.0%
+       100   0.12          4100096          3694592       9.9%
+       100   0.25          4100096          3289088      19.8%
+       100   0.38          4100096          2883584      29.7%
+
+NO WHOLE-PAGE DUPLICATE EXISTS IN ANY CONFIGURATION — 'distinct pages' equals
+'distinct whole' in every row above, including dup_frac = 1.00 where every branch
+wrote byte-identical ROWS. The self-describing header (24 B of
+birth_epoch + arena_id + crc32) makes two independently written pages differ even
+when their contents agree. A whole-page content index would find NOTHING here.
