@@ -12,6 +12,20 @@ weekly rate limit mid-run and a fleet watchdog quarantine-committed the residue.
   nothing touches the guard's seams (`dispatch.rs`, `session.rs`, `pgwire/mod.rs`).
 - **Do NOT merge or push.** Not authorised for this task.
 
+### At merge time, one stale comment to delete
+
+`08e0ec2` adds this above `reader_thread` in `examples/d68_merge_is_o_table.rs`:
+
+> RETAINED DELIBERATELY THOUGH CURRENTLY UNCALLED … It also contains the exact defect that re-run
+> exists to fix: `Session::new()` below builds its OWN `AgentRuntime` with `storage: None` …
+> OWNER: the D101 stub-runtime row.
+
+**That comment is already false on this branch** — `fc443c4` changed that very line to
+`s.ctx.session()`. Keep the `#[allow(dead_code)]` (the function is still uncalled) and delete the
+sentence claiming the defect is present, or the next reader will go looking for a fixed bug.
+Main also deletes `WARMUP`/`MEASURE`/`POINTS` from the same file; this branch does not touch them,
+so that hunk applies cleanly.
+
 ## Done and committed
 
 | commit | what |
