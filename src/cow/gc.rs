@@ -971,6 +971,79 @@ mod tests {
         assert_eq!(stats.reclaimed, 0, "the real collector must take none of them");
     }
 
+    /// The third bullet of the safety argument, which was asserted in prose and nowhere else:
+    /// a branch's root pointer **swapped during the mark** must not cost it the pages the old
+    /// root reached.
+    ///
+    /// This is the case shadow paging makes subtle. The new root shares every unchanged subtree
+    /// with the old one page-identically, so those pages are protected only if the mark reached
+    /// them through the root it snapshotted. If the cycle read roots lazily instead of
+    /// snapshotting them, it would walk the NEW tree and free everything the write replaced that
+    /// the old root still needs.
+    #[test]
+    fn a_root_swapped_during_the_mark_keeps_the_pages_the_old_root_reached() {
+        let env = Env::new("rootswap");
+        let old_root = env.grow_tree(BranchId::TRUNK, 400);
+
+        // Fork a child FIRST, so the trunk's pages stop being private to it. Without this the
+        // trunk mutates its own pages in place and the root never moves at all — `cow_page`
+        // returns `copied == false` for a page born after the branch's own privacy barrier, so a
+        // childless trunk rewriting 200 keys ends on the SAME root. That is the D31 fast path
+        // working, and it silently made the first version of this test vacuous: it asserted a
+        // root swap that had not happened.
+        let child = env.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        let child_id = child.branch_id;
+
+        let mut cycle = GcCycle::open(env.cat(), env.store.as_ref()).unwrap();
+        cycle.step(env.store.as_ref(), env.store.as_ref(), 2).unwrap();
+        assert!(!cycle.is_done(), "the mark must still be in flight for this to be the case");
+
+        // Overwrite a large slice of the tree and publish a new root, mid-mark.
+        let mut root = old_root;
+        for i in 0..200u32 {
+            let e = env.catalog.next_epoch();
+            let k = format!("k{:06}", i);
+            let v = format!("REWRITTEN{:06}", i);
+            root = env.tree.insert(root, BranchId::TRUNK, e, k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        env.catalog.set_root(BranchId::TRUNK, root).unwrap();
+        assert_ne!(
+            root, old_root,
+            "the write must actually have moved the root, or this test proves nothing"
+        );
+        // The child still points at the old root, which is what makes those pages genuinely
+        // still-live rather than merely unreferenced garbage the sweep happens to miss.
+        assert_eq!(env.catalog.get(child_id).unwrap().root_page_id, old_root);
+
+        let stats =
+            cycle.run_to_completion(env.store.as_ref(), env.store.as_ref(), 64, 200_000).unwrap();
+
+        assert_eq!(
+            stats.reclaimed, 0,
+            "collected {} pages across a root swap: {:?}",
+            stats.reclaimed, stats
+        );
+
+        // The NEW tree reads correctly...
+        for i in 0..400u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                env.tree.get(root, k.as_bytes()).unwrap().is_some(),
+                "new root lost {}",
+                k
+            );
+        }
+        // ...and so does the OLD one, which is the half a lazy root read would have broken.
+        for i in 0..400u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                env.tree.get(old_root, k.as_bytes()).unwrap().is_some(),
+                "old root lost {} — the snapshot did not protect what it reached",
+                k
+            );
+        }
+    }
+
     // ---- pause and interference --------------------------------------------------------------
 
     /// The pause bound, stated exactly: **no slice touches more than `budget` pages**, on either
@@ -1105,16 +1178,66 @@ mod tests {
         const REACHABLE_KEYS: u32 = 2_000;
         const BUDGET: u64 = 64;
 
+        // Wall-clock budget. The plant phase, not the collection, is what costs: this box runs a
+        // ten-agent fleet and the 10k row's plant was measured at 0.90 s on a quiet machine and
+        // 41.4 s on a loaded one, a 46x spread. A row that cannot start inside the budget is
+        // declined in the file rather than discovered by a SIGKILL.
+        const WALL_BUDGET_S: f64 = 2_100.0;
+
         let tmp = std::env::temp_dir();
         let mut rows: Vec<String> = Vec::new();
-        let mut refused_at: Option<u32> = None;
+        let mut refused_at: Option<(u32, &str)> = None;
+        let t_start = Instant::now();
+
+        // **The file is opened and its header written BEFORE the first row, and every row is
+        // flushed as it lands.** The first version of this harness built the whole file at the
+        // end, so the run that was killed part-way through the 10^6 row banked nothing at all —
+        // including the two rows it had already earned. A measurement that survives only if the
+        // largest point completes is not a curve, it is a single fragile reading.
+        let mut f = std::fs::File::create("bench/d96_chunk_gc.txt").unwrap();
+        writeln!(f, "D96 — REACHABILITY GC AT PAGE GRANULARITY: THE PAUSE CURVE.").unwrap();
+        writeln!(f, "[HERE] {}", crate::build_provenance()).unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            "⚠ MEASURED ON A LOADED BOX: a ten-agent fleet was building and testing concurrently."
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "max_slice_ns is therefore a CEILING under contention, not a quiet-machine figure. The"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "claim it is asked to support is a SLOPE across the chunk axis, and load inflates every"
+        )
+        .unwrap();
+        writeln!(f, "row rather than tilting the axis, so the slope survives what the level does not.")
+            .unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            "     chunks     arenas  max_slice_ns  snapshot_ns  max_pages       slices   cycle_s   plant_s   bytes_recl"
+        )
+        .unwrap();
+        f.flush().unwrap();
 
         for n in [10_000u32, 100_000, 1_000_000] {
             let need = (n as u64 + 4_096) * PAGE_SIZE as u64;
             let free = free_bytes(&tmp);
             if free.saturating_sub(need) < DISK_FLOOR_BYTES {
-                refused_at = Some(n);
+                refused_at = Some((n, "disk floor"));
                 break;
+            }
+            // Project this row off the last one's measured plant rate rather than a guess.
+            let elapsed = t_start.elapsed().as_secs_f64();
+            if elapsed > 0.0 && !rows.is_empty() {
+                let projected = elapsed * (n as f64 / 10_000.0f64.max(1.0));
+                if elapsed + projected > WALL_BUDGET_S {
+                    refused_at = Some((n, "wall-clock budget"));
+                    break;
+                }
             }
 
             let env = Env::new(&format!("curve{}", n));
@@ -1159,12 +1282,12 @@ mod tests {
                 plant_s,
                 bytes
             ));
+            // Banked immediately, so a kill after this point cannot take the row with it.
+            writeln!(f, "{}", rows.last().unwrap()).unwrap();
+            f.flush().unwrap();
             println!("{}", rows.last().unwrap());
         }
 
-        let mut f = std::fs::File::create("bench/d96_chunk_gc.txt").unwrap();
-        writeln!(f, "D96 — REACHABILITY GC AT PAGE GRANULARITY: THE PAUSE CURVE.").unwrap();
-        writeln!(f, "[HERE] {}", crate::build_provenance()).unwrap();
         writeln!(f).unwrap();
         writeln!(
             f,
@@ -1249,24 +1372,27 @@ mod tests {
         .unwrap();
         writeln!(f, "be confounded with a growing heap. Slice budget {}.", BUDGET).unwrap();
         writeln!(f).unwrap();
-        writeln!(
-            f,
-            "     chunks     arenas  max_slice_ns  snapshot_ns  max_pages       slices   cycle_s   plant_s   bytes_recl"
-        )
-        .unwrap();
-        for r in &rows {
-            writeln!(f, "{}", r).unwrap();
-        }
-        writeln!(f).unwrap();
-        if let Some(n) = refused_at {
+        if let Some((n, why)) = refused_at {
+            writeln!(f, "REFUSED at chunks={}: {}.", n, why).unwrap();
             writeln!(
                 f,
-                "REFUSED at chunks={}: free space would have fallen below the {} GiB floor.",
-                n,
-                DISK_FLOOR_BYTES / (1024 * 1024 * 1024)
+                "  disk floor = {} GiB free; wall-clock budget = {} s.",
+                DISK_FLOOR_BYTES / (1024 * 1024 * 1024),
+                WALL_BUDGET_S as u64
             )
             .unwrap();
-            writeln!(f, "The stopping point IS the result for that row; it is not a pass.").unwrap();
+            writeln!(
+                f,
+                "The stopping point IS the result for that row. It is NOT a pass, and the rows"
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "above do not become a 10^6 result by sitting next to a refusal for 10^6."
+            )
+            .unwrap();
+        } else {
+            writeln!(f, "Every row in the axis completed; nothing was refused.").unwrap();
         }
         writeln!(f).unwrap();
         writeln!(
