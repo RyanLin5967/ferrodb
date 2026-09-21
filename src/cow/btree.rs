@@ -335,16 +335,33 @@ impl CowTree {
         }
         let cp = self.store.cow_page(leaf_id, branch, epoch)?;
         let new_leaf = cp.page_id;
-        {
+        let emptied = {
             let mut f = cp.handle.write();
             let mut n = NodeMut::new(&mut f.data);
             let found = n.view().search(key)?;
             if let Ok(i) = found {
                 n.remove_at(i)?;
             }
+            let emptied = n.count() == 0;
             stamp_checksum(&mut f.data);
-        }
+            emptied
+        };
         drop(cp);
+        // A leaf whose last entry has just left has to leave the tree with it.
+        //
+        // Leaving it linked is not merely untidy: with content-defined boundaries
+        // (`cow::chunker`) the leaf partition is supposed to be a function of the rows, and an
+        // empty leaf is a leaf the rows do not justify. Measured before this fix, 500 rows
+        // reached by deleting half of 1000 carried 20 empty leaves whose live entries matched an
+        // insert-only tree byte for byte, so the two agreed on every row and disagreed on
+        // `cow::cid::leaf_partition_cid` — a false difference, reported by the one comparison
+        // that is supposed to be exact across lineages.
+        //
+        // The root is the exception: an empty root leaf IS the empty tree, and is what
+        // [`CowTree::create`] hands out.
+        if emptied && !path.is_empty() {
+            return self.unlink_up(root, path, new_leaf, branch, epoch);
+        }
         self.relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch)
     }
 
@@ -675,6 +692,86 @@ impl CowTree {
             return Ok(root);
         }
         Ok(child_new)
+    }
+
+    /// Drop `doomed` out of the tree, cascading while its removal leaves a parent with no children
+    /// at all, then relink the rest of the path normally. Returns the new root.
+    ///
+    /// # When a parent can become childless, stated exactly
+    ///
+    /// An internal node holds a leftmost child plus `count` (separator, child) slots, so it has
+    /// `count + 1` children and there is no encoding for "no leftmost". Removing a **slotted**
+    /// child therefore always leaves the leftmost behind and the parent survives. The node becomes
+    /// childless in exactly one case: the child removed was the **leftmost** and `count == 0`, so
+    /// it was the only one. That single case is the whole cascade condition, and it is why this
+    /// loop terminates in tree depth rather than needing a rebalance.
+    ///
+    /// Removing the leftmost when `count > 0` is the one fiddly step: the next child is promoted
+    /// into the leftmost field and *its* separator goes with it, because a separator is the lower
+    /// bound of the child to its right and the leftmost child has no lower bound.
+    ///
+    /// # Ordering
+    ///
+    /// Each page is freed **after** its parent has stopped pointing at it, never before.
+    /// `free_page` can hand a page straight back to the free space map, so freeing first would
+    /// leave a live parent pointing at a page an allocator may already have reissued.
+    ///
+    /// This does **not** merge half-empty siblings and does not collapse a root left with a single
+    /// child, so a tree that has had a lot deleted from it can keep a level it no longer needs.
+    /// Both are rebalancing, both need sibling access this layout deliberately does not have (see
+    /// `cow::node`'s header), and neither is required for the partition to be a function of the
+    /// rows — which is what this is for.
+    fn unlink_up(
+        &self,
+        root: PageId,
+        mut path: DescentPath,
+        mut doomed: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+    ) -> Result<PageId, FerroError> {
+        loop {
+            let Some((parent_id, slot)) = path.pop() else {
+                // Cascaded past the root: every page is gone, so the tree is the empty tree.
+                self.store.free_page(doomed, epoch)?;
+                return self.create(branch, epoch);
+            };
+
+            let cp = self.store.cow_page(parent_id, branch, epoch)?;
+            let new_parent = cp.page_id;
+            let childless = {
+                let mut f = cp.handle.write();
+                let mut n = NodeMut::new(&mut f.data);
+                let childless = match slot {
+                    Some(i) => {
+                        // The cell at `i` carries both the separator and the child pointer, so one
+                        // removal takes both. The leftmost is untouched, so a child remains.
+                        n.remove_at(i)?;
+                        false
+                    }
+                    None if n.count() == 0 => true,
+                    None => {
+                        let promoted = n.view().child(0)?;
+                        n.set_leftmost(promoted);
+                        n.remove_at(0)?;
+                        false
+                    }
+                };
+                stamp_checksum(&mut f.data);
+                childless
+            };
+            drop(cp);
+
+            // Nothing points at it now.
+            self.store.free_page(doomed, epoch)?;
+
+            if childless {
+                doomed = new_parent;
+                continue;
+            }
+            // The parent survived but was copied, so its own parent still has to be repointed.
+            // With an empty path this returns `new_parent`, which is then the new root.
+            return self.relink_up(root, path, parent_id, new_parent, Vec::new(), branch, epoch);
+        }
     }
 }
 
@@ -1124,5 +1221,221 @@ mod diff_tests {
             .collect();
         assert_eq!(got, edited, "scattered edits were dropped, duplicated or reordered");
         assert!(d.deltas.iter().all(|(_, b, a)| b.is_some() && a.as_deref() == Some(b"E")));
+    }
+}
+
+#[cfg(test)]
+mod delete_unlink_tests {
+    use super::*;
+    use crate::branch::arena::ArenaPageStore;
+    use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::BranchCatalog;
+    use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::storage::disk_manager::DiskManager;
+
+    const ARENA_BASE: u32 = 1024;
+
+    fn tree() -> (tempfile::TempDir, Arc<LogBranchCatalog>, CowTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("unlink.db"))
+            .unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(dm));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(
+            ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, ARENA_BASE)
+                .unwrap(),
+        );
+        let t = CowTree::new(store as Arc<dyn PageStore>);
+        (dir, catalog, t)
+    }
+
+    fn k(n: u32) -> Vec<u8> {
+        n.to_be_bytes().to_vec()
+    }
+
+    fn filled(t: &CowTree, cat: &LogBranchCatalog, n: u32) -> PageId {
+        let e = cat.next_epoch();
+        let mut root = t.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..n {
+            root = t.insert(root, BranchId::TRUNK, e, &k(i), format!("v{i}").as_bytes()).unwrap();
+        }
+        root
+    }
+
+    /// Entry counts of every leaf reachable from `root`, in key order.
+    fn leaf_sizes(t: &CowTree, root: PageId) -> Vec<usize> {
+        fn go(t: &CowTree, pid: PageId, depth: usize, out: &mut Vec<usize>) {
+            assert!(depth <= MAX_DESCENT, "cycle while walking leaves");
+            let h = t.store.read_page(pid).unwrap();
+            let f = h.read();
+            let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+            let n = Node::new(&f.data);
+            if ty == PageType::BTreeLeaf {
+                out.push(n.count());
+            } else {
+                let kids = n.all_children().unwrap();
+                drop(f);
+                drop(h);
+                for c in kids {
+                    go(t, c, depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(t, root, 0, &mut out);
+        out
+    }
+
+    /// **The property the unlink exists for.** An emptied leaf must leave the tree rather than
+    /// stay linked holding nothing.
+    ///
+    /// Non-vacuous by construction: the fixture is asserted to be multi-leaf first, because a
+    /// single-leaf tree is the one case where an emptied leaf legitimately stays (it is the root).
+    #[test]
+    fn an_emptied_leaf_is_unlinked_rather_than_left_in_the_tree() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 1000);
+        let before = leaf_sizes(&t, root);
+        assert!(before.len() > 4, "tree is {} leaves; the claim would be vacuous", before.len());
+        assert!(before.iter().all(|n| *n > 0), "fixture already had an empty leaf");
+
+        // Delete a contiguous run big enough to empty whole leaves several times over.
+        let e = cat.next_epoch();
+        for i in 0..600u32 {
+            root = t.delete(root, BranchId::TRUNK, e, &k(i)).unwrap();
+        }
+
+        let after = leaf_sizes(&t, root);
+        assert!(
+            after.iter().all(|n| *n > 0),
+            "{} of {} leaves are empty after deleting 600 keys: {:?}",
+            after.iter().filter(|n| **n == 0).count(),
+            after.len(),
+            after
+        );
+        assert!(after.len() < before.len(), "no leaf was actually unlinked ({} -> {})", before.len(), after.len());
+    }
+
+    /// The anti-corruption guard, and the one that matters most: unlinking must not lose, reorder
+    /// or resurrect a row. Deletes a scattered half so the removals hit leftmost children,
+    /// slotted children and whole subtrees rather than one shape.
+    #[test]
+    fn every_surviving_key_is_still_readable_after_scattered_deletion() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 1000);
+        let e = cat.next_epoch();
+
+        let doomed: Vec<u32> = (0..1000).filter(|i| i % 3 != 0).collect();
+        for &i in &doomed {
+            root = t.delete(root, BranchId::TRUNK, e, &k(i)).unwrap();
+        }
+
+        for i in 0..1000u32 {
+            let got = t.get(root, &k(i)).unwrap();
+            if i % 3 == 0 {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(format!("v{i}").as_bytes()),
+                    "survivor {i} is gone or wrong after deleting around it"
+                );
+            } else {
+                assert_eq!(got, None, "deleted key {i} is still readable");
+            }
+        }
+
+        // And in order, through the cursor rather than by point lookup — a broken separator shows
+        // up here and not above.
+        let scanned: Vec<u32> = t
+            .range_scan(root, None, None)
+            .unwrap()
+            .map(|r| u32::from_be_bytes(r.unwrap().0.try_into().unwrap()))
+            .collect();
+        assert_eq!(scanned, (0..1000).filter(|i| i % 3 == 0).collect::<Vec<u32>>());
+    }
+
+    /// Emptying the FIRST leaf takes the leftmost-child path, where the successor is promoted into
+    /// the leftmost field and its separator goes with it. That branch has no other coverage.
+    #[test]
+    fn emptying_the_leftmost_leaf_promotes_its_successor() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 1000);
+        let first_leaf_size = leaf_sizes(&t, root)[0];
+        let before = leaf_sizes(&t, root).len();
+        assert!(before > 2, "need a multi-leaf tree");
+
+        let e = cat.next_epoch();
+        for i in 0..first_leaf_size as u32 {
+            root = t.delete(root, BranchId::TRUNK, e, &k(i)).unwrap();
+        }
+
+        let after = leaf_sizes(&t, root);
+        assert!(after.iter().all(|n| *n > 0), "leftmost unlink left an empty leaf: {after:?}");
+        assert_eq!(after.len(), before - 1, "exactly the first leaf should have gone");
+        // The smallest surviving key must now be the first one past the old leaf.
+        let lowest = t.range_scan(root, None, None).unwrap().next().unwrap().unwrap().0;
+        assert_eq!(lowest, k(first_leaf_size as u32), "the promoted leftmost is wrong");
+    }
+
+    /// Cascading all the way past the root: every page goes, and what is left is a usable empty
+    /// tree rather than a dangling root.
+    #[test]
+    fn deleting_every_key_leaves_a_usable_empty_tree() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 1000);
+        let e = cat.next_epoch();
+        for i in 0..1000u32 {
+            root = t.delete(root, BranchId::TRUNK, e, &k(i)).unwrap();
+        }
+
+        assert_eq!(leaf_sizes(&t, root), vec![0], "an emptied tree must be exactly one empty leaf");
+        assert_eq!(t.walk_pages(root).unwrap().len(), 1, "the emptied tree still holds interior pages");
+        assert_eq!(t.get(root, &k(0)).unwrap(), None);
+        assert_eq!(t.range_scan(root, None, None).unwrap().count(), 0);
+
+        // And it still works: the empty tree is a real tree, not a tombstone.
+        let e2 = cat.next_epoch();
+        let root = t.insert(root, BranchId::TRUNK, e2, &k(42), b"back").unwrap();
+        assert_eq!(t.get(root, &k(42)).unwrap().as_deref(), Some(&b"back"[..]));
+    }
+
+    /// Unlinking must hand the pages back, not merely stop pointing at them. Without the
+    /// `free_page` calls this passes the partition tests and leaks every emptied leaf.
+    #[test]
+    fn unlinked_pages_are_freed_rather_than_leaked() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 1000);
+        let before = t.store.live_page_count().unwrap();
+        assert!(before > 8, "only {before} live pages; the measurement would be vacuous");
+
+        let e = cat.next_epoch();
+        for i in 0..1000u32 {
+            root = t.delete(root, BranchId::TRUNK, e, &k(i)).unwrap();
+        }
+        let after = t.store.live_page_count().unwrap();
+
+        println!("    live pages: {before} -> {after} after deleting every key");
+        assert!(
+            after < before,
+            "live pages did not drop ({before} -> {after}); unlinked pages are being leaked"
+        );
+    }
+
+    /// A delete that hits nothing must still shadow nothing — the unlink path must not fire on a
+    /// miss and must not be reached by one.
+    #[test]
+    fn deleting_an_absent_key_changes_nothing() {
+        let (_d, cat, t) = tree();
+        let root = filled(&t, &cat, 500);
+        let pages = t.walk_pages(root).unwrap();
+        let e = cat.next_epoch();
+        let same = t.delete(root, BranchId::TRUNK, e, &k(9999)).unwrap();
+        assert_eq!(same, root, "a miss shadowed the tree");
+        assert_eq!(t.walk_pages(same).unwrap(), pages, "a miss changed the page set");
     }
 }
