@@ -149,6 +149,12 @@ struct Row {
     shadow: u64,
     shadow_bytes: u64,
     live_delta: i64,
+    /// Bytes the cycle's shadow pages encode to as deltas against their bases, summed — the real
+    /// end-to-end version of D93's 211 B, taken over pages the engine actually produced rather
+    /// than over a fixture built for the encoder.
+    delta_bytes: usize,
+    /// Shadow pages whose delta was REFUSED because it did not beat the page it encodes.
+    refused: usize,
 }
 
 /// One fork / update `r` scattered rows / merge, with the census bracketing exactly that.
@@ -156,6 +162,7 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Row> {
     s.bp.flush_all().unwrap();
     reset_cow_path_census();
     let live0 = s.store.live_page_count().unwrap_or(0) as i64;
+    let shadows0: std::collections::HashSet<u32> = s.store.shadow_pages().into_iter().collect();
 
     // `with_runtime`, never `Session::new()` — D90's header records that the latter builds its own
     // storage-less runtime and measures a stub while looking like it worked.
@@ -202,6 +209,27 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Row> {
     let live1 = s.store.live_page_count().unwrap_or(0) as i64;
     let _ = branch;
 
+    // **What the pages this cycle shadowed would cost as deltas against their bases.** Read after
+    // the merge and after the flush, so the pages hold what the merge left in them rather than
+    // what `cow_page` copied into them. `delta_against_base` applies both bounds and answers
+    // `None` when a whole page must be stored, so `refused` is not an error column — it is the
+    // budget rule working.
+    let mut delta_bytes = 0usize;
+    let mut refused = 0usize;
+    for page in s.store.shadow_pages() {
+        if shadows0.contains(&page) {
+            continue;
+        }
+        match s.store.delta_against_base(page) {
+            Ok(Some(d)) => delta_bytes += d.encoded_len(),
+            Ok(None) => refused += 1,
+            Err(e) => {
+                eprintln!("  r={r}: delta_against_base({page}) failed: {e}. Refusing to report.");
+                return None;
+            }
+        }
+    }
+
     // ---- ANTI-VACUITY: the merge must have actually moved the rows, read after the counters ----
     let last_i = r - 1;
     let check_id = 1 + (last_i * 7919) % nrows;
@@ -229,7 +257,15 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Row> {
         }
     }
 
-    Some(Row { r, in_place, shadow, shadow_bytes, live_delta: live1 - live0 })
+    Some(Row {
+        r,
+        in_place,
+        shadow,
+        shadow_bytes,
+        live_delta: live1 - live0,
+        delta_bytes,
+        refused,
+    })
 }
 
 fn main() {
@@ -290,11 +326,27 @@ fn main() {
     }
 
     println!();
-    println!("       r | cow in-place |  cow SHADOW | shadow payload B | live pages delta");
+    println!(
+        "       r | cow in-place |  cow SHADOW | shadow payload B | live pg | DELTA B | refused \
+         | copied/delta"
+    );
+    println!(
+        "         the SHADOW column is the one a delta encoder is aimed at: each of those copies \
+         4072 B."
+    );
+    println!(
+        "         DELTA B is what those same pages encode to against their bases, after the merge."
+    );
     for c in &rows {
+        let ratio = if c.delta_bytes > 0 {
+            format!("{:.1}x", c.shadow_bytes as f64 / c.delta_bytes as f64)
+        } else {
+            "-".to_string()
+        };
         println!(
-            "  {:6} | {:12} | {:11} | {:16} | {:+16}",
-            c.r, c.in_place, c.shadow, c.shadow_bytes, c.live_delta
+            "  {:6} | {:12} | {:11} | {:16} | {:+7} | {:7} | {:7} | {:>12}",
+            c.r, c.in_place, c.shadow, c.shadow_bytes, c.live_delta, c.delta_bytes, c.refused,
+            ratio
         );
     }
 
@@ -321,6 +373,22 @@ fn main() {
             println!("  ⇒ The copying arm is reached and scales with r. This is the target a delta");
             println!("    encoder is aimed at, and shadow payload B is the budget it competes with.");
         }
+        let copied: u64 = rows.iter().map(|c| c.shadow_bytes).sum();
+        let deltas: usize = rows.iter().map(|c| c.delta_bytes).sum();
+        let refused: usize = rows.iter().map(|c| c.refused).sum();
+        println!();
+        println!("  Those {total_shadow} copies moved {copied} B of payload. As deltas against their");
+        println!("  bases they encode to {deltas} B, with {refused} refused for exceeding the budget.");
+        if deltas > 0 {
+            println!("  ⇒ {:.1}x less, measured on pages the engine really produced.", copied as f64 / deltas as f64);
+        }
+        println!();
+        println!("  ⚠ THAT RATIO IS OCCUPANCY, NOT BYTES STORED, AND THE TWO ARE NOT THE SAME HERE.");
+        println!("    Each shadow above is ONE page, and one page is the smallest thing DiskManager");
+        println!("    writes. D90's headline is `distinct pages x 4096 + WAL`, so a page whose useful");
+        println!("    content shrinks from 4072 B to a few hundred still costs 4096 B and still");
+        println!("    counts as one page. Occupancy becomes stored bytes only when several logical");
+        println!("    pages share one physical page. Do not report the ratio above as a D90 result.");
     }
 
     let _ = std::fs::remove_dir_all(&dir);

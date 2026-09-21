@@ -78,12 +78,34 @@
 //! at the point where `cow_page`'s full-payload `copy_from_slice` currently throws away
 //! information the writer was holding. The claim worth defending is a measurement, not an idea.
 //!
-//! # Scope: this is the mechanism, not yet the write path
+//! # Scope: what is on the write path, and what is still only measured here
 //!
-//! [`DeltaStore`] is a self-contained store used to encode, bound and measure the mechanism. It is
-//! deliberately **not** wired into `ArenaPageStore::cow_page`: doing that edits files this change
-//! does not own. What is established here is the encoding, the two bounds, and the slope. What is
-//! not established here is behaviour under the real buffer pool, checksums, or the reaper.
+//! **D102 corrected the paragraph that used to sit here.** It said this module was "deliberately
+//! not wired into `ArenaPageStore::cow_page`", and that stayed true long enough to become the
+//! problem: nothing in the crate called this file, so every property below was a property of a
+//! fixture. Two pieces were missing and are now present.
+//!
+//! * A **wire format** — [`PageDelta::encode_to`] and [`PageDelta::decode`]. Without one a delta
+//!   could be computed but never stored, so no write path could have used it whatever else was
+//!   true.
+//! * The **base**. A delta is meaningless without the page it is taken against, and `cow_page`
+//!   was discarding that: the identity of the shadowed page left only as
+//!   `CowPage::previous_page_id`, which the caller consumes to relink a parent and then drops.
+//!   [`crate::branch::arena::ArenaPageStore`] now records it, enforces [`MAX_CHAIN_DEPTH`] at
+//!   write time while recording it, and exposes
+//!   [`crate::branch::arena::ArenaPageStore::delta_against_base`], which encodes a shadow against
+//!   its base and refuses — stores a whole page — when the delta does not beat the page.
+//!
+//! **What is still NOT established, stated so it is not mistaken for done.** The delta is computed
+//! over real arena pages, but `cow_page` still writes a whole page. Making the *stored* bytes the
+//! delta needs a hook at write-back, and there is not one: the buffer pool decides when a dirty
+//! frame reaches disk, `PageStore::flush` has no caller outside tests, and `DiskManager::write`
+//! writes 4096 bytes whatever it is given. So the saving this module measures is a saving in page
+//! OCCUPANCY, and occupancy becomes stored bytes only once several logical pages can share one
+//! physical page. `examples/d102_cow_census.rs` measures both and prints the distinction; D90's
+//! headline is `distinct pages x 4096 + WAL` and therefore cannot see an intra-page saving at all.
+//! Do not quote [`DeltaStore`]'s own sweep as an engine-level result: that store has no buffer
+//! pool, no checksums and no reaper, and it models the encoding, not ferrodb.
 
 use std::collections::HashMap;
 

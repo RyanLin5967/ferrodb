@@ -1,0 +1,74 @@
+D102 — WHICH ARM OF cow_page DOES AN AGENT MERGE TAKE, AND WHAT WOULD IT ENCODE TO?
+Harness: examples/d102_cow_census.rs. Measured at 7361e1f (the D102 commit), on a
+20,000-row table, r = rows changed, swept 1 -> 512 by doubling. Each r: fork a branch,
+UPDATE exactly r scattered rows (i -> 1 + i*7919 mod N, injective, D90's scatter), MERGE.
+
+WHY THIS EXISTS
+D93 measured that an intra-page delta makes a four-row agent merge cost 211 B instead of
+16,384 B, and the plan that followed was "wire PageDelta into cow_page". That plan rested
+on a premise nobody had measured: that an agent merge reaches the arm of cow_page that
+COPIES a whole page at all. cow_page has two arms and a delta can only shrink one of them.
+
+THESE ARE COUNTERS, NOT TIMINGS, so fleet load does not affect them. The two runs below
+were taken from separately built binaries minutes apart and agree to the byte.
+
+INSTRUMENT
+branch::arena::cow_path_census() — three process-wide integers bumped on the exact two
+lines inside cow_page that choose an arm. DELTA B comes from
+ArenaPageStore::delta_against_base(), which applies BOTH bounds (MAX_CHAIN_DEPTH = 8,
+DELTA_BUDGET = 1018) and answers None when a whole page must be stored instead.
+
+ANTI-VACUITY, and it is proven to fire: every cycle reads its last written row back
+through an ordinary SELECT against the trunk, after the counters are read, and refuses to
+report unless the trunk holds the value the branch wrote. D102_FIRECHECK=1 forks and
+merges while staging nothing; every cycle must then refuse and the process exit non-zero.
+
+⚠ THE HEADLINE RATIO IS OCCUPANCY, NOT BYTES STORED. Each shadow below is ONE page, and
+one page is the smallest thing DiskManager writes. D90's headline is
+`distinct pages x 4096 + WAL`, so a page whose useful content falls from 4072 B to 52 B
+still costs 4096 B and still counts as one page. Occupancy becomes stored bytes only once
+several logical pages can share one physical page. Do not quote this as a D90 result.
+
+RAW OUTPUT FOLLOWS, VERBATIM.
+================================================================================
+D102 — WHICH ARM OF cow_page DOES AN AGENT MERGE TAKE?
+  instrument: branch::arena::cow_path_census(), three counters bumped on the two
+  lines inside cow_page that choose an arm. Counters, not timings.
+
+  shadow > 0  => cow_page copies whole pages here, and a delta encoder has a target.
+  shadow == 0 => this workload never copies a page, and no encoder placed in
+                 cow_page can change one byte of what D90 measures.
+
+table = 20000 rows, fixed. sweep r = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+built; 1 live arena pages
+
+       r | cow in-place |  cow SHADOW | shadow payload B | live pg | DELTA B | refused | copied/delta
+         the SHADOW column is the one a delta encoder is aimed at: each of those copies 4072 B.
+         DELTA B is what those same pages encode to against their bases, after the merge.
+       1 |            0 |           1 |             4072 |      +1 |      52 |       0 |        78.3x
+       2 |            1 |           1 |             4072 |      +1 |      86 |       0 |        47.3x
+       4 |            3 |           1 |             4072 |      +1 |     154 |       0 |        26.4x
+       8 |            7 |           1 |             4072 |      +1 |     290 |       0 |        14.0x
+      16 |           15 |           1 |             4072 |      +3 |      86 |       0 |        47.3x
+      32 |           32 |           1 |             4072 |      +4 |     188 |       0 |        21.7x
+      64 |           64 |           1 |             4072 |      +4 |     323 |       0 |        12.6x
+     128 |          133 |           1 |             4072 |      +9 |     322 |       0 |        12.6x
+     256 |          266 |           1 |             4072 |     +14 |     694 |       0 |         5.9x
+     512 |          541 |           1 |             4072 |     +33 |     217 |       0 |        18.8x
+
+=== VERDICT ===
+  shadow > 0: 10 whole-page copies across 10 merges.
+  ⇒ The copying arm IS reached, but its count is FLAT in r (1 per merge).
+    The saving available is that fixed handful of pages per merge, not a
+    saving that scales with how little changed.
+
+  Those 10 copies moved 40720 B of payload. As deltas against their
+  bases they encode to 2412 B, with 0 refused for exceeding the budget.
+  ⇒ 16.9x less, measured on pages the engine really produced.
+
+  ⚠ THAT RATIO IS OCCUPANCY, NOT BYTES STORED, AND THE TWO ARE NOT THE SAME HERE.
+    Each shadow above is ONE page, and one page is the smallest thing DiskManager
+    writes. D90's headline is `distinct pages x 4096 + WAL`, so a page whose useful
+    content shrinks from 4072 B to a few hundred still costs 4096 B and still
+    counts as one page. Occupancy becomes stored bytes only when several logical
+    pages share one physical page. Do not report the ratio above as a D90 result.

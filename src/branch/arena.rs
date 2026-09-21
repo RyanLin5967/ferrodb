@@ -660,6 +660,14 @@ impl ArenaPageStore {
         self.state.lock().unwrap().shadow_base.get(&shadow).copied()
     }
 
+    /// Every page this store currently knows to be a shadow of another. Ascending, so a harness
+    /// that diffs two calls gets a stable answer.
+    pub fn shadow_pages(&self) -> Vec<PageId> {
+        let mut v: Vec<PageId> = self.state.lock().unwrap().shadow_base.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Encode `shadow`'s CURRENT content as a delta against the page it was shadowed from, or
     /// `None` when a whole page must be stored instead.
     ///
