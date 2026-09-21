@@ -98,7 +98,14 @@ fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<Outcome, String> {
 fn build(dir: &Path, nrows: i64) -> Server {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
-    let disk = DiskManager::new(dir.join("main.db").to_str().unwrap()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.join("main.db"))
+        .unwrap();
+    let disk = DiskManager::new(file).unwrap();
     let bp = Arc::new(BufferPoolManager::new(Arc::new(disk)));
     let catalog = Catalog::create(bp.clone()).unwrap();
     let wal = Arc::new(WalManager::new(dir.join("main.wal")).unwrap());

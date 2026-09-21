@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::branch::delta::{self, PageDelta};
 use crate::branch::record::{ArenaExtent, BranchRecord, PendingFree};
 use crate::branch::types::{
     next_extent_pages, ArenaId, BranchError, BranchId, Epoch, PageId, ARENA_EXTENT_PAGES,
@@ -283,6 +284,21 @@ struct StoreState {
     /// fillable. That is the safe direction: an unfillable extent is still accounted for in
     /// `extents` and still freeable by the reaper, so nothing leaks permanently.
     claim_epoch: HashMap<ArenaId, u64>,
+    /// **D102.** For each page this store produced by SHADOWING another, the page it was shadowed
+    /// from and how many shadows stand between it and a page that was never a shadow.
+    ///
+    /// This is the fact [`crate::branch::delta`] needs and that `cow_page` was throwing away: a
+    /// delta is meaningless without its base, and until now the identity of the base survived only
+    /// as `CowPage::previous_page_id`, which the caller consumes and drops. Recording it is what
+    /// makes a delta against the base expressible at all.
+    ///
+    /// **In memory, and that is a statement about what it is for.** It is not a durable index that
+    /// a read depends on — a read of a delta-encoded page must be able to find its base from the
+    /// page itself, or a lost map would be lost data. It is a write-side cache of the chain depth,
+    /// which is what [`crate::branch::delta::MAX_CHAIN_DEPTH`] is enforced against at write time.
+    /// An entry missing after a restart makes the next shadow of that page a chain ROOT (depth 1)
+    /// rather than a deeper link, which is the safe direction: it can only make chains shorter.
+    shadow_base: HashMap<PageId, (PageId, u8)>,
 }
 
 /// Copy-on-write page store backed by per-branch arenas.
@@ -410,6 +426,7 @@ impl ArenaPageStore {
                 current: HashMap::new(),
                 pending: Vec::new(),
                 claim_epoch: HashMap::new(),
+                shadow_base: HashMap::new(),
             }),
             live_pages: AtomicU32::new(0),
             reserved_pages: AtomicU32::new(0),
@@ -609,6 +626,12 @@ impl ArenaPageStore {
         self.evict(page_id);
         let newly_freed = {
             let mut st = self.state.lock().unwrap();
+            // **D102 — a recycled id must not inherit the base of its previous life.** This id
+            // goes back on the free list and `alloc_in_arena` will hand it out again for something
+            // unrelated; a surviving entry would make that new page read as a delta of a base it
+            // has nothing to do with. Forgotten here rather than at `evict`, because this is the
+            // point at which the id stops naming this page.
+            st.shadow_base.remove(&page_id);
             // If the extent is gone the whole thing was already accounted for by `free_arena`.
             if !st.extents.contains_key(&arena) {
                 false
@@ -625,6 +648,63 @@ impl ArenaPageStore {
         if newly_freed {
             self.live_pages.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+
+    /// The page `shadow` was copied from by [`PageStore::cow_page`], and its chain depth.
+    ///
+    /// `None` for a page that was never a shadow, for one whose chain had already reached
+    /// [`crate::branch::delta::MAX_CHAIN_DEPTH`] when it was made (so it is a chain root), and for
+    /// one shadowed from a page this branch owned — see `cow_page` for why that last case is
+    /// deliberately not recorded.
+    pub fn shadow_base(&self, shadow: PageId) -> Option<(PageId, u8)> {
+        self.state.lock().unwrap().shadow_base.get(&shadow).copied()
+    }
+
+    /// Encode `shadow`'s CURRENT content as a delta against the page it was shadowed from, or
+    /// `None` when a whole page must be stored instead.
+    ///
+    /// **This is the decision `cow_page`'s full-payload copy makes implicitly, made explicitly and
+    /// with both bounds applied.** It answers "would storing this page as a difference from its
+    /// base actually beat storing the page", and it answers `None` in every case where it would
+    /// not:
+    ///
+    /// * `shadow` is not a shadow, or its chain already reached [`delta::MAX_CHAIN_DEPTH`] when it
+    ///   was made. The depth bound is enforced at write time, in `cow_page`, so reaching here with
+    ///   an over-deep chain is not possible rather than merely unlikely.
+    /// * the encoded delta exceeds [`delta::DELTA_BUDGET`]. **A delta that does not beat the page
+    ///   it encodes is refused, not stored.** D93 measured the compaction regime at 1373 B and
+    ///   2552 B against a 1018-byte budget — both over, both correctly whole. Letting those
+    ///   through would have the delta arm claiming a saving it cannot deliver, and would break the
+    ///   read-amplification bound, which is the product of the two constants.
+    ///
+    /// **The 24-byte self-describing header is not diffed, and that is structural rather than
+    /// careful.** `PageDelta` works over [`crate::cow::node::PAYLOAD_LEN`] = `PAGE_SIZE -
+    /// PAGE_HEADER_SIZE` and this method hands it `[PAGE_HEADER_SIZE..]` of each page, so
+    /// `birth_epoch`, `arena_id` and `crc32` are outside the diff by construction. That matters
+    /// because a shadow's header is ALWAYS different from its base's — D94 proved two
+    /// independently written pages differ even with identical content, for exactly this reason —
+    /// so diffing it would put a run at offset 0 in every delta ever taken and inflate the cheapest
+    /// case the most. A materialised page re-stamps its own header rather than inheriting one.
+    pub fn delta_against_base(&self, shadow: PageId) -> Result<Option<PageDelta>, FerroError> {
+        let Some((base, depth)) = self.shadow_base(shadow) else { return Ok(None) };
+        // Belt and braces against the bound the write path already enforces: a chain deeper than
+        // this cannot be built by `cow_page`, so reaching it means a bug in this file, and an
+        // unbounded read is precisely what the bound exists to prevent.
+        if depth > delta::MAX_CHAIN_DEPTH {
+            return Ok(None);
+        }
+        let base_image = self.read_page(base)?.read().data;
+        let shadow_image = self.read_page(shadow)?.read().data;
+        let encoded = PageDelta::between(
+            base,
+            &base_image[PAGE_HEADER_SIZE..],
+            &shadow_image[PAGE_HEADER_SIZE..],
+            depth,
+        )?;
+        if encoded.encoded_len() > delta::DELTA_BUDGET {
+            return Ok(None);
+        }
+        Ok(Some(encoded))
     }
 
     /// Take the pending-free log for re-evaluation.
@@ -1035,6 +1115,9 @@ impl ArenaPageStore {
                 current,
                 pending,
                 claim_epoch,
+                // Deliberately NOT restored from the image: see the field's own doc. A cold map
+                // makes the next shadow a chain root, which can only shorten chains.
+                shadow_base: HashMap::new(),
             };
         *self.space.free_extents.lock().unwrap() = free_extents;
         // Raised, never lowered, and every held range is trimmed to match: the image says this
@@ -1303,13 +1386,45 @@ impl PageStore for ArenaPageStore {
             stamp_checksum(&mut frame.data);
         }
 
+        // **D102 — record what this page is a shadow OF, which is the fact a delta needs.**
+        //
+        // A delta is meaningless without its base, so the base has to be knowable after the copy
+        // above has made the two pages identical. `previous_page_id` carries it out to the caller,
+        // which relinks its parent and drops it; nothing kept it on the store side.
+        //
+        // **`MAX_CHAIN_DEPTH` is enforced HERE, at write time, and not on the read.** A page whose
+        // chain has reached the bound is recorded as a chain ROOT (no entry) rather than as a
+        // deeper link, so a reader cannot encounter a chain the bound forbids — which is a
+        // stronger statement than checking on read, and is why `delta_against_base` below needs no
+        // policy of its own. The bound is not a tuning knob: `branch::mod` invariant 2 cites
+        // BranchBench measuring parent-chain-walking reads at up to 4000x degradation, and an
+        // unbounded delta chain is that same shape wearing different clothes.
+        //
+        // **Only a base this branch does not own is recorded, and that is what keeps this out of
+        // the GC's business.** The `free_page` call directly below runs only when the branch owns
+        // the source extent; in that case the base becomes a freeable page and a delta against it
+        // would be a second, invisible reason to keep it alive — a reference count, in a file
+        // whose header says in bold that there are none. When the branch does NOT own it, the base
+        // is an ancestor's page that this branch inherited, and the epoch interval rule in
+        // `branch::record::reclaimable` already pins it: the branch holding the delta forked after
+        // the base was born, so `free_page` parks the page instead of releasing it. The existing
+        // rule covers this case with no new liveness source, which is the only reason it is safe.
+        let owner_of_source = self.arena_owner(header.arena_id);
+        if owner_of_source != Some(branch) {
+            let mut st = self.state.lock().unwrap();
+            let base_depth = st.shadow_base.get(&page_id).map(|&(_, d)| d).unwrap_or(0);
+            if base_depth < delta::MAX_CHAIN_DEPTH {
+                st.shadow_base.insert(new_id, (page_id, base_depth + 1));
+            }
+        }
+
         // Free the shadowed page **only if this branch owns the arena it came from**.
         //
         // A branch that shadows a page it inherited from an ancestor must leave the original
         // alone: the ancestor still points at it, and the ancestor is not in its own
         // `live_children` array, so the interval rule would eventually declare it reclaimable and
         // corrupt the ancestor. Freeing is the owner's business and nobody else's.
-        if self.arena_owner(header.arena_id) == Some(branch) {
+        if owner_of_source == Some(branch) {
             self.free_page(page_id, epoch)?;
         }
 
@@ -1459,6 +1574,12 @@ impl PageStore for ArenaPageStore {
         st.recycled.remove(&arena);
         st.pending.retain(|p| p.arena_id != arena);
         st.claim_epoch.remove(&arena);
+        // **D102 — the whole extent's ids stop naming these pages, so their bases stop being
+        // theirs.** `release_page` does this one id at a time; freeing an extent bypasses it
+        // entirely (that bypass is the reaper's fast path and the reason arenas exist), so the
+        // same forgetting has to happen here or a reissued range would carry stale bases.
+        let freed = start..start + pages;
+        st.shadow_base.retain(|shadow, _| !freed.contains(shadow));
         if let Some(ext) = ext.as_ref() {
             // **D99 — RE-INDEX THE QUESTION, do not speed up the answer.** "Which branch is
             // currently filling this arena?" was answered by walking every entry in `current`,
@@ -1921,6 +2042,245 @@ mod tests {
             "the child must not free a page its parent still points at"
         );
         assert_eq!(h.store.pending_len(), 0);
+    }
+
+    // ---- D102: the delta write path ------------------------------------------------------
+    //
+    // These bind `cow_page` to `branch::delta`. Before them that module had no caller anywhere in
+    // the crate, so every property it asserted was a property of a fixture.
+
+    /// Overwrite `len` payload bytes of `page` starting at `at`, leaving the rest alone.
+    fn write_payload_run(h: &Harness, page: PageId, at: usize, bytes: &[u8]) {
+        let handle = h.store.read_page(page).unwrap();
+        let mut frame = handle.write();
+        frame.data[PAGE_HEADER_SIZE + at..PAGE_HEADER_SIZE + at + bytes.len()]
+            .copy_from_slice(bytes);
+        stamp_checksum(&mut frame.data);
+    }
+
+    /// Fork a child, shadow `page` into it, and hand back the shadow.
+    fn shadow_once(h: &Harness, parent: BranchId, page: PageId) -> (BranchId, PageId) {
+        let child = h.catalog.fork(parent, LeaseDeadline(1)).unwrap();
+        let cow = h.store.cow_page(page, child.branch_id, h.catalog.next_epoch()).unwrap();
+        assert!(cow.copied, "the fixture needs a real shadow, not an in-place mutation");
+        (child.branch_id, cow.page_id)
+    }
+
+    /// **A few changed bytes cost a few bytes, not a page.** This is D93's claim taken against
+    /// pages the arena really produced rather than against a fixture built for the encoder.
+    #[test]
+    fn a_shadow_that_changed_a_little_encodes_to_a_delta_far_under_a_page() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let p_arena = h.store.arena_for(parent.branch_id).unwrap();
+        let page =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+        // A page with content, so the delta is against something rather than against zeroes.
+        for i in 0..40 {
+            write_payload_run(&h, page, i * 64, &[(i as u8).wrapping_mul(7); 16]);
+        }
+
+        let (_child, shadow) = shadow_once(&h, parent.branch_id, page);
+        assert_eq!(
+            h.store.shadow_base(shadow),
+            Some((page, 1)),
+            "cow_page must record the page a shadow was taken from, at depth 1"
+        );
+
+        // Four rows' worth of change, the shape D93 priced.
+        write_payload_run(&h, shadow, 128, &[0xAA; 24]);
+        write_payload_run(&h, shadow, 1024, &[0xBB; 24]);
+
+        let delta = h.store.delta_against_base(shadow).unwrap().expect("a small change fits");
+        assert_eq!(delta.base(), page);
+        assert_eq!(delta.depth(), 1);
+        assert!(
+            delta.encoded_len() <= delta::DELTA_BUDGET,
+            "a delta that is stored must be within the budget, got {}",
+            delta.encoded_len()
+        );
+        assert!(
+            delta.encoded_len() < PAGE_SIZE / 8,
+            "48 changed bytes encoded to {} bytes; the whole point is that it is far under the \
+             {PAGE_SIZE}-byte page cow_page copies today",
+            delta.encoded_len()
+        );
+
+        // And it is the RIGHT delta: applying it to the base rebuilds the shadow's payload.
+        let base_img = h.store.read_page(page).unwrap().read().data;
+        let shadow_img = h.store.read_page(shadow).unwrap().read().data;
+        let mut rebuilt = base_img[PAGE_HEADER_SIZE..].to_vec();
+        delta.apply(&mut rebuilt).unwrap();
+        assert_eq!(
+            rebuilt,
+            shadow_img[PAGE_HEADER_SIZE..].to_vec(),
+            "the delta did not rebuild the page it was taken from"
+        );
+    }
+
+    /// **The 24-byte header must not appear in the delta.** D94 proved two independently written
+    /// pages differ in their headers even when their content is identical — `birth_epoch`,
+    /// `arena_id` and `crc32` are all different for a shadow. If the header were inside the diff,
+    /// every delta ever taken would carry a run at offset 0 and the cheapest case would be
+    /// inflated the most. A shadow nobody has touched must therefore encode to ZERO runs.
+    #[test]
+    fn a_shadow_nobody_touched_encodes_to_no_runs_although_its_header_differs() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let p_arena = h.store.arena_for(parent.branch_id).unwrap();
+        let page =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+        write_payload_run(&h, page, 0, &[0x5A; 64]);
+
+        let (_child, shadow) = shadow_once(&h, parent.branch_id, page);
+
+        // The premise of the test, read out of the system rather than assumed.
+        let base_img = h.store.read_page(page).unwrap().read().data;
+        let shadow_img = h.store.read_page(shadow).unwrap().read().data;
+        assert_ne!(
+            base_img[..PAGE_HEADER_SIZE],
+            shadow_img[..PAGE_HEADER_SIZE],
+            "the fixture is vacuous unless the two headers really do differ"
+        );
+        assert_eq!(
+            base_img[PAGE_HEADER_SIZE..],
+            shadow_img[PAGE_HEADER_SIZE..],
+            "an untouched shadow must have the same payload as its base"
+        );
+
+        let delta = h.store.delta_against_base(shadow).unwrap().expect("zero runs is in budget");
+        assert!(
+            delta.runs().is_empty(),
+            "the differing header leaked into the delta as {} run(s)",
+            delta.runs().len()
+        );
+        assert_eq!(delta.encoded_len(), delta::DELTA_HEADER);
+    }
+
+    /// **A delta that does not beat the page is REFUSED and a whole page is stored.** D93 measured
+    /// the compaction regime at 1373 B and 2552 B against a 1018-byte budget. Rewriting most of a
+    /// page is that regime, and it must come back `None` rather than as a delta claiming a saving
+    /// it cannot deliver.
+    #[test]
+    fn a_shadow_that_rewrote_the_page_is_refused_a_delta() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let p_arena = h.store.arena_for(parent.branch_id).unwrap();
+        let page =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+
+        let (_child, shadow) = shadow_once(&h, parent.branch_id, page);
+        // Rewrite well past the budget: a contiguous run of half the payload.
+        let big = vec![0xC3u8; crate::cow::node::PAYLOAD_LEN / 2];
+        write_payload_run(&h, shadow, 0, &big);
+
+        assert!(
+            h.store.delta_against_base(shadow).unwrap().is_none(),
+            "a {}-byte rewrite must be refused against a {}-byte budget",
+            big.len(),
+            delta::DELTA_BUDGET
+        );
+    }
+
+    /// **`MAX_CHAIN_DEPTH` is enforced at WRITE time, so a read cannot meet a chain the bound
+    /// forbids.** Shadowing a chain one link past the bound must produce a page recorded as a
+    /// chain ROOT — no base at all — rather than a deeper link. `branch::mod` invariant 2 is why:
+    /// an unbounded delta chain is a parent-chain walk wearing different clothes.
+    #[test]
+    fn a_chain_stops_growing_at_the_bound_rather_than_being_caught_on_read() {
+        let h = Harness::new();
+        let root = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let arena = h.store.arena_for(root.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+
+        // Shadow down a chain of branches, each forking from the last, so every cow sees a page
+        // its own branch does not own and therefore really shadows.
+        let mut owner = root.branch_id;
+        let mut current = page;
+        let mut depths = Vec::new();
+        for _ in 0..(delta::MAX_CHAIN_DEPTH as usize + 3) {
+            let (child, shadow) = shadow_once(&h, owner, current);
+            depths.push(h.store.shadow_base(shadow).map(|(_, d)| d));
+            owner = child;
+            current = shadow;
+        }
+
+        // The chain climbs to the bound, the next link is a ROOT, and the chain after it starts
+        // again from 1. **That restart is the collapse working, not a leak**: a page with no
+        // recorded base is stored whole, and a shadow of a whole page is legitimately depth 1. It
+        // is the same shape `DeltaStore::write` takes when it collapses — store a full page, begin
+        // a new chain — and it is what keeps the bound a bound instead of a ceiling that stalls
+        // every later write.
+        let bound = delta::MAX_CHAIN_DEPTH as usize;
+        let mut expected: Vec<Option<u8>> = (1..=delta::MAX_CHAIN_DEPTH).map(Some).collect();
+        expected.push(None);
+        expected.push(Some(1));
+        expected.push(Some(2));
+        assert_eq!(
+            depths, expected,
+            "the chain must climb to {bound}, collapse to a root, then start again"
+        );
+
+        // The property the bound actually exists for, stated over the whole run rather than over
+        // the one index where it first bites: no read ever faces more than `MAX_CHAIN_DEPTH`
+        // deltas, because no deeper link was ever WRITTEN.
+        assert!(
+            depths.iter().flatten().all(|&d| d <= delta::MAX_CHAIN_DEPTH),
+            "no recorded depth may exceed the bound: {depths:?}"
+        );
+        assert!(
+            depths[bound].is_none(),
+            "the link that would have been depth {} must be a chain root: {depths:?}",
+            bound + 1
+        );
+    }
+
+    /// Shadowing a page the branch OWNS is not recorded as a delta base, and that is what keeps
+    /// this out of the GC's business: that page is handed to `free_page` on the very next line, so
+    /// a delta against it would be a second, invisible reason to keep it alive — a reference
+    /// count, in a file whose header says there are none.
+    #[test]
+    fn shadowing_a_page_you_own_records_no_delta_base() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let arena = h.store.arena_for(parent.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+        // A child fork moves the privacy barrier past the page's birth, so the parent shadows its
+        // OWN page rather than mutating it in place.
+        let _child = h.catalog.fork(parent.branch_id, LeaseDeadline(1)).unwrap();
+        let cow = h.store.cow_page(page, parent.branch_id, h.catalog.next_epoch()).unwrap();
+
+        assert!(cow.copied, "the fixture needs a shadow of a page the branch owns");
+        assert_eq!(
+            h.store.shadow_base(cow.page_id),
+            None,
+            "a base the branch owns must not be recorded: free_page owns that page's liveness"
+        );
+        assert!(h.store.delta_against_base(cow.page_id).unwrap().is_none());
+    }
+
+    /// A recycled page id must not inherit the base of its previous life. Without the removal in
+    /// `release_page` the reissued id reads as a delta against a base it has nothing to do with,
+    /// which materialises a page built from the wrong bytes and reports no error at all.
+    #[test]
+    fn a_released_page_forgets_the_base_it_was_a_shadow_of() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let p_arena = h.store.arena_for(parent.branch_id).unwrap();
+        let page =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+
+        let (child, shadow) = shadow_once(&h, parent.branch_id, page);
+        assert!(h.store.shadow_base(shadow).is_some(), "the fixture needs a recorded base");
+
+        let c_arena = h.store.arena_for(child).unwrap();
+        h.store.release_page(shadow, c_arena);
+        assert_eq!(
+            h.store.shadow_base(shadow),
+            None,
+            "a released id still named a base; the next page to get this id would decode as a \
+             delta of an unrelated page"
+        );
     }
 
     #[test]
