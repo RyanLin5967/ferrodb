@@ -606,6 +606,7 @@ pub fn plan_cherry_pick(
         plan_one_row(
             log,
             from,
+            onto,
             &row_ops,
             &selected,
             target,
@@ -646,6 +647,7 @@ pub fn plan_cherry_pick(
 fn plan_one_row(
     log: &dyn CherryLog,
     from: BranchId,
+    onto: BranchId,
     row_ops: &[&RecordedOp],
     selected: &BTreeSet<u64>,
     target: &dyn CherryTarget,
@@ -702,6 +704,13 @@ fn plan_one_row(
 
         // ---- Rows 9 / 10 / 16: the pick creates the row. --------------------------------------
         Some((OpKind::RowCreate(initial), create_seq)) => {
+            // `conflicts` is the WHOLE pick's accumulator, so its emptiness is a fact about every
+            // row planned before this one. The question at the bottom of this arm is whether
+            // *this row* is clean, so the count is taken here and compared against, rather than
+            // asking `conflicts.is_empty()` — which answers a different question and happens to
+            // agree only because `plan_cherry_pick` refuses the whole pick on any conflict at
+            // all. That agreement is a property of the caller, not of this arm.
+            let conflicts_before_this_row = conflicts.len();
             if on_target.is_some() {
                 conflicts.push(CherryConflict {
                     kind: CherryConflictKind::RowExists,
@@ -772,7 +781,7 @@ fn plan_one_row(
                     Err(e) => conflicts.push(compose_failed(tbl, row, col, &ops, &e)),
                 }
             }
-            if conflicts.is_empty() {
+            if conflicts.len() == conflicts_before_this_row {
                 writes.push(CherryWrite::InsertRow { table, tbl, row, image });
             }
         }
@@ -874,6 +883,7 @@ fn plan_one_row(
 
                 let theirs = divergence(
                     log,
+                    onto,
                     tbl,
                     row,
                     col,
@@ -976,8 +986,26 @@ fn compose_failed(
 ///
 /// The selected ops are excluded: they are `ours`, not `theirs`, and counting them on both sides
 /// would make every pick of an already-published op look like a conflict with itself.
+///
+/// **And so is every op `onto` did not record, which is the one place this is NOT `concurrent_op`
+/// verbatim.** `concurrent_op` needs no branch filter because the log it reads — `State::applied`
+/// — *is the target's own published log*: everything in it, by construction, is something the
+/// target absorbed. A [`CherryLog`] is a different object. It spans branches, because a pick has
+/// to address ops the source recorded and the target never saw, so "later on this cell" and "the
+/// target absorbed it" stop being the same set. Without the filter an unpicked *source* op is
+/// counted as `theirs`, and that is silent data loss rather than a wrong report: a source op that
+/// writes what `ours` writes makes `theirs == ours`, `resolve_cell`'s "two writes of one value
+/// are not a conflict" fires, and the pick overwrites a concurrent target write it should have
+/// refused (see `row03_an_unpicked_source_op_is_not_what_the_target_absorbed`). Do not "simplify"
+/// this back to the runtime's shape.
+///
+/// The filter is `== onto` and not `!= from` on purpose: a third branch's op is no more evidence
+/// of what the target holds than the source's is. An op the target absorbed by *merging* a third
+/// branch therefore does not name its algebra element here, and the cell falls through to the
+/// opaque `Assign` below — which is the conservative reading, not a missed divergence.
 fn divergence(
     log: &dyn CherryLog,
+    onto: BranchId,
     tbl: TableId,
     row: RowId,
     col: ColId,
@@ -999,6 +1027,7 @@ fn divergence(
         .iter()
         .filter(|s| !selected.contains(s))
         .filter_map(|&s| log.op_at(s))
+        .filter(|o| o.branch == onto)
         .map(|o| o.kind.clone())
         .collect();
     if !kinds.is_empty() {
@@ -1008,9 +1037,10 @@ fn divergence(
     }
 
     // Row 6 lives here too: with no witness we cannot establish that the cell did not move, so we
-    // report an opaque `Assign` of whatever the target holds. Against an `Assign` of a different
-    // value that is a conflict under `Reject`, which is the refusal row 6 promises; against an
-    // `Add` it commutes, which is correct — a delta does not care what it is added to.
+    // report an opaque `Assign` of whatever the target holds. `Assign` commutes with nothing
+    // (`OpKind::commutes_with`), so under `Reject` this refuses against an `Add` exactly as it
+    // refuses against a contradictory `Assign` — which is the refusal row 6 promises, and is also
+    // what makes a cell the recorded ops cannot explain refuse rather than silently apply.
     Some(OpKind::Assign(target_now.clone()))
 }
 
@@ -1306,6 +1336,51 @@ mod tests {
         assert_eq!(t.commits, 0, "the writer must never have been entered");
     }
 
+    /// **Row 3 again, with an unpicked SOURCE op sitting in the divergence range.**
+    ///
+    /// The row-3 test above cannot see this: its log holds exactly one op after the picked one
+    /// and that op is the target's. Neither can
+    /// `row13_note_a_straddled_selection_is_reported_not_refused`, which *does* leave an unpicked
+    /// op in the range — its target equals the witness, so `divergence` returns at the row-1
+    /// early exit and never looks at the log at all.
+    ///
+    /// So this fixture puts all three on one cell: the picked source op, the target's own
+    /// concurrent write, and a LATER source op that is deliberately not picked. `divergence`
+    /// folding that last one into `theirs` is silent data loss and not a wrong report: the fold
+    /// `[Assign(7), Assign(9)]` is `Assign(9)`, which equals `ours`, so `resolve_cell`'s "two
+    /// writes of one value are not a conflict" fires and the pick OVERWRITES the target's 7
+    /// with 9 while reporting success.
+    #[test]
+    fn row03_an_unpicked_source_op_is_not_what_the_target_absorbed() {
+        let mut log = MemCherryLog::new();
+        // seq 1 — the source's op, and the only one this pick selects.
+        let ours = log.push(cell_op(OpKind::Assign(int(9)), Some(int(0))));
+        // seq 2 — the target's own concurrent write. THIS is what the target absorbed.
+        let mut theirs = cell_op(OpKind::Assign(int(7)), Some(int(0)));
+        theirs.branch = dst();
+        log.push(theirs);
+        // seq 3 — a later op the SOURCE recorded, not selected. It never reached the target, so
+        // it is the source branch's own history and must not be read as divergence.
+        log.push(cell_op(OpKind::Assign(int(9)), Some(int(9))));
+
+        let mut t = target_with(int(7)); // the target holds ITS OWN write, not the witness
+        let before = t.snapshot();
+        let r = pick(&log, &[ours], &mut t, &PolicyTable::new());
+        let refusal = match &r {
+            CherryResult::Refused(x) => x,
+            CherryResult::Applied(_) => panic!(
+                "expected REFUSE (truth-table row 3): applied = {}, target cell after = {:?} \
+                 — the target's own concurrent write was clobbered by an unpicked source op",
+                r.is_applied(),
+                t.cell(T, R, C)
+            ),
+        };
+        assert!(refusal.has(CherryConflictKind::TargetCellMoved), "{:?}", refusal);
+        assert_eq!(t.cell(T, R, C), Some(&int(7)), "the target's own 7 must survive");
+        assert_eq!(t.snapshot(), before, "the target must be untouched");
+        assert_eq!(t.commits, 0, "the writer must never have been entered");
+    }
+
     // -- Row 4 ---------------------------------------------------------------------------------
 
     #[test]
@@ -1515,6 +1590,67 @@ mod tests {
             1,
             "a created row lands as ONE InsertRow, not an insert plus updates: {:?}",
             applied.plan
+        );
+    }
+
+    /// **The `RowCreate` arm must decide on THIS row's conflicts, not the whole pick's.**
+    ///
+    /// `conflicts` is the accumulator for every row, so `conflicts.is_empty()` at the bottom of
+    /// that arm answers "has anything at all refused yet", and a clean created row planned after
+    /// some *other* row refused would silently lose its `InsertRow`.
+    ///
+    /// Nothing that goes through [`cherry_pick`] can see this: [`plan_cherry_pick`] refuses the
+    /// whole pick on any conflict, so the plan is dropped either way and both spellings produce
+    /// the identical `Refused`. That is why this drives [`plan_one_row`] directly, with the
+    /// accumulator pre-loaded the way an earlier row would have left it — it is the only vantage
+    /// point from which the two spellings differ, and without it the fix is untestable rather
+    /// than merely inert.
+    #[test]
+    fn a_clean_rowcreate_row_is_planned_even_when_another_row_already_conflicted() {
+        let mut log = MemCherryLog::new();
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2), int(3)]), None, None));
+        let row_ops: Vec<&RecordedOp> = vec![log.op_at(create).expect("just pushed")];
+        let selected: BTreeSet<u64> = [create].into_iter().collect();
+
+        let t = MemCherryTarget::new(); // the row is absent, so the create is clean
+        let mut writes: Vec<CherryWrite> = Vec::new();
+        let mut discarded: Vec<DiscardedWrite> = Vec::new();
+        let mut straddled: Vec<Straddled> = Vec::new();
+        // What a DIFFERENT row of the same pick would have left in the accumulator.
+        let mut conflicts: Vec<CherryConflict> = vec![CherryConflict {
+            kind: CherryConflictKind::RowGone,
+            seq: Some(999),
+            tbl: Some(T),
+            row: Some(RowId(1)),
+            col: Some(C),
+            detail: "a conflict recorded by another row of this same pick".into(),
+        }];
+
+        plan_one_row(
+            &log,
+            src(),
+            dst(),
+            &row_ops,
+            &selected,
+            &t,
+            &PolicyTable::new(),
+            &mut writes,
+            &mut discarded,
+            &mut straddled,
+            &mut conflicts,
+        )
+        .expect("engine error");
+
+        assert_eq!(conflicts.len(), 1, "this row must add no conflict of its own: {:?}", conflicts);
+        assert_eq!(
+            writes,
+            vec![CherryWrite::InsertRow {
+                table: "t".into(),
+                tbl: T,
+                row: R,
+                image: vec![int(1), int(2), int(3)],
+            }],
+            "a clean row's write must not be suppressed by ANOTHER row's conflict"
         );
     }
 

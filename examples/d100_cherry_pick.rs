@@ -32,8 +32,8 @@ use std::time::Instant;
 
 use ferrodb::agent_sql::merge_engine::PolicyTable;
 use ferrodb::branch::cherry::{
-    cherry_pick, plan_cherry_pick, CherryLog, MemCherryLog, MemCherryTarget, OpSelector,
-    RecordedOp,
+    cherry_pick, plan_cherry_pick, CherryConflictKind, CherryLog, MemCherryLog, MemCherryTarget,
+    OpSelector, RecordedOp,
 };
 use ferrodb::branch::types::BranchId;
 use ferrodb::catalog::column::Value;
@@ -317,13 +317,42 @@ fn main() {
     // A refusal never reaches the writer, so it is strictly cheaper than an apply. Banked so the
     // curve cannot be read as "refusals are the expensive case".
     println!();
-    let (rlog, rbase, rseqs, _) = build(1_000);
+    let (mut rlog, rbase, rseqs, _) = build(1_000);
     let mut moved = rbase.clone();
     // Move one cell out from under the pick, contradictorily.
-    // Row 500's cell is moved to a value no recorded op explains, so `divergence` falls back to
-    // an opaque Assign — which does not commute with an Add, and the whole pick refuses.
-    moved.insert(T, RowId(500), vec![Value::Integer(0), Value::Integer(-1), Value::Integer(0)]);
-    let sel: Vec<OpSelector> = rseqs[..1000].iter().copied().map(OpSelector::new).collect();
+    //
+    // **It cannot be one of `build`'s own rows, and the first version of this arm tried.** It
+    // moved row 500's cell to -1 and asserted a refusal, on the premise that a value no recorded
+    // op explains makes `divergence` fall back to an opaque `Assign`. The premise is false: every
+    // row `build` emits carries the target's `Add(+10)` at a seq ABOVE the picked op, so
+    // `ops_on_cell` still answers `Add(+10)`, which commutes with the picked `Add(+1)` whatever
+    // the cell now holds. The arm applied, and the assertion — which was right — caught it.
+    //
+    // Reaching the fallback needs a cell with NO recorded op after the picked one, so the log
+    // gets one extra row that only the SOURCE ever wrote. The target holds a value for it that
+    // nothing in the log explains, `divergence` has no op to name, and the opaque `Assign` does
+    // not commute with `Add`, so the whole pick refuses under `Reject`.
+    let lone_row = RowId(1_000);
+    let lone = rlog.push(RecordedOp {
+        seq: 0,
+        txn: TxnId(2_000),
+        branch: src(),
+        table: "t".into(),
+        tbl: T,
+        row: lone_row,
+        col: Some(C),
+        kind: OpKind::Add(Delta::Int(1)),
+        before: Some(Value::Integer(0)),
+        before_row: None,
+    });
+    moved.insert(T, lone_row, vec![Value::Integer(0), Value::Integer(-1), Value::Integer(0)]);
+    // Still 1000 picked ops: 999 of `build`'s, plus the one on the lone row.
+    let sel: Vec<OpSelector> = rseqs[..999]
+        .iter()
+        .copied()
+        .chain(std::iter::once(lone))
+        .map(OpSelector::new)
+        .collect();
     let policy = PolicyTable::new();
     let mut us: Vec<f64> = Vec::new();
     for _ in 0..201 {
@@ -332,6 +361,14 @@ fn main() {
         let r = cherry_pick(&rlog, src(), &sel, dst(), &mut t, &policy).unwrap();
         us.push(start.elapsed().as_secs_f64() * 1e6);
         assert!(!r.is_applied(), "this arm must REFUSE");
+        // ...and for the reason the fixture was built to produce. A refusal on any other
+        // ground — `RowGone`, say — would time a path this arm is not claiming to describe.
+        let refusal = r.refusal().expect("just asserted not applied");
+        assert!(
+            refusal.has(CherryConflictKind::TargetCellMoved),
+            "the refusal must be the moved-cell one, got {:?}",
+            refusal.kinds()
+        );
         assert_eq!(t.commits, 0, "a refusal must not reach the writer");
     }
     println!(
