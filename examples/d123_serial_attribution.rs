@@ -364,6 +364,153 @@ fn mode_perturb(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize)
     println!("  |delta| > 2% => the probe perturbs and every duration it produced is quarantined.");
 }
 
+
+/// Median of a sample. Reported instead of a mean because one transient on this box is a 2x
+/// outlier, not a small perturbation — pass B's `perturb` arm produced exactly such an outlier and
+/// a mean would have carried it straight into the verdict.
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    if n == 0 { f64::NAN } else if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+}
+
+/// ⭐ F1, WITH THE PROBE OFF AND REPLICATED. The version that decides the row.
+///
+/// Two defects in the first F1 run, both fixed here:
+///
+/// 1. **It ran probe-ON.** `mode_stub` reports `HOLD`, which only exists with the probe on, so F1
+///    was a ratio between two instrumented configurations. F1's load-bearing columns are
+///    `forks/sec` and `vs L0` — neither needs the probe. Turning it off removes the instrument
+///    from the answer entirely rather than arguing about how much it perturbs.
+/// 2. **One run per cell.** The first battery produced a 2x outlier in a single cell (warm=0,
+///    probe OFF, T=64: 2796.6/sec against 4788-5256/sec everywhere else). With n=1 there is no way
+///    to tell a transient from an effect, and that one cell was nearly read as "the probe doubles
+///    throughput". Replicated, reported as median with the full min-max spread.
+///
+/// **Level order is ROTATED between reps** (rep r starts at level r mod 4). Run always in the same
+/// order, a monotone drift in the box — a build starting, the page cache filling — lands entirely
+/// on the last level, which is L3, which is the level the verdict rests on. Rotation spreads any
+/// drift across all four.
+fn mode_f1(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps: usize) {
+    banner("MODE=f1 (F1 with the probe OFF, replicated, level order rotated)");
+    println!("⛔ Stubbed levels are NOT a database — see MODE=stub. Every level keeps write_header");
+    println!("   + stage, so >=1 page is dirty and the fsync stays real.");
+    println!("THE VOID GUARD, CHECKED NOT ASSUMED: `syncs` SHOULD fall as the section gets faster —");
+    println!("that is group commit batching more forks behind a shorter critical section. What must");
+    println!("NOT happen is forks going undurable, so the check is CONSERVATION: syncs x f/sync must");
+    println!("still equal N. A level that lost durability fails that; a level that merely batched");
+    println!("better passes it. Printed per level as `syncs*f/sync` against N.");
+    println!();
+    for &t in threads {
+        let mut obs: Vec<Vec<f64>> = vec![Vec::new(); 4];
+        let mut sy: Vec<Vec<f64>> = vec![Vec::new(); 4];
+        let mut fps: Vec<Vec<f64>> = vec![Vec::new(); 4];
+        let mut forks_n = 0usize;
+        for rep in 0..reps {
+            for i in 0..4usize {
+                let stub = ((i + rep) % 4) as u8;
+                probe::configure(false, stub, 0);
+                let a = run_arm(dir, &format!("f1_{t}_{stub}_{rep}"), n, t, warm);
+                obs[stub as usize].push(a.throughput());
+                sy[stub as usize].push(a.syncs as f64);
+                fps[stub as usize].push(a.forks as f64 / a.syncs.max(1) as f64);
+                forks_n = a.forks;
+            }
+        }
+        let base = median(&mut obs[0].clone());
+        println!("  T={t}, reps={reps}, N={forks_n} forks per arm");
+        println!(
+            "  {:>5} {:>11} {:>10} {:>10} {:>8} {:>9} {:>9} {:>8} {:>13}",
+            "stub", "median f/s", "min", "max", "spread", "vs L0", "syncs", "f/sync", "syncs*f/sync"
+        );
+        for lvl in 0..4usize {
+            let mut o = obs[lvl].clone();
+            let med = median(&mut o);
+            let lo = o[0];
+            let hi = o[o.len() - 1];
+            let s = median(&mut sy[lvl].clone());
+            let f = median(&mut fps[lvl].clone());
+            println!(
+                "  {:>5} {:>11.1} {:>10.1} {:>10.1} {:>7.1}% {:>8.2}x {:>9.0} {:>8.1} {:>13.0}",
+                lvl,
+                med,
+                lo,
+                hi,
+                100.0 * (hi - lo) / med,
+                med / base,
+                s,
+                f,
+                s * f
+            );
+        }
+        println!();
+    }
+    println!("F1 FIRES if L3's median is within +/-10% of L0's median: the section is NOT the ceiling.");
+    println!("Compare `spread` against the L3/L0 ratio before believing either.");
+}
+
+/// The perturbation question, replicated and with the ORDER ALTERNATED.
+///
+/// The first battery ran OFF then ON, once, and in the warm=0 regime returned OFF=2796.6 against
+/// ON=5256.1 — an apparent +88% from switching the instrument ON, which would mean the probe
+/// changes the system's dynamics rather than adding overhead. But every OTHER 64-thread warm=0
+/// measurement that evening sat at 4788-5256, so the outlier is the OFF cell, not the ON cell.
+/// One run per cell cannot tell "the probe is magic" from "one arm hit a transient", and the two
+/// have opposite consequences for every duration in the row. Alternating the order additionally
+/// separates a probe effect from a first-arm-in-the-process effect: a real probe effect keeps its
+/// sign when the order flips, an order effect does not.
+fn mode_perturb2(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps: usize) {
+    banner("MODE=perturb2 (replicated, order alternated)");
+    println!("Two questions at once, and they need separating:");
+    println!("  (a) does the PROBE change throughput?   -> compare ON vs OFF");
+    println!("  (b) does POSITION in the process change it? -> compare 1st-run vs 2nd-run");
+    println!("A real probe effect keeps its sign when the order flips. An order effect does not.");
+    println!();
+    for &t in threads {
+        // [config][position] where config 0=off 1=on, position 0=ran first, 1=ran second.
+        let mut cell: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 2]; 2];
+        for rep in 0..reps {
+            let off_leads = rep % 2 == 0;
+            let order: [bool; 2] = if off_leads { [false, true] } else { [true, false] };
+            for (pos, &probe_on) in order.iter().enumerate() {
+                probe::configure(probe_on, 0, 0);
+                let tag = if probe_on { "on" } else { "off" };
+                let a = run_arm(dir, &format!("p2_{t}_{tag}_{rep}"), n, t, warm);
+                cell[probe_on as usize][pos].push(a.throughput());
+            }
+        }
+        let all = |c: usize| {
+            let mut v: Vec<f64> = cell[c][0].iter().chain(cell[c][1].iter()).copied().collect();
+            median(&mut v)
+        };
+        let (mo, mn) = (all(0), all(1));
+        let mut pos_first: Vec<f64> =
+            cell[0][0].iter().chain(cell[1][0].iter()).copied().collect();
+        let mut pos_second: Vec<f64> =
+            cell[0][1].iter().chain(cell[1][1].iter()).copied().collect();
+        let (pf, ps) = (median(&mut pos_first), median(&mut pos_second));
+
+        println!("  T={t}, reps={reps}");
+        println!("    {:<22}{:>11}{:>11}", "median forks/sec", "ran 1st", "ran 2nd");
+        for (c, name) in [(0usize, "probe OFF"), (1, "probe ON")] {
+            println!(
+                "    {:<22}{:>11.1}{:>11.1}",
+                name,
+                median(&mut cell[c][0].clone()),
+                median(&mut cell[c][1].clone())
+            );
+        }
+        println!();
+        println!("    (a) PROBE effect,    ON vs OFF over both positions: {:+.2}%", 100.0 * (mn - mo) / mo);
+        println!("    (b) POSITION effect, 2nd vs 1st over both configs : {:+.2}%", 100.0 * (ps - pf) / pf);
+        println!("    the first battery's single-shot answer was OFF 2796.6 / ON 5256.1 = +87.95%");
+        println!();
+    }
+    println!("  |(a)| > 2% => the probe genuinely perturbs and every duration it produced is");
+    println!("  quarantined. |(a)| within 2% while |(b)| is large => the +88% was position, not");
+    println!("  the instrument, and the durations stand.");
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "phases".into());
     let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4000);
@@ -375,6 +522,8 @@ fn main() {
         .collect();
     let warm: usize =
         std::env::var("FERRODB_D123_WARM").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let reps: usize =
+        std::env::var("FERRODB_D123_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let dir = std::env::temp_dir().join(format!("ferrodb-d123-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -385,8 +534,10 @@ fn main() {
         "extra" => mode_extra(&dir, n, &threads, warm),
         "threads" => mode_threads(&dir, n, &threads, warm),
         "perturb" => mode_perturb(&dir, n, &threads, warm),
+        "f1" => mode_f1(&dir, n, &threads, warm, reps),
+        "perturb2" => mode_perturb2(&dir, n, &threads, warm, reps),
         other => {
-            eprintln!("unknown mode {other}; expected phases|stub|extra|threads|perturb");
+            eprintln!("unknown mode {other}; expected phases|stub|extra|threads|perturb|f1|perturb2");
             std::process::exit(2);
         }
     }

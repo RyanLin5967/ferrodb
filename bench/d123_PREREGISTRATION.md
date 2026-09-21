@@ -236,3 +236,51 @@ S_eff ≈ 0.228 ms, the cycle is ≈14.6 ms, of which the section is 0.228 ms. S
 round. **If `DURABLE` dominates instead and `WAIT` is small, the threads are not queueing on the
 mutex at all, the serial section is not what they are waiting for, and F1 should fire.** That makes
 the WAIT/DURABLE split a second, independent read on Q2 from the same run.
+
+---
+
+# AMENDMENT 6 — THE CLEAN F1 RE-RUN. Written before it is run; the first battery is already read.
+
+The first battery (run by the lead on the rate-limit window; see `bench/D123_LEAD_RAN_THIS.md`)
+answered F1, F2, F4, F5 and F6. Two defects in it are worth one more lock acquisition, and nothing
+else is.
+
+**D1 — F1 was measured with the probe ON.** `mode_stub` prints `HOLD`, which exists only with the
+probe on, so the F1 ratio was taken between two instrumented configurations. F1's load-bearing
+columns are `forks/sec` and `vs L0`; neither needs the probe. `mode_f1` turns it off.
+
+**D2 — one run per cell, and one cell was a 2x outlier.** warm=0, probe OFF, T=64 returned
+2796.6/sec while every other 64-thread warm=0 arm that evening sat at 4788–5256. Read as an effect,
+that single cell says the probe nearly doubles throughput (+87.95%). `mode_f1` and `mode_perturb2`
+replicate 5x and report **medians with the full min–max spread**.
+
+**Level order is rotated between reps** (rep r starts at level r mod 4): run in fixed order, any
+monotone drift in the box lands entirely on the last level, which is L3, which is the level the
+verdict rests on.
+
+### Decision rules, fixed now
+* **F1 fires** iff L3's median is within ±10% of L0's median. Otherwise it does not fire.
+* **If the L3/L0 ratio is smaller than the within-level min–max spread, the result is NOISE** and is
+  reported as "F1 undecided at this N", not as a verdict.
+* **perturb2 (a)** — probe ON vs OFF over both positions. >2% ⇒ the probe perturbs and every
+  duration in this row is quarantined. ≤2% ⇒ the +87.95% was a transient and the durations stand.
+* **perturb2 (b)** — 2nd-run vs 1st-run over both configs. Large (b) with small (a) ⇒ the outlier
+  was position in the process, not the instrument.
+
+### The void guard, restated because the first run made it necessary
+`syncs` FALLS as the section gets faster (496→250 at T=64). That is group commit batching more
+forks behind a shorter critical section, **not** lost durability. The check is therefore
+**conservation**: `syncs × forks-per-sync` must still equal N. A level that lost durability fails
+that; a level that merely batched better passes it. Printed per level.
+
+### What is NOT re-run, and why
+F2, F4, F5, F6 rest on ratios taken *within a single arm* (U(hold), the 64/1 per-phase column, the
+per-upsert cost at fixed k), which a common-mode transient cannot fabricate. They are replicated
+opportunistically (`phases` ×3, `extra` ×2) as a consistency check, not because they are in doubt.
+
+### ⚠ A correction to `bench/d123_raw/00_LEAD_CONTAMINATION.txt`
+That note says the 4.34 s `cargo build --lib` landed on "`20_threads.txt` — the F1 arm". The arm is
+right and the label is wrong: **`20_threads` is F6. F1 is `40_stub`**, which ran afterwards
+(mtimes 18:40 vs 18:43; the build was at 18:37–18:38 local). So F1 carries no known contamination,
+and F6 — whose verdict is `measured/bound` 1.00x→0.03x, nowhere near any boundary — carries one
+that cannot reach it.
