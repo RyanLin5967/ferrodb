@@ -167,7 +167,12 @@ fn main() {
     );
     println!();
 
-    println!("-- 1c. EVERY FIELD, not just the one that was convenient -------------------");
+    println!("-- 1c. EVERY FIELD, AT EVERY INDEX -----------------------------------------");
+    println!("⛔ This block used to mutate index 4 only. An adversarial review found that the");
+    println!("LAST entry of a branch has no successor to disagree with it, so a chain walk");
+    println!("cannot see it altered — and index 4 of a 12-entry log never exercised that. The");
+    println!("sweep now runs every field at every index, against the PUBLISHED head.");
+    let published_all = honest.head();
     let mutations: Vec<(&str, fn(&mut HistoryEntry))> = vec![
         ("content_cid", |e| e.content_cid = ContentId::of(b"x")),
         ("epoch", |e| e.epoch = Epoch(0xdead)),
@@ -177,11 +182,61 @@ fn main() {
         ("prev", |e| e.prev = Attestation([0x5a; 32])),
     ];
     for (name, mutate) in mutations {
-        let mut v: Vec<HistoryEntry> = honest.entries().to_vec();
-        mutate(&mut v[4]);
-        let log = AttestedHistory::load_untrusted(v);
-        c.expect(&format!("mutating `{name}` is detected"), log.verify_chain().is_err());
+        let mut caught_by_chain = 0usize;
+        let mut caught_by_head = 0usize;
+        for victim in 0..honest.len() {
+            let mut v: Vec<HistoryEntry> = honest.entries().to_vec();
+            mutate(&mut v[victim]);
+            let log = AttestedHistory::load_untrusted(v);
+            if log.verify_chain().is_err() {
+                caught_by_chain += 1;
+            }
+            if log.verify_against(&published_all).is_err() {
+                caught_by_head += 1;
+            }
+        }
+        c.expect(
+            &format!(
+                "`{name}` detected at all {} indices by the published head (chain alone: {}/{})",
+                honest.len(),
+                caught_by_chain,
+                honest.len()
+            ),
+            caught_by_head == honest.len(),
+        );
     }
+    println!();
+
+    println!("-- 1c-bis. THE TERMINAL ENTRY, NAMED EXPLICITLY ----------------------------");
+    println!("The most recent row-version a branch wrote is the one an auditor most wants, and");
+    println!("it is exactly the entry a chain walk cannot check. Both halves asserted:");
+    let mut tail: Vec<HistoryEntry> = honest.entries().to_vec();
+    let last_idx = tail.len() - 1;
+    tail[last_idx].content_cid = ContentId::of(b"the agent's last write, edited");
+    let tail_log = AttestedHistory::load_untrusted(tail);
+    c.expect(
+        "a chain walk does NOT catch a mutated terminal entry (the documented limit)",
+        tail_log.verify_chain().is_ok(),
+    );
+    c.expect(
+        "the published head DOES catch it",
+        tail_log.verify_against(&published_all).is_err(),
+    );
+    println!();
+
+    println!("-- 1c-ter. A RECYCLED ID SLOT MUST NOT INHERIT A REAPED BRANCH'S CHAIN -----");
+    let mut recycled = AttestedHistory::new();
+    recycled.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, ContentId::of(b"t"));
+    recycled.append_fork(BranchId::new(7, 0), BranchId::TRUNK, Epoch(2), ContentId::of(b"f"));
+    let reap_att =
+        recycled.append(BranchId::new(7, 0), Epoch(3), BranchOp::Reap, ContentId::of(b"r"));
+    recycled.append(BranchId::new(7, 1), Epoch(4), BranchOp::Commit, ContentId::of(b"g1"));
+    let g1 = *recycled.entries().last().unwrap();
+    c.expect("generation 1 does not chain onto generation 0's reap", g1.prev != reap_att);
+    c.expect(
+        "and a generation-1 branch with no Fork of its own is reported",
+        recycled.verify_chain().is_err(),
+    );
     println!();
 
     println!("-- 1d. THE HARD CASE: a rewrite that RE-LINKS the chain --------------------");

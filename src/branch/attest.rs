@@ -71,9 +71,17 @@
 //!    from trunk at epoch e") and not merely membership. git gets this from parent pointers; CT has
 //!    no branches and so has nothing to say about it.
 //! 2. **The leaf is ferrodb's `(branch, generation, epoch, op, content)` tuple**, so `generation`
-//!    — the reaped-slot guard that already exists in [`BranchId`] — is inside the digest. A
-//!    recycled id slot therefore cannot inherit the attested history of the branch that used to
-//!    live in it. That is a property this codebase needs and CT has no analogue of.
+//!    — the reaped-slot guard that already exists in [`BranchId`] — is inside the digest, **and
+//!    the linkage index is keyed by it too**. A recycled id slot therefore cannot inherit the
+//!    attested history of the branch that used to live in it. That is a property this codebase
+//!    needs and CT has no analogue of.
+//!
+//!    ⚠ **The second half of that sentence was added after an adversarial review, and without it
+//!    the claim was false.** The digest had `generation` in it from the start; the `heads` index
+//!    was keyed by the bare `u64` slot, so generation 1 of slot 7 chained straight onto
+//!    generation 0's final attestation and verified clean — the exact inverse of the property
+//!    claimed here. Putting a field in a digest constrains what a digest *means*; it does not
+//!    constrain what links to what. Only the structure does that.
 //! 3. **The verifier is a free function that cannot reach the database**, structurally: it takes
 //!    bytes and returns a bool, with no `&self`, no store handle and no I/O. See
 //!    [`verify_inclusion`] and [`verify_consistency`]. That is a deliberate API shape, not a novel
@@ -291,8 +299,10 @@ impl BranchOp {
 // Entries
 // ---------------------------------------------------------------------------------------------
 
-/// Exact width of [`HistoryEntry::canonical_bytes`]. Encoder and decoder both assert against it,
-/// the same way [`crate::branch::record::CORE_BYTES`] keeps that format from drifting.
+/// Exact width of [`HistoryEntry::canonical_bytes`]. Both the encoder and
+/// [`HistoryEntry::from_canonical_bytes`] are written against it, the same way
+/// [`crate::branch::record::CORE_BYTES`] keeps that format from drifting, and
+/// `the_canonical_encoding_round_trips` holds the two to each other.
 pub const ENTRY_BYTES: usize = 85;
 
 /// One attested event in a branch's history.
@@ -336,7 +346,13 @@ impl HistoryEntry {
         b
     }
 
-    /// This entry's attestation: `H(DOMAIN || prev || branch_id || content_cid || epoch || op)`.
+    /// This entry's attestation:
+    /// `H(DOMAIN || prev || branch.id || branch.generation || content_cid || epoch || op)`.
+    ///
+    /// `branch.generation` is in the preimage and this line used to omit it, which mattered more
+    /// than a usual doc slip: it is the wire spec a third party would re-implement from, and the
+    /// omitted field is the one the module header singles out as ferrodb's own contribution.
+    /// [`Self::canonical_bytes`] is the authority; this is a description of it.
     ///
     /// **Derived, never stored.** A stored attestation is a second copy of a fact the bytes
     /// already determine, and a verifier that reads it is checking the copy against itself. Every
@@ -346,6 +362,33 @@ impl HistoryEntry {
         h.update(DOMAIN_ENTRY);
         h.update(&self.canonical_bytes());
         Attestation(h.finish())
+    }
+
+    /// Parse the 85 bytes of [`Self::canonical_bytes`] back into an entry.
+    ///
+    /// **The third party's half of the proposition.** The whole claim is that somebody holding 85
+    /// bytes, a proof and a published head can check membership without this database; that only
+    /// means anything if the 85 bytes are an entry they can read, rather than an opaque blob they
+    /// can re-hash. `ENTRY_BYTES`' doc asserted for a while that a decoder asserted against it and
+    /// there was none, which is the kind of claim that hides a gap instead of naming it.
+    ///
+    /// `None` for an unrecognised op code — the one field with values that are not all legal. A
+    /// byte that names no operation must not decode to *some* operation.
+    pub fn from_canonical_bytes(b: &[u8; ENTRY_BYTES]) -> Option<HistoryEntry> {
+        let mut prev = [0u8; 32];
+        prev.copy_from_slice(&b[0..32]);
+        let mut content = [0u8; 32];
+        content.copy_from_slice(&b[44..76]);
+        Some(HistoryEntry {
+            prev: Attestation(prev),
+            branch: BranchId::new(
+                u64::from_be_bytes(b[32..40].try_into().ok()?),
+                u32::from_be_bytes(b[40..44].try_into().ok()?),
+            ),
+            content_cid: ContentId(content),
+            epoch: Epoch(u64::from_be_bytes(b[76..84].try_into().ok()?)),
+            op: BranchOp::from_code(b[84])?,
+        })
     }
 
     /// RFC 6962 leaf hash: `H(0x00 || DOMAIN_LEAF || canonical_bytes)`.
@@ -392,6 +435,27 @@ pub enum TamperFinding {
     DanglingBranch { index: usize, branch: BranchId },
     /// A `Fork` entry names a parent head that no entry in this log produces.
     UnknownForkParent { index: usize, prev: Attestation },
+    /// An entry's `prev` names no entry this log produced, and is not genesis.
+    ///
+    /// Distinct from [`Self::BrokenLink`], which knows what *should* have been there. Here
+    /// nothing does, and saying "expected genesis" would name a digest nothing produced.
+    DanglingLink { index: usize, prev: Attestation },
+    /// An entry's `prev` names an entry that appears *later* in the log. Not a history.
+    ForwardLink { index: usize, prev: Attestation },
+    /// A branch asked about has no entries in this log at all.
+    ///
+    /// A finding rather than a successful walk of length zero: a branch whose entire history was
+    /// deleted from the log must not read as verified. (A run that collected nothing has not
+    /// passed.)
+    NoSuchBranch { branch: BranchId },
+    /// The log's recomputed tree head disagrees with a head published earlier.
+    ///
+    /// **This is the only finding that can catch a mutation of the LAST entry of a branch**, and
+    /// the only one that can catch a rewrite that re-linked the chain behind it. It needs a head
+    /// supplied from outside — see [`AttestedHistory::verify_against`]. The deleted
+    /// `HeadMismatch` compared the log against a re-derivation of itself and therefore could not
+    /// fire; this one compares it against something the log cannot forge.
+    RootMismatch { size: usize, published: [u8; 32], recomputed: [u8; 32] },
     // ⛔ THERE IS NO `HeadMismatch`, AND ITS ABSENCE IS DELIBERATE.
     //
     // An earlier draft of this enum had one, and `verify_chain` ended by recomputing each slot's
@@ -418,6 +482,21 @@ impl Display for TamperFinding {
             TamperFinding::UnknownForkParent { index, prev } => {
                 write!(f, "entry {index}: fork names parent head {prev}, which no entry produces")
             }
+            TamperFinding::DanglingLink { index, prev } => {
+                write!(f, "entry {index}: prev is {prev}, which no entry in this log produces")
+            }
+            TamperFinding::ForwardLink { index, prev } => {
+                write!(f, "entry {index}: prev is {prev}, which appears later in the log")
+            }
+            TamperFinding::NoSuchBranch { branch } => {
+                write!(f, "branch {branch} has no entries in this log")
+            }
+            TamperFinding::RootMismatch { size, published, recomputed } => write!(
+                f,
+                "at size {size} the published head is {}, but these entries hash to {}",
+                &to_hex(published)[..16],
+                &to_hex(recomputed)[..16]
+            ),
         }
     }
 }
@@ -576,8 +655,12 @@ pub fn verify_consistency(
         return proof.path.is_empty() && old_root == new_root;
     }
     if m == 0 {
-        // Every log extends the empty log; RFC specifies an empty proof.
-        return proof.path.is_empty();
+        // Every log extends the empty log and the RFC specifies an empty proof — but the OLD
+        // HEAD IS STILL AN INPUT AND MUST STILL BE THE REAL ONE. Returning `proof.path.is_empty()`
+        // alone accepted `TreeHead { size: 0, root: <anything> }`, including all-zeroes, which is
+        // exactly the value an uninitialised or truncated stored head takes. That is the same
+        // mistake `Attestation::genesis` spends a paragraph refusing to make for the chain.
+        return proof.path.is_empty() && *old_root == empty_root();
     }
     // RFC step 1: if `m` is an exact power of two, the old root is itself the first proof node and
     // is not transmitted.
@@ -642,12 +725,18 @@ pub fn verify_consistency(
 /// this ground and the table is the reason it was right to.
 pub struct AttestedHistory {
     entries: Vec<HistoryEntry>,
-    /// Entry indices per **id slot**, ascending. Keyed by the raw `u64` and not by [`BranchId`]:
-    /// a reaped slot's history and its successor's are both facts about the same slot, and a
-    /// reader asking "what happened under id 7" wants both.
-    by_slot: HashMap<u64, Vec<usize>>,
-    /// Latest attestation per id slot.
-    heads: HashMap<u64, Attestation>,
+    /// Entry indices per branch, ascending.
+    ///
+    /// ⛔ **Keyed by the whole [`BranchId`], generation included, and an earlier draft keyed it by
+    /// the raw `u64` slot.** That draft's stated reason — "a reader asking what happened under id
+    /// 7 wants both generations" — is a fine answer to a *reporting* question and the wrong key
+    /// for a *linkage* one. With the slot as the key, a generation-1 branch inherited generation
+    /// 0's head and chained straight onto the reaped branch's last attestation, which is the
+    /// exact inverse of the property this module's header claims. The digest had the generation
+    /// in it; the structure did not, and only the structure decides what links to what.
+    by_branch: HashMap<BranchId, Vec<usize>>,
+    /// Latest attestation per branch.
+    heads: HashMap<BranchId, Attestation>,
     /// Merkle levels; `levels[0]` is the leaf hashes. Maintained incrementally so that `append` is
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
     /// quadratic, which is the difference between a benchmark that runs and one that does not.
@@ -664,7 +753,7 @@ impl AttestedHistory {
     pub fn new() -> Self {
         AttestedHistory {
             entries: Vec::new(),
-            by_slot: HashMap::new(),
+            by_branch: HashMap::new(),
             heads: HashMap::new(),
             levels: Vec::new(),
         }
@@ -682,9 +771,12 @@ impl AttestedHistory {
         &self.entries
     }
 
-    /// The latest attestation for an id slot, if it has any history.
-    pub fn head_of(&self, slot: u64) -> Option<Attestation> {
-        self.heads.get(&slot).copied()
+    /// The latest attestation for a branch, if it has any history.
+    ///
+    /// Takes a whole [`BranchId`]: a reaped slot and its recycled successor are different
+    /// branches and must not share a head. See [`Self::by_branch`]'s note.
+    pub fn head_of(&self, branch: BranchId) -> Option<Attestation> {
+        self.heads.get(&branch).copied()
     }
 
     /// The Merkle tree head over all `len()` entries. `MTH({})` for an empty log.
@@ -719,7 +811,7 @@ impl AttestedHistory {
         epoch: Epoch,
         content_cid: ContentId,
     ) -> Attestation {
-        let prev = self.heads.get(&parent.id).copied().unwrap_or_else(Attestation::genesis);
+        let prev = self.heads.get(&parent).copied().unwrap_or_else(Attestation::genesis);
         self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork })
     }
 
@@ -731,15 +823,21 @@ impl AttestedHistory {
         op: BranchOp,
         content_cid: ContentId,
     ) -> Attestation {
-        let prev = self.heads.get(&branch.id).copied().unwrap_or_else(Attestation::genesis);
+        let prev = self.heads.get(&branch).copied().unwrap_or_else(Attestation::genesis);
         self.push(HistoryEntry { prev, branch, content_cid, epoch, op })
     }
 
+    /// Append one already-built entry verbatim. **The single append path**, called by
+    /// [`Self::append`], [`Self::append_fork`] and [`Self::load_untrusted`] alike.
+    ///
+    /// It used to be copied out three times, once of them in the test module. A fix to the
+    /// indexing then had to land in three places, and the copy most likely to be missed was the
+    /// one standing in for the production path inside a test.
     fn push(&mut self, e: HistoryEntry) -> Attestation {
         let att = e.attestation();
         let idx = self.entries.len();
-        self.by_slot.entry(e.branch.id).or_default().push(idx);
-        self.heads.insert(e.branch.id, att);
+        self.by_branch.entry(e.branch).or_default().push(idx);
+        self.heads.insert(e.branch, att);
         self.extend_tree(e.leaf_hash());
         self.entries.push(e);
         att
@@ -755,12 +853,7 @@ impl AttestedHistory {
     pub fn load_untrusted(entries: Vec<HistoryEntry>) -> Self {
         let mut h = AttestedHistory::new();
         for e in entries {
-            let att = e.attestation();
-            let idx = h.entries.len();
-            h.by_slot.entry(e.branch.id).or_default().push(idx);
-            h.heads.insert(e.branch.id, att);
-            h.extend_tree(e.leaf_hash());
-            h.entries.push(e);
+            h.push(e);
         }
         h
     }
@@ -802,56 +895,131 @@ impl AttestedHistory {
 
     /// Walk every entry, recompute its predecessor's attestation, and compare.
     ///
-    /// **O(n), and the header says why that is not enough on its own.** This catches an entry
-    /// altered in place, a reordering, and a head that disagrees with the entries. It does not
-    /// catch a rewrite that re-links everything after it, and it does not catch truncation of a
-    /// tail; both need a witnessed root.
+    /// # ⚠ Exactly what this catches, and exactly what it does not
+    ///
+    /// An earlier version of this sentence said it catches "an entry altered in place, a
+    /// reordering, and a head that disagrees with the entries". **Two of those three were
+    /// false**, and an overclaim in the doc of a detector is worse than a gap in the detector,
+    /// because it is the sentence a reader checks instead of the code. Precisely:
+    ///
+    /// * **Caught:** any alteration of an entry that has a *successor in its own branch* — the
+    ///   successor's `prev` no longer matches. A branch whose creation is missing. A `Fork` whose
+    ///   parent head this log never produced. A link that points at nothing.
+    /// * **NOT caught: alteration of the LAST entry of a branch.** Nothing recomputes an entry's
+    ///   own attestation unless something links to it, and a terminal entry has no successor to
+    ///   disagree. In the agent workload this is the most recent row-version each agent wrote —
+    ///   the one an auditor is most likely to ask about. Use [`Self::verify_against`].
+    /// * **NOT caught: a rewrite that re-links everything behind it,** or truncation of a tail,
+    ///   or a reordering of entries belonging to *different* branches. All three need a head
+    ///   published before the change: [`Self::verify_against`] again.
+    ///
+    /// O(n) in the length of the log.
     pub fn verify_chain(&self) -> Result<(), TamperFinding> {
         let genesis = Attestation::genesis();
         // Every attestation the log produces, so a Fork's `prev` can be resolved to a real entry.
         let mut produced: HashSet<[u8; 32]> = HashSet::new();
         produced.insert(genesis.0);
 
-        let mut slot_head: HashMap<u64, Attestation> = HashMap::new();
+        // Keyed by the whole BranchId. Keying this by the id slot let a recycled slot chain onto
+        // the reaped branch's head — see the note on `AttestedHistory::by_branch`.
+        let mut branch_head: HashMap<BranchId, Attestation> = HashMap::new();
 
         for (i, e) in self.entries.iter().enumerate() {
-            match e.op {
-                BranchOp::Fork => {
-                    // A fork links to a *parent's* head, which must be something this log produced
-                    // (or genesis). Anything else names a history that is not here.
-                    if !produced.contains(&e.prev.0) {
-                        return Err(TamperFinding::UnknownForkParent { index: i, prev: e.prev });
+            match branch_head.get(&e.branch) {
+                // ⛔ THE BRANCH ALREADY HAS HISTORY, SO THIS ENTRY MUST CONTINUE IT — **whatever
+                // its op says, `Fork` included.** The `Fork` arm used to be checked only against
+                // `produced`, i.e. "prev is *some* attestation this log made", and never against
+                // the branch's own head. That was an excision hole: relabelling entry k as a
+                // `Fork` and pointing its `prev` at entry k-2 dropped entry k-1 out of the chain
+                // entirely — nothing linked to it any more, so its content could then be edited
+                // freely and the walk still passed. Replaying a branch's own `Fork` entry at the
+                // end of the log was the cheaper form of the same trick, and it cut the ancestry
+                // walk down to one step while reporting success.
+                //
+                // A second `Fork` for a branch that already exists is not a legitimate shape in
+                // any case: a fork is where a branch *begins*.
+                Some(expected) => {
+                    if *expected != e.prev {
+                        return Err(TamperFinding::BrokenLink {
+                            index: i,
+                            expected_prev: *expected,
+                            found_prev: e.prev,
+                        });
                     }
                 }
-                _ => {
-                    // Every other op links to this branch's own previous attestation.
-                    match slot_head.get(&e.branch.id) {
-                        Some(expected) => {
-                            if *expected != e.prev {
-                                return Err(TamperFinding::BrokenLink {
-                                    index: i,
-                                    expected_prev: *expected,
-                                    found_prev: e.prev,
-                                });
-                            }
-                        }
-                        None => {
-                            // No prior entry for this slot. Only genesis is admissible, and a
-                            // non-Fork opening entry is itself a finding: it means the branch's
-                            // creation is missing from the history.
-                            if e.prev != genesis {
-                                return Err(TamperFinding::DanglingBranch {
-                                    index: i,
-                                    branch: e.branch,
-                                });
-                            }
+                // First entry for this branch.
+                None => match e.op {
+                    // A fork links to its *parent's* head, which must be something this log
+                    // produced (or genesis). Anything else names a history that is not here.
+                    BranchOp::Fork => {
+                        if !produced.contains(&e.prev.0) {
+                            return Err(TamperFinding::UnknownForkParent {
+                                index: i,
+                                prev: e.prev,
+                            });
                         }
                     }
-                }
+                    // ⛔ ANY OTHER FIRST ENTRY IS A BRANCH WHOSE CREATION IS MISSING — **and
+                    // `prev == genesis` does not excuse it.**
+                    //
+                    // This arm used to admit a genesis link here, on the reasoning that a log may
+                    // legitimately begin mid-life. It made `DanglingBranch` almost unreachable:
+                    // `append` sets `prev = genesis` for any branch with no head, so a branch that
+                    // simply appeared out of nowhere produced exactly the admitted shape. The case
+                    // that exposed it is a recycled id slot — generation 1 of slot 7 writing a
+                    // `Commit` with no `Fork` anywhere in the log — which verified clean.
+                    //
+                    // **Trunk is the exception, and it is the only one, because it is the only
+                    // branch in ferrodb that is not forked into existence.** Every other branch
+                    // comes from `BranchCatalog::fork`, so a non-trunk branch whose first recorded
+                    // act is anything other than a `Fork` has had its creation removed.
+                    _ => {
+                        if !e.branch.is_trunk() || e.prev != genesis {
+                            return Err(TamperFinding::DanglingBranch {
+                                index: i,
+                                branch: e.branch,
+                            });
+                        }
+                    }
+                },
             }
             let att = e.attestation();
             produced.insert(att.0);
-            slot_head.insert(e.branch.id, att);
+            branch_head.insert(e.branch, att);
+        }
+        Ok(())
+    }
+
+    /// [`Self::verify_chain`], **plus** the check that these entries are the ones a previously
+    /// published [`TreeHead`] committed to.
+    ///
+    /// **This is the honest entry point, and the one a deployment should call.** The chain walk
+    /// alone cannot see a mutation of a branch's last entry, a rewrite that re-links the chain
+    /// behind it, or a truncated tail; all three are invisible from inside the log and all three
+    /// are caught here, because `published` comes from outside and the log cannot forge it.
+    ///
+    /// `published` must be a head recorded when the log was at `published.size` entries — an
+    /// operator's witnessed value, not one read back out of the same store. Handing it
+    /// `self.head()` makes this exactly as strong as [`Self::verify_chain`] and no stronger,
+    /// which is the trap the deleted `HeadMismatch` variant fell into.
+    pub fn verify_against(&self, published: &TreeHead) -> Result<(), TamperFinding> {
+        self.verify_chain()?;
+        if published.size > self.entries.len() {
+            // The log is shorter than the head says it was: a truncated tail.
+            return Err(TamperFinding::RootMismatch {
+                size: published.size,
+                published: published.root,
+                recomputed: empty_root(),
+            });
+        }
+        let prefix = AttestedHistory::load_untrusted(self.entries[..published.size].to_vec());
+        let recomputed = prefix.root();
+        if recomputed != published.root {
+            return Err(TamperFinding::RootMismatch {
+                size: published.size,
+                published: published.root,
+                recomputed,
+            });
         }
         Ok(())
     }
@@ -861,17 +1029,20 @@ impl AttestedHistory {
     /// The walk crosses fork boundaries: reaching a [`BranchOp::Fork`] continues at whichever entry
     /// produced the attestation it names, which is an entry of the **parent** branch. That is the
     /// ancestry property, and it is O(depth of that branch's history), not O(log).
-    pub fn verify_branch(&self, slot: u64) -> Result<usize, TamperFinding> {
+    /// ⛔ **A branch with no entries is a finding, not a walk of length zero.** This used to
+    /// return `Ok(0)` for an unknown branch, so `history.verify_branch(b)?` — the obvious way to
+    /// ask "has b's history been tampered with" — answered *yes, verified* for a branch whose
+    /// entire history had been deleted from the log. A zero result is a fact about the scope of
+    /// the question, never a pass.
+    pub fn verify_branch(&self, branch: BranchId) -> Result<usize, TamperFinding> {
         let genesis = Attestation::genesis();
         let mut produced: HashMap<[u8; 32], usize> = HashMap::new();
         for (i, e) in self.entries.iter().enumerate() {
             produced.insert(e.attestation().0, i);
         }
-        let Some(idxs) = self.by_slot.get(&slot) else {
-            return Ok(0);
-        };
-        let Some(&last) = idxs.last() else {
-            return Ok(0);
+        let last = match self.by_branch.get(&branch).and_then(|idxs| idxs.last()) {
+            Some(&last) => last,
+            None => return Err(TamperFinding::NoSuchBranch { branch }),
         };
 
         let mut steps = 0usize;
@@ -885,22 +1056,15 @@ impl AttestedHistory {
             match produced.get(&e.prev.0) {
                 Some(&p) => {
                     if p >= cur {
-                        // A link that points forward is not a history.
-                        return Err(TamperFinding::BrokenLink {
-                            index: cur,
-                            expected_prev: genesis,
-                            found_prev: e.prev,
-                        });
+                        // A link that points forward is not a history. Reported as what it is:
+                        // these two arms used to claim `expected_prev: genesis`, which is a value
+                        // neither of them ever expected, in the one type whose job is to say
+                        // where the fault is.
+                        return Err(TamperFinding::ForwardLink { index: cur, prev: e.prev });
                     }
                     cur = p;
                 }
-                None => {
-                    return Err(TamperFinding::BrokenLink {
-                        index: cur,
-                        expected_prev: genesis,
-                        found_prev: e.prev,
-                    })
-                }
+                None => return Err(TamperFinding::DanglingLink { index: cur, prev: e.prev }),
             }
         }
     }
@@ -965,12 +1129,20 @@ impl AttestedHistory {
 
     /// RFC 6962 `MTH(D[lo:hi])`, computed from the literal recursive definition.
     ///
+    /// **Private.** It was `pub` and panicked on an out-of-range argument
+    /// (`AttestedHistory::new().mth_range(0, 1)` indexed an empty level), while every other
+    /// public entry point in this module answers with `Option` or `bool`. It exists to be the
+    /// independent check on `extend_tree`, and the tests live in this file, so it does not need
+    /// to be reachable from outside it.
+    ///
+    /// Precondition: `lo <= hi <= levels[0].len()`.
+    ///
     /// Used by proof generation, and used by the tests as the **independent** check on
     /// [`Self::extend_tree`]: the incremental level construction and this recursion are two
     /// different algorithms, and `the_incremental_tree_matches_the_rfc_recursion` asserts they
     /// agree at every size from 0 to 300. A single implementation agreeing with itself would prove
     /// nothing.
-    pub fn mth_range(&self, lo: usize, hi: usize) -> [u8; 32] {
+    fn mth_range(&self, lo: usize, hi: usize) -> [u8; 32] {
         let n = hi - lo;
         if n == 0 {
             return empty_root();
@@ -1277,7 +1449,7 @@ mod tests {
             let mut h = AttestedHistory::new();
             heads.push(h.head());
             for e in full.entries() {
-                h.load_one_for_test(*e);
+                h.push(*e);
                 heads.push(h.head());
             }
         }
@@ -1408,7 +1580,7 @@ mod tests {
         h.verify_chain().expect("an honest history must verify");
 
         // Ancestry: branch 2's walk crosses two forks and reaches genesis.
-        let steps = h.verify_branch(2).expect("branch 2 verifies");
+        let steps = h.verify_branch(bid(2, 0)).expect("branch 2 verifies");
         assert!(steps >= 4, "branch 2's walk should cross into its ancestry, took {steps} steps");
     }
 
@@ -1490,20 +1662,38 @@ mod tests {
     }
 
     /// A branch whose creation is missing from the log is a finding, not a pass.
+    ///
+    /// ⛔ **The `genesis` case is the one that matters and this test did not used to cover it.**
+    /// It only ever used a junk `prev`, which the old code refused for the wrong reason; a
+    /// non-trunk branch opening with `prev == genesis` — the shape `append` itself produces for
+    /// an unknown branch — sailed through. Both are asserted now.
     #[test]
     fn a_branch_with_no_fork_entry_is_reported() {
-        let e = HistoryEntry {
-            prev: Attestation([0x11; 32]),
-            branch: bid(5, 0),
+        for prev in [Attestation([0x11; 32]), Attestation::genesis()] {
+            let e = HistoryEntry {
+                prev,
+                branch: bid(5, 0),
+                content_cid: cid(1),
+                epoch: Epoch(1),
+                op: BranchOp::Commit,
+            };
+            let log = AttestedHistory::load_untrusted(vec![e]);
+            assert!(
+                matches!(log.verify_chain(), Err(TamperFinding::DanglingBranch { index: 0, .. })),
+                "a non-trunk branch opening with prev={prev} was not reported"
+            );
+        }
+        // Trunk is the one branch that legitimately exists without being forked.
+        let trunk_open = HistoryEntry {
+            prev: Attestation::genesis(),
+            branch: BranchId::TRUNK,
             content_cid: cid(1),
             epoch: Epoch(1),
             op: BranchOp::Commit,
         };
-        let log = AttestedHistory::load_untrusted(vec![e]);
-        assert!(matches!(
-            log.verify_chain(),
-            Err(TamperFinding::DanglingBranch { index: 0, .. })
-        ));
+        AttestedHistory::load_untrusted(vec![trunk_open])
+            .verify_chain()
+            .expect("trunk may open the log without a Fork");
     }
 
     /// A fork that names a parent head this log never produced is a finding.
@@ -1523,15 +1713,193 @@ mod tests {
         ));
     }
 
-    impl AttestedHistory {
-        /// Test-only: append one already-built entry verbatim, as `load_untrusted` does per item.
-        fn load_one_for_test(&mut self, e: HistoryEntry) {
-            let att = e.attestation();
-            let idx = self.entries.len();
-            self.by_slot.entry(e.branch.id).or_default().push(idx);
-            self.heads.insert(e.branch.id, att);
-            self.extend_tree(e.leaf_hash());
-            self.entries.push(e);
+    // =========================================================================================
+    // Regressions from the D97 adversarial review. Each of these FAILED when written; each one
+    // is a hole the original forced-fire set did not reach, which is the whole argument for
+    // having the work attacked in a context that never saw it being written.
+    // =========================================================================================
+
+    /// ⛔ REVIEW FINDING 1. The `Fork` arm skipped the per-slot link check, so relabelling an
+    /// entry as a `Fork` excised its predecessors from the chain while still verifying.
+    #[test]
+    fn relabelling_an_entry_as_a_fork_cannot_excise_its_predecessors() {
+        let honest = linear_log(3);
+        honest.verify_chain().expect("control");
+
+        let mut forged: Vec<HistoryEntry> = honest.entries().to_vec();
+        forged[2].op = BranchOp::Fork;
+        forged[2].prev = forged[0].attestation(); // skip straight past entry 1
+        let log = AttestedHistory::load_untrusted(forged);
+        assert!(
+            log.verify_chain().is_err(),
+            "an entry relabelled Fork excised entry 1 from the chain and still verified"
+        );
+    }
+
+    /// ⛔ REVIEW FINDING 1, second form. Replaying a branch's own `Fork` entry at the end of the
+    /// log collapsed `verify_branch` to one step while `verify_chain` stayed happy.
+    #[test]
+    fn replaying_a_fork_entry_cannot_truncate_a_branchs_ancestry() {
+        let mut h = AttestedHistory::new();
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2));
+        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3));
+        let honest_steps = h.verify_branch(bid(1, 0)).expect("control");
+
+        let mut forged: Vec<HistoryEntry> = h.entries().to_vec();
+        forged.push(forged[1]); // verbatim replay of branch 1's Fork
+        let log = AttestedHistory::load_untrusted(forged);
+        match log.verify_chain() {
+            Err(_) => {}
+            Ok(()) => {
+                let steps = log.verify_branch(bid(1, 0)).expect("walks");
+                panic!(
+                    "a replayed Fork passed verify_chain and cut ancestry from {honest_steps} \
+                     steps to {steps}"
+                );
+            }
         }
+    }
+
+    /// ⛔ REVIEW FINDING 2. Nothing recomputes an entry's attestation unless a later entry links
+    /// to it, so the LAST entry of every slot was freely editable. In the agent-shaped workload
+    /// that is the most recent row-version each agent wrote — the one an auditor most wants.
+    ///
+    /// The chain genuinely cannot catch this on its own: a terminal entry has no successor to
+    /// disagree with it. The Merkle root does, so the fix is an explicit check against a head
+    /// published earlier, and the test pins both halves so the limit cannot silently move.
+    #[test]
+    fn mutating_the_last_entry_of_a_slot_is_caught_by_the_published_head() {
+        let honest = linear_log(3);
+        let published = honest.head();
+
+        let mut forged: Vec<HistoryEntry> = honest.entries().to_vec();
+        forged[2].content_cid = ContentId::of(b"the last thing the agent wrote, edited");
+        let log = AttestedHistory::load_untrusted(forged);
+
+        // Documented limit: a pure chain walk cannot see it.
+        assert!(
+            log.verify_chain().is_ok(),
+            "precondition: a terminal entry has no successor, so the chain alone cannot object"
+        );
+        // But the published head must.
+        match log.verify_against(&published) {
+            Err(TamperFinding::RootMismatch { size, .. }) => assert_eq!(size, 3),
+            other => panic!("the published head did not catch a mutated terminal entry: {other:?}"),
+        }
+    }
+
+    /// Every index, terminal ones included. The original sweep ran `0..11` on a 12-entry log and
+    /// therefore skipped exactly the index that would have failed.
+    #[test]
+    fn verify_against_a_published_head_catches_a_mutation_at_every_index() {
+        let honest = linear_log(12);
+        let published = honest.head();
+        for victim in 0..honest.len() {
+            let mut entries: Vec<HistoryEntry> = honest.entries().to_vec();
+            entries[victim].content_cid = ContentId::of(b"altered after the fact");
+            let log = AttestedHistory::load_untrusted(entries);
+            assert!(
+                log.verify_against(&published).is_err(),
+                "mutating entry {victim} of {} went undetected against the published head",
+                honest.len()
+            );
+        }
+    }
+
+    /// ⛔ REVIEW FINDING 3. `heads` was keyed by the raw id slot, so a recycled slot chained onto
+    /// the reaped branch's head — the exact inverse of the property the header claims.
+    #[test]
+    fn a_recycled_id_slot_does_not_inherit_the_reaped_branchs_chain() {
+        let mut h = AttestedHistory::new();
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
+        h.append_fork(bid(7, 0), BranchId::TRUNK, Epoch(2), cid(2));
+        let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3));
+
+        // Generation 1 takes over the slot and writes without ever being forked.
+        h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4));
+        let last = *h.entries().last().unwrap();
+        assert_ne!(
+            last.prev, reap_att,
+            "generation 1 chained onto generation 0's reap attestation"
+        );
+        assert!(
+            h.verify_chain().is_err(),
+            "a generation-1 branch with no Fork entry must be reported, not inherited"
+        );
+    }
+
+    /// ⛔ REVIEW FINDING 6. `verify_consistency` short-circuited on `size == 0` without looking
+    /// at the root, so an all-zeroes or garbage stored head was accepted as a valid empty head.
+    #[test]
+    fn an_empty_head_must_still_carry_the_empty_root() {
+        let h = linear_log(10);
+        let proof = h.consistency_proof(0).expect("m=0 proof");
+
+        let garbage = TreeHead { size: 0, root: [0xAB; 32] };
+        assert!(
+            !verify_consistency(&garbage, &h.head(), &proof),
+            "accepted a size-0 head carrying a garbage root"
+        );
+        let zeroed = TreeHead { size: 0, root: [0u8; 32] };
+        assert!(
+            !verify_consistency(&zeroed, &h.head(), &proof),
+            "accepted a size-0 head carrying an all-zeroes root"
+        );
+        let real = TreeHead { size: 0, root: empty_root() };
+        assert!(
+            verify_consistency(&real, &h.head(), &proof),
+            "refused the genuine empty head"
+        );
+    }
+
+    /// ⛔ REVIEW FINDING 4. A slot with no history returned `Ok(0)` — a zero presented as a pass,
+    /// so a branch whose entire history was deleted read as verified.
+    #[test]
+    fn verifying_a_branch_that_is_not_in_the_log_is_a_finding_not_a_pass() {
+        let h = linear_log(5);
+        assert!(
+            h.verify_branch(bid(999, 0)).is_err(),
+            "a branch absent from the log reported success"
+        );
+        // And the generation matters: slot 1 exists, generation 4 does not.
+        assert!(
+            h.verify_branch(bid(1, 4)).is_err(),
+            "an absent generation of a present slot reported success"
+        );
+    }
+
+    /// ⛔ REVIEW FINDING 5. Both `verify_branch` failure paths reported `expected_prev: genesis`,
+    /// which was never what they expected — a locator that names a digest nothing produced.
+    #[test]
+    fn verify_branch_findings_do_not_name_a_digest_nothing_produced() {
+        let honest = linear_log(4);
+        let mut forged: Vec<HistoryEntry> = honest.entries().to_vec();
+        forged[3].prev = Attestation([0x33; 32]); // names no entry at all
+        let log = AttestedHistory::load_untrusted(forged);
+        match log.verify_branch(bid(1, 0)) {
+            Err(TamperFinding::DanglingLink { index, prev }) => {
+                assert_eq!(index, 3);
+                assert_eq!(prev, Attestation([0x33; 32]));
+            }
+            other => panic!("expected a DanglingLink naming the real value, got {other:?}"),
+        }
+    }
+
+    /// ⛔ REVIEW FINDING 10. The third-party story is "you hold 85 bytes and a proof", so those
+    /// 85 bytes must parse back into an entry. `ENTRY_BYTES`' doc asserted a decoder existed.
+    #[test]
+    fn the_canonical_encoding_round_trips() {
+        let h = linear_log(20);
+        for e in h.entries() {
+            let bytes = e.canonical_bytes();
+            let back = HistoryEntry::from_canonical_bytes(&bytes).expect("decodes");
+            assert_eq!(&back, e, "round trip changed the entry");
+            assert_eq!(back.attestation(), e.attestation());
+        }
+        // An unknown op code is refused rather than silently mapped to something.
+        let mut bad = h.entries()[0].canonical_bytes();
+        bad[84] = 200;
+        assert!(HistoryEntry::from_canonical_bytes(&bad).is_none(), "accepted an unknown op code");
     }
 }
