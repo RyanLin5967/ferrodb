@@ -52,6 +52,10 @@ use crate::branch::types::{BranchId, BranchState, CommitHash, Epoch, LeaseDeadli
 use crate::branch::attest::{
     AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry, InclusionProof, TreeHead,
 };
+use crate::branch::cherry::{
+    cherry_pick as cherry_pick_ops, CherryLog, CherryResult, CherryTarget, CherryWrite, OpSelector,
+    RecordedOp,
+};
 use crate::branch::version_graph::{AncestryError, VersionGraph};
 use crate::cow::diff::{diff as cow_diff, Change as CowChange, PageIdentity};
 use crate::cow::PageStore;
@@ -337,6 +341,225 @@ struct Staged {
     after: RowState,
     ops: Vec<Op>,
     guard: Option<Guard>,
+}
+
+/// One published op, as an agent choosing a cherry-pick sees it.
+///
+/// `seq` is what [`AgentRuntime::cherry_pick`] takes, and it names ONE write: a txn may write a
+/// cell more than once, and the point of the operation is to be able to pick one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickableOp {
+    pub seq: u64,
+    pub txn: TxnId,
+    /// The branch that published it, recovered through the merge record keyed by txn.
+    pub branch: BranchId,
+    pub table: String,
+    pub row: RowId,
+    /// `None` for whole-row ops.
+    pub col: Option<ColId>,
+}
+
+/// The runtime's applied-op log, **projected to one cherry-pick**.
+///
+/// # Why a projection and not a borrow of `State`
+///
+/// [`CherryLog::ops_on_cell`] returns `&[u64]` — sequence numbers — while D86's index holds
+/// **positions** into `State::applied`. The two are different numbers over the same order (seqs
+/// are handed out monotonically from `apply_seq` and `applied` is append-only, so position *i*
+/// carries `applied[i].seq`), so the seq list has to exist somewhere as a slice.
+///
+/// It is built **only for the cells the selection touches**, by reading D86's index for each of
+/// them — not by scanning the log, and not by building a second index over it, which is what
+/// `ops_on_cell`'s contract rules out. The cost is O(picked + ops on the picked cells), which is
+/// the same bound `concurrent_op` pays per cell on the merge path.
+struct RuntimeCherryLog {
+    /// Every op the pick can reach: the selected ones, plus every op on the cells they name.
+    ops: BTreeMap<u64, RecordedOp>,
+    /// Seqs per touched cell, increasing — the order `plan_cherry_pick`'s `partition_point`
+    /// reasoning depends on.
+    cells: BTreeMap<(u32, u64, u32), Vec<u64>>,
+    empty: Vec<u64>,
+}
+
+impl RuntimeCherryLog {
+    fn project(state: &State, picked: &[u64]) -> RuntimeCherryLog {
+        // Which branch published each txn. `AppliedOp` does not carry a branch; the runtime
+        // recovers it through `MergeRecord { branch, txns }`, which is the join `cherry.rs` says
+        // an impl should do once rather than making every caller repeat it.
+        let mut branch_of: BTreeMap<u64, BranchId> = BTreeMap::new();
+        for rec in state.merges.values() {
+            for t in &rec.txns {
+                branch_of.insert(t.0, rec.branch);
+            }
+        }
+        // Position of each seq, so a cell's position list becomes a seq list.
+        let mut at_seq: BTreeMap<u64, usize> = BTreeMap::new();
+        for (i, op) in state.applied.iter().enumerate() {
+            at_seq.insert(op.seq, i);
+        }
+
+        let recorded = |op: &AppliedOp| RecordedOp {
+            seq: op.seq,
+            txn: op.txn,
+            branch: branch_of.get(&op.txn.0).copied().unwrap_or(BranchId::TRUNK),
+            table: op.table.clone(),
+            tbl: op.tbl,
+            row: op.row,
+            col: op.col,
+            kind: op.kind.clone(),
+            before: op.before.clone(),
+            before_row: op.before_row.clone(),
+        };
+
+        let mut ops: BTreeMap<u64, RecordedOp> = BTreeMap::new();
+        let mut cells: BTreeMap<(u32, u64, u32), Vec<u64>> = BTreeMap::new();
+        for seq in picked {
+            let Some(&pos) = at_seq.get(seq) else { continue };
+            let Some(op) = state.applied.get(pos) else { continue };
+            ops.insert(op.seq, recorded(op));
+            let Some(col) = op.col else { continue };
+            let key = (op.tbl.0, op.row.0, col.0);
+            if cells.contains_key(&key) {
+                continue;
+            }
+            // D86's index, read exactly as `concurrent_op` reads it.
+            let mut seqs = Vec::new();
+            for &at in state.applied_at_cell(op.tbl, op.row, col) {
+                if let Some(o) = state.applied.get(at as usize) {
+                    seqs.push(o.seq);
+                    ops.entry(o.seq).or_insert_with(|| recorded(o));
+                }
+            }
+            cells.insert(key, seqs);
+        }
+        RuntimeCherryLog { ops, cells, empty: Vec::new() }
+    }
+}
+
+impl CherryLog for RuntimeCherryLog {
+    fn op_at(&self, seq: u64) -> Option<&RecordedOp> {
+        self.ops.get(&seq)
+    }
+
+    fn ops_on_cell(&self, tbl: TableId, row: RowId, col: ColId) -> &[u64] {
+        self.cells.get(&(tbl.0, row.0, col.0)).map(|v| v.as_slice()).unwrap_or(&self.empty)
+    }
+}
+
+/// A live agent branch as the thing a pick lands on.
+///
+/// **`commit_all` is one [`AgentRuntime::stage_all`] call**, which is the all-or-nothing door
+/// `cherry.rs` says the runtime owes: it decides every refusal — the capability envelope, then the
+/// escrow check over the whole batch — before it applies anything. That is why
+/// [`AgentRuntime::cherry_pick`] refuses a selection spanning more than one table: the guarantee
+/// is per-table, so across tables there would be nothing to hold it.
+struct BranchCherryTarget<'a> {
+    runtime: &'a AgentRuntime,
+    branch: BranchId,
+    /// The target's image of every row the plan can touch, resolved before planning began.
+    images: BTreeMap<(u32, u64), Vec<Value>>,
+    pk_types: BTreeMap<u32, (String, DataType)>,
+    committed: bool,
+}
+
+impl CherryTarget for BranchCherryTarget<'_> {
+    fn row_image(&self, tbl: TableId, row: RowId) -> Option<Vec<Value>> {
+        self.images.get(&(tbl.0, row.0)).cloned()
+    }
+
+    fn commit_all(&mut self, writes: &[CherryWrite]) -> Result<(), FerroError> {
+        // One pick, one commit. `cherry_pick` reaches this once and only after every row has been
+        // decided; a second call would mean the engine had split a plan, which is the thing the
+        // single-door design exists to prevent.
+        if self.committed {
+            return Err(FerroError::Internal(
+                "a cherry-pick committed twice: the all-or-nothing contract has been broken \
+                 upstream of the target"
+                    .into(),
+            ));
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        // Fold the writes into one staged item per row. Several `Cell` writes can land on one
+        // row, and staging them separately would append the row to the frame more than once.
+        let mut staged: BTreeMap<(u32, u64), Staged> = BTreeMap::new();
+        let mut tbl_id: Option<TableId> = None;
+        for w in writes {
+            tbl_id = Some(w.tbl());
+            let key = (w.tbl().0, w.row().0);
+            match w {
+                CherryWrite::Cell { tbl, row, col, value, before, .. } => {
+                    let entry = staged.entry(key).or_insert_with(|| Staged {
+                        row: *row,
+                        before: self.images.get(&key).cloned(),
+                        after: RowState::Present(
+                            self.images.get(&key).cloned().unwrap_or_default(),
+                        ),
+                        ops: Vec::new(),
+                        guard: None,
+                    });
+                    if let RowState::Present(img) = &mut entry.after {
+                        let idx = col.0 as usize;
+                        if idx >= img.len() {
+                            return Err(FerroError::Internal(format!(
+                                "cherry-pick would write column {idx} of a {}-column image on \
+                                 row {row}",
+                                img.len()
+                            )));
+                        }
+                        img[idx] = value.clone();
+                    }
+                    entry.ops.push(Op::new(
+                        *tbl,
+                        *row,
+                        Some(*col),
+                        OpKind::Assign(value.clone()),
+                    ));
+                    let _ = before;
+                }
+                CherryWrite::InsertRow { tbl, row, image, replaced, .. } => {
+                    staged.insert(
+                        key,
+                        Staged {
+                            row: *row,
+                            before: replaced.clone(),
+                            after: RowState::Present(image.clone()),
+                            ops: vec![Op::new(
+                                *tbl,
+                                *row,
+                                None,
+                                OpKind::RowCreate(image.clone()),
+                            )],
+                            guard: None,
+                        },
+                    );
+                }
+                CherryWrite::DeleteRow { tbl, row, before_row, .. } => {
+                    staged.insert(
+                        key,
+                        Staged {
+                            row: *row,
+                            before: Some(before_row.clone()),
+                            after: RowState::Deleted,
+                            ops: vec![Op::new(*tbl, *row, None, OpKind::RowDelete)],
+                            guard: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        let tbl = tbl_id.expect("a non-empty write list names a table");
+        let (name, pk_type) = self.pk_types.get(&tbl.0).cloned().ok_or_else(|| {
+            FerroError::Internal(format!("no schema resolved for table id {}", tbl.0))
+        })?;
+        let items: Vec<Staged> = staged.into_values().collect();
+        self.runtime.stage_all(self.branch, tbl, &name, &pk_type, items)?;
+        self.committed = true;
+        Ok(())
+    }
 }
 
 /// One side of a sibling merge, lifted out of its `Workspace` so the state lock is not held
@@ -2951,6 +3174,189 @@ impl AgentRuntime {
         let mut state = self.state.lock().unwrap();
         state.next_merge += 1;
         format!("m_{}", state.next_merge)
+    }
+
+    // ---- D103: CHERRY-PICK, on the production op log ----------------------------------------
+
+    /// Published ops, in the order they landed — **the catalogue a cherry-pick selects from.**
+    ///
+    /// An agent cannot name an op it cannot see, so an operation that takes `seq` numbers needs a
+    /// way to learn them. This is the same log `REVERT` addresses ops by, projected to the fields
+    /// a selection is made on.
+    pub fn pickable_ops(&self) -> Vec<PickableOp> {
+        let state = self.state.lock().unwrap();
+        let mut branch_of: BTreeMap<u64, BranchId> = BTreeMap::new();
+        for rec in state.merges.values() {
+            for t in &rec.txns {
+                branch_of.insert(t.0, rec.branch);
+            }
+        }
+        state
+            .applied
+            .iter()
+            .map(|o| PickableOp {
+                seq: o.seq,
+                txn: o.txn,
+                branch: branch_of.get(&o.txn.0).copied().unwrap_or(BranchId::TRUNK),
+                table: o.table.clone(),
+                row: o.row,
+                col: o.col,
+            })
+            .collect()
+    }
+
+    /// Apply a **selected subset** of a published branch's ops onto a live agent branch.
+    ///
+    /// `MERGE` cannot express this: a merge's unit is a whole branch — every effect the source
+    /// recorded or none — and no sequence of merges composes to "these three cells and nothing
+    /// else". `branch::cherry` is the engine for it and had no caller; this is the caller.
+    ///
+    /// `ops` names the ops to pick by the sequence numbers the applied-op log recorded them at,
+    /// which is what `REVERT` already addresses ops by. A `seq` rather than a `(txn, tbl, row,
+    /// col)` tuple because one txn may write a cell more than once and the point of the operation
+    /// is to name *one* of those writes.
+    ///
+    /// # ⚠ One table per pick, and it is a REFUSAL rather than a caveat
+    ///
+    /// `CherryTarget::commit_all` owes an all-or-nothing contract, and `cherry.rs` is explicit
+    /// that the runtime is the one who owes it: "a runtime impl gets it from the one `Mutex` and
+    /// the `PendingWrite` batch a merge already publishes under — which is a claim that will need
+    /// its own test when that impl exists".
+    ///
+    /// The staging door that gives it is [`AgentRuntime::stage_all`], which decides every refusal
+    /// — the capability envelope, then the escrow check over the whole statement — before it
+    /// applies anything. That is atomic **per table**. Across tables it is not: a pick spanning
+    /// two tables whose second table is refused would leave the first staged, which is exactly the
+    /// half-applied state this module makes unrepresentable rather than merely avoids.
+    ///
+    /// So a selection touching more than one table is **refused**, not warned about. The dangerous
+    /// state is removed rather than documented, and the alternative — widening `stage_all` to
+    /// decide across tables — is a change to the door every INSERT, UPDATE and MERGE writes
+    /// through, which is not a thing to do as a side effect of adding a caller.
+    /// `a_pick_spanning_two_tables_is_refused_rather_than_half_applied` pins it.
+    ///
+    /// # What it costs
+    ///
+    /// O(picked + ops on the picked cells). The divergence question is read through D86's
+    /// `applied_by_cell` index — the one that already exists — rather than by scanning the log,
+    /// which is the contract [`CherryLog::ops_on_cell`] states. Nothing walks `State::applied`.
+    pub fn cherry_pick(
+        &self,
+        ctx: &mut ExecCtx,
+        from: BranchId,
+        ops: &[u64],
+        onto: BranchId,
+    ) -> Result<CherryResult, FerroError> {
+        if self.branches.get(onto)?.state == BranchState::Quarantined {
+            return Err(FerroError::Branch(format!(
+                "{onto} is quarantined and cannot be picked onto: {}",
+                self.quarantine_reason(onto).unwrap_or_else(|| "no reason recorded".into())
+            )));
+        }
+        let selectors: Vec<OpSelector> = ops.iter().copied().map(OpSelector::from).collect();
+
+        // ---- the log projection, and the rows the plan can touch --------------------------
+        let (log, rows_touched, policy) = {
+            let state = self.state.lock().unwrap();
+            let log = RuntimeCherryLog::project(&state, ops);
+            let rows: BTreeSet<(u32, u64)> =
+                log.ops.values().map(|o| (o.tbl.0, o.row.0)).collect();
+            (log, rows, state.policy.clone())
+        };
+
+        // Every table the selection touches. Refused above one, for the reason in the doc.
+        let tables: BTreeSet<String> = log.ops.values().map(|o| o.table.clone()).collect();
+        if tables.len() > 1 {
+            return Err(FerroError::Merge(format!(
+                "this pick spans {} tables ({}), and a pick is staged one table at a time — so a \
+                 refusal on the second would leave the first applied. Refusing rather than \
+                 half-applying; pick each table separately.",
+                tables.len(),
+                tables.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+
+        // ---- the target's image of every row the plan can touch ---------------------------
+        //
+        // Resolved up front, because `CherryTarget::row_image` takes no context and must not do
+        // I/O per call. The set is bounded by the selection, so this stays O(picked).
+        let mut images: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        {
+            let state = self.state.lock().unwrap();
+            let ws = state.workspaces.get(&onto.id).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {onto}"))
+            })?;
+            for key in &rows_touched {
+                match ws.rows.get(key) {
+                    Some(RowState::Present(v)) => {
+                        images.insert(*key, v.clone());
+                    }
+                    // Staged as deleted: the branch has no such row, and that is not the same as
+                    // never having had one.
+                    Some(RowState::Deleted) => {}
+                    None => {
+                        if let Some(Some(v)) = ws.base_rows.get(key) {
+                            images.insert(*key, v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Rows the branch has never touched are read from the shared tables, by point lookup
+        // against the primary key carried in the op's own before-image. A scan here would make a
+        // pick of three cells cost O(table), which is the defect D69 removed from `merge`.
+        for key in &rows_touched {
+            if images.contains_key(key) {
+                continue;
+            }
+            let Some(op) = log.ops.values().find(|o| (o.tbl.0, o.row.0) == *key) else { continue };
+            let Some(before) = op.before_row.as_ref().and_then(|r| r.first()).cloned() else {
+                continue;
+            };
+            let Some(entry) = ctx.catalog.get_table(&op.table) else { continue };
+            let Some(pk_col) = entry.schema.columns.first().map(|c| c.name.clone()) else {
+                continue;
+            };
+            let pred = Expr::BinaryOp {
+                left: Box::new(Expr::ColumnRef { table: None, column: pk_col }),
+                operator: TokenType::Equal,
+                right: Box::new(value_expr(&before)),
+            };
+            for row in scan_table_where(&op.table, None, Some(&pred), &ctx.read())? {
+                if row_id_of(&row).0 == key.1 {
+                    images.insert(*key, row);
+                }
+            }
+        }
+
+        // The schema each staged row lands in, resolved before anything is decided.
+        let mut pk_types: BTreeMap<u32, (String, DataType)> = BTreeMap::new();
+        for op in log.ops.values() {
+            if pk_types.contains_key(&op.tbl.0) {
+                continue;
+            }
+            let entry = ctx
+                .catalog
+                .get_table(&op.table)
+                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", op.table)))?;
+            let ty = entry
+                .schema
+                .columns
+                .first()
+                .map(|c| c.data_type.clone())
+                .ok_or_else(|| FerroError::Bind(format!("'{}' has no columns", op.table)))?;
+            pk_types.insert(op.tbl.0, (op.table.clone(), ty));
+        }
+
+        let mut target = BranchCherryTarget {
+            runtime: self,
+            branch: onto,
+            images,
+            pk_types,
+            committed: false,
+        };
+        let result = cherry_pick_ops(&log, from, &selectors, onto, &mut target, &policy)?;
+        Ok(result)
     }
 
     // ---- D103: the branch-history chain -----------------------------------------------------
