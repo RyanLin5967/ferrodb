@@ -68,23 +68,24 @@ warning: method `visible_rows` is never used
      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: `ferrodb` (lib test) generated 5 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 2 suggestions)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.86s
      Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
 
-running 13 tests
-test cow::dedup::tests::different_payloads_never_share ... ok
-test cow::dedup::tests::an_uncommitted_ticket_rolls_its_increment_back_on_drop ... ok
+running 14 tests
 test cow::dedup::tests::an_uncommitted_ticket_on_a_fresh_page_hands_the_page_back ... ok
-test cow::dedup::tests::recovery_leaves_committed_references_alone ... ok
+test cow::dedup::tests::different_payloads_never_share ... ok
 test cow::dedup::tests::a_crash_between_the_increment_and_the_record_leaks_nothing ... ok
-test cow::dedup::tests::recovery_frees_a_page_whose_only_reference_was_lost_to_the_crash ... ok
 test cow::dedup::tests::identical_payloads_share_one_page_and_allocate_once ... ok
+test cow::dedup::tests::an_uncommitted_ticket_rolls_its_increment_back_on_drop ... ok
+test cow::dedup::tests::recovery_frees_a_page_whose_only_reference_was_lost_to_the_crash ... ok
 test cow::dedup::tests::releasing_the_last_reference_frees_the_page ... ok
-test cow::dedup::tests::the_audit_detects_an_inconsistency_it_is_supposed_to_catch ... ok
-test cow::dedup::tests::an_over_release_is_refused_and_changes_nothing ... ok
+test cow::dedup::tests::recovery_leaves_committed_references_alone ... ok
 test cow::dedup::tests::a_content_id_collision_does_not_share_pages ... ok
+test cow::dedup::tests::a_racing_publisher_makes_the_loser_hand_its_page_back ... ok
+test cow::dedup::tests::an_over_release_is_refused_and_changes_nothing ... ok
+test cow::dedup::tests::the_audit_detects_an_inconsistency_it_is_supposed_to_catch ... ok
 test cow::dedup::tests::concurrent_release_frees_the_page_exactly_once ... ok
 test cow::dedup::tests::concurrent_interning_of_one_payload_counts_every_reference_once ... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
 

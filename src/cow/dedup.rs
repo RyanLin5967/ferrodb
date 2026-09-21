@@ -757,6 +757,59 @@ mod tests {
         ix.audit().expect("audit");
     }
 
+    /// **The race path, driven deterministically.**
+    ///
+    /// `intern` releases the index lock to call `alloc`, so another writer can publish the same
+    /// payload in that window. The concurrency test below would only reach this path by luck, and
+    /// a branch reached by luck is not a tested branch — so this test *is* the interleaving: the
+    /// allocating closure publishes the same payload behind its own caller's back, which is
+    /// exactly what a second thread would have done.
+    ///
+    /// What must not happen is the loser silently keeping a second page for identical content —
+    /// that is the leak the whole `surplus` mechanism exists to prevent.
+    #[test]
+    fn a_racing_publisher_makes_the_loser_hand_its_page_back() {
+        let ix = ChunkIndex::new();
+        let pages = Pages::new();
+        let mut winner_page = 0;
+
+        let (outcome, ticket) = ix
+            .intern(b"contended", pages.reader(), || {
+                // Someone else publishes while this caller is allocating.
+                let (inner, t) = ix
+                    .intern(b"contended", pages.reader(), || pages.alloc(b"contended"))
+                    .expect("the racing writer interns");
+                t.commit();
+                winner_page = inner.page_id();
+                // ...and only now does this caller get its own page, which is already redundant.
+                pages.alloc(b"contended")
+            })
+            .expect("intern");
+        ticket.commit();
+
+        let surplus = match outcome {
+            Interned::SharedAfterRace { page_id, surplus } => {
+                assert_eq!(page_id, winner_page, "the loser must adopt the winner's page");
+                surplus
+            }
+            other => panic!("expected the race path to be taken, got {other:?}"),
+        };
+        assert_ne!(surplus, winner_page, "the surplus is this caller's own redundant page");
+        assert_eq!(pages.alloc_count(), 2, "both callers really did allocate");
+        assert_eq!(
+            ix.refcount(winner_page),
+            Some(2),
+            "one reference from each caller, counted once each"
+        );
+        assert_eq!(
+            ix.refcount(surplus),
+            None,
+            "the index must NOT hold the surplus page — it is handed back to be freed"
+        );
+        assert_eq!(ix.len(), 1, "identical content, one entry, not two");
+        ix.audit().expect("audit");
+    }
+
     /// Interning under concurrency must not double-count or lose a reference. The final refcount
     /// is read from the index and compared against the number of committed tickets, which is
     /// counted by the test rather than reported by the subject.
