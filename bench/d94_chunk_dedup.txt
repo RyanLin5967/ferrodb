@@ -1,20 +1,48 @@
 === D94: CROSS-BRANCH CHUNK DEDUP -- the premise first, then the sweep ===
-harness: examples/d94_dedup_premise.rs, built 48c6e602d059
+harness: examples/d94_dedup_premise.rs, built 48c6e602d059  [d94_sweep_raw.txt]
+harness: examples/d94_dedup_premise.rs, built 808273c4b8a8  [d94_sweep_raw_part2.txt]
+  two builds: the sweep was cut off by a rate limit after 7 of 9 rows and finished in a
+  second run. The only source delta between them is +53 lines of #[cfg(test)] module in
+  src/cow/dedup.rs, which is unwired and not on the harness's path; the harness file
+  itself is byte-identical (git diff 48c6e60 HEAD -- examples/d94_dedup_premise.rs is
+  empty). The rows are therefore comparable, and both stamps are printed rather than
+  one being presented as if it covered all nine rows.
 module:  src/cow/dedup.rs        tests: test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
-raw:     bench/d94_sweep_raw.txt, bench/d94_extent_premise_raw.txt
+raw:     bench/d94_sweep_raw.txt + bench/d94_sweep_raw_part2.txt,
+         bench/d94_extent_premise_raw.txt,
+         bench/d94_zero_falsifier.txt (the 0 at dup_frac=0.00, forced to fire at k=1,2,3)
+built by: bench/d94_summarise.py -- every number here is read from a raw run, not retyped
 
-SHORT VERSION. The mechanism is built and tested. Adopting it is NOT recommended on this
-evidence, and the reason is the first table, not the second.
+VERDICT: REFUSE. The mechanism is built and tested; it is NOT adopted and NOT wired into
+any write path. The deciding result is not that dedup wins too little -- it is that the
+frontier's mechanism CANNOT FIRE IN THIS ENGINE AT ALL, and that this is deliberate:
+
+  There is not one byte-identical WHOLE page in any configuration measured below, including
+  dup_frac = 1.00 where every branch writes byte-identical ROWS. ForkBase dedups because its
+  chunks carry no per-owner identity; ferrodb's pages carry birth_epoch and arena_id exactly
+  so the epoch-interval reaper can free them without a global liveness question.
+  THE SAME 24 BYTES THAT MAKE DEDUP IMPOSSIBLE ARE WHAT MAKE RECLAMATION CHEAP.
+
+  Payload-level dedup -- keying on page[24..] instead of the whole page -- is the only form
+  that could ever pay here, and it is refused too. It buys a workload-CONDITIONAL 10-30% and
+  costs refcounts; refcounts reintroduce the global liveness question that src/cow/mod.rs
+  lists as a deliberate non-goal ('this is why Dolt needs copying mark-and-sweep GC'), which
+  makes a chunk-GC row live that is otherwise dead. Reopening a solved reclamation path for
+  a conditional 10-30% is the wrong trade. Written down so it is not rediscovered.
 
 -- PREMISE 1: is extent granularity still the space wall? NO. It was, and it is closed. --
 
-The brief points at a 262x space amplification from 1 MiB extents per branch. That number
-is real and was measured on branch D32-write-curve, which is NOT merged: its artifact
-bench/d32_write_curve.txt does not exist on main (git cat-file -e HEAD:bench/d32_write_curve.txt
--> ABSENT; git branch --contains 4f46e6d -> D32-write-curve only). What it recorded:
+The brief pointed at a 262x space amplification from 1 MiB extents per branch and cited
+bench/d32_write_curve.txt. That citation is wrong and the brief has been retracted: the file
+is not on main (git cat-file -e HEAD:bench/d32_write_curve.txt -> ABSENT; it lives only on
+the unmerged branch D32-write-curve). The number itself is real and IS banked on main, as
+the BEFORE row of bench/d31_before.txt -- which is the reference to quote:
 
-    D32, one page written per branch:  1,048,316 len B/branch   965,108 alloc B/branch
-    -> extrapolated 1.05 TB at 10^6 branches. D31 named as the binding wall.
+    bench/d31_before.txt:9   N=4000   4193.3 MB data   1,048,316 len B/branch
+    bench/d31_after.txt:9    N=4000     16.4 MB data       4,097 len B/branch
+                             -> 'VERDICT -- AMPLIFICATION GONE'
+
+So 262x is a FIXED BUG, not a live wall, and it was fixed before this row was opened.
 
 D31 has since landed on main: branch::types::ARENA_FIRST_EXTENT_PAGES = 1 with geometric
 growth to a 256-page cap (next_extent_pages), used by ArenaPageStore (arena.rs:1325).
@@ -50,6 +78,9 @@ it. Workload: a trunk of 5000 rows, then N branches each writing 8 rows spread a
       1000  0.00    101      101101       9101       9101       9101       92000       0
       1000  0.50    101      101101       9101       9101       5105       92000    3996
       1000  1.00    101      101101       9101       9101       1109       92000    7992
+     10000  0.00    101     1010101      90101      90101      90101      920000       0
+     10000  0.50    101     1010101      90101      90101      50105      920000   39996
+     10000  1.00    101     1010101      90101      90101      10109      920000   79992
 
 TWO RESULTS, and the first one is the one that matters most:
 
@@ -65,6 +96,7 @@ TWO RESULTS, and the first one is the one that matters most:
     actually cost. That reduction is free and already shipped:
       N=100       10201 references ->    1001 pages stored (90.2% collapsed by sharing alone)
       N=1000     101101 references ->    9101 pages stored (91.0% collapsed by sharing alone)
+      N=10000   1010101 references ->   90101 pages stored (91.1% collapsed by sharing alone)
 
     Dedup's entire remaining budget is the 'dedup gains' column, and at dup_frac = 0.00 --
     branches writing DIFFERENT content, which is what independent agents do -- it is
@@ -79,6 +111,9 @@ TWO RESULTS, and the first one is the one that matters most:
       1000  0.00         37,277,696       37,277,696     0.0%
       1000  0.50         37,277,696       20,910,080    43.9%
       1000  1.00         37,277,696        4,542,464    87.8%
+     10000  0.00        369,053,696      369,053,696     0.0%
+     10000  0.50        369,053,696      205,230,080    44.4%
+     10000  1.00        369,053,696       41,406,464    88.8%
 
 A saving percentage is a ratio and a ratio cannot tell a constant from a complexity class.
 The sweep exists so the SLOPE can be fitted -- pages per additional branch:
