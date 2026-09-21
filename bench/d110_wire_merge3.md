@@ -1,12 +1,38 @@
 # D110 — should `cow::merge3` be wired into the production merge path?
 
-**Verdict: NO. The row is retired, and nothing was built to keep it alive.**
+# ⛔ ROW RETIRED. DO NOT WIRE IT. This file is the reason.
 
-The production merge is already proportional to the diff, and — a stronger fact that only the
-measurement found — it does not touch the CoW tree at all. Wiring `merge3` into `MERGE;` is not a
-performance change; it is a storage migration wearing one.
+**If you arrived here because you noticed that `src/cow/merge3.rs` has zero callers in `src/`:
+that is correct, it is deliberate, and it is not a gap. Stop here.**
+
+`merge3`'s zero callers is a **consequence of the architecture, not an oversight**, and the
+one-line reason is:
+
+> **`DIFF` has no delta in hand. `MERGE` does.**
+
+A structural three-way descent earns its keep by skipping subtrees that would otherwise have to be
+walked. `DIFF` must find its delta from two roots, so the descent buys it a real complexity class —
+and it *is* wired there, at `runtime.rs:1850`, with its curve banked in
+`bench/d103_production_diff_curve.txt`. `MERGE` is handed its delta by the workspace before it
+starts. There is nothing for merge3 to skip, so there is nothing for it to win.
+
+Two further facts, measured rather than argued, each sufficient on its own:
+
+1. **A `MERGE;` reads ZERO branch-engine pages at every table size** — not flat, *absent*. It never
+   descends the CoW tree that merge3 merges. (Fire-checked; see below. A zero from a detector never
+   made to fire is silence, not a measurement.)
+2. **The row-level merge is already O(delta · log N)**, never O(rows in the table).
+
+So wiring merge3 into `MERGE` is not a performance change. It is a **storage migration** — moving
+base tables into the CoW tree — wearing one. If that migration ever happens, re-open this as a
+question about `DIFF`'s precedent, not as a merge change.
 
 `[HERE]` = measured by this session, in worktree `/Users/idide/wt/ferrodb-D110-wire-merge3`.
+
+⚠ **"A mechanism with no production caller is a demo" was the wrong lens for this one.** It is a
+good heuristic and it was applied here twice; both times it pointed at a mechanism whose absence
+from the call graph was the architecture working. The heuristic finds demos; it cannot tell a demo
+from a correctly-unused alternative. Only the call graph and a counter can.
 
 ---
 
@@ -200,14 +226,36 @@ independent derivations agreeing on the mechanism *and* the integers is the stro
 available that the mechanism is right. This session's fix (`d7a6f64`) was committed before that
 message arrived; it was not a knowing duplication, and the work is not redone here.
 
-**The two fixes differ, and the choice is the lead's.** `cdc-boundary` treats it as a stale
-assertion and corrects the premise. This one keeps the assertion untouched and makes the workload
-genuinely contested: the pairs are read **out of the leaves themselves** (two entries of one leaf,
-co-resident by construction under any chunker), and `arm()` re-reads that premise off the tree and
-asserts it, so a future layout change fails naming the cause rather than tripping a counter
-assertion four hundred lines away. Preferring this one preserves what the assertion is *for* — it
-is what makes the separated arm's nonzero counters readable as "the counter works" rather than "the
-counter is stuck". Never edit a test to make it pass; the workload was wrong, not the assertion.
+### ✅ WHICH FIX TO LAND: `cdc-boundary`'s (`94bc632`). Close mine (`d7a6f64`).
+
+**Recommended after reading their diff, not their commit message — and it reverses my first
+instinct.** Theirs is the stronger fix and the difference is not stylistic:
+
+| | mine (`d7a6f64`) | **cdc-boundary's (`94bc632`)** |
+|---|---|---|
+| approach | change the **workload** so `== 0` is true again | assert the **law**: `skip_theirs_unchanged == split_pairs` |
+| where the expected value comes from | arranged by construction | **read off the tree** via `leaf_of` per pair |
+| survives the next chunker change? | no — re-breaks if leaves get small | **yes — no fixture assumption at all** |
+| catches a false skip? | only as `!= 0` | **yes, exactly**: a skip with no split pair is a subtree both sides touched |
+| can the assertion fail? | **no — satisfiable by construction** | yes; they fire-checked it (1 against 3 at N=16000) |
+
+The decisive line is the last two rows. My version restores `con_theirs == 0` by making sure
+nothing *can* fire — which is precisely the defect the harness's own anti-vacuity section exists to
+prevent. **An assertion I arranged to be true tests nothing.** Theirs predicts an exact nonzero
+count from the tree and fails if the count is wrong in either direction, which is a strictly
+sharper test than the zero it replaces. They also inverted it to prove it can fail; I did not.
+
+⚠ One property theirs gives up, recorded so it is not rediscovered: with some pairs straddling, the
+contested arm is a mixture and `nodes_read` is no longer a clean upper bound on the descent. That
+is a caveat for the curve's prose, not a reason to keep a weaker assertion.
+
+Worth porting from mine, and nothing else: the `D92_SIZES` env override, so the harness can be
+re-run in minutes instead of half an hour. It is orthogonal to the fix.
+
+**Rule of thumb this cost me:** "never edit a test to make it pass" is about not weakening a test
+to match broken behaviour. It does not license fixing the *fixture* so a stale assertion goes
+quiet — that is the same error wearing better clothes. The behaviour was correct; the assertion was
+a fixture fact; restating it as a law is the repair.
 
 ---
 

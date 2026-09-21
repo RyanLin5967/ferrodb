@@ -38,12 +38,30 @@ consequences visible against the pre-D89 banked numbers:
     share a leaf; a content-defined boundary can fall between them. `skip_theirs_unchanged` read
     2, 2, 1, 1, 0 across the five sizes where the pre-D89 curve had 0 at every one, so
     `assert_eq!(con_theirs, 0)` failed and the example was RED on main.
-The fix (d7a6f64) takes each contested pair OUT OF A LEAF — two entries of one leaf, co-resident
-by construction under any chunker — and `arm()` re-reads that premise off the tree and asserts it.
-The counter assertion is untouched: the workload was wrong, not the assertion.
-⚠ `cdc-boundary` diagnosed the same failure independently on `D89-curve` (94bc632), reaching the
-same straddle counts (2,2,1,1,0, summing to 6) against the same rule totals. Two derivations
-agreeing on mechanism AND integers. That fix restates the assertion instead; only one should land.
+⚠⚠ THIS RUN USED THE HARNESS AT d7a6f64, WHICH IS THE FIX RECOMMENDED AGAINST. READ ON.
+Two fixes for this RED exist, derived independently and agreeing on both the mechanism and the
+integers (straddle counts 2,2,1,1,0 = 6, against rule-2 and rule-3 totals of 6 and 6):
+  * d7a6f64 (this session) changes the WORKLOAD so the old `contested == 0` assertion holds again,
+    by drawing each pair from inside one leaf.
+  * 94bc632 (`cdc-boundary`, branch D89-curve) keeps the original keys and restates the assertion
+    as the LAW: `skip_theirs_unchanged == split_pairs`, where `split_pairs` is counted by asking
+    the tree which pairs straddle a leaf boundary.
+⇒ **94bc632 IS THE ONE TO LAND.** d7a6f64's assertion is satisfiable BY CONSTRUCTION — it is true
+because the workload was arranged so nothing can fire, which is the exact vacuity the anti-vacuity
+section below exists to prevent. 94bc632 predicts an exact nonzero from the tree, fails in either
+direction, and was fire-checked by inversion (1 against 3 at N=16000). See bench/d110_wire_merge3.md.
+
+⇒ SO THE CONTESTED COLUMN BELOW WILL NOT REPRODUCE under 94bc632: this run's workload has zero
+straddling pairs by construction (skip_theirs_unch = 0 at every N), while 94bc632's keeps the
+original keys and will show 2, 2, 1, 1, 0. **The CLAIM is unaffected, and that is the point** —
+`nodes_read` tracks DEPTH under both workloads, measured both ways on this box at 62ee6e0:
+      original (straddling) keys:  nodes_read 25 -> 39  = x1.56, depth 3 -> 4
+      leaf-drawn (this run) keys:  nodes_read 27 -> 39  = x1.44, depth 3 -> 4
+  against pages x253.6 either way. A complexity class that survives both workloads is the result;
+  the individual integers in the contested table are a property of whichever harness produced them.
+⚠ One property 94bc632 gives up: with some pairs straddling, the contested arm is a MIXTURE, so
+`nodes_read` there is no longer a clean upper bound on the descent. Caveat for the prose, not a
+reason to keep the weaker assertion.
 
 ANTI-VACUITY — three checks, asserted inside the harness so a bad run fails rather than prints:
   1. Every arm asserts `root_fast_path == None`; a root-level O(1) rule would retire the merge and
