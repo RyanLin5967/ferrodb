@@ -151,10 +151,12 @@ two HashMap id->slot lookups cost more than a ten-step walk over a hot dense arr
 4.3x ahead at depth 100. This is reported rather than hidden: a caller that knows it is shallow
 should keep walking, and the win is specifically in the deep regime the project aims at.
 
-WHY THE CLOCK IS NOT THE PROOF. Load was 24-45 throughout. The load-independent instrument is
+WHY THE CLOCK IS NOT THE PROOF. Load was 22-45 throughout. The load-independent instrument is
 walk_steps, which is exactly linear in D by construction, against an index whose climb performs
 popcount(depth delta) <= floor(log2 D)+1 array indexings — 17 at depth 100000 versus 200000. The
-clock corroborates the class; the step count establishes it.
+clock corroborates the class; the step count establishes it. See the MECHANISM CHECK section at
+the end, which measures the per-query constant directly and confirms what the flat curve is made
+of.
 
 ## MAX_BRANCH_DEPTH VERDICT
 
@@ -179,3 +181,43 @@ and the walk is still there at HEAD.
 Likewise, nothing yet CALLS this module. It is a correct, measured, tested structure with no
 production caller — the same state MAX_BRANCH_DEPTH's `collapse` was in when D60 found it, which
 is worth saying out loud rather than discovering later.
+
+## MECHANISM CHECK — the shallow-depth crossover, measured rather than asserted
+
+The reading above claimed the index loses below ~depth 30 "because two HashMap id->slot lookups
+cost more than a ten-step walk". That is a mechanism, so it was measured. `depth1hash_ns` times
+`VersionGraph::depth`, which is exactly ONE hash lookup and NO climb.
+
+  depth        1 hash    is_ancestor    2 x hash    climb remainder
+     10          10.7           21.6        21.4               0.2
+    100           9.0           21.1        18.0               3.1
+   1000           9.1           24.0        18.2               5.8
+  10000          10.0           20.4        20.0               0.4
+ 100000           8.9           22.6        17.8               4.8
+
+CONFIRMED. One hash lookup is 8.9-10.7 ns and FLAT in depth. Two of them account for 78-99% of
+`is_ancestor`; the climb itself is the 0.2-5.8 ns remainder, for 2 array indexings at depth 10 and
+up to 17 at depth 100000. The stated mechanism is the right one.
+
+Two consequences worth recording:
+
+  * It explains why `anc_index_ns` reads FLAT rather than logarithmic. The log term is real but is
+    a handful of nanoseconds, swamped by a ~19 ns constant that does not vary with depth. The
+    curve is flat because of the constant, not because the algorithm is O(1) — it is O(log d).
+
+  * There is ~19 ns of headroom for any caller that already holds slot handles rather than
+    `BranchId`s. Not taken here: the API is `BranchId`-shaped because that is what every caller in
+    the branch engine holds, and inventing a handle type to win 19 ns on an operation that just
+    beat the alternative by 1587x would be optimising the wrong end.
+
+## run 4 — MECHANISM CHECK for the shallow crossover  load=25.70 30.74 40.14
+# D95 ancestry curve. ferrodb at bdb36f032961
+# profile=release  arms=walk,index  two chains of depth D off one root
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns   walk_steps  index_nodes
+      10            3.6           21.6        0.2            6.9           26.1        0.3           98.6           10.7           20           21
+     100           89.5           21.1        4.2          100.1           27.9        3.6          136.9            9.0          200          201
+    1000         1010.4           24.0       42.1         1019.4           44.3       23.0          146.1            9.1         2000         2001
+   10000         3055.2           20.4      149.4         9711.5           39.8      244.1          172.2           10.0        20000        20001
+  100000        35827.1           22.6     1587.0        82683.4           50.7     1632.2          247.6            8.9       200000       200001
+# rc=0
+
