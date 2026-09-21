@@ -575,6 +575,17 @@ impl ArenaPageStore {
         self.state.lock().unwrap().pending.len()
     }
 
+    /// Branches currently holding a fillable extent — the length of the `current` map.
+    ///
+    /// **D99.** This is the integer a scan of that map costs, and it is reported instead of a
+    /// duration wherever possible: this box runs a build fleet, so a wall-clock figure is an upper
+    /// bound and nothing better, while an entry count is immune to load. `free_arena` used to walk
+    /// this map once per freed extent; it now does one hash probe, and the harness prints this
+    /// number beside the timing so the two can be read against each other.
+    pub fn current_arena_count(&self) -> usize {
+        self.state.lock().unwrap().current.len()
+    }
+
     /// The branch that owns `arena`, or `None` if the extent has been freed.
     ///
     /// **D40.** This is how `reaper::sweep_touched_extents` asks about a handful of named arenas
@@ -825,6 +836,15 @@ impl ArenaPageStore {
             e.next_free = to;
         }
         st.fill_unknown.insert(arena);
+    }
+
+    /// Test-only: how many arenas are still under fill suspicion. Nothing in the engine asks this
+    /// — it exists so a test can assert that `free_arena` gives the entry back, which is invisible
+    /// from `extent_is_empty` (that already answers false for a missing extent, so a leaked
+    /// suspicion and a collected one look identical from outside).
+    #[cfg(test)]
+    pub fn debug_fill_unknown_len(&self) -> usize {
+        self.state.lock().unwrap().fill_unknown.len()
     }
 
     /// **D85.** Recover a restored extent's true fill by probing its pages, and clear the suspicion.
@@ -1652,6 +1672,15 @@ impl PageStore for ArenaPageStore {
         st.recycled.remove(&arena);
         st.pending.retain(|p| p.arena_id != arena);
         st.claim_epoch.remove(&arena);
+        // **D99 — the one per-arena map this used to leave behind.** `load_state` seeds
+        // `fill_unknown` with EVERY restored extent and only `resolve_fill` ever clears an id
+        // from it. An extent freed before anything probed its fill therefore left its id in the
+        // set for the rest of the process's life, and since arena ids are never reissued nothing
+        // could ever collect it. Not a correctness bug — `extent_is_empty` already answers false
+        // for a missing extent, so the stale entry changes no decision — but it is per-arena state
+        // on a path whose whole job is to give per-arena state back, and at 10^6 restored extents
+        // it is the set, not the leak, that is the wrong shape.
+        st.fill_unknown.remove(&arena);
         // **D102 — the whole extent's ids stop naming these pages, so their bases stop being
         // theirs.** `release_page` does this one id at a time; freeing an extent bypasses it
         // entirely (that bypass is the reaper's fast path and the reason arenas exist), so the
@@ -2604,6 +2633,30 @@ mod tests {
         // away for free and a lookup has to earn.
         assert_eq!(h.store.arena_for(a).unwrap(), aa, "freeing b's extent moved a off its own");
         assert_eq!(h.store.arena_for(c).unwrap(), ac, "freeing b's extent moved c off its own");
+    }
+
+    /// **D99 — freeing an extent hands back EVERY per-arena map entry, `fill_unknown` included.**
+    ///
+    /// It is the only one `free_arena` used to leave behind, and only `resolve_fill` ever clears
+    /// an id from that set — which nothing calls for an extent that no longer exists. Arena ids
+    /// are never reissued, so a leaked suspicion could never be collected by any later path.
+    #[test]
+    fn freeing_an_extent_gives_back_its_fill_suspicion_too() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(b).unwrap();
+
+        // The state a restore leaves: `load_state` marks every restored extent fill-unknown.
+        h.store.debug_set_next_free(arena, 0);
+        assert_eq!(h.store.debug_fill_unknown_len(), 1, "fixture: the extent is not under suspicion");
+
+        h.store.free_arena(arena).unwrap();
+
+        assert_eq!(
+            h.store.debug_fill_unknown_len(),
+            0,
+            "the freed extent is still under fill suspicion, and nothing will ever collect it"
+        );
     }
 
     /// The `get` guard, which the scan also had: freeing an extent the owner has ALREADY moved off
