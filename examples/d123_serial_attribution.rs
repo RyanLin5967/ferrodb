@@ -417,7 +417,35 @@ fn mode_f1(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps
                 forks_n = a.forks;
             }
         }
+        // ⭐ RAW FIRST. Print the whole rep x level matrix before any summary, so a later reader
+        // can redo the analysis without re-running the box. The first clean F1 attempt was
+        // noise-dominated (within-level spread 51-139% against level differences of 14-54%) and
+        // only the medians had been printed, so nothing could be re-analysed from the artifact.
+        println!("  RAW forks/sec, rep x level (level order rotated each rep):");
+        print!("  {:>5}", "rep");
+        for lvl in 0..4 { print!("{:>12}", format!("L{lvl}")); }
+        println!("{:>12}", "L3/L0");
+        let mut paired: Vec<f64> = Vec::new();
+        for rep in 0..reps {
+            print!("  {:>5}", rep);
+            for lvl in 0..4 { print!("{:>12.1}", obs[lvl][rep]); }
+            let r = obs[3][rep] / obs[0][rep];
+            paired.push(r);
+            println!("{:>11.2}x", r);
+        }
+        println!();
+        // ⭐ PAIRED. The four levels of one rep run back to back inside ~25 s, so a load ramp over
+        // the whole battery is common-mode WITHIN a rep and cancels in the ratio. Comparing
+        // level medians ACROSS reps does not cancel it, which is why the unpaired summary below
+        // can be noise while this is not. Median of per-rep ratios, not ratio of medians.
+        let mut pr = paired.clone();
+        let mp = median(&mut pr);
+        pr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("  ⭐ PAIRED L3/L0 per rep: median {:.2}x   min {:.2}x   max {:.2}x", mp, pr[0], pr[pr.len()-1]);
+        println!("     F1 fires iff this median is within +/-10% of 1.00x.");
+        println!();
         let base = median(&mut obs[0].clone());
+        println!("  UNPAIRED summary (kept for comparison; drift does NOT cancel here)");
         println!("  T={t}, reps={reps}, N={forks_n} forks per arm");
         println!(
             "  {:>5} {:>11} {:>10} {:>10} {:>8} {:>9} {:>9} {:>8} {:>13}",
@@ -511,6 +539,67 @@ fn mode_perturb2(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize
     println!("  the instrument, and the durations stand.");
 }
 
+/// ⭐ AMENDMENT 7's DECISIVE ARM: is it NEW PAGES, or is it just "work under the lock"?
+///
+/// `k` identical `upsert` calls are added to the critical section. In one arm they hit a fixed key
+/// set (re-dirtying pages already dirty, allocating nothing); in the other, a key unique per fork
+/// (allocating and dirtying new pages). Same call, same value, same place in the section — key
+/// novelty is the only variable.
+///
+/// The row already knows that fixed-key extras cost 0.68x at 64 threads, i.e. CHEAPER under
+/// contention, while `write_record` and `child_key_insert` cost 2.29x and 2.43x. If novelty is the
+/// variable, the new-key arm must move from 0.68x toward those. If both arms behave alike, novelty
+/// is not the variable and the mechanism goes back to unattributed — which is the F3 answer, and
+/// is pre-registered as acceptable.
+///
+/// Additive: no stub, no correctness compromise, valid regardless of every other arm.
+fn mode_novelty(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps: usize) {
+    banner("MODE=novelty (Amendment 7: new-key vs fixed-key work under the lock)");
+    const K: u64 = 8;
+    println!("k = {K} extra upserts per fork, probe ON (PH_EXTRA is read directly; no fit).");
+    println!("Per-upsert cost = PH_EXTRA / k, median of {reps} reps.");
+    println!();
+    let mut cost: Vec<Vec<f64>> = vec![vec![f64::NAN; 2]; threads.len()];
+    for (ti, &t) in threads.iter().enumerate() {
+        for (ni, &new) in [false, true].iter().enumerate() {
+            probe::set_extra_new_keys(new);
+            probe::configure(true, 0, K);
+            let mut v: Vec<f64> = Vec::new();
+            for rep in 0..reps {
+                let tag = format!("nov_{t}_{}_{rep}", if new { "new" } else { "fix" });
+                let a = run_arm(dir, &tag, n, t, warm);
+                v.push(a.ms(probe::PH_EXTRA) / K as f64);
+            }
+            cost[ti][ni] = median(&mut v);
+        }
+    }
+    probe::set_extra_new_keys(false);
+    println!("  {:>8} {:>18} {:>18}", "threads", "FIXED key ms/ups", "NEW key ms/ups");
+    for (ti, &t) in threads.iter().enumerate() {
+        println!("  {:>8} {:>18.5} {:>18.5}", t, cost[ti][0], cost[ti][1]);
+    }
+    println!();
+    if threads.len() >= 2 {
+        let (lo, hi) = (0, threads.len() - 1);
+        let fix = cost[hi][0] / cost[lo][0];
+        let nw = cost[hi][1] / cost[lo][1];
+        println!(
+            "  T={}/T={} ratio:   FIXED key {:.2}x     NEW key {:.2}x",
+            threads[hi], threads[lo], fix, nw
+        );
+        println!();
+        println!("  for reference, from bench/d123_raw/30_phases.txt at the same thread counts:");
+        println!("    write_record (new keys)     2.29x");
+        println!("    child_key_insert (new key)  2.43x");
+        println!("    core / envelope / header    0.76-0.78x   (reads and one hot page)");
+        println!();
+        println!("  NEW >> FIXED => novelty is the variable. Since only one thread is ever inside");
+        println!("  `logical`, the counterparty cannot be another forker, so it is the concurrent");
+        println!("  group-commit flush draining the pages this section keeps creating.");
+        println!("  NEW ~= FIXED => novelty is NOT the variable; report UNATTRIBUTED per F3.");
+    }
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "phases".into());
     let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4000);
@@ -536,8 +625,9 @@ fn main() {
         "perturb" => mode_perturb(&dir, n, &threads, warm),
         "f1" => mode_f1(&dir, n, &threads, warm, reps),
         "perturb2" => mode_perturb2(&dir, n, &threads, warm, reps),
+        "novelty" => mode_novelty(&dir, n, &threads, warm, reps),
         other => {
-            eprintln!("unknown mode {other}; expected phases|stub|extra|threads|perturb|f1|perturb2");
+            eprintln!("unknown mode {other}; expected phases|stub|extra|threads|perturb|f1|perturb2|novelty");
             std::process::exit(2);
         }
     }

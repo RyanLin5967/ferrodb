@@ -888,8 +888,11 @@ impl BranchCatalog for TableBranchCatalog {
             let extra = probe::extra_upserts();
             if extra > 0 {
                 let t_extra = probe::mark();
+                // SAME CALL in both arms — only the key's novelty differs. See
+                // `d123_probe::set_extra_new_keys` for why that is the whole experiment.
+                let base = if probe::extra_new_keys() { fork_epoch.0.wrapping_mul(64) } else { 0 };
                 for i in 0..extra {
-                    self.upsert(keys::child(D123_EXTRA_PARENT, i), Vec::new())?;
+                    self.upsert(keys::child(D123_EXTRA_PARENT, base + i), Vec::new())?;
                 }
                 probe::record(probe::PH_EXTRA, t_extra);
             }

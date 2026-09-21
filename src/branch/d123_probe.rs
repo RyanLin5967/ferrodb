@@ -88,6 +88,7 @@ pub const PHASE_NAMES: [&str; NPHASE] = [
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static STUB: AtomicU8 = AtomicU8::new(0);
 static EXTRA: AtomicU64 = AtomicU64::new(0);
+static EXTRA_NEW: AtomicBool = AtomicBool::new(false);
 
 /// Merged totals, written once per thread by [`flush_thread`].
 #[derive(Clone, Copy)]
@@ -116,6 +117,32 @@ pub fn configure(probe: bool, stub: u8, extra: u64) {
     ENABLED.store(probe, Ordering::Relaxed);
     STUB.store(stub, Ordering::Relaxed);
     EXTRA.store(extra, Ordering::Relaxed);
+}
+
+/// ⭐ THE ONE VARIABLE THAT SEPARATES THE SURVIVING MECHANISM (Amendment 7).
+///
+/// The extra upserts of F5 normally hit a FIXED key set, so they re-dirty pages that are already
+/// dirty and allocate nothing. Measured that way they cost **0.68x** at 64 threads — the same work
+/// is CHEAPER under contention, exactly like the read phases. Meanwhile the two phases that insert
+/// NEW keys inflate 2.29x and 2.43x.
+///
+/// With this set, the identical `upsert` call goes to a key unique per fork, so it allocates and
+/// dirties NEW pages. Everything else about the operation is unchanged — same call, same value,
+/// same position in the critical section. **Key novelty is the only variable.**
+///
+/// * new-key extras inflate at T=64 while fixed-key extras do not ⇒ the cost is driven by the
+///   number of DISTINCT/NEW pages the section dirties, which (since only one thread is ever inside
+///   `logical`) can only be interference with the concurrent group-commit flush.
+/// * both behave alike ⇒ novelty is not the variable and the mechanism reverts to unattributed.
+///
+/// Additive, so no correctness is compromised and no stub level is involved.
+pub fn set_extra_new_keys(v: bool) {
+    EXTRA_NEW.store(v, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn extra_new_keys() -> bool {
+    EXTRA_NEW.load(Ordering::Relaxed)
 }
 
 #[inline(always)]
