@@ -136,13 +136,23 @@
 //!   so this direction needs no assumption at all. Any use that only has to answer "did this
 //!   change?" — invalidation, skipping equal subtrees during a *scan*, a cheap changed/unchanged
 //!   probe — is safe.
-//! - **NOT sound against a chosen input:** equal cids do **not** prove the inputs are equal. FNV-1a
-//!   is algebraically simple and trivially collidable by anyone who can choose the bytes being
-//!   hashed — and in a database the bytes being hashed are user-supplied keys and values. So a cid
-//!   equality must never be the *sole* authority for an operation whose wrongness is silent:
-//!   deduplicating storage, declaring a merge conflict-free, or skipping a subtree in a diff whose
-//!   output someone will act on. Those need either a real cryptographic hash or a verifying
-//!   comparison behind the fast path.
+//! - **NOT sound against a chosen input:** equal cids do **not** prove the inputs are equal. There
+//!   is no security argument here at all — FNV-1a is algebraically simple, nothing about this
+//!   construction resists an adversary, and in a database the bytes being hashed are user-supplied
+//!   keys and values. So a cid equality must never be the *sole* authority for an operation whose
+//!   wrongness is silent: deduplicating storage, declaring a merge conflict-free, or skipping a
+//!   subtree in a diff whose output someone will act on. Those need either a real cryptographic
+//!   hash or a verifying comparison behind the fast path.
+//!
+//!   **This clause used to say "trivially collidable", and that was too strong — it is corrected
+//!   here rather than deleted, because the operational rule above is unchanged and only the
+//!   severity was wrong.** "Trivial" is true of *one* 64-bit FNV lane, where meet-in-the-middle is
+//!   around 2^32. It is not established for the two-lane construction below, which needs both
+//!   lanes satisfied at once; a 120-bit birthday bound is 2^60, and nobody has produced a
+//!   chosen-input collision against it. The honest statement is that the cost is **unquantified,
+//!   somewhere between those two**, and that an unquantified cost is reason enough to obey the
+//!   rule — not that the hash is known to be cheap to break. Do not re-strengthen this without a
+//!   collision to point at.
 //! - For **accidental** collisions on non-adversarial data the 128-bit width is the whole argument:
 //!   assuming the finalizer approximates a random function (asserted by the avalanche test below,
 //!   not merely hoped for), a collision needs on the order of 2^64 distinct subtrees.
