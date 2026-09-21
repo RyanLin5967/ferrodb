@@ -200,6 +200,97 @@ impl NodeIdentity for SubtreeHash {
     }
 }
 
+/// Memoising adapter for an identity function that is **computed on demand and keeps no memo of
+/// its own** — notably `cow::cid::subtree_cid`, whose own documentation says "Cost is the whole
+/// subtree, every time — there is no memo table".
+///
+/// Handing such a function straight to [`NodeIdentity::id_of`] is a trap: every skip test would
+/// cost a full subtree walk, so the diff would do strictly *more* work than the O(N) path it
+/// replaces while still reporting skips. This wrapper is the one line that fixes it:
+///
+/// ```ignore
+/// let ident = MemoIdentity::new(|p| ferrodb::cow::cid::subtree_cid(&tree, p));
+/// ident.warm(&tree, base)?;
+/// ident.warm(&tree, head)?;
+/// let report = diff(&tree, base, head, &ident)?;
+/// assert_eq!(ident.misses(), 0);
+/// ```
+///
+/// **`warm` is not optional.** An unwarmed page falls back to page identity rather than computing
+/// on the spot, because computing there is exactly the per-comparison blowup this type exists to
+/// prevent. [`MemoIdentity::misses`] counts those fallbacks so an unwarmed provider is visible
+/// instead of silently slow; the fallback itself is sound in this store, so the *answer* is right
+/// either way.
+///
+/// Warming costs O(N · depth) here, because the wrapped function re-walks each subtree from
+/// scratch. [`SubtreeHash`] folds bottom-up and warms in O(N) — prefer it unless the wrapped
+/// digest is specifically what you need.
+pub struct MemoIdentity<F> {
+    compute: F,
+    memo: RwLock<HashMap<PageId, [u8; 16]>>,
+    misses: AtomicUsize,
+}
+
+impl<F> MemoIdentity<F>
+where
+    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+{
+    pub fn new(compute: F) -> Self {
+        MemoIdentity { compute, memo: RwLock::new(HashMap::new()), misses: AtomicUsize::new(0) }
+    }
+
+    /// Compute and memoise an id for every page under `root`. Returns how many were added.
+    pub fn warm(&self, tree: &CowTree, root: PageId) -> Result<usize, FerroError> {
+        let mut added = 0usize;
+        for p in tree.walk_pages(root)? {
+            if self.memo.read().unwrap().contains_key(&p) {
+                continue;
+            }
+            let id = tag_content((self.compute)(p)?);
+            self.memo.write().unwrap().insert(p, id);
+            added += 1;
+        }
+        Ok(added)
+    }
+
+    /// Pages that were compared without having been warmed, i.e. answered by the page-identity
+    /// fallback. Non-zero after a diff means the skip was cruder than the wrapped digest allows.
+    pub fn misses(&self) -> usize {
+        self.misses.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn warmed(&self) -> usize {
+        self.memo.read().unwrap().len()
+    }
+}
+
+impl<F> NodeIdentity for MemoIdentity<F>
+where
+    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+{
+    fn id_of(&self, page: PageId) -> [u8; 16] {
+        match self.memo.read().unwrap().get(&page) {
+            Some(id) => *id,
+            None => {
+                self.misses.fetch_add(1, AtomicOrdering::Relaxed);
+                page_id_identity(page)
+            }
+        }
+    }
+}
+
+/// Stamp a wrapped digest into the content domain.
+///
+/// The wrapped function's codomain is the whole 16 bytes, so one of its outputs could in principle
+/// equal a page-identity fallback value and produce a false skip. Overwriting byte 0 spends 8 of
+/// the wrapped digest's bits to buy the same structural non-collision the rest of this module has,
+/// which is the better side of that trade: the fallback is reachable on any unwarmed page, while
+/// 120 bits is still far more than the birthday bound for any tree that fits on a disk.
+fn tag_content(mut id: [u8; 16]) -> [u8; 16] {
+    id[0] = TAG_CONTENT;
+    id
+}
+
 /// Second FNV stream IV, so the two halves of the id are not the same function of the input.
 const SECOND_IV: u64 = FNV_OFFSET ^ 0x9e37_79b9_7f4a_7c15;
 
@@ -966,6 +1057,47 @@ mod tests {
             by_hash.visited, 0,
             "the content hash should have matched at the root and read nothing"
         );
+    }
+
+    /// The adapter an on-demand digest such as `cow::cid::subtree_cid` has to go through. The
+    /// stand-in below is folded the same way; what is under test is the wrapper's contract, not
+    /// the digest.
+    #[test]
+    fn a_warmed_memo_identity_skips_and_never_falls_back() {
+        let f = Fixture::new();
+        let base = f.build(2000);
+        let mut head = f.fork(B1, base);
+        head = f.put(head, B1, &key(11), "changed");
+
+        let inner = SubtreeHash::new(f.store_dyn());
+        let m = MemoIdentity::new(|p| inner.stamp(p));
+        let warmed = m.warm(&f.tree, base).unwrap() + m.warm(&f.tree, head).unwrap();
+        assert_eq!(warmed, m.warmed());
+
+        let r = diff(&f.tree, base, head, &m).unwrap();
+        assert_eq!(r.changes.len(), 1);
+        assert_eq!(m.misses(), 0, "a fully warmed memo still fell back to page identity");
+        assert!(r.skipped_subtrees > 0);
+        assert_eq!(m.id_of(base)[0], TAG_CONTENT, "a warmed id must sit in the content domain");
+    }
+
+    /// The unwarmed half. The fallback must keep the ANSWER right — it is only the skip that gets
+    /// cruder — and it must be visible in `misses()` rather than silent.
+    #[test]
+    fn an_unwarmed_memo_identity_still_answers_correctly_and_says_so() {
+        let f = Fixture::new();
+        let base = f.build(2000);
+        let mut head = f.fork(B1, base);
+        head = f.put(head, B1, &key(11), "changed");
+
+        let inner = SubtreeHash::new(f.store_dyn());
+        let m = MemoIdentity::new(|p| inner.stamp(p));
+        assert_eq!(m.warmed(), 0);
+
+        let cold = diff(&f.tree, base, head, &m).unwrap();
+        let warm = diff(&f.tree, base, head, &PageIdentity).unwrap();
+        assert_eq!(cold.changes, warm.changes, "the fallback changed the answer");
+        assert!(m.misses() > 0, "an unwarmed memo reported no misses — the counter is dead");
     }
 
     #[test]
