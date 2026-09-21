@@ -47,44 +47,44 @@
 //! numbers, and the reversal between them, are in
 //! `same_data_in_two_orders_converges_to_one_partition_cid`.
 //!
-//! # The delete path is still open, and an earlier version of this header said otherwise
+//! # The delete path, twice wrong before it was right
 //!
-//! `CowTree::delete` used to empty a leaf without unlinking it. `CowTree::unlink_up` fixes that,
-//! and it is a real fix — 22 empty leaves become 0 on the fixture below, and the pages are freed
-//! rather than merely dropped (45 live pages to 1 after deleting every key of 1000).
+//! `CowTree::delete` used to empty a leaf without unlinking it. Fixing that removed 22 empty
+//! leaves on the fixture below and freed their pages (45 live pages to 1 after deleting every key
+//! of 1000) — and an earlier version of this header then claimed the delete path converged. It
+//! did not. That claim rested on a single delete SHAPE: a contiguous suffix, which is the one
+//! shape that cannot destroy an interior content boundary, because the only terminator it removes
+//! belongs to the last leaf and the last leaf may end anywhere.
 //!
-//! **It does not make the delete path converge, and this header previously claimed it did.** That
-//! claim rested on a diagnosis taken from a single delete shape. Measured across two shapes, with
-//! the same 1000-row build and the same comparison:
+//! Adversarial review changed only the shape — one interior boundary key — and found 0 empty
+//! leaves with the partition still wrong: 28 + 9 rows where a clean build makes one leaf of 37.
+//! Deleting the entry that *terminates* a leaf erases that leaf's boundary, and `leaf_put`'s
+//! re-chunk can only ever split a leaf further, never rejoin one, so the two stayed split
+//! permanently.
+//!
+//! `CowTree::merge_right` closes it, on both paths that can erase a terminator — delete, and an
+//! overwrite that makes a value shorter. Measured either side:
 //!
 //! ```text
-//!                                    main 1758b3b              with unlink_up
-//!   suffix, delete 500..1000     44 leaves, 22 empty, agree   22 leaves, 0 empty, agree
-//!   one interior boundary key    44 leaves,  0 empty, DISAGREE 44 leaves, 0 empty, DISAGREE
+//!                            before merge_right          after
+//!   suffix delete         22 leaves, 0 empty, agree    unchanged, still agrees
+//!   interior boundary     44 vs 43 leaves, DISAGREE    agrees, leaf for leaf
+//!   value-length change   94 vs 93 leaves, DISAGREE    agrees
 //! ```
 //!
-//! The interior-key row is **byte-identical either side of the fix**, because there was never an
-//! empty leaf there to unlink. Deleting the key that *terminates* a leaf destroys that leaf's
-//! content boundary, and the two leaves the content now calls for a single leaf of stay split:
-//! 28 + 9 rows where a clean build produces one leaf of 37. Repairing that means merging with the
-//! right-hand neighbour — the sibling access this layout deliberately lacks (`cow::node`'s header),
-//! and the thing `unlink_up`'s own doc declines to do.
+//! # Where it still stops, stated as a measured boundary rather than a slogan
 //!
-//! A contiguous suffix is the **one shape that cannot expose this**, because the only terminator it
-//! destroys belongs to the last leaf, and the last leaf is allowed to end anywhere. The fixture
-//! picked that shape, so it returned the calm answer and an earlier version of this module read it
-//! as the whole story. Found by adversarial review, not by these tests:
-//! `artie-research/frontier/review-chunker.md` F1, probes at `review-chunker-attack` `5e13e98`,
-//! reproduced here against both trees before being written down.
+//! A join has exactly ONE boundary — the neighbour's last entry — so deleting terminators
+//! repeatedly in one region grows a single run without bound. Once that run no longer fits a page,
+//! `chunker::leaf_cuts` falls back to cutting it by SIZE, and those cuts are not content
+//! boundaries. Measured: 40 terminator deletes in one region leave 205 leaves, the widest 96 rows,
+//! 40 of them cut by the byte cap. No repair can avoid that — the content genuinely has no
+//! boundary left to cut on — and it is `chunker::CHUNK_SHIFT`'s own documented exception reached
+//! on purpose rather than by an `e^-8` accident. `deleting_every_boundary_drives_chunks_over_a_page`
+//! pins it.
 //!
-//! So the honest reach: **a cid compares two trees built by insertion exactly, and two trees whose
-//! histories differ by a delete only when the delete destroyed no interior boundary.**
-//! `a_delete_of_an_interior_boundary_key_must_not_change_the_partition` is the `#[ignore]`d
-//! criterion for the rest, and it needs a neighbour merge, not another unlink.
-//!
-//! `cow::chunker`'s own exception still stands alongside this one: a chunk longer than a page is
-//! re-cut at a finer target, and a leaf holding part of an over-long chunk cannot see the rest of
-//! it. That is argued there, not here.
+//! So the reach: **a cid compares two trees holding the same rows exactly, unless their histories
+//! drove some chunk past a page.** Every leaf still fits, always; that guarantee has no exception.
 //!
 //! `cow::diff` defines a `NodeIdentity` seam meant to be driven by [`subtree_cid`] through its
 //! `MemoIdentity` adapter — this module deliberately does not wire itself in, because memoising
@@ -877,7 +877,6 @@ mod tests {
     /// `artie-research/frontier/review-chunker.md` F1; probe `a9` at `review-chunker-attack`
     /// `5e13e98`, reproduced against both trees before this was written.
     #[test]
-    #[ignore = "needs a neighbour merge, which this layout cannot do without sibling access"]
     fn a_delete_of_an_interior_boundary_key_must_not_change_the_partition() {
         let (_d, cat, t) = tree();
         let all: Vec<u32> = (0..1000).collect();
