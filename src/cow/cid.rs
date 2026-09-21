@@ -26,6 +26,27 @@
 //! This is the primitive ForkBase, Noms and Dolt are built on. ferrodb had nothing like it:
 //! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/` returned zero.
 //!
+//! # What it found, and where it stands
+//!
+//! The instrument's first use was to measure whether the tree deserved one. It did not: at the
+//! commit that introduced this file, 1000 rows inserted ascending and shuffled produced trees
+//! holding byte-identical data with **zero** leaves in common, because a byte-balanced split put
+//! the boundaries wherever insertion history happened to leave them. `cow::chunker` then made every
+//! boundary a function of the content, and the same fixture now agrees on all 45 leaves. Both
+//! numbers, and the reversal between them, are in
+//! `same_data_in_two_orders_converges_to_one_partition_cid`.
+//!
+//! One gap is still open and is pinned by a test rather than a comment: `CowTree::delete` empties a
+//! leaf without unlinking it, so 500 rows inserted directly and 500 rows left over from deleting
+//! half of 1000 have an identical *live* partition but differ by 20 empty leaves — and therefore
+//! differ in partition cid. See `a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`.
+//! Stated as a reach: **a cid compares two trees built by insertion exactly, and reports a false
+//! difference between two trees whose histories differ by a delete.**
+//!
+//! `cow::diff` defines a `NodeIdentity` seam meant to be driven by [`subtree_cid`] through its
+//! `MemoIdentity` adapter — this module deliberately does not wire itself in, because memoising
+//! policy belongs to the consumer.
+//!
 //! # The hash is NOT cryptographic
 //!
 //! [`Hasher128`] is a hand-rolled two-lane FNV-1a variant with a splitmix64-style finalizer. Zero
@@ -306,7 +327,26 @@ pub fn ordered_leaf_cids(tree: &CowTree, root: PageId) -> Result<Vec<Cid>, Ferro
 ///
 /// Ignores `PageId`s entirely. Does **not** ignore where the leaf boundaries fall — that is the
 /// measurement this module exists to make, see
-/// `same_data_inserted_in_two_orders_yields_different_partition_cids`.
+/// [`same_data_in_two_orders_converges_to_one_partition_cid`](self#tests).
+///
+/// # It is not a tree identity, and must not be used as one
+///
+/// This folds [`ordered_leaf_cids`] and **nothing else**, so it is blind to everything above the
+/// leaf level: the tree's height, its separator keys, and its internal fanout. Two well-formed
+/// trees over the same leaves — one of height 2, one of height 3, both answering `get` identically
+/// on every key — were built and measured as sharing a partition cid while their
+/// [`subtree_cid`]s differed:
+///
+/// ```text
+/// leaf_partition_cid  A=c43e68dee8bef6fb7eb6974ad94ec6d7  B=c43e68dee8bef6fb7eb6974ad94ec6d7
+/// subtree_cid         A=903bcc9ba5e969b501d3a073ca392352  B=ecc0737314252562d204f40cedd731b5
+/// ```
+///
+/// That is by construction and is the right behaviour for the question this function asks — "is the
+/// same data cut into the same leaves?" — which is exactly what an insertion-order invariance check
+/// wants and what tree height would only add noise to. But it means a caller comparing two trees for
+/// **sameness** wants [`subtree_cid`]. Reproduction: branch `D89-falsify`, commit `3c2a132`,
+/// `examples/d89_falsify2.rs` attack J.
 pub fn leaf_partition_cid(tree: &CowTree, root: PageId) -> Result<Cid, FerroError> {
     let leaves = ordered_leaf_cids(tree, root)?;
     let mut h = Hasher128::new(TAG_PARTITION);
@@ -392,6 +432,19 @@ mod tests {
 
     fn child(cat: &LogBranchCatalog) -> BranchId {
         cat.fork(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap().branch_id
+    }
+
+    /// The leaf partition as raw entries, in key order — **no hash anywhere**.
+    ///
+    /// Every `assert_eq` on two cids leans on the hash's unsound direction (equal cids do not prove
+    /// equal inputs; see the module header). Where a test's conclusion is an *equality*, it
+    /// establishes it on these bytes first and lets the cid assertion be the narrower claim that
+    /// the instrument agrees with the bytes. Without this a hash collision would read as a
+    /// property holding.
+    fn ordered_leaf_entries(t: &CowTree, root: PageId) -> Vec<LeafEntries> {
+        let mut out = Vec::new();
+        super::for_each_leaf(t, root, 0, &mut |e: &LeafEntries| out.push(e.clone())).unwrap();
+        out
     }
 
     /// A fixed permutation of `0..n`, with no dependency and no randomness.
@@ -535,7 +588,16 @@ mod tests {
     }
 
     /// An unchanged subtree keeps its cid across an edit elsewhere. This is the O(1) skip: a diff
-    /// comparing these two roots can drop this whole subtree on a 16-byte comparison.
+    /// comparing two roots can drop every untouched leaf on a 16-byte comparison.
+    ///
+    /// **The claim is a law, not a count.** The first version of this test asserted that the leaf
+    /// *count* was unchanged and that only index 0 moved. `cow::chunker` (landed after this module)
+    /// broke that fixture without touching the property it was defending: overwriting key 0 with a
+    /// longer value now adds a content boundary, so the tree went 45 leaves -> 46 and the assertion
+    /// failed on an arithmetic detail while the thing being claimed still held exactly. Measured
+    /// across key positions 0, 1, 137, 500, 998 and 999, the invariant that actually holds is
+    /// sharper and indifferent to the count: **exactly one leaf cid changes**, wherever the edit
+    /// lands and whether or not a boundary moves with it.
     #[test]
     fn a_subtree_untouched_by_an_edit_keeps_its_cid() {
         let (_d, cat, t) = tree();
@@ -543,51 +605,76 @@ mod tests {
         let before = ordered_leaf_cids(&t, base).unwrap();
         assert!(before.len() > 2, "tree is {} leaves; the claim would be vacuous", before.len());
 
-        let b = child(&cat);
-        let e = cat.next_epoch();
-        let head = t.insert(base, b, e, &k(0), b"edited").unwrap();
-        let after = ordered_leaf_cids(&t, head).unwrap();
-
-        assert_eq!(before.len(), after.len(), "the edit resplit the tree; wrong fixture for this claim");
-        assert_ne!(before[0], after[0], "the edited leaf must have moved");
+        // "How many survived" is counted by membership, which is only a sound measure while the
+        // leaf cids are distinct. Establish that first rather than assuming it — an empty leaf
+        // repeated (see `a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`) would make
+        // the count a multiset error rather than an answer.
+        let distinct: std::collections::HashSet<&Cid> = before.iter().collect();
         assert_eq!(
-            before[1..],
-            after[1..],
-            "leaves the edit did not touch changed cid; the cid is picking up something physical"
+            distinct.len(),
+            before.len(),
+            "fixture has duplicate leaf cids; the survivor count below would be a multiset error"
         );
+
+        // Every position, not one: an edit in the first leaf and an edit in the last disturb the
+        // leaf count differently, and the claim is supposed to be indifferent to that.
+        for key in [0u32, 1, 137, 500, 998, 999] {
+            let b = child(&cat);
+            let e = cat.next_epoch();
+            let head = t.insert(base, b, e, &k(key), b"edited").unwrap();
+            let after = ordered_leaf_cids(&t, head).unwrap();
+
+            let survived = before.iter().filter(|c| after.contains(c)).count();
+            assert_eq!(
+                survived,
+                before.len() - 1,
+                "editing key {key} disturbed {} of {} leaves ({} -> {} leaves); an edit must \
+                 disturb exactly one, or the skip is not proportional to the change",
+                before.len() - survived,
+                before.len(),
+                before.len(),
+                after.len()
+            );
+        }
     }
 
     // ---- THE MEASUREMENT -------------------------------------------------------------------------
 
-    /// **The frontier gap, measured.**
+    /// **The frontier property, measured — and it now holds.**
     ///
     /// The same 1000 key/value pairs, inserted ascending and in a fixed shuffled order. The two
-    /// trees hold byte-identical data — `leaf_content_cid` proves it, and that assertion is what
-    /// stops this test from passing for the boring reason that the two trees differ. Yet their
-    /// `leaf_partition_cid`s differ, because ferrodb splits a full node at a byte-balanced midpoint
-    /// of *whatever it happens to contain at that moment*. Where a leaf boundary falls is therefore
-    /// a function of insertion history, not of content.
+    /// trees hold byte-identical data (`leaf_content_cid` is the control, and it is what stops this
+    /// from passing for the boring reason that the two trees differ), and they are now cut into the
+    /// **same leaves** — so every cid agrees, and a diff between two unrelated lineages can skip
+    /// every one of them on a 16-byte comparison.
     ///
-    /// The consequence is the thing that matters: two branches that converge on the same rows by
-    /// different routes have no equal subtrees to skip. Content addressing buys nothing here yet,
-    /// because nothing is addressed by content — only by where a split happened to land.
+    /// # This test asserted the opposite when it landed, and the reversal is the point
     ///
-    /// # What must change for this to become an equality assertion
+    /// At commit `36011fc` this file asserted **inequality**, and was right to. ferrodb then split
+    /// a full node at a byte-balanced midpoint of whatever it happened to hold at that moment, so
+    /// where a leaf ended was a function of insertion history rather than of content. Measured
+    /// then, on this same fixture:
     ///
-    /// The leaf boundaries must be a deterministic function of the content, not of the insertion
-    /// order. That is **content-defined chunking**, the prolly tree of Noms/Dolt/ForkBase: run a
-    /// rolling hash over the entries in key order and cut a leaf wherever the hash's low `k` bits
-    /// are zero, giving an expected leaf size of `2^k` entries and — crucially — a boundary that
-    /// any tree holding these bytes will place identically. The change is in
-    /// `cow::btree`'s split path (`split_point` in `cow::node` is the byte-balanced rule that would
-    /// be replaced), not in this module: `leaf_partition_cid` is already order-agnostic in every
-    /// respect except the one the tree itself imposes.
+    /// ```text
+    /// ascending insert : 9 leaves, partition cid c861c8777435729cecf24521cabccff5
+    /// shuffled  insert : 8 leaves, partition cid d78571b3cea10cbb938cf0dd025d26bf
+    /// content cid (both): 41cfb97ddfba11f00c343ec1bb232fe4
+    /// leaves with an equal cid on both sides: 0 of 9 / 8
+    /// ```
     ///
-    /// When that lands, delete this test and remove the `#[ignore]` from
-    /// [`same_data_in_two_orders_must_converge_to_one_partition_cid`], which asserts the equality
-    /// the fix must produce.
+    /// Zero shared leaves between two trees holding identical rows — two branches that converged on
+    /// the same data by different routes had nothing whatsoever to skip. `cow::chunker` closed it by
+    /// deriving every boundary from the content (a prolly tree / POS-Tree, as in ForkBase, Noms and
+    /// Dolt), and this assertion was inverted in the commit that verified the closure.
+    ///
+    /// The old test did not have to be hunted down. It carried a guard that fired on its own
+    /// obsolescence — *"the partitioning is more content-determined than this test assumes and the
+    /// gap needs restating"* — so the landing of the fix turned the suite red and named the reason,
+    /// instead of leaving a stale claim quietly green. `cow::tests_chunking` proves the same
+    /// convergence over raw entry lists; this proves it at the level of the **instrument a diff
+    /// would actually use**.
     #[test]
-    fn same_data_inserted_in_two_orders_yields_different_partition_cids() {
+    fn same_data_in_two_orders_converges_to_one_partition_cid() {
         let (_d, cat, t) = tree();
         let ascending: Vec<u32> = (0..1000).collect();
         let shuffled = fixed_shuffle(1000);
@@ -599,29 +686,24 @@ mod tests {
         let asc_leaves = ordered_leaf_cids(&t, asc_root).unwrap();
         let shuf_leaves = ordered_leaf_cids(&t, shuf_root).unwrap();
 
-        // Vacuity guard. A single-leaf tree has no boundaries, so a difference could not show.
+        // Vacuity guard. A single-leaf tree has no boundaries, so agreement would prove nothing.
         assert!(
             asc_leaves.len() > 1 && shuf_leaves.len() > 1,
-            "trees are {} and {} leaves; with one leaf there is no partition to differ",
+            "trees are {} and {} leaves; with one leaf there is no partition to agree about",
             asc_leaves.len(),
             shuf_leaves.len()
         );
 
-        // The control. Same rows, same order, byte for byte — so anything below is about shape.
+        // The control. Same rows byte for byte — so everything below is about shape, not data.
         let asc_content = leaf_content_cid(&t, asc_root).unwrap();
         let shuf_content = leaf_content_cid(&t, shuf_root).unwrap();
         assert_eq!(
             asc_content, shuf_content,
-            "the two trees do not even hold the same data; the partition measurement would be \
-             meaningless"
+            "the two trees do not hold the same data; the partition measurement would be meaningless"
         );
 
         let asc_cid = leaf_partition_cid(&t, asc_root).unwrap();
         let shuf_cid = leaf_partition_cid(&t, shuf_root).unwrap();
-
-        // How total the gap is. The partition cids differing could, on its own, be read as nothing
-        // worse than "one tree has an extra leaf". This is the number that refutes that reading:
-        // how many leaves a content-based diff between these two trees could actually skip.
         let shared = asc_leaves.iter().filter(|c| shuf_leaves.contains(c)).count();
 
         // Printed, not just asserted: these numbers are the deliverable.
@@ -629,58 +711,168 @@ mod tests {
         println!("    shuffled  insert : {} leaves, partition cid {}", shuf_leaves.len(), hex(&shuf_cid));
         println!("    content cid (both): {}", hex(&asc_content));
         println!(
-            "    leaves with an equal cid on both sides: {shared} of {} / {} — a content-based \
-             diff between two trees holding IDENTICAL data can skip {shared} of them",
+            "    leaves with an equal cid on both sides: {shared} of {} / {} (was 0 of 9 / 8 at 36011fc)",
             asc_leaves.len(),
             shuf_leaves.len()
         );
-        assert!(
-            shared * 2 < asc_leaves.len(),
-            "{shared} of {} leaves already match across insertion orders; the partitioning is more \
-             content-determined than this test assumes and the gap needs restating",
-            asc_leaves.len()
-        );
 
-        assert_ne!(
-            asc_cid, shuf_cid,
-            "partition cids already agree — content-defined chunking has landed, so delete this \
-             test and un-ignore same_data_in_two_orders_must_converge_to_one_partition_cid"
-        );
-    }
-
-    /// The equality the fix must produce. Ignored because it fails today, by design — it is the
-    /// acceptance criterion for content-defined chunking, written before the work rather than
-    /// after, so it cannot be quietly weakened to match whatever gets built.
-    ///
-    /// Un-ignore this and delete
-    /// [`same_data_inserted_in_two_orders_yields_different_partition_cids`] together, in the commit
-    /// that replaces the byte-balanced split with a rolling-hash boundary.
-    #[test]
-    #[ignore = "asserts the post-content-defined-chunking behaviour; fails today, on purpose"]
-    fn same_data_in_two_orders_must_converge_to_one_partition_cid() {
-        let (_d, cat, t) = tree();
-        let asc_root = build(&t, &cat, &(0..1000).collect::<Vec<u32>>());
-        let shuf_root = build(&t, &cat, &fixed_shuffle(1000));
-
+        // Hash-free first. This is the property; the cid assertions below are the narrower claim
+        // that the instrument reports it, and on their own they would also be satisfied by a
+        // collision.
         assert_eq!(
-            leaf_content_cid(&t, asc_root).unwrap(),
-            leaf_content_cid(&t, shuf_root).unwrap(),
-            "control: the two trees must hold the same data"
+            ordered_leaf_entries(&t, asc_root),
+            ordered_leaf_entries(&t, shuf_root),
+            "the same data must be cut into the same leaves regardless of insertion order — this \
+             assertion touches no hash, so it is the one that establishes the property"
         );
         assert_eq!(
-            ordered_leaf_cids(&t, asc_root).unwrap(),
-            ordered_leaf_cids(&t, shuf_root).unwrap(),
-            "the same data must be cut into the same leaves regardless of insertion order"
+            asc_leaves, shuf_leaves,
+            "the leaf entries agree but their cids do not; the instrument is reading something \
+             other than the entries"
         );
-        assert_eq!(
-            leaf_partition_cid(&t, asc_root).unwrap(),
-            leaf_partition_cid(&t, shuf_root).unwrap(),
-            "same content must yield one partition cid"
-        );
+        assert_eq!(asc_cid, shuf_cid, "same content must yield one partition cid");
         assert_eq!(
             subtree_cid(&t, asc_root).unwrap(),
             subtree_cid(&t, shuf_root).unwrap(),
             "and one root cid, which is what makes an O(1) subtree skip possible across lineages"
+        );
+    }
+
+    /// **The gap that is still open, measured.** Convergence holds on the paths that *add* content.
+    /// It does not hold across a delete, and the reason is not the chunker's boundary rule — it is
+    /// that emptied leaves are left in the tree.
+    ///
+    /// 500 rows reached two ways: inserted directly, versus inserting 1000 and deleting half. Same
+    /// rows, and `cow::chunker` cuts the survivors identically — all 25 live leaves of the clean
+    /// tree appear in the churned one, byte for byte. But the churned tree carries **20 additional
+    /// empty leaves**, so the leaf sequence differs and the partition cid differs with it:
+    ///
+    /// ```text
+    /// clean   leaves=25 empty=0  rows=500  partition cid e8051f36dbe91c9d7a1289f9275573a1
+    /// churned leaves=45 empty=20 rows=500  partition cid 371db26401024a1b95371c569e0b4ffa
+    /// churned leaf sizes: [14,29,8,4,55,24,21,15,14,14,3,42,21,53,28,2,11,27,36,36,19,3,11,1,9,
+    ///                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    /// ```
+    ///
+    /// `cow::chunker`'s own header predicts a gap on both paths that remove content — *"overwriting
+    /// a value and deleting a key can each erase a boundary"* — and attributes it to an erased
+    /// boundary needing a merge with the right-hand neighbour, which this layout cannot reach
+    /// without sibling pointers. Measured, that prediction is half right, and narrower than stated
+    /// on both halves:
+    ///
+    /// - **Overwrite does not break convergence at all.** 1000 rows in two insertion orders, then
+    ///   143 values overwritten in two different orders: `partition_eq=true`, 55/55 leaves shared,
+    ///   in each of the three combinations (insert order differing, overwrite order differing,
+    ///   both).
+    /// - **Delete does**, but not through the boundary rule. The live partition is **exact** — all
+    ///   25 surviving leaves match byte for byte. What breaks it is simpler and more local:
+    ///   `CowTree::delete` empties a leaf and leaves it linked.
+    ///
+    /// # What must change for this to become an equality assertion
+    ///
+    /// `CowTree::delete` must unlink a leaf that its last entry has just left, freeing the page at
+    /// the deleting epoch and removing the separator from the parent — not a neighbour merge, and
+    /// not a change to the boundary rule. That is in `cow::btree`, not here. When it lands, delete
+    /// this test and un-ignore
+    /// [`a_delete_must_not_change_the_partition_of_the_surviving_rows`].
+    ///
+    /// Until then the honest statement of the instrument's reach is: a cid compares two trees built
+    /// by insertion exactly, and reports a false difference between two trees whose histories
+    /// differ by a delete.
+    #[test]
+    fn a_delete_leaves_empty_leaves_behind_and_breaks_the_partition() {
+        let (_d, cat, t) = tree();
+        let clean = build(&t, &cat, &(0..500).collect::<Vec<u32>>());
+        let mut churned = build(&t, &cat, &(0..1000).collect::<Vec<u32>>());
+        let e = cat.next_epoch();
+        for key in 500..1000u32 {
+            churned = t.delete(churned, BranchId::TRUNK, e, &k(key)).unwrap();
+        }
+
+        // The control: the two trees really do hold the same 500 rows.
+        assert_eq!(
+            leaf_content_cid(&t, clean).unwrap(),
+            leaf_content_cid(&t, churned).unwrap(),
+            "the delete did not leave the same rows behind; this measures nothing"
+        );
+
+        let clean_leaves = ordered_leaf_cids(&t, clean).unwrap();
+        let churned_leaves = ordered_leaf_cids(&t, churned).unwrap();
+        let empty = leaf_cid(&[]);
+        let empties = churned_leaves.iter().filter(|c| **c == empty).count();
+
+        println!(
+            "    clean   {} leaves, {} empty, partition cid {}",
+            clean_leaves.len(),
+            clean_leaves.iter().filter(|c| **c == empty).count(),
+            hex(&leaf_partition_cid(&t, clean).unwrap())
+        );
+        println!(
+            "    churned {} leaves, {} empty, partition cid {}",
+            churned_leaves.len(),
+            empties,
+            hex(&leaf_partition_cid(&t, churned).unwrap())
+        );
+
+        // The diagnosis, asserted rather than narrated: the live partition is exact, and the whole
+        // difference is empty leaves. If a future change makes this fail by dropping to zero
+        // empties, the partition assertion below fails with it and this test is simply obsolete.
+        assert!(empties > 0, "no empty leaves; the diagnosis below no longer describes the tree");
+        // Hash-free, for the same reason as in the convergence test: this is an equality, so it is
+        // established on the entries and only then checked through the instrument.
+        assert_eq!(
+            ordered_leaf_entries(&t, churned)
+                .into_iter()
+                .filter(|e| !e.is_empty())
+                .collect::<Vec<_>>(),
+            ordered_leaf_entries(&t, clean),
+            "the SURVIVING leaves must already agree — if they do not, the gap is in the boundary \
+             rule and not merely in unreclaimed empty leaves, and the diagnosis above is wrong"
+        );
+        assert_eq!(
+            churned_leaves.iter().filter(|c| **c != empty).cloned().collect::<Vec<_>>(),
+            clean_leaves,
+            "the surviving leaf entries agree but their cids do not"
+        );
+        assert_ne!(
+            leaf_partition_cid(&t, clean).unwrap(),
+            leaf_partition_cid(&t, churned).unwrap(),
+            "partition cids already agree — delete now reclaims its empty leaves, so delete this \
+             test and un-ignore a_delete_must_not_change_the_partition_of_the_surviving_rows"
+        );
+    }
+
+    /// The equality the delete-path fix must produce, written before the work so it cannot be
+    /// quietly weakened to match whatever gets built. Ignored because it fails today, by design.
+    ///
+    /// Un-ignore this and delete
+    /// [`a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`] together, in the commit that
+    /// makes `CowTree::delete` unlink an emptied leaf.
+    #[test]
+    #[ignore = "asserts the behaviour after delete reclaims emptied leaves; fails today, on purpose"]
+    fn a_delete_must_not_change_the_partition_of_the_surviving_rows() {
+        let (_d, cat, t) = tree();
+        let clean = build(&t, &cat, &(0..500).collect::<Vec<u32>>());
+        let mut churned = build(&t, &cat, &(0..1000).collect::<Vec<u32>>());
+        let e = cat.next_epoch();
+        for key in 500..1000u32 {
+            churned = t.delete(churned, BranchId::TRUNK, e, &k(key)).unwrap();
+        }
+
+        assert_eq!(
+            leaf_content_cid(&t, clean).unwrap(),
+            leaf_content_cid(&t, churned).unwrap(),
+            "control: the two trees must hold the same rows"
+        );
+        assert_eq!(
+            ordered_leaf_cids(&t, clean).unwrap(),
+            ordered_leaf_cids(&t, churned).unwrap(),
+            "how a row set was reached must not change how it is cut into leaves"
+        );
+        assert_eq!(
+            leaf_partition_cid(&t, clean).unwrap(),
+            leaf_partition_cid(&t, churned).unwrap(),
+            "same rows must yield one partition cid, whatever the history"
         );
     }
 
