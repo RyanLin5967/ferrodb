@@ -276,77 +276,18 @@ impl PageDelta {
     /// Serialise. Big-endian throughout, matching the rest of ferrodb.
     ///
     /// Layout: `base u32 | depth u8 | run_count u16 | run_count * { at u16 | len u16 | bytes }`.
+    /// Encode into a fresh `Vec`. **Delegates to [`PageDelta::encode_to`] so there is exactly ONE
+    /// wire format.** Two encoders existed briefly after the write-path merge — one big-endian
+    /// returning a `Vec`, one little-endian writing into a caller's slice — and two serialisers
+    /// for one record is a format that disagrees with itself the first time a page written by one
+    /// is read by the other.
     pub fn encode(&self) -> Result<Vec<u8>, FerroError> {
-        self.validate_runs()?;
-        let count = u16::try_from(self.runs.len())
-            .map_err(|_| FerroError::Cow(format!("a delta may hold at most {} runs", u16::MAX)))?;
-        let mut out = Vec::with_capacity(self.encoded_len());
-        out.extend_from_slice(&self.base.to_be_bytes());
-        out.push(self.depth);
-        out.extend_from_slice(&count.to_be_bytes());
-        for run in &self.runs {
-            let len = u16::try_from(run.bytes.len())
-                .map_err(|_| FerroError::Cow("a run is longer than a page".to_string()))?;
-            out.extend_from_slice(&run.at.to_be_bytes());
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(&run.bytes);
-        }
+        let mut out = vec![0u8; self.encoded_len()];
+        let n = self.encode_to(&mut out)?;
+        out.truncate(n);
         Ok(out)
     }
 
-    /// Parse a delta produced by [`PageDelta::encode`].
-    ///
-    /// Validates the run shape rather than trusting it. This is the constructor that makes
-    /// overlapping or out-of-order runs reachable at all — `between` cannot emit them — so it
-    /// refuses them here instead of letting `apply` produce a page that depends on run order.
-    pub fn decode(bytes: &[u8]) -> Result<PageDelta, FerroError> {
-        let too_short =
-            || FerroError::Cow("delta is truncated: not enough bytes for its framing".to_string());
-        if bytes.len() < DELTA_HEADER {
-            return Err(too_short());
-        }
-        let base = PageId::from_be_bytes(bytes[0..4].try_into().expect("4 bytes"));
-        let depth = bytes[4];
-        // ⚠ DEPTH IS THE ONE FIELD THAT GOVERNS COLLAPSE, so it is the one field this validator
-        // must not skip. `between` only ever emits `base_depth + 1`, i.e. 1..=MAX_CHAIN_DEPTH.
-        // A stored delta whose depth byte reads 0 would decode cleanly, `DeltaStore::write` would
-        // read `depth_of` = 0 < MAX_CHAIN_DEPTH and keep STACKING instead of collapsing, until
-        // `materialise` refuses on chain length and the page is permanently unreadable.
-        if depth == 0 || depth > MAX_CHAIN_DEPTH {
-            return Err(FerroError::Cow(format!(
-                "delta carries depth {depth}, which `between` can never emit \
-                 (it emits 1..={MAX_CHAIN_DEPTH}); refusing rather than stacking past the bound"
-            )));
-        }
-        let count = u16::from_be_bytes(bytes[5..7].try_into().expect("2 bytes")) as usize;
-
-        let mut runs = Vec::with_capacity(count);
-        let mut cursor = DELTA_HEADER;
-        for _ in 0..count {
-            if cursor + RUN_FRAME > bytes.len() {
-                return Err(too_short());
-            }
-            let at = u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().expect("2 bytes"));
-            let len = u16::from_be_bytes(bytes[cursor + 2..cursor + 4].try_into().expect("2 bytes"))
-                as usize;
-            cursor += RUN_FRAME;
-            if cursor + len > bytes.len() {
-                return Err(too_short());
-            }
-            runs.push(DeltaRun { at, bytes: bytes[cursor..cursor + len].to_vec() });
-            cursor += len;
-        }
-        if cursor != bytes.len() {
-            return Err(FerroError::Cow(format!(
-                "delta has {} trailing bytes after its {count} runs",
-                bytes.len() - cursor
-            )));
-        }
-
-        let delta = PageDelta { base, depth, runs };
-        delta.validate_runs()?;
-        Ok(delta)
-    }
 
     /// Payload bytes this delta writes when applied. The read-cost instrument.
     pub fn applied_bytes(&self) -> usize {
@@ -455,7 +396,31 @@ impl PageDelta {
     /// that outruns the record are all reachable from a corrupt or torn page — and each is refused
     /// rather than clamped. Clamping would turn a damaged record into a plausible one, which is
     /// the D85 failure shape: a partial write that reads as a complete, smaller truth.
+    /// Parse a delta from a buffer that is **exactly** the record.
+    ///
+    /// ⚠ TWO CALLERS WANT OPPOSITE CONTRACTS HERE, and after the write-path merge both were
+    /// pinned by tests on one function. A record read back from storage is followed by other
+    /// bytes, so its reader must tolerate a longer buffer; a record handed over as a unit must
+    /// refuse trailing bytes, because trailing bytes mean the framing disagrees with the buffer
+    /// and that is how a torn write reads as a complete smaller truth. One function cannot be
+    /// both, so this one is STRICT and [`PageDelta::decode_in_page`] is the lenient reader.
     pub fn decode(bytes: &[u8]) -> Result<Self, FerroError> {
+        let (delta, used) = Self::decode_in_page(bytes)?;
+        if used != bytes.len() {
+            return Err(FerroError::Cow(format!(
+                "a delta record framed {used} bytes but the buffer holds {}; trailing bytes mean \
+                 the framing disagrees with the buffer",
+                bytes.len()
+            )));
+        }
+        Ok(delta)
+    }
+
+    /// Parse a delta sitting at the start of a larger buffer, returning it and the bytes consumed.
+    ///
+    /// This is the storage reader: a record lives inside a `PAYLOAD_LEN` page payload with
+    /// whatever follows it, so a longer buffer is the normal case rather than a corruption signal.
+    pub fn decode_in_page(bytes: &[u8]) -> Result<(Self, usize), FerroError> {
         if bytes.len() < DELTA_HEADER {
             return Err(FerroError::Cow(format!(
                 "a delta record is at least {DELTA_HEADER} bytes, got {}",
@@ -464,6 +429,16 @@ impl PageDelta {
         }
         let base = PageId::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let depth = bytes[4];
+        // ⚠ DEPTH GOVERNS COLLAPSE, so it is the one field this validator must not skip.
+        // `between` only ever emits 1..=MAX_CHAIN_DEPTH. A stored delta reading depth 0 decodes
+        // cleanly, `DeltaStore::write` sees 0 < MAX_CHAIN_DEPTH and keeps STACKING instead of
+        // collapsing, until `materialise` refuses on chain length and the page is unreadable.
+        if depth == 0 || depth > MAX_CHAIN_DEPTH {
+            return Err(FerroError::Cow(format!(
+                "a delta carries depth {depth}, which `between` can never emit (it emits \
+                 1..={MAX_CHAIN_DEPTH}); refusing rather than stacking past the read bound"
+            )));
+        }
         let run_count = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
         let mut runs = Vec::with_capacity(run_count);
         let mut at = DELTA_HEADER;
@@ -490,7 +465,7 @@ impl PageDelta {
             runs.push(DeltaRun { at: run_at, bytes: bytes[at..at + len].to_vec() });
             at += len;
         }
-        Ok(PageDelta { base, depth, runs })
+        Ok((PageDelta { base, depth, runs }, at))
     }
 }
 
@@ -1028,7 +1003,7 @@ mod delta_tests {
 
         // Decoding from a buffer LONGER than the record is the real case: the record sits in a
         // 4072-byte page payload with trailing bytes after it.
-        let from_whole_page = PageDelta::decode(&out).unwrap();
+        let (from_whole_page, _used) = PageDelta::decode_in_page(&out).unwrap();
         assert_eq!(from_whole_page, delta, "a record must parse out of a full page payload");
 
         let mut rebuilt = base.clone();

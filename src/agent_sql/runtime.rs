@@ -43,7 +43,7 @@ use crate::agent_sql::merge_engine::{
 };
 use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::gate::{AssertionResult, GateOutcome};
-use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
