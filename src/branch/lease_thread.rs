@@ -471,10 +471,20 @@ const _: () = assert!(REAP_CHUNK > 0);
 /// mutex otherwise lets the re-acquiring sweep jump waiters for the length of the whole sweep —
 /// measured, and the reason this constant exists.
 ///
-/// One millisecond against a chunk of several fsync-bound reaps. It is deliberately a fixed
+/// One millisecond against a chunk that is a durable catalog write. It is deliberately a fixed
 /// interval and not a fraction of the hold: a proportional back-off would make a slow disk slow
 /// the reclaim down quadratically, and reclaim that falls behind is the unbounded growth this
 /// whole module exists to prevent.
+///
+/// ⚠ **The cost is a function of how fast a reap is, and that is stated rather than hidden.** At
+/// the ~58 ms per reap measured here it is under 2% of the sweep. A reap 100× faster would make
+/// this the dominant term. It is still the right default in that world — a waiting statement is
+/// bounded by one reap plus this, in every regime, and being wrong towards fairness is the safe
+/// direction for a background task — but whoever makes reaps that fast should re-read this
+/// constant, and the `sweep_wall` column in `bench/d98_outer_runtime_lock.txt` is where the trade
+/// would show up. A conditional yield ("only stand off if the chunk was slow") was considered and
+/// rejected: in the fast-reap regime it declines to yield and reintroduces exactly the starvation
+/// this constant exists to remove, which is the failure mode that is hardest to notice.
 const REAP_YIELD: Duration = Duration::from_millis(1);
 
 /// One pass: read the cluster's time, reap what has expired, then let the runtime forget it.

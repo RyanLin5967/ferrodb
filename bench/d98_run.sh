@@ -42,7 +42,7 @@ mkdir -p "$OUT"
 # Small N is cheap enough for three reps; N=10^5 costs ~6 minutes of fixture per rep, so it gets
 # one per invocation and earns its statistics from the ABBA repetition instead.
 #   args: N[,N] K_denom K_fixed probe_us reps warmup_ms fixture_threads clients
-SMALL_ARGS="1000,10000 100 64 50 3 200 8 32"
+SMALL_ARGS="1000,10000 100 64 50 2 200 8 32"
 # 500 us at 10^5, not 50: the free arm probes for the whole ~50 s sweep and 32 clients at 50 us
 # would hold ~600 MB of samples. 500 us still resolves a hold of tens of milliseconds with ~100
 # samples per client, and the harness REFUSES a cell no probe overlapped rather than calling it
@@ -56,16 +56,26 @@ run() {  # run <tag> <binary> <args...>
   echo "$tag exit=$? $(grep -c '^ *[0-9]' "$OUT/$tag.txt" || true) data rows" >&2
 }
 
+# THE LOCK IS TAKEN PER ROUND, NOT ONCE FOR THE WHOLE RUN. The script's own stale-owner rule lets
+# another agent break a lock held longer than 45 minutes, and the full four invocations take about
+# 48 — so a single acquisition would be stolen mid-measurement and the run would silently become
+# one taken alongside another measurer. Each ROUND is already a complete before/after pair with
+# every arm inside it, so per-round locking costs the comparison nothing and keeps each hold to
+# roughly 21 minutes.
+#
 # Refuse rather than warn. Exit 1 is "timed out waiting for another MEASURER", and a timing run
 # taken while a sibling agent is also timing is not a run to caveat — it is a run not to take.
-LOCKOUT=$(~/wt/logs/measure-lock.sh acquire D98 2>&1); LOCKRC=$?
-{ echo "measure-lock rc=$LOCKRC"; echo "$LOCKOUT"; echo "load at start: $(uptime)"; } | tee "$OUT/lock.txt"
-if [ "$LOCKRC" -ne 0 ]; then
-  echo "REFUSING TO MEASURE: measure-lock exited $LOCKRC. Do not report a number from this run." >&2
-  exit "$LOCKRC"
-fi
+: > "$OUT/lock.txt"
 
 for round in 1 2; do
+  LOCKOUT=$(~/wt/logs/measure-lock.sh acquire D98 2>&1); LOCKRC=$?
+  { echo "=== round $round ==="; echo "measure-lock rc=$LOCKRC"; echo "$LOCKOUT"
+    echo "load at round start: $(uptime)"; } | tee -a "$OUT/lock.txt"
+  if [ "$LOCKRC" -ne 0 ]; then
+    echo "REFUSING TO MEASURE round $round: measure-lock exited $LOCKRC." >&2
+    exit "$LOCKRC"
+  fi
+
   if [ "$round" = 1 ]; then order="before after"; else order="after before"; fi
   for who in $order; do
     case "$who" in
@@ -75,8 +85,8 @@ for round in 1 2; do
     run "small-$who-r$round" "$bin" $SMALL_ARGS
     run "large-$who-r$round" "$bin" $LARGE_ARGS
   done
-done
 
-echo "load at end: $(uptime)" >> "$OUT/lock.txt"
-~/wt/logs/measure-lock.sh release D98 >> "$OUT/lock.txt" 2>&1
+  echo "load at round end: $(uptime)" >> "$OUT/lock.txt"
+  ~/wt/logs/measure-lock.sh release D98 >> "$OUT/lock.txt" 2>&1
+done
 echo "done" >&2

@@ -152,9 +152,17 @@ impl RuntimeLock for PrivateLock {
 /// reported it gives **reaps per acquisition of the statement lock** — an integer ratio that says
 /// the whole claim and that fleet load cannot move:
 ///
-/// - before, one acquisition holds every reap on the tick, so the ratio IS the number of branches
-///   that expired, and it rises with the branch count;
+/// - before, ONE acquisition holds every reap on the tick, so the ratio rises linearly with the
+///   number of branches that expired;
 /// - after, it is bounded by `lease_thread::REAP_CHUNK` however many expired.
+///
+/// ⚠ Read the ratio, not the acquisition count, and do not expect it to equal K exactly.
+/// `LeaseThread::start` takes the lock once more on the calling thread, for
+/// `resume_interrupted_reaps`, and that acquisition is counted here too — correctly, since it is a
+/// real hold of the statement mutex, though it happens before any client can connect. So the
+/// before arm reads `acqs = 2` at every K (one resume, one sweep) and a ratio of K/2, and the
+/// after arm reads `acqs = 1 + ceil(K / REAP_CHUNK)`. The shape is in how the ratio moves with K:
+/// linear before, flat after.
 ///
 /// "A lock whose hold grows with the branch count" and "a lock whose hold does not" is exactly the
 /// difference between those two, stated without reference to a clock. The latency columns then say

@@ -3,11 +3,20 @@
 Status: done, measured, committed. Evidence files in this directory are the raw runs; every number
 below names the file it came from.
 
-**Read the addendum at the end before acting on this record.** Everything here is about
-`AgentRuntime`'s `Mutex<State>` and holds. It is not the only lock the sweep runs under, and the
-brief's 39.3 s headline is about the other one — the pgwire per-statement mutex that `scan_once`
-holds across the *entire* call, phase 2 included. That was found after this section was written and
-is fixed separately; the addendum has the change and its numbers.
+**Read addendum 5 before acting on this record; there are five, and the last one moves things the
+first four called open.** Everything in the sections above is about `AgentRuntime`'s `Mutex<State>`
+and holds. It is not the only lock the sweep runs under, and the brief's 39.3 s headline is about
+the other one — the pgwire per-statement mutex that `scan_once` held across the *entire* call,
+phase 2 included. Addendum 1 found it and said the work here did not touch it; addendum 1 and
+addendum 3 both left it on their "still open" lists.
+
+**Addendum 5 (D98) closes it, with a control arm and a before/after measured on this machine**
+(`bench/d98_outer_runtime_lock.txt`): reaps per acquisition of that mutex went from rising 100×
+across 100× the branch count to flat, and a statement at 10⁵ branches went from waiting the whole
+51.6 s sweep to a 161.8 ms p99. Two claims elsewhere in this file are corrected there — the
+reconciliation is no longer inside the statement lock, and the unpinnable 39.3 s citation is now
+unnecessary rather than merely labelled. Sections above are kept as written; do not quote a "still
+open" list from addendum 1 or 3 without reading addendum 5 first.
 
 ## What was actually wrong
 
@@ -480,3 +489,139 @@ the base differs, which is the same lesson as the headline.
 target that does not compile prints none — so a loop grepping for `^test result` skipped it, and the
 absence read as a pass. Zero collected is not a pass; the blank had to be chased rather than
 scrolled past.
+
+## Addendum 5 — D98: the outer lock this record twice called open, closed and measured
+
+Addendum 1 identified the OUTER lock and said the chunk-and-index work did not touch it. Addendum
+1's closing section and addendum 3's "still open" list both left it open. This closes it, and the
+number addendum 1 could not pin — it cited `bench/runtime_at_1e6.txt`, which is not in this
+worktree — is now measured here instead of quoted.
+
+**Evidence: `bench/d98_outer_runtime_lock.txt`.** Harness `examples/outer_runtime_lock.rs`, driver
+`bench/d98_run.sh`, before/after as two builds of the identical harness differing only in `src/`,
+run A B B A inside the fleet measure lock (taken per round, `load_at_acquire` 8 and 12).
+
+### What was wrong
+
+`scan_once` held ONE acquisition of the per-statement mutex across the clock read, the candidate
+query, every reap on the tick and the reconciliation. So a statement waited for the whole sweep,
+and a sweep is O(branches that expired) — which in an agent fleet is O(agents).
+
+### The result, as counts first
+
+Counts are integers and fleet load cannot move them; the durations below are upper bounds taken at
+load 8-12 on a box that runs a dozen build agents. `reap/acq` is branches reaped per acquisition of
+the statement mutex.
+
+| N | K | reap/acq before | reap/acq after | statements completed during sweep, before → after |
+|---|---|---|---|---|
+| 1 000 | 10 | 5.00 | 0.91 | 31 → 8 077 |
+| 10 000 | 100 | 50.00 | 0.99 | 45 → 98 106 |
+| 100 000 | 1 000 | **500.00** | **1.00** | **7 → 73 139** |
+
+**The shape, which is the part that transfers.** Across 100× the branch count with K rising in
+proportion (the agent workload), `reap/acq` before rises **100.0×** — 5.00 → 50.00 → 500.00 — and
+after is flat at **1.1×** (0.91 → 0.99 → 1.00). With K held FIXED at 64 it is flat both before and
+after (32.00 at every N), which is the control that says the cost is a function of *what expired*
+and not of *total branches*: the deadline index already handles total branches, and D2 is why.
+
+### The result, as durations (upper bounds, load 8-12)
+
+Worst `after` against best `before`, so the factor is the smallest the data supports:
+
+| N | K | p99 before | p99 after | factor | sweep wall before → after |
+|---|---|---|---|---|---|
+| 1 000 | 64 | 3 857 ms | 67.2 ms | 57× | 3.86 s → 3.65 s |
+| 10 000 | 100 | 6 357 ms | 102.1 ms | 62× | 6.36 s → 8.63 s |
+| 100 000 | 1 000 | **44 562 ms** | **161.8 ms** | **275×** | 44.5 s → 73.9 s |
+
+At N=10⁵ the median statement waited **51.6 s** in one before-run, against a sweep wall of 51.59 s
+— i.e. the entire sweep, which is the signature of the defect rather than a coincidence.
+
+**The cost is real and is in the table: the sweep itself is up to ~1.6× slower** (44.5 s → 73.9 s
+at 10⁵), because it now yields the lock a thousand times and re-contends with clients that are
+actually running. For a background reclamation task against a 15-minute lease and a 30-second scan
+interval that is the right trade, but it is a trade and not a free win.
+
+### THE CONTROL, which is what licenses any of this
+
+`free` runs the identical fixture, the identical K, and the identical reaps under a PRIVATE mutex
+nobody else holds. If 10⁵ branches were slow because of residency rather than the lock, it would
+degrade too. It does not: its p99 is 20.9 µs at N=10⁵/K=1000 against the `idle` floor's 40.1 µs —
+**indistinguishable from doing no sweep at all**, while reaping all 1 000 branches. The before
+arm's 94× slope across N is therefore the lock, not the data.
+
+### Two bounds, not one — and finding this needed the counters
+
+Chunking the reap loop bounds how long the sweep HOLDS the lock. It did **not** bound how long a
+statement WAITS for it. `std::sync::Mutex` is unfair: the sweep unlocked and relocked in a tight
+loop and was re-granted before any waiter was scheduled. Measured at N=500, K=64: `reap/acq` was a
+correctly-bounded 3.76 **while client p99 was still 3.78 s against a 3.79 s sweep** — the whole
+sweep. A correct-looking bound that buys nothing is worse than none, because it reads as done.
+
+`REAP_YIELD` (1 ms between chunks) is the second bound. `yield_now()` would not do: it is a hint
+the scheduler may decline while this thread is still runnable, which is exactly the losing case.
+
+**This was found because the harness reports counts alongside durations.** The count said bounded,
+the latency said not bounded, and the disagreement was the finding. A latency-only harness would
+have reported the first attempt as a success.
+
+### REAP_CHUNK is 1, and the argument for 4 was wrong
+
+Its doc claimed a chunk of 1 would make the sweep "as slow as the queue is long". Measured, same
+fixture, only the constant changed:
+
+| REAP_CHUNK | client p99 | statements done during sweep | sweep wall |
+|---|---|---|---|
+| 4 | 366 ms | 4 080 | 5.03 s |
+| 1 | **66.6 ms** | **16 288** | **3.66 s** |
+
+Better on every column including the one the argument was protecting: with `REAP_YIELD` the
+clients drain in microseconds instead of fighting the sweep, so the sweep finished *sooner* at one
+reap per acquisition. The constant's doc now carries the refuted argument and this table.
+
+### Corrections to this record's earlier claims
+
+- Addendum 1, "What this still does not fix", said the reconciliation "on the error path still runs
+  inside the server's statement lock". **It no longer does.** Its wall time is unchanged and still
+  O(open sessions); what changed is that it is no longer inside that lock. Addendum 1 worried that
+  moving work out "opens a window where a statement can touch a workspace whose branch is already
+  reaped" — that window was already open, because `forget_reaped_branches` has released its own
+  state lock every `FORGET_CHUNK` entries since that chunking landed, and a statement reaching such
+  a workspace finds a `Reaped` branch that `check_readable` rejects.
+- Addendum 1's "39.3 s at 10⁶ open sessions" citation was already labelled unpinnable. It stays
+  unpinned and is now also unnecessary: 51.6 s at 10⁵ branches with 10³ expired is measured here,
+  on this machine, in a file in this directory.
+- The `statement_lock_sweep.rs` header claimed twice that `forget_branches` is "what `scan_once`
+  calls on every successful tick". `scan_once` does not call `reap_expired` any more and calls
+  `forget_branches` once per chunk; those rows are an upper bound on one call. Corrected in place.
+
+### Decision: the debug-only `audit_txn_refs` is bounded
+
+It is O(open sessions) at both doors, so a debug fixture opening N sessions is O(N²). Measured on
+one fixture in both profiles: release per-branch cost is flat (3 685 → 3 143 → 3 344 µs at
+N=4k/8k/16k) while debug's excess over it RISES (1 373 → 2 660 → 3 396 µs). Debug already costs 2×
+at 16k and the factor grows, so at the 10⁶ `SCALE-DESIGN.md` targets a debug build stops being a
+way to reproduce anything — a reproduction trap, not merely slow.
+
+Capped at `AUDIT_FULL_MAX` (1024) workspaces. **The cap is not a weakening**: reaching a map of
+size M requires M door crossings from zero, so a door bypassing `insert_workspace`/
+`remove_workspace` is fully audited long before the map outgrows the cap. Sampling or a cadence
+would have been a weakening; a prefix of the crossings is not. Above the cap it prints one
+`AUDIT_TXN_REFS_DOWNGRADED` line naming the threshold, so the downgrade is never silent, and the
+blind spot it does have — a door correct below the cap and wrong above it — is named in the guard
+itself. Fire-checked both directions: the notice prints exactly once at N=2000 and never at N=200.
+`cargo test --lib` never trips it, which is how 1024 was checked rather than asserted (the old note
+claimed "the largest fork loop anywhere in tests/ is ~200" without one).
+
+### Still open
+
+- `run_activity` remains an O(open sessions) hold on `AgentRuntime`'s state lock and remains this
+  measurement's positive control. Unchanged.
+- `workspaces` lookups are still generation-blind; the escrow half is fixed, the map is not.
+- The reconciliation's wall time is still O(open sessions). It is out of the statement lock now,
+  which is what this row was about, but it is not cheaper.
+- `REAP_YIELD` is a fixed 1 ms, so its cost is a function of how fast a reap is — under 2% at the
+  ~58 ms/reap measured here, dominant if reaps ever get 100× faster. Stated at the constant, with
+  the reason a conditional yield was rejected (it declines to yield in exactly the fast regime
+  where starvation returns).
