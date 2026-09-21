@@ -51,11 +51,18 @@
 //! ran a different one — the failure this project has now hit three times, and the reason a header
 //! here is audited against its body rather than read.
 //!
-//! It is true as written now. The reaps run [`REAP_CHUNK`] at a time, each group inside its own
-//! acquisition, and everything that does not need the lock — the clock, the candidate query, the
-//! error path's O(open sessions) reconciliation, D88's orphan sweep — runs outside it. So a scan
-//! waits for whatever statement is in flight, a statement issued during a scan waits for at most
-//! `REAP_CHUNK` reaps instead of for the whole sweep, and the scan does no client I/O. A scan that
+//! It is true as written now, and it takes TWO bounds, not one. The reaps run [`REAP_CHUNK`] at a
+//! time, each group inside its own acquisition — that bounds how long the sweep HOLDS the lock.
+//! Between groups it stands off for [`REAP_YIELD`] — that bounds how long a statement WAITS for
+//! it, and without it the first bound buys a statement almost nothing, because `std::sync::Mutex`
+//! is unfair and a sweep that unlocks and relocks is granted again before any waiter runs.
+//! Measured: chunking alone left client p99 at 3.78 s against a 3.79 s sweep, i.e. the whole
+//! sweep, with a correctly-bounded 3.76 reaps per acquisition all the while.
+//!
+//! Everything that does not need the lock — the clock, the candidate query, the error path's
+//! O(open sessions) reconciliation, D88's orphan sweep — runs outside it. So a scan waits for
+//! whatever statement is in flight, a statement issued during a scan waits for at most one reap
+//! plus a stand-off instead of for the whole sweep, and the scan does no client I/O. A scan that
 //! finds nothing expired now takes the lock **not at all**.
 //!
 //! Chunking does not weaken the guarantee rule 2 is about.
@@ -428,18 +435,57 @@ impl Drop for LeaseThread {
 /// at most this many reaps rather than for every branch that happened to expire on the same tick,
 /// and that is the property D98 is about.
 ///
-/// Small, because a reap is dominated by a durable catalog write and the sweep is single-threaded,
-/// so it joins no commit group and each reap costs roughly one fsync. Taking and releasing an
-/// uncontended mutex is microseconds against that, so a small chunk buys a much shorter stall for
-/// an overhead that does not register. It is not 1: the lock is released between chunks and
-/// clients are queued on it, so the sweep goes to the back of the queue every time it lets go —
-/// a chunk of one makes a sweep with many candidates as slow as the queue is long. Four bounds the
-/// stall at four reaps while still letting the sweep make progress in groups.
+/// One, because a reap is dominated by a durable catalog write — measured at ~58 ms each on this
+/// machine, fsync-bound — so a chunk of four is a four-fsync stall for no benefit that survived
+/// being measured.
 ///
-/// `bench/d98_outer_runtime_lock.txt` reports the measured stall and the sweep's own wall time in
-/// the same table, so starving the sweep to buy latency would be visible there rather than traded
+/// ⛔ **This said four, and the argument for four was wrong.** It read: "It is not 1: the lock is
+/// released between chunks and clients are queued on it, so the sweep goes to the back of the
+/// queue every time it lets go — a chunk of one makes a sweep with many candidates as slow as the
+/// queue is long." That is a plausible mechanism and it does not happen. Measured with
+/// `examples/outer_runtime_lock.rs` at N=500, K=64, 16 clients, everything else identical:
+///
+/// | REAP_CHUNK | client p99 | client max | statements done during sweep | sweep wall |
+/// |---|---|---|---|---|
+/// | 4 | 366 ms | 438 ms |  4 080 | 5.03 s |
+/// | 1 | **66.6 ms** | **91.0 ms** | **16 288** | **3.66 s** |
+///
+/// The sweep did not go to the back of any queue: at one reap per acquisition it finished
+/// *sooner*, because [`REAP_YIELD`] lets the waiting clients drain in microseconds instead of
+/// leaving them to fight the sweep for the lock. A chunk of one is better on every column,
+/// including the one the argument for four was trying to protect.
+///
+/// `bench/d98_outer_runtime_lock.txt` reports the stall and the sweep's own wall time in the same
+/// table, so buying latency by starving the sweep would show up there rather than being traded
 /// silently.
-const REAP_CHUNK: usize = 4;
+const REAP_CHUNK: usize = 1;
+
+/// A chunk size of zero would make `chunks()` panic, and it is a constant, so the wrong value is a
+/// build failure rather than a lease thread that dies on its first tick in production.
+const _: () = assert!(REAP_CHUNK > 0);
+
+/// How long the sweep stands off the runtime lock between chunks, so a waiting statement gets it.
+///
+/// **This is not politeness, it is the other half of the bound.** See the call site: chunking caps
+/// how long one acquisition lasts, and this caps how long a statement waits, because an unfair
+/// mutex otherwise lets the re-acquiring sweep jump waiters for the length of the whole sweep —
+/// measured, and the reason this constant exists.
+///
+/// One millisecond against a chunk that is a durable catalog write. It is deliberately a fixed
+/// interval and not a fraction of the hold: a proportional back-off would make a slow disk slow
+/// the reclaim down quadratically, and reclaim that falls behind is the unbounded growth this
+/// whole module exists to prevent.
+///
+/// ⚠ **The cost is a function of how fast a reap is, and that is stated rather than hidden.** At
+/// the ~58 ms per reap measured here it is under 2% of the sweep. A reap 100× faster would make
+/// this the dominant term. It is still the right default in that world — a waiting statement is
+/// bounded by one reap plus this, in every regime, and being wrong towards fairness is the safe
+/// direction for a background task — but whoever makes reaps that fast should re-read this
+/// constant, and the `sweep_wall` column in `bench/d98_outer_runtime_lock.txt` is where the trade
+/// would show up. A conditional yield ("only stand off if the chunk was slow") was considered and
+/// rejected: in the fast-reap regime it declines to yield and reintroduces exactly the starvation
+/// this constant exists to remove, which is the failure mode that is hardest to notice.
+const REAP_YIELD: Duration = Duration::from_millis(1);
 
 /// One pass: read the cluster's time, reap what has expired, then let the runtime forget it.
 ///
@@ -520,7 +566,8 @@ fn scan_once(
     let mut reaped_all: Vec<BranchId> = Vec::new();
     let mut forgotten_all = 0usize;
     let mut failure: Option<FerroError> = None;
-    for group in candidates.chunks(REAP_CHUNK) {
+    let mut groups = candidates.chunks(REAP_CHUNK).peekable();
+    while let Some(group) = groups.next() {
         let mut reaped: Vec<BranchId> = Vec::with_capacity(group.len());
         with_lock(lock, || {
             for rec in group {
@@ -560,6 +607,30 @@ fn scan_once(
         reaped_all.append(&mut reaped);
         if failure.is_some() {
             break;
+        }
+        // **Chunking bounds the HOLD. This is what bounds the WAIT — and without it the chunking
+        // buys a statement almost nothing.**
+        //
+        // `std::sync::Mutex` does not queue fairly: a thread that unlocks and immediately relocks
+        // can be granted again before any waiter is scheduled. The reap loop does exactly that, so
+        // a statement blocked at the start of a sweep was still being jumped by the sweep for the
+        // whole sweep. Measured with `examples/outer_runtime_lock.rs` at N=500, K=64, 16 clients:
+        // `reap/acq` was already a correct 3.76, so the hold WAS bounded — and client p99 was
+        // still 3.78 s against a 3.79 s sweep, i.e. the entire sweep, because the waiters never
+        // got the lock. Only 80 statements completed in that window.
+        //
+        // Sleeping rather than `yield_now`: a yield is a hint the scheduler may decline while this
+        // thread is still runnable, which is the case that produced the number above. Descheduling
+        // for a bounded interval means the waiters definitely run. The cost is one interval per
+        // chunk against a chunk that is several durable writes — at the reap cost measured here
+        // (~58 ms each, fsync-bound) this is well under 1% of the sweep, and the sweep's own wall
+        // time is reported beside the stall in the artifact so the trade is visible rather than
+        // asserted.
+        //
+        // Skipped after the final chunk: there is no one left to yield to, and a lease scan should
+        // not add a delay to its own completion for nothing.
+        if groups.peek().is_some() {
+            std::thread::sleep(REAP_YIELD);
         }
     }
 

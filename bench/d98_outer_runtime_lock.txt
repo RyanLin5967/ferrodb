@@ -1,0 +1,509 @@
+D98 — the outer RuntimeLock held across a whole lease sweep, measured before and after.
+
+WHAT THIS ROW IS ABOUT. `branch::lease_thread::scan_once` ran its entire body inside one
+`with_lock(..)`, and in both production shapes that lock is the mutex every SQL statement takes:
+`ServerContext::catalog` for the pgwire server, `CatalogLock` for the CLI. So the stall on every
+connection was the length of one sweep, and a sweep is O(branches that expired on this tick) —
+which in an agent fleet is O(agents). W4's earlier rows are about `AgentRuntime`'s INNER
+`Mutex<State>` and say nothing about this lock; `bench/w4/DECISION.md` addendum 1 says so and its
+closing section lists this one as still open. Nothing had measured it.
+
+REPORT THIS AS A SHAPE, NOT AS A SCORE. A lock held across work proportional to the branch count
+serializes writers in ANY engine that sweeps under a statement lock. That is BranchBench's named
+open problem (arXiv:2604.17180, Fig. 4: "serialization bottlenecks in control-plane operations"),
+and the shape is what transfers off ferrodb. The absolute microseconds do not: a favourable
+number here is partly an artifact of what ferrodb does not yet do, and ferrodb is a proof of
+concept, not a competitor. Nothing below is a claim about beating any system.
+
+TWO KINDS OF NUMBER, AND THEY ARE NOT EQUALLY TRUSTWORTHY.
+  COUNTS    `reap/acq` (branches reaped per acquisition of the statement lock) and `done_in_sw`
+            (client statements that COMPLETED while the sweep ran). Integers. Fleet load does not
+            change how many times a lock was taken. THE CLAIM RESTS ON THESE.
+  DURATIONS p50/p99/max client latency. Real, and UPPER BOUNDS — every one is inflated by whatever
+            the fleet was doing. `load_at_acquire` is stamped below for each round.
+
+HOW IT WAS TAKEN. `examples/outer_runtime_lock.rs`, driven by `bench/d98_run.sh`. Two builds of
+the SAME harness differing only in `src/`, run alternately (A B B A) inside the fleet measure lock,
+which was taken per round so a 45-minute stale-owner steal could not land mid-measurement. Arm
+order inside each invocation rotates with the rep index. Five arms per fixture:
+  idle   — no sweep at all. The negative control and this machine's floor.
+  locked — the production wiring: the sweep is handed the ServerContext whose mutex the clients
+           are taking. The thing under test.
+  free   — same N, same K, the identical sweep work, under a PRIVATE mutex nobody else holds.
+           THE CONTROL THAT COULD HAVE WITHDRAWN THE CLAIM: 10^5 branches is more resident state
+           whatever the lock does, so if `free` degraded with N too, the result would be residency
+           and not the lock.
+Two K series, because "grows with branch count" has two candidate mechanisms and one series cannot
+separate them: K_prop = N/100 rises with N (the agent workload), K_fixed = 64 does not (isolating
+any cost that is a function of TOTAL branches, e.g. the deadline-index descent).
+
+The harness REFUSES rather than reports: a cell whose sweep reaped nothing, a cell no probe
+overlapped, and an arm the fixture could not give its full K all print `--` and exit non-zero.
+All eight invocations exited 0 with every cell measured.
+
+BINARIES
+  before: pre-fix src at a789132 + the D98 harness at 079cbc3, built as f0fba63
+          (a throwaway branch, so both binaries carry the IDENTICAL harness and differ
+           only in the change under test)
+  after : 079cbc37a93b — ferrodb at 079cbc37a93b
+  REAP_CHUNK=1, REAP_YIELD=1ms in the after binary.
+
+MEASURE LOCK AND MACHINE LOAD
+  === round 1 ===
+  measure-lock rc=0
+  ACQUIRED D98  load_at_acquire=8
+  CAVEAT: load 8 >= 8. You hold exclusivity against other MEASURERS, but the
+  box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+  a duration, stamp load_at_acquire=8 beside it and say it is an upper bound.
+  load at round start: 14:43  up 2 days, 17:46, 22 users, load averages: 8.52 11.80 12.45
+  load at round end: 15:07  up 2 days, 18:10, 22 users, load averages: 12.24 11.07 11.56
+  RELEASED D98
+  === round 2 ===
+  measure-lock rc=0
+  ACQUIRED D98  load_at_acquire=12
+  CAVEAT: load 12 >= 8. You hold exclusivity against other MEASURERS, but the
+  box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+  a duration, stamp load_at_acquire=12 beside it and say it is an upper bound.
+  load at round start: 15:07  up 2 days, 18:10, 22 users, load averages: 12.24 11.07 11.56
+  load at round end: 15:26  up 2 days, 18:29, 22 users, load averages: 12.03 8.80 8.80
+  RELEASED D98
+
+================================================================================
+REDUCTION
+================================================================================
+
+## 1. THE CLAIM AS COUNTS. Fleet load cannot move these.
+##
+## reap/acq is how many branches ONE acquisition of the per-statement lock reaped.
+## Before, ONE acquisition holds the whole sweep, so the ratio rises linearly with the
+## number that expired. After, it is bounded by REAP_CHUNK whatever expires.
+## LeaseThread::start takes the lock once more for resume_interrupted_reaps, before any
+## client can connect, and that hold is counted too -- so before reads acqs=2 at every
+## K (ratio K/2) and after reads acqs=1+ceil(K/REAP_CHUNK). The SHAPE is the result.
+## done_in_sweep is how many client statements COMPLETED while the sweep was running.
+
+       N      K     arm  before acqs  after acqs  before r/acq  after r/acq  before done  after done
+    1000     10  locked            4          22          5.00         0.91           31        8077
+    1000     64  locked            4         130         32.00         0.98           37       56060
+   10000     64  locked            4         130         32.00         0.98           38       61669
+   10000    100  locked            4         202         50.00         0.99           45       98106
+  100000     64  locked            2          65         32.00         0.98            6        4700
+  100000   1000  locked            2        1001        500.00         1.00            7       73139
+
+## 2. EVERY INVOCATION, EVERY CELL. Latency in MICROSECONDS, sweep wall in ms.
+
+run                            N     arm      K   samples       p50_us       p99_us       max_us    wall_ms  reaped  acqs   r/acq  done_in_sw
+large-after-r1            100000    free     64    141875          0.2         20.2        152.6    2,721.1      64    65    0.98      141875
+large-after-r1            100000    free   1000   2405948          0.2         20.9      3,420.9   46,477.6    1000  1001    1.00     2405948
+large-after-r1            100000    idle      0     20576          0.2         39.2        116.8        0.0       0     0       -           0
+large-after-r1            100000  locked     64      4423          2.3     54,741.5     58,978.2    2,811.9      64    65    0.98        4412
+large-after-r1            100000  locked   1000     65582         17.5    161,760.1    612,224.2   77,586.6    1000  1001    1.00       65582
+large-after-r2            100000    free     64    229231          0.2         19.8        146.8    5,045.2      64    65    0.98      229230
+large-after-r2            100000    free   1000   2083818          0.2         19.8        901.1   45,916.9    1000  1001    1.00     2083818
+large-after-r2            100000    idle      0     17722          0.2         40.1        134.2        0.0       0     0       -           0
+large-after-r2            100000  locked     64      4700          1.2    100,514.7    133,478.2    4,357.6      64    65    0.98        4700
+large-after-r2            100000  locked   1000     73139          1.5    143,594.4    324,384.8   73,948.6    1000  1001    1.00       73139
+large-before-r1           100000    free     64    158904          0.2         17.1        734.5    3,350.8      64     2   32.00      158904
+large-before-r1           100000    free   1000   2034851          0.2         16.9      6,517.8   40,460.5    1000     2  500.00     2034851
+large-before-r1           100000    idle      0     19645          0.2         16.2        286.4        0.0       0     0       -           0
+large-before-r1           100000  locked     64        38  2,960,957.2  2,961,336.0  2,961,336.0    2,953.1      64     2   32.00           6
+large-before-r1           100000  locked   1000        39 51,597,178.1 51,597,345.3 51,597,345.3   51,588.3    1000     2  500.00           7
+large-before-r2           100000    free     64     99751          0.2         19.3        241.9    2,232.1      64     2   32.00       99751
+large-before-r2           100000    free   1000   2118799          0.2         19.8      3,387.2   47,123.0    1000     2  500.00     2118799
+large-before-r2           100000    idle      0     17577          0.2         39.1         99.2        0.0       0     0       -           0
+large-before-r2           100000  locked     64        36  2,755,568.9  2,755,774.6  2,755,774.6    2,755.0      64     2   32.00           4
+large-before-r2           100000  locked   1000        41 44,562,296.8 44,562,345.0 44,562,345.0   44,546.0    1000     2  500.00           6
+small-after-r1              1000    free     10    525925          0.3         51.3      1,513.2      720.2      20    22    0.91      525923
+small-after-r1              1000    free     64   2506055          0.3         48.8      3,815.3    3,603.1     128   130    0.98     2506050
+small-after-r1              1000    idle      0    313084          0.3         49.0        728.0        0.0       0     0       -           0
+small-after-r1              1000  locked     10      6558          0.4     93,997.2    102,998.7      652.6      20    22    0.91        6530
+small-after-r1              1000  locked     64     48095          0.3     67,242.0    115,840.2    3,646.0     128   130    0.98       48064
+small-after-r1             10000    free     64   2421690          0.2         41.9      3,858.9    3,534.0     128   130    0.98     2421689
+small-after-r1             10000    free    100   4264941          0.3         46.0      2,668.8    6,403.8     200   202    0.99     4264936
+small-after-r1             10000    idle      0    303502          0.3         44.2        475.4        0.0       0     0       -           0
+small-after-r1             10000  locked     64     47178          0.3     92,806.1    172,713.5    4,670.7     128   130    0.98       47173
+small-after-r1             10000  locked    100     81545          0.3    102,074.4    188,090.7    8,628.2     200   202    0.99       81463
+small-after-r2              1000    free     10    317043          0.2         39.4        181.9      404.4      20    22    0.91      317040
+small-after-r2              1000    free     64   2234331          0.2         39.8        461.4    3,148.2     128   130    0.98     2234323
+small-after-r2              1000    idle      0    319932          0.2         39.7        196.2        0.0       0     0       -           0
+small-after-r2              1000  locked     10      8136          0.2     41,794.5     45,859.1      383.0      20    22    0.91        8077
+small-after-r2              1000  locked     64     56094          0.3     50,871.4    151,067.1    2,992.6     128   130    0.98       56060
+small-after-r2             10000    free     64   2186092          0.2         34.8        292.5    3,007.5     128   130    0.98     2186085
+small-after-r2             10000    free    100   3241054          0.2         34.7        269.9    4,350.3     200   202    0.99     3241053
+small-after-r2             10000    idle      0    312194          0.2         32.7        224.8        0.0       0     0       -           0
+small-after-r2             10000  locked     64     61688          0.2     48,850.2    159,045.0    3,381.8     128   130    0.98       61669
+small-after-r2             10000  locked    100     98148          0.2     47,567.0     57,696.6    4,480.0     200   202    0.99       98106
+small-before-r1             1000    free     10    415354          0.3         47.4        274.9      614.5      20     4    5.00      415351
+small-before-r1             1000    free     64   2471103          0.3         49.1      1,328.3    3,361.1     128     4   32.00     2471090
+small-before-r1             1000    idle      0    332442          0.3         48.7        219.7        0.0       0     0       -           0
+small-before-r1             1000  locked     10        96    548,421.0    658,909.9    658,927.2      658.1      20     4    5.00          28
+small-before-r1             1000  locked     64       101  2,783,988.9  3,857,226.0  3,857,267.4    3,856.2     128     4   32.00          37
+small-before-r1            10000    free     64   2570541          0.3         47.4      1,041.8    3,669.8     128     4   32.00     2570540
+small-before-r1            10000    free    100   3627281          0.3         45.8      1,092.7    4,592.1     200     4   50.00     3627278
+small-before-r1            10000    idle      0    333670          0.3         47.1        237.2        0.0       0     0       -           0
+small-before-r1            10000  locked     64        86  3,029,640.0  3,385,796.8  3,385,803.1    3,368.3     128     4   32.00          21
+small-before-r1            10000  locked    100        96  3,747,802.5  6,876,721.6  6,876,724.3    6,860.1     200     4   50.00          31
+small-before-r2             1000    free     10    521007          0.2         34.3        188.2      972.2      20     4    5.00      520970
+small-before-r2             1000    free     64   2731212          0.2         41.3        297.8    4,300.8     128     4   32.00     2731204
+small-before-r2             1000    idle      0    309621          0.2         33.7        209.2        0.0       0     0       -           0
+small-before-r2             1000  locked     10        97    422,102.0    677,668.0    677,669.6      665.0      20     4    5.00          31
+small-before-r2             1000  locked     64        97  3,503,779.8  5,693,948.2  5,693,954.5    5,679.4     128     4   32.00          32
+small-before-r2            10000    free     64   1897942          0.2         43.5      1,389.0    2,627.7     128     4   32.00     1897932
+small-before-r2            10000    free    100   3933142          0.3         45.2        211.4    6,491.1     200     4   50.00     3933141
+small-before-r2            10000    idle      0    301284          0.2         40.4        196.3        0.0       0     0       -           0
+small-before-r2            10000  locked     64       107  2,627,264.5  3,151,763.1  3,151,769.4    3,151.1     128     4   32.00          38
+small-before-r2            10000  locked    100       110  4,543,045.8  6,356,714.2  6,356,736.6    6,355.1     200     4   50.00          45
+
+## 3. CLIENT LATENCY, `locked` arm (the production wiring). UPPER BOUNDS -- see the
+## load_at_acquire stamps in lock.txt. BEST before against WORST after, so the factor
+## is the smallest the data supports. `control` is the `free` arm: same N, same K, the
+## same sweep work under a PRIVATE lock. `floor` is `idle`: no sweep at all.
+
+      N      K   before p50    after p50    factor   before p99    after p99    factor  control p99   floor p99
+   1000     10    422,102.0          0.4 1125605.3x    658,909.9     93,997.2      7.0x         51.3        49.0
+   1000     64  2,783,988.9          0.3 8335296.0x  3,857,226.0     67,242.0     57.4x         49.1        49.0
+  10000     64  2,627,264.5          0.3 8997481.3x  3,151,763.1     92,806.1     34.0x         47.4        47.1
+  10000    100  3,747,802.5          0.3 12834939.9x  6,356,714.2    102,074.4     62.3x         46.0        47.1
+ 100000     64  2,755,568.9          2.3 1202780.0x  2,755,774.6    100,514.7     27.4x         20.2        40.1
+ 100000   1000 44,562,296.8         17.5 2540320.2x 44,562,345.0    161,760.1    275.5x         20.9        40.1
+
+## 4. THE SLOPE. The claim is a shape, not a constant. K_prop rises with N (the agent
+## workload); K_fixed=64 does not. A cost that grows with TOTAL branches would show in
+## the K_fixed row; one that grows with what expired shows in K_prop.
+
+### before, locked arm
+  per_acq  K_prop  N=1000 K=10: 5.00 -> N=10000 K=100: 50.00 -> N=100000 K=1000: 500.00 reaps/acq   [1000 to 100000: 100.0x]
+  per_acq  K_fixed N=1000 K=64: 32.00 -> N=10000 K=64: 32.00 -> N=100000 K=64: 32.00 reaps/acq   [1000 to 100000: 1.0x]
+  p50      K_prop  N=1000 K=10: 548,421.0 -> N=10000 K=100: 4,543,045.8 -> N=100000 K=1000: 51,597,178.1 us   [1000 to 100000: 94.1x]
+  p50      K_fixed N=1000 K=64: 3,503,779.8 -> N=10000 K=64: 3,029,640.0 -> N=100000 K=64: 2,960,957.2 us   [1000 to 100000: 0.8x]
+
+### after, locked arm
+  per_acq  K_prop  N=1000 K=10: 0.91 -> N=10000 K=100: 0.99 -> N=100000 K=1000: 1.00 reaps/acq   [1000 to 100000: 1.1x]
+  per_acq  K_fixed N=1000 K=64: 0.98 -> N=10000 K=64: 0.98 -> N=100000 K=64: 0.98 reaps/acq   [1000 to 100000: 1.0x]
+  p50      K_prop  N=1000 K=10: 0.4 -> N=10000 K=100: 0.3 -> N=100000 K=1000: 17.5 us   [1000 to 100000: 46.8x]
+  p50      K_fixed N=1000 K=64: 0.3 -> N=10000 K=64: 0.3 -> N=100000 K=64: 2.3 us   [1000 to 100000: 6.9x]
+
+
+================================================================================
+RAW — every invocation, verbatim, as the harness printed it
+================================================================================
+
+---------- small-before-r1 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at f0fba63163e5
+# N=[1000, 10000] K_prop=N/100 K_fixed=64 clients=32 probe=50us reps=2 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+    1000    0    idle       -   165155        0            0            0            0              0       0     0        -          0
+    1000    0  locked      10    81112       55    548378875    548518125    548548625      542968750      10     2     5.00         19
+    1000    0    free      10   240817   160403          333        48417       199666      387237833      10     2     5.00     160401
+    1000    0  locked      64    82773       48   2783974958   2784089125   2784089125     2779323500      64     2    32.00         16
+    1000    0    free      64  1156001  1072904          333        51417      1328334     2675519875      64     2    32.00    1072895
+    1000    1  locked      10    81890       41    658806625    658927250    658927250      658061375      10     2     5.00          9
+    1000    1    free      10   343624   254951          250        46959       274875      614464042      10     2     5.00     254950
+    1000    1  locked      64    82286       53   3857106250   3857226042   3857267375     3856192083      64     2    32.00         21
+    1000    1    free      64  1485278  1398199          333        47334       254208     3361143666      64     2    32.00    1398195
+    1000    1    idle       -   167287        0            0            0            0              0       0     0        -          0
+   10000    0    idle       -   166975        0            0            0            0              0       0     0        -          0
+   10000    0  locked     100    83521       54   3747677583   3747994000   3747996875     3726509042     100     2    50.00         22
+   10000    0    free     100  1853530  1761988          333        46958      1092708     4372261208     100     2    50.00    1761986
+   10000    0  locked      64    80012       39   3029612875   3029718667   3029718667     3021005458      64     2    32.00          7
+   10000    0    free      64  1521124  1439727          333        41875      1041750     3669787208      64     2    32.00    1439726
+   10000    1  locked     100    83142       42   6876556542   6876724333   6876724333     6860063916     100     2    50.00          9
+   10000    1    free     100  1942918  1865293          333        44666       608584     4592139417     100     2    50.00    1865292
+   10000    1  locked      64    81385       47   3385612459   3385803125   3385803125     3368269292      64     2    32.00         14
+   10000    1    free      64  1209873  1130814          333        52083       463917     2798601583      64     2    32.00    1130814
+   10000    1    idle       -   166695        0            0            0            0              0       0     0        -          0
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 2 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+    1000    free      10    415354          292        47375       274875      614464042       20      4      5.00      415351
+    1000    free      64   2471103          333        49083      1328334     3361143666      128      4     32.00     2471090
+    1000    idle       0    332442          333        48708       219709              0        0      0         -           0
+    1000  locked      10        96    548420959    658909917    658927250      658061375       20      4      5.00          28
+    1000  locked      64       101   2783988875   3857226042   3857267375     3856192083      128      4     32.00          37
+   10000    free      64   2570541          333        47375      1041750     3669787208      128      4     32.00     2570540
+   10000    free     100   3627281          333        45792      1092708     4592139417      200      4     50.00     3627278
+   10000    idle       0    333670          333        47125       237250              0        0      0         -           0
+   10000  locked      64        86   3029639959   3385796791   3385803125     3368269292      128      4     32.00          21
+   10000  locked     100        96   3747802458   6876721584   6876724333     6860063916      200      4     50.00          31
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- large-before-r1 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at f0fba63163e5
+# N=[100000] K_prop=N/100 K_fixed=64 clients=32 probe=500us reps=1 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+  100000    0    idle       -    19645        0            0            0            0              0       0     0        -          0
+  100000    0  locked    1000    10404       39  51597178125  51597345333  51597345333    51588343209    1000     2   500.00          7
+  100000    0    free    1000  2045501  2034851          167        16916      6517834    40460514792    1000     2   500.00    2034851
+  100000    0  locked      64     9987       38   2960957250   2961336042   2961336042     2953134000      64     2    32.00          6
+  100000    0    free      64   168726   158904          208        17125       734459     3350769875      64     2    32.00     158904
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 1 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+  100000    free      64    158904          208        17125       734459     3350769875       64      2     32.00      158904
+  100000    free    1000   2034851          167        16916      6517834    40460514792     1000      2    500.00     2034851
+  100000    idle       0     19645          167        16250       286375              0        0      0         -           0
+  100000  locked      64        38   2960957250   2961336042   2961336042     2953134000       64      2     32.00           6
+  100000  locked    1000        39  51597178125  51597345333  51597345333    51588343209     1000      2    500.00           7
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- small-after-r1 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at 079cbc37a93b
+# N=[1000, 10000] K_prop=N/100 K_fixed=64 clients=32 probe=50us reps=2 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+    1000    0    idle       -   149490        0            0            0            0              0       0     0        -          0
+    1000    0  locked      10    70746     3098          375     86434625     86774791      508418458      10    11     0.91       3070
+    1000    0    free      10   329387   258538          333        51709       966167      720175042      10    11     0.91     258538
+    1000    0  locked      64    97471    22503          375     72545042    115840250     3645990667      64    65     0.98      22499
+    1000    0    free      64  1397100  1328188          333        50500      3371125     3603108750      64    65     0.98    1328183
+    1000    1  locked      10    94754     3460          375     96381541    102998708      652583542      10    11     0.91       3460
+    1000    1    free      10   357723   267387          333        50875      1513208      681556083      10    11     0.91     267385
+    1000    1  locked      64   107462    25592          334     55719541     86398833     3088665959      64    65     0.98      25565
+    1000    1    free      64  1262631  1177867          333        46542      3815333     2971716791      64    65     0.98    1177867
+    1000    1    idle       -   163594        0            0            0            0              0       0     0        -          0
+   10000    0    idle       -   161535        0            0            0            0              0       0     0        -          0
+   10000    0  locked     100   134120    40592          291    117876833    188090667     8628222625     100   101     0.99      40561
+   10000    0    free     100  2686783  2602344          291        42167       634917     6403756459     100   101     0.99    2602339
+   10000    0  locked      64   108207    25794          291     92858750    138546917     4670687333      64    65     0.98      25794
+   10000    0    free      64  1536871  1446562          250        44541      3858917     3533960375      64    65     0.98    1446562
+   10000    1  locked     100   127528    40953          334     64845584    126095875     5055415042     100   101     0.99      40902
+   10000    1    free     100  1736500  1662597          333        51667      2668750     4182652333     100   101     0.99    1662597
+   10000    1  locked      64   102378    21384          333     92710250    172713458     3665916292      64    65     0.98      21379
+   10000    1    free      64  1051919   975128          167        35875      1768334     2938563708      64    65     0.98     975127
+   10000    1    idle       -   141967        0            0            0            0              0       0     0        -          0
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 2 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+    1000    free      10    525925          333        51292      1513208      720175042       20     22      0.91      525923
+    1000    free      64   2506055          333        48792      3815333     3603108750      128    130      0.98     2506050
+    1000    idle       0    313084          333        48958       728041              0        0      0         -           0
+    1000  locked      10      6558          375     93997208    102998708      652583542       20     22      0.91        6530
+    1000  locked      64     48095          334     67242000    115840250     3645990667      128    130      0.98       48064
+   10000    free      64   2421690          167        41875      3858917     3533960375      128    130      0.98     2421689
+   10000    free     100   4264941          292        46000      2668750     6403756459      200    202      0.99     4264936
+   10000    idle       0    303502          291        44167       475375              0        0      0         -           0
+   10000  locked      64     47178          292     92806084    172713458     4670687333      128    130      0.98       47173
+   10000  locked     100     81545          292    102074417    188090667     8628222625      200    202      0.99       81463
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- large-after-r1 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at 079cbc37a93b
+# N=[100000] K_prop=N/100 K_fixed=64 clients=32 probe=500us reps=1 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+  100000    0    idle       -    20576        0            0            0            0              0       0     0        -          0
+  100000    0  locked    1000    76198    65582        17542    161760125    612224208    77586591500    1000  1001     1.00      65582
+  100000    0    free    1000  2416248  2405948          167        20916      3420917    46477592541    1000  1001     1.00    2405948
+  100000    0  locked      64    14954     4423         2291     54741459     58978166     2811937625      64    65     0.98       4412
+  100000    0    free      64   152120   141875          167        20209       152584     2721146875      64    65     0.98     141875
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 1 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+  100000    free      64    141875          167        20209       152584     2721146875       64     65      0.98      141875
+  100000    free    1000   2405948          167        20916      3420917    46477592541     1000   1001      1.00     2405948
+  100000    idle       0     20576          167        39209       116750              0        0      0         -           0
+  100000  locked      64      4423         2291     54741459     58978166     2811937625       64     65      0.98        4412
+  100000  locked    1000     65582        17542    161760125    612224208    77586591500     1000   1001      1.00       65582
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- small-after-r2 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at 079cbc37a93b
+# N=[1000, 10000] K_prop=N/100 K_fixed=64 clients=32 probe=50us reps=2 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+    1000    0    idle       -   169320        0            0            0            0              0       0     0        -          0
+    1000    0  locked      10    89540     3972          292     40838792     45859125      383041500      10    11     0.91       3943
+    1000    0    free      10   246513   163714          333        45917       181917      404428333      10    11     0.91     163713
+    1000    0  locked      64   109132    26122          334     51861917     61200916     2992640500      64    65     0.98      26112
+    1000    0    free      64  1156847  1071926          250        43792       461416     2556632084      64    65     0.98    1071920
+    1000    1  locked      10    89505     4164          250     41801458     44912583      380075917      10    11     0.91       4134
+    1000    1    free      10   229860   153329          167        31500       151042      398220834      10    11     0.91     153327
+    1000    1  locked      64   110039    29972          209     46223250    151067083     2946243125      64    65     0.98      29948
+    1000    1    free      64  1232462  1162405          250        35375       251709     3148248125      64    65     0.98    1162403
+    1000    1    idle       -   150612        0            0            0            0              0       0     0        -          0
+   10000    0    idle       -   155306        0            0            0            0              0       0     0        -          0
+   10000    0  locked     100   130041    49322          208     47978959     57696625     4428911667     100   101     0.99      49295
+   10000    0    free     100  1640303  1559183          208        33167       269875     4169428125     100   101     0.99    1559183
+   10000    0  locked      64   104444    30723          250     45684000     52151042     2735106250      64    65     0.98      30716
+   10000    0    free      64  1103225  1023836          208        33042       292458     2683845833      64    65     0.98    1023833
+   10000    1  locked     100   125393    48826          291     47529708     54641292     4480044333     100   101     0.99      48811
+   10000    1    free     100  1762492  1681871          167        35791       211583     4350296250     100   101     0.99    1681870
+   10000    1  locked      64   111138    30965          208     53543125    159044958     3381809041      64    65     0.98      30953
+   10000    1    free      64  1245640  1162256          167        36208       192958     3007467084      64    65     0.98    1162252
+   10000    1    idle       -   156888        0            0            0            0              0       0     0        -          0
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 2 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+    1000    free      10    317043          208        39375       181917      404428333       20     22      0.91      317040
+    1000    free      64   2234331          250        39833       461416     3148248125      128    130      0.98     2234323
+    1000    idle       0    319932          250        39708       196166              0        0      0         -           0
+    1000  locked      10      8136          250     41794500     45859125      383041500       20     22      0.91        8077
+    1000  locked      64     56094          292     50871375    151067083     2992640500      128    130      0.98       56060
+   10000    free      64   2186092          167        34792       292458     3007467084      128    130      0.98     2186085
+   10000    free     100   3241054          167        34667       269875     4350296250      200    202      0.99     3241053
+   10000    idle       0    312194          167        32709       224792              0        0      0         -           0
+   10000  locked      64     61688          209     48850250    159044958     3381809041      128    130      0.98       61669
+   10000  locked     100     98148          209     47567000     57696625     4480044333      200    202      0.99       98106
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- large-after-r2 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at 079cbc37a93b
+# N=[100000] K_prop=N/100 K_fixed=64 clients=32 probe=500us reps=1 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+  100000    0    idle       -    17722        0            0            0            0              0       0     0        -          0
+  100000    0  locked    1000    82306    73139         1500    143594416    324384792    73948590875    1000  1001     1.00      73139
+  100000    0    free    1000  2093147  2083818          167        19750       901125    45916933917    1000  1001     1.00    2083818
+  100000    0  locked      64    14264     4700         1250    100514709    133478250     4357614584      64    65     0.98       4700
+  100000    0    free      64   238209   229231          167        19750       146791     5045217916      64    65     0.98     229230
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 1 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+  100000    free      64    229231          167        19750       146791     5045217916       64     65      0.98      229230
+  100000    free    1000   2083818          167        19750       901125    45916933917     1000   1001      1.00     2083818
+  100000    idle       0     17722          167        40125       134250              0        0      0         -           0
+  100000  locked      64      4700         1250    100514709    133478250     4357614584       64     65      0.98        4700
+  100000  locked    1000     73139         1500    143594416    324384792    73948590875     1000   1001      1.00       73139
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- small-before-r2 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at f0fba63163e5
+# N=[1000, 10000] K_prop=N/100 K_fixed=64 clients=32 probe=50us reps=2 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+    1000    0    idle       -   155529        0            0            0            0              0       0     0        -          0
+    1000    0  locked      10    76897       45    677591834    677669583    677669583      664969750      10     2     5.00         12
+    1000    0    free      10   461167   375320          167        33833       188250      972198916      10     2     5.00     375291
+    1000    0  locked      64    75368       56   5693749083   5693948209   5693954458     5679358000      64     2    32.00         23
+    1000    0    free      64  1662748  1583567          292        43417       297833     4300761667      64     2    32.00    1583559
+    1000    1  locked      10    78333       52    422040334    422187583    422202166      413912917      10     2     5.00         19
+    1000    1    free      10   228618   145687          167        35250       126708      374336292      10     2     5.00     145679
+    1000    1  locked      64    78132       41   3503680167   3503870916   3503870916     3499396333      64     2    32.00          9
+    1000    1    free      64  1228869  1147645          167        38125       291958     3010672458      64     2    32.00    1147645
+    1000    1    idle       -   154092        0            0            0            0              0       0     0        -          0
+   10000    0    idle       -   155757        0            0            0            0              0       0     0        -          0
+   10000    0  locked     100    77260       61   4543003417   4543293625   4543306417     4537096042     100     2    50.00         29
+   10000    0    free     100  1672475  1593587          167        36625       208834     4129279083     100     2    50.00    1593586
+   10000    0  locked      64    77812       62   2627203708   2627405833   2627407959     2626754583      64     2    32.00         29
+   10000    0    free      64  1017906   945093          167        37167      1388959     2453462292      64     2    32.00     945091
+   10000    1  locked     100    77466       49   6356622750   6356736583   6356736583     6355069833     100     2    50.00         16
+   10000    1    free     100  2420091  2339555          333        50250       211375     6491065500     100     2    50.00    2339555
+   10000    1  locked      64    72989       45   3151470958   3151769375   3151769375     3151145584      64     2    32.00          9
+   10000    1    free      64  1030175   952849          333        48709       217292     2627682500      64     2    32.00     952841
+   10000    1    idle       -   145527        0            0            0            0              0       0     0        -          0
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 2 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+    1000    free      10    521007          167        34291       188250      972198916       20      4      5.00      520970
+    1000    free      64   2731212          209        41334       297833     4300761667      128      4     32.00     2731204
+    1000    idle       0    309621          167        33709       209167              0        0      0         -           0
+    1000  locked      10        97    422102000    677668041    677669583      664969750       20      4      5.00          31
+    1000  locked      64        97   3503779792   5693948209   5693954458     5679358000      128      4     32.00          32
+   10000    free      64   1897942          209        43500      1388959     2627682500      128      4     32.00     1897932
+   10000    free     100   3933142          291        45167       211375     6491065500      200      4     50.00     3933141
+   10000    idle       0    301284          208        40417       196292              0        0      0         -           0
+   10000  locked      64       107   2627264541   3151763083   3151769375     3151145584      128      4     32.00          38
+   10000  locked     100       110   4543045833   6356714166   6356736583     6355069833      200      4     50.00          45
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
+
+---------- large-before-r2 ----------
+# D98 — the outer RuntimeLock held across `scan_once`
+# ferrodb at f0fba63163e5
+# N=[100000] K_prop=N/100 K_fixed=64 clients=32 probe=500us reps=1 warmup=200ms fixture_threads=8
+# catalog: TableBranchCatalog (the shipped one, deadline-indexed)
+# arms: idle = prober alone (negative control) | locked = sweep under the STATEMENT lock (production) | free = same sweep, same N, same K, PRIVATE lock (control)
+# TWO K series, because "grows with branch count" has two candidate mechanisms and one series cannot separate them: K_prop rises with N (the agent workload — more agents, more abandoned branches per sweep), K_fixed stays constant (isolating any cost that is a function of TOTAL branches alone, e.g. the deadline-index descent).
+# stall columns are prober acquisitions OVERLAPPING the sweep; p50_all is the whole window, i.e. the uncontended floor.
+
+       N  rep     arm       K   probes  overlap    p50_ov_ns    p99_ov_ns       max_ns  sweep_wall_ns  reaped  acqs reap/acq done_in_sw
+  100000    0    idle       -    17577        0            0            0            0              0       0     0        -          0
+  100000    0  locked    1000     8743       41  44562296792  44562345042  44562345042    44545977666    1000     2   500.00          6
+  100000    0    free    1000  2127393  2118799          167        19750      3387250    47122998750    1000     2   500.00    2118799
+  100000    0  locked      64     8263       36   2755568917   2755774583   2755774583     2755034125      64     2    32.00          4
+  100000    0    free      64   108579    99751          167        19291       241917     2232139750      64     2    32.00      99751
+
+# SUMMARY — statement latency while the lease scan runs, pooled over 1 rep(s).
+# `idle` rows have no sweep, so their population is the whole window: the floor. Read `locked` against `free` at the SAME N and K — that pair differs only in which lock the sweep took.
+# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet
+# load cannot move: reap/acq is how many branches one acquisition of the statement lock
+# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.
+       N     arm       K   samples       p50_ns       p99_ns       max_ns  sweep_wall_ns   reaped   acqs  reap/acq  done_in_sw
+  100000    free      64     99751          167        19291       241917     2232139750       64      2     32.00       99751
+  100000    free    1000   2118799          167        19750      3387250    47122998750     1000      2    500.00     2118799
+  100000    idle       0     17577          167        39083        99209              0        0      0         -           0
+  100000  locked      64        36   2755568917   2755774583   2755774583     2755034125       64      2     32.00           4
+  100000  locked    1000        41  44562296792  44562345042  44562345042    44545977666     1000      2    500.00           6
+
+# every cell got its full K, reaped it, and was seen by at least one probe.
