@@ -1,0 +1,24 @@
+d94_dedup_premise at 808273c4b8a8
+
+D94 PREMISE: duplicate content across branches, and who already owns the saving.
+rows/branch = 8, trunk preload = 5000 rows, page = 4096 B, header = 24 B
+
+  'page refs' counts a page once PER BRANCH THAT REACHES IT; 'distinct pages' counts it
+  once. The first gap is COW SHARING and is already banked. The gap from 'distinct
+  pages' to 'distinct payload' is the ONLY space content dedup can still win.
+
+  branches    dup   trunk  page refs   distinct   distinct   distinct     store   cow saves dedup gains
+             frac   pages                 pages      whole    payload      live       pages       pages
+     10000   0.50     101    1010101      90101      90101      50105     90101      920000       39996
+     10000   1.00     101    1010101      90101      90101      10109     90101      920000       79992
+
+BYTES, the two columns the row is decided on (pages x 4096 B):
+  branches    dup   stored today B        deduped B     saving
+     10000   0.50        369053696        205230080      44.4%
+     10000   1.00        369053696         41406464      88.8%
+
+NO WHOLE-PAGE DUPLICATE EXISTS IN ANY CONFIGURATION — 'distinct pages' equals
+'distinct whole' in every row above, including dup_frac = 1.00 where every branch
+wrote byte-identical ROWS. The self-describing header (24 B of
+birth_epoch + arena_id + crc32) makes two independently written pages differ even
+when their contents agree. A whole-page content index would find NOTHING here.
