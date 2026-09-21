@@ -442,11 +442,31 @@ impl NodeIdentity for SubtreeHash {
 /// Like [`SubtreeHash`]'s, this memo is a cache over page ids, and page ids are recycled — see
 /// [`PageVersion`]. Every row carries the version it was computed at, so:
 ///
-/// * a row whose page has been recycled or rewritten **misses** rather than answering for the
-///   page's previous life, and the miss shows up in [`MemoIdentity::misses`];
+/// * a row for a page that has itself been recycled or rewritten **misses** rather than
+///   answering for that page's previous life, and the miss shows up in [`MemoIdentity::misses`];
 /// * `warm` **re-computes** such a row instead of stepping over it. It used to skip any page id
 ///   already present, which made re-warming after a recycle a no-op that added zero entries and
 ///   moved zero counters while the memo went on returning the wrong id.
+///
+/// # ⚠ The blind spot: a row commits to a SUBTREE and is validated against ONE page
+///
+/// Read the first bullet narrowly, because the gap is exactly the width of the word *itself*.
+/// A row here holds whatever the wrapped digest returns, and for the digest this adapter exists
+/// for — `cid::subtree_cid` — that is a commitment to the **whole subtree below the page**. The
+/// row is nevertheless validated against that one page's [`PageVersion`], and no page-local token
+/// can see a change underneath it: `btree::insert` rewrites an already-private leaf where it lies
+/// and stops copying up there, so every ancestor keeps its id, its `birth`, its bytes and
+/// therefore its version. **An ancestor's row stays fresh across a descendant rewrite and goes on
+/// answering with the digest of a subtree that is no longer there** — silently, with
+/// [`MemoIdentity::misses`] not moving, which is the same false skip the version key exists to
+/// prevent one level down. `an_ancestors_warmed_row_survives_a_descendant_rewrite_and_goes_on_answering`
+/// pins it, including the contrast: the rewritten leaf itself is the only page that misses.
+///
+/// The rule that covers it is [`PageVersion`]'s usage rule, not a check: **warm after the last
+/// write to either root, and do not let a warmed provider outlive a write to a branch whose pages
+/// it has warmed.** Which of the staleness routes the `(birth, checksum)` key does and does not
+/// discriminate is measured on `D105-diff-memo` by
+/// `the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant`.
 ///
 /// Validating costs one page fetch and a header parse per query — the 1085 reads broken out of
 /// `warm`'s total above. That is the price of a stale row missing rather than lying, and
@@ -1615,6 +1635,69 @@ mod tests {
             h.id_of(root),
             page_id_identity(root),
             "an in-place rewrite left a row that birth_epoch alone cannot tell is stale"
+        );
+    }
+
+    /// **The subtree blind spot, at this adapter's own level.** A `MemoIdentity` row keyed on
+    /// `cid::subtree_cid` commits to the whole subtree *below* the page, but it is validated
+    /// against that page's own [`PageVersion`] — and `btree::insert` rewrites an already-private
+    /// leaf where it lies without copying up. Every ancestor keeps its id, its `birth`, its bytes
+    /// and therefore its version, so its row stays fresh and goes on answering with the digest of
+    /// a subtree that is no longer there. Nothing raises and [`MemoIdentity::misses`] does not
+    /// move: this is the one staleness route the key cannot see, and the type's docs now say so.
+    ///
+    /// Not a re-derivation: which of the three staleness routes the `(birth, checksum)` key does
+    /// and does not discriminate is measured on `D105-diff-memo` by
+    /// `the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant`. This
+    /// pins what route C costs a caller of **this adapter**, which is what the docs got wrong.
+    /// `bench/d109_ancestor_row_blind_spot_before.txt` is the run that falsified them.
+    #[test]
+    fn an_ancestors_warmed_row_survives_a_descendant_rewrite_and_goes_on_answering() {
+        let f = Fixture::new();
+        let root = f.build(400);
+        let pages = f.tree.walk_pages(root).unwrap();
+        assert!(pages.len() > 3, "premise: a multi-level tree, got {} pages", pages.len());
+
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(ident.warm(root).unwrap(), pages.len());
+        let stamped_root = ident.id_of(root);
+        let root_before = version_of(&f, root);
+
+        // Same branch, existing key, same-width value: nothing splits, the leaf is already
+        // private, so the copy-up stops there and the root is never rewritten.
+        let after = f.put(root, BranchId::TRUNK, &key(3), &value(3, 1));
+        assert_eq!(after, root, "premise: the write copied up to the root");
+        assert_eq!(version_of(&f, root), root_before, "premise: the root's own bytes moved");
+
+        let truth = tag_content(cid::subtree_cid(&f.tree, root).unwrap());
+        assert_ne!(truth, stamped_root, "control: the root's subtree digest did not move");
+
+        // The blind spot. The root's row is still fresh by its own page version, so it answers,
+        // and the wrong answer moves no counter.
+        let misses_before = ident.misses();
+        assert_eq!(
+            ident.id_of(root),
+            stamped_root,
+            "the ancestor's row did not survive the descendant rewrite, so this test is no \
+             longer demonstrating the blind spot its docs describe"
+        );
+        assert_ne!(ident.id_of(root), truth, "the row answered for the subtree that is there now");
+        assert_eq!(ident.misses(), misses_before, "the stale ancestor answer moved a counter");
+
+        // The contrast that makes this a blind spot rather than plain staleness: the page that
+        // was actually rewritten IS discriminated, and it is the only one. A warmed row is
+        // tagged TAG_CONTENT and the fallback TAG_PAGE, so this filter is exact.
+        let stale: Vec<PageId> =
+            pages.iter().copied().filter(|p| ident.id_of(*p) == page_id_identity(*p)).collect();
+        assert_eq!(
+            stale.len(),
+            1,
+            "expected exactly the rewritten leaf to go stale, got {stale:?} of {} pages",
+            pages.len()
+        );
+        assert!(
+            !stale.contains(&root),
+            "the root's row went stale after all, so the ancestor case is not the blind spot"
         );
     }
 
