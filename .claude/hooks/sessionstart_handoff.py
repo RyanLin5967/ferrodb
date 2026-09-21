@@ -81,20 +81,76 @@ def where():
 #    loses first because it lives in another repo entirely.
 # ---------------------------------------------------------------------------------------
 def ledger():
+    """The OPEN wall rows.
+
+    ⛔ THE STATUS IS THE STATUS CELL, NEVER THE WHOLE ROW. This used to be
+    `[l for l in txt.splitlines() if l.startswith("|") and "OPEN" in l]`, which substring-matched
+    `OPEN` anywhere in the row -- including inside a DONE row's own post-mortem prose. D31's cell
+    literally reads "✅ DONE ... ⛔ THIS CELL READ `OPEN` FOR HOURS AFTER THE FIX LANDED", so the
+    sentence recording the old mistake is what regenerated it, permanently.
+
+    Measured 2026-09-21 against the live ledger: of the 9 rows it served as "the single next
+    action", **4 were already DONE** (W4, D28, D29, D31) and it **hid 3 genuinely open ones**
+    (D20, D25, D26, which contain no occurrence of the word). It failed in both directions at
+    once, which is why it survived -- the output always had the right shape and length.
+    """
     txt = read(os.path.join(A, "SCALE-LEDGER.md"))
-    rows = [l for l in txt.splitlines() if l.startswith("|") and "OPEN" in l]
-    if not rows:
-        return "  (no OPEN rows found in SCALE-LEDGER.md -- verify by reading it; do not assume done)"
-    out = []
-    for l in rows:
+    if not txt:
+        return ("  REFUSING: SCALE-LEDGER.md is unreadable or empty. A missing ledger is not an\n"
+                "  empty one -- read it by hand before assuming there is no work.")
+    ROWID = re.compile(r"^[A-Za-z]{1,3}\d{1,3}[a-z]?$")
+    CLOSED = ("DONE", "WITHDRAWN", "NOT JUSTIFIED", "SUPERSEDED", "RETRACTED")
+    out, suppressed, murky = [], [], []
+    for l in txt.splitlines():
+        if not l.startswith("|") or re.match(r"^\|[\s:-]+\|", l):
+            continue
         cells = [c.strip() for c in l.strip("|").split("|")]
-        rid = cells[0] if cells else "?"
-        wall = re.sub(r"\s+", " ", cells[1])[:600] if len(cells) > 1 else ""
-        exit_c = re.sub(r"\s+", " ", cells[3])[:600] if len(cells) > 3 else ""
-        out.append("  [%s] %s" % (rid, wall))
+        if not cells:
+            continue
+        rid = cells[0]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", rid):   # Progress Log, not a wall
+            continue
+        if not ROWID.match(rid):                      # some other table's row
+            continue
+        if len(cells) < 4:                            # the walls table has 4 columns
+            continue
+        wall = re.sub(r"\s+", " ", cells[1])
+        st = cells[2].upper()
+        if any(k in st for k in CLOSED) or st.startswith(u"\u2705") or wall.startswith("~~"):
+            suppressed.append(rid)
+            continue
+        # Extra cells mean an unescaped `|` inside the row, so cells[2] is NOT the status. SHOW it:
+        # hiding a live wall is the expensive direction.
+        if len(cells) > 4:
+            murky.append(rid)
+            out.append("  [%s] %s" % (rid, wall[:600]))
+            out.append("        \u26a0 STATUS UNPARSEABLE (unescaped '|'); read this row by hand.")
+            continue
+        out.append("  [%s] %s" % (rid, wall[:600]))
+        exit_c = re.sub(r"\s+", " ", cells[3])[:600]
         if exit_c:
             out.append("        EXIT: %s" % exit_c)
-    return "\n".join(out)
+    if not out:
+        return ("  REFUSING: parsed the ledger but found ZERO open rows. Zero is not a pass --\n"
+                "  either every row is genuinely closed (then the ledger needs new rows) or this\n"
+                "  status test is wrong. Suppressed as closed: %s"
+                % (", ".join(suppressed) or "none"))
+    # ⛔ SECOND-ORDER: a correct parser over a STALE FIELD is still wrong. With the parsing bug
+    # fixed, D25 and D26 STILL came back open -- their cells read `IN_PROGRESS 2026-09-18` for three
+    # days after the work merged (both branches +0 ahead of main). No selector can fix a
+    # hand-maintained field that ages, so say so every time instead of pretending otherwise.
+    head = ["  \u26a0 THESE ARE CANDIDATES, NOT FACTS. A status cell is hand-maintained and AGES: on",
+            "    2026-09-21 two rows here read IN_PROGRESS three days after their work had merged.",
+            "    VERIFY EACH AT HEAD (read the source; `git rev-list --count main..<branch>`) before",
+            "    building anything. Only HEAD is authoritative.",
+            ""]
+    out.append("")
+    out.append("  (%d row(s) suppressed because their STATUS CELL says closed: %s)"
+               % (len(suppressed), ", ".join(suppressed)))
+    if murky:
+        out.append("  (%d row(s) shown with an unreadable status rather than hidden: %s)"
+                   % (len(murky), ", ".join(murky)))
+    return "\n".join(head + out)
 
 # ---------------------------------------------------------------------------------------
 # 4. WHAT IS STILL LINEAR. The objective is 10^6 branches; linear is a DEFECT here, not a
