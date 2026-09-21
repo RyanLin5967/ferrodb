@@ -1,0 +1,90 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D94-dedup)
+warning: unused import: `encode_row`
+  --> src/agent_sql/runtime.rs:46:48
+   |
+46 | use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+   |                                                ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: method `visible_rows` is never used
+    --> src/agent_sql/runtime.rs:1356:8
+     |
+ 643 | impl AgentRuntime {
+     | ----------------- method in this implementation
+...
+1356 |     fn visible_rows(
+     |        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (lib test) generated 5 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 13 tests
+test cow::dedup::tests::different_payloads_never_share ... ok
+test cow::dedup::tests::an_uncommitted_ticket_rolls_its_increment_back_on_drop ... ok
+test cow::dedup::tests::an_uncommitted_ticket_on_a_fresh_page_hands_the_page_back ... ok
+test cow::dedup::tests::recovery_leaves_committed_references_alone ... ok
+test cow::dedup::tests::a_crash_between_the_increment_and_the_record_leaks_nothing ... ok
+test cow::dedup::tests::recovery_frees_a_page_whose_only_reference_was_lost_to_the_crash ... ok
+test cow::dedup::tests::identical_payloads_share_one_page_and_allocate_once ... ok
+test cow::dedup::tests::releasing_the_last_reference_frees_the_page ... ok
+test cow::dedup::tests::the_audit_detects_an_inconsistency_it_is_supposed_to_catch ... ok
+test cow::dedup::tests::an_over_release_is_refused_and_changes_nothing ... ok
+test cow::dedup::tests::a_content_id_collision_does_not_share_pages ... ok
+test cow::dedup::tests::concurrent_release_frees_the_page_exactly_once ... ok
+test cow::dedup::tests::concurrent_interning_of_one_payload_counts_every_reference_once ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
+
