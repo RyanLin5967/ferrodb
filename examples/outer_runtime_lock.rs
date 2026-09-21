@@ -61,7 +61,7 @@
 //!   be mistaken for a run that saw nothing wrong.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,58 @@ impl RuntimeLock for PrivateLock {
     fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
         let _g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         body();
+    }
+}
+
+/// Wraps whichever lock the sweep is handed and **counts acquisitions**.
+///
+/// # Why this exists, and why it is the number the result rests on
+///
+/// Everything else here is a duration, and this box runs a dozen build agents at load 20-60. A
+/// latency curve taken under that load is partly a curve of the fleet, and a contention wall made
+/// of sibling `rustc` processes looks exactly like the one being hunted.
+///
+/// `acquisitions` is not a duration. It is a count of events, and with the reaps the sweep
+/// reported it gives **reaps per acquisition of the statement lock** — an integer ratio that says
+/// the whole claim and that fleet load cannot move:
+///
+/// - before, one acquisition holds every reap on the tick, so the ratio IS the number of branches
+///   that expired, and it rises with the branch count;
+/// - after, it is bounded by `lease_thread::REAP_CHUNK` however many expired.
+///
+/// "A lock whose hold grows with the branch count" and "a lock whose hold does not" is exactly the
+/// difference between those two, stated without reference to a clock. The latency columns then say
+/// what it costs in seconds on this machine, as an upper bound with its load stamped beside it.
+///
+/// `span_ns` is kept too, but it is a duration and is read as one — and it is the sweep's
+/// **wait plus hold**, not its hold: this wrapper sits outside the inner lock and cannot see the
+/// moment it was granted. So it is an upper bound on hold time, and it is reported as a total
+/// divided by `acquisitions` rather than quoted as "the stall", which is the clients' number.
+struct CountingLock {
+    inner: Arc<dyn RuntimeLock>,
+    acquisitions: AtomicU64,
+    span_ns: AtomicU64,
+}
+
+impl CountingLock {
+    fn new(inner: Arc<dyn RuntimeLock>) -> Arc<CountingLock> {
+        Arc::new(CountingLock {
+            inner,
+            acquisitions: AtomicU64::new(0),
+            span_ns: AtomicU64::new(0),
+        })
+    }
+}
+
+impl RuntimeLock for CountingLock {
+    fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        let t0 = Instant::now();
+        self.inner.with_runtime_lock(body);
+        // Counted AFTER the inner call returns, so it counts acquisitions that completed. A sweep
+        // still blocked on the statement mutex has not acquired anything, and must not be counted
+        // as though it had.
+        self.acquisitions.fetch_add(1, Ordering::SeqCst);
+        self.span_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::SeqCst);
     }
 }
 
@@ -324,6 +376,9 @@ struct Pool {
     sweep_walls: Vec<u64>,
     reaped: u64,
     reps: usize,
+    /// Summed across reps. Integers, so fleet load cannot move them.
+    acquisitions: u64,
+    done_during_sweep: u64,
 }
 
 /// What one arm produced.
@@ -339,6 +394,12 @@ struct Outcome {
     /// Scans that ran with the lock held (should be 1), and scans that refused.
     scans: u64,
     refused: u64,
+    /// **Times the sweep acquired the runtime lock.** An integer; fleet load cannot move it.
+    acquisitions: u64,
+    /// Total wait-plus-hold across those acquisitions, nanoseconds. An upper bound on hold time.
+    span_ns: u64,
+    /// **Client statements that began AND finished inside the sweep window.** An integer.
+    done_during_sweep: u64,
 }
 
 /// Run one arm against a freshly built fixture.
@@ -398,21 +459,27 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
     std::thread::sleep(warmup);
 
     // ---- the sweep ------------------------------------------------------------------------
+    let mut acquisitions = 0u64;
+    let mut span_ns = 0u64;
     let (sweep_from, sweep_to, reaped, scans, refused) = if arm == Arm::Idle {
         // The negative control does no sweep at all. The window is the same length so the two
         // sample sets are the same size of draw.
         std::thread::sleep(warmup);
         (0u64, 0u64, 0, 0, 0)
     } else {
-        let lock: Arc<dyn RuntimeLock> = match arm {
+        let inner: Arc<dyn RuntimeLock> = match arm {
             Arm::Locked => Arc::clone(&f.ctx) as Arc<dyn RuntimeLock>,
             _ => Arc::new(PrivateLock(Mutex::new(()))) as Arc<dyn RuntimeLock>,
         };
+        // Counted in BOTH arms, so `reaps per acquisition` is comparable between them: the
+        // wrapper adds the same two atomics to each and changes which lock is underneath, which
+        // is the one difference the arms are for.
+        let counting = CountingLock::new(inner);
         let from = Instant::now();
         let lease = LeaseThread::start(
             Arc::clone(&f.reaper),
             Arc::clone(&f.runtime),
-            lock,
+            Arc::clone(&counting) as Arc<dyn RuntimeLock>,
             ONE_SWEEP_ONLY,
         )
         .expect("lease thread");
@@ -433,6 +500,9 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
         }
         let to = Instant::now();
         let stats = lease.stop();
+        // Read after `stop()` joined the scan thread, so nothing can still be incrementing them.
+        acquisitions = counting.acquisitions.load(Ordering::SeqCst);
+        span_ns = counting.span_ns.load(Ordering::SeqCst);
         (
             from.duration_since(origin).as_nanos() as u64,
             to.duration_since(origin).as_nanos() as u64,
@@ -465,6 +535,17 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
         reaped,
         scans,
         refused,
+        acquisitions,
+        span_ns,
+        // **A count, not a duration: statements that COMPLETED while the sweep was running.**
+        //
+        // The second load-immune number. Before the fix every client is blocked for the whole
+        // sweep, so this is at most one per client; after it, clients keep going and it is
+        // thousands. Fleet load slows both arms together and cannot invert them.
+        done_during_sweep: raw
+            .iter()
+            .filter(|p| sweep_to > sweep_from && p.asked_at >= sweep_from && p.asked_at + p.waited <= sweep_to)
+            .count() as u64,
     }
 }
 
@@ -540,9 +621,9 @@ fn main() {
         std::collections::BTreeMap::new();
 
     println!(
-        "{:>8} {:>4} {:>7} {:>7} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>14} {:>7}",
-        "N", "rep", "arm", "K", "probes", "overlap", "p50_all_ns", "p50_ov_ns", "p99_ov_ns",
-        "max_ns", "sweep_wall_ns", "reaped"
+        "{:>8} {:>4} {:>7} {:>7} {:>8} {:>8} {:>12} {:>12} {:>12} {:>14} {:>7} {:>5} {:>8} {:>10}",
+        "N", "rep", "arm", "K", "probes", "overlap", "p50_ov_ns", "p99_ov_ns",
+        "max_ns", "sweep_wall_ns", "reaped", "acqs", "reap/acq", "done_in_sw"
     );
 
     for &n in &ns {
@@ -589,20 +670,30 @@ fn main() {
                     if ok { v.to_string() } else { "--".into() }
                 };
 
+                // **reaps per acquisition is the load-immune statement of the whole claim.**
+                // Before: one acquisition holds every reap, so it IS the number that expired and
+                // it rises with the branch count. After: bounded by REAP_CHUNK whatever expires.
+                let per_acq = if o.acquisitions == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{:.2}", o.reaped as f64 / o.acquisitions as f64)
+                };
                 println!(
-                    "{:>8} {:>4} {:>7} {:>7} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>14} {:>7}",
+                    "{:>8} {:>4} {:>7} {:>7} {:>8} {:>8} {:>12} {:>12} {:>12} {:>14} {:>7} {:>5} {:>8} {:>10}",
                     n,
                     rep,
                     spec.arm.name(),
                     if sweeps { armed.to_string() } else { "-".into() },
                     o.all.n(),
                     o.overlap.n(),
-                    o.all.pct(0.50),
                     cell(o.overlap.pct(0.50)),
                     cell(o.overlap.pct(0.99)),
                     cell(o.overlap.max()),
                     o.sweep_wall,
                     o.reaped,
+                    o.acquisitions,
+                    per_acq,
+                    o.done_during_sweep,
                 );
                 if sweeps {
                     eprintln!(
@@ -627,6 +718,8 @@ fn main() {
                     p.sweep_walls.push(o.sweep_wall);
                 }
                 p.reaped += o.reaped;
+                p.acquisitions += o.acquisitions;
+                p.done_during_sweep += o.done_during_sweep;
                 p.reps += 1;
             }
             drop(f);
@@ -644,8 +737,15 @@ fn main() {
          sweep took."
     );
     println!(
-        "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8}",
-        "N", "arm", "K", "samples", "p50_ns", "p99_ns", "max_ns", "sweep_wall_ns", "reaped"
+        "# The two rightmost columns are COUNTS, not durations, and are the claim in a form fleet");
+    println!(
+        "# load cannot move: reap/acq is how many branches one acquisition of the statement lock");
+    println!(
+        "# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.");
+    println!(
+        "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>11}",
+        "N", "arm", "K", "samples", "p50_ns", "p99_ns", "max_ns", "sweep_wall_ns", "reaped",
+        "acqs", "reap/acq", "done_in_sw"
     );
     for ((n, arm, k), p) in &pools {
         let s = Samples::of(p.waits.clone());
@@ -656,8 +756,13 @@ fn main() {
             w.sort_unstable();
             w[w.len() / 2]
         };
+        let per_acq = if p.acquisitions == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.2}", p.reaped as f64 / p.acquisitions as f64)
+        };
         println!(
-            "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8}",
+            "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>11}",
             n,
             arm,
             k,
@@ -666,7 +771,10 @@ fn main() {
             s.pct(0.99),
             s.max(),
             wall,
-            p.reaped
+            p.reaped,
+            p.acquisitions,
+            per_acq,
+            p.done_during_sweep
         );
     }
 

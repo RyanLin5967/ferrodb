@@ -639,8 +639,10 @@ impl RuntimeLock for ChunkGate {
 #[test]
 fn d98_one_acquisition_never_reaps_more_than_a_chunk() {
     let f = fixture();
-    // Deliberately not a multiple of the chunk, so an off-by-one in the last group shows up.
-    let n = REAP_CHUNK * 5 + 3;
+    // Deliberately not a multiple of the chunk, so an off-by-one in the last group shows up, and
+    // never fewer than a dozen: the assertion is that MANY expiries do not become one long hold,
+    // and a fixture with three branches in it cannot distinguish that from anything.
+    let n = (REAP_CHUNK * 5 + 3).max(12);
     for _ in 0..n {
         branch_with_pages(&f, EXPIRED, 1);
     }
@@ -687,7 +689,7 @@ fn d98_one_acquisition_never_reaps_more_than_a_chunk() {
 #[test]
 fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
     let f = fixture();
-    let n = REAP_CHUNK * 4;
+    let n = (REAP_CHUNK * 4).max(8);
     let all: Vec<BranchId> = (0..n).map(|_| branch_with_pages(&f, EXPIRED, 1)).collect();
 
     let gate = ChunkGate::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);

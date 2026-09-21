@@ -16,10 +16,20 @@
 # arm order INSIDE each invocation rotates with the rep index on top of that (a Latin square over
 # the five arms), because the arms are what the control comparison rests on.
 #
-# THE LOCK IS NOT OPTIONAL. `~/wt/logs/measure-lock.sh` refuses rather than warns: it waits for the
-# fleet's timing lock AND for load to fall below 8, and exits non-zero if either fails. This script
-# records what it said in the artifact instead of deciding for the reader — a run taken at load 40
-# is a curve of the fleet, and the header has to say so.
+# THE LOCK IS NOT OPTIONAL, AND IT DOES LESS THAN THIS HEADER ONCE CLAIMED.
+#
+# ⛔ CORRECTED 2026-09-21. This said the lock "waits for the fleet's timing lock AND for load to
+# fall below 8, and exits non-zero if either fails". That was true of the first version of
+# `~/wt/logs/measure-lock.sh` and it DEADLOCKED THE FLEET — the box runs a dozen build agents at
+# load 22-60, so the quiet gate could never open. The script was rewritten: it blocks only on other
+# MEASURERS, there is no exit 3, and the load is STAMPED as `load_at_acquire=<n>` rather than
+# gated. The script's own header is the authority; this comment is a pointer to it.
+#
+# WHAT THAT MEANS FOR THE NUMBERS. Mutual exclusion against other measurers is real and is what
+# this takes. Quiet is not available on this machine, so every duration below is an UPPER BOUND
+# carrying `load_at_acquire` beside it, and the claim rests first on the two INTEGER counters the
+# harness reports — reaps per lock acquisition, and statements completed during the sweep. Those
+# are counts of events, not durations, so fleet load does not move them.
 #
 #   bench/d98_run.sh <before-binary> <after-binary> <out-dir>
 set -u
@@ -46,8 +56,14 @@ run() {  # run <tag> <binary> <args...>
   echo "$tag exit=$? $(grep -c '^ *[0-9]' "$OUT/$tag.txt" || true) data rows" >&2
 }
 
-echo "measure-lock: $(~/wt/logs/measure-lock.sh acquire D98 2>&1)" | tee "$OUT/lock.txt"
-echo "load at start: $(uptime)" >> "$OUT/lock.txt"
+# Refuse rather than warn. Exit 1 is "timed out waiting for another MEASURER", and a timing run
+# taken while a sibling agent is also timing is not a run to caveat — it is a run not to take.
+LOCKOUT=$(~/wt/logs/measure-lock.sh acquire D98 2>&1); LOCKRC=$?
+{ echo "measure-lock rc=$LOCKRC"; echo "$LOCKOUT"; echo "load at start: $(uptime)"; } | tee "$OUT/lock.txt"
+if [ "$LOCKRC" -ne 0 ]; then
+  echo "REFUSING TO MEASURE: measure-lock exited $LOCKRC. Do not report a number from this run." >&2
+  exit "$LOCKRC"
+fi
 
 for round in 1 2; do
   if [ "$round" = 1 ]; then order="before after"; else order="after before"; fi
