@@ -332,11 +332,12 @@ fn main() {
     println!();
     let (rlog, rbase, rseqs, _) = build(1_000);
     let mut moved = rbase.clone();
-    // Move one cell out from under the pick, contradictorily.
-    // Row 500's cell is moved to a value no recorded op explains, so `divergence` falls back to
-    // an opaque Assign — which does not commute with an Add, and the whole pick refuses.
-    moved.insert(T, RowId(500), vec![Value::Integer(0), Value::Integer(-1), Value::Integer(0)]);
-    let sel: Vec<OpSelector> = rseqs[..1000].iter().copied().map(OpSelector::new).collect();
+    // ONE row of the thousand is gone from the target. A moved VALUE is not a refusal in this
+    // fixture — `Add` commutes with everything the log can report on that cell — but a missing
+    // ROW is (truth-table row 7), and it is the refusal an agent actually hits when a sibling
+    // deleted the row out from under the pick.
+    assert!(moved.remove(T, RowId(500)).is_some(), "the fixture must have had that row");
+    let sel = spread(&rseqs, 1000);
     let policy = PolicyTable::new();
     let mut us: Vec<f64> = Vec::new();
     for _ in 0..201 {
