@@ -716,6 +716,38 @@ impl ArenaPageStore {
     /// independently written pages differ even with identical content, for exactly this reason —
     /// so diffing it would put a run at offset 0 in every delta ever taken and inflate the cheapest
     /// case the most. A materialised page re-stamps its own header rather than inheriting one.
+    ///
+    /// # Crash safety: how a half-written chain cannot read as a complete one
+    ///
+    /// D85 in this project was silent data loss of exactly this class — a partial write that read
+    /// back as a complete, smaller truth — so the argument is recorded here rather than left to be
+    /// reconstructed. Four things carry it, and the first is the one that matters most.
+    ///
+    /// 1. **No chain is written yet, so no chain can be half-written.** `cow_page` still stores a
+    ///    whole page; this method computes a delta and returns it. That is not a hedge, it is the
+    ///    current truth, and it means D102 adds no crash-recovery surface at all. Everything below
+    ///    is what must hold *before* anything stores one.
+    /// 2. **A base is always older than the branch that deltas against it.** Only a base the
+    ///    branch does NOT own is recorded (see `cow_page`), i.e. a page inherited from an ancestor,
+    ///    which was made durable by that ancestor's commit before this branch forked. So a delta
+    ///    can never point at a base that the same crash could lose, and the ordering "base durable
+    ///    before delta durable" needs no enforcement — it is a consequence of what is recordable.
+    ///    The epoch interval rule in `branch::record::reclaimable` keeps that base alive, and
+    ///    [`ArenaPageStore::stale_delta_base_count`] counts any case where it did not.
+    /// 3. **Each record is self-describing and checksummed.** A delta carries its own `base` and
+    ///    `depth`, and a page carries `crc32`. A torn record fails `verify_checksum` and
+    ///    `read_page` refuses it — the behaviour
+    ///    `a_torn_page_is_refused_rather_than_returned` already pins. A missing link fails as a
+    ///    bad page rather than as a shorter chain, because the depth is written down rather than
+    ///    inferred from how many links happen to be readable.
+    /// 4. **Truncation refuses rather than parses.** [`crate::branch::delta::PageDelta::decode`]
+    ///    rejects every proper prefix of a record;
+    ///    `every_truncation_of_a_record_is_refused_rather_than_read_short` asserts that over all
+    ///    of them, and a mutant that clamps instead of refusing fails it.
+    ///
+    /// The in-memory `shadow_base` map is deliberately not durable, and that is safe in the one
+    /// direction that matters: losing it makes the next shadow a chain ROOT rather than a deeper
+    /// link, so a crash can only make chains shorter than [`delta::MAX_CHAIN_DEPTH`], never longer.
     pub fn delta_against_base(&self, shadow: PageId) -> Result<Option<PageDelta>, FerroError> {
         let Some(&(base, depth, born)) = self.state.lock().unwrap().shadow_base.get(&shadow) else {
             return Ok(None);
