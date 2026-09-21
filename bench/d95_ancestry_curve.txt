@@ -3,9 +3,17 @@ D95 — ANCESTRY QUERIES: is-ancestor and LCA vs branch DEPTH, walk vs index, bo
 [HERE] runs 04:22-04:26Z, banked 2026-09-21T04:25:26Z  examples/d95_ancestry_curve.rs  ferrodb at 5203b462ab95 (clean)
        load=24.11 35.49 45.70 at run 1 (ten agents building; the reading is the SLOPE, not the
        absolutes). Taken while holding ~/wt/logs/measure-lock.sh as "D95-ancestry", so no other
-       fleet measurement overlapped it. The lock's inner wait for load<8 was still running when
-       these were taken: this box does not go quiet with the fleet up, and the d60 precedent in
-       this directory banked its curve the same way for the same reason.
+       fleet measurement overlapped it.
+
+       LOCK HISTORY, stated exactly because it decides how these numbers may be used: the lock
+       was taken at 04:18:27Z and released at 04:31Z, and ALL FOUR RUNS were taken inside that
+       window. The lock's inner wait for load<8 NEVER COMPLETED — this box does not go quiet
+       while ten agents are up — so by that script's own rule the ABSOLUTES here are
+       untrustworthy and are not reported as anything else. What the lock did buy is real and is
+       the reason it was taken: no other fleet measurement ran against this box while these were
+       taken. The SLOPE across depths, measured in one process with arm order alternated per
+       depth, is the result; bench/d60_depth_premise.txt banked its curve under load 49 for the
+       same reason. The load-independent check on the whole claim is the walk_steps column.
 
 ## PREMISE CORRECTION — READ THIS BEFORE THE NUMBERS
 
