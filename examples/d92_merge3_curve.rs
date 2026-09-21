@@ -33,8 +33,11 @@
 //! `descend_ours_unchanged` both read **0 at every N**, and a reader would have had no way to tell
 //! a rule that cannot fire from a rule that had nothing to fire on. Both workloads therefore run:
 //!
-//! - **contested** — the sides change keys one apart, so they share every node down to the leaf.
-//!   This is the worst case for skipping and the one that bounds `nodes_read` from above.
+//! - **contested** — the sides change two keys OF THE SAME LEAF, so they share every node down to
+//!   the leaf. This is the worst case for skipping and the one that bounds `nodes_read` from above.
+//!   ⚠ The pairs are read out of the leaves themselves rather than picked as `i` and `i+1`: since
+//!   D89 made leaf boundaries content-defined, a boundary can fall between two adjacent keys and
+//!   the arm silently stops being contested. See `Placement::keys`.
 //! - **separated** — ours changes keys in the first half of the key space, theirs in the second,
 //!   so most changed paths are touched by exactly one side. This is the case rules 2 and 3 exist
 //!   for, and it is what makes their zeros in the contested arm readable as "nothing to skip"
@@ -126,6 +129,50 @@ fn key(i: usize) -> Vec<u8> {
     format!("{:016}", i).into_bytes()
 }
 
+/// The index a key encodes, for turning a key read back off a page into an `i`.
+fn key_index(k: &[u8]) -> usize {
+    std::str::from_utf8(k).unwrap().parse().unwrap()
+}
+
+/// Every leaf of `root`, in key order, as the list of keys each one holds.
+///
+/// `all_children` is leftmost-first, so a left-to-right descent visits leaves in key order.
+fn leaf_keys(h: &Harness, root: PageId) -> Vec<Vec<Vec<u8>>> {
+    fn rec(h: &Harness, pid: PageId, out: &mut Vec<Vec<Vec<u8>>>) {
+        let handle = h.store.read_page(pid).unwrap();
+        let f = handle.read();
+        let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+        let node = Node::new(&f.data);
+        if ty == PageType::BTreeLeaf {
+            out.push((0..node.count()).map(|i| node.key(i).unwrap().to_vec()).collect());
+        } else {
+            for c in node.all_children().unwrap() {
+                rec(h, c, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(h, root, &mut out);
+    out
+}
+
+/// Which leaf of `root` holds `k`. The premise-check for the contested workload reads this off
+/// the tree rather than assuming it.
+fn leaf_of(h: &Harness, root: PageId, k: &[u8]) -> PageId {
+    let mut pid = root;
+    loop {
+        let handle = h.store.read_page(pid).unwrap();
+        let f = handle.read();
+        if PageHeader::read_from(&f.data).unwrap().page_type == PageType::BTreeLeaf {
+            return pid;
+        }
+        let child = Node::new(&f.data).child_slot_for(k).unwrap().1;
+        drop(f);
+        drop(handle);
+        pid = child;
+    }
+}
+
 struct Arm {
     n: usize,
     pages: usize,
@@ -137,7 +184,8 @@ struct Arm {
 /// How the two sides' changed keys are placed relative to each other.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Placement {
-    /// `i` and `i+1`: the sides share every node down to the leaf. Worst case for skipping.
+    /// Two entries of ONE leaf: the sides share every node down to the leaf. Worst case for
+    /// skipping. Taken from the built tree, not computed — see `Placement::keys`.
     Contested,
     /// Ours in the first half of the key space, theirs in the second. Most changed paths belong to
     /// exactly one side, which is what rules 2 and 3 are for.
@@ -152,15 +200,56 @@ impl Placement {
         }
     }
 
-    /// The keys each side changes, given N and the per-side delta.
-    fn keys(self, n: usize, deltas: usize) -> (Vec<usize>, Vec<usize>) {
+    /// The keys each side changes, given the built base tree, N and the per-side delta.
+    ///
+    /// # ⚠ Why this reads the tree instead of computing `i` and `i+1`
+    ///
+    /// The contested workload's whole premise is that the two sides' changed keys **share every
+    /// node from the root to the leaf**, so no subtree belongs to one side alone and rules 2 and 3
+    /// cannot fire. `main` asserts exactly that (`con_theirs == 0`, `con_ours == 0`), and that
+    /// assertion is load-bearing: it is what makes the separated arm's nonzero counters readable
+    /// as "the counter works" rather than "the counter is stuck".
+    ///
+    /// This used to pick `i` and `i+1` and assume adjacent keys are co-resident. **D89 made leaf
+    /// boundaries content-defined** (`cow::chunker`, "chunk on the key alone"), so a boundary can
+    /// fall exactly between `i` and `i+1` — and then those two keys are in *different* leaves, a
+    /// subtree does belong to one side alone, and rules 2 and 3 fire in the arm that asserts they
+    /// cannot. Measured on this harness at e7588cc: `skip_theirs_unch` read 2, 2, 1, 1, 0 across
+    /// the five sizes where the pre-D89 banked curve (`D92-merge3` at 3c4ca6c) had 0 at every one.
+    ///
+    /// The premise was never "adjacent keys are adjacent in the tree" — that was an accident of a
+    /// capacity-based splitter. It is "both sides write into one leaf". So the pairs are taken
+    /// **out of the leaves themselves**: each pair is two entries of one leaf, which is co-resident
+    /// by construction under any chunker. `arm` then re-reads the premise off the tree and asserts
+    /// it, so a future layout change fails with "these two keys are in different leaves" instead of
+    /// with a counter assertion four hundred lines away.
+    fn keys(self, h: &Harness, base: PageId, n: usize, deltas: usize) -> (Vec<usize>, Vec<usize>) {
         match self {
             Placement::Contested => {
-                let ours: Vec<usize> = (0..deltas).map(|j| n * (j + 1) / (deltas + 1)).collect();
-                let theirs = ours.iter().map(|k| k + 1).collect();
+                // Leaves holding at least two entries: only those can host a contested pair.
+                let leaves: Vec<Vec<Vec<u8>>> =
+                    leaf_keys(h, base).into_iter().filter(|l| l.len() >= 2).collect();
+                assert!(
+                    leaves.len() >= deltas,
+                    "N={n}: only {} leaves hold two or more entries, need {deltas} to place a \
+                     contested pair in each. The tree is too small or the chunker is producing \
+                     single-entry leaves.",
+                    leaves.len()
+                );
+                // Spread the chosen leaves across the key space so the descent cannot get lucky
+                // with locality — the same intent the old arithmetic had.
+                let mut ours = Vec::with_capacity(deltas);
+                let mut theirs = Vec::with_capacity(deltas);
+                for j in 0..deltas {
+                    let leaf = &leaves[leaves.len() * (j + 1) / (deltas + 1)];
+                    ours.push(key_index(&leaf[0]));
+                    theirs.push(key_index(&leaf[1]));
+                }
                 (ours, theirs)
             }
             Placement::Separated => {
+                // Unaffected by the leaf partition: this places the two sides in opposite HALVES
+                // of the key space, which no chunker can make co-resident.
                 let half = n / 2;
                 let ours = (0..deltas).map(|j| half * (j + 1) / (deltas + 1)).collect();
                 let theirs = (0..deltas).map(|j| half + half * (j + 1) / (deltas + 1)).collect();
@@ -186,7 +275,23 @@ fn arm(n: usize, deltas: usize, placement: Placement) -> Arm {
     let tb = h.fork(3);
 
     // Spread the changes across the key space so the descent cannot get lucky with locality.
-    let (ours_keys, theirs_keys) = placement.keys(n, deltas);
+    let (ours_keys, theirs_keys) = placement.keys(&h, base, n, deltas);
+
+    // ---- the workload's premise, READ OFF THE TREE rather than assumed -----------------------
+    //
+    // `main` asserts that rules 2 and 3 never fire in the contested arm. That is only true if each
+    // pair really does share a leaf. Assert it here, where the failure names the actual cause.
+    if placement == Placement::Contested {
+        for (o, t) in ours_keys.iter().zip(theirs_keys.iter()) {
+            let lo = leaf_of(&h, base, &key(*o));
+            let lt = leaf_of(&h, base, &key(*t));
+            assert_eq!(
+                lo, lt,
+                "N={n} contested: keys {o} and {t} are in different leaves ({lo} vs {lt}), so a \
+                 subtree belongs to one side alone and the contested arm's premise is false"
+            );
+        }
+    }
 
     let mut ours = base;
     for &i in &ours_keys {
@@ -295,7 +400,12 @@ fn main() {
     println!();
 
     let deltas = 4;
-    let sizes = [1_000usize, 4_000, 16_000, 64_000, 256_000];
+    // Overridable so the harness can be re-run cheaply while iterating on it. The banked curve is
+    // the default set; a run at other sizes must say so where it is recorded.
+    let sizes: Vec<usize> = std::env::var("D92_SIZES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1_000, 4_000, 16_000, 64_000, 256_000]);
 
     let mut by_placement = Vec::new();
     for placement in [Placement::Contested, Placement::Separated] {
@@ -304,7 +414,8 @@ fn main() {
         println!("workload: {} — ours and theirs each change {deltas} keys.", placement.name());
         match placement {
             Placement::Contested => println!(
-                "  keys are one apart, so both sides share every node from the root to the leaf."
+                "  each side writes a different entry of the SAME leaf, so both sides share every \
+                 node from the root to the leaf."
             ),
             Placement::Separated => println!(
                 "  ours in the first half of the key space, theirs in the second."
