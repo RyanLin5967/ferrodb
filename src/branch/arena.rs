@@ -1410,8 +1410,27 @@ impl PageStore for ArenaPageStore {
         st.pending.retain(|p| p.arena_id != arena);
         st.claim_epoch.remove(&arena);
         if let Some(ext) = ext.as_ref() {
-            let _ = ext;
-            st.current.retain(|_, a| *a != arena);
+            // **D99 — RE-INDEX THE QUESTION, do not speed up the answer.** "Which branch is
+            // currently filling this arena?" was answered by walking every entry in `current`,
+            // which is keyed by branch: O(branches) under the store's hottest lock, once per
+            // freed extent. The extent record already names the answer, so it is one hash lookup.
+            //
+            // **Exactly equivalent, and arena-id uniqueness is why.** `ArenaSpaceManager::reserve`
+            // draws every id from a monotonic counter (`arena_ids.take(1)`) and `give_back`
+            // recycles only the page RANGE, so an arena id names one extent for the life of the
+            // store and can never be reissued under a second owner. `alloc_arena` writes
+            // `extents[arena].owner = branch` and `current[branch] = arena` inside ONE critical
+            // section, so if any branch maps to this arena it is `ext.owner` and no other — which
+            // is what makes a lookup able to replace a scan rather than merely usually agree with
+            // it.
+            //
+            // The `get` guard carries the case the `retain` also handled: an owner that has since
+            // moved on to a newer extent has `current[owner] != arena`, and neither spelling
+            // touches it. Dropping the guard would evict a live branch's CURRENT arena and send it
+            // back to `alloc_arena` on its next write.
+            if st.current.get(&ext.owner) == Some(&arena) {
+                st.current.remove(&ext.owner);
+            }
         }
         drop(st);
 
@@ -2008,6 +2027,59 @@ mod tests {
             restored.state_bytes(),
             v3,
             "a v2 image did not round-trip to the same map"
+        );
+    }
+
+    /// **D99 — `free_arena` must forget exactly ONE branch's current extent: the owner's.**
+    ///
+    /// The scan this replaced walked every entry in `current` and removed whatever pointed at the
+    /// arena. A lookup keyed on `ext.owner` is equivalent only because an arena id names one
+    /// extent for the life of the store, so the entry it finds is the only one that COULD have
+    /// matched. The assertion that carries that is not "the owner was forgotten" — a rewrite that
+    /// removed the wrong key, or removed several, still satisfies it — but "no bystander moved".
+    #[test]
+    fn freeing_an_extent_forgets_its_owner_and_no_other_branch() {
+        let h = Harness::new();
+        let a = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let c = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let aa = h.store.arena_for(a).unwrap();
+        let ab = h.store.arena_for(b).unwrap();
+        let ac = h.store.arena_for(c).unwrap();
+        assert!(aa != ab && ab != ac && aa != ac, "fixture: branches must not share an extent");
+
+        h.store.free_arena(ab).unwrap();
+
+        // The owner forgot it: its next write opens a new extent instead of refilling a freed one.
+        assert_ne!(
+            h.store.arena_for(b).unwrap(),
+            ab,
+            "the freed extent is still the owner's current arena"
+        );
+        // The bystanders did not. This is the half a scan gave away for free and a lookup has to
+        // earn.
+        assert_eq!(h.store.arena_for(a).unwrap(), aa, "freeing b's extent moved a off its own");
+        assert_eq!(h.store.arena_for(c).unwrap(), ac, "freeing b's extent moved c off its own");
+    }
+
+    /// The `get` guard, which the scan also had: freeing an extent the owner has ALREADY moved off
+    /// must leave it on its current one. Without the guard this evicts a live branch from the
+    /// extent it is filling and sends it back to `alloc_arena` on its next write.
+    #[test]
+    fn freeing_a_superseded_extent_leaves_the_owner_on_its_current_one() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let old = h.store.arena_for(b).unwrap();
+        let new = h.store.alloc_arena(b).unwrap();
+        assert_ne!(old, new, "fixture: the branch did not move to a second extent");
+        assert_eq!(h.store.arena_for(b).unwrap(), new, "fixture: the branch is not on the new one");
+
+        h.store.free_arena(old).unwrap();
+
+        assert_eq!(
+            h.store.arena_for(b).unwrap(),
+            new,
+            "freeing a superseded extent evicted the owner from its CURRENT one"
         );
     }
 
