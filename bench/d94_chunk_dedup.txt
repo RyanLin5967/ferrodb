@@ -1,0 +1,153 @@
+=== D94: CROSS-BRANCH CHUNK DEDUP -- the premise first, then the sweep ===
+harness: examples/d94_dedup_premise.rs, built 48c6e602d059
+module:  src/cow/dedup.rs        tests: test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
+raw:     bench/d94_sweep_raw.txt, bench/d94_extent_premise_raw.txt
+
+SHORT VERSION. The mechanism is built and tested. Adopting it is NOT recommended on this
+evidence, and the reason is the first table, not the second.
+
+-- PREMISE 1: is extent granularity still the space wall? NO. It was, and it is closed. --
+
+The brief points at a 262x space amplification from 1 MiB extents per branch. That number
+is real and was measured on branch D32-write-curve, which is NOT merged: its artifact
+bench/d32_write_curve.txt does not exist on main (git cat-file -e HEAD:bench/d32_write_curve.txt
+-> ABSENT; git branch --contains 4f46e6d -> D32-write-curve only). What it recorded:
+
+    D32, one page written per branch:  1,048,316 len B/branch   965,108 alloc B/branch
+    -> extrapolated 1.05 TB at 10^6 branches. D31 named as the binding wall.
+
+D31 has since landed on main: branch::types::ARENA_FIRST_EXTENT_PAGES = 1 with geometric
+growth to a 256-page cap (next_extent_pages), used by ArenaPageStore (arena.rs:1325).
+Re-running D32's OWN harness, unmodified, on main:
+
+    N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms
+    496       106.0       2.0        2.1           4104             4236            339          496       6.665
+    1000       120.9       4.1        4.2           4100             4198            336         1000       6.423
+    2000        98.5       8.2        8.4           4098             4196            334         2000       6.680
+    4000        95.3      16.4       16.8           4097             4195            334         4000       6.297
+    DID NOT stop early within the budget: N = 4000, 4097 bytes/branch.
+    reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+    VERDICT — AMPLIFICATION GONE. 4097 B/branch is within 8x of a
+    single page, so a branch's first page costs about a page. This is the tree WITH
+    geometric extent growth (D31) built; without it this number is ~1048576.
+
+    -> the per-branch cost fell from 1,048,316 B to about one page. Extent granularity is
+       NO LONGER the wall, so dedup is not being asked to fix the big number; it is being
+       asked to fix what is left.
+
+-- PREMISE 2: how much duplicate content is there, and who already owns the saving? --
+
+A page a branch never writes is not copied: parent and child name the same PageId. So a
+probe that counts repeated content across branches counts CoW's existing saving as if it
+were dedup's. These columns hold the two apart. Each is a strict subset of the one left of
+it. Workload: a trunk of 5000 rows, then N branches each writing 8 rows spread across it.
+
+  branches   dup   trunk   page refs   distinct   distinct   distinct   cow saves  dedup
+             frac  pages               pages      whole      payload    pages      gains
+       100  0.00    101       10201       1001       1001       1001        9200       0
+       100  0.50    101       10201       1001       1001        605        9200     396
+       100  1.00    101       10201       1001       1001        209        9200     792
+      1000  0.00    101      101101       9101       9101       9101       92000       0
+      1000  0.50    101      101101       9101       9101       5105       92000    3996
+      1000  1.00    101      101101       9101       9101       1109       92000    7992
+
+TWO RESULTS, and the first one is the one that matters most:
+
+(a) 'distinct pages' EQUALS 'distinct whole' in every single row, including dup_frac = 1.00
+    where every branch writes byte-identical rows. There is not one byte-identical WHOLE
+    page anywhere in this store. cow::page_header puts {birth_epoch, arena_id, crc32} in
+    the first 16 bytes of every page, so two branches writing the same content produce
+    pages that differ. ForkBase's mechanism as stated -- identical content anywhere is one
+    chunk -- finds NOTHING here. A content index must key on the payload, page[24..4096].
+
+(b) CoW has already banked the large saving. 'page refs' is what these branches would cost
+    if each forked branch held its own copy of the tree; 'distinct pages' is what they
+    actually cost. That reduction is free and already shipped:
+      N=100       10201 references ->    1001 pages stored (90.2% collapsed by sharing alone)
+      N=1000     101101 references ->    9101 pages stored (91.0% collapsed by sharing alone)
+
+    Dedup's entire remaining budget is the 'dedup gains' column, and at dup_frac = 0.00 --
+    branches writing DIFFERENT content, which is what independent agents do -- it is
+    EXACTLY ZERO at every N. Not small: zero.
+
+-- THE SWEEP: bytes stored with and without dedup, and the SLOPE --
+
+  branches   dup     stored today B        deduped B    saving
+       100  0.00          4,100,096        4,100,096     0.0%
+       100  0.50          4,100,096        2,478,080    39.6%
+       100  1.00          4,100,096          856,064    79.1%
+      1000  0.00         37,277,696       37,277,696     0.0%
+      1000  0.50         37,277,696       20,910,080    43.9%
+      1000  1.00         37,277,696        4,542,464    87.8%
+
+A saving percentage is a ratio and a ratio cannot tell a constant from a complexity class.
+The sweep exists so the SLOPE can be fitted -- pages per additional branch:
+
+  series                              pages/branch  fixed pages
+  stored today, dup=0.00                     9.000        101.0
+  stored today, dup=0.50                     9.000        101.0
+  stored today, dup=1.00                     9.000        101.0
+  deduped,      dup=0.00                     9.000        101.0
+  deduped,      dup=0.50                     5.000        105.0
+  deduped,      dup=1.00                     1.000        109.0
+
+Read the slopes, not the percentages. Dedup does not change the complexity class: both
+series are linear in the branch count. What it changes is the COEFFICIENT, and only when
+branches write identical content. At dup_frac = 0.00 the two slopes are the same number.
+
+There is also a FLOOR that dedup can never go below, visible in the deduped slope at
+dup_frac = 1.00: it is not zero. Every branch keeps at least its own tree spine. Internal
+nodes hold child PageIds, which differ per branch by construction, so the spine can never
+be byte-identical across branches no matter how identical the data is.
+
+-- WHAT ADOPTING THIS WOULD COST, which is why it is not wired in --
+
+src/cow/mod.rs lists 'No content addressing' and 'No reference counts' as deliberate
+non-goals, each with a stated reason (btrfs's backref explosion; Dolt needing copying
+mark-and-sweep GC). This is not an oversight to be corrected -- it is load-bearing:
+
+  A deduped page holds ONE arena_id and ONE birth_epoch but is referenced by TWO branches.
+  Liveness here is branch::record::reclaimable, an epoch-interval rule stated per OWNER.
+  It cannot answer for a page with two owners. Adopting dedup means retiring that rule for
+  shared pages and running refcounts instead -- across the reaper, the pending-free log and
+  free_arena's O(1) whole-extent path, which exists precisely to avoid per-page analysis.
+
+And the cheaper alternative is already measured, in the table above. Content that is
+identical across branches BY CONSTRUCTION can be written to the trunk BEFORE forking, where
+CoW shares it for free: that is exactly what the 'cow saves' column is, and it needs no
+index, no refcounts and no change to liveness. Dedup's real remaining case is CONVERGENT
+writes -- two branches independently arriving at identical bytes, unknowably in advance.
+That case is real. Its magnitude in a production agent workload is NOT measured here, and
+this harness cannot measure it: dup_frac is an input, not an observation.
+
+-- WHAT WAS BUILT --
+
+src/cow/dedup.rs: ChunkIndex, a content-addressed index over page payloads with refcounts.
+  * ContentId is sha256 truncated to 128 bits, and is treated as a HINT. Every hit compares
+    the bytes before sharing; a bucket is a LIST so two payloads that collide keep separate
+    pages. Forced with an always-collide hasher, because an unexecuted branch is untested.
+  * An increment is provisional until commit(). RefTicket rolls it back on Drop, closing
+    the in-process window (?, early return, panic) between raising a refcount and recording
+    who owns the reference.
+  * A process crash runs no destructor, so provisional increments are journalled and
+    recover() rolls back every uncommitted one. Tested with std::mem::forget, which is what
+    a dead process looks like to the structure.
+  * An over-release is REFUSED, not clamped: a clamp turns the decrement that deletes live
+    data into a silent no-op.
+  * Allocation happens outside the index lock (the store's arena lock would invert against
+    it); the resulting race is closed by re-checking and handing the loser's page back as
+    surplus rather than leaking it.
+
+  test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 0.00s
+
+  Mutation fire-check -- each guard broken on purpose, and the test that caught it:
+    CAUGHT  byte-comparison removed          -> a_content_id_collision_does_not_share_pages
+    CAUGHT  recover() made a no-op           -> a_crash_between_the_increment_and_the_record_leaks_nothing
+    CAUGHT  over-release clamped not refused -> an_over_release_is_refused_and_changes_nothing
+    CAUGHT  Drop rollback removed            -> an_uncommitted_ticket_rolls_its_increment_back_on_drop
+    CAUGHT  race re-check skipped            -> a_racing_publisher_makes_the_loser_hand_its_page_back
+    CAUGHT  audit ignores a zero refcount    -> the_audit_detects_an_inconsistency_it_is_supposed_to_catch
+  Six mutants, six dead. The guards are tested, not merely present. Scripts that produced
+  this: the mutation runs are in the commit log, not kept as files -- each one edits
+  src/cow/dedup.rs in place, runs one test, and restores the file from HEAD.
+
