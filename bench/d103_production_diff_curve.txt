@@ -1,5 +1,5 @@
 d103 — the PRODUCTION DIFF path, cost curve (release)
-run at unix 1790016183
+run at unix 1790019730
 
 Subject: AgentRuntime::page_changeset_with_cost, the call DIFF <branch> reaches.
 Question: does the production path cost O(delta · log_m N) now, or O(N)?
