@@ -3,12 +3,23 @@
 //!
 //! # Why this exists, and what it is not
 //!
-//! `crate::cow` states "**No content addressing**" as a deliberate non-goal, and that decision is
-//! not being reversed here. That non-goal is about *page identity and liveness*: addressing a page
-//! **by** its content hash makes freeing it a global question ("who else references these bytes?"),
-//! which is why Dolt needs copying mark-and-sweep GC. Pages here are still addressed by `PageId`,
-//! still allocated from per-branch arenas, and liveness is still the epoch interval rule in
+//! "**No content addressing**" is a deliberate non-goal, and it is not written in one place: the
+//! same exclusion appears in `cow::mod`, `cow::store`, `cow::btree`, `branch::types` and
+//! `branch::mod`, five times, each giving the same reason. That decision is not being reversed
+//! here. It is about *page identity and liveness*: addressing a page **by** its content hash makes
+//! freeing it a global question ("who else references these bytes?"), which is why Dolt needs
+//! copying mark-and-sweep GC. Pages here are still addressed by `PageId`, still allocated from
+//! per-branch arenas, and liveness is still the epoch interval rule in
 //! `branch::record::reclaimable`. None of that changes.
+//!
+//! `cow::btree`'s wording is the sharpest, and it is what bounds this module: *"there is no
+//! content addressing and there are no refcounts, so a subtree that did not change is not merely
+//! equal to its old self, it **is** the same page id."* Within one lineage ferrodb already has
+//! subtree identity, for free and exactly, from `PageId`. **A cid buys nothing there** — `cow::diff`
+//! measured precisely that, zero skips won by a digest at every N on a single-lineage workload.
+//! What a cid buys is the one case `PageId` cannot express: identity **across branches that never
+//! shared a page**. That is narrower than "ferrodb has no content addressing" makes it sound, and
+//! it is the whole justification.
 //!
 //! What this module adds is the *instrument*: a cid you can **compute on demand and throw away**.
 //! It is never stored, never used to allocate, never consulted by the reaper, and creates no
@@ -36,16 +47,66 @@
 //! numbers, and the reversal between them, are in
 //! `same_data_in_two_orders_converges_to_one_partition_cid`.
 //!
-//! One gap is still open and is pinned by a test rather than a comment: `CowTree::delete` empties a
-//! leaf without unlinking it, so 500 rows inserted directly and 500 rows left over from deleting
-//! half of 1000 have an identical *live* partition but differ by 20 empty leaves — and therefore
-//! differ in partition cid. See `a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`.
-//! Stated as a reach: **a cid compares two trees built by insertion exactly, and reports a false
-//! difference between two trees whose histories differ by a delete.**
+//! # The delete path is still open, and an earlier version of this header said otherwise
+//!
+//! `CowTree::delete` used to empty a leaf without unlinking it. `CowTree::unlink_up` fixes that,
+//! and it is a real fix — 22 empty leaves become 0 on the fixture below, and the pages are freed
+//! rather than merely dropped (45 live pages to 1 after deleting every key of 1000).
+//!
+//! **It does not make the delete path converge, and this header previously claimed it did.** That
+//! claim rested on a diagnosis taken from a single delete shape. Measured across two shapes, with
+//! the same 1000-row build and the same comparison:
+//!
+//! ```text
+//!                                    main 1758b3b              with unlink_up
+//!   suffix, delete 500..1000     44 leaves, 22 empty, agree   22 leaves, 0 empty, agree
+//!   one interior boundary key    44 leaves,  0 empty, DISAGREE 44 leaves, 0 empty, DISAGREE
+//! ```
+//!
+//! The interior-key row is **byte-identical either side of the fix**, because there was never an
+//! empty leaf there to unlink. Deleting the key that *terminates* a leaf destroys that leaf's
+//! content boundary, and the two leaves the content now calls for a single leaf of stay split:
+//! 28 + 9 rows where a clean build produces one leaf of 37. Repairing that means merging with the
+//! right-hand neighbour — the sibling access this layout deliberately lacks (`cow::node`'s header),
+//! and the thing `unlink_up`'s own doc declines to do.
+//!
+//! A contiguous suffix is the **one shape that cannot expose this**, because the only terminator it
+//! destroys belongs to the last leaf, and the last leaf is allowed to end anywhere. The fixture
+//! picked that shape, so it returned the calm answer and an earlier version of this module read it
+//! as the whole story. Found by adversarial review, not by these tests:
+//! `artie-research/frontier/review-chunker.md` F1, probes at `review-chunker-attack` `5e13e98`,
+//! reproduced here against both trees before being written down.
+//!
+//! So the honest reach: **a cid compares two trees built by insertion exactly, and two trees whose
+//! histories differ by a delete only when the delete destroyed no interior boundary.**
+//! `a_delete_of_an_interior_boundary_key_must_not_change_the_partition` is the `#[ignore]`d
+//! criterion for the rest, and it needs a neighbour merge, not another unlink.
+//!
+//! `cow::chunker`'s own exception still stands alongside this one: a chunk longer than a page is
+//! re-cut at a finer target, and a leaf holding part of an over-long chunk cannot see the rest of
+//! it. That is argued there, not here.
 //!
 //! `cow::diff` defines a `NodeIdentity` seam meant to be driven by [`subtree_cid`] through its
 //! `MemoIdentity` adapter — this module deliberately does not wire itself in, because memoising
 //! policy belongs to the consumer.
+//!
+//! # Why this is not `CommitHash`, and how the two are related
+//!
+//! `branch::types::CommitHash([u8; 32])` already names "a committed state of a branch", and
+//! `tel::frame::TxnFrame::base` carries one so a three-way merge can name its fork point. It is
+//! `CommitHash::ZERO` on every live path — nothing computes one. Adding a second identity type
+//! beside a dead one without writing down why is how both end up unexplained, so:
+//!
+//! They answer different questions. A `CommitHash` names a **version**; a [`Cid`] names a
+//! **subtree's contents**. A subtree cid is not a commit id and this module does not widen,
+//! replace or fill in `CommitHash`.
+//!
+//! They are, however, the same question one level apart, and in Noms and Dolt they are literally
+//! the same value: a commit's id *is* the content hash of its root. So `subtree_cid` of a branch's
+//! root is the obvious thing to eventually compute a real `CommitHash` from. At that point both
+//! caveats below stop being academic — 16 bytes is not 32, and a version id that leaves the
+//! process is a different threat model from an in-process comparison, because an identifier other
+//! people rely on is one an adversary has a reason to collide.
 //!
 //! # The hash is NOT cryptographic
 //!
@@ -327,7 +388,7 @@ pub fn ordered_leaf_cids(tree: &CowTree, root: PageId) -> Result<Vec<Cid>, Ferro
 ///
 /// Ignores `PageId`s entirely. Does **not** ignore where the leaf boundaries fall — that is the
 /// measurement this module exists to make, see
-/// [`same_data_in_two_orders_converges_to_one_partition_cid`](self#tests).
+/// `same_data_in_two_orders_converges_to_one_partition_cid`.
 ///
 /// # It is not a tree identity, and must not be used as one
 ///
@@ -606,9 +667,8 @@ mod tests {
         assert!(before.len() > 2, "tree is {} leaves; the claim would be vacuous", before.len());
 
         // "How many survived" is counted by membership, which is only a sound measure while the
-        // leaf cids are distinct. Establish that first rather than assuming it — an empty leaf
-        // repeated (see `a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`) would make
-        // the count a multiset error rather than an answer.
+        // leaf cids are distinct. Establish that first rather than assuming it — repeated equal
+        // leaves (two empty ones, say) would make the count a multiset error rather than an answer.
         let distinct: std::collections::HashSet<&Cid> = before.iter().collect();
         assert_eq!(
             distinct.len(),
@@ -738,119 +798,28 @@ mod tests {
         );
     }
 
-    /// **The gap that is still open, measured.** Convergence holds on the paths that *add* content.
-    /// It does not hold across a delete, and the reason is not the chunker's boundary rule — it is
-    /// that emptied leaves are left in the tree.
+    /// **Scoped deliberately: a delete that destroys no interior boundary.** Deleting the
+    /// contiguous suffix `500..1000` leaves the same partition as building those 500 rows directly.
     ///
-    /// 500 rows reached two ways: inserted directly, versus inserting 1000 and deleting half. Same
-    /// rows, and `cow::chunker` cuts the survivors identically — all 25 live leaves of the clean
-    /// tree appear in the churned one, byte for byte. But the churned tree carries **20 additional
-    /// empty leaves**, so the leaf sequence differs and the partition cid differs with it:
+    /// This was written as an `#[ignore]`d acceptance criterion before `CowTree::unlink_up`
+    /// existed, and it failed then for the right reason — the two leaf-cid sequences agreed for 25
+    /// leaves and the churned tree carried 20 more, every one of them the cid of an empty leaf.
+    ///
+    /// **Its name used to claim the general property and that was too strong.** A contiguous
+    /// suffix is the one delete shape that cannot destroy an interior content boundary: the only
+    /// terminator it removes belongs to the last leaf, and the last leaf may end anywhere. So this
+    /// passing says the empty-leaf defect is fixed — it does **not** say the delete path converges.
+    /// [`a_delete_of_an_interior_boundary_key_must_not_change_the_partition`] is the shape that
+    /// says the rest, and it still fails.
     ///
     /// ```text
-    /// clean   leaves=25 empty=0  rows=500  partition cid e8051f36dbe91c9d7a1289f9275573a1
-    /// churned leaves=45 empty=20 rows=500  partition cid 371db26401024a1b95371c569e0b4ffa
-    /// churned leaf sizes: [14,29,8,4,55,24,21,15,14,14,3,42,21,53,28,2,11,27,36,36,19,3,11,1,9,
-    ///                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    /// before unlink_up   clean 25 leaves,  0 empty, e8051f36dbe91c9d7a1289f9275573a1
+    ///                    churned 45 leaves, 20 empty, 371db26401024a1b95371c569e0b4ffa
+    /// after              clean 22 leaves,  0 empty, a59b5daa282b5b33f85cc0b4aefb1348
+    ///                    churned 22 leaves, 0 empty, a59b5daa282b5b33f85cc0b4aefb1348
     /// ```
-    ///
-    /// `cow::chunker`'s own header predicts a gap on both paths that remove content — *"overwriting
-    /// a value and deleting a key can each erase a boundary"* — and attributes it to an erased
-    /// boundary needing a merge with the right-hand neighbour, which this layout cannot reach
-    /// without sibling pointers. Measured, that prediction is half right, and narrower than stated
-    /// on both halves:
-    ///
-    /// - **Overwrite does not break convergence at all.** 1000 rows in two insertion orders, then
-    ///   143 values overwritten in two different orders: `partition_eq=true`, 55/55 leaves shared,
-    ///   in each of the three combinations (insert order differing, overwrite order differing,
-    ///   both).
-    /// - **Delete does**, but not through the boundary rule. The live partition is **exact** — all
-    ///   25 surviving leaves match byte for byte. What breaks it is simpler and more local:
-    ///   `CowTree::delete` empties a leaf and leaves it linked.
-    ///
-    /// # What must change for this to become an equality assertion
-    ///
-    /// `CowTree::delete` must unlink a leaf that its last entry has just left, freeing the page at
-    /// the deleting epoch and removing the separator from the parent — not a neighbour merge, and
-    /// not a change to the boundary rule. That is in `cow::btree`, not here. When it lands, delete
-    /// this test and un-ignore
-    /// [`a_delete_must_not_change_the_partition_of_the_surviving_rows`].
-    ///
-    /// Until then the honest statement of the instrument's reach is: a cid compares two trees built
-    /// by insertion exactly, and reports a false difference between two trees whose histories
-    /// differ by a delete.
     #[test]
-    fn a_delete_leaves_empty_leaves_behind_and_breaks_the_partition() {
-        let (_d, cat, t) = tree();
-        let clean = build(&t, &cat, &(0..500).collect::<Vec<u32>>());
-        let mut churned = build(&t, &cat, &(0..1000).collect::<Vec<u32>>());
-        let e = cat.next_epoch();
-        for key in 500..1000u32 {
-            churned = t.delete(churned, BranchId::TRUNK, e, &k(key)).unwrap();
-        }
-
-        // The control: the two trees really do hold the same 500 rows.
-        assert_eq!(
-            leaf_content_cid(&t, clean).unwrap(),
-            leaf_content_cid(&t, churned).unwrap(),
-            "the delete did not leave the same rows behind; this measures nothing"
-        );
-
-        let clean_leaves = ordered_leaf_cids(&t, clean).unwrap();
-        let churned_leaves = ordered_leaf_cids(&t, churned).unwrap();
-        let empty = leaf_cid(&[]);
-        let empties = churned_leaves.iter().filter(|c| **c == empty).count();
-
-        println!(
-            "    clean   {} leaves, {} empty, partition cid {}",
-            clean_leaves.len(),
-            clean_leaves.iter().filter(|c| **c == empty).count(),
-            hex(&leaf_partition_cid(&t, clean).unwrap())
-        );
-        println!(
-            "    churned {} leaves, {} empty, partition cid {}",
-            churned_leaves.len(),
-            empties,
-            hex(&leaf_partition_cid(&t, churned).unwrap())
-        );
-
-        // The diagnosis, asserted rather than narrated: the live partition is exact, and the whole
-        // difference is empty leaves. If a future change makes this fail by dropping to zero
-        // empties, the partition assertion below fails with it and this test is simply obsolete.
-        assert!(empties > 0, "no empty leaves; the diagnosis below no longer describes the tree");
-        // Hash-free, for the same reason as in the convergence test: this is an equality, so it is
-        // established on the entries and only then checked through the instrument.
-        assert_eq!(
-            ordered_leaf_entries(&t, churned)
-                .into_iter()
-                .filter(|e| !e.is_empty())
-                .collect::<Vec<_>>(),
-            ordered_leaf_entries(&t, clean),
-            "the SURVIVING leaves must already agree — if they do not, the gap is in the boundary \
-             rule and not merely in unreclaimed empty leaves, and the diagnosis above is wrong"
-        );
-        assert_eq!(
-            churned_leaves.iter().filter(|c| **c != empty).cloned().collect::<Vec<_>>(),
-            clean_leaves,
-            "the surviving leaf entries agree but their cids do not"
-        );
-        assert_ne!(
-            leaf_partition_cid(&t, clean).unwrap(),
-            leaf_partition_cid(&t, churned).unwrap(),
-            "partition cids already agree — delete now reclaims its empty leaves, so delete this \
-             test and un-ignore a_delete_must_not_change_the_partition_of_the_surviving_rows"
-        );
-    }
-
-    /// The equality the delete-path fix must produce, written before the work so it cannot be
-    /// quietly weakened to match whatever gets built. Ignored because it fails today, by design.
-    ///
-    /// Un-ignore this and delete
-    /// [`a_delete_leaves_empty_leaves_behind_and_breaks_the_partition`] together, in the commit that
-    /// makes `CowTree::delete` unlink an emptied leaf.
-    #[test]
-    #[ignore = "asserts the behaviour after delete reclaims emptied leaves; fails today, on purpose"]
-    fn a_delete_must_not_change_the_partition_of_the_surviving_rows() {
+    fn a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone() {
         let (_d, cat, t) = tree();
         let clean = build(&t, &cat, &(0..500).collect::<Vec<u32>>());
         let mut churned = build(&t, &cat, &(0..1000).collect::<Vec<u32>>());
@@ -864,10 +833,86 @@ mod tests {
             leaf_content_cid(&t, churned).unwrap(),
             "control: the two trees must hold the same rows"
         );
+        // Hash-free first, then through the instrument — an equal-cid assertion alone would also
+        // be satisfied by a collision.
+        assert_eq!(
+            ordered_leaf_entries(&t, churned),
+            ordered_leaf_entries(&t, clean),
+            "a suffix delete changed how the surviving rows are cut into leaves"
+        );
         assert_eq!(
             ordered_leaf_cids(&t, clean).unwrap(),
             ordered_leaf_cids(&t, churned).unwrap(),
-            "how a row set was reached must not change how it is cut into leaves"
+            "the leaf entries agree but their cids do not"
+        );
+        assert_eq!(
+            leaf_partition_cid(&t, clean).unwrap(),
+            leaf_partition_cid(&t, churned).unwrap(),
+            "same rows must yield one partition cid"
+        );
+    }
+
+    /// **The delete-path gap that is still open.** Deleting the single key that *terminates* a
+    /// leaf destroys that leaf's content boundary, and nothing puts it back.
+    ///
+    /// `CowTree::unlink_up` cannot close this and was never going to: there is no empty leaf here
+    /// to unlink. Measured either side of it, byte-identical, on the 1000-row build:
+    ///
+    /// ```text
+    ///                              main 1758b3b               with unlink_up
+    ///   churned                44 leaves, 0 empty        44 leaves, 0 empty
+    ///   clean                  43 leaves                 43 leaves
+    ///   first disagreeing leaf churned 28 rows / clean 37   (identical either side)
+    ///   churned live sizes     [28, 28,  9, 16]
+    ///   clean       sizes      [28, 37, 16,  6]
+    /// ```
+    ///
+    /// 28 + 9 = 37: the two leaves the content calls for one of stay split. Closing it means
+    /// merging with the right-hand neighbour, which needs the sibling access this layout
+    /// deliberately does not have (`cow::node`'s header) — a materially bigger change than the
+    /// unlink, and a different one.
+    ///
+    /// Found by adversarial review rather than by these tests, which is the point worth keeping:
+    /// the suffix fixture above returns the calm answer for every shape it can reach.
+    /// `artie-research/frontier/review-chunker.md` F1; probe `a9` at `review-chunker-attack`
+    /// `5e13e98`, reproduced against both trees before this was written.
+    #[test]
+    #[ignore = "needs a neighbour merge, which this layout cannot do without sibling access"]
+    fn a_delete_of_an_interior_boundary_key_must_not_change_the_partition() {
+        let (_d, cat, t) = tree();
+        let all: Vec<u32> = (0..1000).collect();
+        let churned_root = build(&t, &cat, &all);
+
+        // The key that terminates a leaf well inside the tree — a content boundary, not the last.
+        let leaves = ordered_leaf_entries(&t, churned_root);
+        assert!(leaves.len() > 4, "need a multi-leaf tree");
+        let victim_leaf = leaves.len() / 2;
+        let (vk, vv) = leaves[victim_leaf].last().unwrap().clone();
+        assert!(
+            crate::cow::chunker::is_boundary(&vk, &vv),
+            "fixture: leaf {victim_leaf} must end on a content boundary, or this measures nothing"
+        );
+
+        let e = cat.next_epoch();
+        let churned = t.delete(churned_root, BranchId::TRUNK, e, &vk).unwrap();
+
+        // A clean build of exactly the surviving rows.
+        let survivors: Vec<u32> = all.iter().copied().filter(|i| k(*i) != vk).collect();
+        let clean = build(&t, &cat, &survivors);
+
+        assert_eq!(
+            leaf_content_cid(&t, clean).unwrap(),
+            leaf_content_cid(&t, churned).unwrap(),
+            "control: the two trees must hold the same rows"
+        );
+        assert!(
+            ordered_leaf_entries(&t, churned).iter().all(|l| !l.is_empty()),
+            "fixture: this shape is supposed to leave NO empty leaf, so unlinking is not the issue"
+        );
+        assert_eq!(
+            ordered_leaf_entries(&t, churned),
+            ordered_leaf_entries(&t, clean),
+            "deleting a boundary key left the partition split where the content calls for one leaf"
         );
         assert_eq!(
             leaf_partition_cid(&t, clean).unwrap(),
