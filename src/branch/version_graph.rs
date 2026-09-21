@@ -494,7 +494,9 @@ mod tests {
         a: BranchId,
         b: BranchId,
     ) -> Option<BranchId> {
-        let cb = walk_chain(par, b);
+        // A set for the second chain, so an all-pairs sweep stays linear per pair rather than
+        // quadratic. Still nothing but the declared edge list.
+        let cb: std::collections::HashSet<BranchId> = walk_chain(par, b).into_iter().collect();
         walk_chain(par, a).into_iter().find(|x| cb.contains(x))
     }
 
@@ -744,31 +746,57 @@ mod tests {
     /// this exercises branching at every depth, which is what the real workload produces.
     #[test]
     fn all_pairs_agree_with_the_walk_on_an_irregular_tree() {
-        // Deterministic and self-contained: node i hangs off a pseudo-randomly chosen earlier
-        // node, so depths and fan-outs vary without a dependency on an RNG crate.
-        const N: u64 = 300;
-        let mut edges = Vec::new();
+        // **The shape matters more than the size.** An earlier version of this test attached each
+        // node to a pseudo-randomly chosen recent ancestor, which produced one bushy tree ~33 deep
+        // whose deep nodes nearly all shared a single depth-1 ancestor. It passed against the
+        // known-bad `lca` (verified by reintroducing that bug), because a descent only indexes
+        // past the end of a jump table once the two sides actually diverge high up.
+        //
+        // So: several DISTINCT deep subtrees off the root, which is what forces a cross-subtree
+        // pair to descend the whole way, plus side leaves so the tree is bushy as well as deep.
+        const CHAINS: u64 = 4;
+        const LEN: u64 = 50;
+        let mut edges: Vec<(BranchId, BranchId)> = Vec::new();
+        let mut next = 1u64;
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        for i in 1..N {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            // Bias towards recent nodes so the tree gets genuinely deep as well as wide.
-            let span = (i as f64).sqrt() as u64 + 1;
-            let parent = i - 1 - (seed % span.min(i));
-            edges.push((b(i), b(parent)));
+        let mut deep_leaves: Vec<BranchId> = Vec::new();
+        for _ in 0..CHAINS {
+            let mut prev = b(0);
+            for _ in 0..LEN {
+                let node = b(next);
+                next += 1;
+                edges.push((node, prev));
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed % 4 == 0 {
+                    edges.push((b(next), node));
+                    next += 1;
+                }
+                prev = node;
+            }
+            deep_leaves.push(prev);
         }
+        let n = next;
         let g = graph(b(0), &edges);
         let par = parents(&edges);
 
         let mut deepest = 0;
-        for i in 0..N {
+        for i in 0..n {
             deepest = deepest.max(g.depth(b(i)).unwrap());
         }
-        assert!(deepest >= 8, "tree too shallow to be a real test (depth {deepest})");
+        assert!(deepest >= 40, "tree too shallow to cross a level boundary (depth {deepest})");
+        // The subtrees must really be distinct, or no pair forces a full descent and this test
+        // is vacuous in exactly the way the previous version was.
+        assert_eq!(
+            g.lca(deep_leaves[0], deep_leaves[1]).unwrap(),
+            Some(b(0)),
+            "two deep leaves in different subtrees must meet only at the root"
+        );
+        assert_eq!(g.depth(deep_leaves[0]).unwrap(), LEN as u32);
 
-        for i in 0..N {
-            for j in 0..N {
+        for i in 0..n {
+            for j in 0..n {
                 let (x, y) = (b(i), b(j));
                 assert_eq!(
                     g.is_ancestor(x, y).unwrap(),
