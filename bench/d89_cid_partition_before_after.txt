@@ -76,8 +76,38 @@ leaves a parent with no children at all. Same fixture, after:
     churned 22 leaves, 0 empty, partition cid a59b5daa282b5b33f85cc0b4aefb1348
 
 The acceptance test was un-ignored and the assert-current-behaviour test deleted, which is the
-protocol those two tests documented for each other. So the instrument's reach is now: a cid
-compares two trees holding the same rows exactly, however those rows were reached.
+protocol those two tests documented for each other.
+
+⚠ CORRECTION, logged where the claim was made. An earlier version of this section read "the
+instrument's reach is now: a cid compares two trees holding the same rows exactly, however those
+rows were reached." That is FALSE and was falsified by adversarial review
+(artie-research/frontier/review-chunker.md F1, probe a9 at review-chunker-attack 5e13e98),
+reproduced here against both trees before being written down:
+
+                                   main 1758b3b                 with unlink_up
+    suffix, delete 500..1000    44 leaves, 22 empty, agree    22 leaves, 0 empty, agree
+    one interior boundary key   44 leaves,  0 empty, DISAGREE 44 leaves, 0 empty, DISAGREE
+
+    interior case, first disagreeing surviving leaf: churned 28 rows / clean 37 (neither empty)
+      churned live leaf sizes [28, 28,  9, 16]
+      clean       leaf sizes  [28, 37, 16,  6]
+
+The interior-key row is byte-identical either side of the fix, because no leaf is emptied there
+and so there is nothing to unlink. Deleting the key that TERMINATES a leaf destroys that leaf's
+content boundary; the leaf and its right neighbour stay split where the chunker would cut one
+(28 + 9 = 37). Repairing that is a neighbour merge, which needs the sibling access this layout
+deliberately lacks — the thing the pre-registered diagnosis explicitly ruled out.
+
+A contiguous suffix is the ONE delete shape that cannot expose this, because the only terminator
+it destroys belongs to the last leaf, and the last leaf may end anywhere. The fixture picked that
+shape, so it returned the calm answer and the diagnosis read it as the whole story. That is the
+same fixture-scope defect the insertion-order test above was built to avoid, appearing in the test
+written to replace it.
+
+So the corrected reach: a cid compares two trees built by insertion exactly, and two trees whose
+histories differ by a delete only when the delete destroyed no interior boundary. The rest is
+cow::cid::tests::a_delete_of_an_interior_boundary_key_must_not_change_the_partition, #[ignore]d,
+and it needs a merge rather than another unlink.
 
 An internal node holds a leftmost child plus `count` slots, so removing a slotted child always
 leaves the leftmost behind; a node becomes childless in exactly one case, when the removed child

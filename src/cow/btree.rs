@@ -357,6 +357,10 @@ impl CowTree {
         // `cow::cid::leaf_partition_cid` — a false difference, reported by the one comparison
         // that is supposed to be exact across lineages.
         //
+        // This removes THAT difference. It does not make delete converge in general: a delete
+        // that destroys an interior content boundary leaves two leaves where the content calls
+        // for one, and no leaf is emptied in that case at all. See `unlink_up`'s header.
+        //
         // The root is the exception: an empty root leaf IS the empty tree, and is what
         // [`CowTree::create`] hands out.
         if emptied && !path.is_empty() {
@@ -716,11 +720,27 @@ impl CowTree {
     /// `free_page` can hand a page straight back to the free space map, so freeing first would
     /// leave a live parent pointing at a page an allocator may already have reissued.
     ///
-    /// This does **not** merge half-empty siblings and does not collapse a root left with a single
-    /// child, so a tree that has had a lot deleted from it can keep a level it no longer needs.
-    /// Both are rebalancing, both need sibling access this layout deliberately does not have (see
-    /// `cow::node`'s header), and neither is required for the partition to be a function of the
-    /// rows — which is what this is for.
+    /// # What this does NOT do, and what that costs
+    ///
+    /// It does not merge siblings and does not collapse a root left with a single child, so a tree
+    /// that has had a lot deleted from it can keep a level it no longer needs. Both are
+    /// rebalancing and both need the sibling access this layout deliberately lacks (`cow::node`'s
+    /// header).
+    ///
+    /// **The sibling merge is not merely deferred — its absence leaves a real gap, and an earlier
+    /// version of this comment said otherwise.** Deleting the key that *terminates* a leaf destroys
+    /// that leaf's content boundary, and nothing here puts it back: the leaf and its right
+    /// neighbour stay split where `cow::chunker` would cut one. Measured on a 1000-row build,
+    /// deleting one interior boundary key gives 28 + 9 rows against a clean build's single leaf of
+    /// 37 — **identical either side of this function**, because no leaf was emptied, so there was
+    /// nothing for it to unlink.
+    ///
+    /// So this closes the empty-leaf defect and **not** delete-path convergence. The distinction is
+    /// pinned by two tests in `cow::cid`:
+    /// `a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone` (passes — a suffix is the
+    /// one shape that destroys no interior boundary) and
+    /// `a_delete_of_an_interior_boundary_key_must_not_change_the_partition` (`#[ignore]`d, and it
+    /// needs the merge).
     fn unlink_up(
         &self,
         root: PageId,
