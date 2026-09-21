@@ -17,6 +17,7 @@
 
 pub mod btree;
 pub mod cid;
+pub mod merge3;
 pub mod node;
 pub mod page_header;
 pub mod store;
