@@ -1,32 +1,33 @@
-# D92-merge3-fix — resume state
+# D92-merge3-fix — state
 
-Branch `D92-merge3-fix`, worktree `/Users/idide/wt/ferrodb-D92-merge3-fix`.
-Quarantined earlier residue is on branch `D92-merge3-fix-quarantined` (unreviewed, superseded).
+Branch `D92-merge3-fix`, worktree `/Users/idide/wt/ferrodb-D92-merge3-fix`, rebased on main
+`1758b3b`. Earlier unreviewed residue is preserved on `D92-merge3-fix-quarantined` and is
+superseded — do not merge it.
 
-## Done
-- `499fe80` (rebased onto main `1758b3b`): findings 3 and 4, plus a first cut at 1 and 2.
-  - finding 3: `read_node`'s `_ =>` arm replaced with `cid::shape_of`. Fire-checked.
-  - finding 4: `cid.rs`'s "grep returned zero" claim corrected.
-  - finding 1: memo scoped to one `merge3` call via `begin_merge`. Fire-checked.
-  - finding 2: `H128` deleted, `MerkleId` computes `cid::leaf_cid`/`cid::internal_cid`.
+## Commits
+- `499fe80` findings 3 and 4, plus a first cut at 1 and 2.
+- `0c4956d` supersedes that first cut: merge3 owns no identity, no hasher and no memo.
 
-## Next action (single)
-Consolidate merge3 onto `src/cow/diff.rs`'s identity machinery, per the lead's update:
-delete merge3's `PageIdentity` trait, `ShadowId` and `MerkleId`; use `diff::NodeIdentity`,
-`diff::PageIdentity`, `diff::SubtreeHash`.
+## The four findings
+1. **Memo keyed on a reused `PageId`.** Resolved by deletion: merge3 owns no memo. ⚠ **Not**
+   resolved by consolidating onto `cow::diff` — `SubtreeHash` and `MemoIdentity` are keyed on
+   `PageId` too. Reproduced and pinned by
+   `merge3::tests::a_stale_subtree_hash_makes_merge3_drop_a_change_silently`.
+2. **Sole authority / duplicate hasher.** `H128` deleted. `NodeIdentity::proof()` added with no
+   default; rides out on `MergeResult::identity_proof`.
+3. **`read_node`'s `_ =>` arm.** Now `cid::shape_of`. Fire-checked: the pre-fix arm followed a
+   zeroed `Heap` page's leftmost child to page 0.
+4. **`cid.rs`'s "grep returned zero".** Corrected, and restated as a count rather than a command.
 
-## Corrections owed to the lead (verified, not yet reported)
-1. "Consolidating resolves finding 1 outright" is **false**. `diff::SubtreeHash` and
-   `diff::MemoIdentity` are *also* keyed on `PageId`, so the staleness defect rides along.
-   Fix belongs at the single authority in `diff.rs`.
-2. "ONE hasher in `src/cow/`" is no longer reachable by this change: `cid.rs` (`Hasher128`),
-   `diff.rs` (`SubtreeHash`/`fold_bytes`) and `chunker.rs` each landed their own. What is
-   reachable is **merge3 ships none**.
-3. My own `cid.rs` correction text claims "exactly one 128-bit hash in `src/cow/`" — now false
-   by the same count. Must fix before landing.
+## Verification
+- `cargo test --lib` at `0c4956d`: **1542 passed, 0 failed, 3 ignored**.
+- Fire-checks: read_node guard fails against the restored catch-all; the hazard test fails when
+  `SubtreeHash`'s memo is bypassed.
 
-## Measurement that decides the SHA-256 question
-merge3's own example already reports, at n=16000 convergent edit:
-ShadowId `nodes_read=9`; MerkleId `nodes_read=0` but `pages_hashed=1022`.
-Content identity costs ~113x the page reads it saves. Hash *choice* is second-order;
-re-run across the size axis and record here before choosing.
+## Open, and NOT mine
+- `examples/d92_merge3_curve.rs` **fails on main** at `1758b3b`, identically and with identical
+  counters (rule 2 contested = 6, asserted 0). `cow::chunker`'s content-defined leaf boundaries
+  changed which rules can fire in the "contested" arm; the example's own fire-check assertion
+  predates that. Verified by running the example at `1758b3b` with none of this branch applied.
+- `cow::diff`'s stamp staleness (finding 1's other half). `SubtreeHash` has **no refresh path** —
+  `stamp_inner` returns early on a memo hit — so a caller cannot invalidate, only rebuild.
