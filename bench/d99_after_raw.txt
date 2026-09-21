@@ -1,0 +1,34 @@
+### AFTER B1
+D99 — the two walls D77 left open, each measured with the others held down.
+at eb7d90cad310
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+B1  free_arena vs BRANCHES. pending=0, checkpoint OFF. Isolates current.retain.
+      branches M    freed    ns/free_arena    ns per 1000 M
+          1000      100           166.0           166.00
+         10000      200           375.0            37.50
+        100000      200           500.0             5.00
+       1000000      200           875.0             0.88
+
+### AFTER B2
+D99 — the two walls D77 left open, each measured with the others held down.
+at eb7d90cad310
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+B2  free_arena vs PENDING. branches=1000, checkpoint OFF. Isolates pending.retain.
+      pending P     freed    ns/free_arena    ns per 1000 P
+          1000      100           375.0           375.00
+         10000      100          3167.0           316.70
+        100000      100         38333.0           383.33
+       1000000      100        557250.0           557.25
+

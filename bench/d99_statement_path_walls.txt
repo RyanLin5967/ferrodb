@@ -1,0 +1,230 @@
+D99 — D77's REMAINDER: the two branch-count walls it left open.
+================================================================================
+
+BEFORE runs built at 8d79ee536087 (clean).
+AFTER  runs built at eb7d90cad310 (clean) — 8d79ee5 + the D99 fix below.
+Instrument: examples/d99_statement_path_walls.rs, both runs, same binary source.
+Box: this machine under the 17-agent fleet. Absolutes are noisy; the SHAPE is the
+result. `ns/op` is a median over the frees or iterations in the `freed` column.
+
+VERDICT IN ONE LINE EACH
+  (a) pgwire reader-registry walk — REFUTED as a branch-count wall. 42.0 ns at
+      1k, 10k, 100k AND 1,000,000 branches. It is a real O(CONNECTIONS) wall on
+      a different axis; see A1. Nothing changed for it. Not this row's wall.
+  (b) free_arena's forward scan — REPRODUCED, was O(branches), now O(1).
+      2,189,334 ns -> 875 ns at 10^6 branches (x2,502). Clears the O(log N) bar.
+  (b') BUT free_arena as a FUNCTION is still NOT O(log N), and in the shipped
+      configuration the wall just removed was never the binding one. See B2/B3.
+
+--------------------------------------------------------------------------------
+WHY EVERY ARM PADS ONE COUNTER AND HOLDS THE OTHERS DOWN
+--------------------------------------------------------------------------------
+D77 named ONE scan in `free_arena`. Reading it found FOUR linear-or-worse steps
+in series in that one function:
+
+  1. `for i in 0..pages { evict(..) }`          O(pages in THIS extent) — constant
+  2. `st.pending.retain(|p| ..)`                O(len(pending))
+  3. `st.current.retain(|_, a| *a != arena)`    O(BRANCHES)  <- the named wall
+  4. `persist_if_configured()` -> `state_bytes()`  sorts AND serialises every
+     extent and every `current` entry, then writes the file: O((A+M) log(A+M))
+     plus an fsync.
+
+Walls in series are indistinguishable from one wall twice as big, so each arm
+below moves ONE axis. Step 4 is not hypothetical — `cli.rs` and
+`examples/pgserver.rs` both call `checkpoint_to`, which is why B3 exists.
+
+Two corrections to D77's row, both found by reading before measuring:
+  * The line numbers are stale. `arena.rs:1316` is a COMMENT inside
+    `alloc_arena`; `free_arena` begins at 1391 and the scan is at 1414.
+  * Neither wall is on the statement path as stated. `free_arena`'s only
+    non-test callers are in `reaper.rs`, driven by `lease_thread.rs`. It reaches
+    statements only INDIRECTLY: it does its linear work while holding
+    `self.state`, the same lock every statement's `arena_for` takes. That is the
+    D88 shape and it is a real coupling, but it is not a direct per-statement
+    cost, and the distinction changes what a fix has to clear.
+
+--------------------------------------------------------------------------------
+(a) THE READER-REGISTRY WALK — REFUTED ON THE BRANCH AXIS
+--------------------------------------------------------------------------------
+`register_reader` is called once per TCP CONNECTION (pgwire/mod.rs, startup
+path) and the registry self-cleans by refcount. Its N is live connections. The
+branch count does not enter it anywhere. The measurement says the same thing:
+
+A2  ServerContext::catalog() vs BRANCHES. Readers fixed at 8.
+      branches M    live_count    ns/catalog()
+          1000         1001            42.0
+         10000        10001            42.0
+        100000       100001            42.0
+       1000000      1000001            42.0
+
+Flat to the tenth of a nanosecond across FOUR decades, out to the 10^6 branches
+this project's objective is stated in. The padding is the same padding that
+moves B1 by 2,000x, so a flat A2 is evidence about the code and not about the
+padding having failed to happen — that is the whole reason the two arms share it.
+
+⇒ Wall (a) is NOT a branch-count wall. Per the row's own rule, stopped here.
+  No change was made to src/pgwire/mod.rs.
+
+It IS, separately, a real O(connections) wall, measured:
+
+A1  ServerContext::catalog() vs REGISTERED READERS. Branches: 0.
+      readers C     ns/catalog()      ns per 1000 C
+          1000          1667.0           1667.00
+         10000         27958.0           2795.80
+        100000        283500.0           2835.00
+
+Linear in C (the per-1000 column flattens at ~2,800 ns). Two notes for whoever
+picks this up, neither acted on here because this row is scoped to the branch
+axis:
+  * The header disagrees with the body. The comment at mod.rs:137 says "the scan
+    is N atomic loads over live connections". The body CLONES the Vec<Arc<..>>
+    under the lock, which is N atomic increments, then N decrements when `slots`
+    drops — 2N atomic RMWs, not N loads.
+  * `register_reader` itself runs an O(C) `retain` per call, so opening C
+    connections is O(C^2). That, not patience, is what capped this arm at 10^5.
+
+--------------------------------------------------------------------------------
+(b) free_arena's FORWARD SCAN — REPRODUCED, AND FIXED
+--------------------------------------------------------------------------------
+`st.current` is `HashMap<BranchId, ArenaId>`, so `retain` over it is a walk of
+every branch, under the store's hottest lock, once per freed extent.
+
+B1  free_arena vs BRANCHES. pending=0, checkpoint OFF. Isolates current.retain.
+
+      branches M    BEFORE ns    AFTER ns    factor    BEFORE ns/1k M   AFTER ns/1k M
+          1000         1000.0       166.0      6.0x          1000.00          166.00
+         10000         6875.0       375.0     18.3x           687.50           37.50
+        100000       126917.0       500.0    253.8x          1269.17            5.00
+       1000000      2189334.0       875.0   2502.1x          2189.33            0.88
+
+BEFORE: cost rises with M and the per-1000-branch column stays on the order of
+10^3 ns across the whole axis — the signature of O(M). At 10^6 branches one
+`free_arena` spent 2.19 ms walking the branch map.
+
+AFTER: the per-1000-branch column falls by ~10x per decade (166 -> 37.5 -> 5.0
+-> 0.88), which is what a CONSTANT per-call cost looks like divided by a growing
+M. Absolute cost moves 166 -> 875 ns while M moves 1,000x; that residual growth
+is cache pressure on a larger HashMap, not a term in M.
+
+⇒ O(branches) -> O(1). Clears the O(log N) bar. The bar was not cleared by
+  shrinking a constant: the axis is gone, which is what the per-1000 column shows
+  and a single before/after ratio could not have.
+
+THE FIX (src/branch/arena.rs, in free_arena)
+  - st.current.retain(|_, a| *a != arena);
+  + if st.current.get(&ext.owner) == Some(&arena) { st.current.remove(&ext.owner); }
+
+Re-indexing the question, not speeding up the answer — the same shape as the
+reaper's deadline-ordered index and D86's `applied_by_cell`. Here the index
+already existed and was being thrown away: `ArenaExtent.owner` names the branch,
+and the line above the scan read `let _ = ext;` to silence it.
+
+Equivalence rests on arena ids never being recycled.
+`ArenaSpaceManager::reserve` draws every id from a monotonic counter
+(`arena_ids.take(1)`); `give_back` recycles only the page RANGE. So an id names
+one extent for the store's life and cannot be reissued under a second owner, and
+`alloc_arena` writes `extents[arena].owner = branch` and `current[branch] =
+arena` inside ONE critical section. Therefore if any branch maps to this arena it
+is `ext.owner` and no other. The `get` guard keeps the case the `retain` also
+handled: an owner that has moved to a newer extent has `current[owner] != arena`
+and neither spelling touches it.
+
+--------------------------------------------------------------------------------
+(b') WHAT IS STILL LINEAR — STATED PLAINLY
+--------------------------------------------------------------------------------
+The named wall is gone. `free_arena` is not O(log N), on two other axes.
+
+B2  free_arena vs PENDING. branches=1000, checkpoint OFF. (Control: untouched.)
+      pending P     BEFORE ns    AFTER ns
+          1000         1417.0       375.0
+         10000         4542.0      3167.0
+        100000        35709.0     38333.0
+       1000000       572500.0    557250.0
+
+`st.pending.retain` is O(len(pending)) and remains so: 557 us per free_arena at
+P=10^6, before and after within noise. This arm doubles as the control that the
+fix moved the branch axis and ONLY the branch axis — at the top of the axis the
+two columns agree to 3%, while B1's agree to a factor of 2,502.
+
+B3  free_arena vs BRANCHES, checkpoint ON — the configuration cli.rs ships.
+      branches M    freed    ns/free_arena
+          1000      100      66414875.0     (66.4 ms)
+         10000      200      52448459.0     (52.4 ms)
+      100000        --       run exceeded its 900 s bound and was cut
+
+66 MILLISECONDS per free_arena at one thousand branches — about 66,000x the
+checkpoint-OFF cost at the same M, and it does not rise with M across the two
+points reached, so at these scales it is an fsync-dominated CONSTANT, not a
+function of the map. The 100k row could not be collected inside 900 s, which is
+itself the finding.
+
+⇒ THE HONEST CONSEQUENCE. In the shipped configuration the scan this row removed
+  was never the binding constraint. At M=10^6 it cost 2.19 ms inside a call that
+  pays ~50-66 ms to persist. Removing it is correct and it removes a genuine
+  O(branches) term from under the store's hottest lock — but anyone expecting
+  free_arena to get ~2,500x faster in production will not see it, and a
+  before/after taken with the checkpoint ON would have shown approximately
+  nothing. That is why B3 exists, and it is the same trap D79 already caught this
+  project in: every 10^6 result published here had persistence OFF.
+
+  The next wall on this path is step 4, and it is a rewrite of how the free-space
+  map reaches disk (incremental/append-only rather than whole-map-per-free), not
+  a scan to re-index. It touches `state_bytes`, the v3 image format and
+  `put_pending`'s durability contract, all shared with `alloc_arena` and the
+  reaper. NOT attempted here: out of this row's ownership, and out of its scope.
+
+--------------------------------------------------------------------------------
+TESTS, AND THE FIRE CHECK THAT MADE THEM MEAN SOMETHING
+--------------------------------------------------------------------------------
+src/branch/arena.rs gains two tests. The first phrasing of the first one was
+MASKED and green against a build with the fix deleted outright:
+
+  `free_arena` removes the arena from `claim_epoch` on the line above, and
+  `arena_for` refuses any extent whose claim epoch is missing. So a build that
+  never touches `current` STILL hands the owner a fresh extent, and an assertion
+  phrased on `arena_for` cannot see the difference. Two guards, one testable.
+
+Rephrased to read the durable image, which serialises `current` whole and is
+what the entry actually governs. Three mutations applied to the shipped fix,
+each rebuilt and run:
+
+  no `get` guard        -> freeing_a_superseded_extent_leaves_the_owner...  FAILED
+  removal deleted       -> freeing_an_extent_forgets_its_owner_and_no_other FAILED
+  removal on wrong key  -> freeing_an_extent_forgets_its_owner_and_no_other FAILED
+
+Suite, at eb7d90cad310 in this worktree:
+  cargo test --release --lib                     1361 passed; 0 failed; 1 ignored
+  --test d15_concurrent_fork_and_reap               2 passed; 0 failed
+  --test d18_reaper_asks_the_catalog                2 passed; 0 failed
+  --test d33_add_arena_must_be_durable              3 passed; 0 failed
+  --test integration_arena_exclusivity              5 passed; 0 failed
+  --test integration_branch_pages                  10 passed; 0 failed
+  --test integration_cow_branch                     1 passed; 0 failed
+  --test integration_server_reaps                   8 passed; 0 failed
+  --test w4_forget_branches                         3 passed; 0 failed
+
+integration_server_reaps first reported 5 failed, all of them
+`target/release/examples/pgserver is missing` — a fresh worktree has no built
+examples. `cargo build --release --examples` first; then 8/8. Not a regression,
+and worth writing down because it reads exactly like one.
+
+--------------------------------------------------------------------------------
+INSTRUMENT NOTES — WHERE THIS MEASUREMENT COULD BE WRONG
+--------------------------------------------------------------------------------
+* The padding catalog is `LogBranchCatalog::in_memory`, not the shipped
+  `TableBranchCatalog`. `free_arena` never reads the catalog — it touches
+  extents/recycled/pending/claim_epoch/current, `give_back`, the counters and the
+  persist — so the catalog is setup cost only. It was switched because
+  TableBranchCatalog forks at ~29 ms each (1,000 forks in 28.7 s wall at 2% CPU,
+  fsync-bound), putting 10^6 out of reach for a reason unrelated to the wall.
+  CROSS-CHECKED, not assumed: B1 at M=1,000 measured 959 ns on TableBranchCatalog
+  and 1,000 ns on the in-memory one. `D99_CATALOG=table` reruns any arm.
+* The BEFORE matrix had two `cargo test` runs of mine overlapping part of it.
+  B1's 10k point read 9,625 ns in an earlier quiet run and 6,875 ns in the
+  matrix; the 100k point read 128,625 and 126,917. The shape is unaffected at
+  the two decades where it matters, but the absolutes carry that noise.
+* B3's 100k row does not exist. It was cut by a 900 s bound, not collected and
+  discarded.
+* Every arm refuses rather than printing a number it cannot attribute: zero
+  iterations, zero successful frees, or padding that did not take (`live_count`
+  below M, `pending_len` != P) print NOT A RESULT.

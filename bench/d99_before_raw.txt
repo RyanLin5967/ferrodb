@@ -1,0 +1,81 @@
+### A1
+D99 — the two walls D77 left open, each measured with the others held down.
+at 8d79ee536087
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+A1  ServerContext::catalog() vs REGISTERED READERS (connections). Branches: 0.
+      readers C     ns/catalog()      ns per 1000 C
+          1000          1667.0           1667.00
+         10000         27958.0           2795.80
+        100000        283500.0           2835.00
+
+### A2
+D99 — the two walls D77 left open, each measured with the others held down.
+at 8d79ee536087
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+A2  ServerContext::catalog() vs BRANCHES. Readers fixed at 8 (a small server).
+      branches M    live_count    ns/catalog()
+          1000         1001            42.0
+         10000        10001            42.0
+        100000       100001            42.0
+       1000000      1000001            42.0
+
+### B1
+D99 — the two walls D77 left open, each measured with the others held down.
+at 8d79ee536087
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+B1  free_arena vs BRANCHES. pending=0, checkpoint OFF. Isolates current.retain.
+      branches M    freed    ns/free_arena    ns per 1000 M
+          1000      100          1000.0          1000.00
+         10000      200          6875.0           687.50
+        100000      200        126917.0          1269.17
+       1000000      200       2189334.0          2189.33
+
+### B2
+D99 — the two walls D77 left open, each measured with the others held down.
+at 8d79ee536087
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+B2  free_arena vs PENDING. branches=1000, checkpoint OFF. Isolates pending.retain.
+      pending P     freed    ns/free_arena    ns per 1000 P
+          1000      100          1417.0          1417.00
+         10000      100          4542.0           454.20
+        100000      100         35709.0           357.09
+       1000000      100        572500.0           572.50
+
+### B3
+D99 — the two walls D77 left open, each measured with the others held down.
+at 8d79ee536087
+  padding catalog: mem (free_arena never reads the catalog; setup cost only)
+
+PRE-REGISTERED READING:
+  flat across the axis  -> the axis is not this code's N. Wall refuted ON THAT AXIS.
+  ns proportional to N  -> O(N). Linear, whatever the constant.
+  ns ~ log N            -> cleared the bar.
+
+B3  free_arena vs BRANCHES, checkpoint ON — the configuration cli.rs ships.
+      branches M    freed    ns/free_arena    ns per 1000 M
+          1000      100      66414875.0      66414875.00
+         10000      200      52448459.0       5244845.90
