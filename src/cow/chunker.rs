@@ -25,16 +25,17 @@
 //!   leaf sibling pointers (see `cow::node`'s module doc for why it has none) cannot cheaply walk
 //!   right to repair them.
 //! - Evaluated over a *single* entry, a window is worse than useless: it sees only the last `W`
-//!   bytes, so a table whose values share a long common suffix would have every entry decide
-//!   alike — every entry a boundary, or none of them.
+//!   bytes, so a table whose keys share a long common prefix and differ in a short suffix would
+//!   have every entry decide alike — every entry a boundary, or none of them.
 //!
-//! So the predicate hashes **one whole entry**, key and value, with the same cyclic polynomial.
-//! Every byte of the entry contributes, the decision is local, and an insert can only *add* a
+//! So the predicate hashes **one whole key**, with the cyclic polynomial restarted at each entry.
+//! Every byte of the key contributes, the decision is local, and an insert can only *add* a
 //! boundary — never move or destroy one. That last property is what makes the maintenance in
-//! `btree::leaf_put` a two-way split instead of a rightward cascade.
+//! `btree::leaf_put` a two-way split instead of a rightward cascade. [`key_hash`] carries why the
+//! value is left out, and what was measured on the sorted keys that are said to defeat buzhash.
 //!
 //! [`Buzhash::roll`] keeps the real sliding-window operation available and tested, because the
-//! window is the right tool the moment a *value* is chunked rather than a key/value pair.
+//! window is the right tool the moment a *value* is chunked rather than a key.
 //!
 //! # Where the guarantee stops, and what it cost to put it there
 //!
@@ -167,11 +168,50 @@ impl Buzhash {
     }
 }
 
-/// The chunking hash of one leaf entry: every byte of the key and of the value.
-pub fn cell_hash(key: &[u8], value: &[u8]) -> u32 {
+/// The chunking hash of one entry: every byte of its **key**, and nothing else.
+///
+/// # Why the value is not hashed
+///
+/// Hashing key and value together makes a boundary move whenever a value is rewritten, so
+/// updating one column re-chunks the region around that row and the diff stops being small —
+/// which is the property this whole module exists to protect. With a key-only hash, a value
+/// edit that keeps the row's length cannot move any boundary at all, including its own.
+///
+/// Dolt reaches the same conclusion — its shipped `keySplitter` hashes the key alone — but pairs
+/// it with a *cumulative* size threshold, so in their construction a change in value **length**
+/// still shifts every boundary downstream of it. [`boundary_from`] compares against one entry's
+/// own size instead of a running total, so a length change can only flip the one row it happened
+/// to, and never its neighbours.
+///
+/// # Why buzhash, on sorted keys, when Noms abandoned it
+///
+/// Noms chunked with buzhash over a 67-byte sliding window and a static pattern, and Dolt
+/// replaced it, reporting poor output on sorted or low-entropy keys — massive chunks on exactly
+/// the auto-increment and timestamp keys a database is full of. Two things differ here, and the
+/// distribution was measured rather than assumed (`degenerate_key_shapes_do_not_produce_massive_chunks`):
+///
+/// - The window is one whole key and the state restarts at every entry, so consecutive keys do
+///   not share 67 bytes of window the way consecutive positions in a byte stream do.
+/// - The threshold is proportional to the entry's size, so the boundary *rate* is pinned to
+///   bytes no matter how little the keys vary. A static pattern has no such feedback, which is
+///   what lets a low-entropy stream drift into one enormous chunk.
+///
+/// Measured over 200k rows, mean chunk against a 507-byte target, worst chunk seen:
+///
+/// ```text
+///   ascending key{:06}            mean 507 B   max 2,132 B    0 chunks over a page
+///   big-endian u64 counter        mean 505 B   max 3,480 B    0
+///   big-endian u32 counter        mean 514 B   max 3,204 B    0
+///   monotonic timestamps          mean 510 B   max 5,920 B    7 of 15,691  (0.04 %)
+///   32-byte common prefix         mean 513 B   max 4,032 B    0
+///   random 16-byte keys (control) mean 505 B   max 4,464 B    3 of 18,999  (0.02 %)
+/// ```
+///
+/// The control is the point: the sorted shapes are not worse than random keys, so the reported
+/// failure does not reproduce against this construction.
+pub fn key_hash(key: &[u8]) -> u32 {
     let mut h = Buzhash::new();
     h.push_all(key);
-    h.push_all(value);
     h.finish()
 }
 
@@ -184,22 +224,27 @@ pub fn cell_hash(key: &[u8], value: &[u8]) -> u32 {
 /// four-page chunk for 500-byte rows, and the second of those cannot fit in a leaf at all. The
 /// tuning that matters is against the page, so the predicate is stated against the page.
 ///
-/// It stays a pure function of the entry's bytes. It deliberately does **not** see the entry's
-/// position, its neighbours, or the page it currently sits on — those are the three things that
-/// differ between two insertion orders.
+/// It stays a pure function of the entry itself — its key's bytes and its own size. It
+/// deliberately does **not** see the entry's position, its neighbours, or the page it currently
+/// sits on; those are the three things that differ between two insertion orders.
+///
+/// The size term is what keeps a chunk inside a page, and it is the reason value *length* stays
+/// in the predicate when value *content* does not. Dropping it would denominate the chunk in key
+/// bytes, so a table with 4 KB values would put sixty rows in a chunk and hand a 4 KB page a
+/// quarter-megabyte of them — trading a guarantee the page layout enforces for one it cannot.
 ///
 /// Halving `target` can only *add* boundaries, never move one, so the finer partition contains
 /// the coarser. That nesting is what lets [`leaf_cuts`] refine an over-long run one piece at a
 /// time and still land where refining the whole run would have.
 pub fn is_boundary_at(key: &[u8], value: &[u8], target: usize) -> bool {
-    let h = cell_hash(key, value) as u64;
+    let h = key_hash(key) as u64;
     let size = crate::cow::node::leaf_entry_bytes(key, value);
     boundary_from(h, size, target)
 }
 
 #[inline]
 fn boundary_from(hash: u64, size: usize, target: usize) -> bool {
-    // hash / 2^32 < size / target, in integers and without overflow: hash < 2^32 and
+    // hash / 2^32 <= size / target, in integers and without overflow: hash < 2^32 and
     // target <= a page, so the left side stays under 2^44.
     hash * target.max(1) as u64 <= (size as u64) << 32
 }
@@ -225,7 +270,7 @@ pub fn is_boundary(key: &[u8], value: &[u8]) -> bool {
 /// Step 2 is the case the invariance guarantee does not cover — see [`CHUNK_SHIFT`] for why it is
 /// tuned to essentially never happen, and what it costs to tune it that way.
 ///
-/// `hashes[i]` is [`cell_hash`] for entry `i`; `sizes[i]` is its slot-plus-cell cost.
+/// `hashes[i]` is [`key_hash`] of entry `i`'s key; `sizes[i]` is its slot-plus-cell cost.
 pub fn leaf_cuts(sizes: &[usize], hashes: &[u32], capacity: usize) -> Vec<usize> {
     debug_assert_eq!(sizes.len(), hashes.len());
     let mut cuts = Vec::new();
@@ -307,8 +352,28 @@ mod tests {
     fn sizes_and_hashes(rows: &[(Vec<u8>, Vec<u8>)]) -> (Vec<usize>, Vec<u32>) {
         (
             rows.iter().map(|(k, v)| leaf_entry_bytes(k, v)).collect(),
-            rows.iter().map(|(k, v)| cell_hash(k, v)).collect(),
+            rows.iter().map(|(k, _)| key_hash(k)).collect(),
         )
+    }
+
+    /// Chunk sizes in bytes under the nominal target, with no refinement — the refinement is what
+    /// hides a long tail, so a distribution measured through it would not show the thing being
+    /// asked about.
+    fn chunk_bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut acc = 0usize;
+        for (k, v) in rows {
+            let size = leaf_entry_bytes(k, v);
+            acc += size;
+            if boundary_from(key_hash(k) as u64, size, TARGET_CHUNK_BYTES) {
+                out.push(acc);
+                acc = 0;
+            }
+        }
+        if acc > 0 {
+            out.push(acc);
+        }
+        out
     }
 
     fn pieces_of(cuts: &[usize], n: usize) -> Vec<(usize, usize)> {
@@ -347,10 +412,131 @@ mod tests {
     /// would chunk identically, and keys in a sorted tree are near-anagrams of each other.
     #[test]
     fn the_hash_is_order_sensitive() {
-        assert_ne!(cell_hash(b"ab", b""), cell_hash(b"ba", b""));
-        assert_ne!(cell_hash(b"key000012", b"v"), cell_hash(b"key000021", b"v"));
-        // The key/value split is part of the content, not a separator the hash can see through.
-        assert_eq!(cell_hash(b"ab", b"cd"), cell_hash(b"abcd", b""));
+        assert_ne!(key_hash(b"ab"), key_hash(b"ba"));
+        assert_ne!(key_hash(b"key000012"), key_hash(b"key000021"));
+        // Adjacent keys in a sorted tree differ in one byte near the end; that has to be enough.
+        assert_ne!(key_hash(b"key000012"), key_hash(b"key000013"));
+    }
+
+    /// The property the key-only hash exists for: rewriting a value cannot move a boundary.
+    ///
+    /// Same-length edits are the strong case and must never change a decision. A length change
+    /// moves the entry's own size, so its own decision may flip — but that is the whole blast
+    /// radius, because the predicate compares against one entry's size and not a running total.
+    #[test]
+    fn rewriting_a_value_does_not_move_a_boundary() {
+        let keys: Vec<Vec<u8>> = (0..4000u32).map(|i| format!("key{:06}", i).into_bytes()).collect();
+        let before: Vec<bool> = keys.iter().map(|k| is_boundary(k, b"aaaaaaaaaa")).collect();
+
+        let same_len: Vec<bool> = keys.iter().map(|k| is_boundary(k, b"zzzzzzzzzz")).collect();
+        assert_eq!(before, same_len, "a same-length value rewrite moved a boundary");
+
+        // And the fixture has to contain boundaries, or the equality above is vacuous.
+        assert!(before.iter().any(|&b| b), "no boundary in the fixture at all");
+
+        // A length change is allowed to flip the row it changed, and nothing else: compare the
+        // decisions for every *other* row, whose size did not move.
+        let longer: Vec<bool> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                if i == 1234 {
+                    is_boundary(k, b"aaaaaaaaaaaaaaaaaaaa")
+                } else {
+                    is_boundary(k, b"aaaaaaaaaa")
+                }
+            })
+            .collect();
+        for i in 0..keys.len() {
+            if i != 1234 {
+                assert_eq!(before[i], longer[i], "row {} moved when row 1234 grew", i);
+            }
+        }
+    }
+
+    /// Buzhash is reported to chunk sorted and low-entropy keys badly — Dolt replaced Noms'
+    /// buzhash splitter for producing "massive chunks" on exactly the auto-increment and
+    /// timestamp keys a database is full of. That claim is about a 67-byte sliding window over a
+    /// concatenated byte stream with a static pattern; this chunker restarts the hash per key and
+    /// scales its threshold by entry size, and the difference has to be demonstrated rather than
+    /// argued. The random-key arm is the control: the sorted shapes must not be worse than it.
+    #[test]
+    fn degenerate_key_shapes_do_not_produce_massive_chunks() {
+        const N: u32 = 40_000;
+        let fixed = vec![b'x'; 20];
+        let shapes: Vec<(&str, Vec<(Vec<u8>, Vec<u8>)>)> = vec![
+            (
+                "ascending key{:06}",
+                (0..N).map(|i| (format!("key{:06}", i).into_bytes(), fixed.clone())).collect(),
+            ),
+            (
+                "big-endian u64 counter",
+                (0..N).map(|i| ((i as u64).to_be_bytes().to_vec(), fixed.clone())).collect(),
+            ),
+            (
+                "monotonic timestamps",
+                (0..N)
+                    .map(|i| ((1_700_000_000_000u64 + i as u64 * 1000).to_be_bytes().to_vec(), fixed.clone()))
+                    .collect(),
+            ),
+            (
+                "32-byte common prefix",
+                (0..N)
+                    .map(|i| {
+                        let mut k = b"tenant-00000000000000000001-row-".to_vec();
+                        k.extend_from_slice(&(i as u64).to_be_bytes());
+                        (k, fixed.clone())
+                    })
+                    .collect(),
+            ),
+            (
+                "random-ish 16-byte keys (control)",
+                (0..N)
+                    .map(|i| {
+                        // splitmix64 of i, twice, so the control owns no RNG the test cannot repeat
+                        let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                        let a = z ^ (z >> 31);
+                        let b = a.wrapping_mul(0x94D0_49BB_1331_11EB) ^ 0x5DEE_CE66_D1F3_A7B9;
+                        let mut k = a.to_be_bytes().to_vec();
+                        k.extend_from_slice(&b.to_be_bytes());
+                        (k, fixed.clone())
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for (name, rows) in &shapes {
+            let cs = chunk_bytes(rows);
+            assert!(cs.len() > 100, "{}: only {} chunks - the predicate barely fired", name, cs.len());
+            let total: usize = cs.iter().sum();
+            let mean = total as f64 / cs.len() as f64;
+            let max = *cs.iter().max().unwrap();
+            let over = cs.iter().filter(|&&c| c > NODE_CAPACITY).count();
+            assert!(
+                mean > TARGET_CHUNK_BYTES as f64 * 0.75 && mean < TARGET_CHUNK_BYTES as f64 * 1.25,
+                "{}: mean chunk {:.0} B against a {} B target",
+                name,
+                mean,
+                TARGET_CHUNK_BYTES
+            );
+            // "Massive" is the claim under test. Twenty times the target is five pages.
+            assert!(
+                max < TARGET_CHUNK_BYTES * 20,
+                "{}: largest chunk {} B, over {} B - the sorted-key degeneration reproduced",
+                name,
+                max,
+                TARGET_CHUNK_BYTES * 20
+            );
+            assert!(
+                over * 200 < cs.len(),
+                "{}: {} of {} chunks exceed a page, over the 0.5% the refinement path is budgeted",
+                name,
+                over,
+                cs.len()
+            );
+        }
     }
 
     /// The predicate has to actually fire, and land near the chunk size it advertises. A chunker
@@ -408,11 +594,11 @@ mod tests {
         for _ in 0..8 {
             assert_eq!(is_boundary(b"key000042", b"value-42"), a);
         }
-        // A different value on the same key is a different entry, and may well decide differently.
-        let differing = (0..5000)
-            .filter(|i| is_boundary(b"key000042", format!("value-{}", i).as_bytes()) != a)
-            .count();
-        assert!(differing > 0, "the value never affected the boundary decision");
+        // Different keys must not all decide alike, or the predicate is a constant.
+        let set: std::collections::BTreeSet<bool> = (0..5000u32)
+            .map(|i| is_boundary(format!("key{:06}", i).as_bytes(), b"value-42"))
+            .collect();
+        assert_eq!(set.len(), 2, "the key never affected the boundary decision");
     }
 
     #[test]

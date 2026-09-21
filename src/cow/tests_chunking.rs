@@ -206,7 +206,7 @@ fn insertion_order_does_not_change_the_leaf_partition() {
 /// to look like, computed without reference to any tree.
 fn canonical(set: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
     let sizes: Vec<usize> = set.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
-    let hashes: Vec<u32> = set.iter().map(|(k, v)| chunker::cell_hash(k, v)).collect();
+    let hashes: Vec<u32> = set.iter().map(|(k, _)| chunker::key_hash(k)).collect();
     let cuts = chunker::leaf_cuts(&sizes, &hashes, node::NODE_CAPACITY);
     let mut bounds = vec![0usize];
     bounds.extend_from_slice(&cuts);
@@ -344,4 +344,81 @@ fn wide_rows_chunk_by_content_and_still_fit_the_page() {
         let bytes: usize = leaf.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).sum();
         assert!(bytes <= node::NODE_CAPACITY, "leaf {} holds {} bytes", i, bytes);
     }
+}
+
+/// A rewritten value must not re-chunk the tree.
+///
+/// This is the end-to-end form of `chunker::rewriting_a_value_does_not_move_a_boundary`, and the
+/// reason the chunking hash reads the key alone: a branch that updates a column should shadow the
+/// leaves it touched and nothing else. If boundaries moved with values, the leaves either side
+/// would be rewritten too and `CowTree::diff` — which prunes only on identical page ids — would
+/// stop seeing the rest of the tree as shared.
+#[test]
+fn rewriting_values_in_place_leaves_the_partition_alone() {
+    let set = pairs(1500);
+    let f = Fixture::new();
+    let mut root = f.build(&set);
+    let before = f.leaf_partition(root);
+
+    // Same-length replacements, so only the value bytes change.
+    let updated: Vec<(Vec<u8>, Vec<u8>)> = set
+        .iter()
+        .map(|(k, v)| (k.clone(), vec![b'Z'; v.len()]))
+        .collect();
+    for (k, v) in &updated {
+        let e = f.tick();
+        root = f.tree.insert(root, BranchId::TRUNK, e, k, v).unwrap();
+    }
+    let after = f.leaf_partition(root);
+
+    assert_eq!(
+        after.iter().map(|l| l.len()).collect::<Vec<_>>(),
+        before.iter().map(|l| l.len()).collect::<Vec<_>>(),
+        "rewriting every value moved the leaf boundaries\n  before: {}\n  after : {}",
+        describe(&before),
+        describe(&after)
+    );
+    assert_eq!(after, canonical(&updated), "the rewritten tree is not the chunker's partition");
+}
+
+/// A key can fit a leaf and still be too large to *separate* one, because a content cut promotes
+/// the boundary key plus a byte. That one byte narrows the largest usable key by one, so the
+/// refusal is a real behaviour change and is pinned here rather than left latent — and it has to
+/// arrive before anything is written.
+#[test]
+fn a_key_too_large_to_separate_is_refused_before_the_tree_is_touched() {
+    let f = Fixture::new();
+    let mut root = f.build(&pairs(200));
+    let before = f.leaf_partition(root);
+
+    // Sized from the limits, not hard-coded: the key just fits a leaf entry, its separator does
+    // not fit an internal one.
+    let klen = node::MAX_ENTRY_BYTES - node::internal_entry_bytes(b"");
+    let key = vec![b'k'; klen];
+    let value = vec![b'v'; node::MAX_ENTRY_BYTES - node::leaf_entry_bytes(&key, b"")];
+    assert!(
+        node::leaf_entry_bytes(&key, &value) <= node::MAX_ENTRY_BYTES,
+        "fixture: the entry itself must fit a leaf"
+    );
+    assert!(
+        node::internal_entry_bytes(&key) + 1 > node::MAX_ENTRY_BYTES,
+        "fixture: the separator must not fit an internal node"
+    );
+
+    let e = f.tick();
+    let err = f.tree.insert(root, BranchId::TRUNK, e, &key, &value).unwrap_err();
+    assert!(err.to_string().contains("separator"), "unexpected error: {}", err);
+
+    root = f.tree.insert(root, BranchId::TRUNK, f.tick(), b"probe", b"1").unwrap();
+    assert_eq!(f.tree.get(root, &key).unwrap(), None, "the refused key reached the tree");
+    let after = f.leaf_partition(root);
+    let cells: usize = after.iter().map(|l| l.len()).sum();
+    assert_eq!(cells, 201, "the refused insert changed the tree's contents");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the refused insert changed the partition\n  before: {}\n  after : {}",
+        describe(&before),
+        describe(&after)
+    );
 }

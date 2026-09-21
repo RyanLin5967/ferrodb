@@ -288,6 +288,20 @@ impl CowTree {
                 node::MAX_ENTRY_BYTES
             )));
         }
+        // A content cut promotes `successor_of(key)`, a byte longer than the key, so a key can fit
+        // a leaf and still be one byte too large to *separate* one. Refuse it here: raising it
+        // from inside `internal_relink` would abandon a leaf split that had already happened —
+        // harmless, since shadow paging means the caller never publishes that root, but it spends
+        // pages and reports the limit from the wrong place.
+        let separator_bytes = node::internal_entry_bytes(key) + 1;
+        if separator_bytes > node::MAX_ENTRY_BYTES {
+            return Err(FerroError::Cow(format!(
+                "key of {} bytes needs a {}-byte separator, which exceeds the {}-byte limit for a 4KB page",
+                key.len(),
+                separator_bytes,
+                node::MAX_ENTRY_BYTES
+            )));
+        }
         let (path, leaf_id) = self.descend(root, key)?;
         let cp = self.store.cow_page(leaf_id, branch, epoch)?;
         let new_leaf = cp.page_id;
@@ -465,7 +479,13 @@ impl CowTree {
                     stamp_checksum(&mut f.data);
                     return Ok(Vec::new());
                 }
-                n.view().leaf_entries()?
+                // The entry is already in the page and the re-chunk below reopens it through a
+                // fresh `write()`. Restamp before this guard drops: the page is pinned throughout
+                // so nothing could flush it in between, but a page whose checksum disagrees with
+                // its bytes should be unreachable by construction, not by luck.
+                let entries = n.view().leaf_entries()?;
+                stamp_checksum(&mut f.data);
+                entries
             } else {
                 let mut entries = n.view().leaf_entries()?;
                 match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
@@ -478,7 +498,7 @@ impl CowTree {
 
         let sizes: Vec<usize> =
             entries.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
-        let hashes: Vec<u32> = entries.iter().map(|(k, v)| chunker::cell_hash(k, v)).collect();
+        let hashes: Vec<u32> = entries.iter().map(|(k, _)| chunker::key_hash(k)).collect();
         let cuts = chunker::leaf_cuts(&sizes, &hashes, node::NODE_CAPACITY);
         if cuts.is_empty() {
             // The content says this is one chunk. It reached here only because the entry did not
@@ -685,6 +705,12 @@ struct Level {
 /// full scan, because the size of the answer was decided before the caller ever saw a row. The
 /// last row is the control — asking for the table in RAM still costs the table in RAM, so the
 /// change moved the decision to the caller rather than hiding a cost somewhere else.
+///
+/// These figures were taken before leaf boundaries became content-defined (`cow::chunker`), which
+/// spends fanout on structural invariance and so adds roughly a level to a 10^6-row tree. What the
+/// table *claims* is unaffected — the streamed cost is a property of the tree's depth, not of the
+/// rows returned — but the streamed constants belong to the old, shallower shape and a re-run
+/// would read somewhat higher. `bench/s23_cow_scan_memory_{before,after}.txt` are the raw runs.
 ///
 /// The streamed figures are flat from 10^4 to 10^6 rows (5,024 → 5,540 → 5,640 B): one 4 KiB
 /// leaf buffer, the descent stack, and the entry being yielded. The first scan after a build
