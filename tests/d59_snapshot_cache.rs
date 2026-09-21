@@ -142,7 +142,14 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
             std::thread::spawn(move || {
                 let (mut checked, mut skipped) = (0u64, 0u64);
                 let t0 = Instant::now();
-                while !stop.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(4) {
+                // ⚠ The bound is the STOP FLAG, not a wall-clock window. The old form ran for a
+                // fixed 4 s, which made the test's own anti-vacuity preconditions a function of
+                // MACHINE LOAD rather than of the code: on a busy box this reached only 444
+                // churns against a threshold of 1000 and failed, having proved nothing either
+                // way. `Instant::elapsed` is also quantised to ~41.67 ns here, so wall-clock is
+                // the weaker instrument twice over. The driver below now runs until the COUNTS
+                // the assertions require are actually reached, and refuses on a hard ceiling.
+                while !stop.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(120) {
                     let v1 = t.att_version();
                     let cached = t.read_snapshot_cached();
                     let locked = t.read_snapshot();
@@ -174,13 +181,32 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
         })
         .collect();
 
+    // Drive on the COUNTER the assertions read, not on the clock. The race is exercised when the
+    // writer has churned enough for a reader to have observed a version move mid-read; how long
+    // that takes is a property of this machine's load, which is not what this test is about.
+    // A hard ceiling still refuses rather than hanging — and refuses LOUDLY, naming the count it
+    // could not reach, so "the race could not be exercised" can never read as a pass.
+    {
+        let spin = Instant::now();
+        while churned.load(Ordering::Relaxed) <= 4000 && spin.elapsed() < Duration::from_secs(90) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let n = churned.load(Ordering::Relaxed);
+        assert!(
+            n > 4000,
+            "the writer churned only {n} in 90 s — the race could not be exercised on this \
+             machine at all. This is NOT a pass and NOT a correctness failure: the detector \
+             never ran. Re-run on a quieter box before drawing any conclusion."
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+
     let (mut checked, mut skipped) = (0u64, 0u64);
     for r in readers {
         let (c, s) = r.join().unwrap();
         checked += c;
         skipped += s;
     }
-    stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
     // The detector must have been able to fire: the writer churned, and readers both checked and
