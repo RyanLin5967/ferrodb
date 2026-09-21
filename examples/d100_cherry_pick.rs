@@ -28,6 +28,7 @@
 //!
 //! Run: `cargo run --release --example d100_cherry_pick`
 
+use std::cell::Cell;
 use std::time::Instant;
 
 use ferrodb::agent_sql::merge_engine::PolicyTable;
@@ -106,6 +107,47 @@ fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>, Vec<((u32, u64, 
     (log, target, seqs, cells)
 }
 
+/// **OPS TOUCHED — the integer instrument, and the one that actually settles the claim.**
+///
+/// Wraps any `CherryLog` and counts what the engine asks it for. Deterministic, identical on a
+/// loaded box and an idle one, and it needs no measure lock: it is a property of the algorithm,
+/// not of this machine. A capability's cost is better stated as "picking N ops examines exactly
+/// this many ops" than as a microsecond figure taken while sixteen siblings compile.
+struct CountingLog<'a> {
+    inner: &'a dyn CherryLog,
+    op_at: Cell<usize>,
+    cell_lookups: Cell<usize>,
+    /// Entries the by-cell index handed back — the ops actually examined for divergence.
+    index_entries: Cell<usize>,
+}
+
+impl<'a> CountingLog<'a> {
+    fn new(inner: &'a dyn CherryLog) -> Self {
+        CountingLog {
+            inner,
+            op_at: Cell::new(0),
+            cell_lookups: Cell::new(0),
+            index_entries: Cell::new(0),
+        }
+    }
+    fn total(&self) -> usize {
+        self.op_at.get() + self.index_entries.get()
+    }
+}
+
+impl CherryLog for CountingLog<'_> {
+    fn op_at(&self, seq: u64) -> Option<&RecordedOp> {
+        self.op_at.set(self.op_at.get() + 1);
+        self.inner.op_at(seq)
+    }
+    fn ops_on_cell(&self, tbl: TableId, row: RowId, col: ColId) -> &[u64] {
+        let out = self.inner.ops_on_cell(tbl, row, col);
+        self.cell_lookups.set(self.cell_lookups.get() + 1);
+        self.index_entries.set(self.index_entries.get() + out.len());
+        out
+    }
+}
+
 /// **The control arm: the same log with NO by-cell index.**
 ///
 /// `op_at` delegates, so it is identical in both arms and the A/B isolates exactly one thing —
@@ -118,6 +160,8 @@ fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>, Vec<((u32, u64, 
 struct ScanCherryLog {
     inner: MemCherryLog,
     cells: Vec<((u32, u64, u32), Vec<u64>)>,
+    /// Keys compared while scanning — the unindexed arm's ops-touched.
+    compares: Cell<usize>,
 }
 
 impl CherryLog for ScanCherryLog {
@@ -127,11 +171,13 @@ impl CherryLog for ScanCherryLog {
 
     fn ops_on_cell(&self, tbl: TableId, row: RowId, col: ColId) -> &[u64] {
         let key = (tbl.0, row.0, col.0);
-        self.cells
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.as_slice())
-            .unwrap_or(&[])
+        let mut seen = 0usize;
+        let hit = self.cells.iter().find(|(k, _)| {
+            seen += 1;
+            *k == key
+        });
+        self.compares.set(self.compares.get() + seen);
+        hit.map(|(_, v)| v.as_slice()).unwrap_or(&[])
     }
 }
 
@@ -215,6 +261,66 @@ fn main() {
     );
     println!();
 
+    // ---- AXIS 0: OPS TOUCHED. Integers. No clock, no lock, no fleet. ------------------------
+    //
+    // The headline cost for a CAPABILITY. Every figure below is exact and reproducible on any
+    // machine in any state, which is more than any microsecond in this file can claim.
+    {
+        println!("AXIS 0 — OPS TOUCHED (exact integers; no clock involved)");
+        println!(
+            "  {:>8}  {:>12}  {:>12}  {:>14}  {:>14}",
+            "picked", "op_at", "cell lookups", "index entries", "total per pick"
+        );
+        const L: usize = 10_000;
+        let (l, b, sq, _) = build(L);
+        for &n in &[1usize, 10, 100, 1000] {
+            let sel = spread(&sq, n);
+            let c = CountingLog::new(&l);
+            let r = plan_cherry_pick(&c, src(), &sel, dst(), &b, &PolicyTable::new()).unwrap();
+            assert!(r.is_applied(), "the counted pick must APPLY, got {:?}", r);
+            println!(
+                "  {:>8}  {:>12}  {:>12}  {:>14}  {:>14.2}",
+                n,
+                c.op_at.get(),
+                c.cell_lookups.get(),
+                c.index_entries.get(),
+                c.total() as f64 / n as f64
+            );
+        }
+        println!();
+
+        // The control, as integers. Same selection, same log, index removed.
+        println!("  Log size INDEPENDENCE, 100 picks — indexed total vs unindexed key-compares:");
+        println!(
+            "  {:>10}  {:>16}  {:>18}  {:>10}",
+            "log ops", "indexed touched", "unindexed compares", "ratio"
+        );
+        for &rows in &[500usize, 5_000, 50_000] {
+            let (l, b, sq, cells) = build(rows);
+            let sel = spread(&sq, 100);
+            let indexed = {
+                let c = CountingLog::new(&l);
+                plan_cherry_pick(&c, src(), &sel, dst(), &b, &PolicyTable::new()).unwrap();
+                c.total()
+            };
+            let scan = ScanCherryLog { inner: l, cells, compares: Cell::new(0) };
+            plan_cherry_pick(&scan, src(), &sel, dst(), &b, &PolicyTable::new()).unwrap();
+            let unindexed = scan.compares.get();
+            println!(
+                "  {:>10}  {:>16}  {:>18}  {:>9.1}x",
+                2 * rows,
+                indexed,
+                unindexed,
+                unindexed as f64 / indexed as f64
+            );
+        }
+        println!();
+        println!(
+            "  ⇒ The indexed total is CONSTANT in the log size — it depends only on how many ops\n                  were picked. The unindexed compares grow with it. That is the whole design claim,\n                  stated as integers that no machine load can move."
+        );
+        println!();
+    }
+
     // ---- AXIS 1: cost against the number of PICKED ops, log held fixed. ---------------------
     const ROWS: usize = 10_000;
     let (log, base, seqs, _) = build(ROWS);
@@ -297,7 +403,7 @@ fn main() {
     let mut axis2b: Vec<(usize, f64)> = Vec::new();
     for &rows in &[500usize, 5_000, 50_000] {
         let (l, b, s, cells) = build(rows);
-        let scan = ScanCherryLog { inner: l, cells };
+        let scan = ScanCherryLog { inner: l, cells, compares: Cell::new(0) };
         let sel = spread(&s, 100); // the IDENTICAL selection the indexed arm used
         let (whole, plan) = measure(&scan, &sel, &b, 201);
         println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
