@@ -1715,7 +1715,7 @@ impl AgentRuntime {
     /// Retain the scan a WRITE statement's own `WHERE` clause performed.
     ///
     /// **`UPDATE ... WHERE` and `DELETE ... WHERE` are scans, by this module's own definition.** Both
-    /// call [`AgentRuntime::visible_rows`], which returns *every* row, and then evaluate the bound
+    /// call `visible_rows_where`, which since D71 takes the statement's own predicate and     /// pushes it down — the scan is NOT unpredicated, and the comments at the three write sites     /// below record that, and then evaluate the bound
     /// clause against each one. None of that used to be retained anywhere, and `record_read` had
     /// exactly one caller — `select` — so the read-modify-write shape this lane exists to protect
     /// found ZERO dependents unless the agent happened to spell the scan as a `SELECT` first.

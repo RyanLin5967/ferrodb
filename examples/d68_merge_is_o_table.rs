@@ -48,7 +48,7 @@
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::{Instant};
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
