@@ -1,0 +1,36 @@
+d103 — the PRODUCTION DIFF path, cost curve (release)
+run at unix 1790016183
+
+Subject: AgentRuntime::page_changeset_with_cost, the call DIFF <branch> reaches.
+Question: does the production path cost O(delta · log_m N) now, or O(N)?
+delta is held at exactly 4 changed rows; N is the only axis.
+
+Instruments:
+  visited   DiffCost::visited — nodes the synchronised descent DECODED, which on
+            that path is also every node it read. THE CLAIM.
+  skipped   subtree pairs found equal by page identity and abandoned unread.
+  walked    TreeDiff::pages_walked — walk_pages(base)+walk_pages(head), what the
+            path this replaced must enumerate before it can prune. THE CONTROL.
+  examined  TreeDiff::pages_examined — the old counter. It reports the DECODE
+            half only, which is why an O(N) operation read as cheap.
+
+Both paths were asserted to report the same 4 changes at every N; a row that did
+not would have aborted the run rather than been banked.
+
+      N   nodes  depth | visited  skipped  changes |     walked   examined
+                       |                           |  (control)   (the lie)
+-------  ------  ----- | -------  -------  ------- |  ---------   ---------
+   1000      67      2 |      10       62        4 |        134          10
+   4000     278      3 |      12       70        4 |        556          12
+  16000    1151      3 |      12       82        4 |       2302          12
+  64000    4607      3 |      12      130        4 |       9214          12
+ 256000   18234      4 |      14      141        4 |      36468          14
+
+N grew 256x (1000 -> 256000).
+visited grew 1.4x (10 -> 14), tracking DEPTH 2 -> 4.
+control  grew 272x (134 -> 36468), tracking N.
+
+The old counter, for contrast: examined 10 -> 14, which is flat and true and says
+nothing at all about what that path cost.
+
+PRE-REGISTERED OUTCOME 1: the production path is O(delta · log N).
