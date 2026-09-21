@@ -2050,14 +2050,27 @@ mod tests {
 
         h.store.free_arena(ab).unwrap();
 
-        // The owner forgot it: its next write opens a new extent instead of refilling a freed one.
-        assert_ne!(
-            h.store.arena_for(b).unwrap(),
-            ab,
-            "the freed extent is still the owner's current arena"
+        // **Read the MAP, not `arena_for`.** `free_arena` removes this arena from `claim_epoch` on
+        // the line above, and `arena_for` refuses any extent whose claim epoch is missing — so a
+        // build that forgot the `current` removal altogether STILL hands `b` a fresh extent, and an
+        // assertion phrased on `arena_for` passes against it. Measured: deleting the removal leaves
+        // that phrasing green. The entry's real consequence is the durable image, which serialises
+        // `current` whole, so that is where the assertion belongs. Taken before anything re-fills
+        // `b`, which would put the key straight back.
+        let (arenas_in_image, current_in_image) = key_order_in_image(&h.store.state_bytes());
+        assert!(!arenas_in_image.contains(&ab.0), "fixture: the freed extent is still an extent");
+        let owners: Vec<u64> = current_in_image.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !owners.contains(&b.id),
+            "the freed extent's owner is still named in the image's current-arena section"
         );
-        // The bystanders did not. This is the half a scan gave away for free and a lookup has to
-        // earn.
+        assert!(
+            owners.contains(&a.id) && owners.contains(&c.id),
+            "freeing b's extent dropped a bystander from the image's current-arena section"
+        );
+
+        // And the bystanders still hold the extents they were filling. This is the half a scan gave
+        // away for free and a lookup has to earn.
         assert_eq!(h.store.arena_for(a).unwrap(), aa, "freeing b's extent moved a off its own");
         assert_eq!(h.store.arena_for(c).unwrap(), ac, "freeing b's extent moved c off its own");
     }
