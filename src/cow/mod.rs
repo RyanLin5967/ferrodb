@@ -16,6 +16,7 @@
 //! Liveness is answered instead by the epoch interval rule in `branch::record::reclaimable`.
 
 pub mod btree;
+pub mod cid;
 pub mod node;
 pub mod page_header;
 pub mod store;
