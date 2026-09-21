@@ -176,14 +176,25 @@ impl Db {
     /// Read out of `pickable_ops`, which is the catalogue an agent selects from — so the test
     /// names an op exactly the way a caller has to.
     fn seq_of(&self, table: &str, id: i32, col: u32) -> u64 {
+        self.seq_from(None, table, id, col)
+    }
+
+    /// The same, narrowed to the branch that published it.
+    ///
+    /// ⚠ Needed because a cell can carry ops from several branches, and `cherry_pick` refuses a
+    /// selector naming an op some other branch published (`NotFromSource`). Picking "the last op
+    /// on this cell" is not the same question as "agent A's op on this cell", and conflating them
+    /// made a test refuse for a reason it was not about.
+    fn seq_from(&self, branch: Option<BranchId>, table: &str, id: i32, col: u32) -> u64 {
         let row = row_id_of(&[Value::Integer(id)]);
         let ops = self.runtime.pickable_ops();
         ops.iter()
             .filter(|o| o.table == table && o.row == row && o.col == Some(ColId(col)))
+            .filter(|o| branch.is_none_or(|b| o.branch == b))
             .map(|o| o.seq)
             .next_back()
             .unwrap_or_else(|| {
-                panic!("no recorded op on {table}.col{col} for id {id}; log = {ops:?}")
+                panic!("no recorded op on {table}.col{col} for id {id} from {branch:?}; log = {ops:?}")
             })
     }
 }
@@ -399,5 +410,72 @@ fn a_selector_naming_no_op_is_refused() {
     assert!(
         db.runtime.page_changeset(b).unwrap().is_empty(),
         "a refused pick staged the half that did resolve"
+    );
+}
+
+/// **The divergence read is what lets a commuting pick land, and it goes through D86's index.**
+///
+/// ⚠ **This test exists because the obvious one did not discriminate.** Blinding
+/// `RuntimeCherryLog::ops_on_cell` — returning no divergence information at all — left every other
+/// test in this file green, because `divergence`'s fallback is `Assign(target_now)`, which under
+/// the default REJECT policy refuses. A blinded index therefore produces MORE refusals, and a test
+/// that only checks refusals cannot see it.
+///
+/// So the case that sees it is the one where the index makes a pick **succeed**: the target's cell
+/// moved, but it moved by an op from another branch that COMMUTES with the picked one.
+/// `divergence` recovers that op by replaying the cell's history from the picked op's witness —
+/// `ops_on_cell` filtered to `o.branch != from` — and `resolve_cell` then composes the two adds
+/// instead of refusing.
+///
+/// It also exercises the `branch` recovery this impl owes: `AppliedOp` does not carry a branch, so
+/// `RuntimeCherryLog` joins it through the merge record keyed by txn. Get that join wrong and the
+/// picked op fails to be filtered out of its own divergence, the replay lands on the wrong value,
+/// and this refuses.
+///
+/// The arrangement is deliberate rather than natural, and that is worth saying: every published
+/// op is on the shared table, so a fresh branch has already absorbed the op being picked. The
+/// target here has staged a value of its own, which is what puts it at a point reachable from the
+/// witness by the OTHER branch's op alone.
+#[test]
+fn a_commuting_divergence_is_recovered_through_the_by_cell_index() {
+    let mut db = Db::new();
+    db.seed();
+
+    // A adds 5 from a base of 100, and publishes. Witness for A's op is 100.
+    let (a, mut sa) = db.agent("agent-a");
+    db.ok("UPDATE inventory SET qty = qty + 5 WHERE id = 1;", &mut sa);
+    db.merge(a);
+    assert_eq!(db.cell("inventory", "qty", None, 1), Some(105));
+
+    // C subtracts 3 and publishes, so the cell's history now holds two adds from two branches.
+    let (c, mut sc) = db.agent("agent-c");
+    db.ok("UPDATE inventory SET qty = qty - 3 WHERE id = 1;", &mut sc);
+    db.merge(c);
+    assert_eq!(db.cell("inventory", "qty", None, 1), Some(102));
+
+    let add_five = db.seq_from(Some(a), "inventory", 1, 1);
+
+    // B sits at 97 = 100 - 3: the witness with C's op applied and A's NOT. That is the state the
+    // divergence read has to be able to explain.
+    let (b, mut sb) = db.agent("agent-b");
+    db.ok("UPDATE inventory SET qty = 97 WHERE id = 1;", &mut sb);
+
+    let rt = db.rt();
+    let (bp, txn) = (db.bp.clone(), db.txn.clone());
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let result = rt.cherry_pick(&mut ctx, a, &[add_five], b).unwrap();
+
+    assert!(
+        result.is_applied(),
+        "the pick was refused: {:?}. If the divergence read cannot recover C's op it falls back \
+         to Assign(target), which does not commute with an Add and refuses — which is exactly \
+         what a blinded ops_on_cell produces.",
+        result.refusal().map(|r| r.kinds())
+    );
+    // 97 + 5: the picked add composed onto the target's own value rather than replacing it.
+    assert_eq!(
+        db.cell("inventory", "qty", Some(b), 1),
+        Some(102),
+        "the picked Add did not compose onto the target's value"
     );
 }
