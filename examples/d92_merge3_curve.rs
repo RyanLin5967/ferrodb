@@ -100,6 +100,26 @@ impl Harness {
         b
     }
 
+    /// The leaf page that holds `key`. Two keys in the same leaf share every node above it;
+    /// two keys in different leaves do not, and that is the whole difference rules 2 and 3 turn
+    /// on. Asking the tree is the only honest way to know which case a pair is in — it depends on
+    /// where `cow::chunker` put the boundaries, not on how far apart the keys are.
+    fn leaf_of(&self, root: PageId, key: &[u8]) -> PageId {
+        let mut pid = root;
+        loop {
+            let h = self.store.read_page(pid).unwrap();
+            let f = h.read();
+            let n = Node::new(&f.data);
+            if PageHeader::read_from(&f.data).unwrap().page_type == PageType::BTreeLeaf {
+                return pid;
+            }
+            let next = n.child_slot_for(key).unwrap().1;
+            drop(f);
+            drop(h);
+            pid = next;
+        }
+    }
+
     /// Levels from root to leaf, counted by descending leftmost. 1 = the root is a leaf.
     fn depth(&self, root: PageId) -> usize {
         let mut pid = root;
@@ -132,6 +152,11 @@ struct Arm {
     depth: usize,
     stats: MergeStats,
     conflicts: usize,
+    /// Changed-key pairs whose two sides land in **different leaves** of the base tree.
+    ///
+    /// This is the quantity rules 2 and 3 actually turn on, and it is read from the tree rather
+    /// than assumed from the keys. See the assertions in [`arm`].
+    split_pairs: usize,
 }
 
 /// How the two sides' changed keys are placed relative to each other.
@@ -230,7 +255,62 @@ fn arm(n: usize, deltas: usize, placement: Placement) -> Arm {
         );
     }
 
-    Arm { n, pages, depth, stats: r.stats, conflicts: r.conflicts.len() }
+    // ---- what the skip counters are allowed to say ------------------------------------------
+    //
+    // Rules 2 and 3 skip a subtree exactly one side touched. Whether a changed-key pair gives
+    // them anything to skip is a fact about the **partition**, not about the distance between the
+    // keys: a pair in one leaf shares every node above it and nothing can be skipped, a pair in
+    // two leaves does not and both rules get one subtree each.
+    //
+    // This used to be asserted as `contested == 0`, on the premise that keys one apart always
+    // share a leaf. That was true of a 68-row leaf and of a byte-balanced split. Under
+    // `cow::chunker` the boundary is a function of content, this fixture's rows are 128 bytes, and
+    // a leaf holds about four of them — so a pair straddles a boundary roughly a quarter of the
+    // time and the rules legitimately fire. Measured at the time of the change: 2, 2, 1, 1, 0
+    // straddling pairs across the five N, against rule-2 and rule-3 totals of 6 and 6.
+    //
+    // So the assertion is the law rather than the count. It holds whatever the chunk target, the
+    // fixture size, or the partitioning strategy, and it still fails if a rule skips a subtree
+    // both sides touched — which is the false skip worth catching.
+    let split_pairs = ours_keys
+        .iter()
+        .zip(theirs_keys.iter())
+        .filter(|&(&o, &t)| h.leaf_of(base, &key(o)) != h.leaf_of(base, &key(t)))
+        .count();
+    match placement {
+        Placement::Contested => {
+            // The pairs sit ~N/5 apart, so each is its own locality and contributes independently:
+            // a pair in one leaf gives the rules nothing, a pair in two adjacent leaves gives rule
+            // 2 the leaf only ours touched and rule 3 the leaf only theirs touched — one each.
+            assert_eq!(
+                r.stats.skip_theirs_unchanged, split_pairs,
+                "N={n} contested: rule 2 skipped {} subtrees against {split_pairs} of {deltas} \
+                 pairs in different leaves. A skip with no split pair is a subtree both sides \
+                 touched, which would be a false skip.",
+                r.stats.skip_theirs_unchanged
+            );
+            assert_eq!(
+                r.stats.descend_ours_unchanged, split_pairs,
+                "N={n} contested: rule 3 took {} two-way descents against {split_pairs} of \
+                 {deltas} pairs in different leaves.",
+                r.stats.descend_ours_unchanged
+            );
+        }
+        Placement::Separated => {
+            // No per-pair equality here, and deliberately not: the sides are half the key space
+            // apart, so one skip retires a subtree holding many of them and the count is a fact
+            // about the tree's shape rather than about the pairs. What must hold is the premise
+            // the arm is named for — that the sides really are in different leaves — and that the
+            // rules fire at all, which the summary asserts across the curve.
+            assert_eq!(
+                split_pairs, deltas,
+                "N={n} separated: only {split_pairs} of {deltas} pairs are in different leaves, so \
+                 this arm is not separated and its contrast with the contested arm is empty"
+            );
+        }
+    }
+
+    Arm { n, pages, depth, stats: r.stats, conflicts: r.conflicts.len(), split_pairs }
 }
 
 /// The detector's fire-check: three trees that share nothing must report **zero** skips.
@@ -396,9 +476,20 @@ fn main() {
     println!("  rule 3 (ours == base, two-way)       contested {con_ours:>5}   separated {sep_ours:>5}");
     assert!(sep_theirs > 0, "rule 2 never fired even when only ours touched a subtree");
     assert!(sep_ours > 0, "rule 3 never fired even when only theirs touched a subtree");
-    assert_eq!(con_theirs, 0, "contested keys share every node; rule 2 cannot fire there");
-    assert_eq!(con_ours, 0, "contested keys share every node; rule 3 cannot fire there");
-    println!("  -> rules 2 and 3 read 0 in the contested arm because nothing there can trigger");
+    // Rules 2 and 3 in the contested arm are bounded by the pairs that straddle a leaf boundary,
+    // and `arm` has already asserted that equality at every N. Restating the total here keeps the
+    // printed table readable against a number rather than against a claim.
+    let con_split: usize = contested.iter().map(|a| a.split_pairs).sum();
+    assert_eq!(con_theirs, con_split, "rule 2's contested total must equal the straddling pairs");
+    assert_eq!(con_ours, con_split, "rule 3's contested total must equal the straddling pairs");
+    assert!(
+        sep_theirs > con_theirs && sep_ours > con_ours,
+        "the separated arm must skip strictly more than the contested one, or the two workloads \
+         are not contrasting anything: rule 2 {con_theirs} vs {sep_theirs}, rule 3 {con_ours} vs \
+         {sep_ours}"
+    );
+    println!("  -> the contested arm's {con_split} firings are its {con_split} changed-key pairs that");
+    println!("     straddle a leaf boundary; a pair inside one leaf leaves the rules nothing to skip");
     println!("     them, not because the counters are dead. The separated arm proves they count.");
     println!();
 
