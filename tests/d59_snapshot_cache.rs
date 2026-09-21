@@ -113,6 +113,11 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
     let t = manager(&dir, "race");
     let stop = Arc::new(AtomicBool::new(false));
     let churned = Arc::new(AtomicU64::new(0));
+    // Shared so the driver below can wait on EVERY precondition the assertions make, not
+    // just the writer's. Readers keep their own locals too — those are what get summed and
+    // asserted on, so these can never become the source of the number they gate.
+    let checked_seen = Arc::new(AtomicU64::new(0));
+    let skipped_seen = Arc::new(AtomicU64::new(0));
 
     let writer = {
         let (t, stop, churned) = (t.clone(), stop.clone(), churned.clone());
@@ -138,37 +143,19 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
 
     let readers: Vec<_> = (0..4)
         .map(|_| {
-            let (t, stop, churned) = (t.clone(), stop.clone(), churned.clone());
+            let (t, stop) = (t.clone(), stop.clone());
+            let (checked_seen, skipped_seen) = (checked_seen.clone(), skipped_seen.clone());
             std::thread::spawn(move || {
                 let (mut checked, mut skipped) = (0u64, 0u64);
                 let t0 = Instant::now();
-                // Run until the detector has demonstrably FIRED, not for a fixed stretch of
-                // clock. The assertions below require the writer to have churned and the readers
-                // to have both checked and skipped; a wall-clock window makes those counts a
-                // function of how busy the machine is, which is not a property of the code under
-                // test. A fixed 4s window put the churn count right ON its own >1000 threshold
-                // under fleet load — measured 736 and 752 in-target, and 980 / pass / pass when
-                // run alone — so the test failed its vacuity guard rather than anything it was
-                // testing, intermittently, for everyone.
-                //
-                // The assertions' thresholds are NOT lowered: they are the only thing keeping this
-                // test from passing without exercising the race. These are the loop's EXIT
-                // condition instead, which is a stronger guarantee than a margin — the loop cannot
-                // end below them except by hitting `CAP`, so each is set to 2x its assertion
-                // rather than to a number chosen for luck. `CAP` is a deadlock guard, not the
-                // budget.
-                const NEED_CHURN: u64 = 2_000;
-                const NEED_CHECKED: u64 = 500;
-                const CAP: Duration = Duration::from_secs(60);
-                let fired = |checked: u64, skipped: u64, churned: &AtomicU64| {
-                    churned.load(Ordering::Relaxed) >= NEED_CHURN
-                        && checked >= NEED_CHECKED
-                        && skipped >= 1
-                };
-                while !stop.load(Ordering::Relaxed)
-                    && t0.elapsed() < CAP
-                    && !fired(checked, skipped, &churned)
-                {
+                // ⚠ The bound is the STOP FLAG, not a wall-clock window. The old form ran for a
+                // fixed 4 s, which made the test's own anti-vacuity preconditions a function of
+                // MACHINE LOAD rather than of the code: on a busy box this reached only 444
+                // churns against a threshold of 1000 and failed, having proved nothing either
+                // way. `Instant::elapsed` is also quantised to ~41.67 ns here, so wall-clock is
+                // the weaker instrument twice over. The driver below now runs until the COUNTS
+                // the assertions require are actually reached, and refuses on a hard ceiling.
+                while !stop.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(120) {
                     let v1 = t.att_version();
                     let cached = t.read_snapshot_cached();
                     let locked = t.read_snapshot();
@@ -176,6 +163,7 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
                     if v1 != v2 {
                         // The table changed under us; the two are allowed to differ.
                         skipped += 1;
+                        skipped_seen.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     assert_eq!(
@@ -194,11 +182,62 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
                         cached.high_water, locked.high_water
                     );
                     checked += 1;
+                    checked_seen.fetch_add(1, Ordering::Relaxed);
                 }
                 (checked, skipped)
             })
         })
         .collect();
+
+    // Drive on the COUNTERS the assertions read, not on the clock. The race is exercised when
+    // the writer has churned enough for a reader to have observed a version move mid-read; how
+    // long that takes is a property of this machine's load, which is not what this test is about.
+    //
+    // All THREE preconditions, not just the writer's. The assertions below require churn AND
+    // comparisons AND at least one overlapping read, and a driver that waits only on churn can
+    // release the readers before they have done either of the other two — the counts would then
+    // usually be fine and occasionally not, which is the same class of flake this is replacing.
+    // Waiting on the exact conjunction the assertions make is strictly stronger than waiting on
+    // one of them with a margin, because the loop cannot end below any of them except on the
+    // ceiling, and the ceiling refuses.
+    //
+    // 2x each threshold, and that is exact rather than hopeful: a reader bumps the shared
+    // counter in the same step as its own local, so the shared total IS the sum of the locals
+    // that get asserted on, and neither can fall after the driver reads it. A bigger margin would
+    // only buy runtime — at 4x this took 29 s on a box at load 17. The ceiling refuses LOUDLY and
+    // names WHICH precondition it could not reach, so "the race could not be exercised" can never
+    // read as a pass and never as a correctness failure either.
+    {
+        const NEED_CHURN: u64 = 2_000;
+        const NEED_CHECKED: u64 = 2_000;
+        // Named, and interpolated into the refusal below rather than spelled twice: a
+        // ceiling written once in code and once in prose drifts apart the first time anyone
+        // tunes it, and then the refusal misreports the budget it actually gave.
+        const CEILING: Duration = Duration::from_secs(90);
+        let spin = Instant::now();
+        let reached = |c: &Arc<AtomicU64>, want: u64| c.load(Ordering::Relaxed) > want;
+        while spin.elapsed() < CEILING
+            && !(reached(&churned, NEED_CHURN)
+                && reached(&checked_seen, NEED_CHECKED)
+                && reached(&skipped_seen, 0))
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (n, c, sk) = (
+            churned.load(Ordering::Relaxed),
+            checked_seen.load(Ordering::Relaxed),
+            skipped_seen.load(Ordering::Relaxed),
+        );
+        assert!(
+            n > NEED_CHURN && c > NEED_CHECKED && sk > 0,
+            "in {:?} this machine reached churned={n} (want >{NEED_CHURN}), checked={c} (want \
+             >{NEED_CHECKED}), skipped={sk} (want >0) — the race could not be exercised here. \
+             This is NOT a pass and NOT a correctness failure: the detector never ran. Re-run on \
+             a quieter box before drawing any conclusion.",
+            CEILING
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
 
     let (mut checked, mut skipped) = (0u64, 0u64);
     for r in readers {
@@ -206,7 +245,6 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
         checked += c;
         skipped += s;
     }
-    stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
     // The detector must have been able to fire: the writer churned, and readers both checked and
