@@ -1,0 +1,238 @@
+D90 — DELTA vs CHUNK: what a tens-of-bytes change costs in bytes stored.
+[HERE] 2026-09-21T04:38:09Z at 8be3c8c6fa55
+Harness: examples/d90_delta_vs_chunk.rs. 100,000-row table, fixed. r = rows changed,
+swept 1 -> 4096 by doubling. Each r: fork a branch, UPDATE exactly r rows scattered
+across the key space (i -> 1 + i*7919 mod N, injective), MERGE, count bytes stored.
+
+PRICES ForkBase's own concession, VLDB'18 p.1139 footnote 2: "chunk-based deduplication
+is less effective than delta encoding when the deltas are of much smaller size than the
+chunks." They deferred the fix to future work in 5.3 and never returned to it. Nobody in
+the Noms/Dolt lineage delta-encodes either, and single-row write amplification has never
+been published for any of these systems.
+
+THESE ARE COUNTERS, NOT TIMINGS, SO FLEET LOAD DOES NOT AFFECT THEM.
+Pages come from a counting Storage injected at DiskManager's existing seam (production
+path untouched); WAL bytes from wal::log::fsync_counters(); arena bytes from
+storage::atomic_file::atomic_replace_counters(). Integers, identical at load 60 and at
+load 0. Taken deliberately WITHOUT the fleet measure lock, at load average ~34 with 13
+sibling agents compiling. The check that this is sound is in the data: the ascending and
+descending passes reproduce the same page counts to the byte (worst disagreement 1.01x).
+The merge ms* column is wall-clock from that loaded box. It is NOT a measurement and must
+not be quoted; it is present only to show the sweep did work.
+load during: 33.65 34.30 37.44
+
+HOW EACH SINK IS PROVEN LIVE, not merely zero:
+A counter reading zero because nothing feeds it is indistinguishable from a real zero,
+and the FIRST full run of this sweep reported arena bytes of 0 for all thirteen r values
+for exactly that reason -- ArenaPageStore::persist_if_configured is a no-op until
+checkpoint_to sets a path, and the harness had never set one. A column of zeros looked
+like a finding and was a wiring bug. Two things now prevent that recurring:
+  * build() configures the checkpoint path, so the arena sink actually writes;
+  * the run prints WHOLE-RUN TOTALS across build, warm-up and both passes, and states
+    outright that a sink which is zero for the entire run is NOT WIRED and its per-r
+    column is an artefact. This run: WAL 166 fsyncs / 9,160,893 B; arena 111 replaces /
+    228,807 B. Both non-zero, so both are live.
+
+A MERGE THAT PUBLISHED NOTHING IS REFUSED, AND THE REFUSAL IS PROVEN TO FIRE:
+MergeReport::applied_to_target reports true for an EMPTY changeset. Such a merge costs
+the one page every merge costs, so it would have produced exactly the flat line this run
+looks for -- the one result the harness must not be able to manufacture. Every cycle
+therefore reads its last written row back through an ordinary SELECT against the trunk,
+outside any agent session and after the counters are read, and refuses to report bytes
+unless the trunk holds the value the branch wrote. Forced to fire with D90_FIRECHECK=1,
+which forks and merges while staging nothing:
+    r=64: MERGE reported applied, but trunk row id=3898 reads Some(Integer(27286)),
+          not Integer(64). The merge published nothing this sweep can price.
+          Refusing to report its bytes.
+    REFUSED: a warm-up cycle did not complete
+    exit 1
+27286 is 3898*7, the row's build-time value: the merge genuinely moved nothing while
+reporting success. Without the flag the same binary completes the sweep, so the guard
+does not fire spuriously.
+
+TWO MORE GUARDS, both of which caught a real defect in this harness:
+  * Sessions use Session::with_runtime, never Session::new(). Session::new() builds its
+    own AgentRuntime (storage: None, in-memory catalog, its own provenance store), and
+    agent_sql::dispatch.rs:407 dispatches every agent statement through session.runtime
+    -- so the first three attempts measured an in-memory stub with no arena and no CoW
+    pages while reporting branch=1@g0 prov=prov1 every cycle.
+  * assert_fresh_branches reads the branch out of SessionStarted and refuses a repeat,
+    because a fixed agent identity makes every cycle re-enter one branch and report the
+    accumulated cost of its predecessors.
+
+RAW OUTPUT FOLLOWS, VERBATIM.
+================================================================================
+
+D90 — DELTA vs CHUNK: what does a tens-of-bytes change cost in bytes stored?
+at 8be3c8c6fa55
+
+WHAT IS AND IS NOT A MEASUREMENT IN THIS FILE
+  Every byte and page below is a COUNTER read out of the engine — pages from a counting
+  Storage under DiskManager, WAL bytes from fsync_counters(), arena bytes from
+  atomic_replace_counters(). Counters do not move when the machine is busy, so this run
+  is deliberately taken WITHOUT the fleet measure lock and its numbers are unaffected by
+  whatever else was compiling. Both passes reproducing the same page counts is the check.
+  The `merge ms*` column is the exception: it is wall-clock, it was taken on a loaded
+  box, and it is NOT a measurement. It is there to show the sweep did work, not how
+  fast. Do not quote it. For merge latency see D68/D71, taken under the lock.
+
+PRE-REGISTERED FALSIFIERS (recorded before the first number exists):
+  (a) If AMPLIFICATION FALLS as r FALLS, the wall does not exist and the premise is
+      WRONG — a small change already costs proportionally less.
+  (b) If STORED bytes is already PROPORTIONAL to r (stored/r roughly constant down to
+      r = 1), ferrodb ALREADY DELTA-ENCODES and this whole line of work is DEAD.
+  (c) If AMPLIFICATION RISES with r, the instrument is measuring per-merge bookkeeping
+      that grows with the branch, NOT chunk-vs-delta. Not a result about the wall.
+  The wall, if it exists, is a FLAT high-amplification region at small r: storage cost
+  INDEPENDENT of how small the change was. The decay at large r is not the wall.
+
+PAGE_SIZE = 4096, ROW_SIZE = 36 bytes (from Tuple::serialize, not assumed)
+  -> a change confined to ONE row costs at most PAGE_SIZE/ROW_SIZE = 113.8x if the page
+     is the unit of storage. That ratio is the prediction the FLAT region must match.
+  NOTE: the denominator is the FULL NEW ROW image. A cell-level delta would store
+  less, so every amplification below is a LOWER BOUND on the true one.
+
+table = 100000 rows, fixed. sweep r = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+building the table (one INSERT per row, as the engine ships) ...
+  ... built 20000/100000 rows (7.9s)
+  ... built 40000/100000 rows (16.1s)
+  ... built 60000/100000 rows (22.9s)
+  ... built 80000/100000 rows (28.3s)
+  ... built 100000/100000 rows (33.6s)
+built in 34.1s; table occupies ~1539 pages by the file, 1 live arena pages
+warming up: 6 discarded cycles at r=4096 (first-touch allocation is not a
+cost of changing r rows; the order control below says whether this was enough)
+
+  --- PASS 1: r ASCENDING ---
+       r |   pages   page bytes |  WAL bytes  fsyncs |    STORED(r)     real B |   AMPLIF ||  arepl    arena B | merge ms*
+         the columns LEFT of || answer "what does changing r rows cost". The two RIGHT of
+         it do not: arena B is the free-space map, rewritten whole per merge and sized by the
+         MERGE COUNT, and merge ms* is wall-clock taken on a loaded box (see the header).
+       1 |       1         4096 |        256       2 |         4352         36 |    120.9 ||      1       1577 |      50.0
+       2 |       1         4096 |        223       2 |         4319         72 |     60.0 ||      1       1625 |      66.8
+       4 |       1         4096 |        223       2 |         4319        144 |     30.0 ||      1       1673 |      79.3
+       8 |       1         4096 |        224       2 |         4320        288 |     15.0 ||      1       1721 |      89.2
+      16 |       1         4096 |        224       2 |         4320        576 |      7.5 ||      1       1769 |      89.8
+      32 |       1         4096 |        224       2 |         4320       1152 |      3.8 ||      1       1817 |      67.6
+      64 |       1         4096 |        224       2 |         4320       2304 |      1.9 ||      1       1865 |     111.9
+     128 |       3        12288 |        224       2 |        12512       4608 |      2.7 ||      2       3858 |      87.4
+     256 |       5        20480 |        224       2 |        20704       9216 |      2.2 ||      3       6075 |      86.7
+     512 |       9        36864 |        224       2 |        37088      18432 |      2.0 ||      4       8612 |      96.9
+    1024 |      17        69632 |        224       2 |        69856      36864 |      1.9 ||      5      11565 |      96.4
+    2048 |      33       135168 |        191       1 |       135359      73728 |      1.8 ||      6      15030 |     111.4
+    4096 |      65       266240 |        224       2 |       266464     147456 |      1.8 ||      7      19103 |     113.1
+  (raw pwrite bytes / calls and the arena's own live-page delta, as a cross-check on the
+   distinct-page count — the two instruments share no code — plus the branch each cycle forked:)
+    r=1      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     370.5   merged from branch 7@g0
+    r=2      distinct pages      1   raw pwrite bytes        12288 in       3 calls   live_page_count delta      +1   total ms     316.4   merged from branch 8@g0
+    r=4      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     350.8   merged from branch 9@g0
+    r=8      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     395.8   merged from branch 10@g0
+    r=16     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     393.7   merged from branch 11@g0
+    r=32     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     297.4   merged from branch 12@g0
+    r=64     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     414.4   merged from branch 13@g0
+    r=128    distinct pages      3   raw pwrite bytes        24576 in       6 calls   live_page_count delta      +3   total ms     639.7   merged from branch 14@g0
+    r=256    distinct pages      5   raw pwrite bytes        40960 in      10 calls   live_page_count delta      +5   total ms     872.3   merged from branch 15@g0
+    r=512    distinct pages      9   raw pwrite bytes        77824 in      19 calls   live_page_count delta      +9   total ms    1244.8   merged from branch 16@g0
+    r=1024   distinct pages     17   raw pwrite bytes       143360 in      35 calls   live_page_count delta     +17   total ms    1824.7   merged from branch 17@g0
+    r=2048   distinct pages     33   raw pwrite bytes       286720 in      70 calls   live_page_count delta     +33   total ms    2439.4   merged from branch 18@g0
+    r=4096   distinct pages     65   raw pwrite bytes       577536 in     141 calls   live_page_count delta     +65   total ms    3626.6   merged from branch 19@g0
+
+  --- PASS 2: r DESCENDING (the order control — shape must survive reversal) ---
+       r |   pages   page bytes |  WAL bytes  fsyncs |    STORED(r)     real B |   AMPLIF ||  arepl    arena B | merge ms*
+         the columns LEFT of || answer "what does changing r rows cost". The two RIGHT of
+         it do not: arena B is the free-space map, rewritten whole per merge and sized by the
+         MERGE COUNT, and merge ms* is wall-clock taken on a loaded box (see the header).
+       1 |       1         4096 |        224       2 |         4320         36 |    120.0 ||      1       4121 |      50.0
+       2 |       1         4096 |        224       2 |         4320         72 |     60.0 ||      1       4073 |      85.9
+       4 |       1         4096 |        224       2 |         4320        144 |     30.0 ||      1       4025 |      64.9
+       8 |       1         4096 |        224       2 |         4320        288 |     15.0 ||      1       3977 |      68.1
+      16 |       1         4096 |        224       2 |         4320        576 |      7.5 ||      1       3929 |      48.3
+      32 |       1         4096 |        224       2 |         4320       1152 |      3.8 ||      1       3881 |      51.5
+      64 |       1         4096 |        224       2 |         4320       2304 |      1.9 ||      1       3833 |      43.9
+     128 |       3        12288 |        224       2 |        12512       4608 |      2.7 ||      2       7538 |      60.5
+     256 |       5        20480 |        224       2 |        20704       9216 |      2.2 ||      3      11019 |      56.7
+     512 |       9        36864 |        224       2 |        37088      18432 |      2.0 ||      4      14180 |      57.5
+    1024 |      17        69632 |        257       3 |        69889      36864 |      1.9 ||      5      16925 |      73.3
+    2048 |      33       135168 |        224       2 |       135392      73728 |      1.8 ||      6      19158 |      76.0
+    4096 |      65       266240 |        224       2 |       266464     147456 |      1.8 ||      7      20783 |     177.9
+  (raw pwrite bytes / calls and the arena's own live-page delta, as a cross-check on the
+   distinct-page count — the two instruments share no code — plus the branch each cycle forked:)
+    r=1      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     278.0   merged from branch 32@g0
+    r=2      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     291.3   merged from branch 31@g0
+    r=4      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     292.4   merged from branch 30@g0
+    r=8      distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     299.7   merged from branch 29@g0
+    r=16     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     244.5   merged from branch 28@g0
+    r=32     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     249.6   merged from branch 27@g0
+    r=64     distinct pages      1   raw pwrite bytes         8192 in       2 calls   live_page_count delta      +1   total ms     224.3   merged from branch 26@g0
+    r=128    distinct pages      3   raw pwrite bytes        24576 in       6 calls   live_page_count delta      +3   total ms     451.5   merged from branch 25@g0
+    r=256    distinct pages      5   raw pwrite bytes        40960 in      10 calls   live_page_count delta      +5   total ms     535.6   merged from branch 24@g0
+    r=512    distinct pages      9   raw pwrite bytes        77824 in      19 calls   live_page_count delta      +9   total ms     735.8   merged from branch 23@g0
+    r=1024   distinct pages     17   raw pwrite bytes       147456 in      36 calls   live_page_count delta     +17   total ms    1335.6   merged from branch 22@g0
+    r=2048   distinct pages     33   raw pwrite bytes       290816 in      71 calls   live_page_count delta     +33   total ms    1992.4   merged from branch 21@g0
+    r=4096   distinct pages     65   raw pwrite bytes       569344 in     139 calls   live_page_count delta     +65   total ms    3816.5   merged from branch 20@g0
+
+=== WHICH FALSIFIER FIRED ===
+  amplification at r=1: 120.9x   at r=4096: 1.8x   predicted PAGE/ROW at r=1: 113.8x
+  FLAT REGION (STORED BYTES within 1.5x of its r=1 value, = 4352 B): r = 1 .. 64  (7 of 13 points)
+  stored bytes per changed row: r=1 -> 4352 B/row   r=4096 -> 65 B/row
+  NOTE: amplification FALLS as r RISES here, which is the arithmetic signature of a flat
+  storage cost, not evidence against one. Falsifier (a) is about the opposite direction.
+
+  ⇒ NEITHER FALSIFIER FIRED. THE WALL IS PRESENT AND MEASURED.
+    Across r = 1 .. 64 — a 64-fold range of how much actually changed — the total
+    bytes stored is FLAT at ~4352 B. Changing 1 row costs the same as changing
+    64. Storage cost is INDEPENDENT of how small the change was.
+    At r=1, that is 120.9x amplification against a 36-byte row, versus the
+    PAGE_SIZE/ROW_SIZE prediction of 113.8x — the page IS the unit of storage.
+    This is precisely the case ForkBase's footnote 2 concedes: no content-defined
+    chunking helps, because the cost is the chunk, not the chunking.
+
+  ORDER CONTROL: ascending vs descending amplification, per r
+    r=1      up    120.9x   down    120.0x   ratio 0.99
+    r=2      up     60.0x   down     60.0x   ratio 1.00
+    r=4      up     30.0x   down     30.0x   ratio 1.00
+    r=8      up     15.0x   down     15.0x   ratio 1.00
+    r=16     up      7.5x   down      7.5x   ratio 1.00
+    r=32     up      3.8x   down      3.8x   ratio 1.00
+    r=64     up      1.9x   down      1.9x   ratio 1.00
+    r=128    up      2.7x   down      2.7x   ratio 1.00
+    r=256    up      2.2x   down      2.2x   ratio 1.00
+    r=512    up      2.0x   down      2.0x   ratio 1.00
+    r=1024   up      1.9x   down      1.9x   ratio 1.00
+    r=2048   up      1.8x   down      1.8x   ratio 1.00
+    r=4096   up      1.8x   down      1.8x   ratio 1.00
+    worst up/down disagreement: 1.01x  -> the shape SURVIVES reversal; it is a fact about r, not about cycle number
+
+  THE ARENA FREE-SPACE MAP — a SECOND flat cost, and a different axis:
+    `arena B` is bytes WRITTEN during the cycle, not the image's size: one
+    `replace_atomically` rewrites the whole map, so bytes ~ replaces x image.
+
+    (1) CONFIRMED over all 14 cycles with r = 1 .. 64: every cycle performs EXACTLY
+        one replace. One whole free-map rewrite buys a 1-row change and a
+        64-row change alike — a SECOND cost independent of how small the change was.
+
+    (2) At EVERY r the later pass wrote MORE, though r is identical — so the size tracks merge
+        history, not r. That is why it is excluded from STORED(r):
+             r    up B (merge #)    down B (merge #)
+             1      1577 (#7  )        4121 (#32 )
+             2      1625 (#8  )        4073 (#31 )
+             4      1673 (#9  )        4025 (#30 )
+             8      1721 (#10 )        3977 (#29 )
+            16      1769 (#11 )        3929 (#28 )
+            32      1817 (#12 )        3881 (#27 )
+            64      1865 (#13 )        3833 (#26 )
+           128      3858 (#14 )        7538 (#25 )
+           256      6075 (#15 )       11019 (#24 )
+           512      8612 (#16 )       14180 (#23 )
+          1024     11565 (#17 )       16925 (#22 )
+          2048     15030 (#18 )       19158 (#21 )
+          4096     19103 (#19 )       20783 (#20 )
+
+    A per-merge growth constant is NOT reported: the gap between the two passes at
+    a given r spans merges of OTHER r values that claim different numbers of
+    extents, so no controlled estimate of it exists in this run. Sizing that cost
+    needs its own sweep over merge count at fixed r.
+
+  WHOLE-RUN TOTALS (build + warm-up + both passes), to prove each sink is wired:
+    WAL:   166 fsyncs, 9160893 bytes
+    arena: 111 atomic replaces, 228807 bytes
