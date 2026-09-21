@@ -210,9 +210,13 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
     {
         const NEED_CHURN: u64 = 2_000;
         const NEED_CHECKED: u64 = 2_000;
+        // Named, and interpolated into the refusal below rather than spelled twice: a
+        // ceiling written once in code and once in prose drifts apart the first time anyone
+        // tunes it, and then the refusal misreports the budget it actually gave.
+        const CEILING: Duration = Duration::from_secs(90);
         let spin = Instant::now();
         let reached = |c: &Arc<AtomicU64>, want: u64| c.load(Ordering::Relaxed) > want;
-        while spin.elapsed() < Duration::from_secs(90)
+        while spin.elapsed() < CEILING
             && !(reached(&churned, NEED_CHURN)
                 && reached(&checked_seen, NEED_CHECKED)
                 && reached(&skipped_seen, 0))
@@ -226,10 +230,11 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
         );
         assert!(
             n > NEED_CHURN && c > NEED_CHECKED && sk > 0,
-            "in 90 s this machine reached churned={n} (want >{NEED_CHURN}), checked={c} (want \
+            "in {:?} this machine reached churned={n} (want >{NEED_CHURN}), checked={c} (want \
              >{NEED_CHECKED}), skipped={sk} (want >0) — the race could not be exercised here. \
              This is NOT a pass and NOT a correctness failure: the detector never ran. Re-run on \
-             a quieter box before drawing any conclusion."
+             a quieter box before drawing any conclusion.",
+            CEILING
         );
     }
     stop.store(true, Ordering::Relaxed);
