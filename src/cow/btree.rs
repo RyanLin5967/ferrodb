@@ -1229,6 +1229,7 @@ mod delete_unlink_tests {
     use super::*;
     use crate::branch::arena::ArenaPageStore;
     use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::types::LeaseDeadline;
     use crate::branch::BranchCatalog;
     use crate::buffer::buffer_pool::BufferPoolManager;
     use crate::storage::disk_manager::DiskManager;
@@ -1424,6 +1425,56 @@ mod delete_unlink_tests {
             after < before,
             "live pages did not drop ({before} -> {after}); unlinked pages are being leaked"
         );
+    }
+
+    /// **Deleting on a fork must not touch the parent's tree.** This is where an unlink could
+    /// corrupt something silently and in the wrong branch.
+    ///
+    /// `free_page` can hand a page straight back to the free space map, so a child that freed a
+    /// page its ancestor still points at would corrupt the *ancestor*. Every page `unlink_up`
+    /// frees came out of `cow_page` and is therefore owned by the writing branch — but "therefore"
+    /// is exactly the kind of word this test exists to replace with a run.
+    #[test]
+    fn deleting_on_a_fork_leaves_the_parents_tree_intact() {
+        let (_d, cat, t) = tree();
+        let parent_root = filled(&t, &cat, 1000);
+        let parent_pages = t.walk_pages(parent_root).unwrap();
+        let parent_sizes = leaf_sizes(&t, parent_root);
+        assert!(parent_sizes.len() > 4, "need a multi-leaf parent for this to mean anything");
+
+        let child =
+            cat.fork(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap().branch_id;
+        let e = cat.next_epoch();
+        let mut child_root = parent_root;
+        for i in 0..600u32 {
+            child_root = t.delete(child_root, child, e, &k(i)).unwrap();
+        }
+
+        // The child really did the work — otherwise the parent surviving proves nothing.
+        assert_eq!(t.get(child_root, &k(0)).unwrap(), None, "the child did not delete anything");
+        assert!(
+            leaf_sizes(&t, child_root).iter().all(|n| *n > 0),
+            "the child kept an empty leaf"
+        );
+
+        // And the parent is untouched, page for page and row for row.
+        assert_eq!(
+            t.walk_pages(parent_root).unwrap(),
+            parent_pages,
+            "the child's delete changed the PARENT's page set"
+        );
+        assert_eq!(
+            leaf_sizes(&t, parent_root),
+            parent_sizes,
+            "the child's delete changed the PARENT's partition"
+        );
+        for i in 0..1000u32 {
+            assert_eq!(
+                t.get(parent_root, &k(i)).unwrap().as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "key {i} vanished from the PARENT after the child deleted it"
+            );
+        }
     }
 
     /// A delete that hits nothing must still shadow nothing — the unlink path must not fire on a

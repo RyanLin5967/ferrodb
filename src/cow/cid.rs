@@ -3,12 +3,23 @@
 //!
 //! # Why this exists, and what it is not
 //!
-//! `crate::cow` states "**No content addressing**" as a deliberate non-goal, and that decision is
-//! not being reversed here. That non-goal is about *page identity and liveness*: addressing a page
-//! **by** its content hash makes freeing it a global question ("who else references these bytes?"),
-//! which is why Dolt needs copying mark-and-sweep GC. Pages here are still addressed by `PageId`,
-//! still allocated from per-branch arenas, and liveness is still the epoch interval rule in
+//! "**No content addressing**" is a deliberate non-goal, and it is not written in one place: the
+//! same exclusion appears in `cow::mod`, `cow::store`, `cow::btree`, `branch::types` and
+//! `branch::mod`, five times, each giving the same reason. That decision is not being reversed
+//! here. It is about *page identity and liveness*: addressing a page **by** its content hash makes
+//! freeing it a global question ("who else references these bytes?"), which is why Dolt needs
+//! copying mark-and-sweep GC. Pages here are still addressed by `PageId`, still allocated from
+//! per-branch arenas, and liveness is still the epoch interval rule in
 //! `branch::record::reclaimable`. None of that changes.
+//!
+//! `cow::btree`'s wording is the sharpest, and it is what bounds this module: *"there is no
+//! content addressing and there are no refcounts, so a subtree that did not change is not merely
+//! equal to its old self, it **is** the same page id."* Within one lineage ferrodb already has
+//! subtree identity, for free and exactly, from `PageId`. **A cid buys nothing there** — `cow::diff`
+//! measured precisely that, zero skips won by a digest at every N on a single-lineage workload.
+//! What a cid buys is the one case `PageId` cannot express: identity **across branches that never
+//! shared a page**. That is narrower than "ferrodb has no content addressing" makes it sound, and
+//! it is the whole justification.
 //!
 //! What this module adds is the *instrument*: a cid you can **compute on demand and throw away**.
 //! It is never stored, never used to allocate, never consulted by the reaper, and creates no
@@ -52,6 +63,24 @@
 //! `cow::diff` defines a `NodeIdentity` seam meant to be driven by [`subtree_cid`] through its
 //! `MemoIdentity` adapter — this module deliberately does not wire itself in, because memoising
 //! policy belongs to the consumer.
+//!
+//! # Why this is not `CommitHash`, and how the two are related
+//!
+//! `branch::types::CommitHash([u8; 32])` already names "a committed state of a branch", and
+//! `tel::frame::TxnFrame::base` carries one so a three-way merge can name its fork point. It is
+//! `CommitHash::ZERO` on every live path — nothing computes one. Adding a second identity type
+//! beside a dead one without writing down why is how both end up unexplained, so:
+//!
+//! They answer different questions. A `CommitHash` names a **version**; a [`Cid`] names a
+//! **subtree's contents**. A subtree cid is not a commit id and this module does not widen,
+//! replace or fill in `CommitHash`.
+//!
+//! They are, however, the same question one level apart, and in Noms and Dolt they are literally
+//! the same value: a commit's id *is* the content hash of its root. So `subtree_cid` of a branch's
+//! root is the obvious thing to eventually compute a real `CommitHash` from. At that point both
+//! caveats below stop being academic — 16 bytes is not 32, and a version id that leaves the
+//! process is a different threat model from an in-process comparison, because an identifier other
+//! people rely on is one an adversary has a reason to collide.
 //!
 //! # The hash is NOT cryptographic
 //!
@@ -333,7 +362,7 @@ pub fn ordered_leaf_cids(tree: &CowTree, root: PageId) -> Result<Vec<Cid>, Ferro
 ///
 /// Ignores `PageId`s entirely. Does **not** ignore where the leaf boundaries fall — that is the
 /// measurement this module exists to make, see
-/// [`same_data_in_two_orders_converges_to_one_partition_cid`](self#tests).
+/// `same_data_in_two_orders_converges_to_one_partition_cid`.
 ///
 /// # It is not a tree identity, and must not be used as one
 ///
