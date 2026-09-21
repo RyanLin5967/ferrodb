@@ -5,8 +5,10 @@
 //! `partition_point` rather than scanning the log. One axis cannot separate those — a curve over
 //! picked ops at a fixed log size is consistent with both — so this runs **both**:
 //!
-//!   AXIS 1: picked ops 1 / 10 / 100 / 1000, log held at a fixed size.
-//!   AXIS 2: log size 1e3 / 1e4 / 1e5, picked ops held at 100.
+//!   AXIS 1:  picked ops 1 / 10 / 100 / 1000, log held at a fixed size.
+//!   AXIS 2:  log size 1e3 / 1e4 / 1e5, picked ops held at 100.
+//!   AXIS 2b: THE SAME as axis 2 against a log with no by-cell index, so axis 2's slope has
+//!            something to be compared against rather than being read on its own.
 //!
 //! Axis 2 is the control for axis 1. If per-pick cost is flat in the log size, the index is doing
 //! the work the design claims; if it rises, the pick is scanning something.
@@ -36,7 +38,7 @@ use ferrodb::branch::cherry::{
 use ferrodb::branch::types::BranchId;
 use ferrodb::catalog::column::Value;
 use ferrodb::tel::ids::{ColId, RowId, TableId, TxnId};
-use ferrodb::tel::op::OpKind;
+use ferrodb::tel::op::{Delta, OpKind};
 
 const T: TableId = TableId(1);
 const C: ColId = ColId(1);
@@ -48,18 +50,33 @@ fn dst() -> BranchId {
     BranchId::new(3, 0)
 }
 
-/// A log of `n` ops, each an `Assign` on its own row, recorded by the source branch.
+/// A log over `n` rows in which **the target has diverged on every cell**, so the pick must
+/// actually compute divergence.
 ///
-/// One row per op so no two selected ops share a cell: the cost being measured is the per-op
-/// path, not the per-cell composition path.
-fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>) {
+/// Per row: op A (the source's `Add(+1)`, the one that gets picked) followed by op B (the
+/// target's `Add(+10)`, already landed on the target). So the log is `2n` ops and the target row
+/// holds 10 where the source op's witness says 0.
+///
+/// **This shape is load-bearing and the first version of this harness did not have it.** The
+/// first fixture gave every op a witness equal to the target's value, which means `divergence`
+/// returned at truth-table row 1 — *provably unchanged* — **before ever calling `ops_on_cell`**.
+/// The index was never consulted, so axis 2 measured `BTreeMap` lookup growth and nothing else,
+/// and the unindexed control arm (axis 2b) came back identical, which is what exposed it.
+///
+/// It is also self-checking. If `ops_on_cell` returned nothing, `divergence` would fall back to
+/// an opaque `Assign(10)`, which does not commute with `Add(+1)`, so the pick would REFUSE under
+/// the default `Reject` policy. Every `assert!(is_applied())` below is therefore an assertion
+/// that the indexed path fired: this harness cannot report a number while measuring nothing.
+fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>, Vec<((u32, u64, u32), Vec<u64>)>) {
     let mut log = MemCherryLog::new();
     let mut target = MemCherryTarget::new();
     let mut seqs = Vec::with_capacity(n);
+    let mut cells = Vec::with_capacity(n);
     for i in 0..n {
         let row = RowId(i as u64);
-        target.insert(T, row, vec![Value::Integer(0), Value::Integer(0), Value::Integer(0)]);
-        seqs.push(log.push(RecordedOp {
+        // The target already carries B's effect: 0 + 10.
+        target.insert(T, row, vec![Value::Integer(0), Value::Integer(10), Value::Integer(0)]);
+        let a = log.push(RecordedOp {
             seq: 0,
             txn: TxnId(i as u64),
             branch: src(),
@@ -67,12 +84,26 @@ fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>) {
             tbl: T,
             row,
             col: Some(C),
-            kind: OpKind::Assign(Value::Integer(i as i32 + 1)),
+            kind: OpKind::Add(Delta::Int(1)),
             before: Some(Value::Integer(0)),
             before_row: None,
-        }));
+        });
+        let b = log.push(RecordedOp {
+            seq: 0,
+            txn: TxnId((n + i) as u64),
+            branch: dst(),
+            table: "t".into(),
+            tbl: T,
+            row,
+            col: Some(C),
+            kind: OpKind::Add(Delta::Int(10)),
+            before: Some(Value::Integer(0)),
+            before_row: None,
+        });
+        seqs.push(a);
+        cells.push(((T.0, row.0, C.0), vec![a, b]));
     }
-    (log, target, seqs)
+    (log, target, seqs, cells)
 }
 
 /// **The control arm: the same log with NO by-cell index.**
@@ -102,6 +133,11 @@ impl CherryLog for ScanCherryLog {
             .map(|(_, v)| v.as_slice())
             .unwrap_or(&[])
     }
+}
+
+/// The row the first selector touches — every op `build` emits is on row `seq/2`.
+fn sel_row(sel: &[OpSelector]) -> RowId {
+    RowId((sel[0].seq - 1) / 2)
 }
 
 fn median(mut us: Vec<f64>) -> f64 {
@@ -142,6 +178,14 @@ fn measure(
         whole.push(start.elapsed().as_secs_f64() * 1e6);
         assert!(r.is_applied());
         assert_eq!(t.commits, 1, "one commit per pick");
+        // 0 +10 (theirs, already on the target) +1 (ours) = 11. Reaching 11 proves `divergence`
+        // read the op from the log: the image-comparison fallback yields an opaque Assign, which
+        // does not commute with an Add and would have REFUSED.
+        assert_eq!(
+            t.cell(T, sel_row(sel), C),
+            Some(&Value::Integer(11)),
+            "the divergence must have been read from the log, not guessed"
+        );
     }
     (median(whole), median(plan))
 }
@@ -159,13 +203,14 @@ fn main() {
     println!();
 
     // ---- AXIS 1: cost against the number of PICKED ops, log held fixed. ---------------------
-    const FIXED_LOG: usize = 20_000;
-    let (log, base, seqs) = build(FIXED_LOG);
-    // Sanity: the index is populated, or the "reads through the index" claim is vacuous.
-    assert_eq!(log.len(), FIXED_LOG);
-    assert_eq!(log.ops_on_cell(T, RowId(0), C).len(), 1, "the by-cell index must be populated");
+    const ROWS: usize = 10_000;
+    let (log, base, seqs, _) = build(ROWS);
+    // Anti-vacuity: the index must be populated and must hold BOTH ops on each cell, or the
+    // "reads divergence through the index" claim is measuring nothing.
+    assert_eq!(log.len(), 2 * ROWS);
+    assert_eq!(log.ops_on_cell(T, RowId(0), C).len(), 2, "the by-cell index must be populated");
 
-    println!("AXIS 1 — picked ops, log fixed at {} ops", FIXED_LOG);
+    println!("AXIS 1 — picked ops, log fixed at {} ops", 2 * ROWS);
     println!(
         "  {:>8}  {:>14}  {:>14}  {:>16}",
         "picked", "plan us", "plan+commit us", "plan us per pick"
@@ -207,12 +252,12 @@ fn main() {
         "log ops", "plan us", "plan+commit us", "plan us per pick"
     );
     let mut axis2: Vec<(usize, f64)> = Vec::new();
-    for &size in &[1_000usize, 10_000, 100_000] {
-        let (l, b, s) = build(size);
+    for &rows in &[500usize, 5_000, 50_000] {
+        let (l, b, s, _) = build(rows);
         let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
         let (whole, plan) = measure(&l, &sel, &b, 201);
-        println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", size, plan, whole, plan / 100.0);
-        axis2.push((size, plan));
+        println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
+        axis2.push((2 * rows, plan));
     }
     println!();
     let (s1, m1) = axis2[0];
@@ -237,16 +282,13 @@ fn main() {
         "log ops", "plan us", "plan+commit us", "plan us per pick"
     );
     let mut axis2b: Vec<(usize, f64)> = Vec::new();
-    for &size in &[1_000usize, 10_000, 100_000] {
-        let (l, b, s) = build(size);
-        // Rebuild the by-cell map as an unindexed Vec. Op `i` is the only op on row `i`, col C.
-        let cells: Vec<((u32, u64, u32), Vec<u64>)> =
-            (0..size).map(|i| ((T.0, i as u64, C.0), vec![s[i]])).collect();
+    for &rows in &[500usize, 5_000, 50_000] {
+        let (l, b, s, cells) = build(rows);
         let scan = ScanCherryLog { inner: l, cells };
         let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
         let (whole, plan) = measure(&scan, &sel, &b, 201);
-        println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", size, plan, whole, plan / 100.0);
-        axis2b.push((size, plan));
+        println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
+        axis2b.push((2 * rows, plan));
     }
     println!();
     let (_, b1) = axis2b[0];
@@ -275,9 +317,11 @@ fn main() {
     // A refusal never reaches the writer, so it is strictly cheaper than an apply. Banked so the
     // curve cannot be read as "refusals are the expensive case".
     println!();
-    let (rlog, rbase, rseqs) = build(1_000);
+    let (rlog, rbase, rseqs, _) = build(1_000);
     let mut moved = rbase.clone();
     // Move one cell out from under the pick, contradictorily.
+    // Row 500's cell is moved to a value no recorded op explains, so `divergence` falls back to
+    // an opaque Assign — which does not commute with an Add, and the whole pick refuses.
     moved.insert(T, RowId(500), vec![Value::Integer(0), Value::Integer(-1), Value::Integer(0)]);
     let sel: Vec<OpSelector> = rseqs[..1000].iter().copied().map(OpSelector::new).collect();
     let policy = PolicyTable::new();
