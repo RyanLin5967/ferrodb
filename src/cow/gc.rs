@@ -1044,6 +1044,144 @@ mod tests {
         }
     }
 
+    /// **Is the residue real, or zero?** The question that decides whether this file is worth
+    /// shipping, asked of ORDINARY workloads rather than of planted garbage.
+    ///
+    /// Every other test here plants unreachable pages on purpose. That proves the collector
+    /// finds what is put in front of it; it says nothing about whether ferrodb ever produces
+    /// such a page by itself. A detector that only ever fires on its own fixtures is measuring
+    /// its fixtures.
+    ///
+    /// The confound to separate first: a page that was properly `free_page`d and is parked in
+    /// the pending-free log awaiting the interval rule is *also* allocated-and-unreachable, and
+    /// the sweep would collect it. That is not a leak — it is the existing reclaimer's own
+    /// queue, and collecting from it early is the benign overlap
+    /// `a_concurrent_drain_does_not_double_count` pins. So the scenarios below are ordered by
+    /// how much of that queue they create, and the ones that isolate the true leak class are the
+    /// ones that free nothing at all.
+    ///
+    /// **A true leak is a page the owner never freed and no root reaches.** In a scenario with
+    /// an empty pending log, that is exactly what a non-zero `reclaimed` means.
+    #[test]
+    fn the_residue_on_ordinary_workloads() {
+        // --- A: pure inserts. Nothing is ever freed, so the pending log must be empty and any
+        // reclaim at all is a genuine leak.
+        {
+            let env = Env::new("resA");
+            env.grow_tree(BranchId::TRUNK, 3_000);
+            let _ = env.catalog.next_epoch();
+            assert_eq!(env.store.pending_len(), 0, "pure inserts should free nothing");
+            let stats = env.collect(64);
+            assert_eq!(
+                stats.reclaimed, 0,
+                "A/pure-insert: {} pages allocated, unreachable and NEVER FREED — that is a real \
+                 leak in the insert path, not pending-free residue: {:?}",
+                stats.reclaimed, stats
+            );
+        }
+
+        // --- B: insert then overwrite the same keys. A childless branch mutates its own pages
+        // in place (cow_page returns copied == false inside the privacy barrier), so this still
+        // frees nothing and the same reasoning applies.
+        {
+            let env = Env::new("resB");
+            let mut root = env.grow_tree(BranchId::TRUNK, 1_000);
+            for i in 0..1_000u32 {
+                let e = env.catalog.next_epoch();
+                let k = format!("k{:06}", i);
+                let v = format!("OVERWRITTEN{:06}", i);
+                root = env
+                    .tree
+                    .insert(root, BranchId::TRUNK, e, k.as_bytes(), v.as_bytes())
+                    .unwrap();
+            }
+            env.catalog.set_root(BranchId::TRUNK, root).unwrap();
+            let _ = env.catalog.next_epoch();
+            let pending = env.store.pending_len();
+            let stats = env.collect(64);
+            assert_eq!(
+                stats.reclaimed, 0,
+                "B/overwrite: reclaimed {} with {} parked — a leak in the in-place write path: \
+                 {:?}",
+                stats.reclaimed, pending, stats
+            );
+        }
+
+        // --- C: fork, then write in BOTH branches. Now the parent's pages are shared, so writes
+        // genuinely shadow and the old pages are freed into the pending log. Anything the sweep
+        // finds here should be accounted for by that log, not in excess of it.
+        {
+            let env = Env::new("resC");
+            let mut root = env.grow_tree(BranchId::TRUNK, 1_000);
+            let child = env.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            let child_id = child.branch_id;
+            let mut child_root = root;
+            for i in 0..300u32 {
+                let e = env.catalog.next_epoch();
+                let k = format!("k{:06}", i);
+                child_root = env
+                    .tree
+                    .insert(child_root, child_id, e, k.as_bytes(), b"child")
+                    .unwrap();
+                let e = env.catalog.next_epoch();
+                root = env.tree.insert(root, BranchId::TRUNK, e, k.as_bytes(), b"trunk").unwrap();
+            }
+            env.catalog.set_root(child_id, child_root).unwrap();
+            env.catalog.set_root(BranchId::TRUNK, root).unwrap();
+            let _ = env.catalog.next_epoch();
+
+            let parked = env.store.pending_len() as u64;
+            let stats = env.collect(64);
+            assert!(
+                stats.reclaimed <= parked,
+                "C/fork-and-write: reclaimed {} but only {} were parked as properly freed — the \
+                 excess is a leak, not the reclaimer's queue: {:?}",
+                stats.reclaimed,
+                parked,
+                stats
+            );
+            // Both branches still read correctly after the sweep.
+            assert!(env.tree.get(root, b"k000000").unwrap().is_some(), "trunk damaged");
+            assert!(env.tree.get(child_root, b"k000000").unwrap().is_some(), "child damaged");
+            println!("C/fork-and-write: parked={} reclaimed={}", parked, stats.reclaimed);
+        }
+
+        // --- D: fork, write in the child, then REAP it. The reaper's fast path frees the
+        // child's extents wholesale, so afterwards there should be nothing left for a
+        // reachability sweep to find.
+        {
+            use crate::branch::reaper::TwoTierReaper;
+            use crate::branch::Reaper;
+
+            let env = Env::new("resD");
+            env.grow_tree(BranchId::TRUNK, 500);
+            let child = env.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            let child_id = child.branch_id;
+            let child_root = env.grow_tree(child_id, 300);
+            assert!(env.tree.get(child_root, b"k000000").unwrap().is_some());
+
+            let reaper = TwoTierReaper::new(
+                Arc::clone(&env.catalog) as Arc<dyn BranchCatalog>,
+                Arc::clone(&env.store),
+            );
+            reaper.reap(child_id).unwrap();
+            reaper.drain_pending().unwrap();
+            let _ = env.catalog.next_epoch();
+
+            let parked = env.store.pending_len() as u64;
+            let stats = env.collect(64);
+            assert!(
+                stats.reclaimed <= parked,
+                "D/after-reap: reclaimed {} with {} parked — the reaper left reachable-from-nobody \
+                 pages behind that it should have freed wholesale: {:?}",
+                stats.reclaimed,
+                parked,
+                stats
+            );
+            println!("D/after-reap: parked={} reclaimed={}", parked, stats.reclaimed);
+        }
+    }
+
     // ---- pause and interference --------------------------------------------------------------
 
     /// The pause bound, stated exactly: **no slice touches more than `budget` pages**, on either
@@ -1198,11 +1336,33 @@ mod tests {
         writeln!(f, "D96 — REACHABILITY GC AT PAGE GRANULARITY: THE PAUSE CURVE.").unwrap();
         writeln!(f, "[HERE] {}", crate::build_provenance()).unwrap();
         writeln!(f).unwrap();
+        // Stamp the load the run actually saw, rather than describing it. The fleet measure lock
+        // serialises measurers but explicitly does NOT gate on load — it cannot, because this box
+        // sits at 20-60 with the fleet building — so every number here carries its own caveat.
+        let loadavg = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("uptime")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        writeln!(f, "load at start: {}", loadavg).unwrap();
         writeln!(
             f,
-            "⚠ MEASURED ON A LOADED BOX: a ten-agent fleet was building and testing concurrently."
+            "⚠ MEASURED ON A LOADED BOX under the fleet measure lock (~/wt/logs/measure-lock.sh),"
         )
         .unwrap();
+        writeln!(
+            f,
+            "which serialises measurers but does not gate on load. Sixteen sibling agents were"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "compiling concurrently. Every duration below is an UPPER BOUND, not a quiet-machine"
+        )
+        .unwrap();
+        writeln!(f, "figure.").unwrap();
         writeln!(
             f,
             "max_slice_ns is therefore a CEILING under contention, not a quiet-machine figure. The"
@@ -1223,7 +1383,14 @@ mod tests {
         .unwrap();
         f.flush().unwrap();
 
-        for n in [10_000u32, 100_000, 1_000_000] {
+        // **Bounded on purpose, and 10^6 is NOT in the axis.** The claim is a slope, and a slope
+        // is established by the shape across points, not by reaching the largest one. Three
+        // points over a 10x span answer "does the pause grow with total chunks?" exactly as well
+        // as three over 100x, at a tenth of the disk — and this box runs 17 worktrees. A 10^6
+        // row would have cost ~4 GB and, at the plant rates measured under fleet load, longer
+        // than the wall budget. Spending it to restate a flat line would be the expensive way to
+        // learn nothing.
+        for n in [10_000u32, 50_000, 100_000] {
             let need = (n as u64 + 4_096) * PAGE_SIZE as u64;
             let free = free_bytes(&tmp);
             if free.saturating_sub(need) < DISK_FLOOR_BYTES {
