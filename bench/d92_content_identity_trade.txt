@@ -1,0 +1,122 @@
+D92 — what content identity costs merge3, and what it saves
+===========================================================
+
+Question it answers: merge3 shipped its own 128-bit hasher (H128) to compute a content id per
+node. Before choosing a *better* hash (cid.rs's Hasher128, or provenance/sha256.rs truncated to
+128 bits), measure whether merge3 should be computing a content id on this path at all.
+
+Instrument: MergeStats counters (pages read) and MerkleId::pages_hashed (pages read to answer
+id_of). Integers, not wall clock — the box was running an agent fleet at load 20-60.
+Workload: the CONVERGENT EDIT (truth-table row 4) — both branches independently make the same
+edit. This is the one case page identity provably cannot skip and content identity can, i.e. the
+case most favourable to content identity.
+
+  n       pages   shadow_reads   merkle_reads   merkle_pages_hashed   saved   cost   cost/saved
+  500        66             6              0                    70       6      70         11.7
+  1000      141             6              0                   145       6     145         24.2
+  2000      261             9              0                   267       9     267         29.7
+  4000      540             9              0                   546       9     546         60.7
+  8000     1021             9              0                  1027       9    1027        114.1
+  16000    2015             9              0                  2021       9    2021        224.6
+
+READ THE SLOPE, NOT THE RATIO.
+
+  * What content identity SAVES is CONSTANT: 6 -> 9 page reads across a 32x range of n. It is
+    bounded by the descent's depth, which grows like log N.
+  * What it COSTS is O(N): 70 -> 2021, tracking `pages` almost exactly (it hashes every page
+    under all three roots).
+  * So cost/saved is not a constant to be tuned — it grows linearly and is already 225x at
+    n=16000. There is no n at which this turns around.
+
+CONSEQUENCE FOR THE HASH CHOICE. The hash function is second-order. SHA-256 truncated to 128
+bits would remove the collision argument, but it only makes the O(N) side more expensive and
+changes nothing about the O(1) side. A faster hash does not rescue an O(N)-for-O(log N) trade
+either. So the answer is neither "SHA-256" nor "keep a fast hash": **merge3 should own no hasher
+and should not compute a content id on its descent.** Page identity is exact within a
+copy-on-write lineage (equal page id IS the same page), free, and is what bench/d92_merge3_curve
+already measures.
+
+This is the same effect the D91 diff agent reported from the other side as `skip_cid = 0 at every
+N`: within one lineage, page identity decides first and the content digest is never the thing
+that wins a skip.
+
+WHEN CONTENT IDENTITY WOULD WIN. Only if the id were stamped at WRITE time and amortised into
+the write path, as ForkBase does — cow::diff's SubtreeHash doc says it "models the write-time cid
+stamping that ForkBase does as nodes are built". Then the O(N) term is not paid at merge time and
+only the O(log N) saving remains. Nothing in ferrodb stamps cids at write time today, so that
+configuration is not measurable here and is not claimed.
+
+Reproduce: the numbers above came from a temporary #[test] driving merge3 with ShadowId and with
+MerkleId over the same three roots, printing MergeStats::nodes_read and MerkleId::pages_hashed.
+Both identities are deleted from merge3 by the commit that adds this file; the equivalents are
+cow::diff::PageIdentity and cow::diff::SubtreeHash.
+
+
+ADDENDUM — can the memo be repaired by re-keying instead of re-scoping?
+=======================================================================
+
+The proposed repair for the staleness defect is to key on (PageId, birth_epoch) rather than
+PageId, on the grounds that a recycled page is restamped with a fresh epoch. Measured, printing
+(page_id, birth_epoch) before and after each mutation alongside cid::subtree_cid:
+
+  route                                     key before -> after     discriminates?
+  A  a freed page id handed out again       (1, 2)   -> (1, 4)      YES
+  B  an in-place write to the page itself   (65, 5)  -> (65, 5)     NO  (contents changed)
+  C  an in-place write to a DESCENDANT      (66,403) -> (66,403)    NO  (subtree_cid changed)
+
+A is real: write_fresh_page does restamp, so the key fixes the recycle route.
+
+B is ArenaPageStore::cow_page's in-place arm — it hands a branch its own page back for mutation
+and returns BEFORE touching the header. No reap needed; fires on a branch's second write.
+
+C cannot be repaired by any choice of per-page key, and it is the case that matters for a
+RECURSIVE digest: mutate a descendant in place and the ancestor's own bytes never change, so its
+id, epoch, page type and checksum are all identical while the subtree id it stands for is not.
+
+So (PageId, birth_epoch) is a real improvement and NOT a fix. Landing it as "staleness resolved"
+would put a correctness claim over two routes that then fail silently — worse than the present
+state, where the hazard is at least documented. The only scope that is sound for a recursive
+digest is a window in which nothing writes to the stamped trees: stamp, use, discard.
+
+Pinned by cow::merge3::tests::birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write,
+which asserts all three rows and says what to do if any of them changes.
+
+
+SECOND ADDENDUM — the key that actually landed is NOT the one measured above
+============================================================================
+
+The addendum above measures (PageId, birth_epoch) and finds it covers route A only. The fix
+`fix-diff-memo` landed on D105-diff-memo uses a DIFFERENT key: (birth_epoch, CHECKSUM). crc32
+covers the whole page INCLUDING the header, so it moves on an in-place write where birth_epoch
+alone does not. Against that key, reported by its author and asserted in
+cow::diff::tests::the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant:
+
+  A  recycled page id                  DISCRIMINATED
+  B  in-place write to the page itself DISCRIMINATED   <- the checksum's case, not covered above
+  C  in-place write to a DESCENDANT    provably NOT, and asserted as such
+
+So: two of three, not one of three. Route C stands exactly as stated — no per-page key can reach
+it, because an ancestor's own bytes (and therefore its checksum) do not change when a descendant
+is mutated in place. That limit is now asserted rather than documented, so a future fix flips the
+test into a signal instead of passing quietly.
+
+The store-property test in merge3 is unaffected and still true: it measures birth_epoch, and
+birth_epoch alone genuinely does not discriminate routes B or C. It is deliberately NOT duplicated
+into diff.rs — two tests asserting one store property is the shape where a mutant in either is
+masked by the other.
+
+CROSS-LINEAGE, which the table at the top of this file does NOT cover
+---------------------------------------------------------------------
+The measurement above is in-lineage (base plus two COW descendants), which is what merge3 is
+normally handed. fix-diff-memo measured the cross-lineage case — 1200 rows, 90+90 nodes, no shared
+pages:
+
+  PageIdentity  180 reads, 0 skips
+  SubtreeHash     2 reads, 1 skip, plus 180 reads to stamp, paid once
+
+So one cross-lineage diff is a wash (182 vs 180) and it starts paying from the SECOND diff off a
+single stamp. It reproduces the in-lineage result independently at 18 vs 1833.
+
+⇒ The conclusion in this file is scoped to the in-lineage path and stays as written. "The digest
+never pays" would be too strong as a general claim and is not made: cross-lineage, with the stamp
+amortised over more than one comparison, it pays.

@@ -34,8 +34,26 @@
 //! reading both trees whole. That is the case a cid answers: "are these two subtrees the same?"
 //! becomes a 16-byte comparison instead of a walk, for trees with no common ancestor.
 //!
-//! This is the primitive ForkBase, Noms and Dolt are built on. ferrodb had nothing like it:
-//! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/` returned zero.
+//! This is the primitive ForkBase, Noms and Dolt are built on. ferrodb had nothing like it when
+//! this module was written, and the survey that established that was
+//! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/`.
+//!
+//! **Correction, and do not repair it by re-running the grep.** That command no longer returns
+//! zero, and by the time this module landed it already did not: `src/cow/merge3.rs` came in on the
+//! same merge and matched `Merkle` six times, for a `MerkleId` that carried its own private
+//! 128-bit hasher. The survey's *conclusion* was right — there was no content id in `src/cow/`
+//! before this module — but the command stopped being the evidence for it the moment a second
+//! file landed, and a reader who re-ran it would have found a hasher rather than none.
+//!
+//! What is true now, stated as a count rather than as a command, because the count is what the
+//! claim was always about. `src/cow/` holds **two** 128-bit constructions — [`Hasher128`] here,
+//! and the FNV pair `diff::SubtreeHash` composes into 16 bytes — plus `chunker`'s `Buzhash`,
+//! which is a 64-bit *rolling* hash for content-defined chunking and is not a content id at all.
+//! `merge3` used to make it three: it carried a private `H128` on the path that declares a merge
+//! conflict-free, which is the one place `cid.rs` says a fingerprint must not be sole authority.
+//! That copy is deleted — `merge3` now computes no digest, and takes its identity from
+//! `cow::diff`. See `bench/d92_content_identity_trade.txt` for the measurement that says a merge
+//! is better off not hashing at all.
 //!
 //! # What it found, and where it stands
 //!
@@ -118,13 +136,23 @@
 //!   so this direction needs no assumption at all. Any use that only has to answer "did this
 //!   change?" — invalidation, skipping equal subtrees during a *scan*, a cheap changed/unchanged
 //!   probe — is safe.
-//! - **NOT sound against a chosen input:** equal cids do **not** prove the inputs are equal. FNV-1a
-//!   is algebraically simple and trivially collidable by anyone who can choose the bytes being
-//!   hashed — and in a database the bytes being hashed are user-supplied keys and values. So a cid
-//!   equality must never be the *sole* authority for an operation whose wrongness is silent:
-//!   deduplicating storage, declaring a merge conflict-free, or skipping a subtree in a diff whose
-//!   output someone will act on. Those need either a real cryptographic hash or a verifying
-//!   comparison behind the fast path.
+//! - **NOT sound against a chosen input:** equal cids do **not** prove the inputs are equal. There
+//!   is no security argument here at all — FNV-1a is algebraically simple, nothing about this
+//!   construction resists an adversary, and in a database the bytes being hashed are user-supplied
+//!   keys and values. So a cid equality must never be the *sole* authority for an operation whose
+//!   wrongness is silent: deduplicating storage, declaring a merge conflict-free, or skipping a
+//!   subtree in a diff whose output someone will act on. Those need either a real cryptographic
+//!   hash or a verifying comparison behind the fast path.
+//!
+//!   **This clause used to say "trivially collidable", and that was too strong — it is corrected
+//!   here rather than deleted, because the operational rule above is unchanged and only the
+//!   severity was wrong.** "Trivial" is true of *one* 64-bit FNV lane, where meet-in-the-middle is
+//!   around 2^32. It is not established for the two-lane construction below, which needs both
+//!   lanes satisfied at once; a 120-bit birthday bound is 2^60, and nobody has produced a
+//!   chosen-input collision against it. The honest statement is that the cost is **unquantified,
+//!   somewhere between those two**, and that an unquantified cost is reason enough to obey the
+//!   rule — not that the hash is known to be cheap to break. Do not re-strengthen this without a
+//!   collision to point at.
 //! - For **accidental** collisions on non-adversarial data the 128-bit width is the whole argument:
 //!   assuming the finalizer approximates a random function (asserted by the avalanche test below,
 //!   not merely hoped for), a collision needs on the order of 2^64 distinct subtrees.
@@ -263,13 +291,23 @@ pub fn hex(c: &Cid) -> String {
 
 /// A node's contents, lifted out of the page so the pin can be dropped before recursing — the same
 /// discipline `CowTree::collect_unshared` uses, so a deep tree does not hold one frame per level.
-enum NodeShape {
+///
+/// Visible to the crate because [`shape_of`] is the *guard*, not merely a decoder, and a second
+/// copy of a guard is a second thing to get wrong: `cow::merge3` decodes the same nodes and used to
+/// carry its own `NodeView`, whose catch-all arm read a `Heap` or `Free` page as an internal node
+/// and followed its `u32`s as child page ids.
+pub(crate) enum NodeShape {
     Leaf(LeafEntries),
     /// `(leftmost child, (separator, child) pairs in key order)`.
     Internal(PageId, InternalEntries),
 }
 
-fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
+/// Decode one page as a B+tree node, **refusing anything that is not one**.
+///
+/// The refusal is the point. `PageType` has more variants than the two below, and every other one
+/// decodes into garbage rather than into an error: a zeroed `Heap` page reads as an internal node
+/// with zero separators and a leftmost child of page 0, which a descent will then follow.
+pub(crate) fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
     let handle = tree.store().read_page(page)?;
     let frame = handle.read();
     let page_type = PageHeader::read_from(&frame.data)?.page_type;
@@ -280,7 +318,7 @@ fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
             Ok(NodeShape::Internal(node.leftmost(), node.internal_entries()?))
         }
         other => Err(FerroError::Cow(format!(
-            "cid: page {} is {:?}, not a btree node",
+            "page {} is {:?}, not a btree node",
             page, other
         ))),
     }
@@ -321,6 +359,24 @@ pub fn subtree_cid(tree: &CowTree, page: PageId) -> Result<Cid, FerroError> {
     subtree_cid_at(tree, page, 0)
 }
 
+/// The cid of one internal node, given its children's cids: the child count, the leftmost child's
+/// cid, then each `(separator key, child cid)` pair in order.
+///
+/// Split out of [`subtree_cid`] so a caller that walks the tree itself — `cow::merge3::MerkleId`
+/// memoises its walk, which this module deliberately does not — produces **the same cid** rather
+/// than its own dialect of one. Two hashers over the same tree that disagree by a domain tag or a
+/// length prefix is precisely the failure the module header's encoding section is about.
+pub fn internal_cid(leftmost: &Cid, separators: &[(Vec<u8>, Cid)]) -> Cid {
+    let mut h = Hasher128::new(TAG_INTERNAL);
+    h.number(separators.len() as u64 + 1);
+    h.cid(leftmost);
+    for (separator, child) in separators {
+        h.field(separator);
+        h.cid(child);
+    }
+    h.finish()
+}
+
 fn subtree_cid_at(tree: &CowTree, page: PageId, depth: usize) -> Result<Cid, FerroError> {
     if depth > MAX_DESCENT {
         return Err(FerroError::Cow("cid: subtree walk exceeded the depth guard".into()));
@@ -329,14 +385,11 @@ fn subtree_cid_at(tree: &CowTree, page: PageId, depth: usize) -> Result<Cid, Fer
         NodeShape::Leaf(entries) => Ok(leaf_cid(&entries)),
         NodeShape::Internal(leftmost, separators) => {
             let leftmost_cid = subtree_cid_at(tree, leftmost, depth + 1)?;
-            let mut h = Hasher128::new(TAG_INTERNAL);
-            h.number(separators.len() as u64 + 1);
-            h.cid(&leftmost_cid);
+            let mut children = Vec::with_capacity(separators.len());
             for (separator, child) in &separators {
-                h.field(separator);
-                h.cid(&subtree_cid_at(tree, *child, depth + 1)?);
+                children.push((separator.clone(), subtree_cid_at(tree, *child, depth + 1)?));
             }
-            Ok(h.finish())
+            Ok(internal_cid(&leftmost_cid, &children))
         }
     }
 }

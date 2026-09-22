@@ -133,6 +133,39 @@ const MAX_DESCENT: usize = 64;
 /// silently drops a change from the diff.
 pub trait NodeIdentity {
     fn id_of(&self, page: PageId) -> [u8; 16];
+
+    /// What an equality between two of these ids **proves**, as opposed to suggests.
+    ///
+    /// `cow::cid` states the rule this serves: a content-id equality "must never be the *sole*
+    /// authority for an operation whose wrongness is silent: deduplicating storage, declaring a
+    /// merge conflict-free, or skipping a subtree in a diff whose output someone will act on."
+    /// Both callers of this trait do exactly that kind of skipping, so the strength of the answer
+    /// travels out with the answer.
+    ///
+    /// **It defaults to [`IdentityProof::Fingerprint`], which is the conservative end**, and only
+    /// [`PageIdentity`] overrides it. An earlier cut of this made it a required method, on the
+    /// reasoning that an implementor who has not thought about it should be forced to choose.
+    /// That was backwards: forcing the choice puts `Exact` within reach of someone who has not
+    /// earned it, and picking it wrongly is silent — whereas an undeclared provider inheriting
+    /// `Fingerprint` merely under-claims, costing a skip that was available. Fail to the side
+    /// where the mistake is expensive rather than wrong. It also stops a required method breaking
+    /// impls outside this crate's tree, such as the `Colliding` probe in `tests/review_cow_adv.rs`.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Fingerprint
+    }
+}
+
+/// What an equal [`NodeIdentity`] id proves, and therefore what a skip — or an empty conflict
+/// list — rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProof {
+    /// Equal ids **prove** equal subtrees. [`PageIdentity`] within one copy-on-write lineage: an
+    /// equal page id is not a fingerprint of the same page, it *is* the same page.
+    Exact,
+    /// Equal ids are a 128-bit fingerprint match, not a proof. Sound against accident; **not**
+    /// sound against an input someone chose, which in a database is every key and value. A skip
+    /// or a conflict-free verdict carrying this is a strong claim, not a demonstration.
+    Fingerprint,
 }
 
 /// Byte 0 of an id says which domain produced it, so the two can never compare equal.
@@ -160,6 +193,12 @@ pub struct PageIdentity;
 impl NodeIdentity for PageIdentity {
     fn id_of(&self, page: PageId) -> [u8; 16] {
         page_id_identity(page)
+    }
+
+    /// Exact, and not by assumption: the id *is* the page id. Two equal ids are one page, so
+    /// there is no collision to be sound against.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Exact
     }
 }
 
