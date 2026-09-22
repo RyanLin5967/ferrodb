@@ -1,0 +1,57 @@
+CERTIFICATION — D138 landed, 708822e..ebdf002, pushed 2026-09-22
+
+  landing merge   ebdf002   (a MERGE commit; see the preimage note below)
+  gated sha       5181d73   (d138-effectlog-index tip, unmoved before and after the merge)
+  previous main   708822e
+
+THE SUITE, read from the verifier's own output line, never from the .log
+  d138c: mode=per-target rc=0 passed=2511 failed=0 build_errors=0 head=5181d73
+  d138c: go rc=0 passed=97 failed=0
+
+  Mode matters: 2511 is a PER-TARGET total. `whole` = per-target + 2 doctests, the second of
+  which is a compile_fail reported as its own block. Do not compare this number across modes.
+  2511 = the 2508 baseline at b17ec58 + 3.
+
+★ THE NUMBER WAS PRE-REGISTERED AND LANDED EXACTLY.
+  D138's pre-registration amendment 5 (commit 5181d73) predicted 2511, derived against
+  origin/main 2655e3b BEFORE the run. A count that could not be chosen after the fact is the
+  strongest evidence this project collects.
+
+ALL THREE GATES, verbatim from tools/land-gate.sh
+  certify-head: OK — suite head=5181d73 == landing 5181d73
+  staleness:    COVERED-NO-CODE — the base moved 3 commit(s), none touching code
+                (all under bench/d81_certified/, bench/land-2655e3b_certified/, bench/d81_land_prereg.txt)
+  prepush:      OK — FFI gate sweep clean; RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"
+                on both `cargo build --examples` and `cargo check --all-targets`; and the
+                x86_64-pc-windows-msvc check (which does NOT link, so it cannot see a missing
+                POSIX symbol — check 1 is what covers that).
+  land-gate: OK — suite names the commit · base is covered · CI-parity passes · tree unmoved.
+
+CODE IDENTITY — the merge ships exactly the certified code, COMPUTED not assumed
+  git diff --stat 5181d73 ebdf002 -- src tests examples Cargo.toml   ->   EMPTY
+
+  This is the preimage rule: a certification body can never quote a summary naming its own sha,
+  because the merge commit does not exist until the merge. The gate names 5181d73; this file
+  closes the gap by computing that ebdf002 carries the same code.
+
+WHAT LANDED
+  src/tel/log.rs               +366  MemEffectLog's keyed lookups indexed by position (D86's shape)
+  src/tel/tests_durable_log.rs  +79  tests
+  The PARK-axis slope goes 1 -> 0, fitted at all 8 rows (bench/d138_index_slope/).
+
+⚠ D148 SUPERSEDES ITS OWN EARLIER NUMBER, AND THE OLD ONE MUST NOT BE QUOTED.
+  The quiet re-run, taken UNDER THE MEASURE LOCK: 31% at 10^6, sync_data HELD at 99.3%.
+  The ~25% figure was measured on a loaded box. The two differ by a quarter, and only the
+  quiet one is quotable — banked beside it as d148_durable_phase_quiet_raw.txt.
+
+⚠ CONTENTION DISCLOSED, because a number's conditions belong with the number.
+  land-gate's prepush step runs two builds, and it ran while d154-3b7de87's suite held the
+  suite lock and was ~6 min into its own run. The SUITE above is unaffected — d138c had
+  finished and released the lock before any of this — but d154's number was taken with a
+  build alongside it. Stated here rather than discovered later.
+
+CI
+  main's run on 708822e was still in_progress when ebdf002 was pushed, so it is superseded by
+  the concurrency group, exactly as 2655e3b's was. That costs no information: 708822e was
+  code-identical to b17ec58, which is green on three platforms (PR #44, run 35737124919).
+  ebdf002 carries NEW code and its own run is the one that counts. CHECK IT.
