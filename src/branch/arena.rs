@@ -1460,7 +1460,13 @@ impl PageStore for ArenaPageStore {
             // Nobody else can see it: mutate in place. This is what keeps a hot branch from
             // shadowing the same page on every single write.
             census::bump(&census::IN_PLACE, 1);
-            return Ok(CowPage { page_id, previous_page_id: page_id, copied: false, handle });
+            return Ok(CowPage {
+                page_id,
+                previous_page_id: page_id,
+                copied: false,
+                retire_previous: false,
+                handle,
+            });
         }
 
         let source = handle.read().data;
@@ -1499,14 +1505,22 @@ impl PageStore for ArenaPageStore {
         // unbounded delta chain is that same shape wearing different clothes.
         //
         // **Only a base this branch does not own is recorded, and that is what keeps this out of
-        // the GC's business.** The `free_page` call directly below runs only when the branch owns
-        // the source extent; in that case the base becomes a freeable page and a delta against it
-        // would be a second, invisible reason to keep it alive — a reference count, in a file
-        // whose header says in bold that there are none. When the branch does NOT own it, the base
-        // is an ancestor's page that this branch inherited, and the epoch interval rule in
-        // `branch::record::reclaimable` already pins it: the branch holding the delta forked after
-        // the base was born, so `free_page` parks the page instead of releasing it. The existing
-        // rule covers this case with no new liveness source, which is the only reason it is safe.
+        // the GC's business.** When the branch owns the source extent the base becomes a freeable
+        // page, and a delta against it would be a second, invisible reason to keep it alive — a
+        // reference count, in a file whose header says in bold that there are none. When the
+        // branch does NOT own it, the base is an ancestor's page that this branch inherited, and
+        // the epoch interval rule in `branch::record::reclaimable` already pins it: the branch
+        // holding the delta forked after the base was born, so the free parks the page instead of
+        // releasing it. The existing rule covers this case with no new liveness source, which is
+        // the only reason it is safe.
+        //
+        // ⚠ This paragraph used to say "the `free_page` call directly below". **There is no
+        // longer a `free_page` call below** — D125 moved it to the caller's commit point (see
+        // `CowPage::retire_previous`), because a store cannot know whether its caller's operation
+        // will commit and `CowTree` rolls a failed one back to a root that still points here. The
+        // reasoning above is unaffected: the owned base still becomes freeable, just one step
+        // later. Only the landmark moved, and a header pointing at a call that is not there is
+        // how the next reader of this rule loses an afternoon.
         let owner_of_source = self.arena_owner(header.arena_id);
         if owner_of_source != Some(branch) {
             let mut st = self.state.lock().unwrap();
@@ -1522,11 +1536,20 @@ impl PageStore for ArenaPageStore {
         // alone: the ancestor still points at it, and the ancestor is not in its own
         // `live_children` array, so the interval rule would eventually declare it reclaimable and
         // corrupt the ancestor. Freeing is the owner's business and nobody else's.
-        if owner_of_source == Some(branch) {
-            self.free_page(page_id, epoch)?;
-        }
-
-        Ok(CowPage { page_id: new_id, previous_page_id: page_id, copied: true, handle: new_handle })
+        //
+        // ⛔ D125: AND IT IS NOT THIS FUNCTION'S BUSINESS *WHEN*. This used to call
+        // `self.free_page(page_id, epoch)?` right here. A store cannot know whether its caller's
+        // operation will commit, and `CowTree` rolls a failed one back to a root that still
+        // points at `page_id` — so the free had been taken on behalf of an operation that never
+        // happened. Reported through `retire_previous` and performed by the caller at its commit
+        // point. Same defect as D112 and as the `unlink_up` half of D125.
+        Ok(CowPage {
+            page_id: new_id,
+            previous_page_id: page_id,
+            copied: true,
+            retire_previous: owner_of_source == Some(branch),
+            handle: new_handle,
+        })
     }
 
     fn free_page(&self, page_id: PageId, free_epoch: Epoch) -> Result<(), FerroError> {
@@ -2530,6 +2553,30 @@ mod tests {
 
         let cow = h.store.cow_page(page, parent.branch_id, h.catalog.next_epoch()).unwrap();
         assert!(cow.copied, "the child can see the old page, so it must be shadowed");
+
+        // ⛔ D125 MOVED THE FREE, AND THIS TEST'S REAL PROPERTY IS UNCHANGED BY THAT.
+        //
+        // This used to assert `pending_len() == 1` right here, on the strength of `cow_page`
+        // freeing the original itself. That free was a defect: a store cannot know whether its
+        // caller's operation will commit, and `CowTree` rolls a failed one back to a root that
+        // still points at this page — so the free had been taken for an operation that never
+        // happened. `cow_page` now REPORTS it and the caller frees at its own commit point.
+        //
+        // What this test is actually about survives intact and is still asserted below: when
+        // the original IS freed, a live child pins it, so it is PARKED rather than released.
+        // The two halves are now pinned separately, which is strictly more than before.
+        assert!(
+            cow.retire_previous,
+            "the writer owns the original, so the caller is the one who must retire it"
+        );
+        assert_eq!(
+            h.store.pending_len(),
+            0,
+            "D125: cow_page must not free the page it shadowed — its caller may still roll back"
+        );
+
+        // The caller's commit point.
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
         assert_eq!(h.store.pending_len(), 1, "the original is pinned by the child, not released");
     }
 

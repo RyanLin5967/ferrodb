@@ -213,7 +213,12 @@ fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), Arc::clone(&runtime)));
     let s = Server { ctx, bp, txn, reads, runtime };
 
-    let mut sess = Session::new();
+    // ⛔ D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+    // log), so every agent statement below would run on a STUB and the arena-backed runtime
+    // this harness constructs would be built and never touched. `agent_sql::designated` now
+    // refuses such a statement rather than measuring it.
+    let mut sess = s.ctx.session();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
     for i in 1..=nrows {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
@@ -229,7 +234,12 @@ struct Cycle {
 }
 
 fn one_cycle(s: &Server, tid: usize, seq: u64, delta: usize, nrows: i64) -> Cycle {
-    let mut sess = Session::new();
+    // ⛔ D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+    // log), so every agent statement below would run on a STUB and the arena-backed runtime
+    // this harness constructs would be built and never touched. `agent_sql::designated` now
+    // refuses such a statement rather than measuring it.
+    let mut sess = s.ctx.session();
     if exec(s, &format!("BEGIN AGENT SESSION AS 'a{tid}';"), &mut sess).is_err() {
         return Cycle { writes_reads: 0, merge_reads: 0, applied: false };
     }
