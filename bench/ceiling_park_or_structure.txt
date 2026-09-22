@@ -225,9 +225,15 @@ up on the mutex at L3; they have essentially stopped touching it. The gap that g
 spot: a parked thread's wall clock runs whether or not its `try_lock` ever failed. Both witnesses
 agree, and the one that cannot be fooled by barging is the emphatic one.
 
-⇒ AN INTERNAL CONTROL AGAINST "IT IS JUST THE LOADED BOX": L0 and L3 ran interleaved, in the same
-process, under the same load, with rung order rotated. Scheduler starvation would inflate WAIT at
-both rungs. WAIT differs by 46x between them.
+⇒ TWO INTERNAL CONTROLS AGAINST "PH_WAIT IS JUST ABSORBING SCHEDULER STARVATION ON A LOADED BOX":
+  (a) L0 and L3 ran interleaved, in the same process, under the same load, with rung order
+      rotated per rep. Starvation would inflate WAIT at both rungs. WAIT differs by 46x.
+  (b) At T=1 (bench/ceiling_raw/11), under the same load, WAIT is 0.00032-0.00040 ms at every
+      rung — four orders of magnitude below the T=64 L0 figure. PH_WAIT is not a general sink for
+      descheduled time; it brackets the acquire and nothing else.
+  ⚠ Neither control says a quiet box would report the same absolute WAIT. It would very likely
+  report less. Both say the L0-vs-L3 CONTRAST is not manufactured by load, and the contrast is
+  what the verdict uses.
 
 ================================================================================================
 5b. ⭐ THE OBJECTION THIS MUST SURVIVE: "BUT contended/op IS 0.908 AT L3, WHICH IS HIGH"
