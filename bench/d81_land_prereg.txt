@@ -283,3 +283,70 @@ marginal cost is zero.
 ⚠ VERIFY_MODE=per-target IS SET EXPLICITLY on the runner invocation. D141's run
   came back `whole` because it defaulted (verify-suite.sh:197 `MODE=${VERIFY_MODE:-whole}`),
   and that omission is the entire reason the +1 exists to argue about.
+
+AMENDMENT 5 — cut 2026-09-22T14:12:28Z, WITH THE RUN IN FLIGHT AND NO RESULT IN EXISTENCE
+================================================================================
+⚠ WRITTEN OUTSIDE THE REPOSITORY ON PURPOSE. The run acquired the suite lock at
+14:10:13Z and is writing into this directory now; editing the worktree would
+dirty the tree land-gate must find clean, and would mutate a tree with a run in
+flight against it. This file is committed into bench/d81_land_prereg.txt AFTER
+the run, unchanged. Its value is entirely in having been cut before the result.
+
+ORDERING EVIDENCE, captured by the shell that wrote this file, not asserted:
+  SUMMARY.txt present in this directory ......... NO
+  verdict lines (mode=/HARNESS_EXIT) in runner.out ... 0
+  suite log line count at this instant .......... 1884  (still growing)
+
+⛔ WITHDRAWN: "2509 CLOSES D141's OPEN +1". DELETE THAT READING.
+--------------------------------------------------------------------------------
+Amendment 4 registered 2509 as a benign alternative meaning D141 contributes
+nine runtime tests. **That gap has since been closed by an entirely different
+mechanism, so the story attached to 2509 no longer corresponds to anything.**
+
+WHAT ACTUALLY CLOSED IT (SCALE-DESIGN D152): there are TWO doctests, not one.
+The second is a `compile_fail` at src/cow/diff.rs:483, and rustdoc's merged
+doctest mode reports it as a SEPARATE block with its own "running 1 test" and
+its own "test result" line:
+
+  test src/cow/diff.rs - cow::diff::MemoIdentity (line 443) ... ok
+  test src/cow/diff.rs - cow::diff::MemoIdentity (line 483) - compile fail ... ok
+
+  ⇒ 2482 + 8 + 2 = 2492, which is exactly d141's whole-mode total. Nothing was
+    missing and `per-target` does not under-collect.
+
+⛔ SO AMENDMENT 4's ANALYTIC KILL OF "whole = per-target + 2 doctests" WAS WRONG,
+  AND SO WAS ITS EVIDENCE. I ran `grep -A 4 'Doc-tests'`, saw "running 1 test",
+  and stopped. **That window ends before the second block begins.** Counting
+  `Doc-tests` SECTIONS is not counting doctests — there is one section header
+  and two result blocks. d127's bank was right and I helped argue it down.
+  Verified just now by reading the whole region with
+  `awk '/Doc-tests ferrodb/,0'` instead of a fixed -A window.
+
+⇒ ✅ THE REGISTERED NUMBER IS UNCHANGED AND UNAFFECTED: **2508, mode=per-target.**
+  per-target runs `--lib` plus each tests/*.rs and NEVER runs doctests, so a
+  correction to the doctest count cannot move it. Both derivations in amendment 4
+  stand: 2500 (measured) + 8, and 2482 (measured) + 8 + 18.
+
+⇒ ⛔ THE ONLY CHANGE IS WHAT A MISS MEANS:
+     2508  -> expected.
+     2509  -> **AN UNEXPLAINED DISCREPANCY. INVESTIGATE; DO NOT ABSORB.** There is
+             no longer any pre-registered story that makes it benign. It must be
+             explained BY NAME — which test ran twice, or which count was wrong —
+             before anything is pushed.
+     other -> as amendment 4 already says: a real discrepancy, explained first.
+
+★ WHY THIS AMENDMENT EXISTS AT ALL, since the number did not move: **a falsifier
+  is itself a claim.** A pre-registered alternative that has since been
+  invalidated is WORSE than having none, because it gets applied to the evidence
+  instead of being tested by it — a 2509 would have been waved through as "the
+  D141 gap closing" when the D141 gap had already closed by another route. Left
+  standing, amendment 4's text would have been a rationalisation with a
+  timestamp in front of it.
+
+RESULT — recorded after the run, and the file above is unedited
+--------------------------------------------------------------------------------
+d81final: mode=per-target rc=0 passed=2508 failed=0 build_errors=0 head=b17ec58
+d81final: go rc=0 passed=97 failed=0
+⇒ 2508. The pre-registration hit EXACTLY and the withdrawn 2509 did not occur.
+  Nothing above was altered to match this; amendment 5 was cut at 14:12:28Z with
+  SUMMARY.txt absent and the log at 1884 lines, and is reproduced here verbatim.
