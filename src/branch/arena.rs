@@ -1330,6 +1330,20 @@ impl ArenaPageStore {
         // remember its range after it is consumed so a restored page can be checked against it.
         // Named in this row's summary rather than left to be discovered.
         let claim_epoch = extents.keys().map(|a| (*a, crate::cluster::epoch())).collect();
+        // **D81 — a map that came from somewhere else is a file this process did not write.**
+        //
+        // Taken before the `state` lock, per the outermost-persist rule in [`PersistState`].
+        //
+        // The case that forces this is not a test: `consensus::snapshot`'s install writes a whole
+        // arena image over the live `<db>.arena` with `std::fs::write` and then calls this to
+        // update the running store (`snapshot.rs:1498,1541`). Without this line the store would go
+        // on appending against `image_bytes` and `tail_bytes` describing the image it had BEFORE
+        // the install. It happens to be survivable there — `fs::write` truncates, so there is no
+        // stale tail — but that is a fact about another module's spelling, and the invariant this
+        // restores is the one that means the accounting never has to be reasoned about from
+        // outside: `image_bytes == 0` iff this process has not written the image, so the next
+        // persist is a full rewrite and the file is ours again.
+        self.persist.lock().unwrap().image_bytes = 0;
         *self.state.lock().unwrap() =
             // **D85: every restored extent's fill is SUSPECT until probed.**
             //
@@ -4524,6 +4538,44 @@ mod tests {
         // ...and the store goes back to appending afterwards.
         claim(&h);
         assert_eq!(h.store.persist_counters(), (2, 2), "the guard latched instead of clearing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Loading a map from outside makes the file not ours, so the next persist rewrites it.**
+    ///
+    /// `consensus::snapshot` installs a snapshot by writing a whole arena image over the live
+    /// `<db>.arena` and then calling `load_state` on the running store (`snapshot.rs:1498,1541`).
+    /// A store that kept appending after that would be appending against accounting for an image
+    /// that is no longer in the file.
+    #[test]
+    fn loading_a_map_from_outside_makes_the_next_persist_a_full_rewrite() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h);
+        claim(&h);
+        assert_eq!(h.store.persist_counters(), (1, 1), "fixture: the store should be appending");
+
+        // What a snapshot install does, in the same order: a whole image written over the live
+        // path from outside, then `load_state` on the running store. The image is this store's
+        // own, because `load_state` refuses one describing another region by design and the
+        // point under test is the accounting, not the region check.
+        let image = h.store.state_bytes();
+        std::fs::write(&path, &image).unwrap();
+        h.store.load_state(&image).unwrap();
+
+        claim(&h);
+        assert_eq!(
+            h.store.persist_counters(),
+            (2, 1),
+            "after a map arrived from outside, the next persist must rewrite the image rather \
+             than append against accounting for a file this process did not write"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ArenaPageStore::image_len(&after).unwrap(),
+            after.len(),
+            "the rewrite should leave the file compact"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
