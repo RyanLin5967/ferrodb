@@ -82,6 +82,32 @@ agent_dml/extended 804 = 800 + 2 + 2; merge/extended 168 = 160 + 4 + 4; readonly
   two thirds of the exclusive announcements standing — but it means the measured fraction is a
   FIXED POINT of a self-reinforcing process, not a linear response to offered load.
 
+2a-bis. WHAT THE FIXED POINT IMPLIES FOR A PARTIAL FIX — including W4 itself.
+The feedback in 2a is not a footnote, it is the shape of the whole problem. Write the identity as
+a fixed-point equation: with S the structural exclusive statements, A the shared-path attempts and
+f the stand-down fraction,
+
+      announcements = S + f·A          and      f = g(S + f·A)
+
+because the fallback term IS an announcement. Any fix that removes announcements therefore gets
+amplified by the loop: its direct effect is multiplied by 1/(1 - A·g'), which is greater than one
+wherever the response curve g has slope.
+
+⇒ THE CONSEQUENCE, AND IT IS NOT THE ENCOURAGING ONE. The amplification is only available where
+  g' is LARGE. Section 5's curve is the measurement of g, and it is flat at both ends:
+    * SATURATED (fork_every 1-4, f = 82-95%): g' ≈ 0. The loop gain is ≈ 1, so a partial fix buys
+      almost exactly its direct effect — which, at f = 0.95, is almost nothing. Removing the parse
+      site (25% of announcements in agent/extended) or the DML announcements moves a system
+      already pinned against its ceiling.
+    * STEEP (fork_every 8-64, f = 9-66%): g' is large, the loop gain is well above one, and the
+      SAME fix is worth several times its direct effect.
+⇒ So "W4 buys the 2.19% that is left" is the wrong arithmetic in both directions at once: it
+  understates W4 where the curve is steep and overstates the value of any partial fix where it is
+  flat. A lever's worth here is not a property of the lever. It is a property of where the system
+  already sits on the fork-rate axis — which is, again, the one number neither run measures.
+⇒ And it makes the measured 93-98% NOT an upper bound on what W4 would leave behind: it is the
+  fixed point of TODAY's announcer set. Section 2h drives that perturbation directly.
+
 2b. FINDING 1 OF THE BANKED ARTIFACT STANDS — re-verified independently by call-site enumeration.
 `writer_active.store(true)` exists at exactly one site (`src/pgwire/mod.rs:178`, in
 `drain_readers`). `drain_readers` has exactly one caller (`:159`, in `catalog()`). `catalog()` has
