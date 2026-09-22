@@ -200,11 +200,33 @@ impl ServerContext {
     /// it is false by construction rather than by degree.** The announcer set is exhaustively
     /// enumerable and none of it is DDL-gated: `ServerContext::drain_readers` is the only writer
     /// of `writer_active`, [`ServerContext::catalog`] is its only caller, and `catalog()` has
-    /// exactly four callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl,
-    /// `pgwire::extended::Statement::parse_one`, the exclusive execution path, and
-    /// [`ServerContext::read_catalog`]'s snapshot refresh. **`parse_one` takes it unconditionally
-    /// for every `Kind::Sql`**, so a plain `SELECT 1` on the simple query protocol announces a
-    /// writer and drains every reader at parse time.
+    /// exactly three callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl, the
+    /// exclusive execution path, and [`ServerContext::read_catalog`]'s snapshot refresh.
+    ///
+    /// ⚠ **D151 REMOVED THE FOURTH, and this paragraph used to name it.** It read *"`parse_one`
+    /// takes it unconditionally for every `Kind::Sql`, so a plain `SELECT 1` on the simple query
+    /// protocol announces a writer and drains every reader at parse time."*
+    ///
+    /// ⛔ **That sentence had TWO halves and they did not age the same way.** The first half —
+    /// `parse_one` announcing for every `Kind::Sql` — was true, and D151 is what made it false:
+    /// `pgwire::extended::Statement::parse_one` now reads the per-connection snapshot through
+    /// [`ServerContext::read_catalog`], so a statement that then runs on the shared path announces
+    /// nothing at all. **The second half was ALREADY FALSE when it was written.** `SELECT 1` never
+    /// reached that acquisition: `session::parse` answers it as a liveness probe, so it returns a
+    /// `Kind::Session` and stops short of the catalog entirely. That is not an argument, it is a
+    /// count — E.6's A0 control reads **zero** for `SELECT 1` in `bench/d151_e6_before.txt` as
+    /// much as in `bench/d151_e6_after.txt`, and `bench/e6_outer_lock_count.txt` recorded the same
+    /// thing against the harness before this row existed. The honest example of what the removed
+    /// site cost is a **non-probe** reader — `SELECT c FROM t` — which paid one announcement at
+    /// parse and then took nothing to run.
+    ///
+    /// ⇒ ⭐ **A retraction that credits a claim with more than it had is the same defect as the
+    /// claim.** Measured on `examples/e6_outer_lock_count.rs`, a count and not a timing:
+    /// `bench/d151_parse_site_result.txt`.
+    /// ⚠ **The scope travels with the number, both halves together:** it was ~25% of
+    /// announcements (1,604 of 6,369 in the deciding arm), it is **NOT a W4 rescue**, and it moves
+    /// a system already pinned against its ceiling at high fork rates — worth several times as
+    /// much one decade of fork rate away.
     ///
     /// ⚠ **And do NOT replace that sentence with "the lease thread announces every
     /// `DEFAULT_SCAN_MILLIS`", which is the correction a previous pass tried and which is also

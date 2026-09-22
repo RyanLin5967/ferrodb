@@ -55,3 +55,37 @@ CI
   the concurrency group, exactly as 2655e3b's was. That costs no information: 708822e was
   code-identical to b17ec58, which is green on three platforms (PR #44, run 35737124919).
   ebdf002 carries NEW code and its own run is the one that counts. CHECK IT.
+
+--------------------------------------------------------------------------------
+⛔ REPAIR, 2026-09-22 — THIS BANK WAS NOT RE-CHECKABLE BY THE TOOL THAT MADE IT.
+
+Caught by d151's lane, which went looking for the verdict line here and could not find the
+file. As first banked this directory held CERTIFICATION.txt (prose), runner.log (the WRAPPER's
+log, lowercase) and two suite logs — and `tools/certify-head.sh:48` greps
+
+    "$DIR"/SUMMARY.txt "$DIR"/RUNNER.txt
+
+for a line carrying head= and mode=. Neither name was present, so anyone re-verifying this
+landing later would have been REFUSED, not because the evidence was wrong but because it was
+unreadable. Every other bank in bench/ has a SUMMARY.txt; this one did not.
+
+FIRE-CHECKED, both arms on one directory, rather than assumed:
+
+  arm A — the bank as it WAS (CERTIFICATION.txt + runner.log only):
+    certify-head: REFUSING — no persisted suite summary with a head= field under '<dir>'.
+      Looked for SUMMARY.txt and RUNNER.txt. A verdict that exists only in a terminal
+      buffer is not evidence.
+
+  arm B — the same directory, SUMMARY.txt added and nothing else changed:
+    certify-head: OK — suite head=5181d73 == landing 5181d73
+
+FIXED by copying the VERIFIER'S OWN SUMMARY.txt (not a retyped line) from
+/Users/idide/wt/verify-out/d138c/SUMMARY.txt. CERTIFICATION.txt keeps the prose; SUMMARY.txt
+carries the machine-readable verdict. The numbers are unchanged and were always correct:
+2511 per-target, go 97/0, at head=5181d73.
+
+⇒ THE LESSON, and it is not "remember SUMMARY.txt": a bank that a HUMAN can read is not the
+same as a bank the GATE can read, and the gap is invisible at banking time because the prose
+looks complete. Bank the verifier's own summary file verbatim, then RUN certify-head.sh
+against the bank before committing it. That is a two-second check that turns a bank from a
+claim into evidence.
