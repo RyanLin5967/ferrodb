@@ -1,0 +1,2 @@
+avloop-cbf55d7: mode=per-target rc=0 passed=2529 failed=0 build_errors=0 head=cbf55d7 log=/Users/idide/wt/artie-research/verify-out/suite-avloop-cbf55d7.log
+avloop-cbf55d7: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/suite-avloop-cbf55d7.go.log
