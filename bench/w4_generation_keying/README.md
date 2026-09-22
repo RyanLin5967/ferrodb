@@ -69,3 +69,22 @@ unbounded growth the function exists to prevent — lands green.
 The test is in `runtime.rs`'s own `mod tests` so its fixture is `FORGET_CHUNK + 1` by
 construction. A literal `1025` in `tests/` stops crossing the boundary the day the constant
 grows, and nothing would say so.
+
+## The certification for this row lives in `bench/w4gen-624edf1_certified/`
+
+Not here, and deliberately only ONE copy exists. This row landed as `main 3a9a5f9..624edf1`
+and the lander banked the certification under the LANDING MERGE's name, which is the name
+`certify-head.sh` can actually read back.
+
+I banked a second copy under this directory before I saw that one, and removed it: two
+certification records for one run are two things that can drift, which is the failure this
+project keeps paying for — and it is the same shape as D158's own finding, a correction written
+in the right place while the superseded copy stands where a reader arrives first.
+
+What is in THIS directory is the evidence that certification rests on, which is duplicated
+nowhere: the failing-first run at the parent commit, both fire-checks, the mutator that
+reproduces them, and the pre-registration with its three append-only amendments.
+
+  suite   w4gen: mode=per-target rc=0 passed=2516 failed=0 build_errors=0 head=bfcfa0e
+  claim   +4 @ base 3a9a5f9. The durable form is the DELTA; 2516 is that delta evaluated at a
+          base, and a bare 2516 quoted without its base is not falsifiable.
