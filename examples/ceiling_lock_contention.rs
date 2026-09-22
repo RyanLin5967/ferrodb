@@ -50,6 +50,8 @@
 //! cargo run --release --features lock_census --example ceiling_lock_contention -- <mode> [args]
 //!   model                                  the fire-check and the pure-mutex reference shape
 //!   direct  [N] [T,T,T] [warm]             layer A: the L0→L3 ladder on TableBranchCatalog
+//!   paired  [N] [T,T,T] [warm]             layer A, with D123's phase clock ON beside the count,
+//!                                          so U(hold) and contended/op come from ONE run
 //!   pgwire  [F] [T,T,T]                    layer B: the L0→L3 ladder through the shipped server
 //! ```
 
@@ -85,6 +87,37 @@ fn refuse(why: &str) -> ! {
     std::process::exit(1);
 }
 
+/// ⛔ PROVENANCE, PRINTED BY THE RUN ITSELF — not echoed before it.
+///
+/// This binary links the D123 scaffold, whose stub levels are not a database: L1 never writes the
+/// child's record, L2 leaks retired slots, L3 drops the capability envelope and the parent's
+/// live-child entry. `stub_level()` reads a static that starts at 0, so a clean run is the
+/// overwhelmingly likely case — and that is exactly the shape of this project's three worst
+/// measurement failures (D79 measured with durability off, E.6 measured below the production lock,
+/// D101 measured a runtime with `storage: None`). Each looked fine until someone checked.
+///
+/// So the state is READ BACK from the probe and asserted, at process start and again at every
+/// rung. `expect` is the stub level this rung means to run; anything else, or any non-zero extra
+/// upsert count, refuses instead of printing a number.
+fn assert_probe(expect: u8, where_: &str) {
+    let stub = probe::stub_level();
+    let extra = probe::extra_upserts();
+    let new_keys = probe::extra_new_keys();
+    if stub != expect {
+        refuse(&format!(
+            "{where_}: probe::stub_level() reads {stub}, this rung is L{expect}. The fork path \
+             being measured is not the one the row is labelled with."
+        ));
+    }
+    if extra != 0 || new_keys {
+        refuse(&format!(
+            "{where_}: probe::extra_upserts()={extra}, extra_new_keys()={new_keys}. F5's additive \
+             axis is on and this harness never asks for it, so the critical section under test is \
+             not fork's."
+        ));
+    }
+}
+
 fn stamp(label: &str) {
     let load = std::process::Command::new("uptime")
         .output()
@@ -116,89 +149,80 @@ fn spin(n: u64) {
     std::hint::black_box(acc);
 }
 
+/// ⭐ THE SECOND WITNESS, and it exists because the first fire-check FAILED.
+///
+/// `try_lock`-failure counts COLLISIONS. It does not count THREADS PARKED. Those come apart
+/// whenever a releasing thread re-acquires before any parked waiter can wake — barging, which
+/// `pthread_mutex` on macOS does not prevent. Under barging 63 threads can be parked for the whole
+/// run while the counter reads ~0, because a parked thread makes ONE failed `try_lock` and then
+/// contributes nothing for the thousands of operations the barger completes.
+///
+/// So the model carries an independent, load-immune gauge of *how many threads are inside the
+/// acquire region at the moment one of them gets in*. It is incremented before the acquire and
+/// decremented after, and the pre-decrement value (which includes the acquirer itself) is
+/// recorded. `1` means nobody else was there. `T` means every thread was queued.
+///
+/// ⛔ MODEL ONLY. These are process-wide atomics on the acquire path, i.e. exactly the cache-line
+/// bouncing `lockcount`'s header refuses to put on the real ladder. Here that is the point: the
+/// model has no finding to protect, only a mechanism to expose.
+static IN_ACQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUM_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAX_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct ModelCell {
     contended_per_op: f64,
     acq_per_op: f64,
+    /// Mean number of threads in the acquire region when an acquisition succeeded, self included.
+    queue_mean: f64,
+    /// The largest such number seen. `1` proves the threads never overlapped at all.
+    queue_max: u64,
     ops: u64,
     secs: f64,
 }
 
-/// ⛔⛔ **CORRECTION TO THIS SCAFFOLD'S OWN POSITIVE CONTROL. The premise was wrong, and the
-/// scaffold's refusal is what falsified it.** Raw evidence:
-/// `bench/ceiling_raw/00_model_POSITIVE_CONTROL_FAILED.txt`.
-///
-/// The cell `model_cell(64, 400, hold=20_000, outside=0)` was gated at `contended/op >= 0.5` on
-/// the claim *"64 threads doing nothing but hold one mutex must be contended nearly always"*.
-/// **Measured: 0.04688.** `acq/op` was exactly 1.0000 and the T=1 negative control was exactly
-/// 0.00000, so the acquisition and op bookkeeping are sound — only the *premise* is not.
-///
-/// ⭐ THE MECHANISM, stated before the replacement cell was run. `std::sync::Mutex` **barges**.
-/// Unlocking is a store (plus at most a wake syscall); the woken waiter must be scheduled, which
-/// costs microseconds, while the releasing thread's next `try_lock` CAS costs nanoseconds. With
-/// `outside = 0` the releasing thread re-acquires *immediately* and wins essentially every race.
-/// So with the lock permanently saturated, `try_lock` still SUCCEEDS ~95% of the time.
-///
-/// ⇒ **`try_lock`-failure counts "the lock was held by another thread at the instant I tried",
-/// which is NOT the same as "other threads are blocked".** Under a barging convoy 63 threads can
-/// be parked for the whole run and the census still reads ~0. The cell is the MINIMUM of the
-/// curve, not its maximum, and gating on it was gating on the wrong end.
-///
-/// ✅ THE REPLACEMENT, derived from the mechanism rather than from the observed number: remove the
-/// re-acquisition entirely. `T` threads rendezvous on a barrier, then each takes the lock
-/// **exactly once** and holds it for `hold` spins. Barging cannot help: nobody re-acquires. The
-/// first thread through finds it free, the other `T-1` cannot, so
-/// **`contended/op` must be `(T-1)/T`** — 0.984 at T=64 — by construction, provided the hold is
-/// long against the barrier's release skew. That is a structural prediction, not a tuned one, and
-/// the gate below is `>= 0.5`, the same bar the wrong cell was held to.
-fn model_cell_barrier(t: usize, hold: u64) -> ModelCell {
-    use std::sync::atomic::{AtomicUsize, Ordering as O};
-    let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    let arrived = Arc::new(AtomicUsize::new(0));
-    lk::set_global_mode(false);
-    lk::reset();
-    lk::set_enabled(true);
+/// Spins per second, measured single-threaded, so a cell can be asked for a DURATION instead of a
+/// spin count. Printed with the cells that use it — a conversion factor nobody can see is a
+/// conversion factor nobody can check.
+fn calibrate_spin() -> f64 {
+    // Warm, then measure. One untimed pass so the branch predictor and the frequency governor are
+    // not part of the constant.
+    spin(5_000_000);
     let t0 = Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..t {
-            let m = Arc::clone(&m);
-            let arrived = Arc::clone(&arrived);
-            s.spawn(move || {
-                arrived.fetch_add(1, O::SeqCst);
-                while arrived.load(O::SeqCst) < t {
-                    std::hint::spin_loop();
-                }
-                {
-                    let mut g = lk::acquire_unwrap(&m, lk::LK_LOGICAL);
-                    *g += 1;
-                    spin(hold);
-                }
-                lk::bump_op();
-                lk::flush_thread();
-            });
-        }
-    });
-    let secs = t0.elapsed().as_secs_f64();
-    lk::set_enabled(false);
-    let c = lk::snapshot();
-    if c.threads as usize != t {
-        refuse(&format!("barrier cell lost a thread's accumulators: {} of {t} flushed", c.threads));
-    }
-    if c.ops != t as u64 {
-        refuse(&format!("barrier cell counted {} ops, ran {t}", c.ops));
-    }
-    ModelCell {
-        contended_per_op: c.contended_per_op(lk::LK_LOGICAL),
-        acq_per_op: c.acq_per_op(lk::LK_LOGICAL),
-        ops: c.ops,
-        secs,
-    }
+    spin(50_000_000);
+    50_000_000.0 / t0.elapsed().as_secs_f64()
 }
 
 /// T threads × `iters` iterations: hold the mutex for `hold` spins, then `outside` spins free.
 fn model_cell(t: usize, iters: u64, hold: u64, outside: u64) -> ModelCell {
+    model_cell_ex(t, iters, hold, outside, None)
+}
+
+/// As [`model_cell`], but the work OUTSIDE the section may be a sleep instead of a spin.
+///
+/// ⭐ WHY THIS EXISTS, AND IT IS NOT A DETAIL. In the real ladder the work outside `logical` is
+/// dominated by `durable(seq)` — an fsync. A thread in an fsync is BLOCKED ON I/O: it holds no
+/// core, and the other 63 threads run. A thread in `spin()` holds a core. With 64 threads on a
+/// ~12-core box the spin version oversubscribes the CPU by 5x, which inflates every queue reading
+/// and depresses achieved throughput far below the offered load — the first operating-point
+/// reference below achieved 2.0% utilisation when it was asked for 8.5%.
+///
+/// A sleep is the faithful stand-in: the thread leaves the runnable set for the duration, exactly
+/// as an fsync does. It is not an fsync (no I/O, no group commit, and the wake-up has timer
+/// granularity), and the reference is labelled accordingly.
+fn model_cell_ex(
+    t: usize,
+    iters: u64,
+    hold: u64,
+    outside: u64,
+    outside_sleep: Option<std::time::Duration>,
+) -> ModelCell {
+    use std::sync::atomic::Ordering as O;
     let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     lk::set_global_mode(false);
     lk::reset();
+    IN_ACQ.store(0, O::SeqCst);
+    SUM_SEEN.store(0, O::SeqCst);
+    MAX_SEEN.store(0, O::SeqCst);
     lk::set_enabled(true);
     let t0 = Instant::now();
     std::thread::scope(|s| {
@@ -207,12 +231,21 @@ fn model_cell(t: usize, iters: u64, hold: u64, outside: u64) -> ModelCell {
             s.spawn(move || {
                 for _ in 0..iters {
                     {
+                        IN_ACQ.fetch_add(1, O::SeqCst);
                         let mut g = lk::acquire_unwrap(&m, lk::LK_LOGICAL);
+                        // `fetch_sub` returns the value BEFORE the subtraction, so `seen` counts
+                        // this thread plus everyone else still waiting to get in.
+                        let seen = IN_ACQ.fetch_sub(1, O::SeqCst);
+                        SUM_SEEN.fetch_add(seen, O::Relaxed);
+                        MAX_SEEN.fetch_max(seen, O::Relaxed);
                         *g += 1;
                         spin(hold);
                     }
                     lk::bump_op();
-                    spin(outside);
+                    match outside_sleep {
+                        Some(d) => std::thread::sleep(d),
+                        None => spin(outside),
+                    }
                 }
                 lk::flush_thread();
             });
@@ -230,6 +263,8 @@ fn model_cell(t: usize, iters: u64, hold: u64, outside: u64) -> ModelCell {
     ModelCell {
         contended_per_op: c.contended_per_op(lk::LK_LOGICAL),
         acq_per_op: c.acq_per_op(lk::LK_LOGICAL),
+        queue_mean: SUM_SEEN.load(O::Relaxed) as f64 / c.ops.max(1) as f64,
+        queue_max: MAX_SEEN.load(O::Relaxed),
         ops: c.ops,
         secs,
     }
@@ -241,11 +276,21 @@ fn mode_model() {
     println!("to make the counter fire on purpose and to show what it reads when it should read 0.");
     stamp("model_start");
     println!();
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14} {:>10}", "cell", "T", "hold", "outside", "ops", "contended/op", "acq/op");
+    println!("  queue_mean / queue_max = threads inside the acquire region when one got in, self");
+    println!("  included (the SECOND witness; see IN_ACQ). 1 means nobody else was there at all.");
+    println!();
+    println!("  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8} {:>14} {:>8} {:>10} {:>9}",
+        "cell", "T", "hold", "outside", "ops", "secs", "contended/op", "acq/op", "queue_mean", "queue_max");
+    let row = |name: &str, t: usize, hold: u64, outside: u64, c: &ModelCell| {
+        println!(
+            "  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8.3} {:>14.5} {:>8.4} {:>10.2} {:>9}",
+            name, t, hold, outside, c.ops, c.secs, c.contended_per_op, c.acq_per_op, c.queue_mean, c.queue_max
+        );
+    };
 
     // ── must NOT fire ────────────────────────────────────────────────────────────────────────
     let c = model_cell(1, 20_000, 2_000, 0);
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "NEG single-thread", 1, 2000, 0, c.ops, c.contended_per_op, c.acq_per_op);
+    row("NEG single-thread", 1, 2_000, 0, &c);
     if c.contended_per_op != 0.0 {
         refuse(&format!(
             "NEGATIVE CONTROL FAILED: one thread on a private mutex reported {} contended \
@@ -254,33 +299,53 @@ fn mode_model() {
             c.contended_per_op
         ));
     }
-
-    // ── the WITHDRAWN positive control, kept and still printed ───────────────────────────────
-    // Its gate is gone because its PREMISE was false, not because it was inconvenient. See
-    // `model_cell_barrier`'s doc comment and bench/ceiling_raw/00_model_POSITIVE_CONTROL_FAILED.txt.
-    // It is now reported as what it actually is: the BARGING cell, the minimum of the curve.
-    let c = model_cell(64, 400, 20_000, 0);
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "(barging) 64t", 64, 20000, 0, c.ops, c.contended_per_op, c.acq_per_op);
-    println!("     ^ WITHDRAWN AS A GATE. 64 threads, saturated lock, zero outside work — and the");
-    println!("       census still reads near ZERO, because the releasing thread re-acquires before");
-    println!("       any woken waiter can be scheduled. `try_lock` failure means THE LOCK WAS HELD");
-    println!("       WHEN I TRIED, not THREADS ARE BLOCKED. This scaffold's earlier gate asserted");
-    println!("       the second and measured the first.");
-
-    // ── must fire, and now for a reason barging cannot defeat ────────────────────────────────
-    let c = model_cell_barrier(64, 2_000_000);
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "POS 64t barrier", 64, 2000000, 0, c.ops, c.contended_per_op, c.acq_per_op);
-    println!("     ^ predicted (T-1)/T = {:.5} by construction, BEFORE the run.", 63.0 / 64.0);
-    if c.contended_per_op < 0.5 {
+    if c.queue_max != 1 {
         refuse(&format!(
-            "POSITIVE CONTROL FAILED: 64 threads that rendezvous and then each take the lock \
-             exactly once reported only {:.5} contended acquisitions per op, against a structural \
-             prediction of {:.5}. No re-acquisition happens here, so barging cannot explain it and \
-             the counter genuinely does not fire. NOTHING else in this run is interpretable.",
-            c.contended_per_op,
-            63.0 / 64.0
+            "NEGATIVE CONTROL FAILED on the second witness: one thread reported queue_max={}. \
+             The gauge counts something other than concurrent acquirers.",
+            c.queue_max
         ));
     }
+
+    // ── must fire ────────────────────────────────────────────────────────────────────────────
+    //
+    // ⛔ THE GATED POSITIVE CONTROL IS THE ONE WITH `outside > 0`, AND THAT IS A CORRECTION.
+    // The first version of this file gated on `outside = 0` — 64 threads doing nothing but take
+    // and release one mutex — and it FAILED, reading 0.029 contended per op. The cell below it
+    // ("BARGE") reproduces that failure deliberately, with the queue gauge attached, because the
+    // reason matters: with no work outside the section a releasing thread re-acquires before any
+    // parked waiter can wake, so 63 threads sit blocked while the collision counter reads ~0.
+    // That regime does not resemble either rung of the real ladder (both have milliseconds of
+    // fsync outside the section), so it is reported as a blind spot rather than used as the gate.
+    let c = model_cell(64, 800, 20_000, 20_000);
+    row("POS 64t queued", 64, 20_000, 20_000, &c);
+    let pos = c.contended_per_op;
+    if c.contended_per_op < 0.5 {
+        refuse(&format!(
+            "POSITIVE CONTROL FAILED: 64 threads offering 32x the lock's capacity reported only \
+             {:.4} contended acquisitions per op (queue_mean {:.2}, queue_max {}). The counter \
+             does not fire when contention is certain, so a low reading anywhere else in this run \
+             means nothing.",
+            c.contended_per_op, c.queue_mean, c.queue_max
+        ));
+    }
+
+    let c = model_cell(64, 800, 20_000, 0);
+    row("BARGE 64t no-out", 64, 20_000, 0, &c);
+    if c.queue_max < 2 {
+        refuse(&format!(
+            "The barge cell did not even overlap: queue_max={}. Its low contended count would then \
+             be non-overlap rather than barging, and the blind spot this run documents would be \
+             unproven.",
+            c.queue_max
+        ));
+    }
+    println!();
+    println!("  ⇒ BLIND SPOT, MEASURED: the BARGE row has queue_mean/queue_max showing threads ARE");
+    println!("    parked, while contended/op reads far below the POS row. `try_lock` failure counts");
+    println!("    COLLISIONS, not PARKED THREADS, and the two come apart when the releaser re-takes");
+    println!("    the lock. Direction of the error: contended/op UNDER-reports blocking, i.e. it errs");
+    println!("    toward killing pre-registered outcome 1. Every low reading below inherits that.");
 
     // ── the reference shape: shrink the section, grow the outside work ───────────────────────
     println!();
@@ -288,30 +353,84 @@ fn mode_model() {
     println!("  spins, moved out of the section a step at a time. This is the stub ladder's own");
     println!("  transition (hold shrinks, outside grows) in a system with NO other term.");
     println!();
-    println!("  ⭐ PREDICTED BEFORE THE RUN, from barging + saturation, and committed before it");
-    println!("     was executed (see model_cell_barrier's doc comment). Two terms, opposed:");
-    println!("       (i)  BARGING suppresses the count when `outside` is small, because the");
-    println!("            releasing thread re-wins its own lock. Maximal at outside=0.");
-    println!("       (ii) SATURATION is needed for the count to fire at all. Aggregate demand is");
-    println!("            T*hold/(hold+outside); it drops below 1.0 once hold/20000 < 1/64, i.e.");
-    println!("            at hold < 312 spins. So the last cell (hold=100) is UNDERSATURATED.");
-    println!("     ⇒ the column must be a HUMP: low at hold=20000, high in the middle, low at");
-    println!("       hold=100. A monotone column falsifies this reading of the instrument.");
-    println!();
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14} {:>10}", "cell", "T", "hold", "outside", "ops", "contended/op", "acq/op");
+    println!("  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8} {:>14} {:>8} {:>10} {:>9}",
+        "cell", "T", "hold", "outside", "ops", "secs", "contended/op", "acq/op", "queue_mean", "queue_max");
     for (hold, outside) in [(20_000u64, 0u64), (10_000, 10_000), (2_000, 18_000), (500, 19_500), (100, 19_900)] {
         let c = model_cell(64, 400, hold, outside);
+        row(&format!("work-in {:.0}%", 100.0 * hold as f64 / 20_000.0), 64, hold, outside, &c);
+    }
+
+    // ── the operating-point reference: the ladder's OWN two rungs, in a pure mutex ───────────
+    //
+    // ⭐ THIS IS THE COMPARATOR THE WHOLE RUN TURNS ON. The recorded ladder's two ends are not
+    // arbitrary; each has a measured offered load, and a pure mutex driven at the SAME offered
+    // load is what "nothing but a mutex" reads there. From `bench/d123_serial_attribution.txt`
+    // §3b at T=64, per-thread cycle = 64 / forks-per-sec:
+    //
+    //   L0: HOLD 0.20079 ms, cycle 64/4788.6 = 13.365 ms  ->  hold/cycle = 0.015023  (rho = 0.961)
+    //   L3: HOLD 0.00941 ms, cycle 64/9019.1 =  7.096 ms  ->  hold/cycle = 0.001326  (rho = 0.085)
+    //
+    // Those two fractions are reproduced below as spin ratios. Nothing about the real system is
+    // used except the ratio, so this is a MODEL of the operating point, not a re-measurement.
+    println!();
+    println!("  OPERATING-POINT REFERENCE (a) — SPIN OUTSIDE. A pure mutex driven at the SAME");
+    println!("  hold/cycle fraction as each recorded rung (L0 0.015023, L3 0.001326; d123 §3b,");
+    println!("  T=64). ⚠ The outside work is a SPIN, so all 64 threads are runnable at once on a");
+    println!("  ~12-core box. Achieved utilisation therefore falls well short of the offered load;");
+    println!("  the U_ach column says by how much, and (b) below is the faithful version.");
+    println!();
+    let spins_per_sec = calibrate_spin();
+    println!("  spin calibration: {:.3e} spins/sec single-threaded (hold=2000 spins = {:.4} ms)",
+        spins_per_sec, 2_000.0 * 1000.0 / spins_per_sec);
+    println!();
+    println!("  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8} {:>14} {:>8} {:>10} {:>9} {:>7}",
+        "cell", "T", "hold", "outside", "ops", "secs", "contended/op", "acq/op", "queue_mean", "queue_max", "U_ach");
+    let rowu = |name: &str, t: usize, hold: u64, outside: String, c: &ModelCell, u: f64| {
         println!(
-            "  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}",
-            format!("U~{:.0}%", 100.0 * hold as f64 / 20_000.0),
-            64, hold, outside, c.ops, c.contended_per_op, c.acq_per_op
+            "  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8.3} {:>14.5} {:>8.4} {:>10.2} {:>9} {:>6.1}%",
+            name, t, hold, outside, c.ops, c.secs, c.contended_per_op, c.acq_per_op, c.queue_mean, c.queue_max, 100.0 * u
         );
+    };
+    for (name, frac, iters) in [("L0-like rho=.961", 0.015023f64, 400u64), ("L3-like rho=.085", 0.001326, 400)] {
+        let hold = 2_000u64;
+        let outside = ((hold as f64) * (1.0 / frac - 1.0)).round() as u64;
+        let c = model_cell(64, iters, hold, outside);
+        let u = (c.ops as f64) * (hold as f64 / spins_per_sec) / c.secs;
+        rowu(name, 64, hold, outside.to_string(), &c, u);
+    }
+
+    // ── (b) the faithful operating point: the outside work is an I/O WAIT, as fsync is ───────
+    println!();
+    println!("  OPERATING-POINT REFERENCE (b) — SLEEP OUTSIDE. ⭐ THIS IS THE ONE TO COMPARE THE");
+    println!("  REAL LADDER AGAINST. Both the hold and the outside interval are set to the recorded");
+    println!("  rung's own WALL-CLOCK values, and the outside interval is a sleep, so a thread");
+    println!("  between forks leaves the runnable set exactly as it does inside `durable()`'s fsync.");
+    println!("  From d123 §3b at T=64:  L0 hold 0.20079 ms / cycle 13.365 ms");
+    println!("                          L3 hold 0.00941 ms / cycle  7.096 ms");
+    println!("  It is a MODEL, not an fsync: no I/O, no group commit, and the wake-up carries timer");
+    println!("  granularity. What it reproduces is the ARRIVAL PROCESS at each rung.");
+    println!();
+    println!("  {:>18} {:>4} {:>9} {:>10} {:>8} {:>8} {:>14} {:>8} {:>10} {:>9} {:>7}",
+        "cell", "T", "hold", "outside", "ops", "secs", "contended/op", "acq/op", "queue_mean", "queue_max", "U_ach");
+    let mut opref: Vec<(f64, f64, u64)> = Vec::new();
+    for (name, hold_ms, cycle_ms) in
+        [("L0-like 0.201ms", 0.20079f64, 13.365f64), ("L3-like 0.0094ms", 0.00941, 7.096)]
+    {
+        let hold = (hold_ms / 1000.0 * spins_per_sec).round() as u64;
+        let out = std::time::Duration::from_secs_f64((cycle_ms - hold_ms) / 1000.0);
+        let c = model_cell_ex(64, 200, hold, 0, Some(out));
+        let u = (c.ops as f64) * (hold_ms / 1000.0) / c.secs;
+        rowu(name, 64, hold, format!("sleep {:.3}ms", (cycle_ms - hold_ms)), &c, u);
+        opref.push((c.contended_per_op, c.queue_mean, c.queue_max));
     }
     println!();
-    println!("⭐ READ IT THIS WAY. In a PURE mutex the contended count is what a queue looks like:");
-    println!("   it stays pinned near 1.0 while threads are actually blocking on each other, and");
-    println!("   it falls only when they stop colliding. Whatever this column does here is the");
-    println!("   reference the real ladder's column is compared against.");
+    println!("⭐ READ IT THIS WAY. `contended/op` near {pos:.2} is what a mutex reads when threads are");
+    println!("   genuinely queued on it. Reference (b) gives the value a pure mutex reads at each");
+    println!("   recorded rung's own arrival process: L0-like {:.5} (queue_mean {:.2}), L3-like {:.5}",
+        opref[0].0, opref[0].1, opref[1].0);
+    println!("   (queue_mean {:.2}). If the real ladder's L3 lands near the L3-like reference, the", opref[1].1);
+    println!("   lock is simply not busy and nothing is queued on it — pre-registered outcome 1 dies.");
+    println!("   If it lands near {pos:.2} instead, threads are still piling up and outcome 1 lives.");
 }
 
 // =================================================================================================
@@ -337,11 +456,23 @@ struct DirectArm {
     secs: f64,
     syncs: u64,
     counts: lk::Counts,
+    /// `None` unless the rung ran with D123's phase clock on. See [`mode_paired`].
+    phases: Option<probe::Totals>,
 }
 
 /// One rung. Mirrors `d123_serial_attribution::run_arm` — same constructor, same warm-up shape,
 /// same `n / t` fork-bounded loop — so the ladder is the recorded one and not a lookalike.
-fn run_direct(dir: &Path, tag: &str, n: usize, t: usize, warm: usize, stub: u8, global: bool) -> DirectArm {
+#[allow(clippy::too_many_arguments)]
+fn run_direct(
+    dir: &Path,
+    tag: &str,
+    n: usize,
+    t: usize,
+    warm: usize,
+    stub: u8,
+    global: bool,
+    probe_on: bool,
+) -> DirectArm {
     let cat = open_catalog(dir, tag);
     let lease = LeaseDeadline(u64::MAX);
 
@@ -366,7 +497,9 @@ fn run_direct(dir: &Path, tag: &str, n: usize, t: usize, warm: usize, stub: u8, 
 
     // Probe OFF: this run's evidence is integers, so the clock is never read and the timing
     // instrument's own perturbation is not in the way. `stub` is the only thing that varies.
-    probe::configure(false, stub, 0);
+    probe::configure(probe_on, stub, 0);
+    assert_probe(stub, &format!("direct rung {tag} (L{stub})"));
+    probe::reset();
     lk::set_global_mode(global);
     lk::reset();
     lk::set_enabled(true);
@@ -384,11 +517,13 @@ fn run_direct(dir: &Path, tag: &str, n: usize, t: usize, warm: usize, stub: u8, 
                     cat.fork(BranchId::TRUNK, lease).expect("fork");
                 }
                 lk::flush_thread();
+                probe::flush_thread();
             });
         }
     });
     let secs = t0.elapsed().as_secs_f64();
     lk::set_enabled(false);
+    probe::configure(false, 0, 0);
     let counts = lk::snapshot();
 
     if counts.ops as usize != total {
@@ -406,7 +541,137 @@ fn run_direct(dir: &Path, tag: &str, n: usize, t: usize, warm: usize, stub: u8, 
             counts.threads
         ));
     }
-    DirectArm { forks: total, secs, syncs: cat.syncs_issued() - syncs_before, counts }
+    let phases = if probe_on {
+        let p = probe::snapshot();
+        if p.forks as usize != total {
+            refuse(&format!(
+                "{tag}: the phase clock counted {} forks against {total} run. HOLD per fork would \
+                 be divided by the wrong denominator.",
+                p.forks
+            ));
+        }
+        if p.threads as usize != t {
+            refuse(&format!(
+                "{tag}: {} of {t} threads flushed phase accumulators; HOLD_TOTAL would be short by \
+                 the missing threads and U(hold) would read LOW — the direction that manufactures \
+                 the answer.",
+                p.threads
+            ));
+        }
+        // The identity D123 asserts: HOLD_TOTAL = HOLD + DROPS + UNLOCK, all under the lock.
+        let parts = p.ns[probe::PH_HOLD] + p.ns[probe::PH_DROPS] + p.ns[probe::PH_UNLOCK];
+        let tot = p.ns[probe::PH_HOLD_TOTAL];
+        let rel = (tot as f64 - parts as f64).abs() / tot.max(1) as f64;
+        if rel > 0.05 {
+            refuse(&format!(
+                "{tag}: HOLD_TOTAL {tot} ns != HOLD+DROPS+UNLOCK {parts} ns ({:.1}% apart). The \
+                 bracketing is wrong, so the lock-held total is not the lock-held total.",
+                100.0 * rel
+            ));
+        }
+        Some(p)
+    } else {
+        None
+    };
+    DirectArm { forks: total, secs, syncs: cat.syncs_issued() - syncs_before, counts, phases }
+}
+
+// =================================================================================================
+// paired — THE COUNT AND THE UTILISATION, IN ONE RUN, ONE PROCESS, ONE MOMENT
+// =================================================================================================
+
+/// ⭐ WHY THIS MODE EXISTS, AND IT IS THE ONE THE VERDICT RESTS ON.
+///
+/// The discriminator is *"contended acquisitions stay high WHILE utilisation collapses"*. That is a
+/// statement about TWO quantities, and `mode_direct` measures only one of them — the other comes
+/// from `bench/d123_serial_attribution.txt`, a different run on a differently loaded box. Reading a
+/// count from today against a utilisation from last week is two instruments and two moments, and
+/// this project has a rule about that for a reason.
+///
+/// So this mode turns D123's phase clock back on and reports, per rung, from the SAME threads in
+/// the SAME process:
+///
+/// ```text
+///   contended/op   the census
+///   HOLD_TOT ms    per fork, acquire -> unlock, from the phase clock
+///   S_eff ms       wall / forks
+///   U(hold)        HOLD_TOT / S_eff          <- a ratio of two durations, ONE instrument
+///   gap ms         S_eff - HOLD_TOT          <- the lock-idle interval the question is about
+/// ```
+///
+/// ⚠ U(hold), S_eff and gap are RATIOS OR DURATIONS and the box is not quiet. U(hold) is the one
+/// that survives load, because numerator and denominator move together inside one run; the
+/// absolute ms figures are upper bounds and are stamped as such. The COUNT remains the evidence.
+///
+/// ⚠ The phase clock perturbs: 16 `Instant::now()` pairs per fork, some of them inside the
+/// section. It perturbs every rung the same way, and `mode_direct`'s probe-OFF counts are printed
+/// beside these so the perturbation is visible rather than assumed.
+fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize) {
+    println!("CEILING — MODE=paired. THE COUNT AND THE UTILISATION, MEASURED TOGETHER.");
+    println!();
+    println!("⚠ LAYER: `TableBranchCatalog` driven directly — the layer the recorded 21x/1.9x pair");
+    println!("  was measured at, NOT what any shipped front-end does. See MODE=pgwire.");
+    println!();
+    println!("  Each rung is run TWICE, back to back, same process:");
+    println!("    probe OFF -> contended/op with no clock reads anywhere (the citable count)");
+    println!("    probe ON  -> HOLD_TOT, S_eff, U(hold), gap, and the count again under the clock");
+    println!();
+    println!("  U(hold) is a ratio of two durations taken by ONE instrument inside ONE run, which is");
+    println!("  the kind D123 §(F4) argues survives a loaded box. ms columns are UPPER BOUNDS.");
+    stamp("paired_start");
+    println!();
+    println!(
+        "  {:>7} {:>5} {:>7} {:>13} {:>13} {:>10} {:>10} {:>9} {:>9} {:>10}",
+        "threads", "stub", "forks", "cont/op(off)", "cont/op(on)", "HOLD_TOT", "S_eff", "U(hold)", "gap ms", "forks/sec"
+    );
+    for &t in threads {
+        let mut first: Option<(f64, f64, f64)> = None;
+        for stub in 0u8..=3 {
+            let off = run_direct(dir, &format!("q{t}_{stub}_off"), n, t, warm, stub, false, false);
+            let on = run_direct(dir, &format!("q{t}_{stub}_on"), n, t, warm, stub, false, true);
+            let p = on.phases.expect("probe-on rung must carry phases");
+            let hold_ms = p.ns[probe::PH_HOLD_TOTAL] as f64 / p.forks.max(1) as f64 / 1e6;
+            let s_eff_ms = on.secs * 1000.0 / on.forks.max(1) as f64;
+            let u = hold_ms / s_eff_ms;
+            let gap_ms = s_eff_ms - hold_ms;
+            if off.syncs == 0 || on.syncs == 0 {
+                refuse(&format!("T={t} L{stub}: syncs collapsed to 0; the rung lost DURABILITY."));
+            }
+            println!(
+                "  {:>7} {:>5} {:>7} {:>13.5} {:>13.5} {:>10.5} {:>10.5} {:>8.1}% {:>9.5} {:>10.1}",
+                t,
+                stub,
+                off.forks,
+                off.counts.contended_per_op(lk::LK_LOGICAL),
+                on.counts.contended_per_op(lk::LK_LOGICAL),
+                hold_ms,
+                s_eff_ms,
+                100.0 * u,
+                gap_ms,
+                off.forks as f64 / off.secs
+            );
+            if stub == 0 {
+                first = Some((off.counts.contended_per_op(lk::LK_LOGICAL), u, gap_ms));
+            }
+            if stub == 3 {
+                let (c0, u0, g0) = first.expect("L0 ran first");
+                let c3 = off.counts.contended_per_op(lk::LK_LOGICAL);
+                println!(
+                    "    L0→L3 at T={t}:  contended/op {c0:.5} → {c3:.5} ({:.2}x)   U(hold) {:.1}% → {:.1}% ({:.2}x)   gap {g0:.5} → {gap_ms:.5} ms ({:.2}x)",
+                    c3 / c0.max(f64::MIN_POSITIVE),
+                    100.0 * u0,
+                    100.0 * u,
+                    u / u0.max(f64::MIN_POSITIVE),
+                    gap_ms / g0.max(f64::MIN_POSITIVE)
+                );
+                println!();
+            }
+        }
+    }
+    println!("⭐ THE DISCRIMINATOR, NOW SELF-CONTAINED. If U(hold) collapses across L0→L3 while");
+    println!("   contended/op stays pinned near its L0 value, threads are still colliding on a lock");
+    println!("   that is mostly idle — they are not arriving at random into free time. If instead");
+    println!("   contended/op falls in step with U(hold), the lock simply stopped being busy.");
 }
 
 fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
@@ -438,7 +703,7 @@ fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
         let mut base_tp = f64::NAN;
         let mut rows: Vec<(u8, f64, f64, f64)> = Vec::new();
         for stub in 0u8..=3 {
-            let a = run_direct(dir, &format!("d{t}_{stub}"), n, t, warm, stub, false);
+            let a = run_direct(dir, &format!("d{t}_{stub}"), n, t, warm, stub, false, false);
             let c = &a.counts;
             let ct = c.contended_per_op(lk::LK_LOGICAL);
             let tp = a.forks as f64 / a.secs;
@@ -478,8 +743,8 @@ fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
     println!("  above; the pgwire arm must use process-wide atomics because the library owns its");
     println!("  connection threads. If the two modes disagree, one of them is losing counts.");
     let t = *threads.last().unwrap_or(&64);
-    let tl = run_direct(dir, "xc_tl", n, t, warm, 0, false);
-    let gl = run_direct(dir, "xc_gl", n, t, warm, 0, true);
+    let tl = run_direct(dir, "xc_tl", n, t, warm, 0, false, false);
+    let gl = run_direct(dir, "xc_gl", n, t, warm, 0, true, false);
     let a = tl.counts.contended_per_op(lk::LK_LOGICAL);
     let b = gl.counts.contended_per_op(lk::LK_LOGICAL);
     println!("    T={t} L0  thread-local {a:.5}   global-atomic {b:.5}   ratio {:.4}", b / a.max(f64::MIN_POSITIVE));
@@ -711,6 +976,7 @@ fn run_pgwire(root: &Path, tag: &str, t: usize, f: usize, stub: u8) -> PgArm {
     let addr = rig.addr;
 
     probe::configure(false, stub, 0);
+    assert_probe(stub, &format!("pgwire rung {tag} (L{stub})"));
     // GLOBAL mode: `serve()` owns the connection threads, so no thread-local can be flushed
     // before the counters are read. See `lockcount::GLOBAL_MODE`.
     lk::set_global_mode(true);
@@ -843,12 +1109,23 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
 
     println!("⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.");
+    println!(
+        "   PROVENANCE at process start, read back from the probe: stub_level={} extra_upserts={} \
+         extra_new_keys={} probe_clock={}",
+        probe::stub_level(),
+        probe::extra_upserts(),
+        probe::extra_new_keys(),
+        probe::enabled()
+    );
+    assert_probe(0, "process start");
+    println!("   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.");
     println!();
     match mode.as_str() {
         "model" => mode_model(),
         "direct" => mode_direct(&dir, n, &threads, warm),
+        "paired" => mode_paired(&dir, n, &threads, warm),
         "pgwire" => mode_pgwire(&dir, n, &threads),
-        other => refuse(&format!("unknown mode `{other}` (model | direct | pgwire)")),
+        other => refuse(&format!("unknown mode `{other}` (model | direct | paired | pgwire)")),
     }
     stamp("end");
     let _ = std::fs::remove_dir_all(&dir);
