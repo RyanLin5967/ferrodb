@@ -18,6 +18,8 @@ SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 LOCK_WAIT=${LOCK_WAIT:-3600}
 
 SCAN_MS=${SCAN_MS:-3000}
+# Where this run's own stdout lands, so the feature check below can read back what was printed.
+OUT_SELF=${OUT_SELF:-$WT/bench/d144_lease_lag.txt}
 
 _HELD=0
 _release() { [ "$_HELD" = "1" ] || return 0; _HELD=0; rm -rf "$SUITE_LOCK"; }
@@ -120,6 +122,17 @@ suite_state "after arm 1"
 echo "(arm 1 rc=$rc1)"
 echo
 
+# ⛔ ASK THE ARTIFACT WHICH BINARY RAN, not the filesystem. Draw 1 was voided because a rebuild
+# landed while the run was already executing: a running process keeps its mapped image, so an
+# mtime check on disk would have said "current" while the old code was producing the rows. The
+# only witness that cannot lie is the output itself, and the calibration columns are only printed
+# by a build that has the calibration.
+if ! grep -q "S run/cal" "$OUT_SELF" 2>/dev/null; then
+    echo "# VERDICT: THE ROWS ABOVE CAME FROM A BINARY WITHOUT THE REALISED-INTERVAL CALIBRATION."
+    echo "# Its Δ/S divides a measured Δ by an ASSUMED S. Void this file."
+    exit 4
+fi
+echo "# binary self-identified from its own output: calibration columns present."
 echo "# load after        $(uptime | sed 's/.*load averages*: *//')"
 echo "# arm rcs           $rc1"
 if [ "$rc1" -ne 0 ]; then
