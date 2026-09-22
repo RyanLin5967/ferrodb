@@ -597,6 +597,7 @@ fn run_direct(
     stub: u8,
     global: bool,
     probe_on: bool,
+    census: bool,
 ) -> DirectArm {
     let cat = open_catalog(dir, tag);
     let lease = LeaseDeadline(u64::MAX);
@@ -627,7 +628,10 @@ fn run_direct(
     probe::reset();
     lk::set_global_mode(global);
     lk::reset();
-    lk::set_enabled(true);
+    // `census = false` short-circuits `acquire_unwrap` to a plain `lock().unwrap()`, so the acquire
+    // path is byte-identical to the shipped one. That configuration is what reproduces D123's own
+    // instrument, and it is the control for "does the try_lock census itself move U(hold)?".
+    lk::set_enabled(census);
 
     let syncs_before = cat.syncs_issued();
     let per = n / t.max(1);
@@ -651,14 +655,14 @@ fn run_direct(
     probe::configure(false, 0, 0);
     let counts = lk::snapshot();
 
-    if counts.ops as usize != total {
+    if census && counts.ops as usize != total {
         refuse(&format!(
             "{tag}: census counted {} forks, the harness ran {total}. A per-operation ratio \
              assembled from two disagreeing bookkeepings is not a measurement.",
             counts.ops
         ));
     }
-    if !global && counts.threads as usize != t {
+    if census && !global && counts.threads as usize != t {
         refuse(&format!(
             "{tag}: {} of {t} threads flushed their accumulators. Loss shrinks the contended \
              count in the direction that looks like LESS contention, which is the direction that \
@@ -731,72 +735,226 @@ fn run_direct(
 /// ⚠ The phase clock perturbs: 16 `Instant::now()` pairs per fork, some of them inside the
 /// section. It perturbs every rung the same way, and `mode_direct`'s probe-OFF counts are printed
 /// beside these so the perturbation is visible rather than assumed.
-fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize) {
+fn median(v: &[f64]) -> f64 {
+    let mut s: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+    if s.is_empty() {
+        return f64::NAN;
+    }
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = s.len() / 2;
+    if s.len() % 2 == 1 { s[m] } else { (s[m - 1] + s[m]) / 2.0 }
+}
+
+/// A = the deliverable, B and C the two controls that license reading A's columns together.
+const CFG: [(&str, bool, bool); 3] = [
+    // name,              census, probe
+    ("A census+probe", true, true),
+    ("B census only", true, false),
+    ("C probe only", false, true),
+];
+
+fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize) {
     println!("CEILING — MODE=paired. THE COUNT AND THE UTILISATION, MEASURED TOGETHER.");
     println!();
     println!("⚠ LAYER: `TableBranchCatalog` driven directly — the layer the recorded 21x/1.9x pair");
     println!("  was measured at, NOT what any shipped front-end does. See MODE=pgwire.");
     println!();
-    println!("  Each rung is run TWICE, back to back, same process:");
-    println!("    probe OFF -> contended/op with no clock reads anywhere (the citable count)");
-    println!("    probe ON  -> HOLD_TOT, S_eff, U(hold), gap, and the count again under the clock");
+    println!("  THREE INSTRUMENT CONFIGURATIONS PER RUNG, because a paired reading is worthless if");
+    println!("  either instrument is moving the other's number:");
+    println!("    A  census ON,  probe ON   THE DELIVERABLE: contended/op and U(hold), one loop.");
+    println!("    B  census ON,  probe OFF  does the phase clock move the COUNT?");
+    println!("    C  census OFF, probe ON   does the try_lock census move UTILISATION? With the");
+    println!("                              census off, acquire_unwrap short-circuits to a plain");
+    println!("                              lock().unwrap(), so C is byte-identical to D123's own");
+    println!("                              instrument and is also the REPRODUCTION ARM for the");
+    println!("                              recorded 96.1% -> 8.5% collapse.");
     println!();
     println!("  U(hold) is a ratio of two durations taken by ONE instrument inside ONE run, which is");
     println!("  the kind D123 §(F4) argues survives a loaded box. ms columns are UPPER BOUNDS.");
+    println!("  ⛔ contended/op UNDER-reports blocking under barging — see MODE=model's BARGE row.");
     stamp("paired_start");
+    println!("# build {}", ferrodb::build_provenance());
+    println!("# reps={reps} N={n} warm={warm}; configuration order AND rung order both rotate per rep");
     println!();
-    println!(
-        "  {:>7} {:>5} {:>7} {:>13} {:>13} {:>10} {:>10} {:>9} {:>9} {:>10}",
-        "threads", "stub", "forks", "cont/op(off)", "cont/op(on)", "HOLD_TOT", "S_eff", "U(hold)", "gap ms", "forks/sec"
-    );
+    println!("RECORDED, for comparison only — bench/d123_serial_attribution.txt §3b, warm=0, T=64,");
+    println!("a DIFFERENT process on a DIFFERENT night. Reproducing it is configuration C's job.");
+    println!("   stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)");
+    println!("      0     4788.6   0.20883   0.20079   0.00804    96.1%");
+    println!("      3     9019.1   0.11088   0.00941   0.10147     8.5%");
+    println!();
+
     for &t in threads {
-        let mut first: Option<(f64, f64, f64)> = None;
-        for stub in 0u8..=3 {
-            let off = run_direct(dir, &format!("q{t}_{stub}_off"), n, t, warm, stub, false, false);
-            let on = run_direct(dir, &format!("q{t}_{stub}_on"), n, t, warm, stub, false, true);
-            let p = on.phases.expect("probe-on rung must carry phases");
-            let hold_ms = p.ns[probe::PH_HOLD_TOTAL] as f64 / p.forks.max(1) as f64 / 1e6;
-            let s_eff_ms = on.secs * 1000.0 / on.forks.max(1) as f64;
-            let u = hold_ms / s_eff_ms;
-            let gap_ms = s_eff_ms - hold_ms;
-            if off.syncs == 0 || on.syncs == 0 {
-                refuse(&format!("T={t} L{stub}: syncs collapsed to 0; the rung lost DURABILITY."));
-            }
-            println!(
-                "  {:>7} {:>5} {:>7} {:>13.5} {:>13.5} {:>10.5} {:>10.5} {:>8.1}% {:>9.5} {:>10.1}",
-                t,
-                stub,
-                off.forks,
-                off.counts.contended_per_op(lk::LK_LOGICAL),
-                on.counts.contended_per_op(lk::LK_LOGICAL),
-                hold_ms,
-                s_eff_ms,
-                100.0 * u,
-                gap_ms,
-                off.forks as f64 / off.secs
-            );
-            if stub == 0 {
-                first = Some((off.counts.contended_per_op(lk::LK_LOGICAL), u, gap_ms));
-            }
-            if stub == 3 {
-                let (c0, u0, g0) = first.expect("L0 ran first");
-                let c3 = off.counts.contended_per_op(lk::LK_LOGICAL);
-                println!(
-                    "    L0→L3 at T={t}:  contended/op {c0:.5} → {c3:.5} ({:.2}x)   U(hold) {:.1}% → {:.1}% ({:.2}x)   gap {g0:.5} → {gap_ms:.5} ms ({:.2}x)",
-                    c3 / c0.max(f64::MIN_POSITIVE),
-                    100.0 * u0,
-                    100.0 * u,
-                    u / u0.max(f64::MIN_POSITIVE),
-                    gap_ms / g0.max(f64::MIN_POSITIVE)
-                );
-                println!();
+        println!("================================================================================");
+        println!("T = {t}");
+        println!("================================================================================");
+        println!("RAW — every rep, banked before any aggregation.");
+        println!(
+            "  {:>3} {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>13} {:>7}",
+            "rep", "config", "stub", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)",
+            "contended/op", "syncs"
+        );
+        let mut ct: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut uh: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut tp: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut se: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut ht: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut gp: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+
+        for rep in 0..reps {
+            for ci in 0..3usize {
+                // Rotate BOTH orders. `interleaving does not cancel drift`, but a fixed order puts
+                // the box's drift inside a rep onto the same cell every time, which is worse.
+                let cfg = (ci + rep) % 3;
+                let (name, census, probe_on) = CFG[cfg];
+                for si in 0..4u8 {
+                    let stub = (si + rep as u8) % 4;
+                    let a = run_direct(
+                        dir,
+                        &format!("q{t}_{rep}_{cfg}_{stub}"),
+                        n,
+                        t,
+                        warm,
+                        stub,
+                        false,
+                        probe_on,
+                        census,
+                    );
+                    if a.syncs == 0 {
+                        refuse(&format!(
+                            "T={t} L{stub} rep{rep} {name}: syncs collapsed to 0. The rung lost \
+                             DURABILITY, not serial work, and D123's own validity gate voids it."
+                        ));
+                    }
+                    let s_eff_ms = a.secs * 1000.0 / a.forks.max(1) as f64;
+                    let (hold_ms, u, gap_ms) = match a.phases {
+                        Some(p) => {
+                            let h = p.ns[probe::PH_HOLD_TOTAL] as f64 / p.forks.max(1) as f64 / 1e6;
+                            (h, h / s_eff_ms, s_eff_ms - h)
+                        }
+                        None => (f64::NAN, f64::NAN, f64::NAN),
+                    };
+                    let c = if census {
+                        a.counts.contended_per_op(lk::LK_LOGICAL)
+                    } else {
+                        f64::NAN
+                    };
+                    println!(
+                        "  {:>3} {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>13.5} {:>7}",
+                        rep,
+                        name,
+                        stub,
+                        a.forks as f64 / a.secs,
+                        s_eff_ms,
+                        hold_ms,
+                        gap_ms,
+                        100.0 * u,
+                        c,
+                        a.syncs
+                    );
+                    let s = stub as usize;
+                    ct[cfg][s].push(c);
+                    uh[cfg][s].push(u);
+                    tp[cfg][s].push(a.forks as f64 / a.secs);
+                    se[cfg][s].push(s_eff_ms);
+                    ht[cfg][s].push(hold_ms);
+                    gp[cfg][s].push(gap_ms);
+                }
             }
         }
+
+        println!();
+        println!("MEDIANS over {reps} reps:");
+        println!(
+            "  {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>13}",
+            "config", "stub", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)", "contended/op"
+        );
+        for cfg in 0..3 {
+            for s in 0..4 {
+                println!(
+                    "  {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>13.5}",
+                    CFG[cfg].0,
+                    s,
+                    median(&tp[cfg][s]),
+                    median(&se[cfg][s]),
+                    median(&ht[cfg][s]),
+                    median(&gp[cfg][s]),
+                    100.0 * median(&uh[cfg][s]),
+                    median(&ct[cfg][s])
+                );
+            }
+        }
+
+        println!();
+        println!("CROSS-CONTROLS — a paired reading is licensed only if neither instrument moves");
+        println!("the other's number. Bar: within 25% at every rung.");
+        let mut licensed = true;
+        for s in 0..4 {
+            let a = median(&ct[0][s]);
+            let b = median(&ct[1][s]);
+            let r = a / b;
+            let bad = !(0.80..=1.25).contains(&r);
+            licensed &= !bad;
+            println!(
+                "  L{s}  contended/op  A(probe ON) {a:.5}  vs  B(probe OFF) {b:.5}   ratio {r:.3}{}",
+                if bad { "   <-- DISAGREE" } else { "" }
+            );
+        }
+        for s in 0..4 {
+            let a = median(&uh[0][s]);
+            let c = median(&uh[2][s]);
+            let r = a / c;
+            let bad = !(0.80..=1.25).contains(&r);
+            licensed &= !bad;
+            println!(
+                "  L{s}  U(hold)       A(census ON) {:.1}%  vs  C(census OFF) {:.1}%   ratio {r:.3}{}",
+                100.0 * a,
+                100.0 * c,
+                if bad { "   <-- DISAGREE" } else { "" }
+            );
+        }
+        println!();
+        if !licensed {
+            println!("⛔ A CROSS-CONTROL DISAGREES BY MORE THAN 25%. The two columns are NOT from one");
+            println!("   undisturbed instrument, and the L0->L3 line below is NOT licensed as a");
+            println!("   paired reading. Amendment 2 permits exactly this outcome: a result about");
+            println!("   the INSTRUMENT rather than the hypothesis, labelled as one.");
+            println!();
+        }
+
+        for (cfg, label) in [(0usize, "A (census+probe, THE DELIVERABLE)"), (2, "C (probe only, D123's own instrument)")] {
+            let c0 = median(&ct[cfg][0]);
+            let c3 = median(&ct[cfg][3]);
+            let u0 = median(&uh[cfg][0]);
+            let u3 = median(&uh[cfg][3]);
+            let h0 = median(&ht[cfg][0]);
+            let h3 = median(&ht[cfg][3]);
+            let g0 = median(&gp[cfg][0]);
+            let g3 = median(&gp[cfg][3]);
+            let p0 = median(&tp[cfg][0]);
+            let p3 = median(&tp[cfg][3]);
+            println!("⭐ L0 -> L3 AT T={t}, CONFIGURATION {label}:");
+            println!("     HOLD_TOT      {h0:.5} -> {h3:.5} ms   ({:.1}x DOWN)   [recorded 21x]", h0 / h3);
+            println!("     U(hold)       {:.1}% -> {:.1}%          ({:.1}x DOWN)   [recorded 11.3x, 96.1->8.5]", 100.0 * u0, 100.0 * u3, u0 / u3);
+            println!("     gap           {g0:.5} -> {g3:.5} ms   ({:.1}x UP)     [recorded 12.6x]", g3 / g0);
+            println!("     forks/sec     {p0:.1} -> {p3:.1}        ({:.2}x UP)    [recorded 1.9x]  UPPER BOUND", p3 / p0);
+            println!("     contended/op  {c0:.5} -> {c3:.5}      ({:.2}x)        [never recorded: THIS is the new number]", c3 / c0);
+            println!();
+        }
     }
-    println!("⭐ THE DISCRIMINATOR, NOW SELF-CONTAINED. If U(hold) collapses across L0→L3 while");
-    println!("   contended/op stays pinned near its L0 value, threads are still colliding on a lock");
-    println!("   that is mostly idle — they are not arriving at random into free time. If instead");
-    println!("   contended/op falls in step with U(hold), the lock simply stopped being busy.");
+    println!("⭐ HOW TO READ IT — Amendment 2, pre-registered. No fourth outcome is permitted.");
+    println!("   contended/op RISES as the section shortens ⇒ the gap is park/unpark handoff.");
+    println!("   it does NOT rise                           ⇒ the remaining time is not threads");
+    println!("                                                blocking on each other, and");
+    println!("                                                pre-registered OUTCOME 1 IS DEAD.");
+    println!("   the counts cannot discriminate             ⇒ a result about the INSTRUMENT, which");
+    println!("                                                Amendment 2 permits and requires to");
+    println!("                                                be labelled as one.");
+    println!();
+    println!("⛔ AND THE COMPARATOR IS MODE=model's OPERATING-POINT REFERENCE (b), NOT ZERO. A pure");
+    println!("   mutex driven at each recorded rung's own arrival process already reads a high");
+    println!("   contended/op at BOTH ends. 'Still contended at L3' is only evidence for outcome 1");
+    println!("   if it is HIGHER than what a mutex with no handoff floor reads at that same");
+    println!("   operating point.");
 }
 
 fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
@@ -828,7 +986,7 @@ fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
         let mut base_tp = f64::NAN;
         let mut rows: Vec<(u8, f64, f64, f64)> = Vec::new();
         for stub in 0u8..=3 {
-            let a = run_direct(dir, &format!("d{t}_{stub}"), n, t, warm, stub, false, false);
+            let a = run_direct(dir, &format!("d{t}_{stub}"), n, t, warm, stub, false, false, true);
             let c = &a.counts;
             let ct = c.contended_per_op(lk::LK_LOGICAL);
             let tp = a.forks as f64 / a.secs;
@@ -868,8 +1026,8 @@ fn mode_direct(dir: &Path, n: usize, threads: &[usize], warm: usize) {
     println!("  above; the pgwire arm must use process-wide atomics because the library owns its");
     println!("  connection threads. If the two modes disagree, one of them is losing counts.");
     let t = *threads.last().unwrap_or(&64);
-    let tl = run_direct(dir, "xc_tl", n, t, warm, 0, false, false);
-    let gl = run_direct(dir, "xc_gl", n, t, warm, 0, true, false);
+    let tl = run_direct(dir, "xc_tl", n, t, warm, 0, false, false, true);
+    let gl = run_direct(dir, "xc_gl", n, t, warm, 0, true, false, true);
     let a = tl.counts.contended_per_op(lk::LK_LOGICAL);
     let b = gl.counts.contended_per_op(lk::LK_LOGICAL);
     println!("    T={t} L0  thread-local {a:.5}   global-atomic {b:.5}   ratio {:.4}", b / a.max(f64::MIN_POSITIVE));
@@ -1229,6 +1387,7 @@ fn main() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     let warm: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let reps: usize = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let dir = std::env::temp_dir().join(format!("ferrodb-ceiling-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1248,7 +1407,7 @@ fn main() {
     match mode.as_str() {
         "model" => mode_model(),
         "direct" => mode_direct(&dir, n, &threads, warm),
-        "paired" => mode_paired(&dir, n, &threads, warm),
+        "paired" => mode_paired(&dir, n, &threads, warm, reps),
         "pgwire" => mode_pgwire(&dir, n, &threads),
         other => refuse(&format!("unknown mode `{other}` (model | direct | paired | pgwire)")),
     }
