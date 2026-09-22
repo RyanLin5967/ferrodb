@@ -23,6 +23,11 @@ PGWIRE_REPS=${3:-1}
 # before the run that is quoted; the defaults ARE the pre-registration and D130 names T=128 as
 # mandatory, because every number this project has on this ladder is at T=64.
 TLIST=${TLIST:-1,2,4,8,16,32,64,128}
+# Which phases to run, and whether to truncate. An addendum run (a control added after the fact)
+# must APPEND and must carry its own lock hold and its own timestamps, so a reader can see it was
+# a separate acquisition rather than assume one continuous run.
+PHASES=${PHASES:-direct pgwire}
+APPEND=${APPEND:-0}
 DIRECT_N=${DIRECT_N:-8000}
 PGWIRE_F=${PGWIRE_F:-40}
 LABEL="d130-$(git rev-parse --short HEAD 2>/dev/null || echo nohead)"
@@ -60,7 +65,11 @@ while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
         exit 3
     fi
     [ "$_waited" -eq 0 ] && echo "$LABEL: queued behind a running suite ($_owner)" >&2
-    sleep 30; _waited=$((_waited+30))
+    # 5s, not the 15s tools/verify-suite.sh uses. Not impatience: a longer poll loses the race
+    # for a freed lock to a shorter one at roughly the ratio of the intervals, and with a steady
+    # stream of suites on this box a 30s poll was starved out of four consecutive handovers.
+    # The poll is a mkdir on tmpfs, so the shorter interval costs nothing.
+    sleep 5; _waited=$((_waited+5))
 done
 printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
 _HELD_LOCK=1
@@ -73,7 +82,7 @@ run_bounded() {
     wait "$child"
 }
 
-: > "$OUT"
+[ "$APPEND" = "1" ] || : > "$OUT"
 {
     echo "D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT?"
     echo "Run by bench/d130_run.sh under $SUITE_LOCK, so no other suite's fsyncs move D."
@@ -115,6 +124,7 @@ if ! run_bounded 600 ./target/release/examples/d130_pgwire_batch 4 2; then
 fi
 
 # ------------------------------------------------------------------------------------------------
+case " $PHASES " in *" direct "*)
 {
     echo
     echo "================================================================================"
@@ -140,8 +150,10 @@ for rep in $(seq 1 "$DIRECT_REPS"); do
         exit 1
     fi
 done
+;; esac
 
 # ------------------------------------------------------------------------------------------------
+case " $PHASES " in *" pgwire "*)
 {
     echo
     echo "================================================================================"
@@ -156,6 +168,7 @@ for rep in $(seq 1 "$PGWIRE_REPS"); do
         exit 1
     fi
 done
+;; esac
 
 { echo; echo "finished: $(date -u +%FT%TZ)"; } >> "$OUT"
 echo "$LABEL: done -> $OUT" >&2

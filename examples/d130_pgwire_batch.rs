@@ -366,6 +366,63 @@ impl Arm {
     }
 }
 
+/// ⭐ THE POSITIVE CONTROL. `T` threads calling `fork` on the rig's OWN catalog, no socket.
+///
+/// **Without this the pgwire result is an unfalsified negative.** Arms P and S both report a batch
+/// of 1.00 and 0.20, flat in `T`; read alone, that is indistinguishable from a harness that could
+/// never have reported anything else — a counter read at the wrong moment, a thread pool that
+/// serialises the clients, a rig whose catalog is not the one the server uses. This arm reads the
+/// SAME `syncs_issued()` on the SAME `Arc<TableBranchCatalog>` the running server was built from,
+/// in the same process, and differs only in that it does not go through pgwire. If it shows a
+/// batch while P and S do not, the instrument can see batching and the wire layer has none.
+///
+/// A pgwire server IS listening throughout. It contributes nothing because nobody connects to it,
+/// which is a fact this arm demonstrates rather than assumes.
+fn run_direct_control(t: usize, f: usize, root: &Path) -> Cell {
+    let rig = rig(root, &format!("D-t{t}"));
+    let before = rig.branches.syncs_issued();
+
+    let lease = LeaseDeadline(u64::MAX);
+    let mut ids: BTreeSet<u64> = BTreeSet::new();
+    std::thread::scope(|s| {
+        let mut hs = Vec::with_capacity(t);
+        for _ in 0..t {
+            let cat = Arc::clone(&rig.branches);
+            hs.push(s.spawn(move || {
+                let mut mine = Vec::with_capacity(f);
+                for _ in 0..f {
+                    mine.push(cat.fork(BranchId::TRUNK, lease).expect("fork").branch_id.id);
+                }
+                mine
+            }));
+        }
+        for h in hs {
+            ids.extend(h.join().expect("control thread"));
+        }
+    });
+
+    let after = rig.branches.syncs_issued();
+    // Nothing is abandoned here either, so no slot is retired and every fork must mint a fresh id.
+    if ids.len() != t * f {
+        eprintln!(
+            "d130: REFUSING. D  direct control at T={t}: asked for {} forks, the catalog minted {} \
+             distinct branch ids.",
+            t * f,
+            ids.len()
+        );
+        std::process::exit(1);
+    }
+    if after <= before {
+        eprintln!(
+            "d130: REFUSING. D  direct control at T={t}: the catalog issued 0 fsyncs across {} \
+             forks.",
+            t * f
+        );
+        std::process::exit(1);
+    }
+    Cell { forks: ids.len(), syncs: after - before }
+}
+
 struct Cell {
     forks: usize,
     syncs: u64,
@@ -593,22 +650,28 @@ fn main() {
     println!();
 
     println!("  arm                                threads    forks    syncs    f/sync   f/sync÷T");
+    let row = |label: &str, t: usize, c: &Cell| {
+        let per = c.forks as f64 / c.syncs as f64;
+        println!(
+            "  {:32}  {:5}   {:6}   {:6}   {:7.2}   {:8.4}",
+            label, t, c.forks, c.syncs, per, per / t as f64
+        );
+    };
     for arm in [Arm::PerFork, Arm::Persistent] {
         for &t in &threads {
-            let c = run_cell(arm, t, f, &root);
-            let per = c.forks as f64 / c.syncs as f64;
-            println!(
-                "  {:32}  {:5}   {:6}   {:6}   {:7.2}   {:8.4}",
-                arm.label(),
-                t,
-                c.forks,
-                c.syncs,
-                per,
-                per / t as f64
-            );
+            row(arm.label(), t, &run_cell(arm, t, f, &root));
         }
         println!();
     }
+    for &t in &threads {
+        row("D  POSITIVE CONTROL, no socket", t, &run_direct_control(t, f, &root));
+    }
+    println!();
+    println!("⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,");
+    println!("   same process, a pgwire server listening throughout — it simply does not go through");
+    println!("   the socket. If D shows a batch and P/S do not, the instrument can see batching and");
+    println!("   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact");
+    println!("   about pgwire and every cell in this run is a fact about this harness.");
 
     println!("# end: {}  load: {}", stamp(), loadavg());
     let _ = std::fs::remove_dir_all(&root);

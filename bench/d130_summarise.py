@@ -65,14 +65,17 @@ def main(path):
                 cells[("direct", int(n[0]))].append((int(n[1]), int(n[5])))
         elif mode == "pgwire":
             stripped = line.strip()
-            if not stripped or stripped[0] not in "PS" or not stripped[1:2].isspace():
+            if not stripped or stripped[0] not in "PSD" or not stripped[1:2].isspace():
                 continue
             # <arm label>  T forks syncs f/sync f/sync÷T -- the last five are the numbers.
             n = numbers(" ".join(stripped.split()[-5:]))
             if n is None or len(n) != 5:
                 continue
-            key = "pgwire P (conn per fork, BEGIN only)" if stripped[0] == "P" \
-                else "pgwire S (persistent conn, BEGIN+ABANDON)"
+            key = {
+                "P": "pgwire P (conn per fork, BEGIN only)",
+                "S": "pgwire S (persistent conn, BEGIN+ABANDON)",
+                "D": "pgwire D (POSITIVE CONTROL, no socket)",
+            }[stripped[0]]
             cells[(key, int(n[0]))].append((int(n[1]), int(n[2])))
 
     if not cells:
