@@ -216,7 +216,7 @@ it, kept so the record shows the re-run happened rather than asserting it was un
 
 ## D148 — what the removed scan was WORTH on the shipped durable path
 
-> ⚠ **SUPERSEDED BY THE QUIET RE-RUN.** The figures in this section were taken at load 3.82–5.86
+> ⚠ **SUPERSEDED BY THE QUIET RE-RUN.** The figures in this section were taken at load 6.86
 > without the fleet measure lock. They are kept unedited because the re-run is a *replacement*,
 > not a correction of an error — but **quote the QUIET numbers at the end of this file**, not
 > these. What moved: the 10⁶ extrapolation, 24.5–26.4% → **31.0–32.0%**. What did not: the
@@ -318,7 +318,7 @@ failing is mine.** D139's fixture fix is in this merge, so it may already be gon
 **`e98c5d2` — the commit the suite certified**. Held `~/wt/logs/measure-lock.sh` as `d148-quiet`,
 **`load_at_acquire=2`**, zero competing `cargo`/`rustc`, both fleet locks otherwise free.
 
-| | loaded (3.82–5.86) | **quiet (load 2, under lock)** |
+| | loaded (6.86 / 4.77 / 4.55) | **quiet (load 2, under lock)** |
 |---|---|---|
 | `sync_data` share of an append | 99.1% | **99.3%** |
 | the scan, at 2000 frames | 0.073% | **0.089%** |
@@ -384,3 +384,35 @@ then `prepush` (the CI-parity checks a suite cannot see), and asks `staleness` *
 suite, so it can see a base that moved *during* the run. Main moved by 38 commits of real code
 here, so `COVERED-NO-CODE` is not expected; if staleness returns `STALE-GREEN`, the answer is to
 merge and re-run, not to reason about whether arena changes reach `src/tel/`.
+
+
+## ⛔ Correction, after landing — this file's load figure disagreed with its own raw header
+
+Two places in this file said the loaded D148 arm ran **at load 3.82–5.86**.
+**`d148_durable_phase_raw.txt`, sitting beside it, says `host load: 6.86 4.77 4.55`.**
+
+The 3.82 belonged to an **earlier** loaded run that was superseded when least-squares fitting was
+added to the harness. The artifact underneath was replaced; the number in the prose was not. Both
+places are corrected above.
+
+⇒ **Why this is recorded rather than quietly edited.** It is the failure this repo has logged
+before — *audit the header against the body* — and it is the same shape as the two D138 errors
+this very file corrects: `frames_for`'s "no production caller" came from a harness **label**, and
+the original `frames_for` paragraph named both mergers wrongly. **Three times in one row, a claim
+ABOUT a measurement drifted from the measurement.** The raw header is authoritative in every case,
+because the harness writes it and nobody retypes it.
+
+⇒ **The error direction happens to strengthen the conclusion** — the loaded arm was *more* loaded
+than claimed, so load inflating the fsync explains the quiet-vs-loaded gap better, not worse. That
+is not why it is fixed.
+
+✅ **Everything else in this file was checked against the raw files rather than assumed**, and is
+exact: `sync_data`/`TOTAL` 99.31% → "99.3%"; the loaded arm 99.11% → "99.1%"; both lookups
+0.822 + 8.092 = **8.914 ms**; least-squares slope 1.3869 → "1.39"; crossover 2,227,448 → "2.23M";
+scan at 2000 frames 0.089%. The load figure was the only mismatch.
+
+### Where this result is also banked
+
+`artie-research/bench/D148-RESULT.md`, with both raw files. That copy carries the same correction
+(`f15e333`). **If the two ever disagree, the ferrodb raw files are authoritative** — they are what
+the harness wrote.
