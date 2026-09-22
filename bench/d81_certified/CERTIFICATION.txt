@@ -1,0 +1,148 @@
+CERTIFICATION — D81 landing (SCALE-DESIGN D147), 2026-09-22
+================================================================================
+suite head=  b17ec58   (d81-land = D81-fsm-append + main 1e56fa5, incl. D141)
+mode=        per-target   ⚠ MODE IS PART OF THE NUMBER: `whole` = `per-target` + 2
+             doctests, so this 2508 is NOT comparable term-for-term with a whole total.
+
+⚠ SUPERSEDES the c2e4688 files in bench/d81_certified/ (D81 BEFORE the merge) and
+  anything quoting head=d3be454 (gated, but superseded once D141 landed). Quote
+  head=b17ec58.
+
+FOUR GATES, NOT TWO. Recorded because the framing was corrected mid-flight: a
+suite verdict is ONE of four checks and does not by itself license a landing.
+
+ 1. SUITE — pre-registered 2508 BEFORE the run; hit exactly.
+    d81final: mode=per-target rc=0 passed=2508 failed=0 build_errors=0 head=b17ec58
+    d81final: go rc=0 passed=97 failed=0
+    HARNESS_EXIT=0
+
+ 2. THE COUNT IS VERIFIED BELOW THE TOTAL, not by the total:
+    * All 18 new tests present BY NAME with "... ok", each EXACTLY x1 — which
+      confirms the no-macro-doubling finding independently rather than resting
+      on `grep -n 'macro_rules!'`.
+    * Both reaper fixtures ran in BOTH macro instantiations (`log_catalog` and
+      `table_catalog`) — the surviving `module_path!()` discriminator exercised
+      under exactly the parallel conditions D81 reproduced the collision under
+      3/3.
+    * 134 `test result:` verdicts for `--lib` + 133 integration targets = 1+133
+      exactly, so no target was silently dropped. Zero failures, zero panics.
+
+ 3. CROSS-PLATFORM — PR #44, run 35737124919, sha-matched to b17ec58:
+      Test ubuntu-latest   pass   7m45s
+      Test macos-latest    pass   8m36s
+      Test windows-latest  pass  37m55s
+    ⛔ THIS GATE EXISTS BECAUSE A LOCAL GREEN IS macOS-ONLY. `prepush`'s Windows
+    step is `cargo check --target x86_64-pc-windows-msvc`, which does NOT link
+    and runs ZERO tests. D81 adds 158 lines to src/storage/atomic_file.rs — the
+    file already carrying the `cfg(windows)` arms. ⚠ And pushing the BRANCH runs
+    nothing: tests.yml triggers on push only for `main`/`agent-isolation`, plus
+    `pull_request`. A feature branch with no run does not look red; it reports
+    the latest unrelated run. The PR is what made CI run at all.
+
+ 4. tools/land-gate.sh on b17ec58 — all three, verbatim:
+      [1/3] certify-head  OK — suite head=b17ec58 == landing b17ec58
+      [2/3] staleness     COVERED-NO-CODE: the base moved 4 commit(s), none
+                          touching code (bench/d127_certified/SUMMARY_d127invert.txt,
+                          bench/d141_certified/CERTIFICATION.txt)
+      [3/3] prepush       OK — FFI sweep; `cargo build --examples` and
+                          `cargo check --all-targets` under CI's RUSTFLAGS
+                          (-D duplicate_macro_attributes -D dead_code); and the
+                          x86_64-pc-windows-msvc check RAN rather than SKIPPED.
+    ⭐ STALENESS MATTERED HERE AND WAS NOT A FORMALITY. `main` MOVED DURING the
+    suite, 1e56fa5 -> 15ab12e; the runner recorded main before and after for
+    exactly this reason. A staleness check taken BEFORE the run is structurally
+    blind to that — the D126 failure. Asked LAST, against the certified commit,
+    it returned COVERED-NO-CODE on evidence rather than on my prediction.
+
+THE MERGE, AND WHY arena.rs WAS NOT TAKEN ON TRUST
+--------------------------------------------------------------------------------
+82 commits of main, 5 touching src/branch/arena.rs, against D81's +1249 there.
+Only src/branch/reaper.rs conflicted; arena.rs auto-merged — and a clean textual
+merge asserts that no line collided and nothing more, so the bodies were read:
+ * D125's arena change is confined to `cow_page`: it stops freeing inline and
+   reports `retire_previous` so the caller frees at its commit point.
+ * D81's addition is the append-only tail, whose `persist` mutex is documented
+   OUTERMOST — before `state`, the catalog locks and REPLACE_LOCK.
+ * They meet only at `free_page`, which does NOT take `persist`: it bumps the
+   `pending_version` atomic and takes `state`, the carve-out D81's own field
+   comment already names.
+ ⇒ D125 moved WHEN free_page is called, not which locks it takes; the documented
+   lock order holds. D125's restated test survives with all three assertions:
+   `retire_previous`, `pending_len()==0`, then `==1` after the caller's own free.
+D141 merged with ZERO conflicts — catalog vs arena are disjoint.
+
+THE CONFLICT: EXACTLY ONE DISCRIMINATOR SURVIVES
+--------------------------------------------------------------------------------
+D81 (be761ed) and main (D139) independently found the same defect — the two
+checkpoint fixtures in `macro_rules! reaper_suite` share one path across the
+macro's TWO instantiations. Keeping both fixes would be the "two guards is one
+you cannot test" shape, since either alone makes the paths distinct.
+KEPT main's `module_path!().replace("::","_")`; DELETED `stringify!($modname)`.
+The macro expands to `mod $modname`, so `module_path!()` ALREADY ENDS IN it: it
+separates everything `$modname` separates, plus two instantiations under
+different parents, which `$modname` alone would collide on. It is also not a
+compile error if that body is ever lifted out of the macro.
+⭐ CHECKABLE RATHER THAN ASSERTED: `git diff main..b17ec58 -- src/branch/reaper.rs`
+changes 24 lines and removes 8, and EVERY ONE IS A `//` COMMENT — that file is
+FUNCTIONALLY IDENTICAL to main's.
+D81's evidence was kept on the surviving fixture because it is stronger and
+because it CORRECTS main's stated symptom: D139's own fire-check did not fire,
+D81 reproduced the race 3/3 under parallelism, and post-D81 the first symptom is
+ENOENT from `OsFileOps::append` — `append(true)` WITHOUT `create(true)`,
+src/storage/atomic_file.rs:65-70 — not the "nothing was ever checkpointed" guard.
+
+THE BYTES AXIS, RE-DERIVED RATHER THAN RELAYED
+--------------------------------------------------------------------------------
+bench/d81_check_curve.py re-run against this tree's committed d81_curve_raw2.txt:
+  fsyncs/claim  BEFORE 2.000 2.000 2.000 2.000
+                AFTER  1.008 1.006 1.004 1.002
+  bytes/claim   BEFORE 14992 26992 50993 98993  vs 24L+3000 = 15000 27000 51000
+                                                   99000 (residual <= 8 B)
+                AFTER    122   161   142   167  (1.37x over an 8x range in L,
+                                                 non-monotone: flat plus noise)
+  total  542463 KB -> 1215 KB = 446.5x ; at L=4000 alone 593.6x
+  map bytes L=4000 = 197849 vs D79's 195929, diff exactly 1920 = 40 x 48
+⭐ LOAD-IMMUNITY IS MEASURED, NOT ASSERTED: the script's own output line
+  "counters identical across rounds: True" — the integers are bit-identical
+  across two rounds run at different times under different fleet load.
+
+⛔ NO MILLISECOND FIGURE HERE DISCRIMINATES ANYTHING; THE TIME AXIS WAS NOT RERUN
+  D147: with `checkpoint_to` set a reap costs 16-38 ms in EVERY shape, including
+  one that parks and walks nothing, so the box is fsync-bound and a bytes win
+  cannot appear in wall-clock. D81's OFF controls — the arm its change cannot
+  affect — disagreed by up to 2.4x, which means two bases and a void comparison.
+  For the record only, recomputed from the same raw: BEFORE cycle ON/OFF =
+  2.17 / 0.75 / 1.00 / 0.61 (NOT rising), AFTER = 1.18 / 0.59 / 1.74 / 2.02
+  (noise, other direction). Reported separately and claiming nothing.
+
+LIMITS, CARRIED FORWARD FROM D81 UNCHANGED
+--------------------------------------------------------------------------------
+ * The free record has UNIT-TEST COVERAGE ONLY.
+ * Every D81 arm is SINGLE-NODE; it says nothing about a cluster.
+ * L is confounded with position-within-arm: round 2 reverses arm ORDER but not
+   the L loop inside an arm. Named by D81, not solved.
+ * Everything above L=4000 (the 10^6 projection) is ARITHMETIC, not data.
+
+BLIND SPOTS OF THIS CERTIFICATION ITSELF
+--------------------------------------------------------------------------------
+ * It reads verdicts; it re-runs no test. It cannot tell you a run was honest.
+ * NO ARCHIVED PRE-D81 `<db>.arena` WAS REPLAYED. "Every existing file still
+   opens" rests on the structural walker plus the image's own CRC inside
+   `image_len` (which reads both v2 and v3 strides, so a wrong stride fails the
+   checksum rather than misparsing). The failure direction is safe; the honest
+   statement is that no old file was actually opened.
+ * ⛔ LANDING THIS MAKES THREE IN-TREE PROSE CLAIMS FALSE, none caught by any
+   test. All three are RETRACTED ON THIS BRANCH (they were folded in once a
+   fresh suite became mandatory, so their marginal cost was zero):
+     - tests/integration_server_reaps.rs module header and the fast-path reap
+       comment, both of which said the map is "rewritten" on every extent event.
+       ⭐ The ASSERTIONS were checked and are unaffected, not lucky:
+       `arena_state()` reads through `ArenaPageStore::reopen_from_checkpoint` —
+       the production loader, which reads image+tail — and `after.live` stays
+       exact because the free record carries `live_pages` as an ABSOLUTE
+       snapshot (arena.rs:2385; the replay at arena.rs:1694 states the asymmetry).
+     - examples/d90_delta_vs_chunk.rs, BANDED rather than repaired: its
+       `arena_replaces != 1` self-check now falls to "NOT confirmed" BY DESIGN,
+       and its stated conclusion is the exact wall D81 removes. Its logic and
+       counter are untouched — adjusting the check to keep printing CONFIRMED
+       would be repairing the fixture to fit the assertion.

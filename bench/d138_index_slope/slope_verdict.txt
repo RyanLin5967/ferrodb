@@ -1,0 +1,20 @@
+D138 — PARK axis slope, fitted at every row from the raw artifacts.
+
+--- arm OLD (unindexed, main 29ad1f5): /Users/idide/wt/ferrodb-d138-effectlog-index/bench/d138_index_slope/d138_old_raw.txt
+    rows=8  log_len 250 -> 2000  calls/block 500 hit / 250 miss
+    scan_hit     slope +1.0000  intercept 125.5  (line, all 7 steps equal)
+    scan_miss    slope +1.0000  intercept 124.5  (line, all 7 steps equal)
+    shadow_hit   slope  -       (not recorded in this arm)
+    shadow_miss  slope  -       (not recorded in this arm)
+
+--- arm NEW (indexed, dfe2c70): /Users/idide/wt/ferrodb-d138-effectlog-index/bench/d138_index_slope/d138_new_raw.txt
+    rows=8  log_len 250 -> 2000  calls/block 500 hit / 250 miss
+    scan_hit     slope +0.0000  intercept 0.0  (line, all 7 steps equal)
+    scan_miss    slope +0.0000  intercept 0.0  (line, all 7 steps equal)
+    shadow_hit   slope +1.0000  intercept 125.5  (line, all 7 steps equal)
+    shadow_miss  slope +1.0000  intercept 124.5  (line, all 7 steps equal)
+
+VERDICT
+  scan slope 1 -> 0 : +1.0000 -> +0.0000 (hit), +1.0000 -> +0.0000 (miss)
+  shadow of the removed scan, inside the indexed binary: +1.0000 (hit), +1.0000 (miss)
+  PASS — slope 1 -> 0 at all 8 rows, identical workload, removed scan still slope 1.

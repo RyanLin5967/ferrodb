@@ -1,0 +1,71 @@
+### D148 QUIET RE-RUN — under the fleet MEASURE lock
+branch: d148-quiet (instrumentation on e98c5d2, the CERTIFIED tip)
+measure lock: HELD as d148-quiet, load_at_acquire=2
+started:  2026-09-22T14:29:33Z
+host load at start: 2.95 3.66 4.07
+suite lock: FREE
+cargo/rustc processes: 0
+
+D148 — phase split of `DurableEffectLog::append` (the store `src/cli/cli.rs:141` ships).
+at 2a9ba6625528
+⚠ WALL-CLOCK. The headline is the SHARE and the SLOPE, not any duration.
+
+=== FIRE-CHECK 0 — the clock, in this binary ===
+    smallest non-zero Instant delta: 41 ns
+    ⇒ NOTHING below times a single lookup. Per-append phases (encode/pwrite/sync/
+      TOTAL) are microseconds-to-milliseconds; the LOOKUP is measured by a batched
+      probe of thousands of repetitions, so the tick is amortised, not resolved.
+
+Axis: 8 blocks of 250 sessions, 3 writes each — the PARK shape.
+      frames  appends      encode      pwrite   sync_data   idx/lookup  scan/lookup     scan%
+         250      750       851ns      18.3us    3137.4us        12ns       102ns    0.006%
+             (scan control walked 250 of 250 frames — verified, not assumed)
+         500      750       776ns      19.4us    3016.5us         9ns       149ns    0.010%
+             (scan control walked 500 of 500 frames — verified, not assumed)
+         750      750       636ns      17.5us    3043.3us        20ns       451ns    0.029%
+             (scan control walked 750 of 750 frames — verified, not assumed)
+        1000      750       712ns      20.4us    3094.4us        12ns       361ns    0.023%
+             (scan control walked 1000 of 1000 frames — verified, not assumed)
+        1250      750       746ns      21.0us    3008.2us        13ns       501ns    0.033%
+             (scan control walked 1250 of 1250 frames — verified, not assumed)
+        1500      750       819ns      18.8us    3090.5us         8ns       391ns    0.025%
+             (scan control walked 1500 of 1500 frames — verified, not assumed)
+        1750      750       697ns      17.1us    3102.8us        19ns       1.3us    0.082%
+             (scan control walked 1750 of 1750 frames — verified, not assumed)
+        2000      750       742ns      17.7us    3062.2us        15ns       1.4us    0.089%
+             (scan control walked 2000 of 2000 frames — verified, not assumed)
+
+=== THE TABLE MUST CLOSE — every phase, its counter, and the residual ===
+    units are: lookup* = LOG LENGTH the lookup was over (NOT frames walked — the
+    indexed arm walks none, which is the point); encode/pwrite = bytes; sync = fsyncs.
+    lookup(classify)   calls    6000  units      6001000  total      0.822 ms
+    encode             calls    6000  units       580000  total      4.483 ms
+    pwrite             calls    6000  units       580000  total    112.719 ms
+    sync_data          calls    6000  units         6000  total  18416.406 ms
+    lookup(append)     calls    6000  units      6001000  total      8.092 ms
+    TOTAL              calls    6000  units         6000  total  18543.870 ms
+    residual (TOTAL - parts): 1.347 ms = +0.01%
+
+=== D148's QUESTION: the frame scan's share of a DURABLE append ===
+    Two keyed lookups per durable append: classify_append, then mem.append.
+    at    250 frames  SCAN        204 ns/append   encode+write+sync    3156525 ns   => scan is  0.007% of append
+    at   2000 frames  SCAN       2752 ns/append   encode+write+sync    3080597 ns   => scan is  0.089% of append
+    INDEX, same axis:       24 ns/append at    250 frames ->       29 ns/append at   2000 frames (flat = O(1))
+
+    SCAN slope, least squares over all 8 rows: 1.3869 ns per frame per append
+    SCAN slope, endpoints only:                 1.4555 ns per frame per append
+    encode+pwrite+sync_data mean: 3088935 ns/append — CONSTANT in log length
+    whole append mean (indexed arm): 3090645 ns
+
+    ⭐ EXTRAPOLATED to the objective's own axis (a fit over 250..2000 frames,
+       stated as an extrapolation, NOT a measurement at that size):
+        least squares: scan at 10^6 frames = 1.39 ms/append vs 3.09 ms of I/O  => 31.0% of the append
+            endpoints: scan at 10^6 frames = 1.46 ms/append vs 3.09 ms of I/O  => 32.0% of the append
+    ⇒ the scan EQUALS encode+pwrite+sync at ~2227448 frames (least-squares fit).
+    ⚠ At 10^6 the frame Vec is ~100 MB, so per-element cost would RISE with cache
+      misses. The extrapolation is therefore conservative, not optimistic.
+
+    appends measured: 6000, final log length 2000 frames
+
+### rc=0  finished: 2026-09-22T14:29:52Z
+### host load at end: 3.11 3.65 4.06
