@@ -159,16 +159,61 @@ pub mod scan_count {
     /// — `filter` visits every element — so `scanned` here is always the whole `Vec`, in both
     /// buckets, and the hit/miss split means only "did it match anything".
     pub const SITE_FRAMES_FOR: usize = 3;
-    pub const SITES: usize = 4;
+    /// ⭐ **D138's SHADOW of `MemEffectLog::append`** — what the pre-D138 linear `position` scan
+    /// *would* have walked, recorded on the same call, in the same binary, at the same moment as
+    /// the real site.
+    ///
+    /// It exists because the before/after arms of D138 are **two different binaries**, and a zero
+    /// scan reported by a counter that has been accidentally disconnected reads exactly like a
+    /// zero scan reported by a scan that no longer happens. With this site the eliminated cost and
+    /// the actual cost are two columns of ONE table: the shadow must keep D137's slope-1 law while
+    /// `SITE_APPEND` reads zero. It is recorded ONLY by the indexed arm — in the unindexed arm it
+    /// stays empty and prints as `-`, which is the honest reading (there is no index to shadow).
+    pub const SITE_APPEND_SHADOW: usize = 4;
+    pub const SITES: usize = 5;
 
-    static HIT_SCANNED: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    static HIT_CALLS: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    static MISS_SCANNED: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    static MISS_CALLS: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static HIT_SCANNED: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static HIT_CALLS: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static MISS_SCANNED: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static MISS_CALLS: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Calls where the shadow scan and the index DISAGREED about a key's position.
+    ///
+    /// ⛔ **This must be zero, and it is not a summary statistic — it is an equality checked on
+    /// every single append of the whole run.** A count that is not zero invalidates the arm
+    /// outright: the index would be answering something other than what the log holds.
+    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+    /// The index and a fresh linear scan returned different positions for one key.
+    #[inline]
+    #[allow(dead_code)] // recorded only by the INDEXED arm; empty here is the honest reading.
+    pub(super) fn note_mismatch() {
+        MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// One search, after it finished. `scanned` is what the predicate counted.
     #[inline]
@@ -212,10 +257,13 @@ pub mod scan_count {
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
     pub struct Snapshot {
         pub sites: [SiteCount; SITES],
+        /// Index-vs-scan disagreements. Must be 0; see [`MISMATCHES`].
+        pub mismatches: u64,
     }
 
     pub fn snapshot() -> Snapshot {
         let mut out = Snapshot::default();
+        out.mismatches = MISMATCHES.load(Ordering::Relaxed);
         for i in 0..SITES {
             out.sites[i] = SiteCount {
                 hit_scanned: HIT_SCANNED[i].load(Ordering::Relaxed),
@@ -232,6 +280,7 @@ pub mod scan_count {
         /// the wrong way round gets zeros rather than a wrapped u64 that reads as a huge result.
         pub fn since(&self, earlier: &Snapshot) -> Snapshot {
             let mut out = Snapshot::default();
+            out.mismatches = self.mismatches.saturating_sub(earlier.mismatches);
             for i in 0..SITES {
                 let (a, b) = (&self.sites[i], &earlier.sites[i]);
                 out.sites[i] = SiteCount {
@@ -254,6 +303,9 @@ pub mod scan_count {
         }
         pub fn frames_for(&self) -> SiteCount {
             self.sites[SITE_FRAMES_FOR]
+        }
+        pub fn append_shadow(&self) -> SiteCount {
+            self.sites[SITE_APPEND_SHADOW]
         }
     }
 }

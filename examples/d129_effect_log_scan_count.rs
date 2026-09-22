@@ -460,12 +460,18 @@ fn fire_checks(dir: &std::path::Path) -> bool {
 fn axis(dir: &std::path::Path, tag: &str, what: &str, merge: bool, blocks: usize, block: usize) -> bool {
     let s = build(dir, tag);
     println!("=== AXIS: {what} ===");
+    // ⭐ D138 — `shadow/*` is what `append`'s pre-D138 LINEAR scan WOULD have walked, taken on the
+    // same call as the real `scan/*` beside it. In the unindexed arm nothing records it and it
+    // prints `-`; in the indexed arm it must keep D137's slope-1 law while `scan/*` reads 0.0.
     println!(
-        "    {:>9} {:>9} {:>8} {:>8} {:>12} {:>12} {:>12}",
-        "sessions", "log_len", "hits", "misses", "scan/hit", "scan/miss", "scanned"
+        "    {:>9} {:>9} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "sessions", "log_len", "hits", "misses", "scan/hit", "scan/miss", "shadow/hit",
+        "shadow/miss", "scanned"
     );
     let mut total_appends = 0u64;
     let mut rows: Vec<(usize, f64, f64)> = Vec::new();
+    let mut shadow_rows: Vec<(usize, Option<f64>, Option<f64>, u64)> = Vec::new();
+    let mut mismatches = 0u64;
     for b in 0..blocks {
         let before = scan_count::snapshot();
         let done_before = b * block;
@@ -479,16 +485,21 @@ fn axis(dir: &std::path::Path, tag: &str, what: &str, merge: bool, blocks: usize
         let d = scan_count::snapshot().since(&before);
         let a = d.append();
         total_appends += a.calls();
+        let sh = d.append_shadow();
         println!(
-            "    {:>9} {:>9} {:>8} {:>8} {} {} {:>12}",
+            "    {:>9} {:>9} {:>8} {:>8} {} {} {} {} {:>12}",
             done_before,
             s.log.len(),
             a.hit_calls,
             a.miss_calls,
             f(a.per_hit()),
             f(a.per_miss()),
+            f(sh.per_hit()),
+            f(sh.per_miss()),
             a.scanned(),
         );
+        shadow_rows.push((done_before, sh.per_hit(), sh.per_miss(), sh.calls()));
+        mismatches += d.mismatches;
         if let (Some(h), Some(m)) = (a.per_hit(), a.per_miss()) {
             rows.push((done_before, h, m));
         }
@@ -508,6 +519,36 @@ fn axis(dir: &std::path::Path, tag: &str, what: &str, merge: bool, blocks: usize
             last.2,
             last.2 / first.2.max(1e-9),
         );
+    }
+    // ⭐ D138 — the SHADOW's own growth, and the equality that licenses reading `scan/*` at all.
+    let shadow_calls: u64 = shadow_rows.iter().map(|r| r.3).sum();
+    if shadow_calls == 0 {
+        println!(
+            "    shadow: NOT RECORDED in this arm ({shadow_calls} calls) — there is no index to \
+             shadow, so the `scan/*` columns above ARE the linear scan."
+        );
+    } else {
+        let first = shadow_rows.iter().find(|r| r.1.is_some());
+        let last = shadow_rows.iter().rev().find(|r| r.1.is_some());
+        if let (Some(a), Some(b)) = (first, last) {
+            println!(
+                "    shadow growth (the scan D138 REMOVED, still measured): scan/hit {:.1} -> {:.1}, \
+                 scan/miss {:.1} -> {:.1} over {shadow_calls} calls",
+                a.1.unwrap(),
+                b.1.unwrap(),
+                a.2.unwrap_or(f64::NAN),
+                b.2.unwrap_or(f64::NAN),
+            );
+        }
+        // \u26d4 An equality checked on EVERY append of this axis, not sampled.
+        println!(
+            "    index-vs-scan disagreements over this axis: {mismatches}  => {}",
+            if mismatches == 0 { "PASS (the index answered what the log holds, every time)" } else { "FAIL" }
+        );
+        if mismatches != 0 {
+            println!("⛔ the index disagreed with a linear scan. This arm is not a result.");
+            return false;
+        }
     }
     println!();
     true
