@@ -32,6 +32,8 @@ pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub mod tree_keys;
 /// ⛔ D123 MEASUREMENT SCAFFOLD — must never merge. See the module header.
 pub mod d123_probe;
+/// ⛔ CEILING MEASUREMENT SCAFFOLD — must never merge. See `src/branch/lockcount.rs`.
+pub mod lockcount;
 mod group_commit;
 pub mod table_catalog;
 pub use table_catalog::TableBranchCatalog;
