@@ -242,6 +242,101 @@ BEFORE `standdown::reset()`, so it never reaches the counters either.)
   So: the tag works, the population is empty. Those are different claims and the bare zero
   collapsed them.
 
+2f. E7 — THE REAPER FIRES END-TO-END. ⚠ BUT THE SWEEP DID NOT SWEEP, AND THAT IS MY ERROR.
+`readonly`/`extended` with expiries minted during the measured window (`W4_EXPIRY_MS`). The reaper
+is the only EXOGENOUS announcer such an arm can have: a cached prepared statement never touches
+the exclusive catalog, and there are no writers.
+
+  expiry_ms   minted   ann_lease   sh_stood/1600   SHARED     stderr
+      0 ctl        0           0          0/1600   0.0000%    empty
+    200            1           1         13/1600   0.8125%    1 reap line
+     50            1           1         44/1600   2.7500%    1 reap line
+     10            2           2         15/1600   0.9375%    1 reap line
+      2            6           2         16/1600   1.0000%    1 reap line
+
+WHAT THIS ESTABLISHES, and it is worth having:
+  * ⭐ `ann_lease` MOVES OFF ZERO IN A RUNNING SERVER — 0 → 1, 2 — through the real lease thread,
+    the real `RuntimeLock` seam and the shipped counter. 2d proved the tag fires in a unit test;
+    this proves it fires end to end. It is the first non-zero `ann_lease` in any run of this
+    harness.
+  * ⭐ THE CONTROL IS EXACT AND IT TESTS THE CLAIM 2d ONLY READ. At `expiry_ms=0` the scan runs
+    every 10 ms over an empty candidate list and announces NOTHING: `ann_lease=0`, stand-down
+    EXACTLY 0.000000 over 1600 attempts, and an EMPTY stderr. That is `lease_thread.rs:66`
+    ("a scan that finds nothing expired takes the lock **not at all**") measured rather than
+    quoted, and it is why sweeping the cadence could never have worked.
+  * The four non-empty `.err` files contain only the reaper's own report — "lease: reaped 1
+    expired branch(es) with no client cooperation (b1@g0)". That is the thing E7 exists to
+    provoke, not a failure. The control's `.err` is empty, which is what makes the other four
+    readable.
+  * Closure holds on every row: in a read-only arm `stmts == sh_att`, so the identity collapses to
+    `ann_exec == sh_stood`, and it does (13/13, 44/44, 15/15, 16/16, 0/0).
+
+⛔ WHAT IT DOES NOT ESTABLISH — THE RATE. `minted` came back 1, 1, 2, 6 against cadences of
+200/50/10/2 ms. That is not a rate-proportional series, so THE AXIS WAS NEVER DRIVEN and no
+reaper contribution can be read off these four points. The stand-down column is correspondingly
+meaningless as a curve: 0.81 / 2.75 / 0.94 / 1.00 is not monotone and every value sits inside the
+run-to-run spread section 3 measures.
+
+THE CAUSE IS A SCALE ERROR IN MY ARM, not anything about the engine. Solving the four `minted`
+counts for a common window — minted ≈ T/(fork_cost + expiry_ms) — gives fork_cost ≈ 2 ms and
+T ≈ 24 ms, consistently across all four. THE MEASURED WINDOW IS ABOUT TWENTY-FOUR MILLISECONDS:
+1600 cached-prepared single-row reads served in-process over loopback finish almost immediately.
+A 10 ms scan timer fires about twice in 24 ms, so `ann_lease` could not have exceeded a handful
+however fast branches expired.
+
+⇒ AND THIS RETROACTIVELY STRENGTHENS 2d. `ann_lease=0` in all 30 earlier rows had TWO independent
+  sufficient causes, not one: the 15-minute lease is unreachable, AND the arms are far too short
+  for a 30-SECOND scan timer to fire even once. Either alone guarantees the zero.
+⇒ E7b (`bench/w4_standdown/e7b_reaper_rate.sh`, queued) is the corrected arm: rounds raised 250x
+  so the window is seconds rather than milliseconds, and the scan interval dropped to 1 ms. The
+  fix is a LONGER WINDOW, not a faster knob.
+
+2h. E8 — WHERE DOES THE FIXED POINT MOVE WHEN DML STOPS ANNOUNCING?
+Pre-registered with predictions at `bf2b959`, BEFORE the first run. The perturbation is in the
+WORKLOAD, not the engine: `W4_DML_EVERY` makes a DML client write every n rounds and READ in
+between. Under W4 an admitted DML announces nothing and a stood-down one falls back and announces
+— which is exactly what a SELECT does today. Same position in the path, same
+announce-only-on-stand-down behaviour. ⚠ It models W4's ANNOUNCER SET exactly and its SERVICE TIME
+not at all, because a read does less work after admission than a write would.
+
+⛔ THE ARM THAT SUPPRESSES THE ANNOUNCEMENT DIRECTLY CANNOT BE BUILT, and that is a result about
+the code rather than a preference. `ServerContext::catalog()` performs the announcement, the
+reader drain and the mutex acquisition as ONE act with no seam between them. Patching out the
+announcement also removes the statement's drain-wait and shortens its critical section, so
+throughput would move together with the announcer set and neither could be attributed.
+
+VALIDATION FIRST — the perturbation must be shown to have moved only what it claims.
+  * `ann_exec == (stmts - sh_att) + sh_stood` holds on all 12 rows.
+  * The structural term falls by EXACTLY the drop in `dml_att`, and the fork term — structural
+    minus `dml_att` — is CONSTANT: 800 across every row of sweep A, 16 across every row of
+    sweep B, matching 2 x `defining` in both. The arms are matched; the comparison is not void.
+
+  dml_every    A: fork_every=1            B: fork_every=64
+              sh_stood/sh_att   SHARED   sh_stood/sh_att   SHARED
+      1          763/800        95.38%      1022/1192      85.74%
+      2          898/1000       89.80%      1065/1392      76.51%
+      4          933/1100       84.82%       924/1492      61.93%
+      8          939/1150       81.65%       735/1542      47.67%
+     32         1007/1186       84.91%       461/1578      29.21%
+    200         1043/1198       87.06%       198/1590      12.45%
+  fork term        800 (constant)               16 (constant)
+
+⇒ OUTCOME A CONFIRMED, as pre-registered: where forks are frequent the fixed point BARELY MOVES —
+  95.38% falls to a plateau around 82-87% and flattens. Removing the ENTIRE DML announcer
+  population buys about 8 points, and the residual sits far above the 1% threshold. The 800 fork
+  announcements are the binding term and W4 does not change them.
+⇒ OUTCOME B CONFIRMED: where forks are rare the fixed point COLLAPSES — 85.74% to 12.45%, a
+  factor of 6.9, with the DML term the only thing removed.
+⇒ CROSS-CHECK AGAINST AN INDEPENDENT ARM. Sweep B's endpoint (fork_every=64, DML essentially
+  gone) should be nearly the same system as E6's fork_every=64 point, reached by a different knob
+  from a different arm composition. E6 read 9.53%, E8 reads 12.45%. Same regime, two routes.
+
+⇒ WHAT IT MEANS. Two independent perturbations — the fork rate (section 5) and the announcer set
+  (here) — return the same answer: W4'S PAYOFF IS GOVERNED BY THE FORK RATE, NOT BY DML. And it
+  adds something section 5 could only bound: at a LOW fork rate, taking DML out of the announcer
+  set really does recover most of the win (85.74% → 12.45%). So W4 is not a dead lane; it is a
+  lane whose value is entirely decided by a number neither run has measured.
+
 2e. THE HARNESS'S OWN FIRE-CHECK IS REAL. `tests/w4_standdown_instrument.rs` exists and asserts
 what the artifact says it asserts. Re-run here: 6 passed / 0 failed with the feature ON, and 1
 passed with it OFF (the `None` vs `Some(0)` assertion, which must run in both builds).
@@ -364,6 +459,13 @@ NOT LICENSED, and the banked artifact does not say it, but the brief's summary o
   * The `Parse` site is a real and separately fixable cost, but it is NOT a rescue for W4: in
     agent/extended it is 1604 of 6369 announcements (25%), while the forks are the rest.
 
+⇒ E8 SETTLES THE OTHER HALF, and it moves the verdict toward W4 rather than away. The measured
+  93-98% is the fixed point of TODAY'S announcer set, not a bound on W4 (2a-bis). Perturbing that
+  set directly: where forks are frequent, removing ALL DML announcements buys ~8 points and the
+  lane stays dead; where forks are rare it takes stand-down from 85.74% to 12.45%. So W4 WORKS in
+  the low-fork regime and is worthless in the high-fork one, and nothing else about it matters
+  until the fork rate of a real BranchBench-shaped workload is measured.
+
 ⇒ SCOREBOARD ROW 3: the pre-registered outcome is **B — material, check 3 FAILS for W4 at the
   measured operating points**, with the amendment that the failure is a function of fork rate and
   the curve, not the single point, is the result. Outcome C does NOT apply: the instrument
@@ -380,5 +482,8 @@ NOT LICENSED, and the banked artifact does not say it, but the brief's summary o
   bench/w4_standdown/rederive.sh   + campaigns E1-E4, E6.
   bench/w4_standdown/rederive_load.sh + campaign E5.
   bench/w4_standdown/reduce_rederive.py + the reduction and the closure check of section 2a.
+  bench/w4_standdown/e7_reaper_announcer.sh, e8_fixed_point.sh, e7b_reaper_rate.sh
+                                   + the E7/E8/E7b campaigns, with E8's PRE-REGISTRATION and its
+                                     four predicted outcomes committed before its first run.
   bench/w4_standdown/rederive/     + raw output, one file per point.
 Nothing in `src/` was modified. The subject of the measurement is untouched.
