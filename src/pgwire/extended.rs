@@ -344,15 +344,35 @@ impl Statement {
                     // The pass lives only for the attempt. If `try_run_read` answers `None` the
                     // pass is already dropped by the time the exclusive path runs, which is what
                     // keeps that same deadlock out of the write path too.
+                    // W4 check 3 labels the attempt by what the statement would be under W4 — a
+                    // global fraction would be dominated by the fork statement, which is
+                    // exclusive under W4 as well. `classify` decides NOTHING; it only tags a
+                    // counter, and it is checked against `try_run_read`'s real answer below.
+                    let class = crate::pgwire::standdown::classify(&stmt);
                     let attempted = {
                         match ctx.begin_read(read_slot) {
                             Some(_pass) => {
-                                try_run_read(&stmt, shared, ctx.bp.clone(), ctx.txn.clone(), session)
+                                crate::pgwire::standdown::note_attempt(class, true);
+                                let ran = try_run_read(
+                                    &stmt,
+                                    shared,
+                                    ctx.bp.clone(),
+                                    ctx.txn.clone(),
+                                    session,
+                                );
+                                crate::pgwire::standdown::note_dispatch_agreement(
+                                    class,
+                                    ran.is_some(),
+                                );
+                                ran
                             }
                             // A writer is announced. Standing down is correct, not a failure:
                             // the exclusive path below blocks on the mutex and is what every
                             // statement did before this line existed.
-                            None => None,
+                            None => {
+                                crate::pgwire::standdown::note_attempt(class, false);
+                                None
+                            }
                         }
                     };
                     match attempted {

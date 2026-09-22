@@ -202,6 +202,10 @@ fn with_lock<T>(lock: &dyn RuntimeLock, f: impl FnOnce() -> T) -> T {
 /// life.
 impl RuntimeLock for crate::pgwire::ServerContext {
     fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        // W4 check 3: this is an exclusive acquirer with no client behind it, so it announces a
+        // writer on a timer. Tagged so a stand-down fraction caused by the reaper's cadence is
+        // distinguishable from one caused by client statements.
+        crate::pgwire::standdown::note_site(crate::pgwire::standdown::Site::LeaseScan);
         let _statement = self.catalog();
         body();
     }
