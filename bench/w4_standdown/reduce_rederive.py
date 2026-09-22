@@ -162,6 +162,23 @@ def main():
                   f"{r['defining']:>8} {r['stmts']:>6} {share:>10}")
 
     print()
+    print("## E7 — IS THE REAPER A MATERIAL ANNOUNCER? readonly/extended, scan every 10ms.")
+    print("## That arm reads EXACTLY 0.000000 with ZERO announcements of any kind, so driving")
+    print("## expiries makes the reaper the only EXOGENOUS announcer in the system. The axis is")
+    print("## expired branches per tick, NOT the scan period -- an empty candidate list takes the")
+    print("## lock zero times at any cadence. expiry_ms=0 is the control and must stay at zero.")
+    print(f"{'expiry_ms':>10} {'minted':>7} {'sh_att':>7} {'sh_stood':>8} {'SHARED':>8} "
+          f"{'ann_lease':>9} {'ann_exec':>8} {'closes':>6}")
+    for ms in ["0", "200", "50", "10", "2"]:
+        for r in rows(base / "rederive" / f"e7_expiry_{ms}.txt"):
+            # In a read-only arm every statement is a shared-path attempt, so the closure identity
+            # collapses to ann_exec == sh_stood. A row that breaks it is not reporting the reaper.
+            closes = num(r, "ann_exec") == num(r, "sh_stood")
+            print(f"{ms:>10} {r.get('minted','?'):>7} {r['sh_att']:>7} {r['sh_stood']:>8} "
+                  f"{pct(r,'sh_frac'):>8} {r['ann_lease']:>9} {r['ann_exec']:>8} "
+                  f"{'YES' if closes else 'NO':>6}")
+
+    print()
     print("## E5 — LOAD SENSITIVITY. The same arm quiet and beside a CPU burner.")
     print(f"{'label':<22} {'proto':<10} {'quiet':>8} {'loaded':>8} {'ratio':>8}")
     for label in ["e5_agent_extended", "e5_readonly_simple"]:

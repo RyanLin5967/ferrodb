@@ -153,10 +153,20 @@ until it has been forced to fire, so I forced it — and it would not.
                                                      sh_frac  = 0.000000 at every setting
 
 That is not a broken counter. `scan_once` (`src/branch/lease_thread.rs`) computes
-`expired_candidates` OUTSIDE the lock and takes the lock once per CANDIDATE; an empty candidate
-list takes it zero times at any cadence. A branch expires `DEFAULT_LEASE_MILLIS` after it is
-forked — hardcoded at 15 minutes (`src/agent_sql/runtime.rs:1477`, `LeaseDeadline::from_now`) —
-and no arm runs for 15 minutes.
+`expired_candidates` OUTSIDE the lock and takes the lock inside `candidates.chunks(REAP_CHUNK)`
+at `:573`. `REAP_CHUNK` is 1 (`:465`), so it is one acquisition per CANDIDATE — but the bound
+that matters is the one that does not depend on that constant: AN EMPTY CANDIDATE LIST TAKES THE
+LOCK ZERO TIMES, AT ANY CADENCE. The module says so itself at `:66` ("A scan that finds nothing
+expired now takes the lock **not at all**") and the `DEFAULT_SCAN_MILLIS` doc repeats it at
+`:105`. A branch expires `DEFAULT_LEASE_MILLIS` after it is forked — hardcoded at 15 minutes
+(`src/agent_sql/runtime.rs:1477`, `LeaseDeadline::from_now`, no SQL parameter and no environment
+override) — and no arm runs for 15 minutes.
+
+⇒ So the driving quantity is EXPIRED BRANCHES PER TICK, not the scan period. Section 2f drives
+  that axis and turns this zero into a number.
+(One acquisition the lease thread's own doc omits: `resume_interrupted_reaps` at `:356`, taken
+unconditionally once at `LeaseThread::start`. In this harness that lands inside `build_engine`,
+BEFORE `standdown::reset()`, so it never reaches the counters either.)
 
 ⇒ `ann_lease=0` is TRUE BY CONSTRUCTION in all 30 rows and measures nothing. The reaper's
   contribution to the announcer set is UNMEASURED, in both runs.

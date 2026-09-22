@@ -82,10 +82,21 @@
 //! defaulted zero), zero shared-path attempts, any SQL error from any client, and an arm whose
 //! defining statement — the fork, the merge, the DDL — executed zero times.
 //!
+//! # The reaper is NOT driven by `W4_LEASE_MS`, and that is a trap worth stating here
+//!
+//! `W4_LEASE_MS` sets the scan CADENCE. It cannot make the reaper announce: `scan_once` runs the
+//! candidate query outside the lock and acquires once per expired candidate, so a scan that finds
+//! nothing expired takes the lock **zero times at any cadence**. A branch forked by SQL expires
+//! 15 minutes later, hardcoded. ⇒ Use `W4_EXPIRY_MS` — it mints already-expired branches during
+//! the measured window, which is the axis (expired branches per tick) that actually drives it.
+//! Sweeping the cadence and reading `ann_lease=0` tests the wrong knob.
+//!
 //! Usage:
 //! ```text
 //! cargo run --release --features w4-standdown-count --example w4_standdown_count
 //! W4_CLIENTS=8 W4_ROUNDS=300 W4_LEASE_MS=30000 W4_ARMS=agent,merge ... (all arms by default)
+//! W4_PROTOS=simple,extended,ext_reparse,ext_split   W4_ANNOUNCERS=n   W4_FORK_EVERY=k
+//! W4_EXPIRY_MS=ms   (0 = off, the default: mint an expired branch every `ms` while measuring)
 //! ```
 
 use std::collections::HashSet;
@@ -316,6 +327,9 @@ struct Engine {
     store: Arc<ArenaPageStore>,
     arena_path: String,
     _lock: DbLock,
+    /// Kept so an arm can mint ALREADY-EXPIRED branches and thereby make the reaper announce.
+    /// See [`ExpiryMinter`] for why that is the only knob that can.
+    branches: Arc<TableBranchCatalog>,
 }
 
 fn build_engine(db: &str, lease_ms: u64) -> Engine {
@@ -364,7 +378,73 @@ fn build_engine(db: &str, lease_ms: u64) -> Engine {
         std::time::Duration::from_millis(lease_ms),
     )
     .expect("lease thread");
-    Engine { ctx, lease: Some(lease), store, arena_path, _lock: lock }
+    Engine { ctx, lease: Some(lease), store, arena_path, _lock: lock, branches }
+}
+
+/// Mints ALREADY-EXPIRED branches during the measured window, so the reaper has something to reap.
+///
+/// # Why this exists, and why the obvious knob is the wrong one
+///
+/// Every row of this harness reports `ann_lease=0`, and a detector that has never fired is not a
+/// clean result. The obvious way to force it — shorten the scan interval — DOES NOT WORK, and the
+/// reason is in `src/branch/lease_thread.rs`:
+///
+/// * `scan_once` runs the candidate query OUTSIDE the lock, and takes the lock inside
+///   `candidates.chunks(REAP_CHUNK)`. `REAP_CHUNK` is 1. So it is one acquisition per CANDIDATE,
+///   and a scan that finds nothing expired takes the lock **zero times, at any cadence** — the
+///   module says so at `:66` and the `DEFAULT_SCAN_MILLIS` doc repeats it at `:105`.
+/// * A branch forked by `BEGIN AGENT SESSION` expires `DEFAULT_LEASE_MILLIS` later, hardcoded at
+///   15 minutes (`src/agent_sql/runtime.rs:1477`), with no SQL parameter and no environment
+///   override. No arm runs for 15 minutes.
+///
+/// ⇒ The quantity that drives lease announcements is EXPIRED BRANCHES PER TICK, not the period.
+/// This drives that axis directly: `BranchCatalog::fork` takes the lease as a parameter, so a
+/// branch minted with `LeaseDeadline::from_now(0)` is expired the moment it exists.
+///
+/// ⚠ It forks on the branch catalog rather than through SQL ON PURPOSE. Nothing in `src/` is
+/// modified or bypassed to make this fire: the reaper, the lease thread, the `RuntimeLock` seam
+/// and the counter are all the shipped ones, and the only thing supplied from outside is the
+/// lease value that `fork` already accepts from every caller.
+struct ExpiryMinter {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<u64>>,
+}
+
+impl ExpiryMinter {
+    /// `every_ms` = 0 disables minting entirely and returns a minter that spawns no thread, so an
+    /// un-driven arm is byte-for-byte the experiment it was before this existed.
+    fn start(branches: Arc<TableBranchCatalog>, every_ms: u64) -> ExpiryMinter {
+        let stop = Arc::new(AtomicBool::new(false));
+        if every_ms == 0 {
+            return ExpiryMinter { stop, handle: None };
+        }
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut minted = 0u64;
+            while !flag.load(Ordering::SeqCst) {
+                // Expired on arrival. A failure is counted, never panicked on: the arm's own
+                // refusals are about the CLIENT workload, and a minter that could abort one would
+                // turn a reaper experiment into a flaky harness.
+                if branches
+                    .fork(
+                        ferrodb::branch::types::BranchId::TRUNK,
+                        ferrodb::branch::types::LeaseDeadline::from_now(0),
+                    )
+                    .is_ok()
+                {
+                    minted += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(every_ms));
+            }
+            minted
+        });
+        ExpiryMinter { stop, handle: Some(handle) }
+    }
+
+    fn stop(mut self) -> u64 {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.take().map(|h| h.join().unwrap_or(0)).unwrap_or(0)
+    }
 }
 
 impl Engine {
@@ -583,11 +663,19 @@ struct ArmResult {
     statements: u64,
     defining_statements: u64,
     composition: String,
+    /// Expired branches minted during the measured window; 0 when the minter was off.
+    minted: u64,
 }
 
-fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64, dir: &Path)
-    -> ArmResult
-{
+fn run_arm(
+    arm: &str,
+    proto: Proto,
+    clients: usize,
+    rounds: usize,
+    lease_ms: u64,
+    expiry_ms: u64,
+    dir: &Path,
+) -> ArmResult {
     let roles = roles(arm, clients);
     let db = dir.join(format!("{arm}_{}.db", proto.label()));
     let engine = build_engine(db.to_str().unwrap(), lease_ms);
@@ -718,10 +806,14 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
 
     gate.wait();
     standdown::reset();
+    // Started AFTER the reset so its reaps land inside the measured window, and before the "go"
+    // barrier so the reaper is already announcing when the first client statement arrives.
+    let minter = ExpiryMinter::start(Arc::clone(&engine.branches), expiry_ms);
     gate.wait();
     for t in threads {
         t.join().expect("a client thread panicked");
     }
+    let minted = minter.stop();
 
     let counts = standdown::counts().unwrap_or_else(|| {
         eprintln!(
@@ -764,6 +856,7 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
         statements: statements.load(Ordering::Relaxed),
         defining_statements: defining.load(Ordering::Relaxed),
         composition,
+        minted,
     }
 }
 
@@ -810,6 +903,8 @@ fn main() {
     let clients = env_usize("W4_CLIENTS", 8);
     let rounds = env_usize("W4_ROUNDS", 300);
     let lease_ms = env_usize("W4_LEASE_MS", 30_000) as u64;
+    // 0 = off, and off is the default, so every run already on record is unchanged.
+    let expiry_ms = env_usize("W4_EXPIRY_MS", 0) as u64;
     let arms: Vec<String> = std::env::var("W4_ARMS")
         .unwrap_or_else(|_| "readonly,agent,agent_dml,merge,ddl".into())
         .split(',')
@@ -822,7 +917,8 @@ fn main() {
     println!("# layer: through pgwire over a loopback TCP socket; shipped `pgwire::handle` per");
     println!("#        connection; nothing drives AgentRuntime or Session directly.");
     println!(
-        "# clients={clients} rounds={rounds} lease_scan_ms={lease_ms} fork_every={} announcers={}",
+        "# clients={clients} rounds={rounds} lease_scan_ms={lease_ms} expiry_ms={expiry_ms} \
+         fork_every={} announcers={}",
         fork_every(),
         std::env::var("W4_ANNOUNCERS").unwrap_or_else(|_| "default".into())
     );
@@ -832,7 +928,8 @@ fn main() {
     let mut results = Vec::new();
     for arm in &arms {
         for proto in protos() {
-            let r = run_arm(arm, proto, clients, rounds_for(arm, rounds), lease_ms, dir.path());
+            let r =
+                run_arm(arm, proto, clients, rounds_for(arm, rounds), lease_ms, expiry_ms, dir.path());
 
             if r.counts.attempts() == 0 {
                 eprintln!(
@@ -859,7 +956,7 @@ fn main() {
             println!(
                 "ROW arm={} proto={} sh_att={} sh_stood={} sh_frac={} dml_att={} dml_frac={} \
                  exc_att={} exc_frac={} all_frac={} ann_parse={} ann_refr={} ann_exec={} \
-                 ann_lease={} ann_unattr={} mismatch={} gap={} stmts={} defining={}",
+                 ann_lease={} ann_unattr={} mismatch={} gap={} stmts={} defining={} minted={}",
                 r.arm,
                 r.proto.label(),
                 c.attempts_shared_today(),
@@ -879,6 +976,7 @@ fn main() {
                 c.class_coverage_gap(),
                 r.statements,
                 r.defining_statements,
+                r.minted,
             );
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
