@@ -109,3 +109,35 @@ files). This branch adds exactly **two** tests, both in `src/tel/`:
 
 ⇒ **Expected: per-target 2478 passed, 0 failed. Go 97 passed, 0 failed.**
 Anything else is a finding, not a number to be explained away afterwards.
+
+### AMENDMENT 1 — the base moved under the pre-registration (append-only; nothing above is edited)
+
+Written before the suite ran, and before any count existed. While the measurement was in flight,
+`main` moved **29ad1f5 → 18e63ba** (merges of D136, D130 and d85-rederive). `main` was merged into
+this branch at `1db568b`, cleanly. The pre-registration above was derived from a base that no
+longer exists, so it is re-derived here against the one that does.
+
+⛔ **A broken instrument was caught doing this, and it is worth recording.** The first count used
+`git grep -E '^\s*#\[test\]'`. **`git grep -E` does not honour `\s`** — under POSIX ERE it is not
+an escape, so the pattern degenerated and matched only `#[test]` at column 0. It returned a
+plausible `1281` and a plausible per-file diff showing ONE changed file, while the true answer was
+2452 and two changed files. It failed silently, in the direction that looks like a smaller, calmer
+result. **Use `[[:space:]]`, not `\s`, with `git grep`.**
+
+Re-derived, with `^[[:space:]]*#\[(test|tokio::test)\]`:
+
+| | `#[test]` lines in `src` + `tests` |
+|---|---|
+| `98a44ef` — the tree the banked **2476** certifies | 2452 |
+| `main` `18e63ba` — the tree this branch now merges | 2452 |
+| this branch, merged (`1db568b`) | 2454 |
+
+**`main`'s test set is unchanged since the 2476 certification** — the per-file diff between
+`98a44ef` and `18e63ba` is empty, and so is every other input the count depends on:
+`#[ignore]` 3 → 3, `reaper_suite!` instantiations 3 → 3, `tests/*.rs` targets 132 → 132.
+(That last set is checked because D139's addendum showed a `#[test]` inside a multiply-instantiated
+macro counts once per instantiation. **Neither of this branch's two tests is inside a macro** —
+both are plain `#[test]`s, one in `src/tel/log.rs`, one in `src/tel/tests_durable_log.rs`.)
+
+⇒ **Expected, unchanged: per-target 2478 passed, 0 failed. Go 97 passed, 0 failed.**
+Mode is `per-target`, matching the baseline — `whole` and `per-target` totals are not comparable.
