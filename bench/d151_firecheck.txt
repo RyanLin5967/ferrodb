@@ -1,0 +1,41 @@
+D151 — FIRE-CHECK OF tests/d151_parse_reads_a_refreshed_snapshot.rs
+Run 2026-09-22 in /Users/idide/wt/ferrodb-d151-parse-site, tree clean and committed at 90864f3
+before the mutation, and restored with `git restore --source=HEAD --worktree` after it — named
+source explicitly rather than `git checkout --`, which restores the INDEX and has eaten a fix
+on this project before.
+
+WHY. The test passed the moment it was written, against code that is correct. That is not
+evidence it can see the defect it names. A detector that has never been made to fire is not a
+clean result.
+
+THE MUTATION, aimed at the exact window the test is about — `ServerContext::read_catalog` never
+re-snapshotting after first use, so a connection keeps whatever schema it cached:
+
+    -        let stale = match cache.as_ref() {
+    -            Some((cached, _)) => *cached != now,
+    -            None => true,
+    -        };
+    +        let stale = cache.is_none(); // FIRE-CHECK MUTANT: never re-snapshot after first use
+    +        let _ = now;
+
+VERBATIM OUTPUT UNDER THE MUTANT
+    running 1 test
+    test a_parse_on_a_cached_connection_sees_ddl_another_connection_did ... FAILED
+
+    ---- a_parse_on_a_cached_connection_sees_ddl_another_connection_did stdout ----
+    thread '...' panicked at tests/d151_parse_reads_a_refreshed_snapshot.rs:118:29:
+    `SELECT id FROM later` still fails to parse after another connection created `later`:
+    sql parsing error: binding error: unknown table 'later'; known tables are: t. The cached
+    snapshot was not refreshed, so D151 moved a stale schema into the parse path.
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+
+AND NOT SPURIOUSLY. Source restored from HEAD, mutant confirmed absent by grep, re-run:
+    test a_parse_on_a_cached_connection_sees_ddl_another_connection_did ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+WHAT THIS DOES NOT SHOW. One mutant, aimed at one mechanism. It says the test sees a snapshot
+that is never refreshed; it does not say the test would see an epoch that fails to move on some
+particular DDL, which is a different defect living in `catalog::` rather than in `read_catalog`.
+The in-test fire-check — the same two statements asserted to FAIL before the DDL — is what covers
+the weaker case of a parse path that consults no catalog at all.

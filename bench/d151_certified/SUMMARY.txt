@@ -1,0 +1,2 @@
+d151: mode=per-target rc=0 passed=2512 failed=0 build_errors=0 head=cdf6434 log=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/verifyout_d151/suite-d151.log
+d151: go rc=0 passed=97 failed=0 log=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/verifyout_d151/suite-d151.go.log
