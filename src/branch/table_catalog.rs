@@ -636,15 +636,28 @@ impl TableBranchCatalog {
     /// as the one-entry answer its other callers want, now written in terms of this.
     /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
     ///
-    /// ⛔ **A missing record cannot mean "the child is gone."** No path anywhere deletes a
-    /// `RECORD` key — the only operations on `keys::record` are insert, search and upsert, which
-    /// is the same fact `write_record_new`'s "provably new" safety argument already rests on.
-    /// Retirement is a state FLIP to `Reaped`, and the id-reuse path OVERWRITES the recycled
-    /// slot's record rather than removing it. So the only thing a missing record can describe is
-    /// an entry naming a branch that was never published, and `fork` cannot produce one either:
-    /// it writes the child's record BEFORE the child key, under one logical lock and one commit
-    /// ticket, so no crash can leave the entry durable without it. `attach_child` is the only
-    /// other writer of this span, and it now refuses to create one.
+    /// ⛔ **A missing record cannot mean "the child is gone" — but it does NOT mean "impossible"
+    /// either, and an earlier version of this comment said exactly that and was WRONG.**
+    ///
+    /// The DURABLE form of the claim holds: nothing ever leaves a record deleted. Retirement is a
+    /// state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled slot, and `keys::record`
+    /// is only ever inserted, searched and upserted — the same fact `write_record_new`'s
+    /// "provably new" argument rests on.
+    ///
+    /// The TRANSIENT form does not hold. `BPlusTreeManager` has no replace primitive (see
+    /// `upsert`, which says so), so `upsert` is DELETE-THEN-INSERT; `delete` drops its leaf write
+    /// latch when it returns and `insert` re-acquires, and `write_record` routes the RECORD key
+    /// straight through it. So during any `set_root`, `renew_lease`, `set_state`, `reparent`,
+    /// `restrict_envelope` or `put` — two of those are hot-path writes — the key is briefly
+    /// ABSENT. Every reader here is lockless: `logical` is writers-only. **A reader can therefore
+    /// see "no record" for a perfectly healthy, live branch.**
+    ///
+    /// That is not a reason to resolve it; it is the reason refusing is right. A reader cannot
+    /// distinguish "mid-rewrite" from "never published", and freeing on that ambiguity destroys a
+    /// live branch's pages. Refusing costs a spurious error on a healthy database; resolving
+    /// costs the data. **SCALE-DESIGN D126 closes the window** by giving the tree a real replace,
+    /// after which this really is unreachable — that is a storage-layer change and deliberately
+    /// not part of D124.
     ///
     /// **D124 — both resolvers used to answer "not a pin" here, which is the DESTRUCTIVE
     /// direction.** The parent then reads as childless, `reap_expired` frees its pages, and a
@@ -660,11 +673,13 @@ impl TableBranchCatalog {
             _ => format!("malformed CHILD key {key:02x?}"),
         };
         BranchError::Corrupt(format!(
-            "CHILD entry ({which}) names branch {child_id}, which has no record. A record key is \
-             never deleted — retirement is a state flip to Reaped and id reuse overwrites — so \
-             this entry can only name a branch that was never published. Refusing rather than \
-             resolving it to \"not a live child\", which would let the parent's pages be freed \
-             underneath a branch that may still be reading them."
+            "CHILD entry ({which}) names branch {child_id}, which has no record right now. That \
+             is either a branch that was never published, or — far more likely on a healthy \
+             database — one whose record is mid-rewrite: upsert is delete-then-insert and holds \
+             no latch across the two, so set_root/renew_lease/set_state briefly remove the key. \
+             A reader cannot tell those apart, so this refuses instead of resolving it to \"not \
+             a live child\", which would let the parent's pages be freed underneath a branch \
+             that may still be reading them. Retry is safe; see D124/D126."
         ))
         .into()
     }
@@ -683,8 +698,9 @@ impl TableBranchCatalog {
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
-            // See `dangling_child` for why that state is impossible and why refusing is the only
-            // safe answer to it.
+            // `dangling_child` has the reason: the state is NOT impossible — a concurrent
+            // `set_root` on this very child removes its RECORD key for the length of an upsert —
+            // and a reader that cannot tell "mid-rewrite" from "never existed" must not free.
             None => return Err(Self::dangling_child(key, child_id)),
         })
     }
@@ -736,8 +752,8 @@ impl TableBranchCatalog {
             Some(_) => Ok(None),
             // **D124 — split out of the catch-all these two arms used to share.** That arm's own
             // comment admitted it lumped "reaped with nothing under it" (legitimate, above)
-            // together with "gone entirely" (impossible), and answered the destructive way for
-            // both. See `dangling_child`.
+            // together with "gone entirely", and answered the destructive way for both. "Gone
+            // entirely" is not impossible, just unresolvable: see `dangling_child`.
             None => Err(Self::dangling_child(key, child_id)),
         }
     }
@@ -1232,12 +1248,17 @@ impl BranchCatalog for TableBranchCatalog {
         child_id: u64,
     ) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
-        // **D124 — the entry point is where the impossible state is made unrepresentable.** The
-        // value written here is a child branch id, and both resolvers (`child_liveness`,
-        // `live_child_at`) later ask that child's own record whether the entry is a pin. An entry
-        // naming a branch with no record is a question neither can answer safely, so it is
-        // refused at the only place in the API that can create one — `fork` writes the record
-        // before the child key under this same lock, so it cannot.
+        // **D124 — refuse to CREATE an entry that can never resolve.** The value written here is
+        // a child branch id, and both resolvers (`child_liveness`, `live_child_at`) later ask
+        // that child's own record whether the entry is a pin. An entry naming a branch that was
+        // never published can never answer, so it is refused at the only place in the API that
+        // can create one; `fork` writes the record before the child key under this same lock, so
+        // it cannot create one either.
+        //
+        // ⚠ This removes the PERMANENT form and not the transient one. A record can also be
+        // missing for the length of an `upsert` on a perfectly healthy branch, which this check
+        // cannot prevent and the resolvers therefore still have to refuse — see `dangling_child`,
+        // and D126 for the fix that removes the window itself.
         //
         // One extra point lookup, and it is free where it matters: `migrate_from` is the only
         // production caller (D63 deleted `collapse`) and it already writes every record before it
@@ -1808,9 +1829,10 @@ mod tests {
     /// record in the DESTRUCTIVE direction: `child_liveness` answered `Gone`, which
     /// `has_live_children` then skipped entirely, so the entry pinned nothing and the parent
     /// became reclaimable; `live_child_at` swept the same case into a catch-all it shared with
-    /// the legitimate "reaped with nothing under it". A record key is never deleted anywhere in
-    /// `src/` — see `dangling_child` — so a missing record can only mean "never published", and
-    /// freeing on it is the pages of a live branch.
+    /// the legitimate "reaped with nothing under it". A missing record is never a licence to
+    /// free: it is either a branch that was never published or one whose record is mid-`upsert`
+    /// on a live, healthy branch (`dangling_child` has the mechanism), and freeing on either is
+    /// the pages of a live branch.
     ///
     /// Four parts, and the last two are what make the first two mean anything. A guard that
     /// refuses everything is not a guard, and a guard whose only caller it refuses is worse.
@@ -1863,7 +1885,7 @@ mod tests {
         // 3. AND IT MUST NOT FIRE ON THE LEGITIMATE CASE. `reap` marks a child `Reaped` and then
         //    removes its entry; a crash between those leaves a reaped child with nothing under it,
         //    which is genuinely not a live child and must keep answering exactly that. This is the
-        //    arm `live_child_at`'s old catch-all shared with the impossible one.
+        //    arm `live_child_at`'s old catch-all shared with the unresolvable one.
         assert!(c.detach_child(t, ghost_epoch).unwrap(), "fixture: the ghost entry is gone");
         let doomed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
         c.set_state(doomed.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
@@ -2356,9 +2378,10 @@ enum ChildLiveness {
     /// can explore it without recursing.
     ReapedWithSubtree(u64),
     // There is deliberately no `Gone` variant. It existed until D124 and meant "no record at all
-    // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a CHILD entry
-    // naming an unpublished branch let the parent be reclaimed. That state is impossible and is
-    // now an error rather than a value; see `TableBranchCatalog::dangling_child`. Keeping the
+    // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a child whose
+    // record could not be read let the parent be reclaimed. A missing record is now an ERROR
+    // rather than a value, because it is not a fact about the child: it is equally the signature
+    // of a record being rewritten right now (`dangling_child` has the mechanism). Keeping the
     // variant unconstructed would only invite the next reader to resolve into it again.
 }
 

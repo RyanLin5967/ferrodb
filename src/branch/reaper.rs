@@ -409,25 +409,29 @@ impl TwoTierReaper {
                     ),
                     // ⛔ **D124 — this was `Err(_) => false`, i.e. RELEASE THE PAGE.** The comment
                     // it replaces said "no record at all: nothing can be forked off it, so
-                    // nothing can see the page". That premise is false. No path in `src/` deletes
-                    // a branch record: retirement is a state flip to `Reaped`, the id-reuse path
-                    // overwrites the recycled slot, and neither `LogBranchCatalog` nor
-                    // `TableBranchCatalog` nor `MemCatalog` ever removes one. So a missing record
-                    // cannot mean "gone", only "never published" — and this owner WAS published,
-                    // because the extent it names was created by `alloc_arena`, which ends in
-                    // `catalog.add_arena` and that refuses a branch with no record.
+                    // nothing can see the page". That premise is false.
                     //
-                    // Which leaves a genuine read failure, and answering "not pinned" to one
-                    // hands back a page the interval rule had deliberately parked for a live
-                    // child. Refusing keeps the entry in the pending log for the next drain;
-                    // `DeferTouched` already records `touched` across this early return, which is
-                    // exactly what it exists for.
+                    // This owner WAS published: the extent it names was created by `alloc_arena`,
+                    // which ends in `catalog.add_arena`, and every catalog refuses that for a
+                    // branch with no record. And a record that is missing *right now* has not
+                    // stopped existing — `TableBranchCatalog::upsert` is delete-then-insert with
+                    // no latch held across the two calls, and `write_record` routes the RECORD
+                    // key through it, so a concurrent `set_root` or `renew_lease` on the owner
+                    // makes this read miss on a perfectly healthy branch.
+                    //
+                    // Answering "not pinned" to that hands back a page the interval rule had
+                    // deliberately parked for a live child. Refusing keeps the entry in the
+                    // pending log for the next drain, so the transient case simply succeeds on
+                    // retry; `DeferTouched` already records `touched` across this early return,
+                    // which is exactly what it exists for.
                     //
                     // Not reachable in production today — `reap_expired` runs under the
                     // per-statement lock every `fork` also takes (`lease_thread.rs`) — but W4
                     // exists to remove that lock, so this has to be gone before W4 lands, not
                     // after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock`, which
-                    // is what makes it reachable at all outside production.
+                    // is what makes it reachable at all outside production. The transient window
+                    // above is why W4 makes this urgent rather than theoretical: with the lock
+                    // gone, the old code frees a live branch's pages on an ordinary `set_root`.
                     Err(e) => Err(e),
                 };
                 let pinned = match pinned {
@@ -711,8 +715,14 @@ impl TwoTierReaper {
         match self.catalog.get_raw(branch.id) {
             Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
             Ok(_) => {}
-            // The slot is gone entirely between the query and here: nothing to reap, and nothing
-            // wrong. Same class as the `Branch` error below.
+            // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
+            // did not vanish between the query and here; what this catches is any `Branch` error
+            // from the read, including the momentary miss `TableBranchCatalog::upsert` opens on a
+            // healthy branch. Declining to reap on one is the safe direction: it frees nothing,
+            // and the next sweep asks again. Same class as the `Branch` error below, which
+            // likewise turns a refusal into "did not reap" rather than aborting the sweep —
+            // deliberately left alone, because propagating it would turn a benign already-reaped
+            // race into a failed sweep for a whole pre-existing class of errors.
             Err(FerroError::Branch(_)) => return Ok(false),
             Err(e) => return Err(e),
         }
