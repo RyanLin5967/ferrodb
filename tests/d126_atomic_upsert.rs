@@ -316,3 +316,146 @@ fn insert_still_does_not_replace() {
          because it knows the key is new would now be paying for a replace it does not need."
     );
 }
+
+// ==============================================================================================
+// THE PRIMARY INDEX. Same defect, same fix, a different subsystem and different key/value types.
+// ==============================================================================================
+
+/// **`execution::update` and `execution::insert` open-coded the same pair, on a user table's
+/// PRIMARY INDEX.** This is that, with the real types.
+///
+/// ```text
+/// update.rs   if new_rid != rid { primary_index.delete(&pk)?;  primary_index.insert(pk, new_rid)?; }
+/// insert.rs   primary_index.delete(&vals[0])?;  ...heap.insert(tuple)?...  primary_index.insert(vals[0], rid)?;
+/// ```
+///
+/// The second is the worse of the two: a whole heap insert sits inside the window. Both are now
+/// one `upsert`.
+///
+/// This arm exists because "the mechanism is the same, so the fix is the same" is an argument, and
+/// the argument is cheap to replace with a measurement. `Value`/`RecordId` serialize differently
+/// from `Vec<u8>`/`Vec<u8>` and land differently in a leaf, so the control is re-run for them
+/// rather than assumed. It must fire, exactly as the control above must.
+///
+/// ⚠ **What this does NOT show.** It probes the index, not a concurrent `UPDATE`. Two statements
+/// cannot reach the executor at once today — the pgwire server serialises whole statements behind
+/// `ServerContext::catalog()`, which is the same exclusion that keeps the catalog's window latent
+/// — so a two-thread probe at the SQL layer would need that lock bypassed, which is a harness of
+/// its own. The window is in the index, the fix is in the index, and that is what is measured.
+#[test]
+fn the_primary_index_rewrite_is_never_absent_either() {
+    use ferrodb::catalog::column::Value;
+    use ferrodb::storage::heap_file_manager::RecordId;
+
+    type PrimaryIndex = BPlusTreeManager<Value, RecordId>;
+
+    fn fresh(tag: &str) -> (tempfile::TempDir, Arc<PrimaryIndex>) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join(format!("{tag}.db")))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let ix = Arc::new(PrimaryIndex::create(bp).expect("create primary index"));
+        for k in 0..PREPOP as i32 {
+            ix.insert(Value::Integer(k), RecordId { page_id: 1, slot_num: k as u16 })
+                .expect("prepop");
+        }
+        (dir, ix)
+    }
+
+    /// A plain `fn` pointer rather than a closure type, so the two arms are the same shape and the
+    /// only difference between them is the body.
+    fn run(
+        ix: &Arc<PrimaryIndex>,
+        pk: Value,
+        rewrite: fn(&PrimaryIndex, &Value, RecordId),
+    ) -> (u64, u64) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let misses = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(READERS + 1));
+        let mut hs = Vec::new();
+        for _ in 0..READERS {
+            let (t, k, stop, misses, reads, barrier) = (
+                Arc::clone(ix),
+                pk.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&misses),
+                Arc::clone(&reads),
+                Arc::clone(&barrier),
+            );
+            hs.push(std::thread::spawn(move || {
+                barrier.wait();
+                let (mut m, mut r) = (0u64, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    if t.search(&k).expect("index search").is_none() {
+                        m += 1;
+                    }
+                    r += 1;
+                }
+                misses.fetch_add(m, Ordering::Relaxed);
+                reads.fetch_add(r, Ordering::Relaxed);
+            }));
+        }
+        barrier.wait();
+        for i in 0..WRITES {
+            rewrite(ix, &pk, RecordId { page_id: 2, slot_num: (i % 60_000) as u16 });
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in hs {
+            h.join().expect("reader thread");
+        }
+        (misses.load(Ordering::Relaxed), reads.load(Ordering::Relaxed))
+    }
+
+    let pk = Value::Integer(PREPOP as i32 / 2);
+
+    // CONTROL — what `update.rs` did. It must fire, or the zero below means nothing.
+    let (_d1, ix1) = fresh("pk-control");
+    let (cm, cr) = run(&ix1, pk.clone(), |t, k, rid| {
+        match t.delete(k) {
+            Ok(()) | Err(FerroError::KeyNotFound) => {}
+            Err(e) => panic!("control delete: {e:?}"),
+        }
+        t.insert(k.clone(), rid).expect("control insert");
+    });
+    println!("D126 primary index CONTROL  (delete+insert): misses={cm} reads={cr}");
+
+    // TREATMENT — what it does now.
+    let (_d2, ix2) = fresh("pk-upsert");
+    let (tm, tr) = run(&ix2, pk.clone(), |t, k, rid| {
+        t.upsert(k.clone(), rid).expect("upsert");
+    });
+    println!("D126 primary index TREATMENT (upsert)      : misses={tm} reads={tr}");
+
+    assert!(cr > 0 && tr > 0, "a reader never ran: control {cr}, treatment {tr}");
+    assert!(
+        cm > 0,
+        "THE PROBE IS NOT DISCRIMINATING for Value/RecordId. delete-then-insert leaves the key \
+         absent between the two calls by construction, and {READERS} readers over {WRITES} \
+         rewrites saw it {cm} times in {cr} reads. The treatment's zero means nothing until this \
+         fires."
+    );
+    assert_eq!(tm, 0, "the primary key was absent {tm} times in {tr} reads under `upsert`");
+    assert!(
+        tr >= cr / 4,
+        "the treatment's readers did only {tr} reads against the control's {cr}; its zero is not \
+         comparable"
+    );
+    // And it replaced rather than accumulating: one entry, holding the last value written.
+    let last = RecordId { page_id: 2, slot_num: ((WRITES - 1) % 60_000) as u16 };
+    assert_eq!(
+        ix2.search(&pk).expect("search"),
+        Some(last),
+        "the last upsert is not readable back"
+    );
+    let dupes = ix2
+        .range_scan(Bound::Included(pk.clone()), Bound::Included(pk.clone()))
+        .expect("scan")
+        .count();
+    assert_eq!(dupes, 1, "`upsert` left {dupes} entries under one primary key");
+}
