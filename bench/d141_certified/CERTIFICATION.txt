@@ -1,0 +1,89 @@
+CERTIFICATION — D141, merged into main as 6084883 on 2026-09-22.  NOT PUSHED (see below).
+
+suite head=            28783ab
+merge commit=          6084883
+second parent=         28783ab           <- VERIFIED by git rev-parse, not asserted
+base before merge=     6167bfd
+
+CODE IDENTITY: `git diff 28783ab 6084883 -- src tests examples Cargo.toml` is EMPTY.
+  The code that was tested and the code that landed are the same code. This is the check,
+  not a claim — D126's bank asserted an equality that was false by 506 lines.
+
+⛔ NOT PUSHED TO origin/main. My own operating instructions forbid pushing to the default
+  branch, so the merge is local and the push is the team lead's. `origin/main` is 6167bfd.
+
+RESULT, verbatim from the runner's own stdout
+---------------------------------------------
+d141merged: mode=whole rc=0 passed=2492 failed=0 build_errors=0 head=28783ab
+d141merged: go rc=0 passed=97 failed=0
+RUNNER_EXIT=0
+
+GATE — tools/land-gate.sh, all three, staleness asked LAST
+----------------------------------------------------------
+certify-head  OK — the verdict names 28783ab
+staleness     COVERED-NO-CODE — base moved 1 commit (6167bfd), bench/ only, no code
+prepush       OK — FFI sweep, cargo build --examples, cargo check --all-targets,
+                   and the x86_64-pc-windows-msvc check, all under CI's RUSTFLAGS
+land-gate: OK — "the evidence is about the tree that will ship"
+
+PRE-REGISTRATION (bench/d141_prereg.txt, amended append-only before the run)
+----------------------------------------------------------------------------
+1. rc=0, failed=0, build_errors=0 ................................... HIT
+2. Go 97 passed / 0 failed .......................................... HIT
+3. all EIGHT new tests present BY NAME, each "... ok" ............... HIT (grepped, not inferred)
+4. total == main's count + 8 ........................................ ⚠ DOES NOT CLOSE, see below
+
+⚠ WHAT THIS GREEN DOES NOT LICENSE
+-----------------------------------
+1. ⚠ THE TOTAL IS ONE TEST ADRIFT OF MAIN'S, AND I COULD NOT CLOSE IT.
+   Mine is mode=whole (2492); main's certification at b2991c6 is mode=per-target (2482).
+   The two modes are not comparable directly. Backing the difference out:
+
+     my whole-mode total                                        2492
+     minus my 8, counted BY NAME in the log                     2484   <- implied main whole
+     minus doctests (1: cow::diff::MemoIdentity)                2483   <- implied main per-target
+     main's certified per-target                                2482
+                                                                ----
+     UNEXPLAINED                                                   1
+
+   Checked and ELIMINATED as causes:
+     * a bin target per-target's glob misses — src/main.rs IS run by whole mode, and has
+       0 tests, so it contributes nothing.
+     * a test target declared outside tests/*.rs — Cargo.toml declares none; 133 tests/*.rs
+       files and exactly 133 "Running tests/" lines in the log.
+     * my branch adding 9 rather than 8 — `git diff main...HEAD -- src tests` adds 8
+       `#[test]` and removes 0, and all 8 are present by name at runtime.
+     * a partial or truncated run — the sum of every "test result: ok. N passed" line is
+       exactly 2492, so the run is internally self-consistent.
+
+   ⇒ The gap is NOT in this change: 8 added statically, 8 observed at runtime, 0 removed.
+     It is a question about main's own per-target certification, or about a test whose
+     collection differs between the two modes. It is handed to the team lead unresolved
+     rather than smoothed over. RESOLVING IT NEEDS a per-target run of this same tree,
+     which is one full suite and was not worth spending a reserved quiet box on.
+
+   ⚠ ALSO CORRECTED HERE: the widely-held "whole = per-target + 2 doctests" is WRONG at this
+     commit. This run has exactly ONE doctest. Anyone applying +2 is off by one, and that may
+     be the whole of the gap above.
+
+2. The fire-check proves each guard FIRES and that the boundary still round-trips. It says
+   nothing about identifier limits ABOVE the catalog layer — there are none in src/.
+
+3. `Catalog::persist` returns through `?` without unpinning the catalog page it fetched, so
+   every refusal leaks one pin. PRE-EXISTING on every error path there; D141 made it reachable
+   from SQL for the first time. Bounded, not fixed: 300 consecutive refusals leave the database
+   working, asserted by many_refused_statements_leave_the_database_working.
+
+4. `wal::log::write_str` (src/wal/log.rs:211) still writes `s.len() as u16` UNCHECKED, and its
+   doc comment one line above claims the opposite: "so a name containing anything at all cannot
+   desync the reader." Out of D141's scope, scoped and handed over as its own row. tel/log.rs
+   and consensus/log.rs are NOT affected — each already wraps it in a checked put_str.
+
+EVIDENCE
+--------
+bench/d141_firecheck.txt   all 8 guards reverted to their raw cast one at a time; 8 KILLED,
+                           0 survivors, unmutated baseline PASS first
+bench/d141_mutate.py       the harness that produced it
+bench/d141_prereg.txt      pre-registration + append-only amendment
+SUMMARY.txt, runner.log    this run, as the runner wrote them
+full logs                  /Users/idide/wt/artie-research/verify-out/d141merged/
