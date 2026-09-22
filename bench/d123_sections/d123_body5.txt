@@ -3,8 +3,11 @@
 5. FALSIFIER SCORECARD — every one pre-registered before the first measurement
 ================================================================================================
 
-  F1  section driven toward zero    DOES NOT FIRE. 2.05x, distributions non-overlapping (warm=0).
-                                    ⛔ UNDECIDED at warm=20k: noise-dominated, reported as such.
+  F1  section driven toward zero    DOES NOT FIRE, BOTH REGIMES. Paired, probe OFF, 9 reps each:
+                                    warm=0 median 2.08x (0/9 within +/-10% of 1.00x), warm=20k
+                                    median 1.86x (1/9). 17 of 18 paired draws above 1.10x.
+                                    ⛔ My earlier "UNDECIDED at warm=20k" is WITHDRAWN: that was
+                                    the unpaired summary of the same data. See section 1c.
   F2  residual grows with T?        DOES NOT FIRE. It grows (HOLD 1.25-1.71x), so it IS contention.
   F3  >50% attributed?              SATISFIED. 78.8% of the 0.1532 ms on named, measured causes.
   F4  hold vs handoff               H-HANDOFF DEAD. U(hold) 94-97% across four runs.
@@ -24,8 +27,13 @@
                                     expected — this box was quieter tonight than when the 4,382 was
                                     taken — but it is a marginal pass and is not dressed up as more.
   A5  closure identity              HOLDS. -0.01% / -0.28% / -2.18% at T=1/8/64, band +/-5%.
-  A6  clean F1                      Run. Probe perturbation -1.20% / -1.83%, inside +/-2%, so no
-                                    duration in this row is quarantined.
+  A6  clean F1                      Run twice. Probe perturbation -1.20% / -1.83%, inside +/-2%,
+                                    so no duration in this row is quarantined. The paired
+                                    within-rep ratio was added after the first attempt and is what
+                                    decided both regimes.
+  A8  truncation sentinel           Added after two runs produced result-shaped files that were
+                                    not results. bench/d123_assemble.sh refuses to quote any arm
+                                    lacking `# harness_exit=0`.
   A7  eviction + the missing arm    Eviction eliminated from banked data.
 
 ================================================================================================
