@@ -1,0 +1,5 @@
+d127invert: queued behind a running suite (92075 land21ae398 2026-09-22T11:57:51Z)
+d127invert: acquired the suite lock after 480s
+d127invert: mode=per-target rc=0 passed=2482 failed=0 build_errors=0 head=3b0bee5 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.log
+d127invert: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.go.log
+HARNESS_EXIT=0

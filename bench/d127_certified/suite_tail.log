@@ -1,0 +1,40 @@
+test a_torn_table_page_is_served_as_a_row_that_was_never_written ... ok
+test a_garbled_wal_header_takes_the_database_down_with_its_data_intact ... ok
+test recovery_gives_every_missing_page_its_own_empty_page_in_ascending_order ... ok
+test recovery_itself_writes_the_same_sequence_three_times ... ok
+test recovery_holds_at_every_fault_point_sync_only ... ok
+test recovery_holds_at_every_fault_point_write_through ... ok
+test recovery_holds_at_every_fault_point_through_the_catalog ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.94s
+
+     Running tests/w4_forget_branches.rs (target/debug/deps/w4_forget_branches-0a41a5b3bd0a4bd7)
+
+running 3 tests
+test forget_branches_refuses_a_branch_that_is_still_live ... ok
+test a_reaped_branch_nobody_reported_is_still_reconciled ... ok
+test forget_branches_drops_the_branches_it_is_given ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w4_sweep_slot_recycle.rs (target/debug/deps/w4_sweep_slot_recycle-6ee876f01aec3d39)
+
+running 1 test
+test a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests ferrodb
+
+running 1 test
+test src/cow/diff.rs - cow::diff::MemoIdentity (line 443) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+test src/cow/diff.rs - cow::diff::MemoIdentity (line 483) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+all doctests ran in 0.66s; merged doctests compilation took 0.34s

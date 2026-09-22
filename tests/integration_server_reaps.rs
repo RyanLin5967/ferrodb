@@ -822,12 +822,12 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
     .unwrap();
 
     let deadline = Instant::now() + PATIENCE;
-    while lease.stats().refused < 3 && Instant::now() < deadline {
+    while lease.stats().refused_scans < 3 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     let refusing = lease.stats();
     assert!(
-        refusing.refused >= 3,
+        refusing.refused_scans >= 3,
         "the scan did not refuse on a node with no cluster time; it either reaped or stalled: \
          {refusing:?}"
     );
