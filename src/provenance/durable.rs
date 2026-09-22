@@ -581,10 +581,14 @@ impl ProvenanceStore for DurableProvenanceStore {
         let mut body = Vec::with_capacity(96);
         body.push(TAG_RUN);
         body.extend_from_slice(&id.0.to_be_bytes());
-        write_str(&mut body, &run.agent_id);
-        write_str(&mut body, &run.run_id);
-        write_str(&mut body, &run.model);
-        write_str(&mut body, &run.model_version);
+        // D154: these four are the durable provenance store's own use of the WAL's string
+        // encoder, and they are refused at the encoder rather than truncated. `intern` already
+        // returns `Result`, so the refusal costs nothing here — the cascade this row was scoped
+        // against terminates at this frame.
+        write_str(&mut body, &run.agent_id, "an agent id")?;
+        write_str(&mut body, &run.run_id, "a run id")?;
+        write_str(&mut body, &run.model, "a model name")?;
+        write_str(&mut body, &run.model_version, "a model version")?;
         body.extend_from_slice(&run.prompt_hash);
         body.extend_from_slice(&run.started_at.to_be_bytes());
         body.extend_from_slice(&run.parent_branch.id.to_be_bytes());

@@ -325,28 +325,35 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
                 columns: columns.clone(),
             };
             let mut rec_bytes = Vec::new();
-            rec.serialize(&mut rec_bytes);
+            // D154: this `?` is now the truncation refusal. `wal::log::write_str` checks its own
+            // `u16` prefix, so an over-long name is refused HERE, at the encoder, rather than
+            // being written truncated and detected afterwards.
+            rec.serialize(&mut rec_bytes)?;
 
-            // **`RecKind::serialize` writes every string length as `s.len() as u16`, unchecked.**
-            // A table or column name over 65535 bytes therefore gets a truncated length prefix
-            // followed by its full bytes, and the frame that results is one the peer misparses —
-            // the receiver's re-encode check would catch it, but that is the wrong side of the wire
-            // to find out that this node emitted rubbish.
+            // ⚠ THE COMMENT HERE USED TO SAY `RecKind::serialize` writes every string length as
+            // `s.len() as u16` UNCHECKED, and the refusal below used to say so too. **Both were
+            // true when written and are false since D154**, which moved the guard into
+            // `write_str` itself. This block is one of the three local workarounds that proved
+            // the root was broken; it is kept, but no longer for that reason.
             //
-            // Checked by round-tripping the record here, the same total check `decode_catalog`
-            // applies. It costs one encode of a schema description, on a DDL path, and it catches
-            // every present and future truncation in an encoder this file does not own.
+            // What it still earns: it is a TOTAL check, the same one `decode_catalog` applies, so
+            // it catches non-canonical spellings and trailing bytes — which the length guard does
+            // not and cannot. It costs one encode of a schema description on a DDL path.
+            //
+            // ⛔ It does, however, MASK a mutant of `write_str`'s guard along this path: delete
+            // that guard and this round trip would still refuse an over-long name. So the
+            // fire-check for the guard deliberately does NOT come through here — see
+            // `tests/d154_write_str_refuses.rs`, which drives `WalManager::append` directly.
             match RecKind::deserialize(&rec_bytes) {
                 Ok(back) => {
                     let mut again = Vec::new();
-                    back.serialize(&mut again);
+                    back.serialize(&mut again)?;
                     if again != rec_bytes {
                         return Err(FerroError::Wal(format!(
                             "a Catalog command for table {table:?} does not survive its own \
                              encoding, so the frame would be misparsed by the peer rather than \
-                             refused. `wal::log` writes string lengths as `as u16`, so a name over \
-                             {} bytes truncates its prefix",
-                            u16::MAX
+                             refused. This is a canonicality failure, not a truncated length \
+                             prefix — `wal::log::write_str` refuses those at the encoder"
                         )));
                     }
                 }
@@ -657,7 +664,7 @@ fn decode_catalog(bytes: &[u8], at: &mut usize) -> Result<Command, FerroError> {
     // description.
     let decoded = RecKind::deserialize(&rec_bytes)?;
     let mut reencoded = Vec::new();
-    decoded.serialize(&mut reencoded);
+    decoded.serialize(&mut reencoded)?;
     if reencoded != rec_bytes {
         return Err(FerroError::Wal(format!(
             "a Catalog command's log record did not re-encode to the bytes it arrived as ({} bytes \

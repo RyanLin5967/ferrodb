@@ -452,21 +452,26 @@ const V_BIGINT: u8 = 5;
 const V_DECIMAL: u8 = 6;
 const V_TIMESTAMP: u8 = 7;
 
-/// `write_str` with the guard [`crate::wal::log::write_str`] does not have.
+/// `wal::log::write_str`, with this file's error vocabulary on the refusal.
 ///
 /// The write itself is `wal::log`'s, deliberately: one string encoder means the WAL, the durable
 /// provenance store and this file cannot disagree about what a length-prefixed string is.
+///
+/// ⛔ **THIS NO LONGER CHECKS THE LENGTH, AND MUST NOT.** It used to, because `write_str` wrote
+/// `s.len() as u16` unchecked; D154 moved the guard into `write_str` itself, which is the only
+/// place it can be the authority. Re-adding a check here would mask every mutant of that one —
+/// and this wrapper's own existence, alongside `consensus::log::put_str`, is what showed the root
+/// was broken in the first place. All that is left here is the `FerroError::Merge` shape a merge
+/// frame's caller expects; `tests_durable_log.rs` asserts that message text.
 fn put_str(out: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), FerroError> {
-    if s.len() > u16::MAX as usize {
-        return Err(FerroError::Merge(format!(
+    write_str(out, s, what).map_err(|_| {
+        FerroError::Merge(format!(
             "a {what} in this frame is {} bytes, over the {} a length prefix can hold; refusing to \
              write a record that could not be read back",
             s.len(),
             u16::MAX
-        )));
-    }
-    write_str(out, s);
-    Ok(())
+        ))
+    })
 }
 
 fn put_u32_len(out: &mut Vec<u8>, n: usize, what: &'static str) -> Result<(), FerroError> {

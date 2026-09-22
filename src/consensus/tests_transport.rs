@@ -715,7 +715,7 @@ fn a_catalog_command_carrying_a_page_id_is_refused() {
         columns: vec![("id".into(), DataType::Integer, false)],
     };
     let mut rec_bytes = Vec::new();
-    rec.serialize(&mut rec_bytes);
+    rec.serialize(&mut rec_bytes).unwrap();
 
     let mut b = Vec::new();
     b.extend_from_slice(&1u32.to_be_bytes());
@@ -745,7 +745,7 @@ fn a_catalog_command_carrying_a_page_id_is_refused() {
         columns: vec![("id".into(), DataType::Integer, false)],
     };
     let mut ok_bytes = Vec::new();
-    rec.serialize(&mut ok_bytes);
+    rec.serialize(&mut ok_bytes).unwrap();
     let mut good = b[..b.len() - rec_bytes.len() - 4].to_vec();
     good.extend_from_slice(&(ok_bytes.len() as u32).to_be_bytes());
     good.extend_from_slice(&ok_bytes);
@@ -1221,7 +1221,7 @@ fn a_catalog_command_with_bytes_after_its_ddl_record_is_refused() {
         columns: vec![("id".into(), DataType::Integer, false)],
     };
     let mut rec_bytes = Vec::new();
-    rec.serialize(&mut rec_bytes);
+    rec.serialize(&mut rec_bytes).unwrap();
     rec_bytes.extend_from_slice(b"smuggled");
 
     let mut b = Vec::new();
@@ -1820,7 +1820,7 @@ fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
         columns: vec![("id".into(), DataType::Integer, false)],
     };
     let mut bytes = Vec::new();
-    rec.serialize(&mut bytes);
+    rec.serialize(&mut bytes).unwrap();
     match crate::wal::log::RecKind::deserialize(&bytes) {
         Ok(crate::wal::log::RecKind::Ddl { table, columns, .. }) => {
             assert_eq!(table, "aaaa", "the truncated prefix no longer yields a short table name");
