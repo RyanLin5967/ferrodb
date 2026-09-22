@@ -72,3 +72,15 @@ FIRE-CHECK, on the tree this certifies, baseline before any mutant was read
   forget         w4_sweep_slot_recycle            KILLED
   8/8. `chunk_stop` additionally returns rc=0 against all three PRE-EXISTING tests named for
   `forget_reaped_branches` — which is how the coverage gap was measured rather than asserted.
+
+CODE IDENTITY — the tip ships exactly the certified code, COMPUTED not assumed
+  This file cannot name the commit that contains it: a certification body is a PREIMAGE of its
+  own sha. The gate named `bfcfa0e`; this file and the artifacts beside it were committed above
+  it. What closes that gap is a computation, run at 5babf9a:
+
+    git diff --stat bfcfa0e HEAD -- src tests examples Cargo.toml   ->   EMPTY
+    git diff --name-only bfcfa0e HEAD | cut -d/ -f1 | sort -u       ->   bench
+
+  So every commit above the gated sha is bench-only, and the tree that would ship is
+  byte-identical, in src/ tests/ examples/ and Cargo.toml, to the tree the suite measured.
+  Anyone adding a commit above this one must re-run that first line and get EMPTY, or re-gate.
