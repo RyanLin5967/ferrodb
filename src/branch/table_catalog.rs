@@ -84,10 +84,20 @@ impl TableBranchCatalog {
     /// means a crash between the tree write and the sidecar write leaves a database pointing at a
     /// stale root — silently, because a stale root is a perfectly valid B+tree of an older state.
     ///
-    /// A fixed indirection page moves the volatile value inside the database, where the buffer
-    /// pool's WAL gate already orders writes, and leaves the caller holding an id that is written
-    /// once and never changes. This is the superblock-pointer arrangement: a known location naming
-    /// a moving root, the same shape as SQLite finding `sqlite_schema` at page 1.
+    /// A fixed indirection page moves the volatile value inside the database, so there is ONE
+    /// write to order instead of two files to keep in step, and leaves the caller holding an id
+    /// that is written once and never changes. This is the superblock-pointer arrangement: a known
+    /// location naming a moving root, the same shape as SQLite finding `sqlite_schema` at page 1.
+    ///
+    /// ⚠ **This used to claim the page lands "where the buffer pool's WAL gate already orders
+    /// writes". It does not, and the correction is stricter than the claim it replaces.**
+    /// `BufferPoolManager::wal_gate` defers to `page_lsn_of`, which reads an LSN only for first
+    /// bytes 0 (heap), 2 and 3 (B+tree internal/leaf) and answers 0 for everything else. This page
+    /// begins with the high byte of [`HEADER_PAGE_MAGIC`] (`0xFE`), so the gate is a no-op on it —
+    /// and B+tree pages never set an LSN either, so it is a no-op on the tree this page names.
+    /// Index structure is not logged at all (`wal::recovery::rebuild_indexes` reconstructs every
+    /// tree from the heap), so there is nothing for a gate to order here. What the fixed page buys
+    /// is the sentence above, not WAL ordering. Do not build a durability argument on the gate.
     pub fn create_with_header(
         pool: Arc<BufferPoolManager>,
         trunk_root: PageId,

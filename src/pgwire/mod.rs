@@ -194,7 +194,24 @@ impl ServerContext {
     /// pages a writer is freeing.
     ///
     /// Standing down is not a failure: the caller falls back to the exclusive path, which blocks
-    /// on the mutex and is correct. It happens only while DDL is actually in flight.
+    /// on the mutex and is correct.
+    ///
+    /// ⚠ **This used to say it happens "only while DDL is actually in flight". That is false, and
+    /// W4's check 3 is reasoning from it.** Every exclusive acquirer announces, because
+    /// [`ServerContext::catalog`] drains unconditionally — that is deliberate and documented there.
+    /// So the announcers, read rather than assumed, are all four `ctx.catalog()` callers:
+    ///
+    /// - `pgwire/extended.rs` at the statement level (two sites) — which today means **every**
+    ///   INSERT/UPDATE/DELETE, every MERGE and every `BEGIN AGENT SESSION`, not only DDL, because
+    ///   `try_run_read` admits only EXPLAIN and non-`AS OF` SELECT;
+    /// - [`ServerContext::read_catalog`]'s own snapshot refresh, on first use and after a schema
+    ///   change;
+    /// - `branch::lease_thread`'s `RuntimeLock` impl, which holds this guard across a **whole reap
+    ///   scan**, every `DEFAULT_SCAN_MILLIS` (30 s) by default. That one is neither a statement nor
+    ///   DDL, and it is the announcer a shared-path design is least likely to look for.
+    ///
+    /// The rate therefore is not a property of how much DDL a workload runs, and a design that
+    /// moves DML onto this path must **measure** the stand-down rate rather than infer it here.
     pub fn begin_read<'a>(
         &self,
         slot: &'a std::sync::atomic::AtomicBool,

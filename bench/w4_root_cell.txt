@@ -1,307 +1,471 @@
-W4 OPTION (c) — MAKE THE ROOT CELL ITSELF THE DURABLE RECORD
-Priced 2026-09-22. Read-only design pass at ac2ab26 (worktree wf_e78d06ad-550-1, branch
-W4-root-cell-durable). Every file:line below was re-read in this tree, not recalled.
+W4 OPTION (c) — "MAKE THE ROOT CELL ITSELF THE DURABLE RECORD"
+=====================================================================================
+TWO PASSES. Pass 1 (base 83cb6e8, commits 7828073 + 7627b4d) is preserved VERBATIM below from
+section "VERDICT, up front" onward — it got here first and it is the better copy of everything
+it covers. Pass 2 (base ac2ab26, this merge) adds one option pass 1 did not consider, and the
+source reading that makes it possible. Nothing in pass 1 is restated here and nothing in it is
+retracted.
 
-NO CARGO WAS RUN. Instrument readings, taken in a command separate from any work:
+=====================================================================================
+PASS 2 DELTA — added 2026-09-22, base ac2ab26
+=====================================================================================
+
+NO CARGO WAS RUN in pass 2. Instrument readings, each taken in a command separate from any work:
   ~/wt/logs/measure-lock.sh status  -> "CEILING-resume 86920 2026-09-22T07:05:12Z"  (HELD)
-  cat /tmp/ferrodb-suite.lock/owner -> "80516 d125-69dd9b5-r2 2026-09-22T07:04:28Z"  (HELD)
-Both locks are held by other lanes, so nothing here is a measurement and nothing here was
-compiled. This is a reading. Everything below is falsifiable from source.
+  cat /tmp/ferrodb-suite.lock/owner -> "80516 d125-69dd9b5-r2 2026-09-22T07:04:28Z"  (HELD, and
+                                       pid 80516 is ALIVE by `kill -0`)
+So pass 2 is a reading, not a measurement, and nothing below was compiled.
 
-====================================================================================
-VERDICT
-====================================================================================
-Option (c) SURVIVES, and it closes check 4. But the row's own framing of it is wrong, and the
-correction is the finding:
+PASS 1's TWO LOAD-BEARING CLAIMS, RE-VERIFIED INDEPENDENTLY BEFORE BEING CARRIED FORWARD
+(neither was taken on trust; both hold):
+  - THE LEASE-THREAD ANNOUNCER. `impl RuntimeLock for ServerContext` in
+    `src/branch/lease_thread.rs` is `fn with_runtime_lock(&self, body) { let _statement =
+    self.catalog(); body(); }` — the exclusive catalog guard is held across the WHOLE `body()`,
+    and `DEFAULT_SCAN_MILLIS = 30_000` (`lease_thread.rs:109`). Confirmed: a periodic announcer
+    that is neither DDL nor a statement. Check 3's "only while DDL is in flight" premise is
+    false, exactly as pass 1 says.
+  - THE WAL GATE IS A NO-OP ON THESE PAGES. `wal_gate` (`buffer_pool.rs:1424-1432`) calls
+    `flush_up_to` only when `page_lsn_of(data) > 0`, and `page_lsn_of` (`:1435-1441`) is
+    `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }`. A catalog page stamps 4 or 5, so it falls
+    to `_ => 0` and the gate does nothing. Confirmed.
 
-  ** THE ROOT CELL DOES NOT NEED TO BE MADE DURABLE. IT IS THE SECOND COPY, NOT THE FIRST. **
-
-There is already exactly ONE durable home for a root, it is already at a fixed location, and
-the circularity the brief asks about is already solved. What (c) has to do is not "add
-durability to the cell" but "stop having two values", and the cheapest way to do that needs no
-new file, no new page, no new format and no new bootstrap.
-
-Recommended form, named (c3) below: make `Catalog::persist()` — which is ALREADY `&self` —
-read the live cell instead of the record field, and have the DML tail call it (conditionally)
-instead of `sync_roots`. The diff is contained; it needs one new short mutex private to
-`persist`, and that mutex provably does not recreate check 4's deadlock (argument in section 6).
-
-The textbook end-state, (c5) "the root page id never moves", is STRICTLY BETTER on the D1 axis
-and is what SQLite and InnoDB do — but it invalidates D53's mechanism and both of D53's pinning
-tests, and it needs a new correctness argument inside the B-link descent. That is its own row,
-not part of W4. Stated, not recommended for this lane.
-
-====================================================================================
-1. WHERE THE ROOT CELL LIVES TODAY — the accounting, verified
-====================================================================================
-There are TWO copies of every tree root, plus a reconciler between them.
-
-COPY 1 — DURABLE.  `TableEntry::primary_index_root`, `IndexInfo::root_page_id`,
-  `FullTextIndexInfo::root_page_id`, serialized onto the catalog page chain.
-  - The chain head is `Catalog::first_catalog_page_id`, and `Catalog::create`
-    (catalog.rs:65-76) comments it "= 1 on a fresh DB"; `cli.rs:67` opens with the constant
-    `FIRST_CATALOG_PAGE_ID`.
-    => A FIXED LOCATION. The circularity the brief warns about is already answered, and (c)
-    does not disturb it.
-  - Byte layout: catalog_page.rs:65 header, then per entry
-    `name_len|name|first_directory_page_id|primary_index_root|time_travel_root|...`
-    (serialize at catalog_page.rs:74-100, deserialize at :190-279).
-  - SOLE WRITER of catalog-page bytes, verified by grepping every assignment to `frame.data`
-    in catalog.rs: :74 (`create`), :478 (stamping a NEW chain page), :492 (`persist`).
-    Nothing else in src/ writes a catalog page. That is the property (c) must preserve, and
-    (c3) preserves it exactly.
-
-COPY 2 — IN MEMORY, AND AUTHORITATIVE AT RUNTIME.  `Catalog::roots:
-  HashMap<(String, Option<String>), Arc<AtomicU32>>` (catalog.rs:56).
-  Its own doc: "**Shared root cells, one per tree.** Deliberately NOT serialized — it is
-  derived from `tables` and rebuilt by [`Catalog::sync_root_cells`]" (catalog.rs:44-46).
-  - Seeded from COPY 1 at load (`sync_root_cells`, catalog.rs:112-131; call at :534).
-  - Written on the hot path in exactly one place: `index.rs:593`,
-    `self.root_page_id.store(new_page_id, Ordering::Release)` inside `insert_into_parent`,
-    on `&self`, holding page write latches, with no catalog in scope at all.
-  - Handed to statements by `Catalog::root_cell(&self, ..)` (catalog.rs:89-91) — a plain hash
-    lookup on `&Catalog`, no lock — and consumed by `plan::open_table` (plan.rs:109-134),
-    `optimizer.rs:63-81`, `fulltext_search.rs:250`.
-
-RECONCILER.  `sync_roots` (executor.rs:495-510) and `sync_fulltext_roots` (executor.rs:522-532),
-  called at the tail of all three DML writers:
-    insert.rs:168-169 · update.rs:156-157 · delete.rs:69
-  Each loads COPY 2, compares with COPY 1, and calls `update_primary_root` /
-  `update_index_root` / `update_fulltext_root` only when they differ.
-
-====================================================================================
-2. THE FINDING THAT MAKES (c) EASY, AND IT SHARPENS W4's PREMISE
-====================================================================================
-`Catalog::persist()` is declared `pub fn persist(&self)` — catalog.rs:432. NOT `&mut self`.
+-------------------------------------------------------------------------------------
+⭐ THE READING PASS 1 MISSED, AND IT REMOVES PASS 1's LARGEST STATED COST
+-------------------------------------------------------------------------------------
+`Catalog::persist()` is declared `pub fn persist(&self)` — `catalog.rs:432`. **NOT `&mut self`.**
 
 => THE DURABLE WRITE HAS NEVER NEEDED `&mut Catalog`.
 
-What needs `&mut` is the three-line prologue in `update_primary_root` (catalog.rs:365-376):
+Pass 1 describes `update_primary_root` correctly ("mutate the entry, then `self.persist()`") but
+does not draw the consequence. What actually needs `&mut` is only the prologue
+(`catalog.rs:365-376`):
+
     let entry = self.tables.get_mut(table)?;   // <-- the ONLY reason for &mut
     entry.primary_index_root = new_root;
     self.persist()?;                            // &self
     if let Some(cell) = self.roots.get(..) { cell.store(new_root, Release); }
 
 So the exclusive, whole-statement, every-connection-waits catalog mutex is held at the DML tail
-**to mutate an in-memory mirror of a value that no runtime reader consults.** Check 1 already
-established the second half of that sentence (every runtime reader of `primary_index_root` is a
-`None =>` fallback arm behind D53's shared cell). This pass adds the first half: the mirror is
-write-mostly. Its readers are `persist()` (which re-serializes it), `rebuild_indexes`
-(recovery.rs:235/246/272, which OVERWRITES it), `alter.rs`, and the fallback arms.
+**to mutate an in-memory mirror of a value no runtime reader consults.** Check 1 established the
+second half of that sentence (every runtime reader of `primary_index_root` is a `None =>`
+fallback behind D53's shared cell). This is the first half: the mirror is write-mostly. Its
+readers are `persist()` (which re-serializes it), `rebuild_indexes` (which OVERWRITES it),
+`alter.rs`, and the fallback arms.
 
-=> W4's tail dependency on `&mut Catalog` is not a durability requirement. It is an artifact of
-keeping a mutable second copy. That is the D1 lesson pointing at D53's own cell.
+-------------------------------------------------------------------------------------
+(c3) — A FORM OF (c) WITH NO FORMAT BREAK. Pass 1 did not consider it.
+-------------------------------------------------------------------------------------
+Pass 1 specifies (c) as: repurpose `primary_index_root` into a home-page id and reuse
+`TableBranchCatalog`'s superblock pointer. That is admissible and it is the better STEADY STATE
+— its section 6(e) is right that a four-byte write to one page beats rewriting the whole catalog
+chain. Its own section 6(a) names the price: an ON-DISK FORMAT BREAK across 31 sites, "the
+largest single cost".
 
-====================================================================================
-3. THE FOUR SHAPES OF (c), DEFLATED IN ORDER
-====================================================================================
-(c1) WRITE-THROUGH CELL PATCHING THE CATALOG PAGE IN PLACE.
-  `Arc<AtomicU32>` becomes `Arc<DurableRoot{ atomic, page_id, byte_offset, pool }>`; `store`
-  also patches 4 bytes at `byte_offset`.
-  Checks that pass: the field sits at a computable offset (catalog_page.rs:95-97); the page
-  carries a `checksum` field (catalog_page.rs:14) that is copied through serialize/deserialize
-  and NEVER COMPUTED OR VERIFIED anywhere in src/, so an in-place patch would not invalidate it.
-  (Recorded as an observation about the checksum, not a recommendation.)
-  WHY IT DIES: it puts the catalog-page byte layout in TWO places — `CatalogPage::serialize`
-  and the patcher — and the second one fails SILENTLY in the direction that looks like success.
-  A layout change writes 4 bytes into the middle of a column name and you find out on reopen.
-  That is a second mechanism at the byte level, which is the D1 objection one layer down.
-  REJECTED.
+(c3) buys the same check-4 dissolution for none of that price:
 
-(c2) A NEW FIXED "ROOTS PAGE", i.e. the `TableBranchCatalog::publish_root` pattern
-  (branch/table_catalog.rs:359-375) generalised. That function is real prior art in this repo
-  and is exactly (c) done once: it loads the tree's live root, compares against a published
-  value with an `AtomicU32::swap`, writes a fixed header page only when it moved, and it is
-  `&self`. Its sibling doc states the circularity answer outright (branch/table_catalog.rs:379):
-  "The root page id is the **one** value that cannot live in the tree, because reading the tree
-  requires it."
-  WHY IT DOES NOT TRANSFER: `TableBranchCatalog` has ONE tree and ONE root. The SQL catalog has
-  N roots over a set that changes with DDL, so a roots page needs slot allocation, slot reuse on
-  DROP, and compaction. And to avoid being a second copy, `TableEntry`'s root fields have to be
-  DELETED — which changes the catalog page format, `wal/recovery.rs`'s rebuild, `alter.rs`, the
-  `None =>` fallbacks, and the catalog image carried in `consensus/snapshot.rs`.
-  This is "add a new durable file for roots". It is what D1's lesson says not to do, and the
-  deflation the brief asked for is the one that kills it. REJECTED.
-
-(c3) *** MAKE `persist()` READ THE CELL. *** <- RECOMMENDED
-  One value, one durable location, one writer of that location.
   - `Catalog::persist()` already walks `self.tables` and clones each `TableEntry` into the page
-    (catalog.rs:440-461). Change: before `add_entry`, overwrite the clone's root fields from
+    (`catalog.rs:440-461`). Change: before `add_entry`, overwrite the clone's root fields from
     `self.roots` — `self.root_cell(name, None)`, plus one per secondary and full-text index.
     `persist` is `&self` and `root_cell` is `&self`, so no signature changes.
-  - `sync_roots` / `sync_fulltext_roots` are replaced by ONE `&Catalog` function that compares
-    each live cell against the stored record and calls `persist()` iff any differ — the same
-    conditional check 1 measured, in the same place, on the same rare branch.
-  - `TableEntry::primary_index_root` stops being an independently-mutated value and becomes what
-    it already is in practice: the seed `sync_root_cells` reads at load, and a field `persist`
-    writes. `update_primary_root` and friends stay for ALTER/DROP/tests, which legitimately hold
-    `&mut`.
-  RESULT: the DML tail takes `&Catalog`. `sync_roots` leaves the exclusive path. No new file, no
-  new page, no new format, no new bootstrap, and the catalog page still has exactly one writer.
+  - `sync_roots` / `sync_fulltext_roots` become ONE `&Catalog` function that compares each live
+    cell against the stored record and calls `persist()` iff any differ — the same conditional
+    check 1 measured, in the same place, on the same rare branch.
+  - `TableEntry::primary_index_root` KEEPS ITS MEANING. It stops being an independently-mutated
+    value and becomes what it already is in practice: the seed `sync_root_cells` reads at load,
+    and a field `persist` writes.
 
-(c5) MAKE THE ROOT PAGE ID CONSTANT — the standard answer, stated because rule 1b demands it.
-  On a root split, copy the old root's contents into a freshly allocated page (which becomes the
-  left child) and rewrite the SAME page id as the new internal root. SQLite's `balanceDeeper`;
-  InnoDB records a fixed root page number in its data dictionary for the same reason.
-  Then COPY 1 is never stale, because it never changes after CREATE. `sync_roots`,
-  `update_*_root`, `Catalog::roots` and `sync_root_cells` all become unnecessary, and the cost
-  is one page alloc + one page copy per ROOT split (O(log_F N) over a table's entire life), with
-  ZERO catalog interaction ever.
-  WHY IT IS NOT THIS ROW: it is B+tree surgery under the B-link optimistic descent
-  (index.rs:240-260), the project's most delicate invariant, and it falsifies D53 by
-  construction. `tests/d53_shared_root_cell.rs:45` inserts "until its root page id changes" —
-  under (c5) that loop never terminates. `tests/d53_private_root_allowlist.rs` pins the
-  `root_cell`+`open_shared` shape that (c5) makes pointless. Those are not stale assertions to
-  be quieted; they pin a mechanism (c5) deliberately removes, which is a contract change needing
-  its own row and its own argument. NOT bundled into W4.
+  ON-DISK FORMAT: unchanged. No v6 stamp, no upgrade-on-read, no migration.
+  BLAST RADIUS: the 31 `primary_index_root` sites pass 1 counted are untouched — the field means
+    what it meant. The diff is `persist`, the two `sync_*` functions, three DML call sites, and
+    `Modify::execute`'s signature.
+  CIRCULARITY: unchanged and therefore trivially satisfied — fixed page 1 -> catalog chain ->
+    root. (c3) adds no bootstrap hop at all, where (c2-repurposed) adds one.
+  D1: goes 2 mechanisms -> 1, the same direction as pass 1's form. After it the cell is the only
+    mutable root value in the process and the catalog page is the only durable one, written by
+    the only function that has ever written it (verified: every `frame.data` assignment in
+    catalog.rs is `:74` create, `:478` new-chain-page stamp, `:492` persist — nothing else in
+    src/ writes a catalog page).
 
-====================================================================================
-4. CIRCULARITY CHECK — the one the brief demanded
-====================================================================================
-"Reopen must find the roots before it can read anything, so whatever holds them must be
-reachable from a fixed location."
-Under (c3): the roots stay exactly where they are — inside `TableEntry` on the catalog page
-chain whose head is the constant page 1. Reopen is `Catalog::open(bp, FIRST_CATALOG_PAGE_ID)`
--> `load()` -> `sync_root_cells()` (catalog.rs:534), unchanged, byte for byte the same path.
-(c3) ADDS NO BOOTSTRAP. PASSES trivially, and that is the main reason to prefer it over (c2),
-which would have had to invent one.
+  CHECK 4: dissolves, same as pass 1's form, and the lock argument is different enough to state.
+  (c3) needs one new lock — see the obligation below — call it `persist_lock`, a `Mutex<()>`
+  inside `Catalog`, taken and released entirely inside `persist()`. Edges:
+      exclusive path: catalog mutex -> persist_lock      (DDL persists while holding the mutex)
+      shared path:    read slot     -> persist_lock      (a splitting DML persists under its pass)
+      drain_readers:  catalog mutex -> waits on read slots
+      persist_lock holder: waits on nothing relevant. AUDITED, not assumed: every lock-ish call
+      in the body of `persist` (`catalog.rs:432-520`) is a buffer-pool call and nothing else —
+      `fetch_page`, `frames[i].read()`, `frame_write`, `unpin_page`, `new_page`, and the orphan
+      `deallocate`. No catalog mutex, no read slot, no B+tree latch.
+  persist_lock has out-degree zero, so it is a sink and the graph is acyclic. And (c3) never
+  drops the pass, so option (a)'s DML-vs-DDL window never opens and `sync_roots`'
+  `ok_or(KeyNotFound)` (`executor.rs:497`) stays the unreachable tell it is today. Do not "fix"
+  that `ok_or`.
+  THE ONE EDGE THAT WOULD BREAK THIS, named so it is checked and not rediscovered: persist ->
+  buffer-pool page-table lock (via `new_page`/`deallocate`). A cycle needs a path holding the
+  pool's page-table lock that then blocks on persist_lock. Nothing can today, because
+  persist_lock is new and `persist` is its only acquirer. A second acquirer inherits that
+  obligation and it belongs in the lock's own doc comment.
 
-====================================================================================
-5. D1 CHECK — "is this a second mechanism?"
-====================================================================================
-D1's lesson is that the branch catalog stopped being a second mechanism and became a system
-table so there would not be two. Applied here honestly:
+  THE OBLIGATION (c3) BUYS, stated rather than discovered later. `persist()` is `&self` but has
+  never actually RUN concurrently — every caller reaches it from a `&mut self` method or from
+  recovery. (c3) makes it a concurrent path and it is not safe as written:
+    (i)  LOST UPDATE OF A ROOT. Two shared-path persists interleave; the one that read an older
+         cell finishes LAST and writes a stale root — the exact corruption `sync_roots` prevents.
+    (ii) ORPHAN-PAGE DOUBLE FREE. `persist` shrinks the chain by unlinking and deallocating the
+         orphan tail (`catalog.rs:486` onward). Two concurrent persists can free it twice. This
+         is the less obvious and the more damaging of the two.
+  FIX, one lock and not a new mechanism: take `persist_lock` as the first statement of
+  `persist()`, WITH THE CELL READS INSIDE IT. Sufficient, not merely necessary — split S stores
+  its cell at t and then persists behind P; if P's in-lock read is after t it captured S's value,
+  and if before t then S's own persist runs strictly after P releases and writes the newer one.
+  Either way the last write is the live value.
+  ⚠ This is the SAME SHAPE pass 1 flagged in `publish_root` ("load `root` BEFORE the swap … safe
+  only because every caller reaches it under the `logical` mutex"). Both forms of (c) need a leaf
+  lock on the rare split branch, for the same reason, and neither can inherit the branch
+  catalog's ordering for free.
 
-  TODAY there are already two copies of the root and a reconciler between them. D53 created the
-  second one (for a good reason: the root-split retry was dormant without it) and `sync_roots`
-  is the tax. W4's check 4 deadlock is that tax coming due on the shared path.
+  WRITE VOLUME vs TODAY: LOWER, not higher. I drafted this as "more work per root split" and it
+  was wrong. `update_primary_root` ALREADY calls `self.persist()` (`catalog.rs:368`), and so do
+  `update_index_root` (`:381`) and `update_fulltext_root` (`:395`) — so a statement that moves a
+  primary root and two secondary roots rewrites the whole chain THREE times today. (c3) compares
+  first and persists ONCE. Correcting my own draft rather than shipping the inflated claim.
+  ⚠ Against pass 1's form, though, (c3) is strictly worse steady-state: whole chain vs four
+  bytes. That is the real trade and it is stated below, not buried.
 
-  (c3) REMOVES a copy rather than adding one. After it, the cell is the only mutable root value
-  in the process and the catalog page is the only durable one, written by the only function that
-  has ever written it. The count of mechanisms goes 2 -> 1.
+-------------------------------------------------------------------------------------
+(c5) — THE TEXTBOOK OPTION, NAMED BECAUSE RULE 1b DEMANDS IT, AND NOT RECOMMENDED
+-------------------------------------------------------------------------------------
+MAKE THE ROOT PAGE ID CONSTANT. On a root split, copy the old root's contents into a freshly
+allocated page (which becomes the left child) and rewrite the SAME page id as the new internal
+root. SQLite's `balanceDeeper`; InnoDB records a fixed root page number in its data dictionary
+for the same reason. Then the durable record is never stale because it never changes after
+CREATE: `sync_roots`, `update_*_root`, `Catalog::roots` and `sync_root_cells` all become
+unnecessary, at a cost of one page alloc + one page copy per ROOT split (O(log_F N) over a
+table's whole life) and ZERO catalog interaction ever.
 
-  (c1) and (c2) both go 2 -> 2-or-3 and are rejected on exactly this axis.
+WHY NOT THIS ROW: it is B+tree surgery under the B-link optimistic descent (`index.rs:240-260`),
+the project's most delicate invariant, and it falsifies D53 by construction.
+`tests/d53_shared_root_cell.rs:45` inserts "until its root page id changes" — under (c5) that
+loop never terminates. `tests/d53_private_root_allowlist.rs` pins the `root_cell`+`open_shared`
+shape (c5) makes pointless. Those are not stale assertions to be quieted; they pin a mechanism
+(c5) deliberately removes, which is a contract change needing its own row and its own argument.
 
-====================================================================================
-6. DOES (c3) REINTRODUCE CHECK 4's DEADLOCK? NO — and here is the argument
-====================================================================================
-Check 4 (extended.rs:333-335): "a writer draining would wait for this slot while this reader
-waited for the mutex." The cycle needs someone holding a READ SLOT to block on the CATALOG
-MUTEX.
+-------------------------------------------------------------------------------------
+⇒ WHICH FORM OF (c), AND WHAT PASS 2 CHANGES ABOUT PASS 1's CONCLUSION
+-------------------------------------------------------------------------------------
+PASS 1's BUILD ORDER STANDS UNCHANGED: check 3 (a measurement, cheapest, can kill the line),
+then check 2 (`bump_table_version`, one field, no format change), then (c). (c3) does not move
+that by one place — like (c2-repurposed) it retires `sync_roots` only, so with check 2 unsolved
+every DML still takes the exclusive mutex and the measured change is still exactly zero. (c) in
+ANY form remains unmeasurable in isolation.
 
-(c3)'s tail takes no catalog mutex. It calls `persist()`, which today takes no lock at all. It
-DOES need one new short lock — see section 7 — call it `persist_lock`, a `Mutex<()>` inside
-`Catalog`, taken and released entirely inside `persist()`.
+WHAT IT DOES CHANGE IS WHICH (c) TO BUILD WHEN THE TURN COMES:
 
-Lock-order graph, all edges:
-  - exclusive path: catalog mutex -> persist_lock   (a DDL persists while holding the mutex)
-  - shared path:    read slot     -> persist_lock   (a splitting DML persists while holding its
-                                                     pass)
-  - drain_readers:  catalog mutex -> waits on read slots
-  - persist_lock holder: waits on NOTHING RELEVANT. Audited rather than assumed — every lock-ish
-    call in the body of `persist` (catalog.rs:432-520) is a buffer-pool call and nothing else:
-    `fetch_page`, `frames[i].read()`, `frame_write`, `unpin_page`, `new_page`, and the orphan
-    `deallocate`. No catalog mutex, no read slot, no B+tree latch.
-Because persist_lock has out-degree zero it is a sink, so no cycle exists. A DML holding a slot
-can block behind another persist, and that persist always completes. PASSES.
-  THE ONE EDGE THAT WOULD BREAK THIS, stated so it is checked and not rediscovered: persist ->
-  buffer-pool page-table lock (via `new_page`/`deallocate`). A cycle would need some path that
-  holds the pool's page-table lock and then blocks on persist_lock. Nothing can today, because
-  persist_lock is new and `persist` is its only acquirer. Anyone who adds a second acquirer
-  inherits that obligation, and it belongs in the lock's own doc comment.
+  BUILD (c3). It dissolves check 4 for no format break, no migration, no repurposed field and no
+  extra bootstrap hop, and it is revertible in one commit. Its cost is that a root split rewrites
+  the catalog chain instead of writing four bytes — and NOBODY HAS MEASURED THAT THAT MATTERS.
+  Check 1 already established that root splits are rare, and today's code pays that cost three
+  times over on the same branch.
 
-Contrast with option (a), which died because it PUT THE TOKEN DOWN. (c3) never drops the pass,
-so the DDL exclusion the barrier provides holds for the whole statement — which is also why
-`sync_roots`' `ok_or(KeyNotFound)` (executor.rs:497) stays a can't-happen under (c3). Do not
-"fix" that `ok_or`; under (c3) it remains the tell, and it remains unreachable.
+  HOLD (c2-repurposed) until something measures the chain rewrite. It is the better end state and
+  pass 1 specified it correctly; it is also an on-disk format break across 31 sites bought for a
+  cost that has never been observed. Taking a format break for an unmeasured cost is the trade
+  this project has repeatedly found itself on the wrong side of. If (c3) lands and the rewrite
+  then shows up in a measurement, (c2-repurposed) replaces it with the one format break it always
+  needed — nothing is paid twice, because (c3) never changed the format.
 
-====================================================================================
-7. THE ONE REAL COST (c3) BUYS — an obligation, not a footnote
-====================================================================================
-`persist()` is `&self` but has never actually run concurrently: every caller today reaches it
-from a `&mut self` method or from recovery. (c3) makes it a genuinely concurrent path, and it
-is not safe as written:
+  ⇒ In one line: pass 1 answered "can it be done and is it a second mechanism". Pass 2 answers
+  "which of the two admissible forms to pay for first", and the answer is the one that is not a
+  format break, because the cost the format break buys off is unmeasured.
 
-  (i) LOST UPDATE OF A ROOT. Two shared-path persists interleave; the one that read an older
-      cell value finishes LAST and writes a stale root. That is the exact corruption
-      `sync_roots` exists to prevent.
-  (ii) ORPHAN-PAGE DOUBLE FREE. `persist` shrinks the chain by unlinking and deallocating the
-      orphan tail (catalog.rs:486 onward). Two concurrent persists can walk and free the same
-      orphan list twice. This is the less obvious of the two and the more damaging.
+=====================================================================================
+PASS 1, VERBATIM FROM HERE — base 83cb6e8, commits 7828073 + 7627b4d
+=====================================================================================
 
-FIX, and it is one lock, not a new mechanism: a `persist_lock: Mutex<()>` taken as the first
-statement of `persist()`, WITH THE CELL READS DONE INSIDE IT. That is sufficient, not merely
-necessary:
-  - split S stores into its cell at t; S then calls persist, which serializes behind P.
-  - if P's in-lock cell read happens after t, P captured S's value.
-  - if before t, P wrote the older value, and S's own persist runs strictly after P releases and
-    writes the newer one.
-  Either way the last write is the live value. Both hazards close.
+W4 CHECK 4, OPTION (c) — "MAKE THE ROOT CELL ITSELF THE DURABLE RECORD"
+Priced 2026-09-22 at base 83cb6e8, branch W4-root-cell-durable. READ ONLY — no engine code changed.
 
-CRASH WINDOW: unchanged. Today a split stores the cell and the statement's `sync_roots`
-persists it; with (c3) a split stores the cell and the statement's tail persists it. Same
-statement, same window, no regression.
+=====================================================================================
+VERDICT, up front
+=====================================================================================
 
-WRITE VOLUME: LOWER than today, not higher. I drafted this paragraph as "more work per root
-split" and it was wrong — `update_primary_root` ALREADY calls `self.persist()` (catalog.rs:368),
-and so do `update_index_root` (:381) and `update_fulltext_root` (:395). So a statement that moves
-a primary root and two secondary roots persists the whole chain THREE times today. (c3) compares
-first and persists ONCE. Correcting my own draft here rather than shipping the inflated claim.
+(c) SURVIVES as a design. The mechanism it needs already exists in this repo, the circularity is
+already answered by that mechanism, and it is NOT a second mechanism provided one field changes
+MEANING rather than a new field being added beside it.
 
-====================================================================================
-8. WHAT (c3) DOES AND DOES NOT DISSOLVE
-====================================================================================
-CHECK 4 (the rare root write / deadlock):  DISSOLVED. No path takes the catalog mutex while
-  holding a read slot; the tail is `&Catalog` throughout.
-CHECK 3 (stand-down rate):  NOT DISSOLVED. A shared-path DML still calls `begin_read` and still
-  stands down whenever a writer is announced, whatever the tail does. (c3) changes nothing here;
-  w4-standdown-count still bounds the payoff.
-  => The brief's claim that "(c) makes checks 3 and 4 BOTH dissolve" is HALF FALSE. It is check
-  4 only. SCALE-DESIGN's own later entry ("CHECK 3 IS DISPATCHED, AND IT WAS NEVER BLOCKED ON A
-  QUIET BOX") already caught this; recording it here so the two do not disagree, and so the
-  earlier sentence is not quoted forward on its own.
-CHECK 2 (`bump_table_version`):  unaffected. After (c3) it is the LAST remaining `&mut Catalog`
-  user in `Modify::execute`, which matches D51's compiler probe finding exactly two write sites.
-  Making it an atomic (checks 2a/2b: the bump lands inside the pass, and MERGE reaches
-  `drain_readers` unconditionally at extended.rs:357) is the other half of the tail, and it is
-  independent of this row.
+But pricing it falsified the premise it was dispatched under, in three places, and the third
+changes the project's ordering:
 
-====================================================================================
-9. THE BUILD, IF THIS LANE PROCEEDS — exact sites, all verified in this tree
-====================================================================================
-  catalog.rs:432   `persist()` — add `persist_lock`; read root fields from `self.roots` inside it
-  catalog.rs:56    `roots` — doc update: it is now the AUTHORITY, not a derived cache
-  executor.rs:495  `sync_roots`          -> `Catalog::persist_roots_if_moved(&self, ..)`
-  executor.rs:522  `sync_fulltext_roots` -> folded into the same function
-  insert.rs:168-169 · update.rs:156-157 · delete.rs:69   call the `&Catalog` form
-  executor.rs:31   `Modify::execute(&mut Catalog)` -> `&Catalog` once `bump_table_version` is
-                   atomic (the other of D51's two sites)
-  EXIT CRITERION, and it must be a detector rather than a green: a reopen-after-root-split test
-  that splits a root through the DML path, calls NO `&mut` catalog method, closes, reopens and
-  asserts every key is found. It must FAIL on a build with the persist-reads-the-cell change
-  reverted. Forcing that failure is part of the test, not a follow-up.
+  1. ⛔ "checks 3 and 4 BOTH dissolve" is HALF TRUE. Check 4 dissolves. **Check 3 does not**, and
+     (c) does not touch it. Worse: check 3's own premise — the `begin_read` doc's "standing down
+     happens only while DDL is actually in flight" — is FALSE in the shipped code, and I found a
+     third announcer nobody has named (the lease thread, holding the exclusive guard across a whole
+     reap scan every 30 s).
+  2. ⛔ (c) is NECESSARY BUT NOT SUFFICIENT. It retires `sync_roots` only. `bump_table_version`
+     (check 2) still demands `&mut Catalog` on every DML, so with (c) alone every write still takes
+     the exclusive mutex and the win is exactly ZERO. (c) cannot be priced by measurement in
+     isolation.
+  3. ⛔ The in-tree precedent's own durability justification is FALSE. `create_with_header`'s doc
+     said a fixed indirection page lands "where the buffer pool's WAL gate already orders writes".
+     It does not — `wal_gate` is a no-op on that page AND on the tree it names.
 
-NOT BUILT IN THIS PASS. Blocker, one line: the measure lock (CEILING-resume, pid 86920) and the
-suite lock (d125-69dd9b5-r2, pid 80516) are both held by other lanes, and the brief forbids
-running cargo inside another lane's measurement window. The design was the gating deliverable
-and it is complete; the build is mechanical from this section and needs a free box to prove.
+⇒ ⭐ **THEREFORE (c) IS NOT THE GATING ITEM IT WAS BELIEVED TO BE, AND I DID NOT BUILD IT.**
+The doc's line "(c) is now the one to price first" is what pricing it refutes. (c) is a
+format-breaking change across 31 call sites that buys nothing measurable until check 2 lands and
+that check 3 can still make worthless. The cheap item is check 3 — a measurement — and it can kill
+the whole W4 line. Building (c) first would be paying the expensive half of a bet before reading
+the card that decides it.
 
-====================================================================================
-10. BY-PRODUCTS FOUND WHILE READING, worth the next reader's time
-====================================================================================
- - `CatalogPage::checksum` (catalog_page.rs:14, written at :84, read at :199) is never computed
-   and never verified anywhere in src/. A catalog page is not checksum-protected. Observation
-   only; it is also what makes (c1) technically possible, and (c1) is still rejected.
- - `persist()` frees orphan catalog pages (catalog.rs:486 onward). Anything that makes `persist`
-   concurrent inherits a double-free, not just a lost update.
- - `recover()` returns `Ok(true)` whenever the WAL holds ANY record (recovery.rs:17-19, :124),
-   and `checkpoint_locked` re-appends every DDL record after truncating (txn.rs:857-864 via
-   `replay_schema`, txn.rs:791-800). So a process that ran DDL leaves a non-empty WAL at exit and
-   the next open runs `rebuild_indexes`, which frees and rebuilds every tree from the heap. A
-   process that ran only DML leaves `schema_log` empty, truncates to nothing, and the next open
-   TRUSTS the recorded root.
-   I checked this precisely because I expected to be able to argue that the recorded root never
-   matters — that `rebuild_indexes` makes it dead weight. IT IS NOT DEAD WEIGHT: the DML-only
-   process is exactly the window `sync_roots` protects, and it is the common one for a server.
-   The executor's durability claim at executor.rs:514-517 stands. Premise checked and NOT
-   falsified; recorded because the negative was the point of checking.
+Two false doc claims found in the course of this ARE fixed in this commit (see section 7); both
+are claims a later reader would have acted on.
+
+=====================================================================================
+1. WHERE THE ROOT CELL LIVES TODAY — read at 83cb6e8
+=====================================================================================
+
+There are TWO copies of every tree root, and that is the whole of W4's check 4.
+
+  (i) THE LIVE CELL — `Catalog::roots: HashMap<(String, Option<String>), Arc<AtomicU32>>`
+      (`src/catalog/catalog.rs:56`). In memory, "deliberately NOT serialized" by its own doc.
+      Handed out by `Catalog::root_cell(&self, ..)` (`:90`) — a plain hash lookup, NO lock — and
+      consumed by `BPlusTreeManager::open_shared` (`src/storage/index.rs:114`). Populated by
+      `Catalog::sync_root_cells` (`:114`), which CREATES missing cells and never overwrites an
+      existing one.
+      It is the authority at runtime: `plan::open_table` (`src/planner/plan.rs:110`),
+      `optimizer.rs:66/75/79` and `fulltext_search.rs:251` all descend from the cell and fall back
+      to the recorded value only in the `None` arm.
+      The cell is written in exactly ONE place: `index.rs:593`,
+      `self.root_page_id.store(new_page_id, Ordering::Release)`, inside `insert_into_parent`'s
+      `stack.is_empty()` branch — the root split. The line after it reads
+      `// later store the page id in catalog`.
+
+ (ii) THE DURABLE COPY — `TableEntry::primary_index_root` (`catalog/catalog_page.rs:22`), plus
+      `IndexInfo::root_page_id` and `FullTextIndexInfo::root_page_id`, serialized onto the catalog
+      page chain that starts at `first_catalog_page_id` (= 1 on a fresh DB).
+
+`sync_roots` (`execution/executor.rs:495`) exists ONLY to copy (i) into (ii), and
+`Catalog::update_primary_root` (`catalog.rs:365`) is how it does so: mutate the entry, then
+`self.persist()`, then store the value back into the cell. `persist()` (`:432`) REWRITES THE WHOLE
+CATALOG PAGE CHAIN — every table, every page — for a four-byte change.
+
+⇒ That `&mut self` on `update_primary_root` is the entire reason `Modify::execute` takes
+`&mut Catalog`, minus `bump_table_version`. Check 4 is: on the shared path a statement holds a read
+slot, and `extended.rs:333-335` says taking the catalog mutex while holding one deadlocks against a
+draining writer.
+
+=====================================================================================
+2. CAN IT BE MADE DURABLE WITHOUT A SECOND MECHANISM? — YES, AND THE MECHANISM IS ALREADY HERE
+=====================================================================================
+
+DEFLATION, first, because the answer is "isn't this just X" and X is in the tree:
+
+**It is just `TableBranchCatalog::create_with_header` / `publish_root` / `open_from_header`**
+(all three in `src/branch/table_catalog.rs` — cited by SYMBOL because this commit's own doc edit
+moves their line numbers), applied to user-table trees instead of to the branch-catalog tree.
+That code:
+
+  - allocates ONE header page at create time, whose id never changes, and returns it;
+  - stamps it with a magic so opening the wrong page id is an error rather than a plausible root;
+  - `publish_root(&self)` — **not `&mut`** — loads the tree's live root atomic, compares it with an
+    atomic `published_root`, RETURNS WITHOUT WRITING when they agree, and otherwise writes the
+    four bytes through `pool.fetch_page` + `frame_write`;
+  - `open_from_header(pool, header_page)` reads the magic and the root, then descends.
+
+Its own doc already states the general principle and names the hazard: *"the superblock-pointer
+arrangement: a known location naming a moving root, the same shape as SQLite finding
+`sqlite_schema` at page 1."* This is the D1 lesson applied once already.
+
+⇒ SO THE DESIGN IS: `TableEntry::primary_index_root` STOPS BEING THE ROOT AND BECOMES THE HOME.
+Same `u32`, same slot on the catalog page, opposite lifetime: written ONCE when the tree is created
+and never again. Same for `IndexInfo` and `FullTextIndexInfo`. `sync_root_cells` seeds the cell by
+reading the home page instead of the record. The split site at `index.rs:593` publishes. `sync_roots`,
+`sync_fulltext_roots`, `update_primary_root`, `update_index_root` and `update_fulltext_root` are
+DELETED — not made shared, deleted.
+
+THE D1 TEST, which is the one that decides this: does it add a second durable copy?
+  - If the home page is added BESIDE `primary_index_root`, YES — two durable records of one moving
+    value, which is precisely D1's defect, and the proposal must be refused.
+  - If the field is REPURPOSED, NO — after the change there is exactly one durable root (the home
+    page) and one volatile one (the cell), and the catalog page holds no moving value at all. It is
+    strictly FEWER moving copies than today, not more.
+⇒ The design is admissible only in the repurposing form. Anything that adds a file or a field is
+the wrong answer and D1 already says why.
+
+THE CIRCULARITY TEST: reopen must find the roots before it can read anything.
+  fixed page 1 (`first_catalog_page_id`) → catalog chain → `TableEntry.home` (fixed, written once)
+  → home page (magic + root) → live root.
+No step depends on a value that moves. This is the same chain the branch catalog already walks, and
+it is one hop longer than today's rather than circular.
+
+COST: one 4 KB page per tree, allocated at CREATE TABLE / CREATE INDEX. A tree that has split is
+already ≥ 3 pages. Rejected the tighter alternative (one slot-array page per table, or per database)
+because a slot allocator plus an ordinal-to-tree mapping IS the second mechanism this is trying not
+to be, and the ordinals shift on DROP INDEX.
+
+=====================================================================================
+3. DOES IT ACTUALLY DISSOLVE CHECK 4? — YES, AND HERE IS THE LOCK ARGUMENT
+=====================================================================================
+
+Check 4 is a deadlock: reader holds slot → wants catalog mutex; writer holds catalog mutex → waits
+for slot. Publishing to a home page takes NO catalog mutex, so the cycle needs a different edge.
+There is none, and the reason is checkable rather than asserted:
+
+  a) `ServerContext::catalog()` (`pgwire/mod.rs:143`) acquires the mutex and THEN calls
+     `drain_readers()` (`:171`). While spinning it holds the catalog mutex and NOTHING ELSE — it
+     copies the slot list and releases the readers registry lock before the spin.
+  b) `ctx.catalog()` has exactly FOUR callers in the crate: `extended.rs:283`, `extended.rs:357`,
+     the snapshot refresh inside `ServerContext::read_catalog` and `lease_thread.rs:205`. Every one is at
+     statement/scan top level. **No path holds a page latch or a frame lock and then acquires the
+     catalog mutex.** So a publisher blocked on a frame lock cannot be blocked behind the drainer.
+  c) The lock order the publish uses is DOWNWARD and already legal:
+     `src/storage/page_latch.rs` states the order `page latch → arc_cache → page_table → frame` and
+     says explicitly that *"crabbing only ever calls downward (it holds a page latch and then calls
+     `fetch_page`), and downward calls cannot close a cycle unless the callee calls back up."*
+     A publish from `index.rs` is exactly that shape, needs NO new page latch (the home page is not
+     in the tree), and `index.rs` is already on the `tests/lock_order_allowlist.rs` allowlist.
+
+⇒ Check 4 dissolves. That much of the brief's premise holds.
+
+⚠ ONE THING THAT MUST NOT BE COPIED VERBATIM. `publish_root` compares with
+`self.published_root.swap(root, SeqCst) == root` and loads `root` BEFORE the swap. That is safe in
+`TableBranchCatalog` only because every caller reaches it through `stage()` under the `logical`
+mutex (`table_catalog.rs:805, 842, 929, 967, 987, 1032, 1223, 1250, 1278, 1307, 1319, 1344`). On the
+shared path there is no such mutex, and two publishers can each conclude the other wrote: B swaps,
+sees A's value already there, returns believing it durable, while A has not yet written the frame.
+**This is not a bug in the branch catalog; it is a dependency on the exact lock W4 removes** — the
+`a guard on a private copy cannot fire` shape. The user-table publish must load the cell INSIDE a
+per-tree publish mutex (a leaf lock, taken only on the rare split branch), so the value written is
+one the cell held inside the critical section.
+
+=====================================================================================
+4. ⛔ WHERE THE BRIEF'S PREMISE IS FALSE — CHECK 3 DOES NOT DISSOLVE
+=====================================================================================
+
+The brief says removing the tail write makes check 3 (stand-down rate) dissolve. It does not.
+Standing down is caused by SOMEBODY ELSE ANNOUNCING `writer_active`, not by what this statement
+does at its tail. (c) removes no announcer.
+
+And check 3's stated premise is false in the shipped code. `ServerContext::begin_read`'s doc said,
+at base 83cb6e8: *"It happens only while DDL is actually in flight."* (No line number: this commit
+replaces that sentence, so any number would name a tree that no longer exists.) Read against the
+four `ctx.catalog()` callers:
+
+  - `extended.rs:283` and `:357` — the statement-level exclusive path. `try_run_read`
+    (`executor.rs:93-145`) admits ONLY `Stmt::Explain` and two `Stmt::Select` arms, so TODAY every
+    INSERT, UPDATE, DELETE, MERGE and `BEGIN AGENT SESSION` announces. Not DDL.
+  - `ServerContext::read_catalog`'s snapshot refresh (`self.catalog().clone()`). Rare, not DDL.
+  - ⭐ `branch/lease_thread.rs:205` — `impl RuntimeLock for ServerContext` does
+    `let _statement = self.catalog(); body();`, so the guard is held across the ENTIRE reap scan,
+    every `DEFAULT_SCAN_MILLIS = 30_000` ms by default (`lease_thread.rs:109`). Not a statement, not
+    DDL, and periodic. **This announcer is named nowhere in the W4 entry and it is the one a
+    shared-path design is least likely to look for**: it is a background thread, so it announces
+    even on an idle database, and its hold is a whole scan rather than a statement.
+
+⇒ After W4 the statement announcers would shrink to MERGE + DDL, but the lease thread would remain
+and is periodic by construction. Check 3 therefore stays exactly as open as it was, and its
+measurement must include an idle-but-reaping arm, not only a merge-heavy one.
+
+⇒ FIXED IN THIS COMMIT: `pgwire/mod.rs` now enumerates the four announcers and says the rate must
+be measured, not inferred. The replacement is STRICTER than what it replaced — it names a larger
+set of announcers than "DDL" and refuses the inference the old sentence invited.
+
+=====================================================================================
+5. ⛔ (c) BUYS NOTHING ON ITS OWN — CHECK 2 IS UNTOUCHED
+=====================================================================================
+
+`Modify::execute` takes `&mut Catalog` for TWO reasons (W4's own finding). (c) removes one.
+`bump_table_version` (`catalog.rs:406`) is `*self.table_versions.entry(id).or_insert(0) += 1` on a
+`HashMap` behind `&mut self`, fires UNCONDITIONALLY on every DML, and carries merge correctness.
+With (c) landed and check 2 unsolved, `insert.rs`, `update.rs` and `delete.rs` STILL need
+`&mut Catalog`, still take the exclusive mutex, and the measured throughput change is zero.
+
+⇒ (c) is unmeasurable in isolation. There is no A/B for it: the arm with the mechanism does not
+differ from the arm without it until a second change lands. That is the `a fixture can miss the code
+under test` shape, arriving before the fixture is written, and it is the concrete reason not to
+build (c) now.
+
+⇒ Check 2's own resolution is already sketched and its two sub-checks PASSED (2a, 2b in the
+scoreboard): make `table_versions` interior-mutable and let the existing `ReadPass`/`drain_readers`
+barrier supply the ordering. That is a SMALLER change than (c) — one field, no on-disk format — and
+it is the one that has to land first for (c) to be measurable at all.
+
+=====================================================================================
+6. THE COSTS (c) DOES CARRY, STATED RATHER THAN DISCOVERED LATER
+=====================================================================================
+
+ a) ON-DISK FORMAT BREAK. `primary_index_root` changes meaning with no change of type, so an old
+    database would read a root as a home page and find no magic. The lane exists — `catalog_page.rs`
+    already has a format stamp with an allowlist of 4 and 5 and a test that refuses an unknown one
+    (`an_unknown_catalog_page_format_is_refused`) — so this is a v6 with an upgrade-on-read step,
+    not a new idea. But it IS a format break, and it is the largest single cost.
+
+ b) BLAST RADIUS: 31 `primary_index_root` sites in `src/` across
+    `catalog/{catalog,catalog_page,alter,system_views}.rs`, `planner/plan.rs`,
+    `optimizer/optimizer.rs`, `execution/{executor,fulltext_search}.rs`, `wal/recovery.rs`,
+    `pgwire/mod.rs`, plus 7 in `tests/`.
+
+ c) ALTER LOSES ONE-WRITE ATOMICITY. `alter.rs:707` is explicit that the moved root is written in
+    the SAME `persist` as the schema because *"two persists would be two chances to store one half
+    of an alteration."* Under (c) they become two writes to two pages. ⚠ Honest scoping: `alter.rs`
+    is equally explicit that no shape tried has ever moved the root there (`:1079-1083` — 300×1300,
+    600×600, 1200×60, root stayed put), and the heap rewrite already precedes the persist, so the
+    non-atomic window exists today. (c) adds a page write inside a window it did not create. It is a
+    real cost, not a blocker.
+
+ d) DURABILITY CLASS IS UNCHANGED — and the reason the precedent gave for that is wrong.
+    `create_with_header`'s doc claimed the page lands "where the buffer pool's WAL gate already
+    orders writes". Read: `wal_gate` (`buffer_pool.rs:1425`) defers to `page_lsn_of` (`:1436`),
+    which reads an LSN only for first bytes 0, 2 and 3 and answers 0 otherwise, and a zero LSN
+    skips `flush_up_to` entirely. The header page begins with `0xFE` (high byte of
+    `HEADER_PAGE_MAGIC`), so the gate is a NO-OP on it. Catalog pages (stamp 4/5) are likewise
+    ungated. B+tree pages ARE tags 2/3 — but `src/storage/index.rs` never sets an LSN, so they
+    carry 0 and are ungated too.
+    ⇒ Moving a root from the catalog page to a home page moves it from one ungated page to another.
+    Durability is neither improved nor harmed, and the only sentence that said otherwise was false.
+    ⇒ FIXED IN THIS COMMIT in `table_catalog.rs`.
+
+ e) ⭐ THE ONE PLACE (c) IS STRICTLY BETTER, and it is not the one advertised. Today a root move
+    calls `persist()`, which rewrites the ENTIRE catalog page chain — every table's schema, every
+    index record — for four bytes. A crash mid-`persist` is a torn multi-page catalog. Under (c) the
+    same event is one four-byte write to one page. Smaller blast radius, and `persist()` stops being
+    on the write path at all.
+
+ f) `wal::recovery::rebuild_indexes` (`recovery.rs:177`) opens the OLD tree from the recorded root,
+    frees it, and rebuilds from the heap. Under (c) it reads the home page instead and republishes
+    there. It has `&mut Catalog` and runs at startup, so it is a mechanical edit. ⚠ Note while
+    here: it runs ONLY `if recovered` (`cli.rs:71`), so the stale-root hazard `sync_roots` exists to
+    prevent bites the CLEAN-reopen path; on the crash path a stale recorded root frees a subset of
+    the tree's pages — a leak, not a wrong answer, since the tree is rebuilt regardless.
+
+=====================================================================================
+7. WHAT I DID, AND WHY I DID NOT BUILD
+=====================================================================================
+
+DID NOT BUILD (c). The decision, with the reason, not a request for direction:
+a format-breaking change across 31 sites, whose benefit is identically zero until check 2 lands, and
+which check 3 — still open, and whose premise I found to be false — can make worthless. The correct
+order is check 3 (a measurement, cheapest, can kill the line), then check 2 (one field, no format
+change), then (c). The W4 entry's "(c) is now the one to price first" is what this pricing refutes.
+
+DID land the two verified doc corrections, because both are claims a later reader would act on and
+both were load-bearing for this very design:
+  - `src/pgwire/mod.rs` `begin_read` — "only while DDL is actually in flight" replaced by the four
+    announcers, including the lease thread, and an instruction to measure.
+  - `src/branch/table_catalog.rs` `create_with_header` — the WAL-gate justification replaced by
+    what the fixed page actually buys, with the `page_lsn_of` reason stated.
+Both are strictly stronger than what they replaced: each names a larger set of cases and forbids an
+inference the old text invited. No test assertion was touched.
+
+=====================================================================================
+8. SCOREBOARD DELTA — what a reader should carry forward
+=====================================================================================
+
+| # | check | before this pass | after |
+|---|---|---|---|
+| 2 | `bump_table_version` ordering | ⛔ FIRED, 2a/2b pass | unchanged — and now the FIRST thing to build, not the second |
+| 3 | stand-down rate | ⚠ OPEN, premised on "only DDL" | ⚠ OPEN, and the premise was FALSE; a third announcer (lease thread, 30 s, holds the guard across a whole reap scan) added; measurement needs an idle-but-reaping arm |
+| 4 | the rare root write | ⛔ OPEN, (a) dead, (b)/(c) alive | ✅ (c) ANSWERS IT — repurpose `primary_index_root` into a home-page id and reuse `TableBranchCatalog`'s superblock pointer; no second mechanism, no circularity; but it is unmeasurable until 2 lands |
+| — | option (b), defer to next exclusive acquirer | leading candidate | ⇒ NOT NEEDED if (c) is taken; (c) removes the write rather than rescheduling it, so D81's deferred-claim objection never has to be adjudicated |
+
+⇒ Option (c) is CLOSED as a design question — answered, admissible, and specified. It is OPEN as a
+build, deliberately, behind check 3 and check 2 in that order.
