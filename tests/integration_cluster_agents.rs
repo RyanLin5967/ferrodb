@@ -1094,6 +1094,32 @@ impl Applier for Tally {
     }
 }
 
+/// Write one instrument line where **libtest's output capture cannot swallow it**.
+///
+/// ⛔ `eprintln!` is the wrong tool here and shipping it would have been a silent false negative.
+/// The `print!`/`eprintln!` macros route through `std::io::_eprint`, which consults the
+/// thread-local output capture libtest installs, so under a plain `cargo test` — which is exactly
+/// what `.github/workflows/tests.yml:306` runs, with no `--nocapture` — the line is buffered per
+/// test and emitted only if that test FAILS in the ordinary way. The Windows failure this
+/// instrument exists for produces **no `test result: FAILED` and no `panicked at`**: the process
+/// dies, and every captured buffer dies with it.
+///
+/// Measured before the fix, not assumed: `cargo test --test integration_cluster_agents
+/// on_three_real_nodes_only_the_merge_reaches_a_quorum` emitted **0** `LOOPCOUNT` lines with
+/// `eprintln!` and emits them with this. A missing line was *defined* to mean "it died before
+/// either loop", so the broken form would have pointed a reader at the wrong conclusion — the
+/// detector failing in the direction that looks like a result.
+///
+/// `std::io::stderr()` is the real handle and is not redirected by the capture, and `Stderr` is
+/// unbuffered, so the line is written by the time this returns.
+fn loopcount(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut e = std::io::stderr();
+    let _ = e.write_fmt(line);
+    let _ = e.write_all(b"\n");
+    let _ = e.flush();
+}
+
 impl Fleet {
     fn start(n: u32) -> Arc<Fleet> {
         let listeners: Vec<TcpListener> =
@@ -1197,10 +1223,10 @@ impl Fleet {
         let t0 = std::time::Instant::now();
         for turn in 0..20_000u32 {
             if self.ledgers.iter().all(|l| lock(l).last_applied() >= round) {
-                eprintln!(
+                loopcount(format_args!(
                     "LOOPCOUNT settle_to round={round} turns={turn} bound=20000 ms={}",
                     t0.elapsed().as_millis()
-                );
+                ));
                 return;
             }
             self.pump_all();
@@ -1235,10 +1261,10 @@ impl Fleet {
         for turn in 0..100_000u32 {
             self.pump_all();
             if self.reps.iter().all(|r| r.leader() == Some(l)) {
-                eprintln!(
+                loopcount(format_args!(
                     "LOOPCOUNT hold_leader want={want} turns={turn} bound=100000 ms={}",
                     t0.elapsed().as_millis()
-                );
+                ));
                 return;
             }
         }
