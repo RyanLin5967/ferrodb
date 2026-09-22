@@ -91,6 +91,19 @@ use ferrodb::wal::txn::TxnManager;
 /// release that follows it (at least one interval later) cannot cancel between two samples.
 const SAMPLE_MS: u64 = 10;
 
+/// ⛔ **Why the parked count is `peak / pages` and NOT a sum of the queue's positive increments.**
+///
+/// The increment sum was tried first and is WRONG, caught by a smoke run that reported **12**
+/// parents parked out of **10** pairs. `drain_pending_seeded` is a read-modify-write:
+/// `take_pending` is `std::mem::take` of the whole vec (`arena.rs:800`), so `pending_len()` drops
+/// to **zero** for the length of the walk, and `put_pending` then restores the survivors
+/// (`arena.rs:810`). A sampler that lands inside that window sees the restore as a FRESH park and
+/// counts it again — the queue's own internal transient read as new work.
+///
+/// `peak` is immune: a transient dip cannot raise a maximum. And peak == total here because every
+/// parent expires within one interval of every other and a parked entry outlives at least one
+/// sweep, so the parked intervals overlap. That is a property of this fixture, not a general one.
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -178,6 +191,9 @@ struct Row {
     lease_ms: u64,
     peak: usize,
     parked_parents: usize,
+    /// Diagnostic only — see the note on [`SAMPLE_MS`]. Above `parked_parents` means a sample
+    /// landed inside a drain's take/put window.
+    increment_sum_parents: usize,
     realised_delta_ms: (u64, u64),
     stats: ferrodb::branch::lease_thread::LeaseStats,
 }
@@ -230,7 +246,6 @@ fn run_point(
     let mut prev = 0usize;
     let mut increments = 0usize;
     let mut next_event = 0usize;
-    let mut tick = 0u64;
     loop {
         let now_ms = t0.elapsed().as_millis() as u64;
         while next_event < events.len() && events[next_event].0 <= now_ms {
@@ -257,6 +272,8 @@ fn run_point(
         if l > peak {
             peak = l;
         }
+        // Kept only as a DIAGNOSTIC upper bound; see the note on SAMPLE_MS for why it is not the
+        // reported figure. It exceeding `peak` is the signature of a sample landing mid-drain.
         if l > prev {
             increments += l - prev;
         }
@@ -268,7 +285,7 @@ fn run_point(
         // Derived from elapsed time, not incremented: a loop body that overran SAMPLE_MS (a
         // fork plus its page writes does) would otherwise leave `target` permanently in the past
         // and turn this into a busy spin that competes with the lease thread it is watching.
-        tick = now_ms / SAMPLE_MS + 1;
+        let tick = now_ms / SAMPLE_MS + 1;
         let target = t0 + Duration::from_millis(tick * SAMPLE_MS);
         let now = Instant::now();
         if target > now {
@@ -303,6 +320,12 @@ fn run_point(
              with a {lease_ms} ms lease — the fixture never reached the code under test"
         ));
     }
+    if peak > pairs * pages as usize {
+        refusals.push(format!(
+            "delta={delta_ms} lease={lease_ms}: peak pending {peak} exceeds {pairs} pairs x \
+             {pages} pages — more was parked than exists, so the metric is not measuring parks"
+        ));
+    }
     if realised.len() != pairs {
         refusals.push(format!(
             "delta={delta_ms} lease={lease_ms}: only {} of {pairs} children were forked",
@@ -316,7 +339,8 @@ fn run_point(
         delta_ms,
         lease_ms,
         peak,
-        parked_parents: increments / pages as usize,
+        parked_parents: peak / pages as usize,
+        increment_sum_parents: increments / pages as usize,
         realised_delta_ms: (lo, hi),
         stats,
     }
@@ -342,9 +366,9 @@ fn print_header(scan_ms: u64, lease_ms: u64, pairs: usize, pages: u32) {
     println!("  P2 = refinement:      a KNEE — parked fraction = min(Δ/S, 1), so a RAMP below S.");
     println!();
     println!(
-        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22}",
+        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
         "Δ ms", "lease ms", "Δ/S", "parked", "P1", "P2", "peak pending", "realised Δ",
-        "scans a/s/r/f/reaped"
+        "scans a/s/r/f/reaped", "incsum"
     );
 }
 
@@ -353,7 +377,7 @@ fn print_row(r: &Row, scan_ms: u64, pairs: usize) {
     let p1 = if r.delta_ms > scan_ms { pairs } else { 0 };
     let p2 = (pairs as f64 * ratio.min(1.0)).round() as usize;
     println!(
-        "  {:>8} {:>8} {:>10.3} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22}",
+        "  {:>8} {:>8} {:>10.3} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
         r.delta_ms,
         r.lease_ms,
         ratio,
@@ -366,6 +390,7 @@ fn print_row(r: &Row, scan_ms: u64, pairs: usize) {
             "{}/{}/{}/{}/{}",
             r.stats.attempts, r.stats.scans, r.stats.refused, r.stats.failed, r.stats.reaped
         ),
+        r.increment_sum_parents,
     );
 }
 
@@ -417,9 +442,9 @@ fn main() {
     println!("  CONTROL — L varied at a fixed Δ={control_delta} ms. L is not in the window, so");
     println!("  these rows MUST agree. If they do not, the derivation above is wrong.");
     println!(
-        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22}",
+        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
         "Δ ms", "lease ms", "Δ/S", "parked", "P1", "P2", "peak pending", "realised Δ",
-        "scans a/s/r/f/reaped"
+        "scans a/s/r/f/reaped", "incsum"
     );
     let mut control_parked = Vec::new();
     for &l in &control_leases {
