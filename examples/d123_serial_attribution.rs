@@ -405,8 +405,20 @@ fn mode_f1(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps
         let mut obs: Vec<Vec<f64>> = vec![Vec::new(); 4];
         let mut sy: Vec<Vec<f64>> = vec![Vec::new(); 4];
         let mut fps: Vec<Vec<f64>> = vec![Vec::new(); 4];
+        let mut rep_start: Vec<u64> = Vec::new();
         let mut forks_n = 0usize;
         for rep in 0..reps {
+            // ⭐ STAMP EACH REP WITH WALL-CLOCK TIME. Contamination windows are declared in UTC by
+            // other agents AFTER the fact, and mapping them onto reps by dividing the arm's
+            // duration by the rep count is arithmetic on two mtimes — it cannot see a rep that ran
+            // long. Recording the time each rep STARTED makes the mapping exact, so a later
+            // declaration can be intersected with the raw matrix instead of reconstructed.
+            rep_start.push(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
             for i in 0..4usize {
                 let stub = ((i + rep) % 4) as u8;
                 probe::configure(false, stub, 0);
@@ -422,12 +434,12 @@ fn mode_f1(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize, reps
         // noise-dominated (within-level spread 51-139% against level differences of 14-54%) and
         // only the medians had been printed, so nothing could be re-analysed from the artifact.
         println!("  RAW forks/sec, rep x level (level order rotated each rep):");
-        print!("  {:>5}", "rep");
+        print!("  {:>5}{:>13}", "rep", "started(utc)");
         for lvl in 0..4 { print!("{:>12}", format!("L{lvl}")); }
         println!("{:>12}", "L3/L0");
         let mut paired: Vec<f64> = Vec::new();
         for rep in 0..reps {
-            print!("  {:>5}", rep);
+            print!("  {:>5}{:>13}", rep, rep_start.get(rep).copied().unwrap_or(0));
             for lvl in 0..4 { print!("{:>12.1}", obs[lvl][rep]); }
             let r = obs[3][rep] / obs[0][rep];
             paired.push(r);
