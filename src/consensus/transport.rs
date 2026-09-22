@@ -325,38 +325,30 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
                 columns: columns.clone(),
             };
             let mut rec_bytes = Vec::new();
-            rec.serialize(&mut rec_bytes);
+            // D154: this `?` IS the refusal now. `wal::log::write_str` checks its own `u16`
+            // prefix, so an over-long table or column name is refused here, at the encoder,
+            // instead of being written truncated and detected afterwards.
+            rec.serialize(&mut rec_bytes)?;
 
-            // **`RecKind::serialize` writes every string length as `s.len() as u16`, unchecked.**
-            // A table or column name over 65535 bytes therefore gets a truncated length prefix
-            // followed by its full bytes, and the frame that results is one the peer misparses —
-            // the receiver's re-encode check would catch it, but that is the wrong side of the wire
-            // to find out that this node emitted rubbish.
+            // ⛔ A SEND-SIDE RE-ENCODE CHECK WAS REMOVED HERE BY D154, and it is worth saying why
+            // rather than leaving a silent gap where a guard used to be.
             //
-            // Checked by round-tripping the record here, the same total check `decode_catalog`
-            // applies. It costs one encode of a schema description, on a DDL path, and it catches
-            // every present and future truncation in an encoder this file does not own.
-            match RecKind::deserialize(&rec_bytes) {
-                Ok(back) => {
-                    let mut again = Vec::new();
-                    back.serialize(&mut again);
-                    if again != rec_bytes {
-                        return Err(FerroError::Wal(format!(
-                            "a Catalog command for table {table:?} does not survive its own \
-                             encoding, so the frame would be misparsed by the peer rather than \
-                             refused. `wal::log` writes string lengths as `as u16`, so a name over \
-                             {} bytes truncates its prefix",
-                            u16::MAX
-                        )));
-                    }
-                }
-                Err(e) => {
-                    return Err(FerroError::Wal(format!(
-                        "a Catalog command for table {table:?} did not encode to a readable log \
-                         record ({e}); refused here rather than sent for a peer to choke on"
-                    )))
-                }
-            }
+            // It round-tripped the record and compared bytes, to catch a truncation that reparsed
+            // SUCCESSFULLY but to a different record — the case a length check could not see while
+            // `write_str` was unchecked. It was one of THREE local workarounds around that one
+            // unguarded primitive. With the guard moved into `write_str`, it became unfirable: the
+            // `?` above refuses first, so a mutant deleting the round trip could not be caught,
+            // and its own test had ALREADY needed a hand-built 65540-byte payload to make it fire
+            // once. **A guard nobody can force to fire is the appearance of protection, not
+            // protection.**
+            //
+            // Its forward-looking justification — "catches every present and future truncation in
+            // an encoder this file does not own" — is discharged by `decode_catalog`, which runs
+            // the byte-for-byte IDENTICAL round trip on the receive side and is the total check
+            // for non-canonical spellings. The receiver also has the job the sender structurally
+            // cannot do: trailing bytes arriving off a socket, which `RecKind::deserialize`
+            // silently ignores because it stops at its last field. That one is independently
+            // testable from hand-crafted bytes, and it is the case a signature cannot survive.
             put_bytes(b, &rec_bytes)?;
         }
         Command::Branch { op } => {
@@ -657,7 +649,7 @@ fn decode_catalog(bytes: &[u8], at: &mut usize) -> Result<Command, FerroError> {
     // description.
     let decoded = RecKind::deserialize(&rec_bytes)?;
     let mut reencoded = Vec::new();
-    decoded.serialize(&mut reencoded);
+    decoded.serialize(&mut reencoded)?;
     if reencoded != rec_bytes {
         return Err(FerroError::Wal(format!(
             "a Catalog command's log record did not re-encode to the bytes it arrived as ({} bytes \

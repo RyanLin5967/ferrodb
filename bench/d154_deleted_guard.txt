@@ -1,0 +1,41 @@
+D154 — WHAT THE DELETED SEND-SIDE RE-ENCODE CHECK USED TO CATCH, MEASURED IN BOTH ARMS
+=======================================================================================
+date: 2026-09-22T15:02:53Z   tree: 0699e31
+
+MUTANT: read_data_type maps tag 4 (BigInt) -> Integer, so serialize and deserialize
+disagree. The record encodes with tag 4, reparses as Integer, and re-encodes as tag 0.
+This is the CLASS the send-side check existed for: a record that reparses SUCCESSFULLY
+but to a different record. A length guard cannot see it.
+
+--- ARM A: send-side check DELETED (this branch, HEAD) ---
+PROBE encode  = ACCEPTED (91 bytes)
+PROBE decode  = REFUSED: wal error: entry 0 of 1 in an Append frame: wal error: a Catalog command's log record did not re-encode to the bytes it arrived as (20 bytes in, 20 out). `RecKind::deserialize` stops at its last field and ignores whatever follows, so those bytes would have been discarded silently — and two byte strings decoding to one command is exactly what a signature over the wire cannot survive
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1656 filtered out; finished in 0.00s
+
+--- ARM B: send-side check PRESENT (transport.rs from 783ac05) ---
+PROBE encode  = REFUSED: wal error: a Catalog command for table "t" does not survive its own encoding, so the frame would be misparsed by the peer rather than refused. This is a canonicality failure, not a truncated length prefix — `wal::log::write_str` refuses those at the encoder
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1656 filtered out; finished in 0.00s
+
+VERDICT — the one line the landing queue asked for
+--------------------------------------------------
+MUTANT THAT NO LONGER FAILS AT THE SENDER: `read_data_type` mapping tag 4 (BigInt) -> Integer.
+With the check, `encode` REFUSED it. With the check deleted, `encode` ACCEPTS it.
+WHAT STILL CATCHES THE CLASS: `decode_catalog`'s byte-for-byte identical round trip, on the
+receive side, which REFUSED the same frame (measured above, not argued).
+
+⚠ AND THE HONEST COST, because this is not a pure win. Detection MOVES from the sender to the
+receiver. The deleted comment's own argument was that the receiver is "the wrong side of the wire
+to find out that this node emitted rubbish" — and that argument is still true. What changed is
+what it buys: while `write_str` was unchecked the sender's check was the ONLY thing standing
+between a truncated name and a durable frame, and now it is not, because the truncation is refused
+at the encoder. What remains is a codec-disagreement class that no test exercised, that a mutant
+already survived once, and that the sender's check could no longer be made to fire at all — the
+`?` above it refuses first.
+
+⇒ So the trade is: a guard that cannot be fired, in exchange for the same class caught one hop
+later by a guard that CAN be. This file is the evidence for that trade; it is not claimed to be
+free. If a future row wants sender-side detection back, the way to get it is a canonicality test
+over `RecKind`'s codec that does not depend on an over-long string to trigger it.
+
+SCOPE OF THIS EXPERIMENT: one mutant, one class. It does not enumerate everything the deleted
+check could ever have caught. It shows that the class the check was WRITTEN for is still refused.

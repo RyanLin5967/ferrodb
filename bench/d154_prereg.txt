@@ -1,0 +1,298 @@
+PRE-REGISTRATION — D154, written BEFORE the suite run. Amendments append-only.
+===============================================================================
+
+worktree: /Users/idide/wt/ferrodb-d141-catalog-narrowing
+branch:   d154-write-str   (NOT d141-catalog-narrowing — the worktree directory is named for an
+                            earlier row and that mismatch already caused this lane to be recorded
+                            in the landing queue under a branch that is 0 ahead of main, i.e. to
+                            read as "produced nothing". The branch name is the authority.)
+
+BASELINE, and the check that it applies to the base I actually merged
+---------------------------------------------------------------------
+2508 passed, mode=per-target, head=b17ec58 — bench/land-2655e3b_certified/SUMMARY.txt, verbatim
+from that runner's stdout. Go: 97.
+
+origin/main is 708822e, which is FOUR commits past b17ec58. Those four are bench/ banks only:
+  `git diff --stat b17ec58 origin/main -- src tests examples Cargo.toml` is EMPTY,
+  and `git diff --name-only b17ec58 origin/main` touches only `bench/`.
+⇒ 2508 carries forward to 708822e unchanged. This is checked, not assumed — the equivalent claim
+  was asserted-and-false by 506 lines in D126's bank.
+
+⚠ MODE. 2508 is PER-TARGET. `whole` mode is per-target + 2 doctests (one of which is a
+`compile_fail` block that reports separately — the constant was "corrected" to +1 by three people
+at once and reverted). The run below is pinned to VERIFY_MODE=per-target so no conversion is
+needed. A total is comparable only within its mode AND against its own base.
+
+WHAT THIS BRANCH ADDS
+---------------------
+tests/d154_length_prefix_refusal.rs — a NEW target, +6 tests. Counted from what RUNS
+("running 6 tests"), not from `grep -c '#[test]'`, which undercounts inside macros:
+  every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express
+  a_ddl_record_refuses_a_column_count_its_prefix_cannot_express
+  every_write_str_site_in_a_run_identity_record_refuses
+  a_compensation_record_refuses_through_the_record_it_wraps
+  the_largest_value_each_prefix_can_express_still_encodes
+  the_durable_provenance_store_refuses_a_run_it_cannot_encode
+
+NET ZERO, and stated because it is the one that could hide a loss:
+  consensus::transport::tests::a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender
+  was REWRITTEN, not added or removed — 1 test before, 1 test after. Its contract changed
+  deliberately (it now asserts the INVARIANT "refused, never framed" instead of which mechanism
+  refuses), and its hand-built 65540-byte section went with the send-side check it tested.
+
+PRE-REGISTERED EXPECTATION
+--------------------------
+  2508 + 6 = 2514 passed, 0 failed, 0 build_errors, mode=per-target
+  Go: 97 passed, 0 failed  (no Go files touched)
+
+Falsifiable on its own, each:
+  1. rc=0, failed=0, build_errors=0.
+  2. total == 2514 exactly. 2508 would mean the new target was never swept; 2513 would mean one of
+     the six did not collect; anything above means something else moved and must be explained
+     before this is called green.
+  3. all SIX new tests present BY NAME in the log, each "... ok".
+  4. the rewritten transport test present and passing BY NAME — it is the one whose contract this
+     row changed, so a green that did not run it proves nothing about the change.
+  5. Go 97.
+
+A DELETED GUARD, which a count cannot see
+-----------------------------------------
+This row DELETES the send-side re-encode check in consensus::transport::encode_command. No test
+count moves, so the suite is structurally incapable of noticing. The evidence for that deletion is
+therefore NOT the suite: it is bench/d154_deleted_guard.txt, which names the mutant that used to
+fail there and shows what still catches the class on the receive side.
+
+KNOWN INTERMITTENT, decided in advance
+--------------------------------------
+branch::reaper::tests::…a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+("fixture: nothing was ever checkpointed") — D139. If it is the ONLY failure, re-run. Anything
+else is mine until shown otherwise.
+
+
+AMENDMENT 1 — 2026-09-22, main moved TWICE mid-run (append-only)
+=================================================================
+Run 1 (label d154-3b7de87) produced NO NUMBER. It acquired the lock at 15:07:00Z, got 16 of 134
+targets in, and I killed it at 15:11 once the landing queue disclosed that main had moved to
+4685d80. verify-suite refused rather than reporting a partial:
+
+    d154-3b7de87: REFUSING — aborted by SIGTERM after 505s. A suite cut short is not a count.
+
+Killed rather than finished because it certified a tree that can never land, and the lock is a
+fleet resource. It was also contended: two builds of the landing queue's own (a land-gate for D138,
+whose prepush runs cargo build --examples and cargo check --all-targets) ran alongside its first
+six minutes. Disclosed to me rather than left to surface as a flaky cell.
+
+BASELINE REPLACED — 2508 IS NO LONGER RIGHT
+--------------------------------------------
+2508 was head=b17ec58. D138 has since landed and ADDS TESTS (src/tel/tests_durable_log.rs +79).
+The new certified number is:
+
+    d138c: mode=per-target rc=0 passed=2511 failed=0 build_errors=0 head=5181d73
+    d138c: go rc=0 passed=97 failed=0
+    (bench/land-ebdf002_certified/CERTIFICATION.txt, verbatim)
+
+⇒ D138 added 3 tests: 2508 -> 2511. Had I kept 2508 I would have reported a phantom +3.
+
+Transfer checked, not assumed, the same way as before:
+    git diff --stat 5181d73 origin/main -- src tests examples Cargo.toml   -> EMPTY
+    git diff --name-only 5181d73 origin/main                               -> bench/ only
+⇒ 2511 is the baseline at 4685d80.
+
+THE OVERLAP I WAS WARNED ABOUT, CHECKED
+----------------------------------------
+src/tel/log.rs is touched by BOTH lanes — D138 +366 lines, and D154 rewrites put_str there. My
+earlier "no file overlap" check was against 708822e and was STALE. Re-checked against 4685d80:
+  * D138 adds NO write_str and NO put_str call site (`git diff … | grep -E '^[+-].*(put_str|write_str)'`
+    is empty), so there is no new unguarded site and no collision with the guard.
+  * Hunk ranges do not overlap: D138 touches old-lines 108–328 and 1484–1660; D154 touches 455–473.
+  * `git merge-tree --write-tree HEAD origin/main` -> rc=0.
+Merged clean at cca6145. rc=0 means no line collided, not that the result is coherent — the
+per-site compile check and the suite below are what settle coherence.
+
+REVISED EXPECTATION
+-------------------
+    2511 + 6 = 2517 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+
+Checks 1–5 from the original pre-registration stand unchanged except the total:
+2511 would mean the new target was never swept; 2516 would mean one of the six did not collect.
+
+⚠ CONTENTION RULE FOR THIS RUN, agreed in advance: a GREEN is quotable — contention cannot
+manufacture a pass. A FAILURE is not a finding until that target is re-run on a quiet box; this
+repo has a documented load-sensitive port race and timing-sensitive tests fail under load in a way
+that looks exactly like a regression.
+
+
+AMENDMENT 2 — 2026-09-22, STALE-GREEN forced a re-run (append-only)
+====================================================================
+Run 2 (d154-262113a) was GREEN and every pre-registered check hit:
+
+    d154-262113a: mode=per-target rc=0 passed=2517 failed=0 build_errors=0 head=262113a
+    d154-262113a: go rc=0 passed=97 failed=0
+    RUNNER_EXIT=0
+    certify-head: OK — suite head=262113a == landing 262113a
+
+⛔ AND IT IS STILL NOT LANDABLE. `tools/staleness.sh . <main> 262113a` returned:
+
+    branch 262113a vs 3a9a5f9…: 14 behind, 8 ahead
+      base moved under: 3 Rust file(s), 0 other code file(s)
+    STALE-GREEN: the base moved under code this branch has not seen.
+      (no file is edited by both sides -- lower risk, but still re-run: a lock-order
+       inversion does not fail loudly, it hangs rarely under load, and it can be created
+       by two files that never appear in the same diff.)
+      tests present on 3a9a5f9… but NOT on this branch:
+          tests/d151_parse_reads_a_refreshed_snapshot.rs
+
+⚠ BOTH I AND THE LANDING QUEUE PREDICTED **COVERED**, from the same correct premise — the file
+sets do not intersect (mine: consensus/{log,transport,tests_log,tests_transport},
+provenance/durable, tel/log, wal/log, the new test; D151's: src/pgwire/{extended,mod},
+tests/d151_…). The guard rejects that reasoning ON PURPOSE, and says so in its own output: two
+files that never appear in the same diff can still create a lock-order inversion, which does not
+fail loudly — it hangs rarely, under load. Its verdict line is "Do not reason about whether it
+matters: 'close enough' is the judgement these guards exist to delete."
+⇒ Recorded because the failure mode was US: a disjoint-file-set argument is exactly the shape that
+  feels conclusive and is not, and two people reached it independently.
+⇒ The armed land-gate was KILLED before its prepush ran: it would have refused at step [2/3]
+  anyway, and prepush is the step that builds. No machine time spent on a refusal.
+
+ALSO NOTE: run 2's number was a fact about a base that exists ONLY ON THIS MACHINE. `main` is 14
+ahead of `origin/main`, and `origin/main` == my merge base exactly. A commit count is meaningless
+without the ref it counted against, the same way a total is meaningless without its mode.
+
+BASELINE REPLACED AGAIN — 2511 -> 2512
+---------------------------------------
+D151 landed into local main since run 2's base and adds one test:
+
+    d151: mode=per-target rc=0 passed=2512 failed=0 build_errors=0 head=cdf6434
+    (bench/d151_certified/SUMMARY.txt on main, verbatim)
+
+Transfer checked, not assumed:
+    git diff --stat cdf6434 main -- src tests examples Cargo.toml   -> EMPTY
+    git diff --name-only cdf6434 main                               -> bench/ only
+⇒ 2512 is the baseline at main 3a9a5f9.
+
+⚠ D151's banked log PATH points into a session scratchpad that is wiped on restart, so its logs
+are gone; only the SUMMARY survives. It is still a usable baseline — the SUMMARY is the runner's
+own line — but it cannot be re-derived, and that is worth knowing before anyone tries.
+
+MERGED main at b9fe858. Staleness re-run AFTER the merge:  "0 behind, 9 ahead / COVERED".
+
+REVISED EXPECTATION FOR RUN 3
+-----------------------------
+    2512 + 6 = 2518 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+
+2517 would mean D151's test did not come across in the merge; 2512 would mean my target was never
+swept. Checks 3, 4 and 5 (six new tests by name, the rewritten transport test by name, Go 97)
+stand unchanged, and I am adding a sixth: tests/d151_parse_reads_a_refreshed_snapshot.rs must
+appear BY NAME too, since its absence is what staleness flagged.
+
+
+AMENDMENT 3 — 2026-09-22, BOTH landing orders pre-registered (append-only)
+===========================================================================
+Run 3 (d154-9637308) produced NO NUMBER: killed at 16 of 135 targets, and verify-suite refused
+rather than reporting a partial ("aborted by SIGTERM after 391s. A suite cut short is not a
+count."). The kill's CONCLUSION was right — the base is going to move by design, so that run could
+never have landed — but its PREMISE was false and that is the part worth recording:
+
+⛔ I INFERRED ANOTHER LANE'S STATE INSTEAD OF MEASURING IT. I read "the suite lock is free" plus
+"I intend to land w4gen first" as "w4gen's suite is done and only its landing is pending", and
+acted on it. w4gen's suite was in fact QUEUED, with no verdict in existence, and its branch had
+moved twice since the tip it had reported. Verified after the fact: the lock was taken by d159
+**23 seconds** after I released it (87199 d159 16:24:38Z vs my release at ~16:24:15Z), because
+releasing a mkdir lock does not hand it to whoever you intended — it goes to whoever races first.
+⇒ The check was `cat /tmp/ferrodb-suite.lock/owner`, one command, and I had run it minutes earlier
+  and drawn a conclusion from its ABSENCE of an owner rather than from any statement about w4gen.
+⇒ Same shape as the origin/main error earlier in this row: a well-formed, plausible reading of a
+  state I did not measure. Twice in one row, in opposite directions.
+
+PRE-REGISTERING BOTH LANDING ORDERS, so the number is chosen before the data rather than fitted
+after. D154 is +6 per-target; every absolute below is that one claim evaluated at a base:
+
+    base                                   | absolute | status
+    ---------------------------------------|----------|-----------------------------------------
+    4685d80  (2511, D138 in)               |   2517   | MEASURED, hit exactly, RUNNER_EXIT=0
+    3a9a5f9  (2512, D151 in)               |   2518   | never run — base moved first
+    3a9a5f9 + w4gen (+4)  = 2516           |   2522   | ⭐ EXPECTED at gate time
+    (w4gen landing after me, +4 on 2518)   |   2518   | not expected; w4gen lands first by decision
+
+⇒ If the run returns 2522, D154 is +6 on a base that includes w4gen. If it returns 2518, w4gen did
+  NOT land first and the landing order changed without my being told. Either way the delta is the
+  claim and the absolute is derived, not carried forward.
+
+The +6 is: 6 tests in tests/d154_length_prefix_refusal.rs. The rewritten transport test is net
+zero (1 before, 1 after) and is checked BY NAME for that reason.
+
+
+AMENDMENT 4 — 2026-09-22, the base is now FIXED and the prediction is the one already registered
+=================================================================================================
+w4gen landed first, as agreed, so the row selected from the table committed at 1f6b2ae — BEFORE
+any of this data existed — is the "+w4gen" row:
+
+    base: local main 5b814b8 (merge 624edf1 + its bank), baseline 2516 per-target
+    expectation: 2516 + 6 = 2522, Go 97
+
+Both halves checked rather than taken from the landing queue's message:
+  * `git diff --stat bfcfa0e main -- src tests examples Cargo.toml` -> EMPTY, and the only
+    differing top-level dir is bench/. So w4gen's certified 2516 at bfcfa0e transfers to main.
+  * staleness RUN, not predicted: "branch b4a670e vs 5b814b8…: 0 behind, 12 ahead / COVERED".
+    Predicting it is what cost this row a cycle this morning; both of us said COVERED and the
+    guard said STALE-GREEN.
+
+⚠ origin/main is 4685d80 and RED — a reproduced 0xc0000005 on Windows, 2 of 2 on that sha. The
+base I am landing on is a LOCAL main that is 15+ commits ahead of origin and exists on this
+machine only. Recorded here because the absolute below is meaningless to anyone who fetches.
+
+    DURABLE FORM OF THIS ROW'S CLAIM:  D154 = +6 @ base 5b814b8 (local), per-target.
+    2522 is that claim evaluated at this base and nowhere else.
+
+The Windows failure does not touch this row, and that is MEASURED rather than argued from module
+names: integration_cluster_agents returned "ok. 35 passed; 0 failed" in my own complete run at
+4685d80 — the exact sha that reproduces on Windows — with 0 FAILED result lines in the whole run.
+A file-set argument is what staleness refused from us this morning, so it is not used here either.
+
+
+AMENDMENT 5 — 2026-09-22, d159 landed mid-run; base fixed at main 29801f0
+==========================================================================
+Run 4 (d154-3afec21) produced NO NUMBER: "REFUSING — aborted by SIGTERM after 1011s. A suite cut
+short is not a count." Stopped on request once D159 landed under it. The arithmetic for stopping
+rather than finishing is the landing queue's and it holds: ~3 min sunk against ~45 to restart,
+versus ~85 total if D159 had waited and then re-run STALE-GREEN.
+⚠ Minor correction to that account for the record: the runner reports 1011s, not ~3 minutes. Most
+of it was queue time, so the conclusion is unchanged — but "3 minutes in" understates what was
+spent and the number in the refusal line is the one to quote.
+
+⛔ CORRECTION I OWE THE RECORD, AGAINST MYSELF'S FAVOUR:
+**2529 was NOT pre-registered.** The table committed at 1f6b2ae registered BOTH w4gen orderings
+(2522 / 2518) and nothing about D159, which did not exist to me then. Describing 2529 as "the row
+your table pre-registered" would be retroactive fitting — precisely what pre-registration exists to
+prevent, and this row has already had one near-miss of that exact shape (outcome A in
+d141-basecheck would have HIT on a mechanism that was false).
+⇒ What IS pre-registered and untouched is the DELTA: **D154 = +6 per-target**. That claim has
+  survived four base changes without being re-derived once.
+⇒ 2529 is registered HERE, now, before the run and before any data: 2523 + 6.
+
+BASE, checked not taken:
+  d159: mode=per-target rc=0 passed=2523 failed=0 build_errors=0 head=da8e37e   (banked SUMMARY)
+  `git diff --stat da8e37e main -- src tests examples Cargo.toml` -> EMPTY, only bench/ differs.
+  ⇒ 2523 transfers to main 29801f0. Merged at 27d6262.
+  staleness RUN, not predicted: "0 behind, 14 ahead / COVERED".
+
+THE OVERLAP GUARD, RUN RATHER THAN EYEBALLED — and this is the check the landing queue asked for
+after D159's own merge found w4gen's fix had landed INSIDE its function on a shared file:
+    git log --oneline 5b814b8..main -- src/tel/log.rs src/wal/log.rs \
+        src/provenance/durable.rs src/consensus/     ->  EMPTY
+  ⇒ D159 landed no commit touching any file this row edits. That is a stronger statement than
+    "the file lists do not intersect", because it asks the history rather than comparing two
+    name sets.
+  Semantic re-check after the merge: the only two `write_str` calls not ending in `?;` are the two
+  adapters that map the error. Compiles clean under CI RUSTFLAGS, no unused-Result warnings.
+
+EXPECTATION FOR RUN 5
+---------------------
+    2523 + 6 = 2529 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+    DURABLE FORM: D154 = +6 @ base 29801f0 (LOCAL main; origin/main is 4685d80 and RED).
+
+2523 would mean my target was never swept. 2528 would mean one of the six did not collect. The six
+by name, the rewritten transport test by name, and tests/d151_… by name all still apply.

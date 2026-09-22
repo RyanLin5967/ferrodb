@@ -1009,7 +1009,7 @@ fn wal_type_bytes(ty: &DataType, reference: &DataType) -> (Vec<u8>, Vec<u8>) {
             time_travel_root: 0,
             columns: vec![("c".into(), t.clone(), false)],
         }
-        .serialize(&mut b);
+        .serialize(&mut b).unwrap();
         b
     };
     let a = ser(reference);
