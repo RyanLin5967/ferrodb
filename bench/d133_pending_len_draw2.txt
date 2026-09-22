@@ -1,0 +1,185 @@
+d133-pending-len: queued behind 7683 d127invert 2026-09-22T12:08:28Z
+d133-pending-len: acquired the suite lock after 480s
+# D133 — pending-free queue length under a branching workload. RAW ARTIFACT.
+#
+# run at            2026-09-22T12:23:23Z UTC
+# worktree          /Users/idide/wt/ferrodb-d133-pending-len
+# branch            d133-pending-len
+# head              f132a0adcaf15b6f655743677e5dc6080988f894
+# tree state        1 modified/untracked path(s)
+#                   ?? bench/d133_pending_len_draw2.txt
+# binary mtime      2026-09-22T12:09:12Z
+# host              Darwin 25.6.0 arm64
+# measure lock      61248 d133-pending-len 2026-09-22T11:52:09Z
+# suite lock        HELD BY THIS RUN: 97955 d133-pending-len 2026-09-22T12:23:23Z (queued 480s)
+# load before       6.96 7.49 6.93
+#
+# THE CONFIGURATION GATE, quoted from the code this harness invokes:
+#   arena.rs persist_if_configured —
+#         fn persist_if_configured(&self) -> Result<(), FerroError> {
+#             let path = self.checkpoint_path.lock().unwrap().clone();
+#             match path {
+#                 Some(p) => self.checkpoint(&p),
+#                 None => Ok(()),
+#             }
+#         }
+#   cli/cli.rs, the shipped server — this is why persist=on is the production row:
+#     120:    store.checkpoint_to(std::path::PathBuf::from(&arena_path));
+#   lease_thread.rs, the lock the reap loop runs inside:
+#     461:const REAP_CHUNK: usize = 1;
+#
+==============================================================================
+ARM 1 — the branch-count curve, in-memory catalog, both persist settings.
+  fan/chain pin their children forever (lag = infinity); fanlag holds the lag at ONE
+  reap; fanreap reaps every child first (lag = zero); leaf is the forced negative.
+==============================================================================
+# suite lock @ before arm 1 persist=off: HELD BY THIS RUN (12:23:23Z, load 6.96 7.49 6.93)
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=mem  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    off          100       400       400      100          20200        3.5      0.0349
+  fan    off          300      1200      1200      300         180600       17.7      0.0590
+  fan    off         1000      4000      4000     1000        2002000       99.1      0.0991
+  fan    off         3000     12000     12000     3000       18006000      662.0      0.2207
+  chain  off           99       396       396       99          19800        3.6      0.0364
+  chain  off          299      1196      1196      299         179400       15.1      0.0505
+  chain  off          999      3996      3996      999        1998000      100.3      0.1004
+  chain  off         2999     11996     11996     2999       17994000      776.0      0.2587
+  fanreap off          200         0         0        0              0        0.4      0.0021
+  fanreap off          600         0         0        0              0        1.3      0.0021
+  fanreap off         2000         0         0        0              0        2.2      0.0011
+  fanreap off         6000         0         0        0              0        5.6      0.0009
+  fanlag off          200         0         4      200            800        3.2      0.0161
+  fanlag off          600         0         4      600           2400       11.0      0.0183
+  fanlag off         2000         0         4     2000           8000       40.6      0.0203
+  fanlag off         6000         0         4     6000          24000      127.3      0.0212
+  leaf   off          100         0         0        0              0        0.4      0.0042
+  leaf   off          300         0         0        0              0        1.5      0.0050
+  leaf   off         1000         0         0        0              0        2.0      0.0020
+  leaf   off         3000         0         0        0              0        4.3      0.0014
+
+  20 rows, every fan/chain row parked pages and every leaf row parked none.
+# suite lock @ after arm 1 persist=off: HELD BY THIS RUN (12:23:29Z, load 6.96 7.48 6.93)
+(arm 1 persist=off rc=0)
+
+# suite lock @ before arm 1 persist=on: HELD BY THIS RUN (12:23:29Z, load 6.96 7.48 6.93)
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=mem  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    on           100       400       400      100          20200     1638.4     16.3842
+  fan    on           300      1200      1200      300         180600     4900.9     16.3362
+  fan    on          1000      4000      4000     1000        2002000    16728.3     16.7283
+  fan    on          3000     12000     12000     3000       18006000    59291.9     19.7640
+  fanlag on           200         0         4      200            800     4582.9     22.9143
+  fanlag on           600         0         4      600           2400    14478.9     24.1315
+  fanlag on          2000         0         4     2000           8000    76198.3     38.0992
+  fanlag on          6000         0         4     6000          24000   220686.2     36.7810
+  leaf   on           100         0         0        0              0     2967.1     29.6706
+  leaf   on           300         0         0        0              0     9864.8     32.8826
+  leaf   on          1000         0         0        0              0    23911.8     23.9118
+  leaf   on          3000         0         0        0              0    76710.4     25.5701
+
+  12 rows, every fan/chain row parked pages and every leaf row parked none.
+# suite lock @ after arm 1 persist=on: HELD BY THIS RUN (12:32:07Z, load 2.66 3.69 5.13)
+(arm 1 persist=on rc=0 — every pass fsyncs the whole map, so this arm is the slow one.
+ Shapes trimmed to fan/fanlag/leaf: chain matched fan EXACTLY on every integer and
+ fanreap matches leaf, so running them here would hold the fleet's lock to re-derive
+ a duplicate. fan is the growing queue, fanlag the bounded one, leaf the fast path.)
+
+==============================================================================
+ARM 2 — the SHIPPED catalog, at counts it can reach. D99's rule: two catalogs
+must agree on the integers at a count both can reach, or one of them is the
+thing being measured.
+==============================================================================
+# suite lock @ before arm 2: HELD BY THIS RUN (12:32:07Z, load 2.66 3.69 5.13)
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=table  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    off          100       400       400      100          20200     1144.5     11.4450
+  fan    off          300      1200      1200      300         180600     5796.0     19.3200
+  chain  off           99       396       396       99          19800     5066.0     51.1717
+  chain  off          299      1196      1196      299         179400   121216.4    405.4061
+  fanreap off          200         0         0        0              0     3654.1     18.2704
+  fanreap off          600         0         0        0              0     8448.9     14.0815
+  fanlag off          200         0         4      200            800     2502.2     12.5109
+  fanlag off          600         0         4      600           2400     7414.9     12.3582
+  leaf   off          100         0         0        0              0     1356.5     13.5654
+  leaf   off          300         0         0        0              0     4460.8     14.8692
+
+  10 rows, every fan/chain row parked pages and every leaf row parked none.
+# suite lock @ after arm 2: HELD BY THIS RUN (12:35:22Z, load 7.67 5.35 5.49)
+(arm 2 rc=0)
+
+==============================================================================
+ARM 3 — the PAGES axis, held against ARM 1's N=300 row. pending is pages
+parked, not branches reaped, so P must scale it linearly or the model is wrong.
+==============================================================================
+# suite lock @ before arm 3: HELD BY THIS RUN (12:35:22Z, load 7.67 5.35 5.49)
+  P=1   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=1   fan    off          300       300       300      300          45150        4.0      0.0133
+  P=4   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=4   fan    off          300      1200      1200      300         180600       18.5      0.0616
+  P=16   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=16   fan    off          300      4800      4800      300         722400       67.3      0.2244
+
+# suite lock @ after arm 3: HELD BY THIS RUN (12:35:23Z, load 7.67 5.35 5.49)
+
+==============================================================================
+ARM 4 — a THIRD point on the shipped catalog's chain slope. Two points cannot
+separate a slope from a drifting box, and this project has lost four results
+to exactly that.
+==============================================================================
+# suite lock @ before arm 4: HELD BY THIS RUN (12:35:23Z, load 7.67 5.35 5.49)
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=table  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+bench/d133_run.sh: line 38: 19157 Killed: 9               "$@"
+REFUSED: aborted by SIGTERM after 1999s. A sweep cut short is not a measurement.
+
+################################################################################################
+# ARM 4 — **ABANDONED DELIBERATELY, NOT FAILED.** Recorded as abandoned so the gap is a decision
+# on the record rather than a silence someone later reads as a result.
+#
+# WHAT IT WOULD HAVE BEEN: chain / TableBranchCatalog / V=600 — a THIRD point on the shipped
+# catalog's chain slope, where V=99 -> 51.17 ms/reap and V=299 -> 405.41 ms/reap (a 7.9x across
+# 3.0x V). Two points cannot separate a slope from a drifting box; the third would have settled it.
+#
+# WHY IT STOPPED: started 12:35:23Z, SIGTERMed 12:48:42Z — 13 minutes with no row (a row prints
+# only when the whole point completes). Estimated 8 min from V=299's per-entry cost; the overrun
+# means the per-entry cost is itself rising, so the remaining time was unbounded from here. This
+# run HELD /tmp/ferrodb-suite.lock the whole time and four lanes were queued behind it
+# (land-d93d23b, d141-catalog-narrowing, d138-effectlog-index, plus D144). The team lead ruled:
+# finish if minutes away, abandon otherwise. It was not minutes away.
+#
+# ⚠ WHAT IS AND IS NOT AFFECTED: nothing above this banner. ARM 4 is a REFINEMENT of a slope whose
+# direction is already established by two points and by the entry-visit integers, which are exact.
+# ARMS 1-3 completed with rc=0 and held the suite lock throughout. The D133 verdict does not
+# depend on ARM 4 and does not change without it.
+#
+# ⇒ TO RESUME: bench/d133_run.sh, ARM 4 only. Budget a lock hold of 20+ minutes, or run it with
+#   SUITE_LOCK pointed elsewhere when no lane is queued.
+################################################################################################
