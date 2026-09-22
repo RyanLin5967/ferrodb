@@ -121,7 +121,7 @@ page writes, guard re-checks, fingerprinting and publication. The reading was ri
 
 Found while confirming that an agent `UPDATE` reaches `ws.frame.ops`, and then measured by the same
 harness. `stage_all` ends **every statement** with `ws.frame.clone()` + `self.log.append(&frame)`
-(`runtime.rs:2924-2929`) — the whole frame, cloned and re-appended once per statement. A session
+(`runtime.rs:2868` and `:2873` at `1bf8abe`) — the whole frame, cloned and re-appended once per statement. A session
 issuing W statements copies 1 + 2 + ... + W ops.
 
 Writes phase per session, delta=32 `REPEAT` ascending, from `bench/d114_before_delta32_rerun.txt`:
@@ -357,7 +357,7 @@ currently exercise. This is the same shape D110 already recorded when a brief ca
 ### AMENDMENT 5 (pre-measurement, append-only): a larger quadratic sits next door, on the WRITE path
 
 Noticed while confirming that an agent `UPDATE` reaches `ws.frame.ops`. `stage_all` ends each
-statement with `ws.frame.clone()` and `self.log.append(&frame)` (`runtime.rs:2924-2929`) — **the
+statement with `ws.frame.clone()` and `self.log.append(&frame)` (`runtime.rs:2868` and `:2873` at `1bf8abe`) — **the
 whole frame, cloned and re-appended once per statement.** A session issuing W statements therefore
 copies 1 + 2 + ... + W ops, which is **O(W²) on the write path**, against the merge scan's
 O(delta · W) once at the end.
