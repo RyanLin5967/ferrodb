@@ -1,0 +1,15 @@
+  spin calibration: 1.847e9 spins/sec single-threaded
+           0.01063ms   64     19635 sleep 17.970ms    12800        0.63570     1.0000        40    3.1%
+  queue_mean 3.09
+  spin calibration: 3.609e9 spins/sec single-threaded
+           0.01063ms   64     38360 sleep 17.970ms    12800        0.73813     1.0000        51    3.0%
+  queue_mean 4.48
+  spin calibration: 1.913e9 spins/sec single-threaded
+           0.01063ms   64     20337 sleep 17.970ms    12800        0.68602     1.0000        39    3.1%
+  queue_mean 3.98
+  spin calibration: 2.162e9 spins/sec single-threaded
+           0.01063ms   64     22977 sleep 17.970ms    12800        0.70844     1.0000        43    3.0%
+  queue_mean 4.17
+  spin calibration: 1.769e9 spins/sec single-threaded
+           0.01063ms   64     18808 sleep 17.970ms    12800        0.68172     1.0000        42    3.0%
+  queue_mean 4.03

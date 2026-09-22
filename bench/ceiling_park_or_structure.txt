@@ -8,9 +8,13 @@ Scaffold branch:  CEILING-resume, off CEILING-park-or-structure (c00b26e).
                   ⛔⛔ NEITHER MAY EVER LAND. See "WHAT MUST NOT LAND" at the end.
 Artifacts:        this file, bench/ceiling_INVENTIONS_patch.md, and bench/ceiling_raw/*.
 Harness:          examples/ceiling_lock_contention.rs, built with --features lock_census.
-Box:              NOT quiet. load_at_acquire 24-45 throughout, two swift-frontend compiles and
-                  mediaanalysisd resident; the fleet measure-lock was held for the whole run
-                  (acquired "CEILING-resume", load_at_acquire=8 at acquisition, rising after).
+Box:              NOT quiet. The fleet measure-lock was held for the whole session (owner
+                  "CEILING-resume", acquired 2026-09-22T07:05:12Z at load_at_acquire=8), so no
+                  other MEASURER ran — but two swift-frontend compiles and mediaanalysisd were
+                  resident throughout and the lock does not exclude those. Every raw file carries
+                  its own start and end stamp; across them the 1-minute load ranges from 7.98
+                  (the very first model run, 07:05) to 48.87 (07:15), and sits at 25-38 for every
+                  ladder run in sections 3-6.
                   EVERY DURATION BELOW IS AN UPPER BOUND. The counts are not.
 
 ================================================================================================
@@ -101,7 +105,7 @@ rendezvous; the quantity under test was untouched.
 NEGATIVE CONTROL ON THE REAL LADDER, not just on a model mutex (bench/ceiling_raw/11, T=1):
 
   contended/op   0.00000 at ALL FOUR rungs
-  WAIT           0.0003 ms          (nothing to block on)
+  WAIT           0.00032-0.00040 ms (nothing to block on)
   closure        100.0% at all eight probe-carrying rungs
 
 CROSS-CHECK licensing the process-wide atomic mode the pgwire arm must use
@@ -208,19 +212,32 @@ both rungs. WAIT differs by 46x between them.
 5b. ⭐ THE OBJECTION THIS MUST SURVIVE: "BUT contended/op IS 0.908 AT L3, WHICH IS HIGH"
 ================================================================================================
 
-It is high, and it is HIGHER than a pure mutex reads at the same operating point. From the model
-(bench/ceiling_raw/03), a bare `Mutex` driven at each recorded rung's own arrival process — hold
-and cycle set to the recorded wall-clock values, the outside interval a SLEEP so the thread
-leaves the runnable set as it does in an fsync:
+It is high. The question is whether "high" is evidence of anything, and the answer is that a pure
+mutex WITH NO HANDOFF FLOOR AT ALL also reads high at the same operating point.
 
-  L0-like  hold 0.201 ms / cycle 13.365 ms   contended/op 0.78336  queue_mean 5.35  U_ach 74.2%
-  L3-like  hold 0.0094 ms / cycle 7.096 ms   contended/op 0.41383  queue_mean 1.89  U_ach  6.5%
+`MODE=opref` runs a bare `Mutex` — no tree, no fsync, no second lock — at an operating point you
+supply: hold and cycle, with the outside interval a SLEEP so the thread leaves the runnable set
+as it does inside an fsync. ⭐ **Fed THIS session's own measured L3 numbers** (HOLD_TOTAL
+0.01063 ms, cycle T*S_eff 17.981 ms, T=64), not the recorded ones — the reference in
+bench/ceiling_raw/03 is parameterised by d123 §3b and would be the same two-instruments-two-
+moments error this whole re-run exists to avoid.
 
-Real ladder L3: 0.90812 against a reference of 0.41383. So threads DO still collide on `logical`
-at L3, more than a memoryless arrival process would produce. Taken alone that reads as support
-for outcome 1, and it is exactly why the count alone cannot settle this.
+  Ten draws (bench/ceiling_raw/30, /31, /32):  contended/op 0.525 - 0.738, median ~0.68
+  Real ladder L3, median of 5 reps:            contended/op 0.908
 
-⇒ **IT IS RECONCILED BY WHAT THE COLLISIONS COST, AND BY WHAT CAUSES THEM.**
+⇒ **A mutex with no floor under it reads 0.53-0.74 where the real ladder reads 0.91.** So a high
+collision count at L3 is the NORMAL reading for a lightly-loaded mutex under bunched arrivals,
+not a signature of park/unpark. The real ladder is somewhat above the reference, which is what
+bunching predicts — but see the caveat.
+
+⚠ ⛔ **AND THE REFERENCE IS TOO NOISY TO QUANTIFY THAT EXCESS, SO NOTHING HERE RESTS ON IT.**
+`calibrate_spin()` measures spins/sec on a box at load 25-38 and drifted 1.77e9 - 3.61e9 across
+the ten draws — a 2x spread — so the modelled hold is not reliably the hold that was asked for,
+and the printed `U_ach` is computed from the ASKED hold and therefore cannot audit it. The
+reference establishes the ORDER ("a floor-free mutex also reads ~0.7 here"), which is all it is
+used for. It does not establish "1.3x above reference" and that ratio is not claimed.
+
+⇒ **THE CONCLUSION RESTS ON THE NEXT TWO ITEMS, NEITHER OF WHICH NEEDS THE REFERENCE.**
 
   (i)  THE COST. At L3 the whole of WAIT is 0.25570 ms of a 17.98 ms cycle — **1.4%**. Deleting
        `logical` outright, making every acquisition free, could buy at most that 1.4%. A 90%
