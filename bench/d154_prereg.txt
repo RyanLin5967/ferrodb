@@ -67,3 +67,57 @@ KNOWN INTERMITTENT, decided in advance
 branch::reaper::tests::…a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
 ("fixture: nothing was ever checkpointed") — D139. If it is the ONLY failure, re-run. Anything
 else is mine until shown otherwise.
+
+
+AMENDMENT 1 — 2026-09-22, main moved TWICE mid-run (append-only)
+=================================================================
+Run 1 (label d154-3b7de87) produced NO NUMBER. It acquired the lock at 15:07:00Z, got 16 of 134
+targets in, and I killed it at 15:11 once the landing queue disclosed that main had moved to
+4685d80. verify-suite refused rather than reporting a partial:
+
+    d154-3b7de87: REFUSING — aborted by SIGTERM after 505s. A suite cut short is not a count.
+
+Killed rather than finished because it certified a tree that can never land, and the lock is a
+fleet resource. It was also contended: two builds of the landing queue's own (a land-gate for D138,
+whose prepush runs cargo build --examples and cargo check --all-targets) ran alongside its first
+six minutes. Disclosed to me rather than left to surface as a flaky cell.
+
+BASELINE REPLACED — 2508 IS NO LONGER RIGHT
+--------------------------------------------
+2508 was head=b17ec58. D138 has since landed and ADDS TESTS (src/tel/tests_durable_log.rs +79).
+The new certified number is:
+
+    d138c: mode=per-target rc=0 passed=2511 failed=0 build_errors=0 head=5181d73
+    d138c: go rc=0 passed=97 failed=0
+    (bench/land-ebdf002_certified/CERTIFICATION.txt, verbatim)
+
+⇒ D138 added 3 tests: 2508 -> 2511. Had I kept 2508 I would have reported a phantom +3.
+
+Transfer checked, not assumed, the same way as before:
+    git diff --stat 5181d73 origin/main -- src tests examples Cargo.toml   -> EMPTY
+    git diff --name-only 5181d73 origin/main                               -> bench/ only
+⇒ 2511 is the baseline at 4685d80.
+
+THE OVERLAP I WAS WARNED ABOUT, CHECKED
+----------------------------------------
+src/tel/log.rs is touched by BOTH lanes — D138 +366 lines, and D154 rewrites put_str there. My
+earlier "no file overlap" check was against 708822e and was STALE. Re-checked against 4685d80:
+  * D138 adds NO write_str and NO put_str call site (`git diff … | grep -E '^[+-].*(put_str|write_str)'`
+    is empty), so there is no new unguarded site and no collision with the guard.
+  * Hunk ranges do not overlap: D138 touches old-lines 108–328 and 1484–1660; D154 touches 455–473.
+  * `git merge-tree --write-tree HEAD origin/main` -> rc=0.
+Merged clean at cca6145. rc=0 means no line collided, not that the result is coherent — the
+per-site compile check and the suite below are what settle coherence.
+
+REVISED EXPECTATION
+-------------------
+    2511 + 6 = 2517 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+
+Checks 1–5 from the original pre-registration stand unchanged except the total:
+2511 would mean the new target was never swept; 2516 would mean one of the six did not collect.
+
+⚠ CONTENTION RULE FOR THIS RUN, agreed in advance: a GREEN is quotable — contention cannot
+manufacture a pass. A FAILURE is not a finding until that target is re-run on a quiet box; this
+repo has a documented load-sensitive port race and timing-sensitive tests fail under load in a way
+that looks exactly like a regression.
