@@ -42,6 +42,15 @@ main number inferred by subtracting an offset, because THERE IS NO SINGLE OFFSET
   instrumentation accumulates. I asserted a uniform offset once while writing this section and
   three of the twelve rows came out wrong — the table is what the two trees actually say.
 
+⚠ THIS ARTIFACT'S SUBJECT DOES NOT EXIST ON `main`, AND A CITATION OF IT FROM `main` MUST SAY SO.
+The harness (`examples/w4_standdown_count.rs`), the counters (`src/pgwire/standdown.rs`, 386 lines)
+and their call sites are the DEAD AGENT'S QUARANTINED, UNREVIEWED work. `de1bb0f` is NOT an
+ancestor of `main`: the branch adds 1818 lines across 7 non-bench files, 430 of them into `src/`.
+⇒ So this file may be landed on `main` BY ITSELF — it is text and changes no behaviour — but the
+  code it describes may NOT ride along with it. Anything reproducing these numbers must check out
+  the branch below. Quoting the numbers needs only this file; RE-RUNNING them needs the branch.
+      branch  w4-check3-rederive   artifact first committed at cef94dc
+
 ⛔ Counts only. No duration is measured or reported anywhere here.
 ⛔ Every number is through pgwire over a loopback TCP socket, the shipped `pgwire::handle` per
    connection. Nothing constructs `Session::new()` or drives `ServerContext` directly. Verified by
@@ -336,6 +345,54 @@ VALIDATION FIRST — the perturbation must be shown to have moved only what it c
   adds something section 5 could only bound: at a LOW fork rate, taking DML out of the announcer
   set really does recover most of the win (85.74% → 12.45%). So W4 is not a dead lane; it is a
   lane whose value is entirely decided by a number neither run has measured.
+
+2g. E7b — THE CORRECTED REAPER ARM. The axis IS driven, and it shows something better.
+Same arm as 2f (`readonly`/`extended`, reaper the only EXOGENOUS announcer) with the scale error
+fixed: rounds raised 250x so the measured window is seconds rather than ~24 ms, scan interval 1 ms.
+400,000 shared-path attempts per point instead of 1,600.
+
+  expiry_ms  minted  ann_lease   stand-downs    SHARED    stand-downs per ann_lease
+     0 ctl        0          0             0   0.0000%           —
+    32          105        105         7,497   1.8742%         71.4
+     8        4,594      4,088       103,110  25.7775%         25.2
+     2       12,439      3,976        83,953  20.9882%         21.1
+     1       14,156      3,896        99,306  24.8265%         25.5
+
+⭐ THE CONTROL IS EXACT AT SCALE. 400,000 attempts, 400,000 admitted, ZERO stood down,
+  `ann_parse=0 ann_exec=0 ann_lease=0`, and a ZERO-BYTE stderr — while a 1 ms scan ran throughout.
+  A scan that finds nothing expired announces nothing, at 250x the previous arm length. That is
+  `lease_thread.rs:66` tested to destruction rather than quoted, and it is the pre-registered
+  condition met exactly.
+⭐ THE REAPER IS A MATERIAL ANNOUNCER. 0.0000% -> 1.87% -> ~25% as reaping goes 0 -> 105 -> ~4,000.
+  "The reaper's contribution is unmeasured", which both previous runs had to report, is now a
+  number. Closure holds on all five rows (`ann_exec == sh_stood`, the read-only collapse).
+
+⚠ AND IT SATURATES, WHICH IS A FACT ABOUT THE REAPER AND NOT ABOUT THE KNOB. `ann_lease` pins near
+4,000 while `minted` climbs to 14,156: past ~8 ms the expiry rate stops being the limit, unreaped
+branches simply accumulate, and the fraction plateaus at 21-26% with NO monotone trend inside that
+plateau. The reaper self-throttles — `scan_once` chunks at `REAP_CHUNK=1` with a deliberate
+stand-off between chunks, precisely so a sweep cannot starve statements. ⇒ SO THE HEADLINE IS A
+CEILING, NOT A CURVE: however fast branches expire, the reaper caps its own interference at about
+a quarter of shared-path attempts in a pure-read workload.
+
+⚠ WHAT COUNTS ALONE CANNOT SETTLE HERE, stated because the flattering reading is available.
+This is the only arm whose exogenous announcer is isolated and countable, so it is the cleanest
+view of 2a-bis's loop anywhere in this experiment: 4,088 reaper acquisitions sit beside 103,110
+stand-downs, a ratio of 25. But TWO mechanisms produce identical counts —
+  (i) AMPLIFICATION: each stood-down read announces on its fallback, and those announcements turn
+      away further readers, the loop of 2a-bis; or
+  (ii) DURATION: one reap acquisition simply holds the catalog long enough to turn away ~25
+      readers by itself, the fallbacks being consequences rather than causes.
+Nothing in a count distinguishes them, and separating them needs a timing this experiment refuses
+to take. The ratio RISING as the rate FALLS (71 at 105 reaps, 25 at 4,088) is weak evidence for
+(ii) — overlapping windows would turn away the same reader once — but it is weak and I am not
+resting anything on it.
+
+⛔ AND THE RATE IS SYNTHETIC, which no amount of scale fixes. These points say what the reaper
+costs AT A CHOSEN EXPIRY RATE. They say nothing about the rate a real deployment sees, which
+depends on how often agent branches are abandoned and left to expire rather than merged or
+abandoned explicitly. That is a SECOND unmeasured workload number, alongside the fork rate of
+section 6, and it is now the other thing standing between check 3 and a verdict.
 
 2e. THE HARNESS'S OWN FIRE-CHECK IS REAL. `tests/w4_standdown_instrument.rs` exists and asserts
 what the artifact says it asserts. Re-run here: 6 passed / 0 failed with the feature ON, and 1
