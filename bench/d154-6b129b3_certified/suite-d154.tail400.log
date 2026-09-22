@@ -1,0 +1,400 @@
+running 25 tests
+test a_reaper_wired_to_a_different_catalog_is_caught_at_the_first_seal ... ok
+test a_read_only_candidate_reports_no_rows_written ... ok
+test a_simulation_refuses_to_run_with_no_assertions_no_candidates_or_a_duplicate_name ... ok
+test an_assertion_on_an_unknown_table_or_column_is_refused_at_bind_time ... ok
+test an_admitted_candidates_rows_are_attributed_to_that_candidate ... ok
+test a_candidate_the_first_score_refused_is_admitted_once_the_base_has_moved ... ok
+test a_candidate_whose_body_errors_is_reported_and_never_admitted ... ok
+test a_plan_that_never_says_admit_publishes_nothing ... ok
+test an_assertion_is_scored_over_rows_the_candidate_never_touched ... ok
+test every_candidate_is_scored_against_one_identical_base ... ok
+test a_candidate_writing_an_escrow_bounded_cell_errors_visibly_rather_than_overdrawing ... ok
+test a_third_candidate_that_composes_with_either_of_a_pair_is_refused_against_both ... ok
+test a_candidate_is_scored_by_the_same_gate_a_production_merge_uses ... ok
+test a_losing_candidate_is_left_for_the_reaper_rather_than_quarantined ... ok
+test an_evaluation_whose_read_premise_moved_is_refused_even_though_it_wrote_a_different_table ... ok
+test publishing_an_evaluation_the_gate_declined_is_refused ... ok
+test an_assertion_that_examined_no_rows_blocks_admission_instead_of_passing ... ok
+test simulate_is_refused_inside_an_agent_session ... ok
+test simulate_is_refused_inside_a_transaction_block_because_it_would_escape_the_rollback ... ok
+test publishing_an_evaluation_whose_base_moved_is_refused_and_publishing_a_fresh_one_is_not ... ok
+test state_for_branches_the_reaper_took_is_dropped_rather_than_retained_forever ... ok
+test the_simulate_statement_runs_end_to_end_through_the_sql_surface ... ok
+test k_candidates_cost_k_path_copies_not_k_database_copies ... ok
+test forking_k_candidates_copies_zero_pages_and_the_trunk_really_had_pages_to_copy ... ok
+test the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_return_to_baseline ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+=== target integration_sql_on_durable_branches
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.19s
+     Running tests/integration_sql_on_durable_branches.rs (target/debug/deps/integration_sql_on_durable_branches-1573d64d39185f4f)
+
+running 4 tests
+test abandon_marks_the_branch_reaped_in_the_durable_record_log ... ok
+test branch_writes_stay_invisible_to_main_on_the_durable_catalog ... ok
+test a_guard_violation_is_rejected_with_its_predicate_on_the_durable_catalog ... ok
+test two_branches_decrementing_compose_arithmetically_on_the_durable_catalog ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+=== target integration_statement_atomicity
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.31s
+     Running tests/integration_statement_atomicity.rs (target/debug/deps/integration_statement_atomicity-7a89d477e1710752)
+
+running 3 tests
+test a_refused_multi_row_update_leaves_no_row_rewritten ... ok
+test a_refused_statement_does_not_consume_the_budget_it_never_used ... ok
+test a_multi_row_update_within_budget_still_applies_to_every_row ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+=== target integration_system_views_wire
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.04s
+     Running tests/integration_system_views_wire.rs (target/debug/deps/integration_system_views_wire-2cb7270b919ff355)
+
+running 1 test
+test the_system_views_are_typed_rows_to_an_independent_client ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+=== target integration_system_views
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+warning: unused import: `std::path::Path`
+  --> tests/integration_system_views.rs:26:5
+   |
+26 | use std::path::Path;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_system_views") generated 1 warning (run `cargo fix --test "integration_system_views" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.37s
+     Running tests/integration_system_views.rs (target/debug/deps/integration_system_views-0cd16af7a1f4817a)
+
+running 20 tests
+test an_empty_view_still_announces_every_declared_column ... ok
+test a_table_that_predates_the_views_still_answers_for_its_own_name ... ok
+test an_agent_can_read_the_views_from_inside_its_own_session ... ok
+test a_view_can_be_projected_and_filtered ... ok
+test a_second_session_of_one_run_does_not_restamp_when_the_run_started ... ok
+test every_declared_column_is_selectable_by_name ... ok
+test a_quarantined_branch_shows_up_with_the_reason_it_is_held ... ok
+test an_empty_agent_result_is_distinguishable_from_a_broken_one ... ok
+test a_table_cannot_shadow_a_system_view ... ok
+test a_view_refuses_as_of_branch_and_a_join_rather_than_answering_something_else ... ok
+test every_view_is_populated_once_an_agent_has_run ... ok
+test creating_over_a_legacy_table_named_like_a_view_says_the_table_exists ... ok
+test a_reaped_branch_reports_the_slots_current_generation ... ok
+test an_agent_result_has_typed_columns_a_client_can_read ... ok
+test every_write_shape_against_a_view_refuses_by_name ... ok
+test ferro_runs_reports_the_digest_of_a_declared_prompt ... ok
+test a_view_on_either_side_of_a_join_is_refused_by_name ... ok
+test run_activity_counts_are_per_run_and_not_a_shared_total ... ok
+test a_recreated_table_does_not_inherit_the_previous_tables_authorship ... ok
+test dropping_a_table_does_not_silence_the_read_premise_gate ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+=== target integration_truncation_race
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.94s
+     Running tests/integration_truncation_race.rs (target/debug/deps/integration_truncation_race-9b3eb3ac65390670)
+
+running 1 test
+test a_truncation_racing_a_read_never_yields_a_frame_at_the_wrong_lsn ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+=== target integration_trunk_tree_authority
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.51s
+     Running tests/integration_trunk_tree_authority.rs (target/debug/deps/integration_trunk_tree_authority-069e9ab3d7327f95)
+
+running 3 tests
+test trunks_root_is_a_real_arena_page_named_by_the_branch_catalog ... ok
+test trunk_rows_live_in_the_heap_not_in_trunks_page_tree ... ok
+test an_agent_write_lives_on_branch_pages_and_reaches_the_heap_only_on_merge ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+=== target integration_txn_concurrency
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.38s
+     Running tests/integration_txn_concurrency.rs (target/debug/deps/integration_txn_concurrency-321b53de585b05de)
+
+running 4 tests
+test concurrent_commits_and_aborts_do_not_panic ... ok
+test committed_transactions_leave_the_active_set ... ok
+test a_running_transaction_is_never_missing_from_a_snapshot ... ok
+test concurrent_begins_get_distinct_transaction_ids ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.72s
+
+=== target integration_view_pushdown
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.93s
+     Running tests/integration_view_pushdown.rs (target/debug/deps/integration_view_pushdown-41c09f8d40e27f92)
+
+running 8 tests
+test a_literal_the_binder_refuses_never_reaches_the_hint ... ok
+test a_narrowed_read_still_announces_the_projections_columns ... ok
+test the_extracted_hint_is_the_one_the_predicate_licenses ... ok
+test a_scattered_set_of_live_runs_is_neither_widened_nor_truncated ... ok
+test ferro_runs_reports_exactly_the_branches_with_a_live_run ... ok
+test a_bounded_record_scan_returns_exactly_the_records_in_range ... ok
+test every_view_query_answers_identically_with_and_without_the_hint ... ok
+test the_hint_narrows_what_the_generator_builds ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.57s
+
+=== target integration_wal_concurrency
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.50s
+     Running tests/integration_wal_concurrency.rs (target/debug/deps/integration_wal_concurrency-a8e3f28b25240888)
+
+running 3 tests
+test concurrent_appends_get_distinct_lsns ... ok
+test the_log_remains_a_walkable_chain_after_concurrent_use ... ok
+test flushed_lsn_never_over_reports_while_flushes_are_in_flight ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+=== target integration_zero_copy_fork
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.04s
+     Running tests/integration_zero_copy_fork.rs (target/debug/deps/integration_zero_copy_fork-301b513c069220ff)
+
+running 6 tests
+test a_runtime_without_a_page_store_refuses_row_calls_instead_of_pretending ... ok
+test a_write_on_the_branch_is_invisible_to_the_trunk_and_to_a_sibling ... ok
+test beginning_an_agent_session_copies_zero_data_pages ... ok
+test an_abandoned_agent_session_returns_its_pages_with_no_client_cooperation ... ok
+test a_branch_write_costs_pages_only_on_the_path_it_touches ... ok
+test the_fork_stays_zero_copy_as_the_trunk_grows ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+=== target lock_order_allowlist
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.96s
+     Running tests/lock_order_allowlist.rs (target/debug/deps/lock_order_allowlist-5152dbc136567be8)
+
+running 7 tests
+test the_scanner_catches_an_unlisted_latcher ... ok
+test the_scanner_catches_a_pool_method_missing_its_marker ... ok
+test only_the_att_accessors_may_lock_the_active_transaction_table ... ok
+test every_pool_method_that_locks_opens_a_pool_section ... ok
+test only_the_tree_may_take_a_page_latch ... ok
+test only_the_pool_may_write_lock_a_frame_directly ... ok
+test test_only_sources_are_cfg_test_gated ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+=== target lock_order_runtime
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.03s
+     Running tests/lock_order_runtime.rs (target/debug/deps/lock_order_runtime-d1de576bd7acade5)
+
+running 4 tests
+test a_page_latch_taken_while_holding_a_frame_read_lock_is_caught - should panic ... ok
+test a_page_latch_taken_while_holding_a_frame_write_lock_is_caught - should panic ... ok
+test the_correct_order_latch_then_frame_is_not_flagged ... ok
+test pool_sections_do_not_leak_across_calls ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+=== target prop_cow_diff
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.76s
+     Running tests/prop_cow_diff.rs (target/debug/deps/prop_cow_diff-884fd6568a11d74e)
+
+running 5 tests
+test an_unedited_branch_diffs_to_nothing_for_free ... ok
+test reversing_the_roots_inverts_every_delta ... ok
+test applying_the_diff_to_the_base_reconstructs_the_head ... ok
+test diff_agrees_with_a_full_scan_comparison ... ok
+test a_small_edit_reads_less_than_reading_both_trees ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.60s
+
+=== target prop_escrow
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.15s
+     Running tests/prop_escrow.rs (target/debug/deps/prop_escrow-5281dfec1344b96a)
+
+running 4 tests
+test release_restores_the_pool_and_settle_consumes_it ... ok
+test consumed_never_exceeds_the_declared_slack ... ok
+test claims_outstanding_never_exceed_the_remaining_pool ... ok
+test a_branch_never_spends_beyond_its_own_claim ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+=== target prop_merge_algebra
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.67s
+     Running tests/prop_merge_algebra.rs (target/debug/deps/prop_merge_algebra-b73b1c5f8620b66f)
+
+running 11 tests
+test float_add_is_commutative_but_not_associative_and_that_is_stated_not_assumed ... ok
+test a_nonzero_add_is_never_idempotent ... ok
+test max_is_idempotent_and_commutative ... ok
+test zero_is_the_identity_for_integer_add ... ok
+test add_is_commutative ... ok
+test integer_composition_refuses_overflow_rather_than_wrapping ... ok
+test composing_then_applying_equals_applying_in_sequence ... ok
+test add_is_the_only_kind_that_is_not_idempotent ... ok
+test integer_add_is_associative ... ok
+test two_assigns_never_commute ... ok
+test commutes_with_is_symmetric ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+=== target prop_merge_outcomes
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.79s
+     Running tests/prop_merge_outcomes.rs (target/debug/deps/prop_merge_outcomes-7768847bc32df451)
+
+running 6 tests
+test lww_on_two_different_assigns_never_reports_clean ... ok
+test a_discard_beside_a_composition_still_reports_loss ... ok
+test a_discarded_write_is_never_reported_as_clean_or_commuting ... ok
+test the_name_identifies_the_variant ... ok
+test lost_a_write_agrees_with_the_variant ... ok
+test the_same_merge_classifies_the_same_way_twice ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+=== target provenance_e2e
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.70s
+     Running tests/provenance_e2e.rs (target/debug/deps/provenance_e2e-cb7eeb7fecb44dab)
+
+running 5 tests
+test unattributed_versions_are_reported_as_unattributed ... ok
+test a_snapshot_taken_before_the_write_creates_no_edge ... ok
+test exact_read_set_makes_the_downstream_agent_visible_to_revert ... ok
+test a_range_read_set_still_finds_the_write_it_consumed ... ok
+test scattered_point_reads_stay_exact_through_the_executor ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+=== target provenance_retention_wiring
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.92s
+     Running tests/provenance_retention_wiring.rs (target/debug/deps/provenance_retention_wiring-71dfb10428de7988)
+
+running 11 tests
+test a_read_whose_session_was_sealed_underneath_it_is_refused_rather_than_silently_unretained ... ok
+test a_point_lookup_that_observed_an_absence_halts_the_revert_that_would_refill_it ... ok
+test an_abandoned_tasks_scan_stops_blocking_the_revert_it_never_depended_on ... ok
+test a_multi_version_merge_followed_by_another_merge_keeps_its_causal_answers_exact ... ok
+test a_mirrored_point_read_retains_a_premise_the_gate_can_verify ... ok
+test a_ghost_parent_that_staged_nothing_stops_blocking_once_its_child_has_merged ... ok
+test a_delete_whose_where_clause_scanned_names_its_dependents ... ok
+test an_update_that_names_a_row_by_key_names_its_dependent_and_stays_a_blind_write ... ok
+test an_update_whose_where_clause_scanned_names_its_dependents ... ok
+test a_mirrored_key_equality_is_classified_the_same_as_the_unmirrored_one ... ok
+test parentheses_do_not_change_the_access_shape ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+=== target provenance_scan_cascade
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.24s
+     Running tests/provenance_scan_cascade.rs (target/debug/deps/provenance_scan_cascade-66d42001be305987)
+
+running 5 tests
+test a_scan_depends_on_the_write_that_moved_a_row_out_of_its_range ... ok
+test a_branch_that_scanned_before_the_write_is_not_a_dependent ... ok
+test a_multi_row_merge_is_named_once_by_the_scan_that_read_it_and_reverts_whole ... ok
+test a_dependent_reached_by_a_scan_is_named_by_cascade ... ok
+test a_write_outside_the_scanned_range_is_not_a_dependency ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+=== target provenance_write_path_dependents
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.33s
+     Running tests/provenance_write_path_dependents.rs (target/debug/deps/provenance_write_path_dependents-0a768ca1b4fd14c0)
+
+running 1 test
+test sweep ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.83s
+
+=== target s20_live_count_is_maintained
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.37s
+     Running tests/s20_live_count_is_maintained.rs (target/debug/deps/s20_live_count_is_maintained-0c661209b21dcbb5)
+
+running 3 tests
+test an_idempotent_transition_does_not_move_the_counter ... ok
+test the_counter_agrees_with_a_scan_after_forks ... ok
+test the_counter_agrees_with_a_scan_after_state_transitions ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== target sim_durability
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.35s
+     Running tests/sim_durability.rs (target/debug/deps/sim_durability-9e6ed92c7221a067)
+
+running 16 tests
+test under_sync_only_an_unflushed_write_does_not_survive ... ok
+test a_torn_write_lands_a_prefix_and_ends_the_run ... ok
+test with_no_fault_the_workload_completes_and_every_row_comes_back ... ok
+test undo_compensates_the_losers_in_ascending_transaction_id_order ... ok
+test the_same_seed_reproduces_the_same_byte_sequence_and_the_same_fault_point ... ok
+test the_durable_commit_detector_fires_and_stays_quiet ... ok
+test flush_all_writes_pages_in_ascending_page_id_order ... ok
+test two_different_seeds_crash_in_different_places ... ok
+test the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run ... ok
+test a_torn_table_page_is_served_as_a_row_that_was_never_written ... ok
+test a_garbled_wal_header_takes_the_database_down_with_its_data_intact ... ok
+test recovery_gives_every_missing_page_its_own_empty_page_in_ascending_order ... ok
+test recovery_itself_writes_the_same_sequence_three_times ... ok
+test recovery_holds_at_every_fault_point_sync_only ... ok
+test recovery_holds_at_every_fault_point_write_through ... ok
+test recovery_holds_at_every_fault_point_through_the_catalog ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.28s
+
+=== target w4_forget_branches
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.11s
+     Running tests/w4_forget_branches.rs (target/debug/deps/w4_forget_branches-0a41a5b3bd0a4bd7)
+
+running 3 tests
+test forget_branches_refuses_a_branch_that_is_still_live ... ok
+test a_reaped_branch_nobody_reported_is_still_reconciled ... ok
+test forget_branches_drops_the_branches_it_is_given ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== target w4_stale_branch_crosses_agents
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.09s
+     Running tests/w4_stale_branch_crosses_agents.rs (target/debug/deps/w4_stale_branch_crosses_agents-56dece9702f8bcac)
+
+running 2 tests
+test a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session ... ok
+test a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+=== target w4_sweep_slot_recycle
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d141-catalog-narrowing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.09s
+     Running tests/w4_sweep_slot_recycle.rs (target/debug/deps/w4_sweep_slot_recycle-6ee876f01aec3d39)
+
+running 1 test
+test a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
