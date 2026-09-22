@@ -1,0 +1,30 @@
+
+================================================================================================
+1. Q2 — IS THE SERIAL SECTION THE CEILING?  YES. F1 DOES NOT FIRE. M-FSYNC IS REFUTED.
+================================================================================================
+
+1a. THE ADVERSARY'S BOUND, EVALUATED RATHER THAN ASSERTED.
+INVENTION-TRIGGER.md:148: "a closed 64-thread harness is fsync-bound at 64 forks per 3.574 ms
+round, so even a serial section driven to ZERO cannot clear the bar." That bound is 64/3.574 ms =
+17,907 forks/sec — 4.09x ABOVE the 4,382/sec it was invoked to explain. A bound four times above
+the observation cannot be what pins it. Measured directly (bench/d123_raw/20_threads.txt), taking
+each arm's OWN fsync round duration rather than inheriting the 3.574 ms residual:
+
+  threads  forks/sec   f/sync   M-FSYNC bound   measured/bound       (warm=20,000)
+        1      215.3      1.0             215            1.00x
+        8     1197.0      4.0            2422            0.49x
+       64     5262.8     17.5           19199            0.27x
+      128     5053.6     17.4           37073            0.14x
+      256     5158.2     16.6           79786            0.06x
+      512     4942.7     15.7          161516            0.03x
+
+M-FSYNC requires throughput proportional to T. Throughput is FLAT from 64 to 512 (5262 -> 4942)
+while the bound grows 8x. ⛔ REFUTED.
+
+⭐ AND IT IS REFUTED ON A PURE COUNTER, WHICH NEEDS NO CLOCK AT ALL. `f/sync` is two integers from
+`syncs_issued()`. Under M-FSYNC a round commits every in-flight thread, so f/sync MUST equal T:
+1, 8, 64, 128, 256, 512. Measured: 1.0, 4.0, 17.5, 17.4, 16.6, 15.7 — it stops at ~17 and stays
+there while T grows 8x. Immune to the 41.67 ns tick and to the 46x load spread. This also
+reproduces the already-banked 1.0/3.9/14.5/13.8 from fork_concurrency_after.txt, so that artifact
+contained the refutation of the premise built on top of it.
+

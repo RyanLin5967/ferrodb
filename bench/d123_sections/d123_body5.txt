@@ -1,0 +1,82 @@
+
+================================================================================================
+5. FALSIFIER SCORECARD — every one pre-registered before the first measurement
+================================================================================================
+
+  F1  section driven toward zero    DOES NOT FIRE, BOTH REGIMES. Paired, probe OFF, 9 reps each:
+                                    warm=0 median 2.08x (0/9 within +/-10% of 1.00x), warm=20k
+                                    median 1.86x (1/9). 17 of 18 paired draws above 1.10x;
+                                    combined median 2.00x.
+                                    ⛔ My earlier "UNDECIDED at warm=20k" is WITHDRAWN: that was
+                                    the unpaired summary of the same data. See section 1c.
+  F2  residual grows with T?        DOES NOT FIRE. It grows (HOLD 1.25-1.71x), so it IS contention.
+  F3  >50% attributed?              SATISFIED. 78.8% of the 0.1532 ms on named, measured causes.
+  F4  hold vs handoff               H-HANDOFF DEAD. U(hold) 94-97% across four runs.
+  F5  marginal cost of added work   0.68x. Identical fixed-key work is CHEAPER at 64 threads.
+  F6  thread axis                   M-FSYNC REFUTED. f/sync stalls at ~17 while T grows to 512.
+  A1  drops/unlock seam             Immaterial: gap 0.006-0.012 ms, below the 0.02 ms threshold
+                                    that would have required a second iteration. Bracketed anyway.
+  A2  stale 3.574 residual          Confirmed stale: reproduces only against the SUPERSEDED
+                                    SUM=0.1148. Immaterial (0.006 ms) but it is in a quoted file.
+  A3  fixed-key bias                Honoured: 0.68x rules out line bouncing on shared pages and is
+                                    explicitly NOT read as ruling out page-diversity effects.
+  A4  warm=0 reproduction check     PASS ON THE MEDIAN, and reported with its failures:
+                                       4788.6  +9.3% PASS      5177.8 +18.1% OUTSIDE
+                                       4815.8  +9.9% PASS      5069.5 +15.7% OUTSIDE
+                                       median 4942.6 +12.8% PASS (band +/-15%)
+                                    Two of four arms fall outside individually. The direction is
+                                    expected — this box was quieter tonight than when the 4,382 was
+                                    taken — but it is a marginal pass and is not dressed up as more.
+  A5  closure identity              HOLDS. -0.01% / -0.28% / -2.18% at T=1/8/64, band +/-5%.
+  A6  clean F1                      Run twice. Probe perturbation -1.20% / -1.83%, inside +/-2%,
+                                    so no duration in this row is quarantined. The paired
+                                    within-rep ratio was added after the first attempt and is what
+                                    decided both regimes.
+  A8  truncation sentinel           Added after two runs produced result-shaped files that were
+                                    not results. bench/d123_assemble.sh refuses to quote any arm
+                                    lacking `# harness_exit=0`.
+  A7  eviction + the missing arm    Eviction eliminated from banked data.
+
+================================================================================================
+6. INSTRUMENT, LOAD, AND WHAT IS NOT TRUSTWORTHY HERE
+================================================================================================
+
+* Probe perturbation MEASURED, not assumed: -1.20% (warm=20k) and -1.83% (warm=0), 5 reps each,
+  ON/OFF order alternated. Inside the pre-registered +/-2%. The first battery's single-shot
+  +87.95% does not reproduce; that cell was n=1 and its OFF value (2796.6) was the outlier, not
+  its ON value — the reading had inverted which cell was anomalous.
+* The probe adds ~13 clock reads inside the section. That is common-mode between T=1 and T=64, so
+  it DILUTES the 64/1 ratios toward 1.0. The inflation figures are therefore understated, not
+  manufactured.
+* `Instant::elapsed` quantises to 41.67 ns here. Every figure is a sum over >=8,000 samples
+  (>=4,500 ticks for a 0.19 ms section). No single-operation duration is reported anywhere.
+* LOAD. Lock held for every timed run. `load_at_acquire=4` for the re-run; no CAVEAT line printed
+  (threshold is 8). But load RAMPED to 11.05 during 10_f1_warm20k and that arm is the one that came
+  out noise-dominated. The measure lock excludes other MEASURERS, not builds or suites, so "lock
+  held" is not "box quiet" and is not claimed to be. EVERY duration here is an UPPER BOUND.
+* ⭐ WHAT IS NOT TRUSTWORTHY: any absolute millisecond figure, and the warm=20k F1 arm. What IS
+  trustworthy: the counters (f/sync, syncs x f/sync = N), the COUNT of paired F1 draws above
+  1.10x (17 of 18),
+  and ratios of two durations taken by ONE instrument inside ONE process (U(hold), the 64/1
+  column, per-upsert cost at fixed k) — which is where every conclusion above rests.
+* A tree-size confound exists in F1 and is bounded rather than removed: stubbed levels insert fewer
+  keys, so their trees grow more slowly inside the timed window. The depth-sensitive phases
+  (core + envelope + free_scan) total ~0.022 ms of a ~0.19 ms section, so even a 20% swing in them
+  moves F1 by ~2%, against an effect of 105%.
+
+⚠ A DECLARED CONTAMINATION THIS ARTIFACT CARRIES, AND WHAT WAS DONE ABOUT IT.
+`diff-identity` declared near-continuous cargo in a sibling worktree from 23:04:00-23:12:54Z, inside
+the `d123-f1` lock window (acquired 23:03:55Z). It covers the first F1 arms, both perturb2 arms, all
+three phases reps and part of one extra arm. The measure lock excludes other MEASURERS; it does not
+exclude builds or test suites, so holding it is not evidence of a quiet box and is never claimed as
+such here.
+  * F1 was RE-RUN clean (section 1b) because Round 3's gate rests on it.
+  * The within-arm ratios were NOT re-run, for the reason given at the end of section 2.
+  * It also supersedes my own earlier explanation of why the first warm=20k F1 arm was
+    noise-dominated: I attributed it to a load ramp; a 1577-test suite landing inside it is the
+    better explanation, and I have said so where I wrote the original.
+
+⚠ TWO RUNS IN THIS ROW PRODUCED FILES THAT LOOK LIKE RESULTS AND ARE NOT. See Amendment 8: the
+detector is the ABSENCE of the `# harness_exit=` sentinel, and `bench/d123_assemble.sh` now checks
+every arm for it before writing this artifact. A d123 file without `# harness_exit=0` at its foot
+is a truncated run and must not be quoted.

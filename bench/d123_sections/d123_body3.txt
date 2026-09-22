@@ -1,0 +1,73 @@
+
+================================================================================================
+3. NAMING THE MECHANISM — WHAT SURVIVES ELIMINATION
+================================================================================================
+
+The brief listed five candidates. Four are eliminated by measurement or by structure.
+
+⛔ MUTEX HANDOFF / PARK-UNPARK. Eliminated by F4: the lock is idle 0.006-0.012 ms per fork, 3-6%
+   of the interval (U(hold) 94-97%). The unlock itself is separately bracketed at 0.002 ms and the
+   record drops at 0.00002 ms. This was the mechanism the brief thought most likely and it is the
+   smallest term measured.
+
+⛔ BUFFER-POOL EVICTION. Eliminated FREE, from the two regimes already banked. The pool is capped
+   at 1024 pages (buffer_pool.rs:442). The warm=20,000 tree (~100k keys) strains it; the warm=0
+   tree does not. Eviction predicts the LARGE tree inflates more. It inflates LESS:
+       64/1          warm=20k (large)   warm=0 (small)
+       write_record       2.29x            2.36x
+       child_key          2.43x            2.61x
+       HOLD               1.61x            1.71x
+   Wrong direction in both phases and in the total. No extra arm was needed and none was run.
+
+⛔ PAGE-LATCH CONTENTION BETWEEN FORKERS, ALLOCATOR CONTENTION BETWEEN FORKERS, CACHE-LINE
+   BOUNCING BETWEEN FORKERS. Eliminated STRUCTURALLY, not statistically: `fork` does every tree
+   mutation under `logical`, so **only one thread is ever inside the section**.
+
+   CHECKED AGAINST THE CODE THAT RAN, not from memory. Enumerating every tree access in `fork`
+   by line offset within the function (src/branch/table_catalog.rs):
+       +14  let g = self.logical.lock()            <- acquired
+       +26  self.core(parent.id)                   \
+       +38  self.envelope_bytes(parent.id)          |
+       +50  self.tree.range_scan(FREE_ID span)      |
+       +64  self.remove_if_present(free_id)         | EVERY tree access in the function
+       +65  self.core(id)                           | lies strictly between the two
+       +86  self.write_record  / +88 _new           |
+      +100  self.tree.insert(child key)             |
+      +115  self.upsert (F5 extras)                 |
+      +124  self.write_header()                     |
+      +129  self.stage()                           /
+      +141  drop(g)                                <- released
+      +148  self.durable(seq)                      <- THE ONLY THING OUTSIDE
+   There is no tree access before +14 or between +141 and +148. So the set of things that can run
+   concurrently with the section is exactly {`durable`}, and `durable` is
+   `pool.flush_all()` + `disk_manager.sync()`. Two forkers cannot
+   contend on a page latch, an allocator or a cache line because two forkers are never in there at
+   once. Combined with U(hold) = 94-97%, which puts the time INSIDE the section, the counterparty
+   must be something that runs OUTSIDE the lock — and in this harness exactly one thing does:
+   `durable()` -> `pool.flush_all()` + `disk_manager.sync()`, the group-commit flush.
+
+⛔ CACHE-LINE BOUNCING ON SHARED TREE PAGES specifically. Eliminated by F5, and this was
+   pre-registered in Amendment 3 as the reading the fixed-key design would license: the extra
+   upserts hit the SAME few pages from all 64 threads, which is the best case for residency and
+   the WORST case for line bouncing. If lines were bouncing, that arm would inflate most. It is
+   the CHEAPEST thing measured:
+       identical fixed-key upsert work:  T=1 0.02994 ms/upsert  ->  T=64 0.02038 ms/upsert = 0.68x
+
+✅ SURVIVING, NAMED: INTERFERENCE BETWEEN THE SECTION'S NEW-PAGE WRITES AND THE CONCURRENT
+   GROUP-COMMIT FLUSH. Four counters select it and they all point the same way:
+     1. only the two phases that insert NEW keys inflate      (2.29x, 2.43x)
+     2. reads and the single hot header page get FASTER       (0.43-0.92x)
+     3. identical work on ALREADY-DIRTY pages gets faster     (0.68x)
+     4. inflation tracks how many forks each flush must drain:
+            f/sync     1.0    4.0   17.5
+            write_record 1.00x 1.59x 2.29x     monotone
+   At T=64, DURABLE is 5.35 ms against S_eff 0.19 ms, so a flush is in progress essentially all the
+   time; at T=1 the section and the flush strictly alternate and never overlap. The inflation
+   appears as soon as they can overlap (T=8, 1.27x) and grows with how much they overlap.
+
+⚠ WHAT IS STILL NOT SEPARATED, STATED PLAINLY PER F3. "Interference with the flush" covers both a
+  latch/pool path and a file-extension/IO path, and this row does not separate them. Nor has an arm
+  been run with the flush REMOVED, because removing it removes durability and macOS then
+  short-circuits F_FULLFSYNC — the confound guarded against throughout. The mechanism is named by
+  elimination plus four selectivity counters plus a structural argument, NOT by direct
+  intervention on the flush itself.

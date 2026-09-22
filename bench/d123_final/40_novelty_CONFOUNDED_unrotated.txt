@@ -1,0 +1,47 @@
+# lock: ACQUIRED d123-nov2  load_at_acquire=3
+# acquired_utc: 2026-09-22T00:16:16Z
+# other cargo/rustc/suite at acquire:
+#   7917 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"; cd /Users/idide/projects/ferrodb
+#   until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 110; done
+#   cat /tmp/gp14.log | tail -5
+#   echo "ahead=$(git rev-list --count origin/main..main) origin=$(git rev-parse --short origin/main)"' < /dev/null && pwd -P >| /tmp/claude-69f9-cwd
+#   8274 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+#   ps -eo command | grep -c '"'"'[g]p14.sh'"'"' | awk '"'"'{print "gated push armed: "$1" (fires on its own)"}'"'"'
+#   cd /Users/idide/projects/ferrodb
+#   until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 55; done
+# FERRODB_D123_WARM=20000  FERRODB_D123_REPS=5
+# load_at_run_start: 3.79 5.84 6.02
+D123 serial-section attribution — MODE=novelty (Amendment 7: new-key vs fixed-key work under the lock)
+build at 4427df251512
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+k = 8 extra upserts per fork, probe ON (PH_EXTRA is read directly; no fit).
+Per-upsert cost = PH_EXTRA / k, median of 5 reps.
+
+   threads   FIXED key ms/ups     NEW key ms/ups
+         1            0.02051            0.02503
+        64            0.02107            0.03853
+
+  T=64/T=1 ratio:   FIXED key 1.03x     NEW key 1.54x
+
+  for reference, from bench/d123_raw/30_phases.txt at the same thread counts:
+    write_record (new keys)     2.29x
+    child_key_insert (new key)  2.43x
+    core / envelope / header    0.76-0.78x   (reads and one hot page)
+
+  NEW >> FIXED => novelty is the variable. Since only one thread is ever inside
+  `logical`, the counterparty cannot be another forker, so it is the concurrent
+  group-commit flush draining the pages this section keeps creating.
+  NEW ~= FIXED => novelty is NOT the variable; report UNATTRIBUTED per F3.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# released_utc: 2026-09-22T00:28:43Z
+# load_at_run_end: 13.64 10.11 7.91
+
+⚠ READ-BACK NOTE, appended after the run: the `# other cargo/rustc/suite at acquire:`
+  header above OVER-REPORTS — it matches any command line CONTAINING those strings, and every
+  shell here carries `cargo` via its PATH export. Measured 17 matches against 0 real cargo
+  processes. See 00_PGREP_OVERREPORT.txt. `load_at_*` is the trustworthy field.

@@ -1,0 +1,28 @@
+⛔ CONTAMINATION OF 50_f1_clean.txt, CAUSED BY ME. It is NOT the clean arm its name claims.
+
+Declared against myself on the same standard applied to diff-identity and d77-walls.
+
+  00:28:43Z   50_f1_clean acquires the lock -- with `load_at_acquire=13`. The box was ALREADY
+              loud at acquire; the lock excludes measurers, not builds, and I started the arm
+              anyway instead of waiting for the load to fall.
+  00:31:33Z   I wrote a new binary into target/release/examples/ -- 2 m 50 s INTO that arm.
+              Two `cargo build --release --example` invocations (the mode_novelty rewrite, then a
+              `touch build.rs` rebuild for provenance) ran while the arm was measuring.
+
+WHAT IT DOES AND DOES NOT AFFECT:
+ - The RUNNING process is unaffected in code terms: it had already exec'd the previous binary and
+   replacing the file does not change a running image. Its `build at` stamp is correct for the code
+   that ran.
+ - But the COMPILES CONSUMED CPU inside the measurement window. That is load, and this row has
+   spent the night establishing that load on this box moves throughput by up to 46x.
+ - `load_at_acquire=13` means it was never a quiet draw to begin with.
+
+⇒ 50_f1_clean.txt IS REPORTED AND IS REPORTED AS DIRTY. It is not the arm the F1 verdict rests on.
+   A re-run (51_f1_clean2.txt) is queued behind the paired novelty arm, and NO BUILD WILL BE ISSUED
+   FROM THIS WORKTREE WHILE ANY ARM IS QUEUED OR RUNNING.
+
+⭐ THE STRUCTURAL LESSON, WHICH IS THE PART WORTH KEEPING. The measure lock protects a measurement
+   from OTHER AGENTS. It does not protect it from ITS OWN AUTHOR, who is editing and rebuilding in
+   the very worktree whose target/ holds the binary under test. I held two other agents to a
+   declaration standard for exactly this and then did it to myself within the hour, while holding
+   the lock, which felt like protection. **Holding the lock is not a licence to build.**

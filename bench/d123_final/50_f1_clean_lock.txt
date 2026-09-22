@@ -1,0 +1,4 @@
+ACQUIRED d123-f1c  load_at_acquire=13
+CAVEAT: load 13 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=13 beside it and say it is an upper bound.

@@ -1,0 +1,51 @@
+
+================================================================================================
+3c. ⭐ THE INTERVENTION — NEW-KEY vs FIXED-KEY WORK UNDER THE LOCK. MECHANISM NAMED.
+================================================================================================
+
+bench/d123_final/41_novelty_paired.txt. k=8 identical `upsert` calls added to the critical section;
+in one arm they hit a FIXED key set (re-dirtying pages already dirty, allocating nothing), in the
+other a key unique per fork (allocating and dirtying NEW pages). Same call, same value, same place
+in the section. **Key novelty is the only variable.**
+
+All four cells run ADJACENTLY inside one rep, order rotated each rep, each rep wall-clock stamped,
+so a load trajectory is common-mode across the cells and divides out in the per-rep contrast. (The
+first attempt at this arm was NOT rotated and is VOID — Amendment 10.)
+
+    rep   started(utc)      T1-fix     T1-NEW    T64-fix    T64-NEW
+      0     1790040067     0.03558    0.03563    0.02040    0.03911
+      1     1790040160     0.03707    0.03518    0.01916    0.03574
+      2     1790040252     0.03235    0.03114    0.01844    0.03404
+      3     1790040348     0.03564    0.03490    0.01867    0.05808
+      4     1790040450     0.03628    0.03358    0.01994    0.03692
+
+    rep     R_fixed      R_new   R_new/R_fixed
+      0       0.57x      1.10x           1.91x
+      1       0.52x      1.02x           1.97x
+      2       0.57x      1.09x           1.92x
+      3       0.52x      1.66x           3.18x
+      4       0.55x      1.10x           2.00x
+
+  R_fixed (FIXED-key work, T=64/T=1)   median 0.55x   <- gets FASTER under concurrency
+  R_new   (NEW-key work,   T=64/T=1)   median 1.10x   <- gets SLOWER
+  ⭐ CONTRAST R_new/R_fixed   median 1.97x   min 1.91x   max 3.18x   reps above 1.00x: 5 of 5
+
+⇒ **NEW >> FIXED. NOVELTY IS THE VARIABLE, AND THE MECHANISM IS NOW NAMED BY INTERVENTION RATHER
+THAN BY ELIMINATION.** Four of five draws cluster in 1.91-2.00x; even the minimum is 1.91x. The
+pre-registered alternative — CONTRAST ~= 1, report UNATTRIBUTED per F3 — is not close.
+
+⇒ Combined with the structural fact that **only one thread is ever inside `logical`** (section 3,
+enumerated line by line), the counterparty cannot be another forker. It is `durable()` —
+`pool.flush_all()` + `disk_manager.sync()` — the group-commit flush draining the pages the section
+keeps creating. That is the answer to Q1's "name it with a counter, not a guess."
+
+⚠ THE CONFOUND, TESTED RATHER THAN ASSUMED. A reviewer raised that new-key inflation might be
+TREE GROWTH: new keys are the only component that enlarges the tree, so if higher T completed more
+forks per window it would grow the tree more and deepen every descent. That objection requires a
+TIME-bounded run. This harness is FORK-bounded: `run_arm` does `let per = n / t.max(1)`, so N=8,000
+is the TOTAL divided across threads. The same 8,000 forks insert the same 64,000 keys at T=1 and at
+T=64 — identical final tree, identical growth trajectory, present in both numerator and denominator
+of `R_new`. **It cancels, as Amendment 9 pre-registered before the run.**
+
+⚠ And the absolute ms/upsert is higher for NEW at BOTH thread counts, for that same reason. That
+difference is the tree, not contention. Only the ratios are quoted.

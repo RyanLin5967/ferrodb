@@ -1,0 +1,44 @@
+# FERRODB_D123_WARM=20000  FERRODB_D123_REPS=1
+# load_at_run_start: 4.60 5.75 4.77
+D123 serial-section attribution — MODE=phases (F2: does the residual grow with T? F4: hold vs handoff)
+build at bc3cbdf162d7
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+PER-PHASE, ms per fork, measured IN PLACE under contention.
+Phases core..extra are a disjoint partition of HOLD. WAIT and DURABLE are OUTSIDE it.
+  phase                            T=1        T=64        64/1
+  wait_for_lock                0.00008     6.77350    85450.38
+  core(parent)                 0.01641     0.00712        0.43
+  envelope(parent)             0.01393     0.00620        0.44
+  free_id_scan                 0.01223     0.00549        0.45
+  mint_id                      0.00007     0.00004        0.62
+  build_child                  0.00009     0.00002        0.20
+  write_record                 0.07407     0.12761        1.72
+  child_key_insert             0.01968     0.04144        2.11
+  write_header                 0.02863     0.01858        0.65
+  stage(publish+ticket)        0.00022     0.00076        3.51
+  extra_upserts(F5)            0.00000     0.00000           -
+  drops(under lock)            0.00005     0.00002        0.29
+  unlock                       0.00007     0.00176       26.59
+  HOLD(work only)              0.16585     0.20748        1.25
+  HOLD_TOTAL(to unlock)        0.16607     0.20932        1.26
+  durable(after release)       4.49569     6.90745        1.54
+
+THE DECOMPOSITION F4 PRE-REGISTERED. Only one thread can hold `logical` at a time,
+so S_eff = HOLD_TOTAL + gap EXACTLY. HOLD_TOTAL runs to the UNLOCK, not to the end of
+the work -- Amendment 1: the guard is declared first so it drops LAST, and the record
+drops before it are lock-held too. `id` checks HOLD_TOTAL = HOLD+drops+unlock.
+  threads  forks/sec     S_eff   HOLD_TOT       gap   U(hold)     HOLD   sum_ph in_resid       id
+        1      214.5   4.66248    0.16607   4.49642      3.6%  0.16585  0.16531  0.00054  0.00009
+       64     4511.9   0.22163    0.20932   0.01231     94.4%  0.20748  0.20726  0.00022  0.00006
+
+  U near 33% => H-HANDOFF: the lock is IDLE most of the interval.
+  U near 100% => H-INFLATION: the time is INSIDE the section, and `64/1` above names
+  WHICH phase inflated. `in_resid` is section time in no named phase; if it is large
+  the partition is incomplete and the attribution is not finished.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# load_at_run_end: 11.12 7.43 5.46

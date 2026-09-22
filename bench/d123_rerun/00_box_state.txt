@@ -1,0 +1,27 @@
+=== at acquire ===
+2026-09-21T23:03:55Z
+4.90 4.87 4.00
+--- other cargo/test/bench processes ---
+7917 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"; cd /Users/idide/projects/ferrodb
+until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 110; done
+cat /tmp/gp14.log | tail -5
+echo "ahead=$(git rev-list --count origin/main..main) origin=$(git rev-parse --short origin/main)"' < /dev/null && pwd -P >| /tmp/claude-69f9-cwd
+8274 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+ps -eo command | grep -c '"'"'[g]p14.sh'"'"' | awk '"'"'{print "gated push armed: "$1" (fires on its own)"}'"'"'
+cd /Users/idide/projects/ferrodb
+until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 55; done
+cat /tmp/gp14.log | tail -4; echo "ahead=$(git rev-list --count origin/main..main)"' < /dev/null && pwd -P >| /tmp/claude-fdc3-cwd
+10256 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+until ! pgrep -f d71_ab >/dev/null 2>&1; do sleep 45; done
+echo "=== D71 A/B FINAL ==="; cat /tmp/d71_ab.log' < /dev/null && pwd -P >| /tmp/claude-5aa8-cwd
+10923 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+until ! pgrep -f d71_ins_ab >/dev/null 2>&1; do sleep 90; done
+echo "=== INSERT A/B ==="; cat /tmp/d71_ins_ab.log' < /dev/null && pwd -P >| /tmp/claude-cdb3-cwd
+30484 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+until ! pgrep -f d71_ab >/dev/null 2>&1; do sleep 30; done
+cat /tmp/d71_ab.log' < /dev/null && pwd -P >| /tmp/claude-f975-cwd
+32622 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"; cd /Users/idide/wt/ferrodb-D110-wire-merge3 && timeout 7200 ./target/release/examples/d92_merge3_curve > /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d92_final.txt 2>&1; echo "rc=$?" >> /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d92_final.txt' < /dev/null && pwd -P >| /tmp/claude-a7bc-cwd
+32625 timeout 7200 ./target/release/examples/d92_merge3_curve
+=== at release ===
+2026-09-21T23:19:18Z
+3.21 5.48 5.65

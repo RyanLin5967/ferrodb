@@ -1,0 +1,50 @@
+
+================================================================================================
+4. VERDICT ON W-B, AND WHAT CHANGES FOR ROUND 3
+================================================================================================
+
+⭐ **W-B IS CORRECTLY SPECIFIED. THE EVIDENCE IT WAS SPECIFIED ON WAS NOT.**
+
+The claim "the serial section is the ceiling" is TRUE and is now backed by two measurements that
+could have come out the other way:
+  * F1 — driving the section toward zero moves throughput by a paired median of 2.00x across 18
+    draws in two regimes (warm=0 2.08x, warm=20k 1.86x), with 17 of 18 individual draws above
+    1.10x against a falsifier that required 1.00x +/-10%.
+  * F6 — M-FSYNC refuted on a pure counter: f/sync stalls at ~17 while T grows to 512.
+
+The evidence it was ORIGINALLY specified on — D8's "throughput = 1/serial_time, 0.15% agreement
+across four runs" — is an algebraic identity between two columns that are reciprocals by
+construction, and its 0.15% residual is exactly the rounding of 0.228170 to 0.228. It could not
+have failed, so it never discriminated anything. **W-B was right by accident.**
+
+The adversary's kill was ALSO wrong, and wrong in a way arithmetic alone disposes of: 64 forks per
+3.574 ms is 17,907/sec, four times ABOVE the 4,382/sec it was invoked to explain.
+
+### So both of Round 2's closing statements about W-B were wrong, in opposite directions.
+INVENTION-TRIGGER.md:148 currently reads "⛔ MIS-SPECIFIED ... 67.2% unattributed ... fsync-bound
+at 64 forks per 3.574 ms round, so even a serial section driven to ZERO cannot clear the bar."
+Every clause of that needs replacing:
+  * "67.2% unattributed"  -> 78.8% attributed; and roughly half of the 0.1532 ms was never a
+    physical cost, it was four regimes subtracted from each other.
+  * "fsync-bound"          -> refuted on a counter, in both regimes, at six thread counts.
+  * "even a serial section driven to ZERO cannot clear the bar" -> driven to its limit it gives
+    about 2x (paired median 2.00x). Which is the real constraint on Round 3, and it is a budget,
+    not a wall.
+
+### WHAT ROUND 3 SHOULD BE TOLD, AND IT IS A DIFFERENT SHAPE OF TARGET
+1. **The budget for serial-section work is ~2x, measured.** L3 is the limit of that strategy and it
+   is not implementable. A candidate promising more than 2x from shortening fork's critical section
+   is promising more than the section contains.
+2. **The two phases worth attacking are the two that insert NEW KEYS** — `write_record` and the
+   child-key insert. They are 76% of the section at 64 threads and they are the ONLY parts that get
+   worse with concurrency. Everything else gets faster.
+3. **Handoff is not worth attacking.** The lock is idle 3-6% of the interval. A better mutex, a
+   lock-free queue or elision buys at most that.
+4. **⭐ THE LARGER PRIZE IS OUTSIDE THE SECTION ENTIRELY, and this row can see it but did not
+   measure it as a candidate.** At T=64 a thread spends 0.19 ms in the section and 12.2 ms waiting
+   (WAIT 6.84 + DURABLE 5.35). The section is the CEILING ON THROUGHPUT because it serialises, but
+   it is 1.5% of LATENCY. A mechanism that lets forks commit without every one of them passing
+   through one mutex — sharding the catalog by parent, or batching fork admission the way group
+   commit already batches fsync — changes the shape rather than the constant. D6's own note already
+   points at this ("option 4, pre-minting ids in durable blocks"), and it is the only direction in
+   this row's data with more than 2x in it.

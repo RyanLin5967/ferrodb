@@ -1,0 +1,9 @@
+1d. THE HEADROOM, WHICH IS THE NUMBER ROUND 3 ACTUALLY NEEDS.
+L3 removes write_record, the FREE_ID scan, the envelope lookup and the child-key insert, keeping
+only write_header + stage. It is not implementable — it drops the child's record (the branch does
+not exist), its envelope (a capability escape) and its entry in the parent's live set (a GC hole).
+It is the LIMIT of serial-section work removal, and it buys a **paired median of 2.00x**
+(warm=0 2.08x, warm=20k 1.86x, 18 draws). So:
+
+  ⇒ ANY W-B candidate that works by removing work from fork's serial section has a hard ceiling of
+    about 2x, and the 22 candidates were aimed at a real target with a small budget.

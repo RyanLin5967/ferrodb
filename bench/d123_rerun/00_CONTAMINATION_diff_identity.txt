@@ -1,0 +1,42 @@
+CONTAMINATION DECLARED BY ANOTHER AGENT AGAINST THIS DIRECTORY — read before quoting any arm here.
+
+Declared by teammate `diff-identity` working in /Users/idide/wt/ferrodb-D109-diff-identity, from
+file mtimes/birthtimes rather than memory. My measure lock `d123-f1` was acquired 2026-09-21T23:03:55Z.
+
+  ~23:04:00 - 23:12:54Z   near-continuous cargo in that worktree: two `cargo build --all-targets`
+                          over the lib and all test/example targets, then `cargo test --lib
+                          cow::diff`, `--lib cow::`, `--test integration_production_diff_wiring`,
+                          `--doc cow::`, `--lib agent_sql`.
+  23:11:04 - 23:12:11Z    the heaviest item: a full unfiltered `cargo test --lib`, 1577 tests,
+                          61.91 s of execution plus link — and it INCLUDES
+                          branch::reaper::tests::table_catalog::
+                          a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent,
+                          which alone runs >60 s and is concurrency-heavy on the same subsystem
+                          this row measures.
+  23:12:21 - 23:12:54Z    a final `cargo test --lib cow::diff` plus the integration target.
+
+WHICH ARMS FALL INSIDE IT (local times, = UTC - 4h):
+  10_f1_warm20k.txt      done 19:06:46   INSIDE   <- and this is the arm that came out
+                                                     NOISE-DOMINATED (spreads 51-139%). The
+                                                     contamination is the likeliest cause and this
+                                                     supersedes "a load ramp" as the explanation.
+  11_f1_warm0.txt        done 19:07:08   INSIDE   <- ⛔ THE ARM F1's VERDICT RESTED ON
+  20_perturb2_warm0.txt  done 19:07:27   INSIDE
+  21_perturb2_warm20k    done 19:08:36   INSIDE
+  31/32/33_phases        19:09:23-19:11:04  INSIDE (32 and 33 overlap the 1577-test run)
+  41_extra_warm20k       done 19:15:35   PARTLY (starts inside, ends after 19:12:54)
+  42_extra_warm20k       done 19:19:18   OUTSIDE
+
+CONSEQUENCE, AND IT IS NOT "DISCARD EVERYTHING":
+ - F1 is a RATIO between stub levels with level order ROTATED across 5 reps, and the contamination
+   was near-continuous rather than a spike, so it is closer to common-mode than to a confound that
+   could fabricate a 2x separation. But `11_f1_warm0` is the single arm the whole row's verdict
+   rests on, and a verdict that important must not carry a declared contamination when re-running
+   it is cheap. ⇒ IT IS RE-RUN in bench/d123_final/ on a box with no declared activity.
+ - perturb2's -1.20%/-1.83% and the phases 64/1 ratios are within-arm ratios and are NOT re-run;
+   they are reported with this declaration attached.
+
+diff-identity reports no cargo/rustc alive under that worktree from 23:12:54Z onward, and notes
+their own deliverable is a page-read COUNT, not a timing, so their numbers are unaffected. The
+error was not checking the measure lock; the lock excludes other MEASURERS, not builds, so this is
+a gap in the tool rather than in their diligence.

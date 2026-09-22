@@ -1,0 +1,27 @@
+⚠ THE `# other cargo/rustc/suite at acquire:` BLOCK IN THESE FILES IS AN UPPER BOUND, NOT A LIST.
+
+It was produced by `pgrep -fl 'cargo|rustc|verify-suite'`, which matches any process whose COMMAND
+LINE CONTAINS those strings — not processes that ARE those programs.
+
+MEASURED ON THIS BOX, at a moment when the arms were queued:
+
+    pgrep -f 'cargo|rustc|verify-suite'   ->  17 matches
+    pgrep -c -x cargo                     ->   0 actual cargo processes
+    pgrep -c -x rustc                     ->   0 actual rustc processes
+    of the 17, matching only via the PATH export  ->  15
+
+**A 100% false-positive rate, and the cause is this project's own standing convention:** every
+shell here begins `export PATH="$HOME/.cargo/bin:$PATH"`, so every shell's command line contains
+the string `cargo` and matches the pattern. The convention breaks the detector.
+
+⇒ CONSEQUENCE FOR ANYONE INTERSECTING A CONTAMINATION WINDOW AGAINST THESE FILES: you will
+  OVER-ATTRIBUTE. Entries in that block are candidates, not builders. The trustworthy field in the
+  same header is `load_at_*`, which is not pattern-matched, and it is what actually caught both
+  contaminations in this row.
+
+⇒ THE FIX, for any future harness: count with `pgrep -c -x cargo` (exact program name) and identify
+  the tree with `lsof -a -p <pid> -d cwd` — facts about the process, not about a string it happens
+  to carry. Also note `pgrep -fl | wc -l` counts LINES, so a multi-line command inflates it further.
+
+Arms taken after this was noticed narrow the pattern to `cargo test|cargo build|verify-suite`, which
+is better but still a string match; treat it as an upper bound too.
