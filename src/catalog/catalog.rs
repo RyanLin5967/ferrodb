@@ -169,8 +169,11 @@ impl Catalog {
             indexes: Vec::new(),
             fulltext_indexes: Vec::new()
         };
-        self.tables.insert(name, entry);
-        self.persist()?;
+        self.tables.insert(name.clone(), entry);
+        // Undo: the table never existed if it could not be written down.
+        self.persist_or_undo(|c| {
+            c.tables.remove(&name);
+        })?;
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -242,7 +245,14 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
-        self.persist()?;
+        // Undo: pop the index this call pushed. A column name too long for its length prefix is
+        // refused by the encoder exactly as a table name is.
+        let table = table.to_string();
+        self.persist_or_undo(|c| {
+            if let Some(e) = c.tables.get_mut(&table) {
+                e.indexes.pop();
+            }
+        })?;
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -306,7 +316,13 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
-        self.persist()?;
+        // Undo: pop the full-text index this call pushed. Same reason as `create_index`.
+        let table = table.to_string();
+        self.persist_or_undo(|c| {
+            if let Some(e) = c.tables.get_mut(&table) {
+                e.fulltext_indexes.pop();
+            }
+        })?;
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -427,6 +443,32 @@ impl Catalog {
             h = h.wrapping_mul(0x0100_0193);
         }
         h
+    }
+
+    /// Make an in-memory catalog change durable, and **undo it if it cannot be made durable**.
+    ///
+    /// `Catalog::tables` is the authority every reader and every later `persist` works from, and
+    /// the mutators here insert into it *before* persisting. That was harmless only while `persist`
+    /// could not refuse for a reason the caller had just created. D141 made it refuse: a name too
+    /// long for a catalog page's length prefix is now caught at the encoder instead of being
+    /// written truncated, and nothing upstream bounds identifier length.
+    ///
+    /// Without the undo, the refused entry stays in the map and **every later DDL re-serializes it
+    /// and fails too** — one over-long `CREATE TABLE` takes out every subsequent one until restart.
+    /// That is a wedge, not a refusal. Measured before this existed, by
+    /// `tests/d141_long_identifier.rs::a_refused_create_table_does_not_wedge_the_next_one`.
+    ///
+    /// It is not a second length check — the encoder remains the only authority on what fits. This
+    /// makes the *mutation* atomic, so it covers every reason `persist` can fail, an I/O error
+    /// included, and not just the one D141 added.
+    fn persist_or_undo(&mut self, undo: impl FnOnce(&mut Self)) -> Result<(), FerroError> {
+        match self.persist() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                undo(self);
+                Err(e)
+            }
+        }
     }
 
     pub fn persist(&self) -> Result<(), FerroError> {
