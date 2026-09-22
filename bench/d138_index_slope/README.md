@@ -87,8 +87,19 @@ D138 says: *"A fourth, `frames_for()`, has no production caller — the run labe
 
 **It has two**, both outside `#[cfg(test)]`:
 
-    src/tel/engine.rs:461-462        SurfaceMerger::diff   (cfg(test) starts at :1149)
-    src/agent_sql/merge_engine.rs:428  RuntimeMerger::diff (cfg(test) starts at :463)
+    src/tel/engine.rs                impl Merger for ThreeWayMerger :: diff
+    src/agent_sql/merge_engine.rs    impl Merger for SurfaceMerger  :: diff
+
+⛔ **AMENDED — the first cut of this very paragraph named both of them WRONG.** It said
+`SurfaceMerger::diff` for the `tel/engine.rs` site and `RuntimeMerger::diff` for the `agent_sql`
+one. The types are **swapped** (the `tel/engine.rs` call is inside `impl Merger for
+ThreeWayMerger`; the `agent_sql` call is inside `impl Merger for SurfaceMerger`), and
+**`RuntimeMerger` does not exist in this repo** — `git grep` found it only in the comment that
+invented it. The COUNT of two production callers was correct; both names were not. Recorded rather
+than quietly corrected, because of where it landed: a paragraph whose entire job is to fix a wrong
+citation is the worst place to put one — the next reader greps the invented name, gets zero, and
+cannot tell whether the finding itself was real. Found by a fresh-context adversarial read of the
+diff, then verified at source before being believed.
 
 The D129 harness observed zero calls because **neither of its axes merges**, not because the
 callers do not exist — an absence in one workload read as an absence in the code. The weaker,
@@ -141,3 +152,26 @@ both are plain `#[test]`s, one in `src/tel/log.rs`, one in `src/tel/tests_durabl
 
 ⇒ **Expected, unchanged: per-target 2478 passed, 0 failed. Go 97 passed, 0 failed.**
 Mode is `per-target`, matching the baseline — `whole` and `per-target` totals are not comparable.
+
+### AMENDMENT 2 — three tests, not two (append-only; nothing above is edited)
+
+Written before the suite ran. A fresh-context adversarial review of the diff landed three changes
+after Amendment 1, one of which adds a **third** test:
+`tel::log::tests::pushing_a_key_the_index_already_holds_is_refused_not_overwritten`. It forces
+`Frames::push`'s duplicate-key refusal to fire — that refusal replaced a `debug_assert`, which is
+compiled out of release, where the failure would have been silent frame-orphaning rather than a
+wrong number. Fire-checked: reverting the guard to a plain `HashMap::insert` makes the test fail.
+
+Re-derived with the same instrument as Amendment 1 (`^[[:space:]]*#\[(test|tokio::test)\]`):
+
+| | `#[test]` lines in `src` + `tests` |
+|---|---|
+| `98a44ef` — the tree the banked **2476** certifies | 2452 |
+| `main` `18e63ba` | 2452 |
+| this branch at `bb10a8a` | 2455 |
+
+Per file: `src/tel/log.rs` 5 → 7, `src/tel/tests_durable_log.rs` 24 → 25. All three are plain
+`#[test]`s outside any macro, so D139's once-per-instantiation rule does not apply.
+
+⇒ **Expected, revised: per-target 2479 passed, 0 failed. Go 97 passed, 0 failed.**
+Amendment 1's 2478 is superseded by this line and is left above unedited.
