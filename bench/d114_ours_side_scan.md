@@ -157,6 +157,22 @@ all of it that is established.
 * The conclusion rests on the **counts**, which load cannot move; the re-run removes the caveat from
   the durations as well.
 
+## Verification of the code that shipped with this row
+
+No fix was written, but the instrument is production code: the three identical scans in
+`evaluate_merge`, `merge_into` and `sibling_op` were collapsed into one `ours_ops_on_cell`, and the
+counters added. That is a behaviour-neutral claim, so it was measured rather than asserted:
+
+    tools/verify-suite.sh D114-4bfd6c6
+    D114-4bfd6c6: mode=whole rc=0 passed=2426 failed=0 build_errors=0 head=4bfd6c6
+    D114-4bfd6c6: go    rc=0 passed=97   failed=0
+
+`head=4bfd6c6` is the commit this artifact describes, so the green certifies the tree it names.
+`tools/verify-impacted.sh` alone was **not** sufficient and said so: run against `HEAD` it saw only
+the example file and selected **0 of 128** integration targets, because the `runtime.rs` change was
+already committed. It had to be re-run as `--since 1bf8abe --binaries` to select the 96 targets
+that actually reach this code.
+
 ## Two harness defects, found and fixed before any number was trusted
 
 Both produced **n=1 out of 15** while printing a normal-looking row — a broken instrument wearing a
