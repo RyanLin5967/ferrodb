@@ -216,6 +216,13 @@ it, kept so the record shows the re-run happened rather than asserting it was un
 
 ## D148 — what the removed scan was WORTH on the shipped durable path
 
+> ⚠ **SUPERSEDED BY THE QUIET RE-RUN.** The figures in this section were taken at load 3.82–5.86
+> without the fleet measure lock. They are kept unedited because the re-run is a *replacement*,
+> not a correction of an error — but **quote the QUIET numbers at the end of this file**, not
+> these. What moved: the 10⁶ extrapolation, 24.5–26.4% → **31.0–32.0%**. What did not: the
+> `sync_data` share, 99.1% → **99.3%**.
+
+
 `d148_durable_phase_raw.txt`. D148 asked: D137's slope-1 law is `MemEffectLog`'s, because pgwire
 forces that store — but `src/cli/cli.rs:141` ships `DurableEffectLog`, which also encodes,
 `pwrite`s and **`sync_data`s once per statement**. What share is the frame scan there? Precedent
@@ -303,3 +310,51 @@ Amendments 1 (2478) and 2 (2479) were against `29ad1f5`/`18e63ba` and are supers
 `reaper_suite` instantiated twice, racing in parallel threads (SCALE-DESIGN D139). If the run fails
 **only** there it is re-run, not treated as falsifying this pre-registration. **Anything else
 failing is mine.** D139's fixture fix is in this merge, so it may already be gone.
+
+
+## D148 QUIET RE-RUN — canonical, under the fleet measure lock
+
+`d148_durable_phase_quiet_raw.txt`. Same instrument, same harness, instrumentation placed on
+**`e98c5d2` — the commit the suite certified**. Held `~/wt/logs/measure-lock.sh` as `d148-quiet`,
+**`load_at_acquire=2`**, zero competing `cargo`/`rustc`, both fleet locks otherwise free.
+
+| | loaded (3.82–5.86) | **quiet (load 2, under lock)** |
+|---|---|---|
+| `sync_data` share of an append | 99.1% | **99.3%** |
+| the scan, at 2000 frames | 0.073% | **0.089%** |
+| scan slope, least squares | 1.09 ns/frame | **1.39 ns/frame** |
+| `encode`+`pwrite`+`sync_data` mean | 3.35 ms | **3.09 ms** |
+| extrapolated share at 10⁶ frames | 24.5–26.4% | **31.0–32.0%** |
+| crossover (scan == I/O) | 3.1M frames | **2.23M frames** |
+| residual — the table closes | +0.01% | **+0.01%** |
+
+    sync_data      18416.406 ms of 18543.870 ms  = 99.3%
+    pwrite           112.719 ms
+    encode             4.483 ms
+    both lookups       8.914 ms  = 0.048%   (indexed arm, flat in N: 24 -> 29 ns)
+    residual           +0.01%,   fsyncs 6000 == appends 6000
+
+### What this changes, and what it does not
+
+⭐ **The conclusion is unchanged and stronger: swamped today, roughly a THIRD of a durable append
+at the objective.** 0.089% at 2000 frames; 31–32% at 10⁶; crossover 2.23M.
+
+✅ **`sync_data` did NOT move materially — 99.1% → 99.3%.** That is the figure whose agreement with
+D115's independently-measured ≥97.6% licenses the conclusion that the durable lever is the fsync
+(D81's territory, not this row's). **It survives the quiet run intact, so anything resting on that
+cross-lane agreement is undisturbed.**
+
+⛔ **The 10⁶ extrapolation DID move, 25% → 31%, and in the predicted direction.** The loaded run's
+own caveat argued that load inflates the fsync and therefore *understates* the scan's relative
+share, making ~25% conservative. **That was an argument; this is the measurement, and it agreed.**
+A quieter box has a faster fsync (3.35 → 3.09 ms) and a less noise-flattened scan slope (1.09 →
+1.39 ns/frame), and both push the scan's share up.
+
+⚠ **The guards were kept, because a quiet box removes load as a confounder and removes nothing
+else.** The 41 ns tick still cannot resolve a single lookup, so the lookup is still a batched
+probe; and the scan control still counts what it walked — every row reads `scan control walked
+N of N frames — verified, not assumed`.
+
+⇒ **Both numbers, or neither:** 0.089% at 2000 frames and ~31% at 10⁶ are the same line of code at
+two log lengths. That is what it means for a percentage to be unable to price a complexity-class
+change.
