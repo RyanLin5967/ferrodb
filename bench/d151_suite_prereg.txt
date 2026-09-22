@@ -30,3 +30,28 @@ FALSIFIERS
 
 A SUITE VERDICT IS NOT A LANDING GATE. `tools/land-gate.sh` asks three questions — certify-head,
 staleness, prepush — and the suite is one input to the first. All three are run and recorded.
+
+-----------------------------------------------------------------------------------------------
+AMENDMENT 1 — the branch now adds ONE test, so the pre-registered total changes. Written before
+the suite was run; the earlier launch was stopped while still QUEUED behind d138c's suite and
+never acquired the lock, so no suite number has been taken on this branch at all.
+
+WHAT WAS ADDED AND WHY
+  tests/d151_parse_reads_a_refreshed_snapshot.rs — one `#[test]`, in a NEW target.
+
+  D151 makes parse-time correctness depend on `Catalog::epoch` for the first time: before it,
+  `parse_one` held the live catalog and could not see a stale schema. `d54_as_of_in_session`
+  already covers same-connection DDL-then-parse; the case D151 introduces — a connection that
+  CACHED BEFORE another connection's DDL — was reached by nothing in the suite.
+
+COUNTED FROM WHAT RUNS, NOT FROM THE DIFF
+  One `#[test]` attribute, no `macro_rules!` body, so the `reaper_suite` doubling trap does not
+  apply. `cargo test --test d151_parse_reads_a_refreshed_snapshot` reports
+  `1 passed; 0 failed`, which is the count this amendment uses — the target was run, not read.
+
+THE TEST WAS FIRE-CHECKED, and the mutation and its output are banked in
+bench/d151_firecheck.txt. A green test on fixed code is not evidence the test can see the defect.
+
+PRE-REGISTERED RESULT, REVISED:  rc=0, passed=2509, failed=0, per-target.
+  2508 (bench/land-2655e3b_certified, head b17ec58) + 1.
+  Falsifiers unchanged, with 2508 replaced by 2509 throughout.
