@@ -1553,8 +1553,11 @@ mod d126_record_key_probe {
     ///   a torn snapshot, a descent that loses a page mid-write — the neighbour would miss too.
     ///   It must not, and the target's zero is only worth something alongside it.
     ///
-    /// Measured before the fix with the same shape (`bench/d126_probe_before.txt`): 472 misses on
-    /// the target through `get_raw`, 0 on the neighbour.
+    /// **Fire-checked, and it fires.** With `upsert` put back to `tree.delete` then `tree.insert`
+    /// and nothing else changed, this arm reports `target_miss=255 neighbour_miss=0` in 125,170
+    /// reads — the target vanishes, the neighbour does not, which is exactly the discrimination
+    /// this arm claims. The miss count is a race and varies run to run (214 and 255 on two
+    /// consecutive runs); the neighbour's zero did not. Log: `bench/d126_probe_before.txt`.
     #[test]
     fn renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves() {
         let lease = LeaseDeadline(u64::MAX);
