@@ -1,0 +1,69 @@
+PRE-REGISTRATION — D154, written BEFORE the suite run. Amendments append-only.
+===============================================================================
+
+worktree: /Users/idide/wt/ferrodb-d141-catalog-narrowing
+branch:   d154-write-str   (NOT d141-catalog-narrowing — the worktree directory is named for an
+                            earlier row and that mismatch already caused this lane to be recorded
+                            in the landing queue under a branch that is 0 ahead of main, i.e. to
+                            read as "produced nothing". The branch name is the authority.)
+
+BASELINE, and the check that it applies to the base I actually merged
+---------------------------------------------------------------------
+2508 passed, mode=per-target, head=b17ec58 — bench/land-2655e3b_certified/SUMMARY.txt, verbatim
+from that runner's stdout. Go: 97.
+
+origin/main is 708822e, which is FOUR commits past b17ec58. Those four are bench/ banks only:
+  `git diff --stat b17ec58 origin/main -- src tests examples Cargo.toml` is EMPTY,
+  and `git diff --name-only b17ec58 origin/main` touches only `bench/`.
+⇒ 2508 carries forward to 708822e unchanged. This is checked, not assumed — the equivalent claim
+  was asserted-and-false by 506 lines in D126's bank.
+
+⚠ MODE. 2508 is PER-TARGET. `whole` mode is per-target + 2 doctests (one of which is a
+`compile_fail` block that reports separately — the constant was "corrected" to +1 by three people
+at once and reverted). The run below is pinned to VERIFY_MODE=per-target so no conversion is
+needed. A total is comparable only within its mode AND against its own base.
+
+WHAT THIS BRANCH ADDS
+---------------------
+tests/d154_length_prefix_refusal.rs — a NEW target, +6 tests. Counted from what RUNS
+("running 6 tests"), not from `grep -c '#[test]'`, which undercounts inside macros:
+  every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express
+  a_ddl_record_refuses_a_column_count_its_prefix_cannot_express
+  every_write_str_site_in_a_run_identity_record_refuses
+  a_compensation_record_refuses_through_the_record_it_wraps
+  the_largest_value_each_prefix_can_express_still_encodes
+  the_durable_provenance_store_refuses_a_run_it_cannot_encode
+
+NET ZERO, and stated because it is the one that could hide a loss:
+  consensus::transport::tests::a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender
+  was REWRITTEN, not added or removed — 1 test before, 1 test after. Its contract changed
+  deliberately (it now asserts the INVARIANT "refused, never framed" instead of which mechanism
+  refuses), and its hand-built 65540-byte section went with the send-side check it tested.
+
+PRE-REGISTERED EXPECTATION
+--------------------------
+  2508 + 6 = 2514 passed, 0 failed, 0 build_errors, mode=per-target
+  Go: 97 passed, 0 failed  (no Go files touched)
+
+Falsifiable on its own, each:
+  1. rc=0, failed=0, build_errors=0.
+  2. total == 2514 exactly. 2508 would mean the new target was never swept; 2513 would mean one of
+     the six did not collect; anything above means something else moved and must be explained
+     before this is called green.
+  3. all SIX new tests present BY NAME in the log, each "... ok".
+  4. the rewritten transport test present and passing BY NAME — it is the one whose contract this
+     row changed, so a green that did not run it proves nothing about the change.
+  5. Go 97.
+
+A DELETED GUARD, which a count cannot see
+-----------------------------------------
+This row DELETES the send-side re-encode check in consensus::transport::encode_command. No test
+count moves, so the suite is structurally incapable of noticing. The evidence for that deletion is
+therefore NOT the suite: it is bench/d154_deleted_guard.txt, which names the mutant that used to
+fail there and shows what still catches the class on the receive side.
+
+KNOWN INTERMITTENT, decided in advance
+--------------------------------------
+branch::reaper::tests::…a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+("fixture: nothing was ever checkpointed") — D139. If it is the ONLY failure, re-run. Anything
+else is mine until shown otherwise.
