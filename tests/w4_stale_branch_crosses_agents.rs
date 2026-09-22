@@ -10,11 +10,13 @@
 //! and hands `a.branch` to the runtime on every statement (`dispatch.rs:519`) — it is never
 //! re-read from the catalog.
 //!
-//! Nothing renews a lease. `renew_lease` has no caller in `src` outside the catalogs' own tests,
-//! so a session's lease is set once at fork (`DEFAULT_LEASE_MILLIS`, 15 minutes) and expires
-//! while the connection is open and idle. That is the ordinary shape of an agent run, not an
-//! edge: the lease reaper exists precisely to collect branches whose agent stopped talking.
-//! So the interleaving below needs no timing luck at all —
+//! **There is no automatic keepalive.** A session's lease is set once at fork
+//! (`DEFAULT_LEASE_MILLIS`, `15 * 60 * 1000` at `runtime.rs:96`) and no statement path renews it.
+//! The one production `renew_lease` is `simulate.rs:431`, and it sets the lease on a candidate
+//! branch `simulate` forked two lines above it, so it cannot extend a session that has gone
+//! quiet — which is the session this file is about. That is the ordinary shape of an agent run,
+//! not an edge: the lease reaper exists precisely to collect branches whose agent stopped
+//! talking. So the interleaving below needs no timing luck at all —
 //!
 //!   1. connection A opens a session on slot S, generation 0;
 //!   2. A goes quiet past its lease; the sweep reaps S, bumps the generation and releases the
@@ -228,8 +230,9 @@ fn a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row() {
     assert!(
         answer.is_err(),
         "connection A's session was reaped and slot {slot} now belongs to agent-b at generation \
-         1, yet A's SELECT on {stale} was answered: qty = {:?}. `workspaces` is keyed by the id \
-         slot alone, so A was handed agent-b's workspace. 999 is agent-b's staged, unmerged row.",
+         1, yet A's SELECT on {stale} was answered: qty = {:?}. A workspace lookup found the slot \
+         rather than the branch, so A was handed agent-b's workspace. 999 is agent-b's staged, \
+         unmerged row.",
         answer.as_ref().ok()
     );
 
@@ -296,8 +299,8 @@ fn a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session() {
         b_still_works.as_ref().ok(),
         Some(&999),
         "agent-b's session was destroyed by agent-a's ABANDON of a branch that no longer exists: \
-         B's own SELECT on {live} now answers {b_still_works:?}. `seal` removes the workspace and \
-         unbinds the name keyed by the id slot alone, before its first catalog read."
+         B's own SELECT on {live} now answers {b_still_works:?}. `seal` removed a workspace found \
+         by slot rather than by branch, and unbound its name, before its first catalog read."
     );
 
     // The refusal arrives, and it arrives too late to matter — recorded so that a later change

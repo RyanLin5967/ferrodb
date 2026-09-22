@@ -652,13 +652,28 @@ does not, and it is not. What follows is the refutation, then the fix.
 |---|---|---|
 | a connection caches its branch | `execution/session.rs`, `Session::agent: Option<AgentSession>` | set once by `BEGIN AGENT SESSION` |
 | and hands it to the runtime unchecked | `agent_sql/dispatch.rs`, `run_in_session` | `let branch = a.branch` — never re-read from the catalog |
-| nothing renews the lease | `renew_lease` has **no caller in `src`** outside the catalogs' own tests | so the branch expires with the connection open |
+| nothing renews it on its own | there is **no automatic keepalive**: the sole production `renew_lease` is `simulate.rs:431`, applied to a candidate branch `simulate` forked two lines above it | so an idle session's branch expires with the connection open |
 | the sweep reaps it and frees the slot | `reaper.rs` `set_state(..Reaped)` (bumps the generation) then `release_id` | `lease_thread.rs` then calls `runtime.forget_branches` |
 | the next session pops that slot | `catalog.rs` `fork` | same slot, generation + 1 |
 
-`DEFAULT_LEASE_MILLIS` is 15 minutes. An agent that pauses longer than that — one LLM call — comes
-back holding a `BranchId` that names another agent's workspace. The SELECT path in particular
-(`visible_rows_where`, then `record_read`) consults the catalog **not at all**.
+`DEFAULT_LEASE_MILLIS` is `15 * 60 * 1000` (`runtime.rs:96`). An agent that pauses longer than that
+— one LLM call — comes back holding a `BranchId` that names another agent's workspace. The SELECT
+path in particular (`visible_rows_where`, then `record_read`) consults the catalog **not at all**.
+
+⛔ **Correction to this table's third row, made before this record was acted on and logged here
+because this is where the claim was made.** It first read *"`renew_lease` has **no caller in `src`**
+outside the catalogs' own tests"*. **That is false.** `src/agent_sql/simulate.rs:431` is a
+production caller — enclosing `pub fn simulate` at `:367`, and there is no `mod tests` in that file
+at all. Found by a reviewer reading all 43 occurrences instead of trusting a count, with `grep -w
+fork` → 580 as a fired control on the instrument; re-checked here independently before this edit.
+
+**The conclusion is unchanged and the premise is now stricter, which is the only direction a
+premise may be revised.** The hazard was never "the symbol has no callers" — it is that **there is
+no automatic keepalive**. The one production renewal sets the lease on a branch the same function
+forked two lines earlier (`simulate.rs:429`), so it cannot extend a session that is *idle*, and an
+idle session is the session by hypothesis. No statement path renews anything. Stated the original
+way, the first reader to run `grep -w renew_lease src/` withdraws this addendum; stated this way it
+survives the re-check.
 
 ### What it cost, measured over the real statement path
 

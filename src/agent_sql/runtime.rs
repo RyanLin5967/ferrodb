@@ -730,9 +730,16 @@ struct State {
     /// Measured over the real statement path in
     /// `tests/w4_stale_branch_crosses_agents.rs`, against this file one commit earlier: a
     /// reaped session's `SELECT` returned `qty = 999`, the live agent's staged and unmerged row,
-    /// and its `ABANDON;` unbound the live agent's name. Nothing renews a lease — `renew_lease`
-    /// has no caller in `src` outside the catalogs' own tests — so every agent session outlives
-    /// its 15-minute lease with its connection still open, and the interleaving needs no race.
+    /// and its `ABANDON;` unbound the live agent's name. **There is no automatic keepalive**: the
+    /// only production `renew_lease` is `simulate.rs:431`, which sets the lease on a candidate
+    /// branch `simulate` forked two lines above it, so it cannot extend a session that is idle.
+    /// An agent that pauses longer than [`DEFAULT_LEASE_MILLIS`] therefore loses its branch with
+    /// its connection still open, and the interleaving needs no race to win.
+    ///
+    /// ⚠ This paragraph first said `renew_lease` "has no caller in `src` outside the catalogs'
+    /// own tests", which is false — `simulate.rs:431` is production. Corrected before landing;
+    /// the conclusion is unchanged because the hazard is the absent keepalive, not the absent
+    /// symbol. `bench/w4/DECISION.md` addendum 6 carries the full reversal.
     ///
     /// `forget_one_branch` had already taken this argument and validated the whole `BranchId`
     /// against `names`; only that one write path took it. Keying here retires the argument

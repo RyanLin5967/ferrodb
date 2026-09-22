@@ -3,9 +3,14 @@
 //! The sweep asks the catalog about each candidate with the state lock **released**, because the
 //! catalog takes its own lock and the two are acquired in the other order elsewhere. That window
 //! is not free: the catalog recycles a reaped branch's id SLOT (`release_id` pushes it back and
-//! `fork` pops it), and both `State::workspaces` and `State::names` are keyed by the slot alone —
-//! a session forking into slot 5 takes the same map key and the same `b_5` name as the branch that
+//! `fork` pops it), and a session forking into slot 5 takes the same `b_5` name as the branch that
 //! just died there. Only the generation tells them apart.
+//!
+//! ⚠ When this file was written that was true of `State::workspaces` too — it was keyed by the
+//! slot alone, which is what made the sweep's re-validation necessary. D158 item 1 keyed it by
+//! the whole `BranchId`, so `workspaces` no longer collides and `State::names` is the map this
+//! header is now about. The sweep property below is unchanged and still fires: see the fire-check
+//! note on the test.
 //!
 //! So a sweep that acts on what the catalog said, without re-reading, removes the workspace of a
 //! branch it never asked about. The agent holding that session then gets "no agent session on
@@ -176,8 +181,16 @@ impl BranchCatalog for ForkInTheWindow {
 ///
 /// The assertion is on the NEW session being usable afterwards, not on the sweep's return count:
 /// a count is satisfied by removing the wrong thing, and what this is about is which workspace
-/// went. Forcing it to fire is a two-line experiment — delete the `still_ours` re-validation in
-/// `forget_reaped_branches` and this test reports the new session's branch as having no workspace.
+/// went.
+///
+/// **Forcing it to fire, re-derived after D158 item 1.** This used to say "delete the
+/// `still_ours` re-validation in `forget_reaped_branches`" — there is no such re-validation any
+/// more, because keying `workspaces` by the whole `BranchId` made it unnecessary, so that
+/// instruction would now send a reader looking for code that is not there. The equivalent
+/// mutation is to make `forget_one_branch` remove by SLOT instead of by key: replace
+/// `state.remove_workspace(&bid)` with a lookup of the first entry in
+/// `BranchId::new(bid.id, 0)..=BranchId::new(bid.id, u32::MAX)` and remove that. Run and measured
+/// on `4677ff3`+: this test FAILS with the mutant and passes without it.
 #[test]
 fn a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight() {
     let inner = Arc::new(LogBranchCatalog::in_memory(1));
