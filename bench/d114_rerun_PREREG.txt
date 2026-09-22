@@ -1,0 +1,42 @@
+D114 RE-RUN — PRE-REGISTERED BEFORE THE FIRST MEASUREMENT, 2026-09-22
+=====================================================================
+WHY: `bench/d114_before.txt` says "src tree = 1bf8abe + the ours_scan instrument ONLY" and
+"harness commit: 935b0c1". Both are 2026-09-21 evening; D101's guard (ca61e38, 2026-09-21
+01:01) did not reach main until 83cb6e8 on 2026-09-22 00:34, and
+`git merge-base --is-ancestor ca61e38 935b0c1` answers NO. ⇒ **THE BANKED CURVE RAN ON
+`Session::new()`'s PRIVATE STUB RUNTIME** — `storage: None`, a private in-memory
+`LogBranchCatalog`, a private effect log.
+
+⚠ AND THE HONEST POSITION IS "UNKNOWN", NOT "WRONG". Unlike D110, whose counter was
+`PageStore::read_page` and therefore ZERO BY CONSTRUCTION on a runtime with no page store,
+D114's counters (`examined`, `matched`) count ops walked and folded in the runtime's OP LOG,
+which the stub also has. So the banked SHAPE may well be right. What is certain is only that
+it was measured against a different storage backing than production, and nothing in the
+banked file says so. **A shape taken on the wrong backing is a hypothesis, not a result.**
+
+WHAT IS RE-RUN: the same harness at main a7baa9e, rewired onto `s.ctx.session()` (7a7e998),
+i.e. the arena-backed designated runtime that `ServerContext` owns.
+
+THE INSTRUMENT IS A COUNT, SO LOAD DOES NOT BIND IT. The harness's own header: "The counters
+are the finding; the milliseconds are an UPPER BOUND on a shared box." Two other suites are
+in flight and that is fine for `examined` / `matched`. ⛔ The MERGE ms column is NOT a result
+from this run and must not be quoted from it.
+
+THE HARNESS'S OWN PRE-REGISTRATION, UNCHANGED:
+  FLAT in ops/branch   => the ours-side-scan reading is WRONG, the row closes.
+  LINEAR at fixed delta => the row is real.
+
+MY ADDITIONS, WRITTEN DOWN NOW:
+  A. The two passes per arm (ascending and descending) must agree on the SHAPE. The harness
+     says so itself: "If the two passes disagree on the SHAPE, the machine moved and neither
+     pass is a result." A count should not care, so a disagreement here is a finding about
+     the harness and must be reported as one.
+  B. `n` must equal `merges` at EVERY point. Any point with n < merges is a partial and the
+     harness's own "NO MERGE APPLIED — not a result, and not a zero" path is the model: do
+     not average over it.
+  C. The CHURN arm is the discriminator, not REPEAT. REPEAT grows scan AND fold together, so
+     it cannot separate them; CHURN grows only the scan. REPEAT linear + CHURN FLAT means
+     the slope is the FOLD and an index would NOT fix it — which would close the row even
+     though REPEAT looks linear.
+  D. Compare against `bench/d114_before.txt` ONLY on shape, never on magnitude: different
+     backing, different box load, and `a ratio needs one instrument and one moment`.
