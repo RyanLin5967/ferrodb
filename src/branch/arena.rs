@@ -342,6 +342,17 @@ pub struct ArenaPageStore {
     /// Extent pages currently reserved by some branch. Returns to baseline only if freed extents
     /// are genuinely recycled, which is the stronger claim exit criterion 8 actually wants.
     reserved_pages: AtomicU32,
+    /// **D144.** Entries ever PUSHED onto the pending-free log, cumulative and monotone.
+    ///
+    /// `pending_len()` is a LEVEL and cannot answer "how much was ever parked": the log is drained
+    /// as well as filled, and a parked entry whose child dies leaves it again. Sampling the level
+    /// from outside cannot recover the total either — the drain is a read-modify-write
+    /// (`take_pending` empties the whole vec before `put_pending` restores the survivors), so a
+    /// sampler sees transients that belong to no park at all, and whether two parks coexist at any
+    /// instant depends on the sweep cadence rather than on anything being measured. This counter
+    /// is incremented at the two sites that park a page and nowhere else, so it is immune to all
+    /// of that.
+    pending_pushed: AtomicU64,
     /// The authority epoch this store's in-memory state belongs to.
     ///
     /// Compared against [`crate::cluster::epoch`] on every allocation path; a change revokes the
@@ -453,6 +464,7 @@ impl ArenaPageStore {
             }),
             live_pages: AtomicU32::new(0),
             reserved_pages: AtomicU32::new(0),
+            pending_pushed: AtomicU64::new(0),
             authority_epoch: AtomicU64::new(crate::cluster::epoch()),
             checkpoint_path: Mutex::new(None),
         })
@@ -570,9 +582,17 @@ impl ArenaPageStore {
         self.reserved_pages.load(Ordering::SeqCst)
     }
 
-    /// Entries in the pending-free log.
+    /// Entries in the pending-free log. A LEVEL: it falls as well as rises.
     pub fn pending_len(&self) -> usize {
         self.state.lock().unwrap().pending.len()
+    }
+
+    /// Entries ever pushed onto the pending-free log. See [`ArenaPageStore::pending_pushed`].
+    ///
+    /// Cumulative and monotone, so unlike [`Self::pending_len`] it answers "how many pages were
+    /// ever parked" regardless of when they were released or whether two parks overlapped.
+    pub fn pending_pushed_total(&self) -> u64 {
+        self.pending_pushed.load(Ordering::Relaxed)
     }
 
     /// Branches currently holding a fillable extent — the length of the `current` map.
@@ -944,6 +964,7 @@ impl ArenaPageStore {
                         free_epoch,
                         owner: rec.branch_id,
                     });
+                    self.pending_pushed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -1598,6 +1619,7 @@ impl PageStore for ArenaPageStore {
                 free_epoch,
                 owner,
             });
+            self.pending_pushed.fetch_add(1, Ordering::Relaxed);
         } else {
             self.release_page(page_id, arena);
         }

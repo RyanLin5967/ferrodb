@@ -1,0 +1,144 @@
+################################################################################################
+# DRAW 2 -- SUPERSEDED, NOT VOID. Its rows are real; one COLUMN was mislabelled.
+#
+# The column printed as `parked` is the maximum number of parents whose pages were parked AT ANY
+# ONE INSTANT. Below S that is NOT the number that parked: a parked entry lives about one sweep
+# there (the child expires in the next one), while the 60 parents are reaped across TWO
+# consecutive sweeps, so the two groups never coexist and the maximum returns max(A,B) instead of
+# A+B. Above S an entry outlives a sweep, the groups overlap, and the two coincide -- which is why
+# the rows at 1.495 / 1.991 / 2.990 read a correct 60 and are unaffected.
+#
+# ⇒ WHAT STANDS FROM THIS DRAW: P1 refuted (parking at every Delta > 0 below S, where P1 says
+#   zero); the plateau above S; the knee at Delta = S; the L-invariance control; and the realised
+#   sweep interval, 3009-3013 ms against a nominal 3000, which discharged the load hazard.
+# ⇒ WHAT DOES NOT: the SHAPE of the ramp below S. Those figures are a LOWER BOUND.
+#
+# Superseded by bench/d144_lease_lag.txt, which adds ArenaPageStore::pending_pushed_total() -- a
+# cumulative, monotone count of parks that is immune to sampling, to the drain's read-modify-write
+# and to the cadence. Both columns are now printed side by side.
+################################################################################################
+d144-lease-lag: queued behind 96489 d141merged 2026-09-22T13:03:45Z
+d144-lease-lag: acquired the suite lock after 465s
+# D144 — the lag the LEASE produces. RAW ARTIFACT.
+#
+# run at            2026-09-22T13:13:20Z UTC
+# worktree          /Users/idide/wt/ferrodb-d133-pending-len
+# branch            d133-pending-len
+# head              e62169ca0471d41ec52c3846ca8d919c52f1075a
+# tree state        1 modified/untracked path(s)
+#                   ?? bench/d144_lease_lag.txt
+# binary mtime      2026-09-22T13:01:00Z
+# host              Darwin 25.6.0 arm64
+# measure lock      61248 d133-pending-len 2026-09-22T11:52:09Z
+# suite lock        HELD BY THIS RUN: 97835 d144-lease-lag 2026-09-22T13:13:20Z (queued 465s)
+#
+# ⛔ THE SCAN INTERVAL THIS RUN USED IS **3000 ms**, NOT THE SHIPPED 30 s.
+#    Δ is swept against $SCAN_MS, never against 30 s. The knob is the shipped one:
+#     109:pub const DEFAULT_SCAN_MILLIS: u64 = 30_000;
+#     112:pub const SCAN_INTERVAL_ENV: &str = "FERRODB_LEASE_SCAN_MILLIS";
+#    and the harness reads it through the server's own scan_interval_from_env():
+#     pub fn scan_interval_from_env() -> Result<Duration, FerroError> {
+#         match std::env::var(SCAN_INTERVAL_ENV) {
+#             Err(_) => Ok(Duration::from_millis(DEFAULT_SCAN_MILLIS)),
+#             Ok(v) => parse_scan_interval(&v),
+#         }
+#     }
+#
+# ⛔ THE LEASE IS COMPRESSED. The shipped constant has no environment override:
+#     96:pub const DEFAULT_LEASE_MILLIS: u64 = 15 * 60 * 1000;
+#     1477:            .fork(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
+#    The window under test is exactly Δ and does not contain L, so a compressed L rescales
+#    WHEN the window opens and not HOW WIDE it is. The CONTROL arm varies L at fixed Δ and
+#    must not move; the run REFUSES if it does.
+#
+==============================================================================
+ARM 1 — Δ swept ACROSS the scan interval S=3000 ms, below and above.
+==============================================================================
+# suite lock @ before arm 1: HELD BY THIS RUN (13:13:20Z, load 4.55 4.76 5.31)
+D144 — the lag the LEASE produces, swept across the scan interval.
+
+  scan interval S  3000 ms   (from scan_interval_from_env(), i.e. FERRODB_LEASE_SCAN_MILLIS or the 30000 ms default)
+  lease L          20000 ms  (COMPRESSED from DEFAULT_LEASE_MILLIS = 900000 ms, which has no env override;
+                   L does not enter the window, which is exactly Δ — the `lease` control arm tests that claim)
+  pairs per point  60, parent forks spread across exactly one S so the sweep phase is uniform
+  pages per parent 4, written BEFORE the child forks so the child can see them
+  reaping          the REAL LeaseThread on a real clock. No faked time, no direct reap() call.
+
+  S realis = the MEDIAN sweep gap this row actually achieved, from the lease
+             thread's own `attempts` counter. Every Δ/S below divides realised by
+             realised — one instrument, one moment. The nominal 3000 ms is the
+             REQUEST, and appears in no ratio. `S spread` is min..max of those gaps;
+             a row whose spread exceeds 25% of its median REFUSES rather than
+             pretending one number describes the cadence.
+
+  P1 = D144 as written: a STEP — 0 parked below S, all parked above.
+  P2 = refinement:      a KNEE — parked fraction = min(Δ/S, 1), so a RAMP below S.
+
+      Δ ms lease ms S run/cal      Δ/S  parked    P1    P2   peak    realised Δ      S spread scans a/s/r/f/reaped  incsum
+lease: reaped 42 expired branch(es) with no client cooperation (b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b28@g0, b26@g0, b24@g0, b22@g0, b20@g0, b18@g0, b16@g0, b14@g0, b12@g0, b10@g0, b8@g0, b6@g0, b4@g0, b2@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b29@g0, b27@g0, b25@g0, b23@g0, b21@g0, b19@g0, b17@g0, b15@g0, b13@g0, b11@g0, b9@g0, b7@g0, b5@g0, b3@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 78 expired branch(es) with no client cooperation (b120@g0, b118@g0, b116@g0, b114@g0, b112@g0, b110@g0, b108@g0, b106@g0, b104@g0, b102@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b119@g0, b117@g0, b115@g0, b113@g0, b111@g0, b109@g0, b107@g0, b105@g0, b103@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0); 0 workspace(s) forgotten
+         0    20000 3010/3003    0.000       0     0     0      0          0..1    2999..3121        15/15/0/0/120       0
+lease: reaped 32 expired branch(es) with no client cooperation (b31@g0, b29@g0, b27@g0, b25@g0, b23@g0, b21@g0, b19@g0, b17@g0, b15@g0, b13@g0, b11@g0, b32@g0, b30@g0, b28@g0, b26@g0, b24@g0, b22@g0, b20@g0, b18@g0, b16@g0, b14@g0, b12@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 88 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b109@g0, b107@g0, b105@g0, b103@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b110@g0, b108@g0, b106@g0, b104@g0, b102@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0); 0 workspace(s) forgotten
+       500    20000 3009/3006    0.166      10     0    10     40      488..512    2997..3162        15/15/0/0/120      30
+lease: reaped 22 expired branch(es) with no client cooperation (b21@g0, b22@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 98 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b29@g0, b27@g0, b25@g0, b23@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b28@g0, b26@g0, b24@g0); 0 workspace(s) forgotten
+      1000    20000 3011/3007    0.332      20     0    20     80     988..1012    2999..3151        15/15/0/0/120      31
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 91 expired branch(es) with no client cooperation (b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 8 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0); 0 workspace(s) forgotten
+      1500    20000 3009/3009    0.499      21     0    30     84    1488..1509    3000..3149        16/16/0/0/120      32
+lease: reaped 20 expired branch(es) with no client cooperation (b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 81 expired branch(es) with no client cooperation (b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0, b21@g0); 0 workspace(s) forgotten
+lease: reaped 19 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0); 0 workspace(s) forgotten
+      2000    20000 3009/3014    0.665      20     0    40     80    1990..2012    3000..3128        16/16/0/0/120      38
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 71 expired branch(es) with no client cooperation (b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 28 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0); 0 workspace(s) forgotten
+      2500    20000 3011/3001    0.830      28     0    50    112    2496..2503    2998..3113        16/16/0/0/120      48
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 61 expired branch(es) with no client cooperation (b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0, b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 38 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0); 0 workspace(s) forgotten
+      3000    20000 3009/3007    0.997      38     0    60    152    2989..3010    3000..3087        16/16/0/0/120      75
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 39 expired branch(es) with no client cooperation (b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 53 expired branch(es) with no client cooperation (b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0); 0 workspace(s) forgotten
+lease: reaped 7 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0); 0 workspace(s) forgotten
+      4500    20000 3011/3005    1.495      60    60    60    240    4488..4512    2999..3087        17/17/0/0/120      60
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 39 expired branch(es) with no client cooperation (b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 23 expired branch(es) with no client cooperation (b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0); 0 workspace(s) forgotten
+lease: reaped 37 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0); 0 workspace(s) forgotten
+      6000    20000 3013/3010    1.991      60    60    60    240    5989..6011    2999..3071        17/17/0/0/120     101
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 39 expired branch(es) with no client cooperation (b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 23 expired branch(es) with no client cooperation (b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0); 0 workspace(s) forgotten
+lease: reaped 37 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0); 0 workspace(s) forgotten
+      9000    20000 3010/3002    2.990      60    60    60    240    8988..9013    3000..3071        18/18/0/0/120      60
+
+  CONTROL — L varied at a fixed Δ=6000 ms. L is not in the window, so
+  these rows MUST agree. If they do not, the derivation above is wrong.
+      Δ ms lease ms S run/cal      Δ/S  parked    P1    P2   peak    realised Δ      S spread scans a/s/r/f/reaped  incsum
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 39 expired branch(es) with no client cooperation (b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 23 expired branch(es) with no client cooperation (b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0); 0 workspace(s) forgotten
+lease: reaped 37 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0); 0 workspace(s) forgotten
+      6000    20000 3012/3003    1.992      60    60    60    240    5988..6013    2998..3062        17/17/0/0/120      79
+lease: reaped 42 expired branch(es) with no client cooperation (b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0, b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 18 expired branch(es) with no client cooperation (b60@g0, b59@g0, b58@g0, b57@g0, b56@g0, b55@g0, b54@g0, b53@g0, b52@g0, b51@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0); 0 workspace(s) forgotten
+lease: reaped 44 expired branch(es) with no client cooperation (b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b70@g0, b69@g0, b68@g0, b67@g0, b66@g0, b65@g0, b64@g0, b63@g0, b62@g0, b61@g0); 0 workspace(s) forgotten
+lease: reaped 16 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0); 0 workspace(s) forgotten
+      6000    40000 3009/3010    1.994      60    60    60    240    5989..6012    2999..3071        24/24/0/0/120      62
+
+  realised Δ is computed from the DEADLINES the catalog recorded
+  (child.lease_deadline - parent.lease_deadline), not from the requested value.
+  CONTROL HELD: parked [60, 60] across leases [20000, 40000] — varying L did not move the window.
+  12 rows, every lease thread scanned, none refused, none failed.
+# suite lock @ after arm 1: HELD BY THIS RUN (13:23:11Z, load 2.43 3.09 4.03)
+(arm 1 rc=0)
+
+# binary self-identified from its own output: calibration columns present.
+# load after        2.43 3.09 4.03
+# arm rcs           0
+# the arm returned 0: every lease thread scanned, none refused, none failed, and the
+# lease control did not move.

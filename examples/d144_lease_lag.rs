@@ -197,6 +197,9 @@ struct Row {
     scan_spread_ms: (u64, u64),
     peak: usize,
     parked_parents: usize,
+    /// Parents whose pages were parked, from the arena's cumulative push counter. THE figure.
+    /// `peak_parents` below is the max that ever coexisted, which is a different question.
+    peak_parents: usize,
     /// Diagnostic only — see the note on [`SAMPLE_MS`]. Above `parked_parents` means a sample
     /// landed inside a drain's take/put window.
     increment_sum_parents: usize,
@@ -355,6 +358,8 @@ fn run_point(
         }
     }
 
+    // Cumulative, monotone, taken after the thread has stopped so no sweep is in flight.
+    let pushed = rig.store.pending_pushed_total();
     let stats = lease.stop();
     let _ = std::fs::remove_dir_all(&rig.dir);
 
@@ -380,6 +385,12 @@ fn run_point(
         refusals.push(format!(
             "delta={delta_ms} lease={lease_ms}: the lease thread reaped NOTHING in {end_ms} ms \
              with a {lease_ms} ms lease — the fixture never reached the code under test"
+        ));
+    }
+    if pushed > (pairs * pages as usize) as u64 {
+        refusals.push(format!(
+            "delta={delta_ms} lease={lease_ms}: {pushed} entries pushed but only {pairs} pairs x \
+             {pages} pages exist — more was parked than could be"
         ));
     }
     if peak > pairs * pages as usize {
@@ -437,7 +448,8 @@ fn run_point(
         cal_scan_ms: realised_ms,
         scan_spread_ms: (g_lo, g_hi),
         peak,
-        parked_parents: peak / pages as usize,
+        parked_parents: (pushed / pages as u64) as usize,
+        peak_parents: peak / pages as usize,
         increment_sum_parents: increments / pages as usize,
         realised_delta_ms: (lo, hi),
         stats,
@@ -467,13 +479,23 @@ fn print_header(scan_ms: u64, lease_ms: u64, pairs: usize, pages: u32) {
     println!("             a row whose spread exceeds 25% of its median REFUSES rather than");
     println!("             pretending one number describes the cadence.");
     println!();
+    println!("  parked  = parents whose pages were parked, from the arena's CUMULATIVE push");
+    println!("            counter. `maxcoex` is the most that ever coexisted, and BELOW S it is a");
+    println!("            LOWER BOUND on `parked`, not the same number: a parked entry lives about");
+    println!("            one sweep there, while the parents are reaped across TWO consecutive");
+    println!("            sweeps, so the two groups never overlap. Above S entries outlive a sweep,");
+    println!("            they do overlap, and the two columns converge. Draw 2 reported `maxcoex`");
+    println!("            as `parked` and so understated the fraction below S.");
+    println!("  peak    = the longest the QUEUE itself ever got, in entries. That is D142's");
+    println!("            question and `maxcoex` x pages answers it correctly in both regimes.");
+    println!();
     println!("  P1 = D144 as written: a STEP — 0 parked below S, all parked above.");
     println!("  P2 = refinement:      a KNEE — parked fraction = min(Δ/S, 1), so a RAMP below S.");
     println!();
     println!(
-        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
-        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "peak", "realised Δ",
-        "S spread", "scans a/s/r/f/reaped", "incsum"
+        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>8} {:>6} {:>13} {:>13} {:>20} {:>7}",
+        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "maxcoex", "peak",
+        "realised Δ", "S spread", "scans a/s/r/f/reaped", "incsum"
     );
 }
 
@@ -486,7 +508,7 @@ fn print_row(r: &Row, _nominal_ms: u64, pairs: usize) {
     let p1 = if r.delta_ms > scan_ms { pairs } else { 0 };
     let p2 = (pairs as f64 * ratio.min(1.0)).round() as usize;
     println!(
-        "  {:>8} {:>8} {:>9} {:>8.3} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
+        "  {:>8} {:>8} {:>9} {:>8.3} {:>7} {:>5} {:>5} {:>8} {:>6} {:>13} {:>13} {:>20} {:>7}",
         r.delta_ms,
         r.lease_ms,
         format!("{}/{}", r.realised_scan_ms, r.cal_scan_ms),
@@ -494,6 +516,7 @@ fn print_row(r: &Row, _nominal_ms: u64, pairs: usize) {
         r.parked_parents,
         p1,
         p2,
+        r.peak_parents,
         r.peak,
         format!("{}..{}", r.realised_delta_ms.0, r.realised_delta_ms.1),
         format!("{}..{}", r.scan_spread_ms.0, r.scan_spread_ms.1),
@@ -553,9 +576,9 @@ fn main() {
     println!("  CONTROL — L varied at a fixed Δ={control_delta} ms. L is not in the window, so");
     println!("  these rows MUST agree. If they do not, the derivation above is wrong.");
     println!(
-        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
-        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "peak", "realised Δ",
-        "S spread", "scans a/s/r/f/reaped", "incsum"
+        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>8} {:>6} {:>13} {:>13} {:>20} {:>7}",
+        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "maxcoex", "peak",
+        "realised Δ", "S spread", "scans a/s/r/f/reaped", "incsum"
     );
     let mut control_parked = Vec::new();
     for &l in &control_leases {
