@@ -397,12 +397,23 @@ pub fn run_agent_alter(
 }
 
 /// Bind and run one agent statement.
-pub fn run_agent_stmt(
+/// Bind and run one agent statement, **deferring the fork's fsync** into `pending`.
+///
+/// `pending` is how the durable half of `BEGIN AGENT SESSION` escapes this call. The caller is
+/// holding a lock wider than the runtime's own — over pgwire, `ServerContext::catalog()` for the
+/// whole statement — and syncing under it is what kept `f/sync` pinned at 1.00 over the wire while
+/// the branch catalog's own group commit batched x17 beneath it. Completing it after that lock is
+/// released is the entire point; see [`crate::agent_sql::session::ForkDurability`].
+///
+/// ⛔ The caller **must** complete anything left in `pending`. [`run_agent_stmt`] is the spelling
+/// that cannot forget.
+pub fn run_agent_stmt_staged(
     stmt: Stmt,
     catalog: &mut Catalog,
     bp: Arc<BufferPoolManager>,
     txn: Arc<TxnManager>,
     session: &mut Session,
+    pending: &mut Option<crate::agent_sql::session::ForkDurability>,
 ) -> Result<Outcome, FerroError> {
     let runtime = session.runtime.clone();
     // D101 — refuse a statement that is about to run on a runtime this process did not designate.
@@ -435,7 +446,9 @@ pub fn run_agent_stmt(
             // it into `RunEntity::prompt_hash` and drops it. Nothing on this path — the session
             // struct, the `SessionStarted` output, the branch record — carries the plaintext, so
             // there is no route by which a prompt becomes a durable copy of what it contained.
-            let s = runtime.begin_session_as(
+            // STAGED: everything but the fsync, which leaves through `pending` so it can be
+            // awaited once the caller has dropped its statement-wide catalog guard.
+            let (s, durability) = runtime.begin_session_as_staged(
                 crate::agent_sql::runtime::RunIdentity {
                     agent_id: &agent_id,
                     run_id: run_id.as_deref(),
@@ -444,6 +457,7 @@ pub fn run_agent_stmt(
                 },
                 parent,
             )?;
+            *pending = Some(durability);
             session.agent = Some(s.clone());
             Ok(Outcome::Agent(AgentOutput::SessionStarted(s)))
         }
@@ -499,6 +513,29 @@ pub fn run_agent_stmt(
             Ok(Outcome::Rows(rows))
         }
     }
+}
+
+/// Bind and run one agent statement, durable when it returns.
+///
+/// The spelling for every caller that is **not** holding a lock wider than the runtime's own.
+/// Delegates to [`run_agent_stmt_staged`] and completes the fork's sync itself, so there is one
+/// implementation and no way to forget the second half.
+pub fn run_agent_stmt(
+    stmt: Stmt,
+    catalog: &mut Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    session: &mut Session,
+) -> Result<Outcome, FerroError> {
+    let mut pending = None;
+    let outcome = run_agent_stmt_staged(stmt, catalog, bp, txn, session, &mut pending);
+    // Completed on the ERROR path too, and deliberately: `pending` is set only after the fork has
+    // already landed in the buffer pool, so a later failure in this statement does not un-fork it.
+    // Dropping the ticket instead would leave those pages unsynced and trip the `Drop` assertion.
+    if let Some(d) = pending {
+        d.complete()?;
+    }
+    outcome
 }
 
 /// Run a statement issued *inside* an agent session.

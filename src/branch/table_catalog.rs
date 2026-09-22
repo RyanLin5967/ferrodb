@@ -883,6 +883,27 @@ impl BranchCatalog for TableBranchCatalog {
     }
 
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        // The durable spelling, defined in terms of the staged one so there is exactly one fork
+        // body. A caller that holds no wider lock should use this and not think about tickets.
+        let (record, seq) = self.fork_staged(parent, lease)?;
+        self.await_fork_durable(seq)?;
+        Ok(record)
+    }
+
+    /// Wait for the shared sync covering `seq`. See [`BranchCatalog::fork_staged`] for why this is
+    /// a separate call: it must be reachable *after* the caller has released its own lock.
+    fn await_fork_durable(&self, seq: Option<u64>) -> Result<(), FerroError> {
+        match seq {
+            Some(seq) => self.durable(seq),
+            None => Ok(()),
+        }
+    }
+
+    fn fork_staged(
+        &self,
+        parent: BranchId,
+        lease: LeaseDeadline,
+    ) -> Result<(BranchRecord, Option<u64>), FerroError> {
         let fork_epoch = self.next_epoch();
         // The lock covers every TREE MUTATION and nothing else. It is dropped before the fsync, so
         // concurrent forkers share one disk round-trip instead of queueing for private ones. See
@@ -953,9 +974,14 @@ impl BranchCatalog for TableBranchCatalog {
             // point necessarily covers this fork.
             (child, self.stage()?)
         };
-        // Durable before the caller is told the fork happened -- but shared, not private.
-        self.durable(seq)?;
-        Ok(child)
+        // ⛔ NOT durable yet. The sync that covers `seq` is the caller's to await, and the whole
+        // point of handing it back rather than doing it here is that the caller may be holding a
+        // lock WIDER than `logical` -- over pgwire it holds `ServerContext::catalog()` for the
+        // whole statement. Syncing under that lock is what made `f/sync` exactly 1.00 at every
+        // thread count (`bench/d130_batch_vs_threads.txt`) while this catalog's own group commit
+        // batched x17 one layer down: the forkers never met inside `wait_durable` because they
+        // were still serialised in front of it. See `BranchCatalog::fork_staged`.
+        Ok((child, Some(seq)))
     }
 
     fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {

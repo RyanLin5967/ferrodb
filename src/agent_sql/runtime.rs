@@ -45,7 +45,7 @@ use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::gate::{AssertionResult, GateOutcome};
 use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::simulate::Assertion;
-use crate::agent_sql::session::AgentSession;
+use crate::agent_sql::session::{AgentSession, ForkDurability};
 use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId};
@@ -1468,13 +1468,42 @@ impl AgentRuntime {
         id: RunIdentity<'_>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
+        let (session, durability) = self.begin_session_as_staged(id, parent)?;
+        durability.complete()?;
+        Ok(session)
+    }
+
+    /// `begin_session_as`, **stopping one step short of durable.**
+    ///
+    /// Returns the session and a [`ForkDurability`] the caller must `complete()` before telling
+    /// anyone the fork happened. Use this **only** when holding a lock wider than the runtime's
+    /// own — over pgwire that is `ServerContext::catalog()`, held for the whole statement — so the
+    /// sync can be awaited after releasing it. Everything this method does before returning is
+    /// still inside the caller's exclusion; only the disk round-trip is deferred.
+    ///
+    /// ⛔ **THE ATOMICITY THIS PRESERVES IS THE REASON IT IS SHAPED THIS WAY, AND IT IS NOT
+    /// OBVIOUS.** This function's body is two disjoint critical sections — the branch-catalog
+    /// mutations under `logical`, and the `state` block below that snapshots the PARENT's
+    /// workspace — and the child's `fork_root` comes from the first while its staged rows come
+    /// from the second. Only the caller's wider lock makes those one instant. A `MERGE`,
+    /// `CHERRY PICK ... ONTO` or `seal` of the parent landing between them yields a child whose
+    /// page-level view and whose staged-buffer view come from different moments: empty rows beside
+    /// a `fork_root` that still addresses the parent's arena tree. ⇒ **Do not "fix" the
+    /// serialisation by calling this without a wider lock held.** What is safe to move out is the
+    /// fsync, and only the fsync — which is exactly what this returns rather than performs.
+    pub fn begin_session_as_staged(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+    ) -> Result<(AgentSession, ForkDurability), FerroError> {
         let RunIdentity { agent_id, run_id, model, prompt } = id;
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
-        let record = self
+        // STAGED, not durable. The ticket travels out with the session; see the type's docs.
+        let (record, fork_seq_ticket) = self
             .branches
-            .fork(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
+            .fork_staged(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
         let branch = record.branch_id;
 
         let run = run_id.unwrap_or("<unnamed>").to_string();
@@ -1602,14 +1631,17 @@ impl AgentRuntime {
             },
         );
         state.captures.insert(txn.0, TxnCapture::new(txn, prov, branch));
-        Ok(AgentSession {
-            branch,
-            branch_name: name,
-            agent_id: agent_id.to_string(),
-            run_id: run,
-            prov,
-            txn,
-        })
+        Ok((
+            AgentSession {
+                branch,
+                branch_name: name,
+                agent_id: agent_id.to_string(),
+                run_id: run,
+                prov,
+                txn,
+            },
+            ForkDurability { branches: Arc::clone(&self.branches), seq: fork_seq_ticket },
+        ))
     }
 
     /// The interned run behind a branch: which agent + run + model wrote here.
