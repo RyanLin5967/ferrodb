@@ -111,3 +111,30 @@ and both arms ran in this worktree today.
 
 ⚠ And unchanged, travelling with every number in this file: NOT a W4 rescue, and it moves a
 system already pinned against its ceiling at high fork rates.
+
+-----------------------------------------------------------------------------------------------
+RE-MEASURED ON THE MERGED BASE. THE BASE MOVED UNDER ME, SO THE NUMBERS WERE TAKEN AGAIN.
+-----------------------------------------------------------------------------------------------
+The table above was taken on `main` tip 2a0a8fc. While this row was being built `main` advanced 19
+commits to 4685d80, landing D138 — which rewrites `src/tel/log.rs`, and `src/tel::MemEffectLog` is
+a type THIS HARNESS CONSTRUCTS. `src/pgwire/` is byte-identical across the merge (`git diff
+6e8e11d..HEAD -- src/pgwire/` is empty), so the measured code did not change; the rest of the
+process it runs in did.
+
+⚠ "The code I measured did not change" is an argument. Re-running is a measurement, and re-running
+was two builds and two runs, so the argument was not worth making.
+
+  Raw artifacts: bench/d151_e6_before_merged.txt, bench/d151_e6_after_merged.txt
+  Both arms built from `origin/main` 4685d80 + ed598e4; AFTER is that plus D151's two code
+  commits (5bf89a4, 3da24e7) cherry-picked, and nothing else.
+
+    arm   T=1    T=4    T=16   T=64     total (A1+A2)
+    A1    33->17 132->68 528->272 2112->1088
+    A2    24->16  96->64 384->256 1536->1024
+    A0     0->0    0->0    0->0     0->0     CONTROL, unmoved
+    B      0->0    0->0    0->0     0->0     CONTROL, unmoved
+                                              4845 -> 2805
+
+**Every one of the sixteen cells is identical to the 2a0a8fc measurement, to the integer.** Both
+controls still zero, instrument self-check passed in both arms. The conclusion is unchanged and is
+now about the tree that will ship rather than about the tree that was current when it was written.

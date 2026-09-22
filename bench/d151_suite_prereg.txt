@@ -55,3 +55,32 @@ bench/d151_firecheck.txt. A green test on fixed code is not evidence the test ca
 PRE-REGISTERED RESULT, REVISED:  rc=0, passed=2509, failed=0, per-target.
   2508 (bench/land-2655e3b_certified, head b17ec58) + 1.
   Falsifiers unchanged, with 2508 replaced by 2509 throughout.
+
+-----------------------------------------------------------------------------------------------
+AMENDMENT 2 — THE BASE MOVED 19 COMMITS. 2509 WAS RIGHT FOR MY OLD BASE AND IS WRONG FOR THIS ONE.
+Written before the suite was run. No suite number has yet been taken on this branch: the first
+launch was stopped while still queued, and the second ACQUIRED the lock and was then killed at
+628 s (`REFUSING — aborted by SIGTERM. A suite cut short is not a count`), so it produced none.
+
+⚠ **2508 AND 2509 ARE BASE-RELATIVE NUMBERS AND MUST NEVER BE QUOTED WITHOUT THEIR BASE.** 2508 is
+`bench/land-2655e3b_certified`, head b17ec58 — which was `main` when this branch started. Since
+then D138 landed `src/tel/tests_durable_log.rs` and three tests with it.
+
+THE CURRENT BASE FIGURE, VERIFIED IN THIS TREE RATHER THAN TAKEN ON REPORT
+  bench/land-ebdf002_certified/CERTIFICATION.txt:8 and runner.log:1 both read
+    d138c: mode=per-target rc=0 passed=2511 failed=0 build_errors=0 head=5181d73
+  `5181d73` resolves and `git merge-base --is-ancestor 5181d73 origin/main` is true, and
+  `git diff --stat 5181d73..origin/main -- src tests examples Cargo.toml` is EMPTY — so no test
+  appeared or vanished between the commit that count certifies and `origin/main` (4685d80).
+  ⇒ origin/main is 2511 per-target.
+
+THIS BRANCH'S DELTA, counted from what RUNS
+  `git diff --name-status origin/main...HEAD -- tests/` lists exactly one added target,
+  tests/d151_parse_reads_a_refreshed_snapshot.rs, and `cargo test --test
+  d151_parse_reads_a_refreshed_snapshot` reports `1 passed; 0 failed`. One `#[test]`, no
+  `macro_rules!` body, so the reaper_suite doubling trap does not apply.
+
+PRE-REGISTERED RESULT, REVISED AGAIN:  rc=0, passed=2512, failed=0, per-target, on base 4685d80.
+  2511 (origin/main, bench/land-ebdf002_certified, head 5181d73) + 1.
+  Falsifiers unchanged, with 2512 substituted throughout.
+  A `whole`-mode number is still a different quantity and may not be compared with this one.
