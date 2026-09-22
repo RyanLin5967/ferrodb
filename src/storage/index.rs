@@ -576,6 +576,25 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         if !leaf.is_full() {
             return self.write_page(leaf_id, leaf.serialize()?);
         }
+        // ⛔ A full leaf holding ONE entry cannot be split into two that fit: the entry is itself
+        // larger than a page. `split` takes `mid = len / 2`, which is 0 here, so `split_off(0)`
+        // would move everything to the new page, leave THIS leaf empty, and then panic inside
+        // `serialize` — `range end index 4143 out of range for slice of length 4096` on the test
+        // below, from a `copy_from_slice` in `index_page.rs`, which names neither the key nor the
+        // cause. Refuse by name instead, before anything is written.
+        //
+        // **D126 is why this is here.** `Insert` could only reach the case on an EMPTY leaf, where
+        // it has always panicked. `Replace` reaches it on a populated one: a replacement value can
+        // grow a one-entry leaf past the page without ever making it two entries, which is a shape
+        // no `insert` can produce. The guard is written for both, and
+        // `an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf` fires it
+        // from both directions and checks that a value that DOES fit is still accepted.
+        if leaf.key_arr.len() < 2 {
+            return Err(FerroError::Io(format!(
+                "a single entry does not fit in a {PAGE_SIZE}-byte leaf page (page {leaf_id}); \
+                 splitting cannot help, and doing it anyway would leave an empty leaf"
+            )));
+        }
 
         let new_page_id = self.buffer_pool.new_page()?;
         // A freshly allocated page is reachable by nobody, so this latch is uncontended by
@@ -1049,5 +1068,84 @@ mod tests {
         let mut sorted = all.clone();
         sorted.sort();
         assert_eq!(all, sorted, "scan came back out of order");
+    }
+
+    /// **An entry larger than a page must be REFUSED, not split into an empty leaf.**
+    ///
+    /// `BPlusTreeLeafPage::split` takes `mid = len / 2`. On a leaf holding ONE entry that is
+    /// `mid = 0`, so `split_off(0)` moves everything to the new page and leaves the old leaf
+    /// EMPTY — and `serialize` on the new page then indexes past `PAGE_SIZE` and panics inside
+    /// `copy_from_slice`. Measured before the guard, on this exact test: it panicked at
+    /// `src/storage/index_page.rs:117` with
+    /// `range end index 4143 out of range for slice of length 4096`
+    /// (27 header + 12 key + 4104 value).
+    ///
+    /// **D126 is why this is written down now.** `insert` could only reach the case by inserting
+    /// an oversized entry into an EMPTY leaf; `upsert` reaches it on a POPULATED one, because a
+    /// replacement value can grow a one-entry leaf past the page without ever making it two
+    /// entries. Both arms are asserted, because the guard covers both and a guard that only ever
+    /// fires on the new path would say nothing about the old one.
+    ///
+    /// The refusal happens before anything is written, so the pre-existing value must survive —
+    /// asserted, because "refuses" and "refuses without corrupting" are different claims.
+    #[test]
+    fn an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversize.db");
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&path).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp).unwrap();
+
+        // A `Vec<u8>` entry costs 4 length bytes plus its payload, and a leaf header is 27, so one
+        // entry overflows a 4096-byte page at a payload of ~4053. 4100 is comfortably past it.
+        let huge = vec![0x5Au8; 4100];
+        let k = b"oversize".to_vec();
+        tree.insert(k.clone(), vec![1u8; 8]).expect("the small entry must fit");
+
+        // ARM 1 — UPSERT, the case D126 introduced: one entry already there, grown past the page.
+        let e = tree.upsert(k.clone(), huge.clone()).expect_err("an oversized upsert must refuse");
+        assert!(
+            e.to_string().contains("does not fit"),
+            "refused, but not by the guard that names the reason: {e}"
+        );
+        assert_eq!(
+            tree.search(&k).expect("search"),
+            Some(vec![1u8; 8]),
+            "the refusal wrote something; the previous value must survive untouched"
+        );
+
+        // ARM 2 — INSERT into an empty leaf, the case that always existed and panicked.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("oversize2.db");
+        let file2 = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&path2).unwrap();
+        let bp2 = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file2).unwrap())));
+        let empty = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp2).unwrap();
+        let e2 = empty.insert(k.clone(), huge).expect_err("an oversized insert must refuse");
+        assert!(
+            e2.to_string().contains("does not fit"),
+            "refused, but not by the guard that names the reason: {e2}"
+        );
+        assert_eq!(empty.search(&k).expect("search"), None, "nothing must have been written");
+
+        // NEGATIVE CONTROL. The guard must not refuse an entry that DOES fit, including one big
+        // enough to force a genuine split of a leaf that holds more than one entry.
+        let big_but_ok = vec![0x11u8; 2000];
+        tree.upsert(k.clone(), big_but_ok.clone()).expect("a 2000-byte value fits");
+        assert_eq!(tree.search(&k).expect("search"), Some(big_but_ok));
+        for i in 0u32..40 {
+            tree.insert(i.to_be_bytes().to_vec(), vec![0x22u8; 300])
+                .expect("ordinary inserts must still split normally");
+        }
+        for i in 0u32..40 {
+            assert_eq!(
+                tree.search(&i.to_be_bytes().to_vec()).expect("search"),
+                Some(vec![0x22u8; 300]),
+                "key {i} lost after the splits the control forced"
+            );
+        }
     }
 }
