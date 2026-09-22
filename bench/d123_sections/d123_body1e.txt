@@ -1,0 +1,43 @@
+
+1e. THE CONTAMINATION LEDGER, AND WHY THE CLEAN-DRAW COUNT IS SMALLER THAN THE DRAW COUNT
+================================================================================================
+
+Two agents declared activity overlapping this row's measure-lock windows. Neither was at fault: the
+measure lock excludes other MEASURERS and does not exclude builds or suites, so a correct poll and a
+correct acquire can both precede a full test suite landing on the same CPU.
+
+  declarer        window (UTC)             what
+  diff-identity   23:04:00 - 23:12:54Z     near-continuous cargo in a sibling worktree, incl. a
+                                           full `cargo test --lib` (1577 tests, 61.91 s) which
+                                           itself contains a >60 s concurrency-heavy reaper test
+                                           on this very subsystem
+  d77-walls       23:59:00 - 00:03:00Z     `cargo build --examples`, `cargo test --lib` (~72 s),
+                                           8 integration targets — a rebase verification
+
+  arm                            ran (UTC)              intersection
+  first battery F1 (both)        23:06 - 23:07Z         ENTIRELY inside diff-identity
+  20_f1_paired_warm0             23:59:46 - 00:01:32Z   ENTIRELY inside d77-walls
+  30_f1_paired_warm20k           00:01:32 - 00:05:46Z   first 88 s of 254 s inside d77-walls
+
+⇒ **OF THE 18 PAIRED DRAWS, ONLY FIVE FALL OUTSIDE EVERY DECLARED WINDOW** — `30_f1_paired_warm20k`
+reps 4-8, at 28.2 s per rep. Those five give **median 1.97x, 4 of 5 above 1.10x**. One of them (rep
+4, 1.03x) sits inside the falsifier's band. **An earlier draft of this artifact said "17 of 18" and
+that overstates the clean evidence; the phrasing is withdrawn.** F1 is therefore re-run clean in
+`bench/d123_final/50_f1_clean.txt`, and the verdict below rests on that.
+
+⛔ AND A DIRECTION ARGUMENT I MADE AND HAVE SINCE NARROWED. I claimed contamination biases the F1
+ratio UPWARD, because interference hurts L0 more than L3 (L0 spends ~21x longer inside the section).
+That holds for SEVERE degradation — warm=0's reps 5-8, where L0 collapsed to 303-2412 forks/sec,
+produced the highest ratios seen anywhere (2.90-6.58x). **It does not hold for mild load.** In
+warm=20k the contaminated reps 0-2 median 1.83x while the clean reps 4-8 median 1.97x, i.e. the
+contamination slightly DEFLATED the ratio there. So "contamination biases upward" is a property of
+severe degradation, not a general law, and it is not used here as a reason to trust a dirty arm.
+
+⭐ THE METHOD FIX, WHICH MATTERS MORE THAN THIS PARTICULAR LEDGER. The rep-to-window mapping above
+was reconstructed by dividing an arm's wall duration by its rep count — arithmetic on two file
+mtimes. That assumes every rep took the same time, and **the reps we most care about are exactly the
+ones that ran LONG because the box was loaded**, so the estimate is biased in the direction that
+misplaces the boundary. The harness now stamps **each rep with wall-clock UTC in the raw matrix**,
+so any declaration arriving later can be intersected with the data exactly, by anyone, without
+re-deriving it. A derived quantity standing in for a recorded one is the same defect as section 0's
+reciprocal, in a different costume.

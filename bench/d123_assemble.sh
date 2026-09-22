@@ -14,7 +14,7 @@ fi
 S=$W/bench/d123_sections
 OUT=$W/bench/d123_serial_attribution.txt
 cat "$S/d123_head.txt" \
-    "$S/d123_body1a.txt" "$S/d123_body1b.txt" "$S/d123_body1d.txt" \
+    "$S/d123_body1a.txt" "$S/d123_body1b.txt" "$S/d123_body1e.txt" "$S/d123_body1d.txt" \
     "$S/d123_body2.txt" "$S/d123_body_f5.txt" \
     "$S/d123_body3.txt" "$S/d123_body3c.txt" "$S/d123_body3b.txt" \
     "$S/d123_body4.txt" "$S/d123_body5.txt" > "$OUT"
