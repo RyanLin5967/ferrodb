@@ -86,14 +86,27 @@ say "[2/3] staleness.sh — has the base moved under this branch's files SINCE t
 STALE_OUT=$(bash tools/staleness.sh . "$BASE_SHA" "$WANT_SHA" 2>&1)
 STALE_RC=$?
 printf '%s\n' "$STALE_OUT" | sed 's/^/      /'
-case "$STALE_OUT" in
+# \u26d4 THE VERDICT IS A LINE, NOT A PREFIX. The first cut of this matched `case "$STALE_OUT" in
+# COVERED*)`, which can never fire: staleness.sh prints a header line ("branch X vs Y: N behind,
+# M ahead") BEFORE its verdict, so the blob never STARTS with a verdict word. Every verdict fell
+# to the `*)` catch-all. It refused rather than allowed -- the safe direction, and the reason this
+# was recoverable -- but it would have refused a genuine STALE-GREEN with "unrecognised verdict",
+# i.e. the right answer for the wrong reason, which is indistinguishable from luck.
+#
+# It survived its own fire-check because that check fed it SYNTHETIC verdict strings ("COVERED",
+# "STALE-GREEN: ...") rather than real `staleness.sh` output. Nine cases passed and the first real
+# one failed. ⇒ A parser must be fire-checked against the ACTUAL emitter, never against a
+# hand-written example of what you believe the emitter says.
+VERDICT=$(printf '%s\n' "$STALE_OUT" | grep -oE '^(COVERED[A-Z-]*|STALE-GREEN|UNKNOWN)' | head -1)
+case "$VERDICT" in
     COVERED*) : ;;                       # COVERED, COVERED-NO-CODE, COVERED-COMMENTS-ONLY
-    STALE-GREEN*) die "STALE-GREEN — the base moved under code this branch has not seen.
+    STALE-GREEN) die "STALE-GREEN — the base moved under code this branch has not seen.
   Merge $BASE into $WANT and RE-RUN the suite. Do not reason about whether it matters:
   'close enough' is the judgement these guards exist to delete." ;;
-    UNKNOWN*) die "staleness could not determine a verdict (rc=$STALE_RC).
+    UNKNOWN) die "staleness could not determine a verdict (rc=$STALE_RC).
   A guard that cannot parse its own input must never fall through to allow." ;;
-    *) die "staleness emitted an unrecognised verdict (rc=$STALE_RC). Refusing rather than guessing." ;;
+    *) die "staleness emitted no recognisable verdict LINE (rc=$STALE_RC). Refusing rather than guessing.
+  Its output is above. A verdict must appear at the start of one of its lines." ;;
 esac
 [ "$STALE_RC" = 0 ] || die "staleness printed a COVERED verdict but exited $STALE_RC. Refusing on the disagreement."
 printf '\n'
