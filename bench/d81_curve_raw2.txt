@@ -1,0 +1,203 @@
+ACQUIRED d81-fsm  load_at_acquire=3
+
+======================================================================
+ARM: R1 BEFORE/OFF   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_BEFORE   D75_PERSIST=unset   started 2026-09-22T03:42:58Z
+load at arm start: 3.95 4.53 4.67
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at a7b8c5033c43
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: OFF (as every 10^6 harness here does)
+      500          501            68.170           136.3402      120            0           0         0        0            0      5787     11574.0
+     1000         1001           247.073           247.0726      120            0           0         0        0            0     12670     12669.9
+           ^ 2.0x the live branches, 3.62x the cycle
+     2000         2001           171.957            85.9786      120            0           0         0        0            0     31848     15923.9
+           ^ 4.0x the live branches, 2.52x the cycle
+     4000         4001           174.148            43.5369      120            0           0         0        0            0     63229     15807.3
+           ^ 8.0x the live branches, 2.55x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R1 BEFORE/OFF rc=0 elapsed=204s
+
+======================================================================
+ARM: R1 BEFORE/ON   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_BEFORE   D75_PERSIST=1   started 2026-09-22T03:46:22Z
+load at arm start: 5.05 4.53 4.61
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at a7b8c5033c43
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: ON (as cli.rs:120 does)
+      500          501           250.871           501.7429      120        29849         620         0     1240         9077     22097     44194.2
+     1000         1001           232.072           232.0721      120        53849        1120         0     2240        29523     41749     41749.2
+           ^ 2.0x the live branches, 0.93x the cycle
+     2000         2001           253.890           126.9450      120       101849        2120         0     4240       105571     84353     42176.5
+           ^ 4.0x the live branches, 1.01x the cycle
+     4000         4001            92.257            23.0643      120       197849        4120         0     8240       398292    110900     27725.0
+           ^ 8.0x the live branches, 0.37x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R1 BEFORE/ON rc=0 elapsed=345s
+
+======================================================================
+ARM: R1 AFTER/OFF   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_AFTER   D75_PERSIST=unset   started 2026-09-22T03:52:07Z
+load at arm start: 2.88 3.24 3.93
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at 0f596da650e4
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: OFF (as every 10^6 harness here does)
+      500          501            80.048           160.0951      120            0           0         0        0            0      4641      9282.1
+     1000         1001           313.058           313.0575      120            0           0         0        0            0     16774     16773.9
+           ^ 2.0x the live branches, 3.91x the cycle
+     2000         2001           104.029            52.0147      120            0           0         0        0            0     55796     27897.9
+           ^ 4.0x the live branches, 1.30x the cycle
+     4000         4001            90.914            22.7285      120            0           0         0        0            0     73027     18256.7
+           ^ 8.0x the live branches, 1.14x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R1 AFTER/OFF rc=0 elapsed=222s
+
+======================================================================
+ARM: R1 AFTER/ON   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_AFTER   D75_PERSIST=1   started 2026-09-22T03:55:49Z
+load at arm start: 2.68 3.15 3.75
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at 0f596da650e4
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: ON (as cli.rs:120 does)
+      500          501           102.202           204.4038      120        29303           5       615      625           74      7459     14917.6
+     1000         1001           111.030           111.0299      120        53588           7      1113     1127          176     15593     15593.0
+           ^ 2.0x the live branches, 1.09x the cycle
+     2000         2001           105.944            52.9719      120       100244           8      2112     2128          294     35549     17774.6
+           ^ 4.0x the live branches, 1.04x the cycle
+     4000         4001           199.167            49.7917      120       196682          10      4110     4130          671     69817     17454.1
+           ^ 8.0x the live branches, 1.95x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R1 AFTER/ON rc=0 elapsed=178s
+
+======================================================================
+ARM: R2 AFTER/ON   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_AFTER   D75_PERSIST=1   started 2026-09-22T03:58:47Z
+load at arm start: 3.67 3.30 3.69
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at 0f596da650e4
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: ON (as cli.rs:120 does)
+      500          501           125.950           251.8996      120        29303           5       615      625           74      9979     19958.5
+     1000         1001           109.041           109.0415      120        53588           7      1113     1127          176     14743     14742.9
+           ^ 2.0x the live branches, 0.87x the cycle
+     2000         2001           238.720           119.3600      120       100244           8      2112     2128          294     34344     17171.9
+           ^ 4.0x the live branches, 1.90x the cycle
+     4000         4001           103.398            25.8495      120       196682          10      4110     4130          671     63076     15769.0
+           ^ 8.0x the live branches, 0.82x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R2 AFTER/ON rc=0 elapsed=181s
+
+======================================================================
+ARM: R2 AFTER/OFF   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_AFTER   D75_PERSIST=unset   started 2026-09-22T04:01:48Z
+load at arm start: 3.87 3.29 3.60
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at 0f596da650e4
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: OFF (as every 10^6 harness here does)
+      500          501           112.774           225.5487      120            0           0         0        0            0      6077     12154.7
+     1000         1001            57.048            57.0481      120            0           0         0        0            0     11020     11019.9
+           ^ 2.0x the live branches, 0.51x the cycle
+     2000         2001            94.065            47.0325      120            0           0         0        0            0     22691     11345.6
+           ^ 4.0x the live branches, 0.83x the cycle
+     4000         4001            58.996            14.7490      120            0           0         0        0            0     55497     13874.2
+           ^ 8.0x the live branches, 0.52x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R2 AFTER/OFF rc=0 elapsed=145s
+
+======================================================================
+ARM: R2 BEFORE/ON   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_BEFORE   D75_PERSIST=1   started 2026-09-22T04:04:13Z
+load at arm start: 2.71 3.12 3.48
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at a7b8c5033c43
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: ON (as cli.rs:120 does)
+      500          501           111.981           223.9615      120        29849         620         0     1240         9077      9745     19490.7
+     1000         1001           101.899           101.8989      120        53849        1120         0     2240        29523     25669     25668.9
+           ^ 2.0x the live branches, 0.91x the cycle
+     2000         2001            99.041            49.5206      120       101849        2120         0     4240       105571     40631     20315.4
+           ^ 4.0x the live branches, 0.88x the cycle
+     4000         4001           111.051            27.7629      120       197849        4120         0     8240       398292    110811     27702.7
+           ^ 8.0x the live branches, 0.99x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R2 BEFORE/ON rc=0 elapsed=232s
+
+======================================================================
+ARM: R2 BEFORE/OFF   binary=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d81/d75_BEFORE   D75_PERSIST=unset   started 2026-09-22T04:08:05Z
+load at arm start: 2.83 2.83 3.25
+======================================================================
+D75 — per-statement cost against the number of LIVE branches.
+at a7b8c5033c43
+4 threads doing fork/write/merge cycles; L other branches sit LIVE underneath.
+PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked
+  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)
+  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)
+  persistence: OFF (as every 10^6 harness here does)
+      500          501            99.187           198.3733      120            0           0         0        0            0      5323     10645.9
+     1000         1001           200.938           200.9378      120            0           0         0        0            0     26375     26374.6
+           ^ 2.0x the live branches, 2.03x the cycle
+     2000         2001           179.893            89.9465      120            0           0         0        0            0     27999     13999.3
+           ^ 4.0x the live branches, 1.81x the cycle
+     4000         4001           158.992            39.7479      120            0           0         0        0            0     94477     23619.3
+           ^ 8.0x the live branches, 1.60x the cycle
+
+FLAT median ms/cycle -> cost is independent of how many branches are live.
+A flat 'ms per 1000 live' column is the signature of LINEAR in L.
+ARM R2 BEFORE/OFF rc=0 elapsed=221s
+ALL ARMS DONE 2026-09-22T04:11:46Z
+RELEASED d81-fsm

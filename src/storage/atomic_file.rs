@@ -33,6 +33,14 @@ pub trait FileOps {
     /// Create or truncate `path` and write every byte. Makes nothing durable.
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
 
+    /// Append every byte to the **end of an existing** `path`. Makes nothing durable.
+    ///
+    /// Deliberately refuses a path that does not exist rather than creating it. An append is only
+    /// ever meaningful after the thing it extends — see [`append_durably`], whose whole contract is
+    /// that the reader can find a complete image in front of the appended bytes. Creating the file
+    /// here would produce a headless tail that no reader can interpret.
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+
     /// Flush `path`'s data and metadata to the device.
     fn sync_file(&self, path: &Path) -> io::Result<()>;
 
@@ -52,6 +60,13 @@ pub struct OsFileOps;
 impl FileOps for OsFileOps {
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
+    }
+
+    /// `append(true)` **without** `create(true)`: a missing target is `ENOENT`, which is the
+    /// refusal the trait's doc comment promises rather than a silently headless file.
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        OpenOptions::new().append(true).open(path)?.write_all(bytes)
     }
 
     /// Opened **for writing** rather than with `File::open`: Windows' `FlushFileBuffers` refuses a
@@ -103,6 +118,54 @@ pub static ATOMIC_REPLACE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomi
 pub fn atomic_replace_counters() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (ATOMIC_REPLACES.load(Ordering::Relaxed), ATOMIC_REPLACE_BYTES.load(Ordering::Relaxed))
+}
+
+/// The same two counters for [`append_durably`], kept SEPARATE from the replace pair.
+///
+/// Separate because the point of D81 is the difference between the two: a replace is two fsyncs
+/// over the whole image, an append is one fsync over one record. Summing them would hide exactly
+/// the quantity the row is about.
+pub static DURABLE_APPENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DURABLE_APPEND_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(appends, bytes)` since process start.
+pub fn durable_append_counters() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (DURABLE_APPENDS.load(Ordering::Relaxed), DURABLE_APPEND_BYTES.load(Ordering::Relaxed))
+}
+
+/// Extend `path` with `bytes` and make the extension durable, without rewriting what is in front
+/// of it.
+///
+/// **Two steps, not four, and the two that are missing are the point.** A replace has to fsync a
+/// temporary *and* the directory, because it publishes a new inode under an existing name. An
+/// append changes neither the name nor the inode: the directory entry is already durable, so there
+/// is nothing for `sync_dir` to do. What is left is write-then-fsync — **one fsync where
+/// [`replace_atomically`] pays two**, over one record instead of the whole file.
+///
+/// `sync_file` rather than a data-only flush: the file's LENGTH is metadata, and a tail whose bytes
+/// are on the device under a length that is not is a tail no reader will look at.
+///
+/// **Under the same [`REPLACE_LOCK`] as a replace, and that is load-bearing.** An append that
+/// interleaved with a replace of the same target would land on the inode being replaced and vanish
+/// with it — a durably-acknowledged claim that is not in the file afterwards, which is the one
+/// outcome worse than a slow checkpoint.
+///
+/// ⚠ **What this does NOT give you, and the caller must:** an append is atomic against other
+/// writers here, never against a power cut. A torn append leaves a partial record at the end of
+/// the file, so whatever the caller appends must be self-delimiting and self-checked, and its
+/// reader must be able to discard an incomplete final record. `ArenaPageStore`'s tail records
+/// carry a length and a CRC32 for exactly this reason.
+pub fn append_durably(ops: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    {
+        use std::sync::atomic::Ordering;
+        DURABLE_APPENDS.fetch_add(1, Ordering::Relaxed);
+        DURABLE_APPEND_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }
+    let _serialised = REPLACE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ops.append(path, bytes)?;
+    ops.sync_file(path)
 }
 
 pub fn replace_atomically(ops: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -172,6 +235,7 @@ pub fn parent_dir(path: &Path) -> &Path {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
     Write(PathBuf, Vec<u8>),
+    Append(PathBuf, Vec<u8>),
     SyncFile(PathBuf),
     Rename(PathBuf, PathBuf),
     SyncDir(PathBuf),
@@ -203,6 +267,7 @@ impl RecordingOps {
             .into_iter()
             .map(|op| match op {
                 Op::Write(p, _) => ("write", p),
+                Op::Append(p, _) => ("append", p),
                 Op::SyncFile(p) => ("sync_file", p),
                 Op::Rename(from, _) => ("rename", from),
                 Op::SyncDir(p) => ("sync_dir", p),
@@ -215,6 +280,11 @@ impl RecordingOps {
 impl FileOps for RecordingOps {
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         self.ops.lock().unwrap().push(Op::Write(path.to_path_buf(), bytes.to_vec()));
+        Ok(())
+    }
+
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.ops.lock().unwrap().push(Op::Append(path.to_path_buf(), bytes.to_vec()));
         Ok(())
     }
 
@@ -361,6 +431,94 @@ mod tests {
                 });
             }
         });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The saving D81 is built on, stated as an order rather than argued about.** A replace is
+    /// four operations and TWO fsyncs; an append is two operations and ONE, and neither of the
+    /// missing ones is the directory's by accident — an append does not change the directory.
+    #[test]
+    fn a_durable_append_is_one_fsync_where_a_replace_is_two() {
+        let target = Path::new("/var/db/state.arena");
+
+        let replacing = RecordingOps::new();
+        replace_atomically(&replacing, target, b"image").unwrap();
+        let appending = RecordingOps::new();
+        append_durably(&appending, target, b"rec").unwrap();
+
+        assert_eq!(
+            appending.shape(),
+            vec![("append", target.to_path_buf()), ("sync_file", target.to_path_buf())],
+            "an append writes the record and flushes it, and touches nothing else"
+        );
+        assert_eq!(
+            appending.ops()[0],
+            Op::Append(target.to_path_buf(), b"rec".to_vec()),
+            "the record must go to the target itself, not through a temporary"
+        );
+
+        let fsyncs = |ops: &RecordingOps| {
+            ops.shape().iter().filter(|(kind, _)| *kind == "sync_file" || *kind == "sync_dir").count()
+        };
+        assert_eq!(fsyncs(&replacing), 2, "a replace fsyncs the temporary and the directory");
+        assert_eq!(fsyncs(&appending), 1, "an append fsyncs only the file it extended");
+        assert!(
+            !appending.shape().iter().any(|(kind, _)| *kind == "sync_dir" || *kind == "rename"),
+            "an append changes no directory entry, so it must pay for neither"
+        );
+    }
+
+    /// An append onto a path that does not exist must REFUSE, not create one.
+    ///
+    /// A created file would hold tail records with no image in front of them, and the reader's
+    /// first act is to parse an image. Measured against the real filesystem, because this is a
+    /// property of `OpenOptions`, not of anything this module decides.
+    #[test]
+    fn appending_to_a_missing_file_is_refused_rather_than_creating_a_headless_tail() {
+        let dir = std::env::temp_dir().join(format!("ferro-append-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state.arena");
+
+        let err = append_durably(&OsFileOps, &target, b"rec").expect_err(
+            "an append with nothing to append to must fail, not invent a file",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(!target.exists(), "the refusal must leave no file behind");
+
+        // ...and it works the moment there is something in front of it.
+        replace_atomically(&OsFileOps, &target, b"image").unwrap();
+        append_durably(&OsFileOps, &target, b"rec").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"imagerec", "the append must EXTEND, not replace");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replace after appends must leave the target holding the image ALONE.
+    ///
+    /// This is what makes compaction a compaction: `replace_atomically` renames a fresh inode over
+    /// the target, so the old tail goes with the old inode. If it truncated in place instead, a
+    /// shorter image would leave the previous tail's bytes stranded after it and the next reader
+    /// would replay records that had already been folded in.
+    #[test]
+    fn a_replace_after_appends_drops_the_tail_instead_of_stranding_it() {
+        let dir = std::env::temp_dir().join(format!("ferro-append-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state.arena");
+
+        replace_atomically(&OsFileOps, &target, b"LONG-IMAGE-V1").unwrap();
+        append_durably(&OsFileOps, &target, b"tail-a").unwrap();
+        append_durably(&OsFileOps, &target, b"tail-b").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"LONG-IMAGE-V1tail-atail-b");
+
+        replace_atomically(&OsFileOps, &target, b"V2").unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"V2",
+            "a shorter image must not leave the old tail visible after it"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

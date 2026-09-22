@@ -1111,6 +1111,23 @@ mod tests {
                 // fired with "nothing was ever checkpointed". Intermittent, because it
                 // needs an unlucky interleaving -- it survived thousands of green runs
                 // and surfaced only under fleet load.
+                //
+                // ⭐ **D81 FOUND THE SAME COLLISION INDEPENDENTLY AND REPRODUCED IT ON
+                // DEMAND**, which D139's own fire-check did not manage: 3/3 parallel runs
+                // failed, `--test-threads=1` passed. ⛔ **AND IT CHANGES THE SYMPTOM ABOVE.**
+                // The race was survivable while every durable write was a create-or-replace;
+                // once `<db>.arena` became append-only, an append to a file the other copy
+                // has just unlinked is ENOENT -- deliberately, see `OsFileOps::append`, which
+                // is `append(true)` WITHOUT `create(true)`. So on this tree the first
+                // symptom is an io error, not the "nothing was ever checkpointed" guard.
+                //
+                // ⚠ ONE DISCRIMINATOR, NOT TWO. D81 fixed these same two paths with
+                // `stringify!($modname)`; that half was deleted in the merge rather than
+                // kept alongside, because two guards over one collision is one you cannot
+                // test. `module_path!()` is the survivor: it ENDS in the generated
+                // `$modname`, so it separates everything `$modname` separates and also two
+                // instantiations under different parents, and it is not a compile error if
+                // this body is ever lifted out of the macro.
                 "ferro-reap-ckpt-{}-{}.bin",
                 module_path!().replace("::", "_"),
                 std::process::id()
@@ -1191,14 +1208,13 @@ mod tests {
         let (h, reaper) = setup();
         let path = std::env::temp_dir()
             .join(format!(
-                // **D139: `module_path!()` is load-bearing, not decoration.**
-                // This test lives inside `reaper_suite!`, which is instantiated TWICE
-                // (`log_catalog`, `table_catalog`). Keyed on the pid alone, BOTH
-                // instances computed this same path and raced: one `remove_file`d the
-                // checkpoint the other had just written, and the fixture guard below
-                // fired with "nothing was ever checkpointed". Intermittent, because it
-                // needs an unlucky interleaving -- it survived thousands of green runs
-                // and surfaced only under fleet load.
+                // Same collision as `a_fast_path_reap_reaches_the_durable_map_not_just_memory`
+                // above, fixed the same way and with the same single discriminator; the long
+                // note is there, not repeated here.
+                //
+                // ⚠ **THIS ONE HAS NEVER BEEN SEEN TO FAIL**, which is a statement about
+                // scheduling luck and not about the fixture: the path it computed was just as
+                // shared as the other's. Both branches that found this independently say so.
                 "ferro-slow-reap-ckpt-{}-{}.bin",
                 module_path!().replace("::", "_"),
                 std::process::id()

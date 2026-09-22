@@ -1,0 +1,2 @@
+d81final: mode=per-target rc=0 passed=2508 failed=0 build_errors=0 head=b17ec58 log=/Users/idide/wt/artie-research/verify-out/d81final/suite-d81final.log
+d81final: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d81final/suite-d81final.go.log
