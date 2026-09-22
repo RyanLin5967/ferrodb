@@ -327,6 +327,26 @@ because of a buffer-pool property it did not state, own or test. Now pinned by
 `unpinning_without_the_dirty_flag_never_clears_it`, in the buffer pool — where that edit would
 be made, not three layers away in a caller nobody would re-run. Fire-checked: the tidy-up fails it.
 
+**One existing test had to be restated, and that is a contract change rather than a test fix.**
+`branch::arena::tests::shadowing_your_own_page_across_a_child_fork_parks_the_original` called
+`cow_page` directly and asserted `pending_len() == 1` immediately afterwards — i.e. it encoded
+the very behaviour this finding removes. Its real property is unchanged and is still asserted:
+when the original IS freed, a live child pins it, so it is parked rather than released. The test
+now pins both halves separately — `retire_previous` is reported, the store has NOT freed, and
+the page parks once the caller does — which fails if the store goes back to freeing inline *and*
+if it stops reporting. Strictly more than it asserted before.
+
+**And one test is positive evidence the success path still behaves**:
+`cow::tests_isolation::a_live_child_forces_the_parent_to_shadow_instead_of_mutating` drives the
+shadow through `CowTree::insert`, so the journal frees `previous_page_id` at commit and its
+`pending_free_len() == 1` still holds. That is the test that would catch this fix *leaking* the
+original rather than deferring it, which is the opposite error and just as real.
+
+**A stale comment the fix orphaned**, fixed rather than left: `branch/arena.rs` said "the
+`free_page` call directly below" in the delta-base reasoning, and there is no longer a call
+below. The reasoning is unaffected — the owned base still becomes freeable, one step later — but
+a header pointing at a call that is not there is how the next reader of that rule loses an hour.
+
 **Review answers that were clean**, recorded so the absence is legible: no write guard reachable
 from `insert`/`delete` bypasses `shadow()` (enumerated from the type — `NodeMut::new` needs
 `&mut Frame`, so `PageHandle::write()` is the complete gate, and all 13 sites in `btree.rs` are
