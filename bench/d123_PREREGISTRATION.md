@@ -348,3 +348,24 @@ foot is a truncated run and must not be quoted.
 ⇒ And the companion check, which established that two banked binaries never contained `mode_novelty`
 at all: **run the harness with a deliberately bad mode and read the list it admits.** The presence
 of a built binary says nothing about which arms it has.
+
+# AMENDMENT 9 — A CONFOUND IN THE NOVELTY ARM, CHECKED BEFORE ITS RESULT WAS READ.
+
+The new-key arm inserts k=8 NEW keys per fork; over 8,000 forks that is 64,000 keys added to the
+tree, against 8 keys total for the fixed-key arm. The new-key arm therefore runs against a tree that
+grows far more during its window, and deeper descents would inflate its cost for a reason that has
+nothing to do with page novelty.
+
+⇒ **It cancels, and here is why the criterion is stated the way it is.** The verdict is NOT
+`new_cost / fixed_cost`. It is the T=64/T=1 ratio computed SEPARATELY WITHIN each config:
+
+    fixed:  cost(T=64) / cost(T=1)
+    new:    cost(T=64) / cost(T=1)
+
+Both thread counts of a given config insert the same 64,000 (or 8) keys, so the tree growth is
+identical in numerator and denominator and divides out. What the two ratios then compare is how each
+kind of work RESPONDS to concurrency, which is the question, rather than how expensive each kind of
+work is, which is not.
+
+⇒ Consequence to state when reporting: the new-key arm's ABSOLUTE ms/upsert will be higher at both
+thread counts, and that difference is the tree, not contention. Only the ratios are quoted.
