@@ -73,7 +73,8 @@ Every number below is from my own run on this worktree, `cargo test --release`,
 2026-09-22 ~07:20Z, box load ~32 (13-agent fleet). These are COUNTS, not
 durations, so the load caveat does not touch them.
 
-`cargo test --release --test d126_atomic_upsert -- --test-threads=1`, 3 passed:
+`cargo test --release --test d126_atomic_upsert -- --test-threads=1`, 4 passed
+(the fourth arm is mine and is described in section 6):
 
     a_rewritten_key_is_never_absent_to_a_concurrent_reader
       CONTROL   (delete+insert)  misses=30826  reads=59976  errors=0   <- FIRES
@@ -81,6 +82,9 @@ durations, so the load caveat does not touch them.
     a_growing_rewrite_that_splits_is_still_never_absent
                                  misses=0      reads=4643
     insert_still_does_not_replace                                  ok
+    the_primary_index_rewrite_is_never_absent_either  (section 6)
+      CONTROL   (delete+insert)  misses=34675  reads=65026          <- FIRES
+      TREATMENT (upsert)         misses=0      reads=30354
 
 `cargo test --release --lib d126_record_key_probe -- --test-threads=1`, 2 passed:
 
@@ -222,23 +226,39 @@ reachable in production today because reader and writer are both inside the
 per-statement mutex. W4 removes that mutex. D126 is now in front of it.
 
 ================================================================================
-6. WHAT I ADDED — (c) THE EXECUTOR'S TWO OPEN-CODED REWRITES
+6. WHAT I ADDED — (c) THE THREE OPEN-CODED REWRITES STILL LEFT IN src/
 ================================================================================
 
-Commit 5388fda. The primitive was added for the branch catalog, and the
-identical pair was left open-coded on a user table's PRIMARY INDEX:
+Commits 5388fda and a3114d0. The primitive was added for the branch catalog,
+and the identical pair was left open-coded on a user table's PRIMARY INDEX in
+three places:
 
   src/execution/update.rs   if new_rid != rid { primary_index.delete(&pk)?;
                                                 primary_index.insert(pk, new_rid)?; }
   src/execution/insert.rs   primary_index.delete(&vals[0])?;
                             ... heap.insert(tuple)? ...
                             primary_index.insert(vals[0], rid)?;
+  src/catalog/alter.rs      if primary.search(&k)? == Some(rid) {
+                                primary.delete(&k)?; primary.insert(k, new_rid)?; }
 
-The second is the worse of the two: a whole heap insert sits inside the window.
-Both are now one `upsert`. `update.rs` also loses an error path that could only
-fire AFTER the heap was already updated — `delete` returns `KeyNotFound` for a
-missing entry and propagating it aborted the statement with the index left
-disagreeing with the heap; `upsert` repairs the entry instead.
+The second is the worst: a whole heap insert sits inside the window. All three
+are now one `upsert`.
+
+`update.rs` also loses an error path that could only fire AFTER the heap was
+already updated — `delete` returns `KeyNotFound` for a missing entry and
+propagating it aborted the statement with the index left disagreeing with the
+heap; `upsert` repairs the entry instead.
+
+`alter.rs` keeps its `search(&k) == Some(rid)` guard, and that is load-bearing:
+`upsert` INSERTS a key that is absent, which is exactly what a rewrite must not
+do — a deleted row keeps its heap tombstone AND its index entry. The guard
+decides whether to write; `upsert` only decides how.
+
+That is every open-coded delete-then-insert on a `BPlusTreeManager` in `src/`,
+enumerated from a grep for `.delete(` rather than from memory. What remains is
+`TableBranchCatalog::remove_if_present` (a genuine removal) and the CoW tree's
+own root-returning `delete(root, branch, epoch, key)`, which is a different
+structure with a different API and not this defect.
 
 Probed with the REAL types rather than assuming the `Vec<u8>` result carries
 over (`Value`/`RecordId` serialize differently and land differently in a leaf):
