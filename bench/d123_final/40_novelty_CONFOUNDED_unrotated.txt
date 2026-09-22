@@ -40,3 +40,8 @@ warm-up forks per arm = 20000, N per arm = 8000
 # harness_exit=0
 # released_utc: 2026-09-22T00:28:43Z
 # load_at_run_end: 13.64 10.11 7.91
+
+⚠ READ-BACK NOTE, appended after the run: the `# other cargo/rustc/suite at acquire:`
+  header above OVER-REPORTS — it matches any command line CONTAINING those strings, and every
+  shell here carries `cargo` via its PATH export. Measured 17 matches against 0 real cargo
+  processes. See 00_PGREP_OVERREPORT.txt. `load_at_*` is the trustworthy field.

@@ -1,0 +1,29 @@
+# FERRODB_D123_WARM=20000  FERRODB_D123_REPS=5
+# load_at_run_start: 7.33 6.29 4.78
+D123 serial-section attribution — MODE=perturb2 (replicated, order alternated)
+build at bc3cbdf162d7
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+Two questions at once, and they need separating:
+  (a) does the PROBE change throughput?   -> compare ON vs OFF
+  (b) does POSITION in the process change it? -> compare 1st-run vs 2nd-run
+A real probe effect keeps its sign when the order flips. An order effect does not.
+
+  T=64, reps=5
+    median forks/sec          ran 1st    ran 2nd
+    probe OFF                  5108.5     5304.5
+    probe ON                   5297.7     5088.8
+
+    (a) PROBE effect,    ON vs OFF over both positions: -1.20%
+    (b) POSITION effect, 2nd vs 1st over both configs : +1.56%
+    the first battery's single-shot answer was OFF 2796.6 / ON 5256.1 = +87.95%
+
+  |(a)| > 2% => the probe genuinely perturbs and every duration it produced is
+  quarantined. |(a)| within 2% while |(b)| is large => the +88% was position, not
+  the instrument, and the durations stand.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# load_at_run_end: 5.37 6.03 4.81

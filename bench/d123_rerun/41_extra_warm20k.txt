@@ -1,0 +1,42 @@
+# FERRODB_D123_WARM=20000  FERRODB_D123_REPS=1
+# load_at_run_start: 12.17 8.39 5.93
+D123 serial-section attribution — MODE=extra (F5: marginal cost of work added under `logical`)
+build at bc3cbdf162d7
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+k extra upserts under the lock, on a fixed key set. An upsert costs u = 0.01344 ms
+UNCONTENDED (bench/serial_section_profile.txt). Fit 1/throughput against k:
+  slope ~ u      => added work costs what it costs alone; the residual is a FIXED
+                    per-fork overhead (handoff), not an inflation of the work.
+  slope ~ 3.05u  => work under the lock is 3.05x dearer under contention, which is
+                    exactly 0.228/0.0748 — and that ATTRIBUTES the residual.
+  slope ~ 0      => M-FSYNC, and F1 fires.
+
+  threads    k   forks/sec    S_eff ms    HOLD ms   extra ms   f/sync
+        1    0       115.3     8.67653    0.24900    0.00000      1.0
+        1    2       253.9     3.93850    0.15514    0.04387      1.0
+        1    4       251.7     3.97261    0.20392    0.09438      1.0
+        1    8       232.4     4.30276    0.23011    0.14423      1.0
+        1   16       220.0     4.54489    0.45782    0.36147      1.0
+
+  FIT T=1:  1/throughput = 5.90096 + -0.13565*k   R^2=0.1800
+     slope/u = -10.09x  (u = 0.01344 ms uncontended).  intercept is an INDEPENDENT
+     estimate of S that never touches the 1-thread profiler.
+
+  threads    k   forks/sec    S_eff ms    HOLD ms   extra ms   f/sync
+       64    0      5267.7     0.18983    0.18250    0.00000     16.8
+       64    2      4383.5     0.22813    0.22219    0.03667     15.0
+       64    4      3618.3     0.27638    0.27170    0.07455     12.8
+       64    8      2892.3     0.34575    0.34107    0.14964     10.5
+       64   16      2011.7     0.49710    0.49207    0.30479      7.1
+
+  FIT T=64:  1/throughput = 0.19275 + 0.01911*k   R^2=0.9988
+     slope/u = 1.42x  (u = 0.01344 ms uncontended).  intercept is an INDEPENDENT
+     estimate of S that never touches the 1-thread profiler.
+
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# load_at_run_end: 9.41 8.23 6.46

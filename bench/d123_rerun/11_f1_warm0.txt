@@ -1,0 +1,29 @@
+# FERRODB_D123_WARM=0  FERRODB_D123_REPS=5
+# load_at_run_start: 11.05 6.69 4.85
+D123 serial-section attribution — MODE=f1 (F1 with the probe OFF, replicated, level order rotated)
+build at bc3cbdf162d7
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+⛔ Stubbed levels are NOT a database — see MODE=stub. Every level keeps write_header
+   + stage, so >=1 page is dirty and the fsync stays real.
+THE VOID GUARD, CHECKED NOT ASSUMED: `syncs` SHOULD fall as the section gets faster —
+that is group commit batching more forks behind a shorter critical section. What must
+NOT happen is forks going undurable, so the check is CONSERVATION: syncs x f/sync must
+still equal N. A level that lost durability fails that; a level that merely batched
+better passes it. Printed per level as `syncs*f/sync` against N.
+
+  T=64, reps=5, N=8000 forks per arm
+   stub  median f/s        min        max   spread     vs L0     syncs   f/sync  syncs*f/sync
+      0      5069.5     3767.9     5244.6    29.1%     1.00x       476     16.8          8000
+      1      9968.1     7207.7    10102.6    29.0%     1.97x       259     30.9          8000
+      2      9657.2     6666.8     9963.5    34.1%     1.90x       256     31.2          8000
+      3     10404.3     7699.4    10515.8    27.1%     2.05x       250     32.0          8000
+
+F1 FIRES if L3's median is within +/-10% of L0's median: the section is NOT the ceiling.
+Compare `spread` against the L3/L0 ratio before believing either.
+
+warm-up forks per arm = 0, N per arm = 8000
+# harness_exit=0
+# load_at_run_end: 9.05 6.52 4.83
