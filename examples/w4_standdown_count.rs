@@ -580,6 +580,16 @@ fn roles(arm: &str, clients: usize) -> Vec<Role> {
     }
 }
 
+/// How often a `Dml` client actually writes, in rounds. 1 means every round, which is the
+/// unperturbed arm. Larger values move DML OUT of the announcer set; see `round`.
+fn dml_every() -> usize {
+    std::env::var("W4_DML_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
 /// How often a `Forker` actually forks, in rounds. 1 means every round.
 fn fork_every() -> usize {
     std::env::var("W4_FORK_EVERY")
@@ -631,7 +641,29 @@ fn round(role: Role, w: usize, i: usize) -> Vec<(String, String)> {
             ("upd".into(), format!("UPDATE t SET v = v + 1 WHERE id = {w};")),
             ("merge".into(), "MERGE;".into()),
         ],
+        // `W4_DML_EVERY=n` makes a DML client write once every n rounds and READ in between.
+        //
+        // ⚠ This is the W4 COUNTERFACTUAL FOR THE ANNOUNCER SET, and it is deliberately realised
+        // in the workload rather than by patching the engine. Suppressing the announcement in
+        // `Statement::execute` would NOT be the clean perturbation it looks like:
+        // `ServerContext::catalog()` performs the announcement, the reader drain and the mutex
+        // acquisition as ONE act, with no seam between them, so removing the announcement also
+        // removes the statement's drain-wait and shortens its critical section. Throughput would
+        // move with the announcer set and the two could not be told apart.
+        //
+        // Substituting a SELECT is exact where it matters. Under W4 an admitted DML announces
+        // NOTHING and a stood-down one falls back and announces — which is precisely what a
+        // SELECT does today. Same position in the path, same announce-only-on-stand-down
+        // behaviour. The one difference is the work done AFTER admission (a read does less than a
+        // write would), so this models W4's ANNOUNCER SET exactly and its service time not at all.
         Role::Dml => {
+            let every = dml_every();
+            if every > 1 && i % every != 0 {
+                return vec![(
+                    "read".into(),
+                    format!("SELECT id, v FROM t WHERE id = {};", i % 64),
+                )];
+            }
             vec![("dml".into(), format!("UPDATE t SET v = v + 1 WHERE id = {};", 100 + w))]
         }
         Role::Ddl => vec![
@@ -918,8 +950,9 @@ fn main() {
     println!("#        connection; nothing drives AgentRuntime or Session directly.");
     println!(
         "# clients={clients} rounds={rounds} lease_scan_ms={lease_ms} expiry_ms={expiry_ms} \
-         fork_every={} announcers={}",
+         fork_every={} dml_every={} announcers={}",
         fork_every(),
+        dml_every(),
         std::env::var("W4_ANNOUNCERS").unwrap_or_else(|_| "default".into())
     );
     println!("# a COUNT, not a timing: no duration is measured and none is reported.");
