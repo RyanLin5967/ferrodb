@@ -24,6 +24,28 @@
 //! `ServerContext::catalog()` → `AgentRuntime`'s `Mutex<State>` → `TableBranchCatalog::logical`,
 //! outermost first, and the fork statement is not admitted to `try_run_read`'s shared path.
 //!
+//! ⚠ **BAND, 2026-09-22 (D159). The paragraph above describes the tree it was written against and
+//! two of its clauses have since stopped being true. It is banded rather than repaired, so a reader
+//! of the banked `bench/d130_batch_vs_threads.txt` can still see which tree that run measured.**
+//!
+//! * **The nesting is wrong even for the tree it was written against.** `AgentRuntime`'s
+//!   `Mutex<State>` is never held while `TableBranchCatalog::logical` is taken — `begin_session_as`
+//!   forks *first* (`runtime.rs:1475-1477`) and locks `state` *after* (`:1512`), so they are
+//!   siblings under the catalog mutex, not nested. `runtime.rs:1095-1100` states the runtime's one
+//!   lock order and it is the opposite of the chain above: the catalog lock *"must not be reached
+//!   while `state` is held"*.
+//! * **The fsync is no longer under `ServerContext::catalog()`.** D159 split the fork into stage +
+//!   durable (`BranchCatalog::fork_staged` / `await_fork_durable`): pgwire drops the catalog guard
+//!   and only then awaits the sync, so forkers can meet inside `CommitGroup::wait_durable`. The
+//!   fork statement is still **not** admitted to `try_run_read`'s shared path — that clause stands —
+//!   and everything except the sync still runs under the catalog guard, deliberately.
+//! * ⚠ **What this does NOT license.** D159 amendment 4 predicts `f/sync` stays near 1.00 on this
+//!   harness anyway, because this harness gives every fork a **unique run id** (`r<thread>_<iter>`,
+//!   see `run_ids` below) and so pays `prov_store.intern`'s own fsync per fork, under `state`,
+//!   inside the catalog guard. **That is a second serialiser this change does not touch.** A flat
+//!   arm P here is therefore the predicted reading, not evidence that the split did nothing — the
+//!   split's own evidence is `tests/d159_fork_sync_is_deferred.rs`, which is deterministic.
+//!
 //! # The instrument
 //!
 //! `TableBranchCatalog::syncs_issued()` is a counter on the server's own catalog, read from inside
