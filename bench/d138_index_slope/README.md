@@ -213,3 +213,63 @@ than eyeballed — the extracted PARK tables diff **empty**:
 ⇒ **The verdict at the top of this file holds for the shipping tree, not only for `dfe2c70`.**
 `reduce_slope.py` still reads `d138_new_raw.txt`; `d138_ship_raw.txt` is the re-derivation beside
 it, kept so the record shows the re-run happened rather than asserting it was unnecessary.
+
+## D148 — what the removed scan was WORTH on the shipped durable path
+
+`d148_durable_phase_raw.txt`. D148 asked: D137's slope-1 law is `MemEffectLog`'s, because pgwire
+forces that store — but `src/cli/cli.rs:141` ships `DurableEffectLog`, which also encodes,
+`pwrite`s and **`sync_data`s once per statement**. What share is the frame scan there? Precedent
+said expect ~2% (D133's quadratic walk deflated to ≲1% behind `checkpoint_to`).
+
+**The answer is that the question has no single number, and that is the finding.**
+
+| | at 2000 frames | at 10⁶ frames (extrapolated) |
+|---|---|---|
+| the scan D138 removes | **0.073%** of an append | **~24–26%** of an append |
+| `encode` + `pwrite` + `sync_data` | 99.9% | ~75% |
+
+    sync_data       19904.664 ms of 20082.769 ms  = 99.1% of every durable append
+    pwrite            160.365 ms
+    encode              5.261 ms
+    both lookups       11.182 ms                  = 0.056%  (indexed arm, flat in N)
+    residual            +0.01%   -- the table closes
+
+⇒ **Today it is swamped, and by far more than D148 guessed: 0.073%, not ~2%.** On the durable
+path the lever is the fsync, which is 99.1% of the append — that is D81's territory, not D138's.
+⇒ **But the scan grows at 1.09 ns per frame per append (least squares over all 8 rows; endpoints
+give 1.20, and the gap between the two fits is the error bar) while encode+pwrite+sync is CONSTANT
+in log length.** Crossover ~3.1M frames; at the 10⁶-branch objective the same scan is ~a quarter of
+a durable append.
+
+⇒ ⭐ **So "is D138 a 2% fix?" is unanswerable as posed — the percentage is a function of the axis,
+which is exactly what a complexity-class change means.** It is 0.073% at 2000 frames and ~25% at
+10⁶, from one unchanged line of code. **Quoting either number without its log length is the error.**
+
+### Bounds on this, stated because they are easy to lose
+
+⚠ **Two stores, two answers, and they must not be merged.** This drives `DurableEffectLog`
+**directly**, which is what `cli.rs` ships. **pgwire forces `MemEffectLog`** (D137's own bound), and
+there the scan is the whole lookup cost and D138 removes all of it. Neither result transfers.
+⚠ **Wall-clock on a loaded box.** Mitigated, not eliminated: every phase is timed inside one
+`append` so all phases carry the same load and the SHARE is a within-append ratio; every timer is
+paired with a counter that must be non-zero; and the parts are summed against an independently
+timed TOTAL, which closes to +0.01%.
+⚠ **10⁶ is an EXTRAPOLATION from a fit over 250–2000 frames, not a measurement.** It is
+conservative rather than optimistic: at 10⁶ the frame `Vec` is ~100 MB, so per-element cost would
+rise with cache misses, steepening the slope.
+
+### ⛔ The first run of this was WRONG, and the way it was wrong is the point
+
+It probed session 0's key — **position 0** — so `position()` short-circuited after ONE comparison
+and reported a 2000-frame scan as **1 ns**, i.e. "the scan is free". **A scan control that does not
+scan manufactures exactly the conclusion the measurement exists to test.** Fixed by probing the
+most recent session's key (D137: a recently-created txn's frame sits at the BACK, which is why a
+hit costs about the whole Vec) **and** by counting what the scan actually walked, refusing the arm
+below half the log. Every row now carries `scan control walked N of N frames — verified, not
+assumed`.
+
+⛔ **And the run before that was refused by its own clock check**: `Instant` ticks at **41 ns** here
+and a single keyed lookup is tens of ns, so per-call timing measures the clock and truncates
+toward zero — "unresolvable" reading as "free". Nothing here times a single lookup; the lookup is
+measured by a batched probe of thousands of repetitions, both shapes over the same `Vec` under one
+lock at one moment.
