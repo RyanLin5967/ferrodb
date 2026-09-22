@@ -167,7 +167,9 @@ counters added. That is a behaviour-neutral claim, so it was measured rather tha
     D114-4bfd6c6: mode=whole rc=0 passed=2426 failed=0 build_errors=0 head=4bfd6c6
     D114-4bfd6c6: go    rc=0 passed=97   failed=0
 
-`head=4bfd6c6` is the commit this artifact describes, so the green certifies the tree it names.
+`head=4bfd6c6` is the commit the green certifies. **This artifact lives one commit later**, because
+a body cannot quote a summary that names its own sha; `git diff --name-only 4bfd6c6 <tip>` is
+`bench/d114_ours_side_scan.md` and nothing else, so no compiled file moved after the green.
 `tools/verify-impacted.sh` alone was **not** sufficient and said so: run against `HEAD` it saw only
 the example file and selected **0 of 128** integration targets, because the `runtime.rs` change was
 already committed. It had to be re-run as `--since 1bf8abe --binaries` to select the 96 targets
