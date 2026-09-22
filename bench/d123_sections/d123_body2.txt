@@ -1,0 +1,109 @@
+
+================================================================================================
+2. Q1 — WHAT IS THE 0.1532 ms?  IT IS NOT HANDOFF, IT IS INSIDE THE SECTION, AND MOST OF IT IS
+   NOT A PHYSICAL COST AT ALL.
+================================================================================================
+
+2a. F4 — HOLD vs HANDOFF. DECIDED BY ONE NUMBER, MEASURED FOUR TIMES.
+Only one thread can hold `logical`, so S_eff = HOLD_TOTAL + gap EXACTLY, with no third term.
+HOLD_TOTAL is stamped to the UNLOCK, not to the end of the work: the guard is declared first so it
+drops LAST, and the record drops before it are lock-held too (Amendment 1 — without bracketing
+those, allocator work would have been misreported as handoff).
+
+  run                              S_eff    HOLD_TOTAL      gap    U(hold)   sum_ph  in_resid
+  first battery, warm=20k        0.19774      0.19202   0.00572     97.1%   0.18971   0.00025
+  first battery, warm=0          0.20765      0.20136   0.00629     97.0%   0.19884   0.00024
+  re-run rep 1,   warm=20k       0.20898      0.19651   0.01247     94.0%   0.19423   0.00023
+  re-run rep 2,   warm=20k       0.22163      0.20932   0.01231     94.4%   0.20726   0.00022
+
+⇒ **U(hold) = 94-97%. H-HANDOFF IS DEAD.** The mutex sits idle for 0.006-0.012 ms per fork, 3-6%
+of the interval. The predicted H-HANDOFF signature was U ~ 33%; it is not close.
+⇒ **THE NAMED PHASES ACCOUNT FOR THE SECTION TO 0.13%** (in_resid 0.00022-0.00025 ms of a ~0.20 ms
+section). The partition is complete; there is no hidden limb inside the lock.
+
+2b. THE CLOSURE IDENTITY (Amendment 5) — THE INSTRUMENT CHECKED AGAINST THE WALL CLOCK.
+Every thread's cycle is wait -> hold -> durable, so WAIT + HOLD_TOTAL + DURABLE must equal T*S_eff.
+All three come from the probe; T*S_eff comes from the wall clock.
+    T=1    4.08588 vs 4.08614   -0.01%
+    T=8    6.84263 vs 6.86200   -0.28%
+    T=64  12.37919 vs 12.65536  -2.18%
+Inside the pre-registered +/-5% at every T. The probe accounts for the whole loop.
+And the pre-registered second read on Q2 from the same numbers: at T=64, WAIT = 6.84 ms exceeds
+DURABLE = 5.35 ms, so the threads ARE queueing on the mutex rather than on the disk — independent
+of F1, and agreeing with it.
+
+2c. F2 — IT IS CONTENTION, AND IT IS CONFINED TO EXACTLY TWO PHASES.
+64/1 ratios, in place, replicated (first battery warm=20k / warm=0, then re-run reps 1 and 2):
+
+  phase                    w20k    w0   rep1   rep2     what it does
+  write_record             2.29x 2.36x 2.21x  1.72x     INSERTS 3 NEW KEYS
+  child_key_insert         2.43x 2.61x 2.33x  2.11x     INSERTS 1 NEW KEY
+  ---------------------------------------------------------------------
+  core(parent)             0.78x 0.74x 0.80x  0.43x     point READ
+  envelope(parent)         0.76x 0.85x    -      -      point READ
+  free_id_scan             0.78x 0.89x    -      -      range READ
+  write_header             0.76x 0.92x 0.92x  0.65x     rewrites ONE hot page
+  HOLD (whole section)     1.61x 1.71x 1.66x  1.25x
+
+**F2 DOES NOT FIRE** — the cost does grow with thread count, so it is contention. But it is not the
+section that inflates; it is the two phases that INSERT NEW KEYS. Every read and the single-page
+header write get FASTER at 64 threads (0.43-0.92x, below 1.0 in all four runs) — a hotter pool.
+Magnitudes vary run to run (write_record 1.72-2.36x); the SIGN is identical in all four.
+
+2d. ⭐ THE RECONCILIATION — WHY 67.2% WAS "UNATTRIBUTED", AND WHAT IT REALLY WAS.
+The inherited subtraction took S_eff from one regime and the named components from another. It
+mixes FOUR, not the one the brief named:
+  (i)   1 thread            vs 64 threads
+  (ii)  uncontended         vs contended
+  (iii) 20k-key tree        vs a tree growing 0 -> 4k during the timed window
+  (iv)  ISOLATED TIGHT LOOP vs in place inside a real fork      <- nobody had named this one
+
+(iv) is systematic and it is large. Every component measured in place at T=1 costs MORE than the
+same component measured alone in a 2,000-iteration loop, because a tight loop over one operation
+is the best case for cache:
+
+  component            artifact (isolated)   mine (in place, T=1)   ratio
+  core                            0.00533               0.01050    1.97x
+  envelope                        0.00693               0.00900    1.30x
+  free_scan                       0.00715               0.00798    1.12x
+  write_record_new                0.02779               0.04793    1.72x
+  child_key                       0.01003               0.01546    1.54x
+  write_header                    0.01756               0.02701    1.54x
+  SUM                             0.07479               0.11788    1.58x
+
+⚠ AND ONE ROW OF THAT TABLE IS NOT A MEASUREMENT ON EITHER SIDE OF THE ORIGINAL. The artifact's
+`write_record_new = 0.02779` was never measured: it is `0.06316 x 0.44`, where 0.06316 is the cost
+of three UPSERTS and 0.44 is the insert/upsert ratio `0.01003/0.02280` taken on the CHILD KEY and
+then applied to three different keys. So the inherited 0.0748 is part measured, part modelled — the
+single largest of its six components is a scaled estimate resting on a ratio measured elsewhere.
+My 0.04793 is the operation `fork` actually performs, timed in place. The 1.72x on that row is
+therefore "measurement vs model", not "in-place vs isolated", and the honest statement of the other
+five rows is that isolated tight loops understate in-place cost by 1.12x-1.97x.
+
+So the 0.1532 ms decomposes as:
+     0.04309 ms   28.1%   isolated microbenchmark understates the SAME work (regime iv)
+     0.07168 ms   46.8%   REAL contention inflation, T=1 -> T=64
+     0.00572 ms    3.7%   mutex handoff (the lock actually idle)
+     0.00025 ms    0.2%   in-section residual in no named phase
+     ---------------------------------------------------------------
+     0.12074 ms   78.8%   ACCOUNTED
+    +0.03246 ms   21.2%   box speed and tree depth between two runs taken days apart
+
+⇒ **F3 IS SATISFIED: 78.8% is attributed to named, measured causes** — but the headline is that
+only about HALF of the "unattributed 0.1532 ms" was ever a physical cost. The rest was the
+measurement method. Measured within ONE regime, the section is accounted for to 0.13%.
+
+⚠ CONTAMINATION APPLYING TO 2a-2d. Every `phases` arm quoted above ran inside a window another
+agent (`diff-identity`) later declared: near-continuous cargo in a sibling worktree from
+23:04:00-23:12:54Z, including a full unfiltered `cargo test --lib` (1577 tests, 61.91 s) that
+contains `branch::reaper::tests::table_catalog::
+a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent` — >60 s, concurrency-heavy,
+on this very subsystem. Full declaration: bench/d123_rerun/00_CONTAMINATION_diff_identity.txt.
+
+These arms are NOT re-run and here is the reason, which is about what kind of quantity they are.
+U(hold), the 64/1 column and the per-upsert cost at fixed k are all RATIOS OF TWO DURATIONS TAKEN
+BY ONE INSTRUMENT INSIDE ONE ARM. Load inflates numerator and denominator together; it cannot make
+`write_record` inflate 2.29x while `core` DEFLATES to 0.78x in the same microseconds of the same
+process. The signs are structural. What load CAN do is move the absolute milliseconds, which is why
+none of them is quoted as a physical constant. The one arm whose verdict a common-mode shift could
+plausibly have moved — F1's — was re-run, and the re-run is section 1b.

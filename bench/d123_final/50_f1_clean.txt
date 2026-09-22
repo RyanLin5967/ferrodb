@@ -1,0 +1,68 @@
+# lock: ACQUIRED d123-f1c  load_at_acquire=13
+CAVEAT: load 13 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=13 beside it and say it is an upper bound.
+# acquired_utc: 2026-09-22T00:28:43Z
+# other cargo/rustc/suite at acquire:
+#   7917 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"; cd /Users/idide/projects/ferrodb
+#   until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 110; done
+#   cat /tmp/gp14.log | tail -5
+#   echo "ahead=$(git rev-list --count origin/main..main) origin=$(git rev-parse --short origin/main)"' < /dev/null && pwd -P >| /tmp/claude-69f9-cwd
+#   8274 /bin/zsh -c source /Users/idide/.claude/shell-snapshots/snapshot-zsh-1789779628563-6jgzb3.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'export PATH="$HOME/.cargo/bin:$PATH"
+#   ps -eo command | grep -c '"'"'[g]p14.sh'"'"' | awk '"'"'{print "gated push armed: "$1" (fires on its own)"}'"'"'
+#   cd /Users/idide/projects/ferrodb
+#   until grep -qE '"'"'CERTIFIED|NOT CERTIFIED'"'"' /tmp/gp14.log 2>/dev/null; do sleep 55; done
+# FERRODB_D123_WARM=20000  FERRODB_D123_REPS=9
+# load_at_run_start: 13.64 10.11 7.91
+D123 serial-section attribution — MODE=f1 (F1 with the probe OFF, replicated, level order rotated)
+build at 4427df251512
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+⛔ Stubbed levels are NOT a database — see MODE=stub. Every level keeps write_header
+   + stage, so >=1 page is dirty and the fsync stays real.
+THE VOID GUARD, CHECKED NOT ASSUMED: `syncs` SHOULD fall as the section gets faster —
+that is group commit batching more forks behind a shorter critical section. What must
+NOT happen is forks going undurable, so the check is CONSERVATION: syncs x f/sync must
+still equal N. A level that lost durability fails that; a level that merely batched
+better passes it. Printed per level as `syncs*f/sync` against N.
+
+  RAW forks/sec, rep x level (level order rotated each rep):
+    rep started(utc)          L0          L1          L2          L3       L3/L0
+      0   1790036923      3577.0      6078.7      2677.3     10150.1       2.84x
+      1   1790036956      3684.8      5836.2      8122.7      5214.9       1.42x
+      2   1790036987      3359.6      4732.4      4653.7      5877.6       1.75x
+      3   1790037029      3121.4      5730.7      5495.1      5822.2       1.87x
+      4   1790037073      3448.6      4854.1      5788.2      6441.5       1.87x
+      5   1790037110      2992.6      5291.4      5066.1      6214.5       2.08x
+      6   1790037151      3899.9      4566.5      5618.4      6129.1       1.57x
+      7   1790037193      3741.9      4292.4      4410.3      5729.8       1.53x
+      8   1790037237      2910.1      4157.8      4550.6      4833.4       1.66x
+
+  ⭐ PAIRED L3/L0 per rep: median 1.75x   min 1.42x   max 2.84x
+     F1 fires iff this median is within +/-10% of 1.00x.
+
+  UNPAIRED summary (kept for comparison; drift does NOT cancel here)
+  T=64, reps=9, N=8000 forks per arm
+   stub  median f/s        min        max   spread     vs L0     syncs   f/sync  syncs*f/sync
+      0      3448.6     2910.1     3899.9    28.7%     1.00x       351     22.8          8000
+      1      4854.1     4157.8     6078.7    39.6%     1.41x       279     28.7          8000
+      2      5066.1     2677.3     8122.7   107.5%     1.47x       287     27.9          8000
+      3      5877.6     4833.4    10150.1    90.5%     1.70x       250     32.0          8000
+
+F1 FIRES if L3's median is within +/-10% of L0's median: the section is NOT the ceiling.
+Compare `spread` against the L3/L0 ratio before believing either.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# released_utc: 2026-09-22T00:34:51Z
+# load_at_run_end: 6.94 9.72 8.58
+
+⚠ READ-BACK NOTE, appended after the run: the `# other cargo/rustc/suite at acquire:`
+  header above OVER-REPORTS — see 00_PGREP_OVERREPORT.txt. `load_at_*` is the trustworthy field.
+⛔ THIS ARM IS DIRTY AND IS NOT THE F1 VERDICT — see 50_CONTAMINATION_BY_ME.txt. It acquired at
+  load_at_acquire=13 and its own author ran two cargo builds inside it. Using the per-rep UTC
+  stamps above, those builds fall in reps 3 and 4 ONLY (00:31:10-00:31:35Z). The seven build-free
+  reps are 0,1,2,5,6,7,8 with ratios 1.42/1.53/1.57/1.66/1.75/2.08/2.84, median 1.66x — still
+  0 of 7 anywhere near the 1.00x the falsifier required.

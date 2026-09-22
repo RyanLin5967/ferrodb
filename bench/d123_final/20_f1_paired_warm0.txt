@@ -1,0 +1,45 @@
+# FERRODB_D123_WARM=0  FERRODB_D123_REPS=9
+# load_at_run_start: 5.31 5.11 4.86
+D123 serial-section attribution — MODE=f1 (F1 with the probe OFF, replicated, level order rotated)
+build at 8665941de637
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+⛔ Stubbed levels are NOT a database — see MODE=stub. Every level keeps write_header
+   + stage, so >=1 page is dirty and the fsync stays real.
+THE VOID GUARD, CHECKED NOT ASSUMED: `syncs` SHOULD fall as the section gets faster —
+that is group commit batching more forks behind a shorter critical section. What must
+NOT happen is forks going undurable, so the check is CONSERVATION: syncs x f/sync must
+still equal N. A level that lost durability fails that; a level that merely batched
+better passes it. Printed per level as `syncs*f/sync` against N.
+
+  RAW forks/sec, rep x level (level order rotated each rep):
+    rep          L0          L1          L2          L3       L3/L0
+      0      4765.1      9224.8      9249.3      9706.7       2.04x
+      1      4662.4      8160.4      8566.8      8848.9       1.90x
+      2      4330.2      8649.7      8019.5      7166.9       1.66x
+      3      4497.0      7837.3      6680.5      9337.6       2.08x
+      4      4487.1      7456.4      6683.3      8105.8       1.81x
+      5      2412.7      7403.2      7828.6      9477.6       3.93x
+      6      1043.2      1213.2      1907.2      3024.9       2.90x
+      7       303.1      1398.0      2253.9      1993.0       6.58x
+      8      1220.0      2797.7      3030.3      3743.2       3.07x
+
+  ⭐ PAIRED L3/L0 per rep: median 2.08x   min 1.66x   max 6.58x
+     F1 fires iff this median is within +/-10% of 1.00x.
+
+  UNPAIRED summary (kept for comparison; drift does NOT cancel here)
+  T=64, reps=9, N=8000 forks per arm
+   stub  median f/s        min        max   spread     vs L0     syncs   f/sync  syncs*f/sync
+      0      4330.2      303.1     4765.1   103.0%     1.00x       465     17.2          8000
+      1      7456.4     1213.2     9224.8   107.4%     1.72x       257     31.1          8000
+      2      6683.3     1907.2     9249.3   109.9%     1.54x       256     31.2          8000
+      3      8105.8     1993.0     9706.7    95.2%     1.87x       250     32.0          8000
+
+F1 FIRES if L3's median is within +/-10% of L0's median: the section is NOT the ceiling.
+Compare `spread` against the L3/L0 ratio before believing either.
+
+warm-up forks per arm = 0, N per arm = 8000
+# harness_exit=0
+# load_at_run_end: 7.87 6.67 5.54

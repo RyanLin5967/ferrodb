@@ -1,0 +1,29 @@
+
+================================================================================================
+2e. ⛔ F5 RESTATED — AND A CORRECTION TO HOW ITS NUMBER HAS BEEN USED
+================================================================================================
+
+F5 adds k identical `upsert`s to the critical section on a FIXED key set. Two ways to express the
+result, and they disagree because one of them crosses regimes:
+
+  (A) SAME INSTRUMENT, same process, my T=64 against my own in-place T=1:
+        first battery 0.64x | re-run 41 0.84x | re-run 42 0.74x    -> MEDIAN 0.74x
+      i.e. identical work under the lock is ~26% CHEAPER at 64 threads than at 1.
+
+  (B) The harness's own `slope/u` column: my contended slope divided by the ARTIFACT's
+      u = 0.01344 ms (bench/serial_section_profile.txt):
+        41: 0.01911/0.01344 = 1.42x | 42: 0.01690/0.01344 = 1.26x
+
+⛔ **(B) IS NOT A CONTENTION MULTIPLIER AND MUST NOT BE QUOTED AS ONE.** Its denominator is an
+ISOLATED TIGHT-LOOP microbenchmark, and section 2d measures that those understate in-place cost by
+1.58x across all six components. Re-basing (B) on my own in-place T=1 (0.02563 ms, median of three
+runs) gives 0.75x and 0.66x — which agrees with (A). The 1.42x is the regime error of section 2d
+wearing a ratio's clothing, in a column of my own harness. The label is the bug, not the slope.
+
+⚠ **THIS MATTERS BEYOND BOOKKEEPING: 1.42x was used to kill a Round 3 candidate (flat combining).**
+The number points the OPPOSITE way once same-instrument: adding work to the critical section costs
+LESS per unit under contention, not more. That kill should be re-examined — though NOT simply
+reversed, because flat combining would batch REAL fork work, which is NEW-key insertion, and
+new-key work is the one thing here that does inflate (2.29x / 2.43x). The right multiplier for
+flat combining is the new-key one, which is what the novelty arm (section 3c) measures. Neither
+0.74x nor 1.42x is the number that decides it.

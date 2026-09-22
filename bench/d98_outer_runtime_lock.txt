@@ -68,37 +68,6 @@ MEASURE LOCK AND MACHINE LOAD
   load at round end: 15:26  up 2 days, 18:29, 22 users, load averages: 12.03 8.80 8.80
   RELEASED D98
 
-COMPLETENESS - this artifact records whether it is whole, because a truncated run reads
-exactly like a complete one.
-
-All eight blocks exited 0, and all eight carry a '# SUMMARY' section in the RAW section below
-(grep -c '^# SUMMARY' == 8). The harness itself exits non-zero if any cell reaped nothing, was
-seen by no probe, or could not be given its full K -- so every block exiting 0 is also a
-statement that no cell was refused.
-
-WARNING: the per-block statuses below are quoted from the driver's stderr log, because THIS RUN
-PREDATES the completeness record. bench/d98_run.sh threw the exit status away: it echoed the
-status to stderr and nothing tested it, nothing wrote it into the evidence directory, and the
-trailing banner printed 'done' regardless. A timeout kill on the N=10^5 block -- the one that can
-actually hit the wall, at roughly six minutes of fixture plus a fifty-second sweep per rep --
-would have left a truncated file here reading exactly like this one.
-
-FIXED: the driver now writes exit_codes.txt into the evidence directory, one line per block, and
-both its banner and its exit status are a function of every block having exited 0 WITH a SUMMARY.
-bench/d98_reduce.py refuses to reduce a directory containing any failed or summary-less block,
-rather than silently dropping its rows and still printing a table. Both were fire-checked in both
-directions: forced to fire on a timed-out block (driver exit 3 naming the four blocks, reducer
-exit 3), and shown not to fire on a clean one (driver 'COMPLETE: 8 blocks', reducer exit 0).
-
-  small-before-r1 exit=0 30 data rows
-  large-before-r1 exit=0 10 data rows
-  small-after-r1 exit=0 30 data rows
-  large-after-r1 exit=0 10 data rows
-  small-after-r2 exit=0 30 data rows
-  large-after-r2 exit=0 10 data rows
-  small-before-r2 exit=0 30 data rows
-  large-before-r2 exit=0 10 data rows
-
 ================================================================================
 REDUCTION
 ================================================================================

@@ -1,0 +1,60 @@
+D123 — WHERE FORK'S SERIAL SECTION GOES, AND WHETHER IT IS THE CEILING.
+
+Falsifiers pre-registered and committed BEFORE the first measurement: bench/d123_PREREGISTRATION.md
+(f05283b), amendments 1-8 append-only. Scaffold branch D123-serial-attribution; the src/ edits are a
+MEASUREMENT SCAFFOLD and MUST NEVER MERGE (same status as D35-gate-stubtouch, buffer_pool.rs:158).
+RAW, in the order taken:
+  bench/d123_raw/         battery A, warm=20,000        bench/d123_raw_warm0/  battery B, warm=0
+  bench/d123_rerun/       probe-off F1, perturb2, phases x3, extra x2
+  bench/d123_final/       PAIRED F1 (both regimes), the novelty intervention, and the clean F1
+This artifact is assembled by bench/d123_assemble.sh from bench/d123_sections/, which REFUSES to
+emit if any section still says PENDING and warns on any arm lacking a `# harness_exit=0` sentinel.
+
+⛔ WHICH NUMBERS IN HERE ARE CLEAN. Two agents declared activity overlapping this row's measure-lock
+windows (section 1e has the ledger). The F1 verdict rests on bench/d123_final/51_f1_clean2.txt.
+Earlier F1 arms are reported, and reported as dirty — including 50_f1_clean.txt, which I
+CONTAMINATED MYSELF by running two cargo builds 2 m 50 s into it (50_CONTAMINATION_BY_ME.txt).
+
+⚠ PROVENANCE. The first battery was run by the team lead on the rate-limit window after this agent
+hit its session limit with zero arms run (bench/D123_LEAD_RAN_THIS.md). It rebuilt a stale binary
+(ff8339e -> dd65665) before any arm, and declared a 4.34 s `cargo build --lib` that overlapped one
+arm (bench/d123_raw/00_LEAD_CONTAMINATION.txt). ⛔ That note names the overlapped arm "20_threads —
+the F1 arm". The arm is right, the label is wrong: 20_threads is F6; F1 is 40_stub, which ran
+afterwards (mtimes 18:40 vs 18:43; the build was 18:37-18:38 local). So F1 carries no known
+contamination, and F6's verdict (measured/bound 1.00x -> 0.03x) is nowhere near a boundary a 4 s
+spike could move.
+
+================================================================================================
+0. ⭐ THE FINDING THAT MATTERS MOST: THE EVIDENCE W-B WAS BUILT ON IS AN IDENTITY, NOT A MODEL.
+================================================================================================
+
+D8's result, quoted into INVENTION-TRIGGER.md as what established W-B: "throughput = 1/serial_time
+predicted 4,386 against 4,382.7 measured — 0.15% agreement across four runs."
+
+That is division. In fork_concurrency.rs the two printed columns are
+
+    per-fork ms = secs*1000/total          forks/sec = total/secs
+
+which are algebraic reciprocals, so "1/per-fork-ms agrees with forks/sec" is true of ANY numbers
+the harness could ever print. Checked against this row's own runs, where the same two columns are
+computed the same way:
+
+    T=1    forks/sec  244.7   1000/S_eff  244.7   ratio 0.999878
+    T=8    forks/sec 1165.8   1000/S_eff 1165.8   ratio 0.999965
+    T=64   forks/sec 5057.3   1000/S_eff 5057.1   ratio 1.000031
+    T=512  forks/sec 4942.7   1000/S_eff 4942.7   ratio 1.000007
+
+And the inherited residual is reproduced exactly as a ROUNDING artifact:
+
+    measured 4382.7/sec -> exact per-fork 0.228170 ms -> PRINTED to 3 dp as 0.228
+    1 / 0.228 ms = 4385.96/sec         discrepancy vs measured  +0.074%
+                                       discrepancy from rounding +0.074%   <- identical
+
+⇒ The 0.15% was the third decimal place of a rounded reciprocal. **It is not evidence that the
+serial section is the binding constraint, and never was.** The trigger file's own lesson — "a tight
+fit is the most persuasive way to be wrong" — is stronger than it knew: this fit could not have
+failed. (Caught by the team lead on the throughput columns; confirmed here and traced back to the
+inherited D8 claim, which is where it does damage.)
+
+⇒ The section IS the ceiling, but that is established below by F1 and F6, on evidence that could
+have come out the other way. W-B was right by accident.

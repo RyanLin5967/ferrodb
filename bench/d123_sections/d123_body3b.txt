@@ -1,0 +1,49 @@
+
+================================================================================================
+3b. ⭐ OF WHAT IS INSIDE THE SECTION, HOW MUCH IS THE FIVE DURABLE KEYS?  88%.
+    (Asked by the lead after round 3 closed on "multi-key atomicity over five durable keys".)
+================================================================================================
+
+The five keys are: `write_record` = 3 (record, state, deadline), `child_key_insert` = 1, and
+`write_header` = 1. Split of HOLD at T=64, three independent runs:
+
+                                  warm=20k        warm=0     re-run rep1
+  FIVE DURABLE KEYS                 88.4%          88.4%         88.0%
+    of which 4 NEW keys             77.6%          76.4%            -     <- the ONLY inflating part
+    of which 1 hot key (header)     10.8%          12.0%            -     <- gets FASTER with T
+  everything else                   11.5%          11.5%            -     2 point reads, 1 range
+                                                                          scan, id mint, ticket
+  cost per NEW key at T=64        0.03686 ms     0.03800 ms
+
+⇒ **The section essentially IS the five keys.** Reads, the id mint and the commit ticket together
+are 11.5%, so no amount of cleverness about them matters. Whatever replaces this section has to
+replace the key writes.
+⇒ **But the four NEW keys are the whole problem, and the fifth is not.** `write_header` rewrites
+one already-hot page every fork and gets CHEAPER under concurrency (0.65-0.92x). A mechanism that
+reduced five keys to four by folding the header away would remove the one key that costs nothing
+extra under load.
+
+### ⛔ AND THE RETURN ON REMOVING KEYS SATURATES — THIS IS THE NUMBER ROUND 3 NEEDS MOST
+From the warm=0 stub table at T=64:
+
+   stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)
+      0     4788.6   0.20883   0.20079   0.00804    96.1%
+      1     8447.6   0.11838   0.07707   0.04131    65.1%
+      2     8988.9   0.11125   0.07188   0.03937    64.6%
+      3     9019.1   0.11088   0.00941   0.10147     8.5%
+
+HOLD falls **21x** (0.20079 -> 0.00941). Throughput rises only **1.9x**, because the GAP rises
+**12.6x** (0.00804 -> 0.10147) and lock utilisation collapses 96.1% -> 8.5%.
+
+⇒ **THE SECTION AND THE HANDOFF TRADE OFF AGAINST EACH OTHER.** A critical section that short
+cannot be handed between 64 parked threads fast enough to keep the lock busy, so park/unpark
+becomes the binding term. This is why F1 measures ~2x and not the ~21x that `throughput = 1/S`
+would predict from the same numbers — **and it is a second, independent demonstration that
+`throughput = 1/serial_time` is not a law of this system.** It held in the L0 regime because the
+lock was 96% busy there; it fails by an order of magnitude as soon as the section is short.
+
+⇒ So the answer to "fewer keys, or a different atomicity mechanism" is: **fewer keys buys at most
+~2x and the curve is already flat by L1** (8447 -> 9019 from removing three more keys' worth of
+work, i.e. 6.8% for the last two levels). A different atomicity mechanism is the only thing in
+this data with more than 2x in it, and it has to remove the SERIALISATION, not the work — because
+the work is already only 88% of a term that stops binding once you shrink it.
