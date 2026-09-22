@@ -45,3 +45,47 @@ KNOWN INTERMITTENT, DECIDED IN ADVANCE
 branch::reaper::tests::…a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
 ("fixture: nothing was ever checkpointed") is a known flake unrelated to this change — D139.
 If it is the ONLY failure, re-run. Any other failure is mine until shown otherwise.
+
+
+AMENDMENT 1 — 2026-09-22, after run 1 was aborted and main was merged (append-only)
+===================================================================================
+
+RUN 1 DID NOT PRODUCE A NUMBER. It sat queued behind d133-pending-len for 826s; I killed it
+deliberately (see below) and tools/verify-suite.sh refused rather than reporting a partial:
+
+    d141: REFUSING — aborted by SIGTERM after 826s. A suite cut short is not a count.
+    RUNNER_EXIT=143
+
+Why killed: main had moved to b2991c6 while run 1 queued. A green certifies the commit it NAMES,
+so a run against the un-merged branch would not have certified anything landable. Killing a QUEUED
+run costs nothing — it never acquired the lock — and it replaces two runs with one against the
+tree that will actually land.
+
+⚠ NOTE ON MY OWN HARNESS, recorded because it nearly misled me: the `SENTINEL_DONE` line I append
+after the runner also fires when the runner is KILLED, because the outer shell continues. The
+discriminator is `RUNNER_EXIT=`, not the sentinel. A sentinel alone is not evidence of completion.
+
+NEW HEAD: dcac878 (Merge branch 'main' into d141-catalog-narrowing), main b2991c6 merged in.
+`git merge-tree --write-tree HEAD main` returned rc=0 before the merge, and main's 28 changed files
+touch NONE of mine (src/catalog/catalog_page.rs, src/catalog/catalog.rs, src/error.rs,
+tests/d141_long_identifier.rs). rc=0 means no line collided — not that the result is coherent;
+the suite is what settles that.
+
+REVISED EXPECTATION, and why it is no longer an absolute number
+---------------------------------------------------------------
+The 2476 baseline was measured at 98a44ef. Main has since landed D127, D136, D85 and D139, which
+add tests (src/branch/lease_thread/tests.rs +454 lines, src/branch/reaper.rs +272). I have NO
+certified count for b2991c6, so I will not pre-register an absolute total I cannot derive — a
+number invented to look rigorous is worse than none.
+
+What IS pre-registered, and each of these is falsifiable on its own:
+  1. rc=0, failed=0, build_errors=0, mode=per-target.
+  2. Go suite: 97 passed, 0 failed. I touched no Go files.
+  3. All EIGHT new tests appear in the log as passing — checked by name, not inferred from a
+     total. This is the check the absolute number was standing in for: it catches both "zero
+     collected" and "the new tests/d141_long_identifier.rs target was never swept".
+  4. total == (whatever main's next certification reports at b2991c6) + 8. Recorded now so it can
+     be checked later against a number I do not yet hold.
+
+D139 NOTE: main's d93d23b is the reaper fixture fix for the very intermittent this row was warned
+about. If that test still flakes, it is now a fact about d93d23b, not about me.
