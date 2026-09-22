@@ -59,12 +59,17 @@ fn fmt_ns(v: Option<f64>) -> String {
     }
 }
 
-/// ⛔ The clock must be shown to resolve what is being asked of it, IN THIS BINARY, before any
-/// share below is a reading. A sub-tick phase repeats one quantum and looks like a perfect
-/// constant; that failure has happened on this project.
-fn clock_fire_check() -> bool {
+/// ⛔ The clock must be shown to resolve what is asked of it, IN THIS BINARY, before any share
+/// below is a reading.
+///
+/// The first cut of this check timed a 250-iteration arithmetic loop and got 42 ns against a 41 ns
+/// tick — because the loop was optimised away, and because a single keyed lookup IS sub-tick here.
+/// **It failed, and it was right to.** A sub-tick phase truncates toward zero, so it reads as
+/// "free" rather than "unresolvable", which is the direction that flatters whoever is measuring.
+/// The fix is not a better timer, it is BATCHING: nothing below times a single lookup.
+fn clock_tick() -> u64 {
     let mut tick = u64::MAX;
-    for _ in 0..200 {
+    for _ in 0..500 {
         let a = Instant::now();
         loop {
             let d = a.elapsed().as_nanos() as u64;
@@ -74,25 +79,7 @@ fn clock_fire_check() -> bool {
             }
         }
     }
-    // A phase the size of the scan at the SMALLEST log length this run reaches.
-    let probe = Instant::now();
-    let mut acc = 0u64;
-    for i in 0..250u64 {
-        acc = acc.wrapping_add(i * 7);
-    }
-    let walked = probe.elapsed().as_nanos() as u64;
-    std::hint::black_box(acc);
-    println!("=== FIRE-CHECK 0 — the clock, in this binary ===");
-    println!("    smallest non-zero Instant delta observed: {tick} ns");
-    println!("    a 250-iteration loop measures {walked} ns  ({:.1}x the tick)", walked as f64 / tick.max(1) as f64);
-    let ok = tick > 0 && walked > tick * 3;
-    println!(
-        "    => {} : the scan-sized phase is resolvable, so a small share is a reading and not a \
-         rounding artifact",
-        if ok { "PASS" } else { "FAIL" }
-    );
-    println!();
-    ok
+    tick
 }
 
 fn main() {
@@ -101,10 +88,13 @@ fn main() {
     println!("⚠ WALL-CLOCK. The headline is the SHARE and the SLOPE, not any duration.");
     println!();
 
-    if !clock_fire_check() {
-        println!("⛔ the clock cannot resolve a scan-sized phase. No share is reported.");
-        std::process::exit(1);
-    }
+    let tick = clock_tick();
+    println!("=== FIRE-CHECK 0 — the clock, in this binary ===");
+    println!("    smallest non-zero Instant delta: {tick} ns");
+    println!("    ⇒ NOTHING below times a single lookup. Per-append phases (encode/pwrite/sync/");
+    println!("      TOTAL) are microseconds-to-milliseconds; the LOOKUP is measured by a batched");
+    println!("      probe of thousands of repetitions, so the tick is amortised, not resolved.");
+    println!();
 
     let blocks = env_usize("D148_BLOCKS", 8);
     let block = env_usize("D148_BLOCK", 250);
@@ -116,11 +106,12 @@ fn main() {
 
     println!("Axis: {blocks} blocks of {block} sessions, {WRITES_PER_SESSION} writes each — the PARK shape.");
     println!(
-        "    {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>9} {:>9}",
-        "frames", "appends", "lookup", "encode", "pwrite", "sync_data", "lookup%", "resid%"
+        "    {:>8} {:>8} {:>11} {:>11} {:>11} {:>12} {:>12} {:>9}",
+        "frames", "appends", "encode", "pwrite", "sync_data", "idx/lookup", "scan/lookup", "scan%"
     );
 
-    let mut rows: Vec<(f64, f64, f64)> = Vec::new(); // (frames_before, lookup_ns/append, io_ns/append)
+    let mut rows: Vec<(f64, f64, f64)> = Vec::new();      // (frames, SCAN ns/append, io ns/append)
+    let mut idx_rows: Vec<(f64, f64, f64)> = Vec::new();  // (frames, INDEX ns/append, total ns/append)
     let mut total_appends = 0u64;
     for b in 0..blocks {
         let before = phase::snapshot();
@@ -139,21 +130,35 @@ fn main() {
             std::process::exit(1);
         }
         let per = |i: usize| d.p[i].nanos as f64 / appends as f64;
-        let lookup = per(phase::LOOKUP_CLASSIFY) + per(phase::LOOKUP_APPEND);
         let io = per(phase::ENCODE) + per(phase::PWRITE) + per(phase::SYNC);
         let total = per(phase::TOTAL);
+
+        // ⭐ THE LOOKUP, BATCHED — both shapes over the same Vec, under one lock, one moment.
+        let reps = env_usize("D148_REPS", 20_000) as u64;
+        let key_b = BranchId::new(1, 0);
+        let key_t = TxnId(1);
+        let (idx_ns, scan_ns, frames_now, sink) = log.probe_lookup_batch(key_b, key_t, reps);
+        std::hint::black_box(sink);
+        let idx_each = idx_ns as f64 / reps as f64;
+        let scan_each = scan_ns as f64 / reps as f64;
+        if idx_ns == 0 || scan_ns == 0 {
+            println!("⛔ a batched probe of {reps} reps measured ZERO ns. Not a result.");
+            std::process::exit(1);
+        }
         println!(
-            "    {:>9} {:>9} {} {} {} {} {:>8.2}% {:>8.2}%",
-            frames_before as u64,
+            "    {:>8} {:>8} {} {} {} {} {} {:>8.2}%",
+            frames_now,
             appends,
-            fmt_ns(Some(lookup)),
             fmt_ns(d.p[phase::ENCODE].per_call()),
             fmt_ns(d.p[phase::PWRITE].per_call()),
             fmt_ns(d.p[phase::SYNC].per_call()),
-            100.0 * lookup / total.max(1e-9),
-            100.0 * (total - lookup - io) / total.max(1e-9),
+            fmt_ns(Some(idx_each)),
+            fmt_ns(Some(scan_each)),
+            // Two lookups per durable append: classify_append, then mem.append.
+            100.0 * (2.0 * scan_each) / total.max(1e-9),
         );
-        rows.push((frames_before, lookup, io));
+        rows.push((frames_now as f64, 2.0 * scan_each, io));
+        idx_rows.push((frames_now as f64, 2.0 * idx_each, total));
     }
 
     // ── every timer paired with a counter that must be non-zero ───────────────────────────────
@@ -197,32 +202,39 @@ fn main() {
     // ── the answer D148 asks for ──────────────────────────────────────────────────────────────
     println!();
     println!("=== D148's QUESTION: the frame scan's share of a DURABLE append ===");
+    println!("    Two keyed lookups per durable append: classify_append, then mem.append.");
     let first = rows.first().copied().unwrap_or_default();
     let last = rows.last().copied().unwrap_or_default();
-    let share = |r: (f64, f64, f64)| 100.0 * r.1 / (r.1 + r.2).max(1e-9);
+    let ifirst = idx_rows.first().copied().unwrap_or_default();
+    let ilast = idx_rows.last().copied().unwrap_or_default();
     println!(
-        "    at {:>7} frames: lookup {:>9.0} ns/append vs encode+write+sync {:>9.0} ns  => {:>6.3}%",
-        first.0, first.1, first.2, share(first)
+        "    at {:>6} frames  SCAN {:>10.0} ns/append   encode+write+sync {:>10.0} ns   => scan is {:>6.3}% of append",
+        first.0, first.1, first.2, 100.0 * first.1 / ilast.2.max(1e-9)
     );
     println!(
-        "    at {:>7} frames: lookup {:>9.0} ns/append vs encode+write+sync {:>9.0} ns  => {:>6.3}%",
-        last.0, last.1, last.2, share(last)
+        "    at {:>6} frames  SCAN {:>10.0} ns/append   encode+write+sync {:>10.0} ns   => scan is {:>6.3}% of append",
+        last.0, last.1, last.2, 100.0 * last.1 / ilast.2.max(1e-9)
     );
-    // Slope of the lookup against log length, and where it would meet the constant I/O term.
+    println!(
+        "    INDEX, same axis: {:>8.0} ns/append at {:>6} frames -> {:>8.0} ns/append at {:>6} frames (flat = O(1))",
+        ifirst.1, ifirst.0, ilast.1, ilast.0
+    );
+    println!();
     if rows.len() >= 2 && (last.0 - first.0).abs() > 0.0 {
         let a = (last.1 - first.1) / (last.0 - first.0);
         let b = first.1 - a * first.0;
         let io_mean = rows.iter().map(|r| r.2).sum::<f64>() / rows.len() as f64;
-        println!("    lookup fit: {a:.4} ns per frame in the log, intercept {b:.0} ns");
-        println!("    encode+write+sync mean: {io_mean:.0} ns/append, and it does NOT grow with log length");
-        if a > 1e-9 {
-            let cross = (io_mean - b) / a;
-            println!(
-                "    ⇒ CROSSOVER at ~{cross:.0} frames — below it the scan is swamped by the fsync, \
-                 above it the scan dominates."
-            );
-        } else {
-            println!("    ⇒ the lookup does not grow with log length (this is the INDEXED arm).");
+        let total_mean = idx_rows.iter().map(|r| r.2).sum::<f64>() / idx_rows.len() as f64;
+        println!("    SCAN fit over the axis: {a:.4} ns per frame in the log, intercept {b:.0} ns");
+        println!("    encode+pwrite+sync_data mean: {io_mean:.0} ns/append — CONSTANT in log length");
+        println!("    whole append mean (indexed arm): {total_mean:.0} ns");
+        if a > 1e-12 {
+            let cross = (total_mean - b) / a;
+            println!();
+            println!("    ⭐ CROSSOVER: the scan equals the WHOLE durable append at ~{cross:.0} frames.");
+            println!("       Below that the fsync dominates and D138 is a small fix.");
+            println!("       Above it the scan dominates and D138 is the whole cost.");
+            println!("       The 10^6-branch objective is {:.0}x past that crossover.", 1e6 / cross.max(1.0));
         }
     }
     println!();

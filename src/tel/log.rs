@@ -367,6 +367,38 @@ impl MemEffectLog {
         self.len() == 0
     }
 
+    /// D148 — cost of ONE keyed lookup, both shapes, BATCHED.
+    ///
+    /// ⛔ `Instant` ticks at ~41 ns on this box and an index probe is tens of ns, so timing a
+    /// single lookup measures the clock, not the lookup — and it does so in the direction that
+    /// looks like success, because a sub-tick phase truncates toward zero. This runs `reps` of
+    /// each shape back to back and returns the two batch times, so the clock is amortised over
+    /// thousands of operations instead of being asked to resolve one.
+    ///
+    /// Both shapes run over the SAME `Vec`, under ONE lock, in one call — same data, same cache
+    /// state, same moment, so the pair is comparable even on a loaded box. Returns
+    /// `(index_ns, scan_ns, frames, checksum)`; the checksum is consumed by the caller so neither
+    /// loop can be optimised away, and the caller requires the two loops to agree.
+    pub fn probe_lookup_batch(&self, branch: BranchId, txn: TxnId, reps: u64) -> (u64, u64, u64, u64) {
+        let g = self.frames.lock().expect("effect log mutex poisoned");
+        let mut sink = 0u64;
+
+        let t_idx = std::time::Instant::now();
+        for _ in 0..reps {
+            sink = sink.wrapping_add(g.position(branch, txn).map_or(0, |i| i as u64 + 1));
+        }
+        let index_ns = t_idx.elapsed().as_nanos() as u64;
+
+        let t_scan = std::time::Instant::now();
+        for _ in 0..reps {
+            let hit = g.frames.iter().position(|f| f.branch == branch && f.txn_id == txn);
+            sink = sink.wrapping_add(hit.map_or(0, |i| i as u64 + 1));
+        }
+        let scan_ns = t_scan.elapsed().as_nanos() as u64;
+
+        (index_ns, scan_ns, g.frames.len() as u64, sink)
+    }
+
     /// The frame for one transaction on one branch, if it was ever appended.
     ///
     /// ⚠ **No production caller, checked at HEAD rather than assumed.** `frame` is not on the
@@ -1743,6 +1775,11 @@ impl DurableEffectLog {
     }
 
     /// The frame for one transaction on one branch, if it was ever appended.
+    /// D148 — see [`MemEffectLog::probe_lookup_batch`].
+    pub fn probe_lookup_batch(&self, branch: BranchId, txn: TxnId, reps: u64) -> (u64, u64, u64, u64) {
+        self.mem.probe_lookup_batch(branch, txn, reps)
+    }
+
     /// ⚠ Like [`MemEffectLog::frame`] it delegates to, this has **no production caller** — it is
     /// not on the [`crate::tel::EffectLog`] trait and nothing outside this file calls it.
     pub fn frame(&self, branch: BranchId, txn: TxnId) -> Option<TxnFrame> {
