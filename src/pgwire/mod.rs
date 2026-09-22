@@ -20,6 +20,7 @@ pub mod extended;
 pub mod message;
 pub mod params;
 pub mod session;
+pub mod standdown;
 pub mod types;
 
 use std::io::{BufReader, Read, Write};
@@ -182,6 +183,11 @@ impl ServerContext {
                 std::hint::spin_loop();
             }
         }
+        // W4 check 3 — one announcement, from whichever caller took the exclusive path: a wire
+        // statement, the lease scan, or a `read_catalog` snapshot refresh. Counted AFTER the
+        // drain so the tally is of completed announcements, which is what a stand-down can have
+        // observed. Compiled out unless `standdown_count` is on.
+        standdown::record_drain();
     }
 
     /// Enter a shared-path read, or `None` if a writer is announced.
@@ -203,8 +209,10 @@ impl ServerContext {
         slot.store(true, SeqCst);
         if self.writer_active.load(SeqCst) {
             slot.store(false, SeqCst);
+            standdown::record_begin_read(false);
             return None;
         }
+        standdown::record_begin_read(true);
         Some(ReadPass { slot })
     }
 

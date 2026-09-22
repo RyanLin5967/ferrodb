@@ -40,6 +40,7 @@ use crate::parser::scanner::{Scanner, TokenType};
 use crate::pgwire::message::{Body, Field, Message, TxnStatus};
 use crate::pgwire::params;
 use crate::pgwire::session::{ProbeValue, SessionCommand, SessionParams};
+use crate::pgwire::standdown;
 use crate::pgwire::types::{self, oid, oid_of_type, ParamLiteral};
 use crate::pgwire::{sqlstate_of, ServerContext};
 
@@ -337,20 +338,34 @@ impl Statement {
                     // The pass lives only for the attempt. If `try_run_read` answers `None` the
                     // pass is already dropped by the time the exclusive path runs, which is what
                     // keeps that same deadlock out of the write path too.
+                    // W4 check 3 — a REPORTING label, computed here because `begin_read` has no
+                    // statement to look at. Nothing branches on it: `try_run_read`'s `Option` is
+                    // still the only thing that decides where a statement runs, which is the
+                    // property that keeps a dispatcher from drifting from an executor. Compiled
+                    // out with the rest of the instrument.
+                    let vb = standdown::verb_of(&stmt);
                     let attempted = {
                         match ctx.begin_read(read_slot) {
                             Some(_pass) => {
+                                standdown::record_pgwire_attempt(vb, true);
                                 try_run_read(&stmt, shared, ctx.bp.clone(), ctx.txn.clone(), session)
                             }
                             // A writer is announced. Standing down is correct, not a failure:
                             // the exclusive path below blocks on the mutex and is what every
                             // statement did before this line existed.
-                            None => None,
+                            None => {
+                                standdown::record_pgwire_attempt(vb, false);
+                                None
+                            }
                         }
                     };
                     match attempted {
-                        Some(read) => read?,
+                        Some(read) => {
+                            standdown::record_pgwire_shared(vb);
+                            read?
+                        }
                         None => {
+                            standdown::record_pgwire_exclusive(vb);
                             // **The catalog lock, held for exactly one statement.** See
                             // `pgwire::serve` for why this is the outermost lock and why holding
                             // it for longer would rebuild the sequential server this replaced.

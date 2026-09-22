@@ -4,6 +4,12 @@ name = "ferrodb"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# W4 check 3 — two counters on `ServerContext::begin_read`, off by default. See
+# `src/pgwire/standdown.rs` for why they are not on all the time: they are shared-word STORES on
+# the statement path, which is the class of thing the shared read path exists to remove.
+standdown_count = []
+
 [dependencies]
 
 [dev-dependencies]
