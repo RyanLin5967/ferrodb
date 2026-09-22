@@ -90,6 +90,7 @@ use crate::branch::types::{BranchId, LeaseDeadline};
 // inherent methods (`resume_interrupted_reaps`, `expired_candidates`, `reap_if_still_expired`,
 // `collect_orphans_if_due`), because the trait's `reap_expired` is the whole-sweep shape whose
 // hold time is what this row removed.
+use crate::branch::reaper::{refusal_report, ReapOutcome};
 use crate::branch::TwoTierReaper;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
@@ -259,7 +260,24 @@ pub struct LeaseStats {
     /// Workspaces dropped by [`AgentRuntime::forget_reaped_branches`] afterwards.
     pub forgotten: u64,
     /// Scans that refused because this node does not know the cluster's time.
+    ///
+    /// **A SCAN counter, not a branch counter** — see [`LeaseStats::refused_reaps`] for the other
+    /// one. The whole pass refused here: no candidate was even asked about.
     pub refused: u64,
+    /// **D127.** Individual branches a scan could not decide about, summed over all scans.
+    ///
+    /// A `Branch`-class error came back from the record read or from the reap itself, and the
+    /// reaper declined to act on it rather than aborting the sweep — see
+    /// [`crate::branch::reaper::ReapOutcome::Refused`]. Nothing was freed and nothing is lost, so
+    /// this is not [`LeaseStats::failed`]; but it is also not "nothing happened", which is what it
+    /// used to be indistinguishable from.
+    ///
+    /// **The number to watch is the RATE, not the total.** A momentary miss on a healthy branch —
+    /// `TableBranchCatalog::upsert` is delete-then-insert and holds no latch across the two — is
+    /// expected under load and is retried on the next tick. A count that climbs while `reaped`
+    /// stays flat is a branch nothing will ever reap, which is the unbounded leak D127 exists to
+    /// make audible. The branch ids and the verbatim refusal text go to stderr in the same pass.
+    pub refused_reaps: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
 }
@@ -271,6 +289,7 @@ struct Counters {
     reaped: AtomicU64,
     forgotten: AtomicU64,
     refused: AtomicU64,
+    refused_reaps: AtomicU64,
     failed: AtomicU64,
 }
 
@@ -282,6 +301,7 @@ impl Counters {
             reaped: self.reaped.load(Ordering::SeqCst),
             forgotten: self.forgotten.load(Ordering::SeqCst),
             refused: self.refused.load(Ordering::SeqCst),
+            refused_reaps: self.refused_reaps.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
         }
     }
@@ -566,14 +586,26 @@ fn scan_once(
     let mut reaped_all: Vec<BranchId> = Vec::new();
     let mut forgotten_all = 0usize;
     let mut failure: Option<FerroError> = None;
+    // **D127.** Branches this pass could not decide about. Accumulated across chunks and printed
+    // once at the end rather than per branch: a refusal is a per-branch fact, but a reader wants
+    // one line per pass naming all of them, the same shape the reap report already has.
+    let mut refused_all: Vec<(BranchId, FerroError)> = Vec::new();
     let mut groups = candidates.chunks(REAP_CHUNK).peekable();
     while let Some(group) = groups.next() {
         let mut reaped: Vec<BranchId> = Vec::with_capacity(group.len());
         with_lock(lock, || {
             for rec in group {
                 match reaper.reap_if_still_expired(rec.branch_id(), now) {
-                    Ok(true) => reaped.push(rec.branch_id()),
-                    Ok(false) => {}
+                    Ok(ReapOutcome::Reaped) => reaped.push(rec.branch_id()),
+                    // A decision, made on the record: the lease moved after the candidate query.
+                    // Nothing to say — this is the case the skip was always for.
+                    Ok(ReapOutcome::NotExpired) => {}
+                    // **NOT a decision.** This arm is the whole of D127: it used to share the
+                    // line above, so a branch the reaper refused to judge was reported as a
+                    // branch it had judged not to reap. It does not stop the sweep — a branch
+                    // that legitimately vanished mid-pass must not — but it no longer passes
+                    // without a trace.
+                    Ok(ReapOutcome::Refused(e)) => refused_all.push((rec.branch_id(), e)),
                     Err(e) => {
                         failure = Some(e);
                         return;
@@ -632,6 +664,17 @@ fn scan_once(
         if groups.peek().is_some() {
             std::thread::sleep(REAP_YIELD);
         }
+    }
+
+    // **D127 — before the `failure` arms, and outside both of them.**
+    //
+    // A refusal is independent of whether a later chunk went on to fail hard: the branches below
+    // were refused whatever happened afterwards, and a pass that ends in `Some(e)` is exactly the
+    // pass where the operator most needs the full picture. Putting this in either arm would lose
+    // it in the other.
+    if !refused_all.is_empty() {
+        counters.refused_reaps.fetch_add(refused_all.len() as u64, Ordering::SeqCst);
+        report(refusal_report(&refused_all));
     }
 
     match failure {
@@ -715,9 +758,44 @@ fn join_ids(ids: &[BranchId]) -> String {
 /// so the observable result of a closed stderr would be a database that silently stopped reaping.
 /// `examples/pgserver.rs` already avoids `println!` on its stdout for the same reason, proven
 /// there against a real harness that drops its reader.
-fn report(msg: String) {
+/// **D127 — `pub(crate)` so [`crate::branch::reaper::Reaper::reap_expired`] prints through the
+/// same writer.** The whole-sweep shape has no other channel, and giving it a second one is how
+/// two spellings of "a refusal looks like this" start to drift.
+pub(crate) fn report(msg: String) {
+    // **The test seam, and it is deliberately not a mock.** `report` writes to a process-wide
+    // stderr that a unit test cannot read back, so without this a test could only assert the
+    // counter — and a counter is exactly the half of D127 that would still pass if the message
+    // were dropped. The capture is thread-local because `cargo test` runs a binary's tests as
+    // threads of one process (see this module's test header), so a shared buffer would mix passes
+    // from unrelated tests. Production keeps one `writeln!` and nothing else.
+    #[cfg(test)]
+    reported::push(&msg);
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
+/// Everything [`report`] said on this thread, for a test that has to prove a message reached a
+/// reader rather than only a counter.
+#[cfg(test)]
+pub(crate) mod reported {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn push(msg: &str) {
+        LINES.with(|l| l.borrow_mut().push(msg.to_string()));
+    }
+
+    /// Drop everything said so far, so a test reads only what its own call reported.
+    pub(crate) fn clear() {
+        LINES.with(|l| l.borrow_mut().clear());
+    }
+
+    pub(crate) fn lines() -> Vec<String> {
+        LINES.with(|l| l.borrow().clone())
+    }
 }
 
 #[cfg(test)]

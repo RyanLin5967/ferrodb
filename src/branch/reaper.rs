@@ -621,12 +621,25 @@ impl Reaper for TwoTierReaper {
         // the server's per-statement lock around bounded groups of reaps instead of around all of
         // them — see `branch::lease_thread::REAP_CHUNK`. There is one implementation of each half,
         // so the two call shapes cannot drift on what "expired" means or on what order reaps go in.
+        //
+        // **D127 — this shape keeps returning only the reaped ids, and that is a choice with a
+        // reason.** A refusal is not a branch this pass reaped, so it does not belong in the
+        // vector; and it must not become an `Err`, because aborting the sweep on a branch that
+        // legitimately vanished mid-pass is the failure the swallow was written to avoid. What it
+        // must not do is vanish, which is what it did before this row. So it is printed here,
+        // through the same builder `scan_once` uses, and the caller's contract is unchanged.
         let candidates = self.expired_candidates(now_millis)?;
         let mut reaped = Vec::with_capacity(candidates.len());
+        let mut refused: Vec<(BranchId, FerroError)> = Vec::new();
         for rec in candidates {
-            if self.reap_if_still_expired(rec.branch_id(), now_millis)? {
-                reaped.push(rec.branch_id());
+            match self.reap_if_still_expired(rec.branch_id(), now_millis)? {
+                ReapOutcome::Reaped => reaped.push(rec.branch_id()),
+                ReapOutcome::NotExpired => {}
+                ReapOutcome::Refused(e) => refused.push((rec.branch_id(), e)),
             }
+        }
+        if !refused.is_empty() {
+            crate::branch::lease_thread::report(refusal_report(&refused));
         }
 
         // **D40 — the crash-orphan collector rides the background tick, on a cadence.**
@@ -707,32 +720,101 @@ impl TwoTierReaper {
     /// would be a second predicate to drift, and the one that is easier to test would mask the one
     /// that ships. The single new question is the deadline, and it is asked because the removed
     /// lock is what used to answer it.
+    /// **D127 — the return type used to be `bool`, and `Ok(false)` meant two different things.**
+    ///
+    /// One of them was *"I read the record and its lease has moved"* — a decision, made on data.
+    /// The other was *"a `Branch` error came back and I declined to act on it"* — the absence of a
+    /// decision. `scan_once` could only treat them the same, so it did: neither was counted,
+    /// neither was reported. D124's refusal — whose message names the parent, the fork epoch and
+    /// the child precisely so an operator can act on it — was constructed, converted, matched and
+    /// dropped without ever reaching a reader. See [`ReapOutcome`].
     pub(crate) fn reap_if_still_expired(
         &self,
         branch: BranchId,
         now_millis: u64,
-    ) -> Result<bool, FerroError> {
+    ) -> Result<ReapOutcome, FerroError> {
         match self.catalog.get_raw(branch.id) {
-            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
+            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => {
+                return Ok(ReapOutcome::NotExpired);
+            }
             Ok(_) => {}
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
             // from the read, including the momentary miss `TableBranchCatalog::upsert` opens on a
             // healthy branch. Declining to reap on one is the safe direction: it frees nothing,
             // and the next sweep asks again. Same class as the `Branch` error below, which
-            // likewise turns a refusal into "did not reap" rather than aborting the sweep —
-            // deliberately left alone, because propagating it would turn a benign already-reaped
-            // race into a failed sweep for a whole pre-existing class of errors.
-            Err(FerroError::Branch(_)) => return Ok(false),
+            // likewise must not abort the sweep — propagating it would turn a benign
+            // already-reaped race into a failed sweep for a whole pre-existing class of errors.
+            //
+            // **D127 — what changed is the SHAPE, not the tolerance.** The error is still not
+            // propagated and the sweep still continues; it is now carried out as
+            // [`ReapOutcome::Refused`] instead of being flattened into "did not reap", so the
+            // caller can count and print it. Nothing here reads the message to decide anything:
+            // every `Branch` error at this point is the same fact — *this branch was not decided
+            // on this pass* — and the text is payload for the reader, not a discriminator.
+            Err(e @ FerroError::Branch(_)) => return Ok(ReapOutcome::Refused(e)),
             Err(e) => return Err(e),
         }
         match self.reap(branch) {
-            Ok(_) => Ok(true),
-            // A branch already reaped as a side effect of this same scan is not an error.
-            Err(FerroError::Branch(_)) => Ok(false),
+            Ok(_) => Ok(ReapOutcome::Reaped),
+            // A branch already reaped as a side effect of this same scan lands here, and so does
+            // every D124 refusal raised inside `reap` — `has_live_children` and
+            // `live_child_in_epoch_range` both resolve through `dangling_child`. They are
+            // indistinguishable to this match by construction (`From<BranchError> for FerroError`
+            // collapses the variant to a string) and they are deliberately NOT told apart here:
+            // recovering the variant by matching on wording is a guard a reword walks around.
+            // Both are "no answer", both are reported, and an operator reads the message.
+            Err(e @ FerroError::Branch(_)) => Ok(ReapOutcome::Refused(e)),
             Err(e) => Err(e),
         }
     }
+}
+
+/// What one [`TwoTierReaper::reap_if_still_expired`] call decided about one branch. **D127.**
+///
+/// The two negative arms are not two flavours of the same answer. [`ReapOutcome::NotExpired`] is a
+/// decision the reaper made after reading the record; [`ReapOutcome::Refused`] is the reaper
+/// saying it could not decide at all. Collapsing them into `false` is what made D124's guard
+/// inaudible: the branch is skipped either way, but only one of the two means *nothing will ever
+/// reap this branch until someone looks at it*.
+#[derive(Debug)]
+pub enum ReapOutcome {
+    /// The branch was reaped. Its pages are freed and its workspace can be forgotten.
+    Reaped,
+    /// **A decision.** The record was read inside the caller's lock and its lease is no longer
+    /// expired — a keepalive landed after the candidate query. Nothing is wrong; the branch is
+    /// alive and its next expiry will put it back on the list.
+    NotExpired,
+    /// **Not a decision.** A `Branch`-class error came back and the reaper declined to act on it.
+    /// Nothing was freed, nothing was lost, and the next sweep asks again — but if the cause is
+    /// durable (a genuinely corrupt CHILD entry, say) the next sweep refuses too, for ever, and
+    /// the branch is a leak that looks exactly like a healthy one. That is why this arm carries
+    /// the error instead of discarding it: the message is the only thing that tells an operator
+    /// which of those two they have.
+    Refused(FerroError),
+}
+
+/// The line a sweep prints when it refused to decide about one or more branches.
+///
+/// One implementation, two callers ([`Reaper::reap_expired`] and
+/// [`crate::branch::lease_thread::scan_once`]), so the whole-pass shape and the chunked shape
+/// cannot drift on what a refusal looks like — the same reason `expired_candidates` and
+/// `reap_if_still_expired` are shared halves rather than two copies.
+///
+/// It quotes each underlying message verbatim. That is the point of the row: D124 spent its
+/// refusal text naming the parent, the fork epoch and the child, and every byte of it was being
+/// dropped one frame above where it was written.
+pub(crate) fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
+    let mut s = format!(
+        "lease: REFUSED to decide about {} branch(es) this pass. Nothing was freed and nothing \
+         is lost — but a refusal that repeats is a branch that can never be reaped, which is \
+         indistinguishable from a healthy one except by this line. Each refusal, verbatim:",
+        refused.len()
+    );
+    for (branch, e) in refused {
+        s.push_str(&format!("\n  lease: branch {branch}: {e}"));
+    }
+    s
 }
 
 #[cfg(test)]

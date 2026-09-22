@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use super::*;
 use crate::branch::arena::harness::Harness;
-use crate::branch::record::BranchRecord;
-use crate::branch::types::{BranchState, PageId};
+use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+use crate::branch::types::{ArenaId, BranchError, BranchState, Epoch, PageId};
 use crate::branch::BranchCatalog;
 use crate::cow::page_header::{stamp_checksum, PageType};
 use crate::cow::{PageStore, PAGE_HEADER_SIZE};
@@ -730,5 +730,398 @@ fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
         n - REAP_CHUNK,
         "expected the {} renewed branches to survive, found {survivors}",
         n - REAP_CHUNK
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// D127 — a REFUSED reap must be counted and reported, distinctly from "not expired".
+// -------------------------------------------------------------------------------------------
+//
+// The chain this closes, all three links read from source at `ac2ab26`:
+//
+// 1. `From<BranchError> for FerroError` collapses every variant into `FerroError::Branch(String)`,
+//    so `Corrupt` and `NotFound` are the same thing to a `match`.
+// 2. `reap_if_still_expired` turned every `Err(FerroError::Branch(_))` into `Ok(false)`.
+// 3. `scan_once` matched `Ok(false) => {}` — not pushed to `reaped`, not counted, never reported.
+//
+// So D124's refusal text — which names the parent, the fork epoch and the child on purpose —
+// reached no log, no counter and no operator, and the branch it refused about was reported
+// exactly like a branch whose agent had renewed its lease a moment earlier.
+//
+// **The refusal is injected, not manufactured by corrupting a catalog**, for the same reason
+// `tests/d124_owner_record_refusal.rs` uses a decorator: the arms under test catch an `Err`, so
+// what they must be given is an `Err` arriving at the exact call they swallowed. Corrupting a
+// real catalog would prove something about the catalog and nothing about the arm.
+//
+// Both refusal sites are covered, and — the half that makes this more than a counter test — the
+// OTHER meaning of the old `Ok(false)` is asserted too: a branch whose lease moved must raise
+// neither the counter nor a line. A fix that reported every skip would pass a refusal test and
+// fail that one.
+
+/// A distinctive token planted inside the injected refusal, so the assertion can prove the
+/// **message** survived rather than merely that some line was printed. D124 spends its refusal
+/// text naming the parent, the fork epoch and the child; if a fix reports "1 branch refused" and
+/// drops the text, that is the same defect one layer up.
+const D124_TOKEN: &str = "CHILD entry (parent 41, fork epoch 4242) names branch 909";
+
+/// Wraps a catalog and makes exactly one branch undecidable at exactly one of the two sites
+/// `reap_if_still_expired` declines to act on. Everything else delegates untouched.
+///
+/// Two injection points because the swallow had two arms, and they are reached through different
+/// code: `get_raw` is `reap_if_still_expired`'s own record read, while `has_live_children` is the
+/// D124-guarded resolver that `Reaper::reap` calls *after* it has already marked the branch
+/// `Reaping` — which is where a real `dangling_child` refusal arrives.
+///
+/// `u64::MAX` means "inject nothing": ids are minted from 0 up, so no real branch reaches it.
+struct RefusesOneBranch {
+    inner: Arc<dyn BranchCatalog>,
+    hidden_from_get_raw: AtomicU64,
+    corrupt_children_of: AtomicU64,
+}
+
+impl RefusesOneBranch {
+    fn wrapping(inner: Arc<dyn BranchCatalog>) -> Arc<RefusesOneBranch> {
+        Arc::new(RefusesOneBranch {
+            inner,
+            hidden_from_get_raw: AtomicU64::new(u64::MAX),
+            corrupt_children_of: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// `get_raw` on this id fails the way a record mid-`upsert` fails: the first swallowed arm.
+    fn hide_record_of(&self, id: u64) {
+        self.hidden_from_get_raw.store(id, Ordering::SeqCst);
+    }
+
+    /// `has_live_children` on this id raises D124's refusal: the second swallowed arm, reached
+    /// from inside `reap`.
+    fn refuse_child_resolution_for(&self, id: u64) {
+        self.corrupt_children_of.store(id, Ordering::SeqCst);
+    }
+}
+
+impl BranchCatalog for RefusesOneBranch {
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        if id == self.hidden_from_get_raw.load(Ordering::SeqCst) {
+            return Err(BranchError::NotFound(BranchId::new(id, 0)).into());
+        }
+        self.inner.get_raw(id)
+    }
+
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        if parent_id == self.corrupt_children_of.load(Ordering::SeqCst) {
+            return Err(BranchError::Corrupt(format!(
+                "{D124_TOKEN}, which has no record right now. A reader cannot tell a branch that \
+                 was never published from one whose record is mid-rewrite, so this refuses \
+                 instead of resolving it to \"not a live child\"."
+            ))
+            .into());
+        }
+        self.inner.has_live_children(parent_id)
+    }
+
+    fn next_epoch(&self) -> Epoch {
+        self.inner.next_epoch()
+    }
+    fn current_epoch(&self) -> Epoch {
+        self.inner.current_epoch()
+    }
+    fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        self.inner.fork(parent, lease)
+    }
+    fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
+        self.inner.get(branch)
+    }
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(branch, parent, fork_epoch, root)
+    }
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(branch, envelope)
+    }
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        self.inner.set_state(branch, expect, to)
+    }
+    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
+        self.inner.set_root(branch, root)
+    }
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        self.inner.expired_before(now_millis)
+    }
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        self.inner.in_state(state)
+    }
+    fn scan(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan()
+    }
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        self.inner.max_live_child(parent_id)
+    }
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        self.inner.live_child_in_epoch_range(parent_id, lo, hi)
+    }
+    fn live_count(&self) -> usize {
+        self.inner.live_count()
+    }
+    fn release_id(&self, id: u64) {
+        self.inner.release_id(id)
+    }
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        child_id: u64,
+    ) -> Result<(), FerroError> {
+        self.inner.attach_child(parent_id, fork_epoch, child_id)
+    }
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        self.inner.detach_child(parent_id, fork_epoch)
+    }
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(branch, arena)
+    }
+    fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
+        self.inner.renew_lease(branch, lease)
+    }
+    fn charge_row_writes(&self, branch: BranchId, n: u64) -> Result<(), FerroError> {
+        self.inner.charge_row_writes(branch, n)
+    }
+}
+
+/// A [`Fixture`] whose **reaper** reads through [`RefusesOneBranch`], and the decorator itself.
+///
+/// The fork/inspection helpers keep talking to the undecorated catalog through `f.h.catalog`, so
+/// building the fixture and reading the result back are never affected by the injection — only
+/// the reaper's own reads are, which is the whole point.
+fn refusing_fixture(table: bool) -> (Fixture, Arc<RefusesOneBranch>) {
+    let h = Harness::new_with(table);
+    let catalog = RefusesOneBranch::wrapping(Arc::clone(&h.catalog));
+    let runtime = Arc::new(
+        AgentRuntime::with_storage(
+            Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            Arc::clone(&h.store) as Arc<dyn PageStore>,
+        )
+        .unwrap(),
+    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+        Arc::clone(&h.store),
+    ));
+    (Fixture { h, reaper, runtime }, catalog)
+}
+
+/// The refusal lines this pass printed, as one blob. Empty when nothing was refused.
+fn refusal_lines() -> String {
+    reported::lines()
+        .into_iter()
+        .filter(|l| l.contains("REFUSED to decide"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **D127, the second swallowed arm — the one D124 actually raises.**
+///
+/// `has_live_children` refuses mid-`reap`. Before this row the whole sweep reported "reaped 2
+/// branches" and said nothing at all about the third, which is now a branch no sweep will ever
+/// reclaim. The three assertions are the three halves of the exit criterion: counted, reported
+/// with the message intact, and *not* at the cost of the sweep — the other branches still reap.
+#[test]
+fn d127_a_refusal_inside_reap_is_counted_and_reported() {
+    for table in [false, true] {
+        let (f, catalog) = refusing_fixture(table);
+        let a = branch_with_pages(&f, EXPIRED, 1);
+        let refused = branch_with_pages(&f, EXPIRED, 1);
+        let c = branch_with_pages(&f, EXPIRED, 1);
+        catalog.refuse_child_resolution_for(refused.id);
+
+        let gate = TestGate::new();
+        let counters = Counters::default();
+        reported::clear();
+        scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+        let stats = counters.snapshot();
+        let lines = refusal_lines();
+
+        assert_eq!(
+            stats.refused_reaps, 1,
+            "table={table}: the reaper declined to decide about branch {refused} and the pass \
+             counted {} refusals. A refusal that raises no counter is a branch that can never be \
+             reaped and looks exactly like a healthy one.",
+            stats.refused_reaps
+        );
+        assert!(
+            lines.contains(&refused.to_string()) && lines.contains(D124_TOKEN),
+            "table={table}: the refusal reached no reader. Reported lines mentioning a refusal:\n\
+             {lines}\nA counter without the message cannot tell a momentary miss (retry) from a \
+             corrupt CHILD entry (act), which is the distinction D124 spent its text on."
+        );
+        // Not at the cost of the sweep: the swallow exists so one odd branch does not stop the
+        // rest, and that must survive the fix.
+        assert_eq!(stats.reaped, 2, "table={table}: the other two branches must still be reaped");
+        assert_eq!(stats.failed, 0, "table={table}: a refusal must not fail the sweep");
+        assert_eq!(stats.scans, 1, "table={table}: the pass must still complete");
+        assert_eq!(state_of(&f, a), BranchState::Reaped, "table={table}");
+        assert_eq!(state_of(&f, c), BranchState::Reaped, "table={table}");
+
+        // Negative control, same bodies, injection removed: three reaps, no refusal, no line.
+        let (f2, _c2) = refusing_fixture(table);
+        for _ in 0..3 {
+            branch_with_pages(&f2, EXPIRED, 1);
+        }
+        let counters2 = Counters::default();
+        reported::clear();
+        scan_once(&f2.reaper, &f2.runtime, &*TestGate::new(), &counters2);
+        assert_eq!(counters2.snapshot().reaped, 3, "table={table}: control");
+        assert_eq!(
+            counters2.snapshot().refused_reaps,
+            0,
+            "table={table}: a guard that refuses on a healthy database is not a guard"
+        );
+        assert!(refusal_lines().is_empty(), "table={table}: control printed a refusal");
+    }
+}
+
+/// **D127, the first swallowed arm.** `reap_if_still_expired`'s own record read fails — the
+/// momentary miss `TableBranchCatalog::upsert` opens on a perfectly healthy branch, which is the
+/// case D124's comment names. It is benign and retryable, and it still must be audible: the only
+/// thing that tells a benign miss from a permanent one is whether it keeps happening, and a
+/// counter that never moves cannot say.
+#[test]
+fn d127_a_refusal_at_the_record_read_is_counted_and_reported() {
+    let (f, catalog) = refusing_fixture(true);
+    let a = branch_with_pages(&f, EXPIRED, 1);
+    let hidden = branch_with_pages(&f, EXPIRED, 1);
+    catalog.hide_record_of(hidden.id);
+
+    let counters = Counters::default();
+    reported::clear();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters);
+    let stats = counters.snapshot();
+
+    assert_eq!(stats.refused_reaps, 1, "the hidden record's refusal was not counted");
+    assert!(
+        refusal_lines().contains(&hidden.to_string()),
+        "the refusal did not name the branch it was about. Lines:\n{}",
+        refusal_lines()
+    );
+    assert_eq!(stats.reaped, 1, "the reachable branch must still be reaped");
+    assert_eq!(state_of(&f, a), BranchState::Reaped);
+    assert_eq!(
+        state_of(&f, hidden),
+        BranchState::Live,
+        "a refusal must free nothing: the branch is untouched, which is why this is a leak and \
+         not data loss"
+    );
+}
+
+/// **The other direction, and the reason this row is not a counter patch.**
+///
+/// `Ok(false)` meant two things. If the fix reports every skip, the leak becomes audible and so
+/// does every ordinary keepalive race — an operator reading "1 branch refused" every tick learns
+/// nothing, which is the same silence with more lines. A branch whose lease moved between the
+/// candidate query and the reap must raise **neither** the counter nor a line.
+///
+/// The renewal is driven from inside the lock acquisition, which is exactly the window D98 opened
+/// by moving the candidate query outside it.
+#[test]
+fn d127_a_branch_whose_lease_moved_is_not_reported_as_a_refusal() {
+    struct RenewingGate {
+        statement: Mutex<()>,
+        catalog: Arc<dyn BranchCatalog>,
+        branches: Vec<BranchId>,
+    }
+    impl RuntimeLock for RenewingGate {
+        fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+            let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+            for b in &self.branches {
+                self.catalog.renew_lease(*b, FAR_FUTURE).unwrap();
+            }
+            body();
+        }
+    }
+
+    let (f, _catalog) = refusing_fixture(true);
+    let all: Vec<BranchId> = (0..3).map(|_| branch_with_pages(&f, EXPIRED, 1)).collect();
+    let gate = RenewingGate {
+        statement: Mutex::new(()),
+        catalog: Arc::clone(&f.h.catalog),
+        branches: all.clone(),
+    };
+
+    let counters = Counters::default();
+    reported::clear();
+    scan_once(&f.reaper, &f.runtime, &gate, &counters);
+    let stats = counters.snapshot();
+
+    assert_eq!(stats.reaped, 0, "every candidate was renewed inside the lock");
+    assert_eq!(
+        stats.refused_reaps, 0,
+        "a lease that moved is a DECISION the reaper made on the record, not a refusal to make \
+         one. Counting it here would bury the refusals that matter under the ordinary keepalive \
+         race this skip has always existed for."
+    );
+    assert!(
+        refusal_lines().is_empty(),
+        "an ordinary keepalive race printed a refusal:\n{}",
+        refusal_lines()
+    );
+    for b in &all {
+        assert_eq!(state_of(&f, *b), BranchState::Live);
+    }
+}
+
+/// The type itself, without a sweep around it: the three outcomes are three values, so a caller
+/// cannot silently collapse two of them again. This is the assertion that would have failed at
+/// `ac2ab26` for a reason no amount of counting can express — there was nothing to return.
+#[test]
+fn d127_refused_and_not_expired_are_different_values() {
+    let (f, catalog) = refusing_fixture(true);
+    let refused = branch_with_pages(&f, EXPIRED, 1);
+    let alive = branch_with_pages(&f, FAR_FUTURE, 1);
+    let healthy = branch_with_pages(&f, EXPIRED, 1);
+    catalog.refuse_child_resolution_for(refused.id);
+    let now = 1u64;
+
+    let out = f.reaper.reap_if_still_expired(refused, now).expect("a refusal must not propagate");
+    assert!(
+        matches!(out, ReapOutcome::Refused(_)),
+        "a branch the catalog refused to resolve came back as {out:?}"
+    );
+    assert!(
+        matches!(f.reaper.reap_if_still_expired(alive, now), Ok(ReapOutcome::NotExpired)),
+        "a live lease must be a decision, not a refusal"
+    );
+    assert!(
+        matches!(f.reaper.reap_if_still_expired(healthy, now), Ok(ReapOutcome::Reaped)),
+        "fixture: an expired, resolvable branch must reap, or the two arms above prove nothing"
+    );
+
+    // The message is carried, not summarised: `refusal_report` is what both sweep shapes print.
+    let ReapOutcome::Refused(e) = out else { unreachable!() };
+    let line = refusal_report(&[(refused, e)]);
+    assert!(
+        line.contains(D124_TOKEN),
+        "the builder dropped the refusal text, so an operator gets a count and no cause:\n{line}"
     );
 }
