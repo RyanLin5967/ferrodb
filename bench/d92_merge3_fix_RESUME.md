@@ -1,31 +1,27 @@
 # D92-merge3-fix — state
 
-Branch `D92-merge3-fix`, worktree `/Users/idide/wt/ferrodb-D92-merge3-fix`, rebased on main
-`1758b3b`. Earlier unreviewed residue is preserved on `D92-merge3-fix-quarantined` and is
-superseded — do not merge it.
+Branch `D92-merge3-fix`, worktree `/Users/idide/wt/ferrodb-D92-merge3-fix`.
+**Rebased onto main past D105/D108–D112; eight commits, `main..HEAD`.** Earlier unreviewed residue
+is on `D92-merge3-fix-quarantined` and is superseded — do not merge it.
 
-## Commits
-- `499fe80` findings 3 and 4, plus a first cut at 1 and 2.
-- `0c4956d` supersedes that first cut: merge3 owns no identity, no hasher and no memo.
-- `5e61c45` verification record, and that `d92_merge3_curve` is red on main already.
-- `5220530` the three-route measurement of `(PageId, birth_epoch)`.
-- `953efa0` `cid.rs`: "trivially collidable" was too strong.
+⚠ **This branch is HYGIENE on a RETIRED module.** `cow::merge3` has zero production callers:
+`MERGE` has a delta in hand and `DIFF` does not, and a `MERGE` reads zero branch-engine pages.
+Land it as hygiene; do not expand it or treat it as groundwork for wiring merge3 up.
 
-A sixth commit withdrawing the `diff.rs` edits was made and then **discarded** (`git reset`) when
-the lead reversed the drop order; it survives only in the reflog and must not be resurrected.
+## `diff.rs` co-edit — resolved
+The earlier "do not rebase until `fix-diff-memo` lands" block is **cleared**; `fddf13c` landed and
+this branch is rebased past it. Both conflicts were resolved by taking **main's** side: my
+"A STAMP GOES STALE" warning and my `MemoIdentity` note were superseded by better text that names
+the real key and carries measured page-read counts.
 
-## ⚠ MERGE ORDER — do not rebase unprompted
-`src/cow/diff.rs` is touched by two branches. `fix-diff-memo` lands **first**; only then does this
-branch rebase onto it, and only then does the lead merge. **Do not rebase until the lead says
-`diff.rs` has landed.**
+What is left of this branch in `src/cow/diff.rs` is **39 insertions, 0 deletions** against current
+main, and only two things: the `IdentityProof` enum, and `NodeIdentity::proof()` **with a
+`Fingerprint` default** so it cannot break foreign impls. The explicit `Fingerprint` impls on
+`SubtreeHash` and `MemoIdentity` were dropped as redundant with that default.
 
-This branch's `diff.rs` footprint is **purely additive — 70 insertions, 0 deletions** (`IdentityProof`,
-`NodeIdentity::proof()` with no default plus its three impls, and staleness warnings on
-`SubtreeHash`/`MemoIdentity`). That is what makes the co-edit safe: the lost-edit shape is two
-writers modifying the same lines, which this is not. **If `fix-diff-memo`'s work deletes or
-reshapes `NodeIdentity`, `SubtreeHash`, `MemoIdentity` or `page_id_identity`, additive stops
-holding — tell the lead rather than forcing the rebase.** `fix-diff-memo` has been asked to give a
-heads-up if it plans any of those, and has been told `proof()` is staying.
+⚠ The shipped memo key is **`(birth_epoch, checksum)`** (`cow::diff::PageVersion`), NOT
+`(PageId, birth_epoch)`. It catches routes A and B; route C stays open by construction. Anything
+on this branch that names the old candidate is describing a rejected proposal, not live advice.
 
 ## The four findings
 1. **Memo keyed on a reused `PageId`.** Resolved by deletion: merge3 owns no memo. ⚠ **Not**
@@ -49,14 +45,21 @@ heads-up if it plans any of those, and has been told `proof()` is staying.
 4. **`cid.rs`'s "grep returned zero".** Corrected, and restated as a count rather than a command.
 
 ## Verification
-- `cargo test --lib`: **1543 passed, 0 failed, 3 ignored**.
-- Fire-checks: read_node guard fails against the restored catch-all; the hazard test fails when
-  `SubtreeHash`'s memo is bypassed.
+- Counts below are PENDING re-measurement after the rebase onto current main — the 1543 figure
+  was taken at base `1758b3b` and does not name this tip. Re-run `cargo test --lib cow` and
+  record the literal line here.
+- Fire-checks, all taken pre-rebase and all still expected to hold: the `read_node` guard fails
+  against the restored `_ =>` catch-all; the store-property test fails when route B's premise is
+  flipped; `proof()` without a default reproduces `error[E0046]` in `tests/review_cow_adv.rs:368`.
+- ⚠ `a_stale_subtree_hash_makes_merge3_drop_a_change_silently` was a PINNED HAZARD and its own doc
+  says to delete it once `cow::diff` grew a staleness guard. `fddf13c` is that guard, so this test
+  is **expected to fail now** and must be converted into a guard that the fix HOLDS, not deleted
+  outright. Confirm by running it before changing it.
 
 ## Open, and NOT mine
-- `examples/d92_merge3_curve.rs` **fails on main** at `1758b3b`, identically and with identical
-  counters (rule 2 contested = 6, asserted 0). `cow::chunker`'s content-defined leaf boundaries
-  changed which rules can fire in the "contested" arm; the example's own fire-check assertion
-  predates that. Verified by running the example at `1758b3b` with none of this branch applied.
-- `cow::diff`'s stamp staleness (finding 1's other half). `SubtreeHash` has **no refresh path** —
-  `stamp_inner` returns early on a memo hit — so a caller cannot invalidate, only rebuild.
+- `examples/d92_merge3_curve.rs` was **red on main** at `1758b3b`, verified by running it there
+  with none of this branch applied (rule 2 contested = 6, asserted 0; `cow::chunker`'s
+  content-defined leaf boundaries changed which rules can fire). ⚠ Main has moved a long way
+  since — **re-check before repeating the claim**, and route it to the chunker author.
+- Route C of the memo staleness: an in-place write to a *descendant* leaves every ancestor
+  byte-identical, so no per-page key reaches it. Asserted as a limit on `cow::diff`'s side.
