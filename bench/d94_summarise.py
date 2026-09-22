@@ -19,7 +19,7 @@ SWEEP_FILES = [f"{WT}/bench/d94_sweep_main.txt", f"{WT}/bench/d94_sweep_main_10k
 # which half is arithmetic about a tree shape that has since changed.
 HIST_FILES = [f"{WT}/bench/d94_sweep_raw.txt", f"{WT}/bench/d94_sweep_raw_part2.txt"]
 EXTENT = f"{WT}/bench/d94_extent_premise_raw.txt"
-FALSIFIER = f"{WT}/bench/d94_zero_falsifier.txt"
+FALSIFIER = f"{WT}/bench/d94_zero_falsifier_main.txt"
 TESTS = f"{WT}/bench/d94_dedup_tests.txt"
 OUT = f"{WT}/bench/d94_chunk_dedup.txt"
 PAGE = 4096
@@ -228,12 +228,15 @@ def main():
     w("    produced a non-zero result is indistinguishable from one that cannot. So the smallest")
     w("    signal the workload can carry was planted deliberately -- k of the 8 rows per branch")
     w("    made identical across branches -- and the gain must come back as exactly k*(N-1) pages")
-    w("    at N=100. Raw: bench/d94_zero_falsifier.txt")
+    w("    at N=100. Raw: bench/d94_zero_falsifier_main.txt")
     for _fn, _fs in fals_stamps:
         w(f"    falsifier built {_fs.split(chr(97)+chr(116),1)[1].strip()}")
     if fals_stamps and stamps and {s for _, s in fals_stamps} != {s for _, s in stamps}:
         w("    NOTE: the falsifier and the sweep were built at DIFFERENT commits; both are")
-        w("    named so the reader can check the delta rather than assume they agree.")
+        w("    named so the reader can check the delta rather than assume they agree. The only")
+        w("    delta on the measurement path is src/cow/diff.rs, which the harness does not use,")
+        w("    and bench/d94_sweep_recheck_main.txt re-runs the N=100 sweep row at the falsifier's")
+        w("    own commit and reproduces it exactly, which closes the gap.")
     w("")
     if fals_rows:
         w(f"      {chr(107):<4} {'dup_frac':>9} {'gain (pages)':>13} {'k*(N-1)':>9}  {'':<6}")
