@@ -394,7 +394,7 @@ impl TwoTierReaper {
             }
             let mut still_pinned = Vec::new();
             let mut moved = false;
-            for pf in entries {
+            for (i, pf) in entries.iter().copied().enumerate() {
                 let pinned = match self.catalog.get_raw(pf.owner.id) {
                     // **D18, second site.** This read `rec.live_children` too, and on the table
                     // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
@@ -406,7 +406,7 @@ impl TwoTierReaper {
                         pf.owner.id,
                         pf.birth_epoch,
                         pf.free_epoch,
-                    )?,
+                    ),
                     // ⛔ **D124 — this was `Err(_) => false`, i.e. RELEASE THE PAGE.** The comment
                     // it replaces said "no record at all: nothing can be forked off it, so
                     // nothing can see the page". That premise is false. No path in `src/` deletes
@@ -426,9 +426,24 @@ impl TwoTierReaper {
                     // Not reachable in production today — `reap_expired` runs under the
                     // per-statement lock every `fork` also takes (`lease_thread.rs`) — but W4
                     // exists to remove that lock, so this has to be gone before W4 lands, not
-                    // after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock` and
-                    // is where the fire-check for it lives.
-                    Err(e) => return Err(e),
+                    // after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock`, which
+                    // is what makes it reachable at all outside production.
+                    Err(e) => Err(e),
+                };
+                let pinned = match pinned {
+                    Ok(p) => p,
+                    // **D83's reasoning, applied to `entries` rather than to `touched`.**
+                    // `take_pending` has ALREADY emptied the durable log, so returning from here
+                    // with entries still in hand drops them: the pages would be neither released
+                    // nor ever revisited, which turns a refusal into a permanent reservation.
+                    // Put back everything not yet decided — this entry and the rest — and only
+                    // then refuse. The pre-existing `?` on `live_child_in_epoch_range` had the
+                    // same hole and now goes through here too.
+                    Err(e) => {
+                        still_pinned.extend_from_slice(&entries[i..]);
+                        self.store.put_pending(still_pinned)?;
+                        return Err(e);
+                    }
                 };
                 if pinned {
                     still_pinned.push(pf);
