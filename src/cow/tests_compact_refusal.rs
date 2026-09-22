@@ -63,11 +63,39 @@ struct StarvingStore {
     /// `internal_relink` or the new-root tail of `relink_up`, so the type sequence says which
     /// stage the operation died in.
     log: Mutex<Vec<(Option<PageId>, PageType)>>,
+    /// Pages to photograph at the instant an allocation is refused, and the photograph.
+    ///
+    /// ⛔ **This is the only place from which a half-finished write operation can be seen.**
+    /// D125 gave `CowTree` a rollback, so by the time a failing `insert` returns, every page it
+    /// touched has been put back — which is the fix working, and which also means D113's
+    /// end-to-end falsifier can no longer observe the compacted page it exists to catch by
+    /// looking at the tree afterwards. It would have gone quietly vacuous: still green, still
+    /// asserting, and blind. The refusal is the moment the defect exists, so the refusal is
+    /// where the camera goes.
+    watch: Mutex<Vec<PageId>>,
+    at_refusal: Mutex<Vec<(PageId, [u8; PAGE_SIZE])>>,
 }
 
 impl StarvingStore {
     fn new(inner: Arc<CowStore>) -> StarvingStore {
-        StarvingStore { inner, budget: AtomicI64::new(-1), log: Mutex::new(Vec::new()) }
+        StarvingStore {
+            inner,
+            budget: AtomicI64::new(-1),
+            log: Mutex::new(Vec::new()),
+            watch: Mutex::new(Vec::new()),
+            at_refusal: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Photograph `ids` the next time an allocation is refused.
+    fn watch(&self, ids: &[PageId]) {
+        *self.watch.lock().unwrap() = ids.to_vec();
+        self.at_refusal.lock().unwrap().clear();
+    }
+
+    /// The photograph: each watched page as it stood mid-operation, at the refusal.
+    fn at_refusal(&self) -> Vec<(PageId, [u8; PAGE_SIZE])> {
+        self.at_refusal.lock().unwrap().clone()
     }
 
     fn reset_log(&self) {
@@ -102,6 +130,20 @@ impl PageStore for StarvingStore {
             && self.budget.fetch_sub(1, Ordering::SeqCst) <= 0
         {
             self.log.lock().unwrap().push((None, page_type));
+            // The camera. Read through the pool directly rather than `read_page`, because a
+            // page that fails its checksum is exactly what this is here to catch and
+            // `read_page` would refuse to hand it over.
+            let watch = self.watch.lock().unwrap().clone();
+            if !watch.is_empty() {
+                let mut shot = self.at_refusal.lock().unwrap();
+                if shot.is_empty() {
+                    for id in watch {
+                        let h = PageHandle::fetch(self.inner.pool().clone(), id).unwrap();
+                        let data = h.read().data;
+                        shot.push((id, data));
+                    }
+                }
+            }
             return Err(FerroError::Cow("starving store: allocation refused".into()));
         }
         let id = self.inner.alloc_in_arena(arena, page_type, birth_epoch)?;
@@ -377,6 +419,7 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
                 assert!(verify_checksum(page), "fixture: page {} was already invalid", id);
             }
 
+            f.store.watch(&ids);
             f.store.allow(allowance);
             let outcome = f.insert(root, &key, &value);
             f.store.unlimited();
@@ -395,35 +438,64 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
                     );
                     starved_failures += 1;
 
+                    // The tree AS IT STOOD AT THE REFUSAL, not as it stands now — D125's
+                    // rollback has since put every page back, so "now" can no longer show the
+                    // state D113 is about. See `StarvingStore::watch`.
+                    let mid = f.store.at_refusal();
+                    assert_eq!(
+                        mid.len(),
+                        before.len(),
+                        "fixture: the refusal camera did not fire, so nothing below is an \
+                         observation of the failing operation"
+                    );
+
                     // Did this failure leave anything rewritten? Those are the failures that can
                     // expose the defect; a failure that mutated nothing proves nothing.
                     let changed: usize = before
                         .iter()
-                        .map(|(id, page)| {
-                            let now = f.raw(*id);
+                        .zip(mid.iter())
+                        .map(|((_, page), (_, now))| {
                             page.iter().zip(now.iter()).filter(|(a, b)| a != b).count()
                         })
                         .sum();
                     if changed > 0 {
                         mutating_failures += 1;
                     }
-                    if before.iter().any(|(id, page)| compacted_in_place(page, &f.raw(*id))) {
+                    if before
+                        .iter()
+                        .zip(mid.iter())
+                        .any(|((_, page), (_, now))| compacted_in_place(page, now))
+                    {
                         compaction_failures += 1;
                     }
 
-                    // The conclusion: a failed allocation may abandon the operation, but it may
-                    // not leave a page that the production reader refuses.
-                    for (id, _) in &before {
-                        let now = f.raw(*id);
+                    // D113's conclusion: a failed allocation may abandon the operation, but at
+                    // no point may it leave a page that the production reader would refuse.
+                    for (id, now) in &mid {
                         assert!(
-                            verify_checksum(&now),
-                            "D113: after a starved allocation (key {:?}, {} allowed) page {} has \
-                             a checksum that disagrees with its bytes; {} bytes were rewritten \
-                             across the tree and `read_page` now refuses this page as torn",
+                            verify_checksum(now),
+                            "D113: at the moment a starved allocation was refused (key {:?}, {} \
+                             allowed) page {} had a checksum that disagrees with its bytes; {} \
+                             bytes were rewritten across the tree and `read_page` would refuse \
+                             this page as torn",
                             String::from_utf8_lossy(&key[..12.min(key.len())]),
                             allowance,
                             id,
                             changed
+                        );
+                    }
+
+                    // D125's conclusion, which is strictly stronger and is why the check above
+                    // had to move: once the call has returned, the page is not merely readable,
+                    // it is byte-for-byte what it was before the call.
+                    for (id, page) in &before {
+                        let now = f.raw(*id);
+                        assert!(
+                            page[..] == now[..],
+                            "D125: page {} differs after a failed insert (key {:?}, {} allowed)",
+                            id,
+                            String::from_utf8_lossy(&key[..12.min(key.len())]),
+                            allowance
                         );
                         f.store.read_page(*id).unwrap_or_else(|e| {
                             panic!("D113: page {} is no longer readable: {}", id, e)
