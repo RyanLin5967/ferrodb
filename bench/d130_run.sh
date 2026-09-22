@@ -89,6 +89,32 @@ if ! run_bounded 1800 cargo build --release --example fork_concurrency --example
 fi
 
 # ------------------------------------------------------------------------------------------------
+# A PROOF PASS, under the same hold, before anything that gets quoted.
+#
+# The suite lock is a shared resource and this sweep holds it for a quarter of an hour. A run that
+# refuses at minute fifteen for a reason discoverable at minute two — a harness that will not
+# build, an `ABANDON` the server rejects, an instrument self-check that fails — has spent that
+# hold for nothing and has to queue again. This pass is deliberately too small to be evidence and
+# is labelled as such; its only job is to reach every refusal in both binaries.
+{
+    echo
+    echo "================================================================================"
+    echo "PROOF PASS — NOT EVIDENCE. Two threads, a handful of forks, both binaries."
+    echo "Its only purpose is to reach every refusal in both harnesses under this same lock"
+    echo "hold, so a sweep that cannot run fails in minutes rather than at the end. Read no"
+    echo "ratio out of it: at this size f/sync is dominated by whichever thread arrived first."
+    echo "================================================================================"
+} >> "$OUT"
+if ! run_bounded 600 ./target/release/examples/fork_concurrency 200 2; then
+    echo "$LABEL: REFUSING — the direct harness failed its proof pass; see $OUT" >&2
+    exit 1
+fi
+if ! run_bounded 600 ./target/release/examples/d130_pgwire_batch 4 2; then
+    echo "$LABEL: REFUSING — the pgwire harness failed its proof pass; see $OUT" >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------------------------
 {
     echo
     echo "================================================================================"
