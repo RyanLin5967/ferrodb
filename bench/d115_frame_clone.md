@@ -24,6 +24,12 @@ was written, deliberately. Raw runs, both directions, in `bench/d115_before.txt`
 `bench/d115_real_mem.txt`, `bench/d115_real_durable.txt`, `bench/d115_crossover.txt`;
 `bench/d115_run4.sh` is the driver.
 
+**Suite:** the instrument commit is `a19e881` on `D115-frame-clone`; `cargo test --release --lib`
+there reports **`ok. 1599 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out`**, `rc=0`,
+`head=a19e881` (`bench/d115_verify_full.sh`). Nothing here is filtered: the instrument adds
+counters, makes the cloned frame's `drop` explicit, and splits `stage_all` into a timing wrapper
+and a body — no behaviour change, and the whole suite says so at the commit that carries it.
+
 ---
 
 ## 1. THE VERDICT AGAINST THE PRE-REGISTERED FALSIFIER
@@ -117,6 +123,23 @@ arena warm-up dominate. The curves are clean.
 
 ## 3. WHAT DOMINATES, AND WHY THE ROW NAMED THE WRONG THING
 
+### First — the instrument was forced to fire, so a small reading means something
+
+A phase timer that reports "the clone is 3.2%" is worthless unless it can be shown reading the
+clone LARGE when the clone IS large. **The same binary, the same spans, the same run:**
+
+| configuration | clone + drop, share of `stage_all` @8192 |
+|---|---|
+| A — stub runtime, `MemEffectLog` | **80.7%** |
+| B — arena store, `MemEffectLog` | **71.5%** |
+| C — **shipped**, arena + `DurableEffectLog` | **6.2%** |
+| D — `MemEffectLog` @32768 ops | **79.4%** |
+
+The detector pegs at 80% in three configurations and reads 6.2% in the fourth. The 6.2% is a fact
+about the configuration, not a blind instrument. The phase table also has to close — `sum/stage`
+reads **100.0%** at the top of every arm — so there is no unattributed remainder for the term to
+be hiding in.
+
 **On the shipped store: `DurableEffectLog::append`, at 4.057 ms per statement** — 33.24 s of a
 36.05 s session at 8192 ops.
 
@@ -131,8 +154,14 @@ session. So the comparisons account for **at most 800 ms of the 33,236 ms**, i.e
 the price of the guarantee rather than an oversight."*
 
 **Second: the CoW mirror**, `put_row` → `set_root` → `TableBranchCatalog::durable` → `flush_all` +
-`disk_manager.sync()`. A second fsync per statement. It is 99.1% of `stage_all` at 32 ops in
-configuration B and decays to 0.040 ms/statement as the commit group and page cache warm.
+`disk_manager.sync()`, and `DiskManager::sync` is `storage.sync_all()` — a real fsync per
+statement. It is 99.1% of `stage_all` at 32 ops in configuration B, at **0.554 ms/statement**, and
+falls to **0.040 ms/statement** by 8192.
+
+⚠ **The reason for that 14x decay is NOT established here.** Group commit and page-cache warmth
+are both plausible and neither was checked, so no mechanism is claimed for it. What the number
+supports is only the magnitude: past a few hundred statements this term is tens of microseconds,
+not hundreds.
 
 **The clone, its drop, and `extends` are the third group**, together 6.2% (ASC) / 7.6% (DESC) of
 `stage_all` at 8192 ops on the shipped store.
@@ -169,10 +198,18 @@ when a page store is attached; it read 0 at every point of the axis. The timer s
 0.000 ms, which reads as *"the mirror is cheap"*. The harness now refuses a run that mirrors zero
 rows.
 
-⚠ **A null control confirms it rather than resting on the reading:** an arm configured with
-`DurableEffectLog` produced numbers indistinguishable from the `MemEffectLog` arm
-(`bench/d115_before_durable.txt`, 8192 ops in 3.6 s — 8192 fsyncs cannot happen in 3.6 s). The
-store it opened was never written to.
+⚠ **A null control confirms it, and the proof is an INTEGER rather than a timing argument.** An
+arm configured with `DurableEffectLog` (`bench/d115_before_durable.txt`) reported
+`extends_cmp = 33,550,336` at 8192 ops — **one** frame-comparison pass. The genuine durable path
+provably runs **two** (67,100,672, measured in §3, because `classify_append` and `self.mem.append`
+each run one). A store that is actually on the path cannot report the mem store's comparison
+count. `mirror_rows = 0` in the same run says the same thing about the page store.
+
+> ⛔ **Withdrawn, and logged here because this is where the claim was made.** An earlier draft of
+> this paragraph argued instead that *"8192 fsyncs cannot happen in 3.6 s"*. **That argument does
+> not hold and is retracted.** The CoW mirror's own `set_root` reaches a real `sync_all()` and
+> still measures 0.040 ms/statement at 8192 ops on this box, so a sub-millisecond sync is exactly
+> what this measurement cannot rule out. The integer above does not depend on it.
 
 **(2) The clone is three terms, and the row names the one that is not even the largest pair.**
 Every statement pays, with `n` = ops recorded so far:
