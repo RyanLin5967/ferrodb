@@ -1,0 +1,27 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=pgwire. THE SAME L0→L3 LADDER, AT THE LAYER PRODUCTION RUNS.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost first:
+  `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog::logical`.
+  E.6 measured that this is NOT the same experiment as MODE=direct.
+
+  outer = ServerContext::catalog(), the per-statement mutex every connection waits on.
+  inner = TableBranchCatalog::logical, the mutex the 21x/1.9x pair is about.
+  Counted with process-wide atomics (the library owns these threads) — the `direct`
+  mode's cross-check is what licenses that.
+# pgwire_start: 2026-09-22T07:30:12Z  load_at_acquire=s: 32.68 28.75 26.15
+
+  threads  stub   forks   outer/op outerCont/op   inner/op innerCont/op stmts/sec
+        1     0      40     4.0250      0.00000     3.0000      0.00000      34.9
+
+        8     0     320     4.0250      2.42500     3.0000      0.00000      33.5
+
+       64     0    2560     4.0250      2.42148     3.0000      0.00000      39.9
+
+⚠ stmts/sec is an UPPER BOUND on a loaded box and is NOT evidence here. Each fork is
+  two TCP round trips, so this arm's throughput is bounded by the socket, not the lock.
+# end: 2026-09-22T07:31:27Z  load_at_acquire=s: 33.90 30.68 27.15

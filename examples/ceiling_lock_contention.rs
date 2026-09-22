@@ -1402,7 +1402,21 @@ fn run_pgwire(root: &Path, tag: &str, t: usize, f: usize, stub: u8) -> PgArm {
     }
 }
 
-fn mode_pgwire(root: &Path, f: usize, threads: &[usize]) {
+/// ⛔ `max_stub` EXISTS BECAUSE THE LADDER PHYSICALLY CANNOT BE DRIVEN THROUGH THE SHIPPED SERVER
+/// ABOVE L0, AND THAT IS A RESULT, NOT A WORKAROUND.
+///
+/// Measured (`bench/ceiling_raw/20_pgwire_ladder_BREAKS_above_L0.txt`): L0 completes; the L1 arm
+/// dies with `ABANDON returned an error: branch error: branch b1@g0 not found`. L1's definition is
+/// *"skip `write_record`"* — the child's record is never written — and `ABANDON` is a front-end
+/// statement that reads that record back. So the stub ladder and the shipped front-end are
+/// mutually exclusive by construction above L0: the very thing L1 removes is the thing the
+/// front-end needs.
+///
+/// ⇒ The comparison Amendment 2 asks for is therefore **asymmetric, and the asymmetry must be
+/// stated with the numbers rather than papered over**: layer A runs the whole ladder, layer B runs
+/// L0 only. Skipping `ABANDON` at L1+ would make the rungs different workloads and the ladder a
+/// lookalike, which is worse than an honest hole.
+fn mode_pgwire(root: &Path, f: usize, threads: &[usize], max_stub: u8) {
     println!("CEILING — MODE=pgwire. THE SAME L0→L3 LADDER, AT THE LAYER PRODUCTION RUNS.");
     println!();
     println!("⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per");
@@ -1421,7 +1435,7 @@ fn mode_pgwire(root: &Path, f: usize, threads: &[usize]) {
         "threads", "stub", "forks", "outer/op", "outerCont/op", "inner/op", "innerCont/op", "stmts/sec"
     );
     for &t in threads {
-        for stub in 0u8..=3 {
+        for stub in 0u8..=max_stub {
             let a = run_pgwire(root, &format!("p{t}_{stub}"), t, f, stub);
             let ops = a.forks.max(1) as f64;
             if a.inner.ops as usize != a.forks {
@@ -1462,6 +1476,9 @@ fn main() {
         .collect();
     let warm: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
     let reps: usize = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(5);
+    // Same positional slot, different mode: `paired` reads it as rep count, `pgwire` as the
+    // highest stub level to attempt. See `mode_pgwire` for why L1+ cannot be driven at that layer.
+    let max_stub: u8 = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     let dir = std::env::temp_dir().join(format!("ferrodb-ceiling-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1482,7 +1499,7 @@ fn main() {
         "model" => mode_model(),
         "direct" => mode_direct(&dir, n, &threads, warm),
         "paired" => mode_paired(&dir, n, &threads, warm, reps),
-        "pgwire" => mode_pgwire(&dir, n, &threads),
+        "pgwire" => mode_pgwire(&dir, n, &threads, max_stub.min(3)),
         other => refuse(&format!("unknown mode `{other}` (model | direct | paired | pgwire)")),
     }
     stamp("end");
