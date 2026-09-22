@@ -1,0 +1,507 @@
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT?
+Run by bench/d130_run.sh under /tmp/ferrodb-suite.lock, so no other suite's fsyncs move D.
+tree: dd2d1f5aa6093c7deee2782bea3a903ce9e7db21  worktree: /Users/idide/wt/ferrodb-D130-batch-vs-threads
+host: Darwin 25.6.0 arm64  started: 2026-09-22T11:31:40Z
+
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D130-batch-vs-threads)
+    Finished `release` profile [optimized] target(s) in 7.82s
+
+================================================================================
+PROOF PASS — NOT EVIDENCE. Two threads, a handful of forks, both binaries.
+Its only purpose is to reach every refusal in both harnesses under this same lock
+hold, so a sweep that cannot run fails in minutes rather than at the end. Read no
+ratio out of it: at this size f/sync is dominated by whichever thread arrived first.
+================================================================================
+D6/D7: fork throughput vs concurrency. N=200 forks per arm, TableBranchCatalog, release.
+parent arenas = 0 (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY
+and this harness CANNOT see D7 -- see give_parent_arenas).
+Recorded 2026-09-22T07:31:48-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        2       200      0.817       244.8      4.085      200         1.0
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT? MODE=pgwire.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread or per fork, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost
+  first: `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog`'s
+  `logical`. E.6 measured that this is NOT the same experiment as MODE=direct, which
+  is `examples/fork_concurrency.rs`. Amendment 1 binds each number to its layer.
+
+  f/sync   = forks the server named, divided by fsyncs the catalog issued. A ratio of
+             two counters taken by one instrument over one run, so it is load-immune.
+  f/sync÷T = the pre-registered discriminator. ≈0.5 flat ⇒ outcome 1 (wake-up race);
+             falling in T ⇒ outcome 2 (the batch is not bounded by the threads);
+             ≈1.0 ⇒ outcome 3 (the batch already captures everyone).
+
+⛔ NO THROUGHPUT IS REPORTED. Each fork is a TCP round trip and the box is shared;
+   a rate from this harness would be a fact about the socket. The counts are the
+   evidence.
+
+# start: 2026-09-22T11:31:49Z  load: 3.35 2.79 2.82
+
+instrument self-check: two idle reads moved the counter by 0, and one serial fork moved it by exactly 1. OK
+
+  arm                                threads    forks    syncs    f/sync   f/sync÷T
+  P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+
+  S  persistent conn, BEGIN+ABANDON      2        8       40      0.20     0.1000
+
+  D  POSITIVE CONTROL, no socket        2        8        8      1.00     0.5000
+
+⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,
+   same process, a pgwire server listening throughout — it simply does not go through
+   the socket. If D shows a batch and P/S do not, the instrument can see batching and
+   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact
+   about pgwire and every cell in this run is a fact about this harness.
+# end: 2026-09-22T11:31:49Z  load: 3.35 2.79 2.82
+
+================================================================================
+MODE=direct — examples/fork_concurrency.rs, UNMODIFIED.
+
+  LAYER: TableBranchCatalog::fork driven directly (open_sidecar + cat.fork), holding
+  `logical` and nothing else. This is the layer the recorded 21x/1.9x/12.6x pair and
+  the L0->L3 ladder were measured at. It is NOT what any shipped front-end does.
+
+  N=8000 forks per arm, matching the rung of bench/ceiling_raw/22_direct_crosscheck.txt.
+  The rung is the REAL fork: no stub level. The ceiling ladder's L0 row (the only
+  unstubbed one) reported f/sync 23.8 at T=64; its 32.0 is L3, which is not a database.
+
+⛔ forks/sec in this harness's own output is an UPPER BOUND on a shared box and is NOT
+   evidence for anything in D130. The f/sync column is the finding.
+================================================================================
+
+--- direct rep 1/3  load: 3.35 2.79 2.82
+D6/D7: fork throughput vs concurrency. N=8000 forks per arm, TableBranchCatalog, release.
+parent arenas = 0 (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY
+and this harness CANNOT see D7 -- see give_parent_arenas).
+Recorded 2026-09-22T07:31:50-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        1      8000     30.485       262.4      3.811     8000         1.0
+        2      8000     28.789       277.9      3.599     7996         1.0
+        4      8000     14.340       557.9      1.793     4008         2.0
+        8      8000      7.015      1140.3      0.877     2042         3.9
+       16      8000      3.862      2071.4      0.483     1120         7.1
+       32      8000      2.158      3706.3      0.270      657        12.2
+       64      8000      1.516      5278.0      0.189      470        17.0
+      128      7936      1.520      5222.6      0.191      455        17.4
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+
+--- direct rep 2/3  load: 2.48 2.58 2.73
+D6/D7: fork throughput vs concurrency. N=8000 forks per arm, TableBranchCatalog, release.
+parent arenas = 0 (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY
+and this harness CANNOT see D7 -- see give_parent_arenas).
+Recorded 2026-09-22T07:33:19-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        1      8000     30.035       266.4      3.754     8000         1.0
+        2      8000     27.729       288.5      3.466     7995         1.0
+        4      8000     14.364       556.9      1.796     4011         2.0
+        8      8000      7.219      1108.2      0.902     2037         3.9
+       16      8000      3.831      2088.1      0.479     1097         7.3
+       32      8000      2.157      3708.5      0.270      636        12.6
+       64      8000      1.665      4804.9      0.208      463        17.3
+      128      7936      1.590      4990.2      0.200      460        17.3
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+
+--- direct rep 3/3  load: 3.13 2.80 2.80
+D6/D7: fork throughput vs concurrency. N=8000 forks per arm, TableBranchCatalog, release.
+parent arenas = 0 (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY
+and this harness CANNOT see D7 -- see give_parent_arenas).
+Recorded 2026-09-22T07:34:48-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        1      8000     29.496       271.2      3.687     8000         1.0
+        2      8000     27.337       292.6      3.417     7999         1.0
+        4      8000     14.325       558.5      1.791     4012         2.0
+        8      8000      7.460      1072.4      0.932     2039         3.9
+       16      8000      3.811      2099.2      0.476     1081         7.4
+       32      8000      2.307      3468.0      0.288      628        12.7
+       64      8000      1.703      4697.0      0.213      456        17.5
+      128      7936      3.054      2598.5      0.385      461        17.2
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+
+================================================================================
+MODE=pgwire — examples/d130_pgwire_batch.rs.
+================================================================================
+
+--- pgwire rep 1/1
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT? MODE=pgwire.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread or per fork, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost
+  first: `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog`'s
+  `logical`. E.6 measured that this is NOT the same experiment as MODE=direct, which
+  is `examples/fork_concurrency.rs`. Amendment 1 binds each number to its layer.
+
+  f/sync   = forks the server named, divided by fsyncs the catalog issued. A ratio of
+             two counters taken by one instrument over one run, so it is load-immune.
+  f/sync÷T = the pre-registered discriminator. ≈0.5 flat ⇒ outcome 1 (wake-up race);
+             falling in T ⇒ outcome 2 (the batch is not bounded by the threads);
+             ≈1.0 ⇒ outcome 3 (the batch already captures everyone).
+
+⛔ NO THROUGHPUT IS REPORTED. Each fork is a TCP round trip and the box is shared;
+   a rate from this harness would be a fact about the socket. The counts are the
+   evidence.
+
+# start: 2026-09-22T11:36:17Z  load: 2.90 2.78 2.79
+
+instrument self-check: two idle reads moved the counter by 0, and one serial fork moved it by exactly 1. OK
+
+  arm                                threads    forks    syncs    f/sync   f/sync÷T
+  P  conn per fork, BEGIN only          1       40       40      1.00     1.0000
+  P  conn per fork, BEGIN only          2       80       80      1.00     0.5000
+  P  conn per fork, BEGIN only          4      160      160      1.00     0.2500
+  P  conn per fork, BEGIN only          8      320      320      1.00     0.1250
+  P  conn per fork, BEGIN only         16      640      640      1.00     0.0625
+  P  conn per fork, BEGIN only         32     1280     1280      1.00     0.0312
+  P  conn per fork, BEGIN only         64     2560     2560      1.00     0.0156
+  P  conn per fork, BEGIN only        128     5120     5120      1.00     0.0078
+
+  S  persistent conn, BEGIN+ABANDON      1       40      200      0.20     0.2000
+  S  persistent conn, BEGIN+ABANDON      2       80      400      0.20     0.1000
+  S  persistent conn, BEGIN+ABANDON      4      160      800      0.20     0.0500
+  S  persistent conn, BEGIN+ABANDON      8      320     1600      0.20     0.0250
+  S  persistent conn, BEGIN+ABANDON     16      640     3200      0.20     0.0125
+  S  persistent conn, BEGIN+ABANDON     32     1280     6400      0.20     0.0063
+  S  persistent conn, BEGIN+ABANDON     64     2560    12800      0.20     0.0031
+  S  persistent conn, BEGIN+ABANDON    128     5120    25600      0.20     0.0016
+
+  D  POSITIVE CONTROL, no socket        1       40       40      1.00     1.0000
+  D  POSITIVE CONTROL, no socket        2       80       80      1.00     0.5000
+  D  POSITIVE CONTROL, no socket        4      160       80      2.00     0.5000
+  D  POSITIVE CONTROL, no socket        8      320       83      3.86     0.4819
+  D  POSITIVE CONTROL, no socket       16      640       90      7.11     0.4444
+  D  POSITIVE CONTROL, no socket       32     1280      103     12.43     0.3883
+  D  POSITIVE CONTROL, no socket       64     2560      155     16.52     0.2581
+  D  POSITIVE CONTROL, no socket      128     5120      299     17.12     0.1338
+
+⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,
+   same process, a pgwire server listening throughout — it simply does not go through
+   the socket. If D shows a batch and P/S do not, the instrument can see batching and
+   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact
+   about pgwire and every cell in this run is a fact about this harness.
+# end: 2026-09-22T11:40:11Z  load: 2.58 2.89 2.85
+
+finished: 2026-09-22T11:40:11Z
+
+================================================================================
+THE TABLE THE ROW TURNS ON — produced by bench/d130_summarise.py from the rows
+above, so the report and the artifact divide the same numbers.
+================================================================================
+
+MODE=direct   (3 reps per cell)
+      T     forks    syncs    f/sync   f/sync÷T   f/sync vs T=1
+      1     24000    24000      1.00     1.0000           1.00x
+      2     24000    23990      1.00     0.5002           1.00x
+      4     24000    12031      1.99     0.4987           1.99x
+      8     24000     6118      3.92     0.4904           3.92x
+     16     24000     3298      7.28     0.4548           7.28x
+     32     24000     1921     12.49     0.3904          12.49x
+     64     24000     1389     17.28     0.2700          17.28x
+    128     23808     1376     17.30     0.1352          17.30x
+
+MODE=pgwire D (POSITIVE CONTROL, no socket)   (1 rep per cell)
+      T     forks    syncs    f/sync   f/sync÷T   f/sync vs T=1
+      1        40       40      1.00     1.0000           1.00x
+      2        80       80      1.00     0.5000           1.00x
+      4       160       80      2.00     0.5000           2.00x
+      8       320       83      3.86     0.4819           3.86x
+     16       640       90      7.11     0.4444           7.11x
+     32      1280      103     12.43     0.3883          12.43x
+     64      2560      155     16.52     0.2581          16.52x
+    128      5120      299     17.12     0.1338          17.12x
+
+MODE=pgwire P (conn per fork, BEGIN only)   (1 rep per cell)
+      T     forks    syncs    f/sync   f/sync÷T   f/sync vs T=1
+      1        40       40      1.00     1.0000           1.00x
+      2        80       80      1.00     0.5000           1.00x
+      4       160      160      1.00     0.2500           1.00x
+      8       320      320      1.00     0.1250           1.00x
+     16       640      640      1.00     0.0625           1.00x
+     32      1280     1280      1.00     0.0312           1.00x
+     64      2560     2560      1.00     0.0156           1.00x
+    128      5120     5120      1.00     0.0078           1.00x
+
+MODE=pgwire S (persistent conn, BEGIN+ABANDON)   (1 rep per cell)
+      T     forks    syncs    f/sync   f/sync÷T   f/sync vs T=1
+      1        40      200      0.20     0.2000           1.00x
+      2        80      400      0.20     0.1000           1.00x
+      4       160      800      0.20     0.0500           1.00x
+      8       320     1600      0.20     0.0250           1.00x
+     16       640     3200      0.20     0.0125           1.00x
+     32      1280     6400      0.20     0.0063           1.00x
+     64      2560    12800      0.20     0.0031           1.00x
+    128      5120    25600      0.20     0.0016           1.00x
+
+READ IT THIS WAY — the three outcomes D130 pre-registered, in its own words:
+  1. `f/sync ÷ T` ≈ 0.5, flat in T  ⇒ the wake-up race is real.
+  2. `f/sync ÷ T` FALLS as T rises  ⇒ the batch is bounded by something that is not
+     the thread count — arrival, or an fsync that is not the serialization point at
+     all. The `T/2` reading is wrong and this row shrinks to a note.
+  3. `f/sync ÷ T` ≈ 1.0 at some T   ⇒ the race explanation is falsified outright.
+
+================================================================================
+⭐ THE RESULT — PRE-REGISTERED OUTCOME 2 FIRED, AT BOTH LAYERS.
+================================================================================
+
+In the entry's own words:
+
+  2. `f/sync ÷ T` FALLS as T rises ⇒ the batch is bounded by something that is not
+     the thread count — arrival, or an fsync that is not the serialization point at
+     all. The `T/2` reading is wrong and this row shrinks to a note.
+
+MODE=direct     `f/sync ÷ T`  1.000 · 0.500 · 0.499 · 0.490 · 0.455 · 0.390 · 0.270 · 0.135
+MODE=pgwire D   `f/sync ÷ T`  1.000 · 0.500 · 0.500 · 0.482 · 0.444 · 0.388 · 0.258 · 0.134
+MODE=pgwire P   `f/sync ÷ T`  1.000 · 0.500 · 0.250 · 0.125 · 0.063 · 0.031 · 0.016 · 0.008
+MODE=pgwire S   `f/sync ÷ T`  0.200 · 0.100 · 0.050 · 0.025 · 0.013 · 0.006 · 0.003 · 0.002
+                          T =     1       2       4       8      16      32      64     128
+
+⛔ THE T=1 CELL IS NOT OUTCOME 3. `f/sync ÷ T` reads 1.0 there because a lone forker has
+   nobody to share an fsync with, so `f/sync` is 1.0 by construction. It is the
+   instrument's positive control on the numerator — 24,000 fsyncs for 24,000
+   single-threaded forks — and it is evidence about the harness, not about the batch.
+
+--------------------------------------------------------------------------------
+1. THE DECISIVE NUMBER IS T=64 → T=128, AND IT IS A COUNT
+--------------------------------------------------------------------------------
+
+Doubling the thread count from 64 to 128 moved the direct-layer batch from 17.28 to
+17.30 forks per fsync: **+0.1%**. A batch set by the thread count would have doubled.
+The batch SATURATES, at a value this sweep measures: C ≈ 17.3.
+
+That saturation is now measured three independent times, and they agree to 2.9%:
+
+    C at T=128     17.61   MODE=direct, an earlier full run of this same script
+                           (committed at `cd2e9ac`; raw rows in that commit's artifact)
+                   17.30   MODE=direct, the run above, 3 reps
+                   17.12   MODE=pgwire arm D, a DIFFERENT fixture entirely
+                           (`default_for_database` + arena + runtime, 40 forks/thread)
+                           in a different process from the other two
+
+  and at T=64 the two direct runs are 17.08 and 17.28 — **1.2% apart**, twenty minutes
+  apart, on a box running other agents' suites throughout. That is what `f/sync` being a
+  ratio of two counters in one process buys, and it is why this row was specified in
+  counts rather than durations.
+
+⇒ This needed T=128 to see, exactly as the row said. At T=64 alone — the only T this
+  project had before this run — `f/sync ÷ T` is 0.270, and one point cannot tell a
+  saturating curve from a rising one.
+
+--------------------------------------------------------------------------------
+2. THE `T/2` LAW IS REAL, AND IT IS NOT THE CEILING
+--------------------------------------------------------------------------------
+
+The sweep does NOT kill the wake-up race. Below the knee the direct layer tracks `T/2`
+to within 9%:
+
+      T      f/sync    T/2    ratio
+      2        1.00      1     1.00
+      4        1.99      2     0.99
+      8        3.92      4     0.98
+     16        7.28      8     0.91
+     32       12.49     16     0.78      ← the knee
+     64       17.28     32     0.54
+    128       17.30     64     0.27
+
+⇒ The batch is `max(1, min(T/2, C))` with C ≈ 17.3 measured here, and the knee sits at
+  `T ≈ 2C ≈ 35`. The race governs while `T/2 < C`; above it the serial section does, and
+  `T` stops appearing in the answer at all.
+
+⇒ ⭐ SO THE ROW'S HEADLINE IS RIGHT WHERE IT DOES NOT MATTER AND WRONG WHERE IT DOES.
+  "The batch is EXACTLY HALF THE THREAD COUNT" holds for `T ≤ 16` and fails at `T = 64`
+  (0.270) and `T = 128` (0.135) — and 64 is the operating point every other number in
+  this project is quoted at.
+
+--------------------------------------------------------------------------------
+3. THE 32.0 THAT STARTED THE ROW IS A STUBBED RUNG, AND ITS OWN TABLE SAYS SO
+--------------------------------------------------------------------------------
+
+`bench/ceiling_raw/22_direct_crosscheck.txt` (branch `CEILING-artifacts`) is the cited
+file. Recomputing `f/sync ÷ T` from its own `syncs` column at T=64, N=8000, beside the
+second run of the same ladder in `12_paired_T64_N8000_warm0_reps5_WAITDUR.txt`, rep 0,
+configuration A:
+
+      rung   22_direct syncs  f/sync   ÷T       12_paired syncs  f/sync   ÷T
+      L0          336          23.81  0.372           440         18.18  0.284
+      L1          256          31.25  0.488           257         31.13  0.486
+      L2          256          31.25  0.488           256         31.25  0.488
+      L3          250          32.00  0.500           250         32.00  0.500
+
+⇒ The pinning at `T/2` is a property of the STUBBED rungs. L1–L3 agree across two
+  processes to within 0.4%; **L0 — the only rung that is a database — reads 0.372 in one
+  and 0.284 in the other, a 31% disagreement, and neither is 0.5.** That artifact's own
+  header says L1 writes no child record, L2 leaks retired slots, and L3 also drops the
+  capability envelope and the parent's live-child entry.
+
+⇒ This sweep's L0-equivalent at T=64 is 17.28 over three reps, 5.0% from `12_paired`'s
+  L0 (18.18). It does NOT reproduce `22_direct`'s L0 (23.81) — but those two prior L0
+  readings do not reproduce each other either, which is the point of the row above.
+
+--------------------------------------------------------------------------------
+4. AT THE LAYER PRODUCTION RUNS, THERE IS NO GROUP COMMIT AT ALL
+--------------------------------------------------------------------------------
+
+`f/sync` is **1.00 at every T from 1 to 128** in arm P, with `syncs` exactly equal to
+`forks` in every cell — 40/40, 80/80, … 5120/5120. Not approximately: exactly. Every
+`BEGIN AGENT SESSION` over the wire pays a private fsync and shares it with nobody, at
+128 concurrent connections as at one.
+
+⭐ **THE NEGATIVE IS FALSIFIED, NOT ASSUMED.** A flat 1.00 read alone is indistinguishable
+from a harness that could never have shown anything else. Arm D is the control: it forks
+on the rig's OWN `Arc<TableBranchCatalog>`, reads the SAME `syncs_issued()`, runs in the
+same process with a pgwire server listening throughout, and differs from P and S only in
+not going through the socket. It rises **1.00 → 17.12, a factor of 17.1**, across the
+same T values on which P never leaves 1.00. ⇒ The instrument can see a batch. The wire
+layer has none.
+
+Arm S answers the other objection — that arm P's threads spend their time connecting
+rather than queueing, so few are ever inside `wait_durable` together. It holds one
+connection per thread and returns to the fork immediately. It reads **exactly 0.20 at
+every T**, which is 1/5: five catalog fsyncs per BEGIN+ABANDON cycle, and just as flat.
+⇒ The connection shape is not the reason either.
+
+The mechanism is the second alternative outcome 2 names — *"an fsync that is not the
+serialization point at all"*. `ServerContext::catalog()` is taken outermost for the
+duration of one statement; `try_run_read` admits only EXPLAIN and non-`AS OF` SELECT, and
+the fork statement is not among them. So no two forks are ever concurrently inside
+`wait_durable`, and there is never a group to commit. This is an independent, load-immune
+confirmation of what E.6 measured with lock counts and what W4 reads off the source.
+
+⇒ ⭐ THE GROUP-COMMIT MECHANISM THE 21×/1.9× PAIR IS ABOUT IS INVISIBLE TO ANYTHING THAT
+  CONNECTS OVER THE WIRE.
+
+--------------------------------------------------------------------------------
+5. WHAT THIS LICENSES — AND WHAT IT DOES NOT
+--------------------------------------------------------------------------------
+
+⛔ **STAGED GROUP COMMIT IS NOT LICENSED BY THIS RESULT AND IS NOT PROPOSED ON IT.**
+The entry pre-wrote that fix for outcome 1, with its prior art named: PostgreSQL's
+`commit_delay`/`commit_siblings`; MySQL 5.6 / MariaDB binlog group commit split into
+flush/sync/commit stages (Kristian Nielsen); ARIES (Mohan et al., TODS 1992); RocksDB's
+write-batch leader. Outcome 1 did not fire. Staging lifts the batch from `T/2` toward `T`
+only where `T/2` is the binding term — `T ≤ 16` here — and at and above the knee the
+batch is capped at C by the serial section, so staging buys nothing at the operating
+point. At the pgwire layer it buys nothing at any T, because there is no group to stage.
+
+✅ What the counts do license, both of them engineering this project has already named:
+
+  (a) DIRECT LAYER — the lever is `C`, the number of forks that can pass through
+      `logical` while one fsync runs. Shortening that section is the only thing that
+      moves the batch above the knee. Not new: `bench/fork_concurrency_after.txt` already
+      concluded *"the batch size is not set by the disk at all — it is set by HOW MANY
+      FORKS CAN GET THROUGH `logical` WHILE ONE FSYNC RUNS"*, from a T=64-vs-T=256 pair.
+      This sweep confirms it across eight values of T, locates the knee at `T ≈ 2C`, and
+      reproduces C three times in two fixtures.
+
+  (b) PGWIRE LAYER — the lever is the outer statement lock, and the change is already
+      written down as W4 falsifier 3: *"Does the fork statement (`BEGIN AGENT SESSION`)
+      need `&mut Catalog` at all? It is not DML. If it does not, it may be admissible to
+      `try_run_read` independently of DML — a much smaller change that directly answers
+      E.6."* Until something of that shape lands, no work on `group_commit.rs` changes a
+      single number a client can observe.
+
+⇒ ⭐ THE FINDING IS THE CORRECTION, NOT A MECHANISM. The most-cited quantity in this
+  project is a batch that saturates at ~17.3 and a wire layer where it is 1.00, and
+  candidates have been designed against `T/D` as though `T` were in the numerator. It is
+  — but only below `T ≈ 32`, and never at all through pgwire.
+
+--------------------------------------------------------------------------------
+6. SUBORDINATE CROSS-CHECK — NOT EVIDENCE FOR THE OUTCOME
+--------------------------------------------------------------------------------
+
+The outcome above rests on counts alone. This paragraph is a consistency check and is
+labelled as one, because the box is shared and every duration on it is an upper bound.
+
+If `C = D/S`, the single-thread per-fork cost is `D + S` and the saturated per-fork cost
+is `S`. From rep 1 of the direct sweep above: 3.811 ms at T=1 and 0.191 ms at T=128 give
+`S ≈ 0.191`, `D ≈ 3.620`, `D/S ≈ 19.0`, against a measured batch of 17.3 — **10% apart,
+and HIGH**, which is the direction the instrument predicts: both durations are upper
+bounds on a shared box, and the T=1 cost carries per-fork scheduling that `D` does not,
+so this estimate of `D` is inflated and `D/S` with it. It is consistent with `C = D/S`
+at the precision two upper-bound durations can support, and it is not offered as proof
+of it. No throughput figure from this sweep is quoted anywhere above.
+
+--------------------------------------------------------------------------------
+7. WHAT THIS RUN CANNOT SAY
+--------------------------------------------------------------------------------
+
+- **It does not test the stubbed ladder.** L1–L3 exist only on `CEILING-park-or-structure`,
+  a never-merge scaffold on a divergent base. Whether `f/sync` stays pinned at `T/2` up to
+  T=128 on those rungs is untested here. It would not change the finding: those rungs are
+  not a database, and §2 shows the real rung obeys `T/2` below its own knee anyway.
+- **The pgwire arms are one rep**, not three. They do not need more: every cell is an
+  exact integer identity (`syncs == forks`, `syncs == 5 × forks`), not a noisy average.
+- **`FERRODB_PARENT_ARENAS=0`**, so the direct harness cannot see D7's arena scan. That
+  keeps `S` at its smallest and `C = D/S` at its largest, which is the direction that
+  favours the hypothesis under test — the batch saturates anyway.
+
+================================================================================
+8. ⭐ THE LOAD-BEARING PREMISE — STATED AS ONE SENTENCE, AND RE-CHECKED AT MAIN'S
+   CURRENT HEAD RATHER THAN AT THIS BRANCH'S BASE.
+================================================================================
+
+Three sibling lanes came back NOT LANDABLE on the same day for a false premise rather
+than a wrong number — one of them because a premise true when written was falsified by a
+merge 2.5 hours later. Everything above rests on one premise of exactly that kind, so it
+is written here to be checked rather than assumed.
+
+⭐ **THE PREMISE.** `CommitGroup::wait_durable` (`src/branch/group_commit.rs`) is
+single-stage commit-when-ready: the leader sets `syncing`, reads `let target =
+st.requested;` while still holding the state lock and before it calls `sync()`, and
+applies no size cap and no accumulation delay — so one fsync covers exactly the tickets
+that existed at the instant it began, and a ticket handed out during a sync waits a whole
+further round.
+
+That is what makes `throughput = min(1/S, T/D)` and the `f/sync ≈ T/2` race prediction
+mean anything at all. If it is false, every number above is computed on top of a fiction.
+
+**CHECKED 2026-09-22T11:45Z against `main` at `98a44ef`** — not against `2bc80fd`, which
+is where this branch was cut and which main has since moved past several times:
+
+    git rev-parse 2bc80fd:src/branch/group_commit.rs  -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+    git rev-parse 98a44ef:src/branch/group_commit.rs  -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+    git rev-parse main:src/branch/group_commit.rs     -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+
+⇒ **Byte-identical.** `src/branch/table_catalog.rs`, which holds the only production call
+sites, is likewise unchanged across that span (`git diff --stat 2bc80fd..main --` on both
+files is empty). The premise is TRUE AT HEAD, and the measurement was taken on the same
+blob production runs.
+
+**The symbols, not line numbers** — line numbers drift, and correcting a right one with a
+wrong one has already cost this project once:
+
+  - `src/branch/group_commit.rs` :: `CommitGroup::wait_durable` — reads `target` under the
+    state lock, immediately after setting `syncing` and immediately before `drop(st)`.
+  - `src/branch/group_commit.rs` :: `CommitGroup::ticket` — the only way `requested` moves.
+  - `src/branch/table_catalog.rs` :: `TableBranchCatalog::stage` — the ONLY production
+    caller of `ticket()`; takes it after `publish_root()`, under the logical lock.
+  - `src/branch/table_catalog.rs` :: `TableBranchCatalog::durable` — the ONLY production
+    caller of `wait_durable`; supplies `flush_all` + `disk_manager.sync()` as the fsync.
+
+⇒ Enumerated from the callers, not assumed: at `main` there are exactly **four** callers
+  of `ticket()` — three of them in this file's own `#[cfg(test)]` module — and exactly
+  **one** caller of `wait_durable` outside the module. There is no second commit path for
+  the premise to be false on.
+
+⛔ **ONE PRECISION, SO NOBODY "CORRECTS" THIS PREMISE WRONGLY LATER.** The phrase "no
+timer" is right about batching and wrong as a literal reading of the file: `wait_durable`
+contains `wait_timeout(st, Duration::from_millis(50))`. That is a FOLLOWER's bounded park,
+present so a lost wakeup cannot hang a writer for the life of the process, and the file
+says so in as many words. It is **not** a leader delaying its flush to collect more
+tickets — which is precisely what PostgreSQL's `commit_delay` is, and precisely what this
+code does not have. A reader who greps `Duration::` here will find it; the premise
+survives, and the distinction is the whole difference between single-stage and staged
+group commit.
+
+⇒ ✅ THE PREMISE HELD. Had it not, that would have been the result and the tables above
+  would have been withdrawn rather than reported.
