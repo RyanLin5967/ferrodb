@@ -352,6 +352,24 @@ impl TableBranchCatalog {
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
     /// One waiter issues the sync and the rest share it, which is the entire point: holding the
     /// lock here would put the serialization straight back.
+    ///
+    /// ⛔ **`flush_all` TAKING NO `seq` IS LOAD-BEARING. DO NOT "OPTIMISE" IT TO A SEQ-SCOPED
+    /// FLUSH.** It reads the whole `page_table` and writes *every* dirty page
+    /// (`buffer/buffer_pool.rs`), which looks like obvious dead work from here — this method has a
+    /// `seq`, so why flush pages no ticket asked for? Because since D159 a fork can be **staged and
+    /// not yet awaited**: `fork_staged` returns its ticket to the caller so the sync can happen
+    /// outside the caller's wider lock. During that window the staged fork's pages sit dirty in
+    /// this pool, and what guarantees they are not lost is that **any later `durable()` on this
+    /// catalog flushes them too**.
+    ///
+    /// The per-seq accounting in `CommitGroup` does NOT provide that guarantee — it is strictly
+    /// weaker and only ever under-claims. ⇒ Narrowing the flush to the pages `seq` covers would
+    /// convert a non-hazard into a real one, and **the ticket accounting would still say the fork
+    /// was durable while its pages had never been written.**
+    ///
+    /// `tests/d159_fork_sync_is_deferred.rs::a_later_sync_makes_an_earlier_staged_fork_durable`
+    /// asserts this behaviourally, by reopening the file, so the coarseness is pinned rather than
+    /// merely described here.
     fn durable(&self, seq: u64) -> Result<(), FerroError> {
         self.commit_group.wait_durable(seq, || {
             self.pool.flush_all()?;

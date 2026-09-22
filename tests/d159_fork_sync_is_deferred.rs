@@ -206,6 +206,58 @@ fn completing_a_staged_fork_does_not_touch_the_fallback_counter() {
     );
 }
 
+/// ⛔ **The basis of the whole "a staged fork cannot be lost" argument, asserted instead of
+/// assumed — and it is COARSER than the per-seq accounting the design is written in terms of.**
+///
+/// `durable(seq)` calls `BufferPoolManager::flush_all`, which takes **no seq**: it writes every
+/// dirty page in the pool. So a fork that is staged and whose ticket is never awaited directly is
+/// still made durable by *any later* sync on the same catalog.
+///
+/// This test exists because that coarseness reads like dead work from inside `durable()` — it has a
+/// `seq`, so flushing pages no ticket asked for looks like something to optimise away. Narrowing it
+/// would convert a non-hazard into a real one, **and the ticket accounting would not notice**:
+/// `CommitGroup` would still report the fork durable while its pages had never been written.
+///
+/// The assertion is therefore made against the FILE, by reopening it — not against the sync
+/// counter, which would pass under exactly the mutation this is meant to catch.
+#[test]
+fn a_later_sync_makes_an_earlier_staged_fork_durable() {
+    use ferrodb::branch::types::LeaseDeadline;
+    use ferrodb::branch::BranchCatalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.branchcat");
+
+    let staged = {
+        let cat = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+
+        // A is staged and its ticket is DELIBERATELY dropped on the floor — no `await_fork_durable`
+        // for this one, ever. Nothing but the coarse flush can save it.
+        let (a, _never_awaited) =
+            cat.fork_staged(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap();
+
+        // An unrelated later fork, and ITS sync is the only one issued.
+        let (_b, seq_b) =
+            cat.fork_staged(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap();
+        cat.await_fork_durable(seq_b).unwrap();
+
+        a.branch_id
+        // `cat` drops here. The pool does NOT flush on drop -- that is exactly how an earlier
+        // version of this catalog shipped a database whose header page read `magic 0x00000000`
+        // on reopen, so this drop is not doing the test's work for it.
+    };
+
+    let reopened = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+    reopened.get(staged).unwrap_or_else(|e| {
+        panic!(
+            "a fork staged before an unrelated sync was NOT on disk after reopen: {e}. \
+             `durable()` must flush the whole pool, not just the pages its `seq` covers -- if that \
+             has been narrowed, every staged-but-not-yet-awaited fork can be lost while \
+             CommitGroup still reports it durable."
+        )
+    });
+}
+
 /// `BranchCatalog::fork` keeps its contract on a store that does NOT implement the split. The
 /// default `fork_staged` forks durably and reports nothing pending, so an implementor that never
 /// heard of tickets is correct by default rather than silently non-durable.
