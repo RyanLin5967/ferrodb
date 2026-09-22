@@ -138,3 +138,24 @@ was two builds and two runs, so the argument was not worth making.
 **Every one of the sixteen cells is identical to the 2a0a8fc measurement, to the integer.** Both
 controls still zero, instrument self-check passed in both arms. The conclusion is unchanged and is
 now about the tree that will ship rather than about the tree that was current when it was written.
+
+-----------------------------------------------------------------------------------------------
+⚠ WHAT A COUNTER IS EVIDENCE OF. Scoping this row's instrument, not its number.
+-----------------------------------------------------------------------------------------------
+Everything in this file is a COUNT of acquisitions of `ServerContext::catalog()`. That answers one
+question honestly — HOW MANY TIMES was the outermost lock taken — and is silent on every other:
+
+  * it does not show that removing an acquisition changed throughput or latency. No duration is
+    measured anywhere in this file, deliberately, and none may be inferred from it;
+  * it says nothing about what any acquisition DID. A count agrees with itself whether or not the
+    work under the lock was correct.
+
+The d159 lane measured the cost of forgetting this: a mutant that made the catalog lose every
+staged fork left six of seven tests green, because the ratio those tests read was a counter and
+the counter still agreed with itself. A counter is the right instrument for "did a group form?"
+and the wrong one for "did anything reach disk?".
+
+⇒ **The functional claim for D151 is NOT carried by this file.** It is carried by the per-target
+suite (bench/d151_certified/, 2512 passed on base 4685d80) and by
+tests/d151_parse_reads_a_refreshed_snapshot.rs, whose ability to see the defect it names was
+itself established by mutation (bench/d151_firecheck.txt) rather than asserted.
