@@ -129,6 +129,27 @@ pub fn ours_scan_counters() -> (u64, u64) {
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///
+/// # ⛔ D114 — yes, this is a full scan per changed cell. MEASURED, and it is NOT the cost.
+///
+/// If you are here because you noticed that the caller computes `theirs` on the very next line via
+/// `concurrent_op` — which **D86 indexed** down to a `partition_point` — and that this side was
+/// left linear: that reading is correct, and it has already been measured. Do not index it.
+///
+/// The scan is exactly `delta x ops`, confirmed to a ratio of **1.000** by a counter. It is also
+/// invisible: driving `examined` up **128.5x** moved merge latency 0.93x-1.20x, and a
+/// configuration walking **32x more ops** merges FASTER than one walking fewer with a bigger
+/// delta. **Merge cost tracks the DELTA, not this op log.** The curve, both directions, 15/15
+/// merges applied, is `bench/d114_ours_side_scan.md` with raw runs in `bench/d114_before.txt`.
+///
+/// Two reasons indexing it would be a mistake rather than merely useless. First, `evaluate_merge`
+/// already clones this whole Vec once per merge (`ops: ws.frame.ops.clone()`), so the merge is
+/// O(ops) regardless and the scan only adds a factor of the delta — never a complexity class.
+/// Second, it would be the THIRD wrong mechanism proposed for a slope on this exact code (D68,
+/// D69-REOPEN, D114); the first two were also read correctly off the source and also wrong.
+///
+/// ⚠ If you are looking for a real quadratic on this path, it is in `stage_all`, which clones the
+/// whole frame once **per statement** — measured at exponent 1.95, and 200x larger than this.
+///
 /// One function rather than the three identical iterator chains that were here before
 /// (`evaluate_merge`, `merge_into`, `sibling_op`) — they differed only in which `Vec<Op>` they
 /// read, and a defect in a scan repeated three times is a defect that gets fixed twice. The
