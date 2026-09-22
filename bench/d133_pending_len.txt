@@ -1,3 +1,24 @@
+################################################################################################
+# ⛔⛔ DRAW 1 — **CONTAMINATED. DO NOT QUOTE ANY ms COLUMN FROM THIS FILE.**
+#
+# This run held /tmp/ferrodb-measure.lock and checked /tmp/ferrodb-suite.lock ONCE, at start,
+# where it was free. `tools/verify-suite.sh land21ae398` (pid 92075) then took the suite lock at
+# **11:57:51Z — 106 seconds into this 252-second run** (11:56:05Z -> 12:00:17Z). ARM 2, the
+# shipped-catalog arm, ran almost entirely underneath a full suite build.
+#
+# The measure lock could not have prevented it: `tools/verify-suite.sh` knows only
+# SUITE_LOCK=/tmp/ferrodb-suite.lock and never reads the measure lock, so the protection is
+# one-way — it deters measurers and no suite at all.
+#
+# ✅ **WHAT SURVIVES: every INTEGER column** — pend_end, pend_peak, passes, entry_visits. They are
+# counts, not durations, and a loaded box cannot change them. `bench/d133_check.py` verifies all
+# 30 rows against the closed form derived from the code. The ms and ms/reap columns are kept only
+# so this draw can be compared with the clean one; they are not evidence.
+#
+# ⇒ The quotable timings are in **DRAW 2**, `bench/d133_pending_len_draw2.txt`, produced by the
+#   hardened runner that samples the suite lock before and after every arm and exits 3 if it was
+#   ever taken.
+################################################################################################
 # D133 — pending-free queue length under a branching workload. RAW ARTIFACT.
 #
 # run at            2026-09-22T11:56:05Z UTC
