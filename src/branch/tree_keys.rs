@@ -124,6 +124,18 @@ pub fn child_epoch_from_key(key: &[u8]) -> Option<u64> {
     Some(u64::MAX - c)
 }
 
+/// Recover the parent id from a `CHILD` key's middle eight bytes. NOT complemented — only the
+/// epoch is, so that the span reads newest-first.
+///
+/// The sibling of [`child_epoch_from_key`], and it exists for one reason: a resolver that refuses
+/// an entry holds only the key, and an error that cannot say WHICH entry is unactionable.
+pub fn child_parent_from_key(key: &[u8]) -> Option<u64> {
+    if key.len() != 17 || key[0] != tag::CHILD {
+        return None;
+    }
+    Some(u64::from_be_bytes(key[1..9].try_into().ok()?))
+}
+
 /// `[0x04][u64::MAX - id]` — **complemented**, so the HIGHEST free id is the first key.
 ///
 /// Not an aesthetic choice: `LogBranchCatalog` keeps free ids in a sorted `Vec` and `fork` calls
@@ -315,7 +327,36 @@ mod tests {
                     "child keys are not descending in the fork epoch at {a} vs {b}"
                 );
                 assert_eq!(child_epoch_from_key(&child(7, a)), Some(a), "epoch does not round-trip");
+                // Both halves, from the SAME key: an error that names the wrong entry is worse
+                // than one that names none, and the epoch is complemented while the parent is not.
+                assert_eq!(
+                    child_parent_from_key(&child(a, b)),
+                    Some(a),
+                    "parent does not round-trip out of a CHILD key at {a}/{b}"
+                );
+                assert_eq!(
+                    child_epoch_from_key(&child(a, b)),
+                    Some(b),
+                    "epoch does not round-trip out of a CHILD key at {a}/{b}"
+                );
             }
+        }
+    }
+
+    /// A decoder that answers for a key it was not given is worse than one that refuses: both
+    /// callers put the answer into an error message that a human uses to find the entry.
+    #[test]
+    fn the_child_key_decoders_refuse_anything_that_is_not_a_child_key() {
+        for (name, k) in [
+            ("record", record(7)),
+            ("deadline", deadline(7, 7)),
+            ("state", state(1, 7)),
+            ("free_id", free_id(7)),
+            ("arena", arena(7, 7)),
+            ("truncated child", child(7, 7)[..16].to_vec()),
+        ] {
+            assert!(child_parent_from_key(&k).is_none(), "parent decoded out of a {name} key");
+            assert!(child_epoch_from_key(&k).is_none(), "epoch decoded out of a {name} key");
         }
     }
 
