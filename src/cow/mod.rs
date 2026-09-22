@@ -70,6 +70,16 @@ impl PageHandle {
         PageHandle { pool, page_id, frame_idx, dirty: AtomicBool::new(false) }
     }
 
+    /// A second, independent pin on the same page.
+    ///
+    /// `CowTree`'s write journal holds one of these for every page it may have to restore, so
+    /// the restore writes through a frame that cannot have been evicted and never has to go
+    /// back through [`PageStore::read_page`] — which verifies the checksum and would refuse
+    /// exactly the half-written page a rollback exists to repair.
+    pub fn repin(&self) -> Result<PageHandle, FerroError> {
+        PageHandle::fetch(self.pool.clone(), self.page_id)
+    }
+
     pub fn read(&self) -> RwLockReadGuard<'_, Frame> {
         self.pool.frames[self.frame_idx].read().unwrap()
     }

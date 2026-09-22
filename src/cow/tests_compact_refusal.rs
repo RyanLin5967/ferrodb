@@ -24,8 +24,9 @@
 //! starved failures without reaching the refusal path once, and passed.
 
 use std::fs::OpenOptions;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
@@ -55,11 +56,26 @@ struct StarvingStore {
     inner: Arc<CowStore>,
     /// Allocations still permitted, or `-1` for "no limit".
     budget: AtomicI64,
+    /// Every allocation this store has served or refused since [`StarvingStore::reset_log`],
+    /// in order. `None` is a refusal. D125's instrument reads this to attribute a failure to a
+    /// call site without putting a hook in production code: `alloc_for(BTreeLeaf)` is only
+    /// reached from `write_leaf_chunked`, and `alloc_for(BTreeInternal)` only from
+    /// `internal_relink` or the new-root tail of `relink_up`, so the type sequence says which
+    /// stage the operation died in.
+    log: Mutex<Vec<(Option<PageId>, PageType)>>,
 }
 
 impl StarvingStore {
     fn new(inner: Arc<CowStore>) -> StarvingStore {
-        StarvingStore { inner, budget: AtomicI64::new(-1) }
+        StarvingStore { inner, budget: AtomicI64::new(-1), log: Mutex::new(Vec::new()) }
+    }
+
+    fn reset_log(&self) {
+        self.log.lock().unwrap().clear();
+    }
+
+    fn log_entries(&self) -> Vec<(Option<PageId>, PageType)> {
+        self.log.lock().unwrap().clone()
     }
 
     /// Permit exactly `n` more allocations, then refuse every one after that. Sweeping `n`
@@ -85,9 +101,12 @@ impl PageStore for StarvingStore {
         if self.budget.load(Ordering::SeqCst) >= 0
             && self.budget.fetch_sub(1, Ordering::SeqCst) <= 0
         {
+            self.log.lock().unwrap().push((None, page_type));
             return Err(FerroError::Cow("starving store: allocation refused".into()));
         }
-        self.inner.alloc_in_arena(arena, page_type, birth_epoch)
+        let id = self.inner.alloc_in_arena(arena, page_type, birth_epoch)?;
+        self.log.lock().unwrap().push((Some(id), page_type));
+        Ok(id)
     }
 
     fn read_page(&self, page_id: PageId) -> Result<PageHandle, FerroError> {
@@ -173,6 +192,52 @@ impl Fixture {
         let h = PageHandle::fetch(self.inner.pool().clone(), id).unwrap();
         let f = h.read();
         f.data
+    }
+
+    /// Every key the tree can reach from `root`, and every page it reaches to get them.
+    ///
+    /// Reads pages through [`Fixture::raw`] rather than `read_page` so a tree that has been left
+    /// with a bad checksum can still be enumerated — the question here is which rows are
+    /// *reachable*, not whether the reader would hand them over.
+    fn reachable(&self, root: PageId) -> (BTreeSet<Vec<u8>>, BTreeSet<PageId>) {
+        let pages = self.leaves_and_internals(root);
+        let mut keys = BTreeSet::new();
+        for p in &pages {
+            let page = self.raw(*p);
+            if PageHeader::read_from(&page).unwrap().page_type != PageType::BTreeLeaf {
+                continue;
+            }
+            for (k, _) in Node::new(&page).leaf_entries().unwrap() {
+                keys.insert(k);
+            }
+        }
+        (keys, pages.into_iter().collect())
+    }
+
+    /// Every key in the subtree rooted at `page_id`, whether or not anything points at it.
+    ///
+    /// Recursive, because an orphaned **internal** node strands every leaf beneath it, and those
+    /// leaves are pages that existed long before the call that stranded them.
+    fn keys_under(&self, page_id: PageId, depth: usize, out: &mut BTreeSet<Vec<u8>>) {
+        if depth > 64 {
+            return;
+        }
+        let page = self.raw(page_id);
+        match PageHeader::read_from(&page) {
+            Ok(h) if h.page_type == PageType::BTreeLeaf => {
+                if let Ok(entries) = Node::new(&page).leaf_entries() {
+                    out.extend(entries.into_iter().map(|(k, _)| k));
+                }
+            }
+            Ok(h) if h.page_type == PageType::BTreeInternal => {
+                if let Ok(kids) = Node::new(&page).all_children() {
+                    for c in kids {
+                        self.keys_under(c, depth + 1, out);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Every leaf page id, left to right.
@@ -491,6 +556,264 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
         starved_base,
         starved_gap
     );
+}
+
+// ================================================================================================
+// D125 instrument: WHERE the rows go when a starved insert loses them
+// ================================================================================================
+
+/// The instrument behind D125, kept because the number without it is a mechanism-free fact.
+///
+/// It runs the probe's own sequence and, on **every** failure that loses a row, records three
+/// things that together separate the two candidate mechanisms:
+///
+/// * the [`PageType`] of the **refused** allocation. `alloc_for(BTreeLeaf)` is reached only from
+///   `write_leaf_chunked`; `alloc_for(BTreeInternal)` only from `internal_relink` or the
+///   new-root tail of `relink_up`. So the type says which stage died.
+/// * how many pages of each type the call had already been *served* before it was refused —
+///   i.e. whether the leaf split had completed.
+/// * for each lost key, whether it now sits on a page **allocated during this very call** and
+///   unreachable from the root (a fresh split piece nobody points at), or has vanished from a
+///   page that was there before.
+///
+/// Run it with `--ignored --nocapture`; it prints a table and asserts only its own premises.
+#[test]
+#[ignore = "D125 instrument: prints the mechanism table, gates nothing"]
+fn d125_instrument_where_a_starved_insert_loses_rows() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut failures = 0usize;
+    let mut losing = 0usize;
+    let mut refused_leaf = 0usize;
+    let mut refused_internal = 0usize;
+    let mut losing_refused_leaf = 0usize;
+    let mut losing_refused_internal = 0usize;
+    let mut lost_total = 0usize;
+    let mut lost_on_fresh_orphan = 0usize;
+    let mut lost_on_detached = 0usize;
+    let mut lost_elsewhere = 0usize;
+    let mut leaf_split_completed = 0usize;
+    let mut printed = 0usize;
+
+    for j in 0..220u32 {
+        let key = gap_key_of(300, j);
+        let mut allowance = 0i64;
+        loop {
+            let (before_keys, before_pages) = f.reachable(root);
+            f.store.reset_log();
+            f.store.allow(allowance);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited();
+            let entries = f.store.log_entries();
+            match outcome {
+                Ok(new_root) => {
+                    root = new_root;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    let refused = entries.iter().find(|(id, _)| id.is_none()).map(|(_, t)| *t);
+                    let served_leaf = entries
+                        .iter()
+                        .filter(|(id, t)| id.is_some() && *t == PageType::BTreeLeaf)
+                        .count();
+                    let served_internal = entries
+                        .iter()
+                        .filter(|(id, t)| id.is_some() && *t == PageType::BTreeInternal)
+                        .count();
+                    match refused {
+                        Some(PageType::BTreeLeaf) => refused_leaf += 1,
+                        Some(PageType::BTreeInternal) => refused_internal += 1,
+                        other => panic!("unexpected refusal of {:?}", other),
+                    }
+                    let (after_keys, after_pages) = f.reachable(root);
+                    let lost: Vec<Vec<u8>> =
+                        before_keys.difference(&after_keys).cloned().collect();
+                    if !lost.is_empty() {
+                        losing += 1;
+                        lost_total += lost.len();
+                        match refused {
+                            Some(PageType::BTreeLeaf) => losing_refused_leaf += 1,
+                            Some(PageType::BTreeInternal) => losing_refused_internal += 1,
+                            _ => unreachable!(),
+                        }
+                        // Did the leaf split finish before the call died? It allocates one page
+                        // per cut past the first, so "served at least one leaf and was not
+                        // refused a leaf" means the cut loop ran to completion.
+                        if refused != Some(PageType::BTreeLeaf) && served_leaf > 0 {
+                            leaf_split_completed += 1;
+                        }
+                        // Pages this call allocated and that nothing points at afterwards.
+                        let fresh_orphans: Vec<PageId> = entries
+                            .iter()
+                            .filter_map(|(id, _)| *id)
+                            .filter(|id| !after_pages.contains(id))
+                            .collect();
+                        let mut on_fresh = BTreeSet::new();
+                        for p in &fresh_orphans {
+                            f.keys_under(*p, 0, &mut on_fresh);
+                        }
+                        // Pages that WERE reachable before this call and are not now: a
+                        // pre-existing subtree the failure detached.
+                        let detached: Vec<PageId> =
+                            before_pages.difference(&after_pages).copied().collect();
+                        let mut on_detached = BTreeSet::new();
+                        for p in &detached {
+                            f.keys_under(*p, 0, &mut on_detached);
+                        }
+                        let here = lost.iter().filter(|k| on_fresh.contains(*k)).count();
+                        let there = lost
+                            .iter()
+                            .filter(|k| !on_fresh.contains(*k) && on_detached.contains(*k))
+                            .count();
+                        lost_on_fresh_orphan += here;
+                        lost_on_detached += there;
+                        lost_elsewhere += lost.len() - here - there;
+                        if printed < 8 {
+                            printed += 1;
+                            println!(
+                                "  loss #{}: budget={} refused={:?} served(leaf={},int={}) \
+                                 lost={} [fresh-orphan={} detached-preexisting={} other={}] \
+                                 fresh_orphan_pages={} detached_pages={} \
+                                 pages_before={} pages_after={}",
+                                losing,
+                                allowance,
+                                refused.unwrap(),
+                                served_leaf,
+                                served_internal,
+                                lost.len(),
+                                here,
+                                there,
+                                lost.len() - here - there,
+                                fresh_orphans.len(),
+                                detached.len(),
+                                before_pages.len(),
+                                after_pages.len(),
+                            );
+                        }
+                    }
+                    allowance += 1;
+                    assert!(allowance < 64, "fixture: never succeeded");
+                }
+            }
+        }
+    }
+
+    println!(
+        "D125 instrument: {} starved failures, {} of them lost rows ({} rows total).\n\
+         refused allocation was a leaf page in {} failures ({} of them losing), an internal \
+         page in {} ({} losing).\n\
+         leaf split had already completed in {} of the {} losing failures.\n\
+         lost rows by where they went: {} into a subtree the failing call ALLOCATED and left \
+         unreachable, {} into a PRE-EXISTING subtree the failing call detached, {} unaccounted \
+         for by either.",
+        failures,
+        losing,
+        lost_total,
+        refused_leaf,
+        losing_refused_leaf,
+        refused_internal,
+        losing_refused_internal,
+        leaf_split_completed,
+        losing,
+        lost_on_fresh_orphan,
+        lost_on_detached,
+        lost_elsewhere,
+    );
+
+    assert!(failures > 0, "fixture: nothing was ever starved");
+    assert!(losing > 0, "fixture: nothing ever lost a row, so there is no mechanism to attribute");
+}
+
+/// The second half of D125's instrument: the **same** starvation on a tree whose pages are not
+/// private, which is the arm that pins the mechanism to in-place mutation.
+///
+/// Registering a child branch that forked *after* the build makes every page of that build fail
+/// `CowStore::privacy`, so `cow_page` shadows instead of handing the page back for in-place
+/// mutation. Nothing else about the fixture changes: same 600 + 220 keys, same budget sweep,
+/// same allocator refusals in the same places.
+///
+/// If the trunk's losses were caused by anything other than mutating a page the old root still
+/// points at, this arm would lose rows too.
+#[test]
+#[ignore = "D125 instrument: prints the mechanism table, gates nothing"]
+fn d125_instrument_the_same_starvation_on_shadowed_pages() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    // A live child forked immediately before every attempt below. `CowStore::privacy` refuses
+    // in-place mutation of a page born before a live child's fork epoch, so this makes every
+    // page the build produced non-private at the moment it is touched. One fork is not enough:
+    // a shadow is born at the *current* epoch, so it is private again on the next write, which
+    // is why an earlier cut of this arm shadowed 1 insert of 220 and reproduced the loss exactly.
+    let mut next_branch = 1u64;
+
+    let mut failures = 0usize;
+    let mut losing = 0usize;
+    let mut lost_total = 0usize;
+    let mut shadowed = 0usize;
+    for j in 0..220u32 {
+        let key = gap_key_of(300, j);
+        let mut allowance = 0i64;
+        loop {
+            let (before_keys, _) = f.reachable(root);
+            f.inner
+                .register_branch(
+                    BranchId { id: next_branch, generation: 0 },
+                    Some(BranchId::TRUNK),
+                    f.tick(),
+                )
+                .unwrap();
+            next_branch += 1;
+            f.store.reset_log();
+            f.store.allow(allowance);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited();
+            match outcome {
+                Ok(new_root) => {
+                    if new_root != root {
+                        shadowed += 1;
+                    }
+                    root = new_root;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    let (after_keys, _) = f.reachable(root);
+                    let lost = before_keys.difference(&after_keys).count();
+                    if lost > 0 {
+                        losing += 1;
+                        lost_total += lost;
+                    }
+                    allowance += 1;
+                    assert!(allowance < 64, "fixture: never succeeded");
+                }
+            }
+        }
+    }
+    let base_lost =
+        (0..600u32).filter(|&i| f.tree.get(root, &long_key_of(i)).unwrap().is_none()).count();
+    let gap_lost =
+        (0..220u32).filter(|&j| f.tree.get(root, &gap_key_of(300, j)).unwrap().is_none()).count();
+    println!(
+        "D125 shadowed arm: {} starved failures, {} of them lost rows ({} rows); \
+         end state: {} of 600 base and {} of 220 gap rows missing; \
+         {} of 220 inserts moved the root (i.e. actually shadowed).",
+        failures, losing, lost_total, base_lost, gap_lost, shadowed,
+    );
+
+    // Premises: this arm has to reach the same failures, and it has to actually be shadowing.
+    assert!(failures > 0, "fixture: nothing was ever starved in the shadowed arm");
+    assert!(shadowed > 0, "fixture: no insert shadowed, so the fork did not take effect");
 }
 
 // ================================================================================================
