@@ -44,7 +44,7 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::cow::page_header::{flags, stamp_checksum, verify_checksum, PageHeader, PageType};
 use crate::cow::{CowPage, PageHandle, PageStore, PAGE_HEADER_SIZE};
 use crate::error::FerroError;
-use crate::storage::atomic_file::{replace_atomically, FileOps, OsFileOps};
+use crate::storage::atomic_file::{append_durably, replace_atomically, FileOps, OsFileOps};
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::wal::log::crc32;
 
@@ -355,6 +355,125 @@ pub struct ArenaPageStore {
     /// extent is the rare event (once per `extent_pages`, default 256), so persisting there costs
     /// a small write per 256 allocations and bounds what a crash can lose to one extent.
     checkpoint_path: Mutex<Option<std::path::PathBuf>>,
+    /// **D81.** What this process knows about the shape of the file at `checkpoint_path`, and the
+    /// lock that makes the DURABLE record order equal the IN-MEMORY mutation order.
+    ///
+    /// See [`PersistState`]. Held across the state mutation *and* the durable write on the two
+    /// paths that append a delta, which is the whole reason it is a separate lock rather than a
+    /// pair of counters.
+    persist: Mutex<PersistState>,
+    /// Bumped by every change to the pending-free log that no tail record describes.
+    ///
+    /// Outside `persist` deliberately: `park_or_release` holds only the `state` lock, and making
+    /// it take the persist lock would put a durable-write mutex on the page-free path. A counter
+    /// it can bump freely, compared under the persist lock, gets the same answer without the
+    /// lock-order problem. See [`PersistState::durable_pending_version`].
+    pending_version: AtomicU64,
+}
+
+/// **D81 — the append-only tail, and what this process is allowed to assume about the file.**
+///
+/// `<db>.arena` is `[image][tail record]*`. The image is exactly what [`ArenaPageStore::
+/// state_bytes`] has always produced — byte-identical, same version, every file already on disk
+/// still opens — and the tail is a sequence of self-delimiting, individually CRC'd records that
+/// each describe ONE change to the map. A claim appends 45 bytes and fsyncs once; the whole
+/// image is rewritten through [`replace_atomically`] only when the tail has grown past
+/// [`ArenaPageStore::compact_threshold`] of it.
+///
+/// # Why this is a struct with a lock and not three atomics
+///
+/// **The tail is an ORDERED log, so the durable order has to equal the in-memory order.** The case
+/// that forces it: `free_arena` returns extent X to the free list and `alloc_arena` immediately
+/// re-claims it. In memory that is free-then-claim and it is correct. If the two records reach the
+/// file claim-then-free, replay ends with X on the free list *and* live in `extents` — two owners
+/// for one page range, which is the exact failure the whole map exists to prevent. Full-image
+/// checkpoints could not have this bug, because each one publishes a coherent snapshot of the
+/// moment it ran and the last writer wins; a delta cannot, because every delta is only meaningful
+/// against the one before it.
+///
+/// So this mutex is held across `reserve` + the `state` mutation + the append, on both delta
+/// paths. It is **outermost**: taken before `state`, before the catalog's locks and before
+/// `REPLACE_LOCK`, and never acquired while any of them is held. Every `persist_if_configured`
+/// call site already drops the `state` guard before persisting, which is what makes that rule
+/// satisfiable rather than aspirational.
+///
+/// # What a tail record does NOT carry, and why that is not a hole
+///
+/// A full-image checkpoint made *everything* durable as a side effect, so it is worth being
+/// explicit about what stops doing so. Three kinds of per-PAGE state change without persisting
+/// anything, and did so before this row too: `next_free` (advanced by `alloc_in_arena`), the
+/// per-extent `recycled` list (pushed by `release_page`, popped by `alloc_in_arena`), and the
+/// pending-free log. Under full images a later claim wrote them down incidentally; a tail record
+/// does not.
+///
+/// **For the first two that changes nothing, because the design already refuses to trust them in
+/// a restored extent** — and it refuses per-extent, not per-age-of-image. `load_state` clears
+/// `current`, so `arena_for` never resumes filling a restored extent and never reaches its
+/// recycled list; and D85's `fill_unknown` makes `extent_is_empty` refuse until `resolve_fill`
+/// has probed. Both guards apply to every extent that came out of the file, whenever it was
+/// written. An older image means MORE extents get that treatment, not weaker treatment.
+///
+/// **The pending log is the exception and gets an explicit guard**, because nothing refuses to
+/// trust it and a lost entry is a page `drain_pending` never revisits — see
+/// [`PersistState::durable_pending_version`].
+///
+/// What genuinely must be durable before it is used is the extent CLAIM — the range and the two
+/// watermarks — because that is the one fact whose loss gives two owners one page range. That is
+/// precisely what the record carries, and `append_durably` fsyncs it before `alloc_arena`
+/// returns.
+///
+/// Cost of holding it: extent claims serialise. They already did — `REPLACE_LOCK` serialises the
+/// fsync, which is the part that costs anything — so what is newly serialised is `reserve`, a
+/// counter take, and `catalog.add_arena`.
+///
+/// # Why `image_bytes == 0` is the interesting state
+///
+/// It means **this process has not itself written a full image to the current path**, and in that
+/// state appending is refused: the next persist is a full rewrite. That single rule closes two
+/// holes at once and is why neither needs its own code.
+///
+///   * A store armed by `checkpoint_to` with no file on disk yet cannot produce a headless tail.
+///   * A store reopened by `reopen_from_checkpoint` cannot append onto a tail it did not write —
+///     and a tail it did not write may end in a TORN record from the session that crashed. Its
+///     first persist rewrites the image, which drops the torn bytes. So a good record can never
+///     end up sitting behind a bad one, which is the one arrangement the reader cannot recover
+///     from (it must stop at the first bad record, and would then silently discard the good one).
+struct PersistState {
+    /// Bytes of the image THIS process last wrote to `checkpoint_path`, or 0 for "none".
+    image_bytes: u64,
+    /// Bytes of tail records appended after that image.
+    tail_bytes: u64,
+    /// The authority epoch the image was written under.
+    ///
+    /// A change of authority clears `free_extents` inside `give_back`/`recycled_start`
+    /// (`ArenaSpaceManager`), and a clear is not expressible as a per-extent delta. Rather than
+    /// invent a record for it, a persist whose epoch does not match the image's rewrites the image
+    /// — the transition becomes unrepresentable in the tail instead of something the replayer has
+    /// to be trusted to get right.
+    image_epoch: u64,
+    /// The value of [`ArenaPageStore::pending_version`] that the durable file represents.
+    ///
+    /// **The pending-free log is the one part of the map no per-extent record describes**, and
+    /// two paths change it without persisting anything: `park_or_release`'s push and
+    /// `take_pending`'s drain. Under full-image checkpoints those changes reached disk at the
+    /// next claim, incidentally, because the claim rewrote everything. A tail record does not
+    /// carry them, so without this a parked page could sit unrecorded until the next compaction
+    /// and a crash in between would leak it — `drain_pending` never revisits an entry that is not
+    /// in the file.
+    ///
+    /// So a delta is only taken while the log is unchanged since the image; otherwise the image
+    /// is rewritten. Compared rather than trusted: the counter is read BEFORE `state_bytes`
+    /// serialises, so a push racing the write is recorded as still-dirty and costs one extra
+    /// rewrite — never a missed one.
+    durable_pending_version: u64,
+    /// Full-image rewrites and tail appends this store has performed.
+    ///
+    /// Per-STORE, where `storage::atomic_file`'s counters are per-process. Both exist and neither
+    /// replaces the other: a benchmark wants the process total, and an assertion cannot use it,
+    /// because tests run concurrently in one process and would be reading each other's writes.
+    /// The quantity this row is about is an integer, so it is worth being able to assert exactly.
+    rewrites: u64,
+    appends: u64,
 }
 
 impl ArenaPageStore {
@@ -455,6 +574,15 @@ impl ArenaPageStore {
             reserved_pages: AtomicU32::new(0),
             authority_epoch: AtomicU64::new(crate::cluster::epoch()),
             checkpoint_path: Mutex::new(None),
+            persist: Mutex::new(PersistState {
+                image_bytes: 0,
+                tail_bytes: 0,
+                image_epoch: crate::cluster::epoch(),
+                durable_pending_version: 0,
+                rewrites: 0,
+                appends: 0,
+            }),
+            pending_version: AtomicU64::new(0),
         })
     }
 
@@ -798,6 +926,10 @@ impl ArenaPageStore {
 
     /// Take the pending-free log for re-evaluation.
     pub fn take_pending(&self) -> Vec<PendingFree> {
+        // **D81.** Draining the log changes it and persists nothing; no tail record describes
+        // that, so the next claim must rewrite the image rather than append behind a file that
+        // still lists these entries. See [`PersistState::durable_pending_version`].
+        self.pending_version.fetch_add(1, Ordering::SeqCst);
         std::mem::take(&mut self.state.lock().unwrap().pending)
     }
 
@@ -1232,20 +1364,374 @@ impl ArenaPageStore {
         Ok(())
     }
 
+    // ---- D81: the append-only tail ---------------------------------------------------------
+    //
+    // Tail record, big-endian like everything else here:
+    //
+    //   kind u8 | payload_len u32 | payload[payload_len] | crc32 u32   (over kind|len|payload)
+    //
+    // Self-delimiting and self-checked, because `append_durably` is atomic against other writers
+    // and not against a power cut: a torn append leaves a partial record at the END of the file
+    // and the reader has to be able to say so. See `replay_tail` for the rule that distinguishes
+    // a torn last record from corruption in the middle, which is a different thing and is refused.
+
+    /// An extent was claimed. `alloc_arena`'s durable record, and the one that was costing 48·N
+    /// bytes and two fsyncs.
+    const TAIL_ARENA_CLAIMED: u8 = 1;
+    /// A whole extent was freed. `free_arena`'s fast path.
+    const TAIL_EXTENT_FREED: u8 = 2;
+    /// Kinds this build understands. An allowlist for the same reason `READABLE_STATE_VERSIONS`
+    /// is one.
+    const KNOWN_TAIL_KINDS: &'static [u8] = &[Self::TAIL_ARENA_CLAIMED, Self::TAIL_EXTENT_FREED];
+
+    /// Below this the tail may grow freely however small the image is.
+    ///
+    /// Without a floor, a nearly-empty store (21-byte image) would compact on its very first
+    /// append and the tail would never be used at all. 4 KiB is one page of slack — about 100
+    /// claims — and bounds the replay a crash can leave behind to something trivial.
+    const TAIL_COMPACT_FLOOR_BYTES: u64 = 4096;
+
+    /// Compact once the tail exceeds this many bytes.
+    ///
+    /// Half the image. That choice is what makes the write volume LINEAR rather than quadratic,
+    /// and the arithmetic is worth stating because it is the whole point of the row: with a record
+    /// of `r` bytes and an image of `48·L`, a compaction happens every `24·L/r` claims and costs
+    /// `48·L` bytes, so the amortised per-claim cost is `2·r` bytes — **independent of L**. Total
+    /// over a run of N claims: O(N), where rewriting in full was `sum(48·i) = 24·N²`.
+    ///
+    /// It also bounds the file at 1.5x the image and the replay at half of it.
+    fn compact_threshold(image_bytes: u64) -> u64 {
+        (image_bytes / 2).max(Self::TAIL_COMPACT_FLOOR_BYTES)
+    }
+
+    fn encode_tail_record(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(9 + payload.len());
+        b.push(kind);
+        b.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        b.extend_from_slice(payload);
+        let crc = crc32(&b);
+        b.extend_from_slice(&crc.to_be_bytes());
+        b
+    }
+
     /// Persist the map on every extent claim from now on.
     ///
     /// Separate from construction because `reopen_from_checkpoint` already takes the path it read
     /// from, and a store that is only ever a test fixture should not be writing files.
+    ///
+    /// **Arming resets `image_bytes` to 0**, so the first persist against a newly armed path is a
+    /// full rewrite. That is what stops this process appending onto a file it has not written —
+    /// see [`PersistState`].
     pub fn checkpoint_to(&self, path: std::path::PathBuf) {
+        let mut g = self.persist.lock().unwrap();
         *self.checkpoint_path.lock().unwrap() = Some(path);
+        g.image_bytes = 0;
+        g.tail_bytes = 0;
+        g.image_epoch = crate::cluster::epoch();
     }
 
     fn persist_if_configured(&self) -> Result<(), FerroError> {
+        let mut g = self.persist.lock().unwrap();
+        self.persist_full_locked(&mut g)
+    }
+
+    /// Rewrite the whole image and drop the tail with it.
+    ///
+    /// `replace_atomically` renames a fresh inode over the target, so the previous tail goes away
+    /// with the previous inode rather than being left stranded after a shorter image. Pinned by
+    /// `a_replace_after_appends_drops_the_tail_instead_of_stranding_it`.
+    fn persist_full_locked(&self, g: &mut PersistState) -> Result<(), FerroError> {
         let path = self.checkpoint_path.lock().unwrap().clone();
-        match path {
-            Some(p) => self.checkpoint(&p),
-            None => Ok(()),
+        let Some(p) = path else { return Ok(()) };
+        // Read BEFORE the image is serialised. A push that lands in between is written into the
+        // image anyway and merely leaves this looking stale, which costs one extra rewrite later.
+        // Reading it afterwards would do the opposite: record a change as durable that the image
+        // does not contain.
+        let pending_version = self.pending_version.load(Ordering::SeqCst);
+        let written = self.checkpoint_with(&OsFileOps, &p)?;
+        g.image_bytes = written as u64;
+        g.tail_bytes = 0;
+        g.image_epoch = crate::cluster::epoch();
+        g.durable_pending_version = pending_version;
+        g.rewrites += 1;
+        Ok(())
+    }
+
+    /// Append one delta record, or rewrite the whole image if appending is not available or the
+    /// tail has grown past its share.
+    ///
+    /// The four conditions that force a rewrite are each a place where a delta would be a lie,
+    /// not a tuning knob:
+    ///   * `image_bytes == 0` — this process has not written the image; see [`PersistState`].
+    ///   * the authority epoch moved — `free_extents` was cleared wholesale, which no per-extent
+    ///     record describes.
+    ///   * the pending-free log changed — see [`PersistState::durable_pending_version`].
+    ///   * the tail would exceed [`Self::compact_threshold`] — the amortisation bound.
+    fn persist_delta_locked(
+        &self,
+        g: &mut PersistState,
+        kind: u8,
+        payload: &[u8],
+    ) -> Result<(), FerroError> {
+        let path = self.checkpoint_path.lock().unwrap().clone();
+        let Some(p) = path else { return Ok(()) };
+        let rec = Self::encode_tail_record(kind, payload);
+        if g.image_bytes == 0
+            || g.image_epoch != crate::cluster::epoch()
+            || g.durable_pending_version != self.pending_version.load(Ordering::SeqCst)
+            || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
+        {
+            // The rewrite folds in the mutation this record described, because `state_bytes`
+            // serialises live memory and the caller has already applied it. So the record is
+            // simply not needed, rather than needed and skipped.
+            return self.persist_full_locked(g);
         }
+        append_durably(&OsFileOps, &p, &rec).map_err(|e| FerroError::Io(e.to_string()))?;
+        g.tail_bytes += rec.len() as u64;
+        g.appends += 1;
+        Ok(())
+    }
+
+    /// `(full rewrites, tail appends)` this store has performed against its armed path.
+    ///
+    /// The whole of D81 stated as two integers: what used to be one rewrite per claim should now
+    /// be one append per claim and a rewrite only when the tail outgrows its share.
+    #[cfg(test)]
+    pub(crate) fn persist_counters(&self) -> (u64, u64) {
+        let g = self.persist.lock().unwrap();
+        (g.rewrites, g.appends)
+    }
+
+    /// How many bytes of `buf` the IMAGE occupies, including its trailing CRC32.
+    ///
+    /// # Why this exists instead of a length field in the header
+    ///
+    /// The obvious spelling is a v4 image that records its own length. It was not taken. This
+    /// file's own D85 note spells out the price of a version bump — *"bump `STATE_VERSION` and
+    /// migrate every `<db>.arena` on disk"* — and `key_order_in_image` and
+    /// `two_stores_in_the_same_state_checkpoint_byte_identical_images` both pin the current
+    /// layout. Walking the structure instead costs one pass over ~48·L bytes at open time and
+    /// leaves the format, every file on disk, and both pinning tests exactly as they were.
+    ///
+    /// **It allocates nothing.** That is deliberate and it is what makes it safe to run BEFORE the
+    /// checksum: every count it reads is used only to advance a bounds-checked cursor, so a
+    /// corrupt count fails as "truncated" instead of reserving four billion entries. `load_state`
+    /// keeps its own checksum-first order, because by then the slice is known to be an image.
+    ///
+    /// ⚠ **It mirrors [`Self::state_bytes`] and nothing in the type system says so.** Pinned by
+    /// `the_image_walker_agrees_with_state_bytes_on_a_fully_populated_store`, whose fixture fills
+    /// every variable-length section — free extents, recycled pages, current, pending — because a
+    /// fixture that leaves one empty cannot see that section's stride being wrong.
+    fn image_len(buf: &[u8]) -> Result<usize, FerroError> {
+        let mut c = StateCursor { b: buf, at: 0 };
+        let version = c.u8()?;
+        if !Self::READABLE_STATE_VERSIONS.contains(&version) {
+            return Err(BranchError::Arena(format!(
+                "unknown arena state version {} (readable: {:?})",
+                version,
+                Self::READABLE_STATE_VERSIONS
+            ))
+            .into());
+        }
+        // base_page, next_extent_start, next_arena_id, live, reserved.
+        c.skip(20)?;
+        // free_extents: v3 writes (start, page_count); v2 wrote start alone.
+        let n = c.u32()? as usize;
+        c.skip(n.checked_mul(if version >= 3 { 8 } else { 4 }).unwrap_or(usize::MAX))?;
+        // extents: arena u32 | owner u64+u32 | start u32 | page_count u32 | next_free u32, then
+        // a counted list of recycled page ids.
+        let n = c.u32()? as usize;
+        for _ in 0..n {
+            c.skip(28)?;
+            let rec = c.u32()? as usize;
+            c.skip(rec.checked_mul(4).unwrap_or(usize::MAX))?;
+        }
+        // current: branch u64+u32 | arena u32.
+        let n = c.u32()? as usize;
+        c.skip(n.checked_mul(16).unwrap_or(usize::MAX))?;
+        // pending: page u32 | arena u32 | birth u64 | free u64 | owner u64+u32.
+        let n = c.u32()? as usize;
+        c.skip(n.checked_mul(36).unwrap_or(usize::MAX))?;
+
+        let body = c.at;
+        let stored = u32::from_be_bytes(c.take(4)?.try_into().unwrap());
+        if crc32(&buf[..body]) != stored {
+            return Err(BranchError::Arena("arena state checksum mismatch".into()).into());
+        }
+        Ok(body + 4)
+    }
+
+    /// Load a whole `<db>.arena` file: the image, then every intact tail record behind it.
+    ///
+    /// Returns how many bytes of tail were applied, which is what tells the caller whether the
+    /// file is already compact.
+    fn load_file(&self, buf: &[u8]) -> Result<u64, FerroError> {
+        let n = Self::image_len(buf)?;
+        self.load_state(&buf[..n])?;
+        self.replay_tail(&buf[n..])
+    }
+
+    /// Apply the tail records in `tail`, stopping at a torn final record and **refusing**
+    /// anything else.
+    ///
+    /// # The rule, and why it is not simply "stop at the first bad record"
+    ///
+    /// Stopping is the standard log-tail rule and it is right for the one shape a crash actually
+    /// produces: an append that did not finish, which is always LAST because `append_durably`
+    /// fsyncs before `alloc_arena` returns and the process that crashed does not come back to
+    /// write another. Dropping such a record is correct — the claim was never acknowledged, so no
+    /// page was ever written into that extent.
+    ///
+    /// It is wrong for anything else. A record that is fully present, well-framed and fails its
+    /// CRC **with more bytes behind it** is not a torn tail; it is corruption, and stopping there
+    /// would silently discard every later claim — extents whose pages a durable branch record
+    /// still names, whose watermark advance would be lost, and whose range the next claim would
+    /// hand out again. So that case errors, the way `load_state` errors on a bad image, rather
+    /// than quietly returning a map that is half right.
+    ///
+    /// A zero `kind` is treated as unwritten space rather than an unknown kind: a crash can expose
+    /// a zero-filled extension, and kinds start at 1 precisely so that reads as "nothing here".
+    fn replay_tail(&self, tail: &[u8]) -> Result<u64, FerroError> {
+        let mut at = 0usize;
+        while at < tail.len() {
+            let rest = &tail[at..];
+            if rest.len() < 9 {
+                break; // torn: not even a frame
+            }
+            let kind = rest[0];
+            if kind == 0 {
+                break; // zero-filled extension, not a record
+            }
+            let len = u32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+            let Some(total) = len.checked_add(9).filter(|t| *t <= rest.len()) else {
+                break; // torn: the frame promises more than the file holds
+            };
+            let stored = u32::from_be_bytes(rest[total - 4..total].try_into().unwrap());
+            if crc32(&rest[..total - 4]) != stored {
+                if total < rest.len() {
+                    return Err(BranchError::Arena(format!(
+                        "arena tail record at byte {at} fails its checksum and is NOT the last \
+                         record ({} bytes follow it): that is corruption rather than a torn \
+                         append, and stopping here would discard claims whose page ranges the \
+                         next allocation would then hand out again",
+                        rest.len() - total
+                    ))
+                    .into());
+                }
+                break; // torn: the last record did not finish
+            }
+            if !Self::KNOWN_TAIL_KINDS.contains(&kind) {
+                return Err(BranchError::Arena(format!(
+                    "arena tail record kind {kind} at byte {at} was written by a newer build \
+                     (known: {:?}); refusing rather than skipping a change to the free-space map",
+                    Self::KNOWN_TAIL_KINDS
+                ))
+                .into());
+            }
+            self.apply_tail_record(kind, &rest[5..total - 4])?;
+            at += total;
+        }
+        Ok(at as u64)
+    }
+
+    fn apply_tail_record(&self, kind: u8, payload: &[u8]) -> Result<(), FerroError> {
+        let mut c = StateCursor { b: payload, at: 0 };
+        match kind {
+            Self::TAIL_ARENA_CLAIMED => {
+                let arena = ArenaId(c.u32()?);
+                let owner = BranchId::new(c.u64()?, c.u32()?);
+                let start_page = c.u32()?;
+                let page_count = c.u32()?;
+                let next_start = c.u32()?;
+                let next_arena = c.u32()?;
+                let live = c.u32()?;
+                // If `reserve` satisfied this claim out of the recycle list, the image in front of
+                // us still lists the hole as free. Leaving it there would hand the same range to
+                // the next claim.
+                {
+                    let mut free = self.space.free_extents.lock().unwrap();
+                    if let Some(v) = free.get_mut(&page_count) {
+                        if let Some(i) = v.iter().position(|s| *s == start_page) {
+                            v.swap_remove(i);
+                        }
+                    }
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.extents.insert(
+                        arena,
+                        ArenaExtent { arena_id: arena, owner, start_page, page_count, next_free: 0 },
+                    );
+                    st.recycled.insert(arena, Vec::new());
+                    // **D85, and for the same reason `load_state` marks every restored extent.**
+                    // `next_free` is recorded as 0 here and pages handed out afterwards never
+                    // touched the file, so this extent's fill is exactly as unknown as one that
+                    // came out of the image.
+                    st.fill_unknown.insert(arena);
+                    st.claim_epoch.insert(arena, crate::cluster::epoch());
+                    // `current` is deliberately NOT restored: `load_state` clears it, on the rule
+                    // that a restored extent is never resumed. A replayed claim is a restored
+                    // extent.
+                }
+                // Monotone, so the order two records reach the file in cannot lower a watermark.
+                self.space.extent_starts.raise_issued_through(next_start as u64);
+                self.space.arena_ids.raise_issued_through(next_arena as u64);
+                self.reserved_pages.fetch_add(page_count, Ordering::SeqCst);
+                // **Absolute, where `reserved_pages` is a delta, and the asymmetry is the point.**
+                // `reserved_pages` changes ONLY on the two paths that write a record, so a delta
+                // tracks it exactly. `live_pages` changes on every `alloc_in_arena` and
+                // `release_page`, neither of which persists anything — so the only durable value
+                // it can have is a SNAPSHOT, which is exactly what `state_bytes` has always
+                // written. Carrying it here keeps a restore as fresh as it was when every claim
+                // rewrote the whole image; leaving it out made a restart report zero live pages
+                // after seven allocations.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            Self::TAIL_EXTENT_FREED => {
+                let arena = ArenaId(c.u32()?);
+                let start_page = c.u32()?;
+                let page_count = c.u32()?;
+                let live = c.u32()?;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.extents.remove(&arena);
+                    st.recycled.remove(&arena);
+                    st.fill_unknown.remove(&arena);
+                    st.claim_epoch.remove(&arena);
+                    // `free_arena` drops this arena's parked entries too, and so must replay:
+                    // a pending entry naming a freed extent would send `drain_pending` looking
+                    // for pages in a range that has already gone back on the free list.
+                    st.pending.retain(|p| p.arena_id != arena);
+                    // `shadow_base` and `current` need no repair. `shadow_base` is not persisted
+                    // at all (see its doc: a cold map only shortens chains), and `current` is
+                    // cleared by `load_state` and never set by a replayed claim.
+                }
+                self.space
+                    .free_extents
+                    .lock()
+                    .unwrap()
+                    .entry(page_count)
+                    .or_default()
+                    .push(start_page);
+                saturating_sub_atomic(&self.reserved_pages, page_count);
+                // Absolute, for the reason spelled out under the claim record above.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            other => {
+                return Err(BranchError::Arena(format!(
+                    "arena tail record kind {other} reached apply after the kind allowlist"
+                ))
+                .into())
+            }
+        }
+        if c.at != c.b.len() {
+            return Err(BranchError::Arena(format!(
+                "arena tail record kind {kind} has {} trailing bytes",
+                c.b.len() - c.at
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Write the free-space map to `path` durably, so a crash leaves either the previous checkpoint
@@ -1261,18 +1747,34 @@ impl ArenaPageStore {
     /// The four steps live in [`crate::storage::atomic_file`], which is also where they can be
     /// *asserted*: an fsync is invisible to any test that merely reads the file back.
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), FerroError> {
-        self.checkpoint_with(&OsFileOps, path)
+        let mut g = self.persist.lock().unwrap();
+        let pending_version = self.pending_version.load(Ordering::SeqCst);
+        let written = self.checkpoint_with(&OsFileOps, path)?;
+        // A checkpoint aimed at the armed path IS the image this process may then append to, so
+        // it resets the tail accounting. One aimed anywhere else (the CLI's exit checkpoint to a
+        // copy, a test dumping state) must leave it alone: claiming a tail of zero on a file we
+        // did not write is exactly the mistake `image_bytes == 0` exists to prevent.
+        if self.checkpoint_path.lock().unwrap().as_deref() == Some(path) {
+            g.image_bytes = written as u64;
+            g.tail_bytes = 0;
+            g.image_epoch = crate::cluster::epoch();
+            g.durable_pending_version = pending_version;
+            g.rewrites += 1;
+        }
+        Ok(())
     }
 
     /// [`ArenaPageStore::checkpoint`] against an injected [`FileOps`], so a test can see the order
-    /// of the four operations rather than only their result.
+    /// of the four operations rather than only their result. Returns the image's length, which is
+    /// what the tail accounting is measured against.
     pub(crate) fn checkpoint_with(
         &self,
         ops: &dyn FileOps,
         path: &std::path::Path,
-    ) -> Result<(), FerroError> {
-        replace_atomically(ops, path, &self.state_bytes())
-            .map_err(|e| FerroError::Io(e.to_string()))
+    ) -> Result<usize, FerroError> {
+        let bytes = self.state_bytes();
+        replace_atomically(ops, path, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
+        Ok(bytes.len())
     }
 
     /// Restore from a checkpoint written by [`ArenaPageStore::checkpoint`]. A missing file is not
@@ -1282,7 +1784,7 @@ impl ArenaPageStore {
             return Ok(false);
         }
         let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
-        self.load_state(&bytes)?;
+        self.load_file(&bytes)?;
         Ok(true)
     }
 
@@ -1291,24 +1793,15 @@ impl ArenaPageStore {
     /// Validates the checksum and version first: a base read out of a corrupt image is worse than
     /// no base at all, because it is the number the floor gets registered from.
     pub fn base_page_in_state(bytes: &[u8]) -> Result<PageId, FerroError> {
-        let body = bytes
-            .len()
-            .checked_sub(4)
-            .ok_or_else(|| BranchError::Arena("arena state shorter than its checksum".into()))?;
-        let stored = u32::from_be_bytes(bytes[body..].try_into().unwrap());
-        if crc32(&bytes[..body]) != stored {
-            return Err(BranchError::Arena("arena state checksum mismatch".into()).into());
-        }
-        let mut c = StateCursor { b: &bytes[..body], at: 0 };
-        let version = c.u8()?;
-        if !Self::READABLE_STATE_VERSIONS.contains(&version) {
-            return Err(BranchError::Arena(format!(
-                "unknown arena state version {} (readable: {:?})",
-                version,
-                Self::READABLE_STATE_VERSIONS
-            ))
-            .into());
-        }
+        // **D81: the image is a PREFIX of the file now, not the whole of it.** This used to take
+        // the last four bytes as the checksum; with a tail behind the image those four bytes are
+        // the last tail record's CRC and every reopen would fail "checksum mismatch".
+        // `image_len` finds the boundary and verifies the image's own checksum on the way.
+        let n = Self::image_len(bytes)?;
+        let mut c = StateCursor { b: &bytes[..n - 4], at: 0 };
+        // The version is re-checked inside `image_len` against the same allowlist, so reading past
+        // it here is not skipping a check.
+        c.u8()?;
         c.u32()
     }
 
@@ -1333,10 +1826,18 @@ impl ArenaPageStore {
         let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
         let base = Self::base_page_in_state(&bytes)?;
         let store = Self::reopen(pool, catalog, base)?;
-        store.load_state(&bytes)?;
+        // **D81: the image AND the tail.** A claim made after the last full checkpoint lives in a
+        // tail record; loading only the image would forget it and re-issue its page range, which
+        // is the same aliasing the arming below exists to prevent.
+        store.load_file(&bytes)?;
         // Reattaching implies continuing to own this image. Leaving it unarmed is how the first
         // version of this still aliased after a crash: the restored store claimed a fresh extent,
         // never wrote that fact down, and the open after it claimed the very same range.
+        //
+        // Arming also sets `image_bytes` to 0, which makes the next persist a full rewrite. That
+        // is not an optimisation to be tuned away: the tail we just replayed may end in a TORN
+        // record, and appending behind it would leave a good record sitting after a bad one —
+        // the one arrangement `replay_tail` cannot recover from. See [`PersistState`].
         store.checkpoint_to(path.to_path_buf());
         Ok(store)
     }
@@ -1347,9 +1848,23 @@ struct StateCursor<'a> {
     at: usize,
 }
 
+/// Subtract without wrapping.
+///
+/// `AtomicU32::fetch_sub` wraps, so a replayed free whose extent the image had already accounted
+/// for would turn a page count of zero into four billion. These two counters are statistics —
+/// exit criteria 1 and 8 are stated in them — so the right answer to an underflow is to clamp,
+/// not to publish a number that is off by 2^32.
+fn saturating_sub_atomic(cell: &AtomicU32, v: u32) {
+    let _ = cell.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(v)));
+}
+
 impl<'a> StateCursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], FerroError> {
-        if self.at + n > self.b.len() {
+        // `checked_add`, not `self.at + n`: `image_len` walks the structure BEFORE the checksum
+        // is verified, so `n` can be a corrupt count multiplied by a stride. Plain addition
+        // overflows and panics in a debug build and WRAPS in a release one, where it would pass
+        // this check and slice out of bounds.
+        if self.at.checked_add(n).is_none_or(|end| end > self.b.len()) {
             return Err(BranchError::Arena(format!(
                 "arena state truncated at byte {} (wanted {})",
                 self.at, n
@@ -1359,6 +1874,13 @@ impl<'a> StateCursor<'a> {
         let s = &self.b[self.at..self.at + n];
         self.at += n;
         Ok(s)
+    }
+    /// Advance past `n` bytes without reading them, refusing to run off the end.
+    ///
+    /// The bounds check is what makes [`ArenaPageStore::image_len`] safe to run before the
+    /// checksum: a corrupt count can only produce "truncated", never an allocation.
+    fn skip(&mut self, n: usize) -> Result<(), FerroError> {
+        self.take(n).map(|_| ())
     }
     fn u8(&mut self) -> Result<u8, FerroError> {
         Ok(self.take(1)?[0])
@@ -1552,6 +2074,11 @@ impl PageStore for ArenaPageStore {
             )?;
 
         if pinned {
+            // **D81.** Parking a page persists nothing — it never did — but under full-image
+            // checkpoints the next claim wrote it down as a side effect. A tail record does not,
+            // so this marks the log changed and the next claim rewrites the image instead of
+            // appending. See [`PersistState::durable_pending_version`].
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
             self.state.lock().unwrap().pending.push(PendingFree {
                 page_id,
                 arena_id: arena,
@@ -1566,6 +2093,14 @@ impl PageStore for ArenaPageStore {
     }
 
     fn alloc_arena(&self, branch: BranchId) -> Result<ArenaId, FerroError> {
+        // **D81 — OUTERMOST, and held across the whole claim.** The durable tail is an ordered
+        // log, so the order records reach the file has to be the order the memory changed in;
+        // otherwise a free of extent X and an immediate re-claim of it can be written down
+        // backwards and replay leaves X both free and live. Taken before `state`, before the
+        // catalog's locks and before `REPLACE_LOCK`, and never the other way round — see
+        // [`PersistState`]. What this newly serialises is `reserve` and `catalog.add_arena`; the
+        // fsync at the end was already serialised by `REPLACE_LOCK`.
+        let mut persist = self.persist.lock().unwrap();
         let epoch = self.revoke_stale_authority();
 
         // **D31 — the size is a function of what this branch is already filling.** Derived from
@@ -1623,7 +2158,37 @@ impl PageStore for ArenaPageStore {
         // invisible to the next open, which then claims the same range and hands out pages that are
         // already in use. Ordered AFTER the catalog write so a crash between the two leaves an
         // extent recorded as reserved but unreferenced, which leaks; the other order aliases.
-        self.persist_if_configured()?;
+        //
+        // **D81 — THIS is the wall, and it is the only site that changes shape.** D79 measured the
+        // whole 48·L-byte image being re-serialised and re-fsynced here, once per new branch, for
+        // `sum(48·i) = 24·N²` bytes over a run. It now appends 45 bytes and fsyncs once, and the
+        // image is rewritten only when the tail has grown past half of it.
+        //
+        // The other three `persist_if_configured` sites keep the full rewrite deliberately. They
+        // fire once per REAP, not once per branch created, and each one changes list-shaped state
+        // — the pending-free log, per-extent recycled lists — that a per-extent record does not
+        // describe. They double as compaction points, so leaving them whole costs a bounded tail
+        // rather than a missing guarantee. ⚠ The condition under which that stops being the right
+        // call, stated rather than discovered: a workload that reaps as often as it forks pays a
+        // full rewrite per reap and only half of this row's benefit.
+        let payload = {
+            let mut p = Vec::with_capacity(36);
+            p.extend_from_slice(&arena.0.to_be_bytes());
+            p.extend_from_slice(&branch.id.to_be_bytes());
+            p.extend_from_slice(&branch.generation.to_be_bytes());
+            p.extend_from_slice(&start.to_be_bytes());
+            p.extend_from_slice(&pages.to_be_bytes());
+            // The watermarks AFTER the take. Absolute and applied with `raise_issued_through`,
+            // which is monotone — so these are the one part of a record that is safe whatever
+            // order it lands in.
+            p.extend_from_slice(&(self.space.extent_starts.issued_through() as u32).to_be_bytes());
+            p.extend_from_slice(&(self.space.arena_ids.issued_through() as u32).to_be_bytes());
+            // The live-page count as `state_bytes` would have written it at this instant. See
+            // the note beside its replay: it is the only durable form this counter can have.
+            p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            p
+        };
+        self.persist_delta_locked(&mut persist, Self::TAIL_ARENA_CLAIMED, &payload)?;
         Ok(arena)
     }
 
@@ -1652,6 +2217,11 @@ impl PageStore for ArenaPageStore {
 
 
     fn free_arena(&self, arena: ArenaId) -> Result<u32, FerroError> {
+        // **D81 — the same outermost lock `alloc_arena` takes, and for the same reason.** The
+        // ordering hazard the tail has is precisely between these two: this method returns a page
+        // range to `free_extents` and the very next `alloc_arena` can re-claim it, so the two
+        // durable records must be written in the order the memory changed. See [`PersistState`].
+        let mut persist = self.persist.lock().unwrap();
         // **D31 — every one of these is the EXTENT's own size, never the store's cap.** Extents
         // are no longer uniform, so `self.space.extent_pages` here would evict 255 pages belonging
         // to other arenas, credit the reserved counter with space this extent never held, and hand
@@ -1751,7 +2321,16 @@ impl PageStore for ArenaPageStore {
             // rather than aliases — and `reap_expired` discards its partial list of reaped branches
             // on any `Err`, which was already true of every slow-path IO error and which no
             // production caller sees today, because `runtime.rs` calls `reap` directly.
-            self.persist_if_configured()?;
+            //
+            // **D81:** a 16-byte record and one fsync, not the whole image and two. The reaper's
+            // fast path is as frequent as the claim it mirrors in any workload that reaps what it
+            // forks, so leaving it on the full rewrite would cap this row's benefit at half.
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&arena.0.to_be_bytes());
+            payload.extend_from_slice(&start.to_be_bytes());
+            payload.extend_from_slice(&pages.to_be_bytes());
+            payload.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            self.persist_delta_locked(&mut persist, Self::TAIL_EXTENT_FREED, &payload)?;
         }
         Ok(allocated)
     }
@@ -3404,4 +3983,558 @@ mod tests {
         );
     }
 
+    // ==== D81 — the append-only tail =========================================================
+    //
+    // Every test below is written so that it FAILS if the append path is never taken. Most of
+    // them assert first that the tail is non-empty or that `appends > 0`: a suite that exercised
+    // only the full-rewrite path would pass every correctness assertion here while proving
+    // nothing, and that is the shape of failure this row is most exposed to.
+
+    static D81_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm `h.store` on a fresh path and return it.
+    fn arm(h: &Harness) -> std::path::PathBuf {
+        let n = D81_SEQ.fetch_add(1, Ordering::SeqCst);
+        let p =
+            std::env::temp_dir().join(format!("ferro-d81-{}-{}.arena", std::process::id(), n));
+        let _ = std::fs::remove_file(&p);
+        h.store.checkpoint_to(p.clone());
+        p
+    }
+
+    /// Fork trunk and claim it an extent, which is the event D79 measured.
+    fn claim(h: &Harness) -> (BranchId, ArenaId) {
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        (b.branch_id, a)
+    }
+
+    /// A store whose map has something in EVERY variable-length section.
+    ///
+    /// A walker that mis-strides one section is invisible to a fixture that leaves that section
+    /// empty, and four of the five are empty in an ordinary small fixture.
+    fn fully_populated(h: &Harness) -> (BranchId, ArenaId) {
+        let (parent, a1) = claim(h);
+        for _ in 0..5 {
+            h.store.alloc_for(parent, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        }
+        // a second live extent, so `extents` and `current` both have more than one entry
+        claim(h);
+        // a freed extent, so `free_extents` is non-empty
+        let (_b3, a3) = claim(h);
+        h.store.free_arena(a3).unwrap();
+        // a page released with no live child, so `recycled` is non-empty
+        let loose = h.store.alloc_for(parent, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        h.store.free_page(loose, h.catalog.next_epoch()).unwrap();
+        // a page parked against a live child, so `pending` is non-empty
+        let parked = h.store.alloc_for(parent, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        let _child = h.catalog.fork(parent, LeaseDeadline(0)).unwrap();
+        h.store.free_page(parked, h.catalog.next_epoch()).unwrap();
+        (parent, a1)
+    }
+
+    /// **The walker mirrors `state_bytes` and nothing in the type system says so.** This is the
+    /// pin.
+    ///
+    /// The fixture matters more than the assertion: every variable-length section is non-empty,
+    /// checked here rather than assumed, because an empty section has its stride multiplied by
+    /// zero and a wrong stride then disappears.
+    #[test]
+    fn the_image_walker_agrees_with_state_bytes_on_a_fully_populated_store() {
+        let h = Harness::new();
+        fully_populated(&h);
+        let image = h.store.state_bytes();
+
+        // Fixture assertions. The free-extent count sits at offset 21, the documented header size.
+        assert!(
+            u32::from_be_bytes(image[21..25].try_into().unwrap()) > 0,
+            "fixture: no freed extent, so the free-list stride is never exercised"
+        );
+        assert!(h.store.live_arenas().len() >= 2, "fixture: fewer than two live extents");
+        assert!(h.store.pending_len() >= 1, "fixture: the pending log is empty");
+
+        assert_eq!(
+            ArenaPageStore::image_len(&image).unwrap(),
+            image.len(),
+            "the walker and the writer disagree about where the image ends"
+        );
+
+        // And it must say the same thing with a tail behind it, which is the only reason it
+        // exists.
+        let mut with_tail = image.clone();
+        with_tail.extend_from_slice(&ArenaPageStore::encode_tail_record(
+            ArenaPageStore::TAIL_EXTENT_FREED,
+            &[0u8; 16],
+        ));
+        assert_eq!(
+            ArenaPageStore::image_len(&with_tail).unwrap(),
+            image.len(),
+            "the walker followed the tail instead of stopping at the image"
+        );
+    }
+
+    /// The walker runs BEFORE the checksum, so its failure modes are the interesting ones: it
+    /// must refuse rather than trust a count, and it must refuse a corrupt image at all.
+    #[test]
+    fn the_image_walker_refuses_a_corrupt_image_instead_of_trusting_its_counts() {
+        let h = Harness::new();
+        fully_populated(&h);
+        let good = h.store.state_bytes();
+
+        let mut flipped = good.clone();
+        flipped[1] ^= 0xff;
+        assert!(
+            ArenaPageStore::image_len(&flipped).is_err(),
+            "a flipped byte must fail the image's own checksum"
+        );
+
+        assert!(
+            ArenaPageStore::image_len(&good[..good.len() - 7]).is_err(),
+            "a truncated image must be refused, not read as a shorter one"
+        );
+
+        let mut bogus_count = good.clone();
+        // Four billion free extents. The walk must fail as "truncated": it must reserve nothing,
+        // and the cursor must not wrap into an offset that passes the bounds check.
+        bogus_count[21..25].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            ArenaPageStore::image_len(&bogus_count).is_err(),
+            "a corrupt count must be refused by the bounds check"
+        );
+
+        let mut bad_version = good.clone();
+        bad_version[0] = 9;
+        assert!(
+            ArenaPageStore::image_len(&bad_version).is_err(),
+            "unknown version must be refused"
+        );
+    }
+
+    /// **THE ROW, AS TWO INTEGERS.** One append per claim, where it used to be one whole-image
+    /// rewrite.
+    ///
+    /// D79 measured the map being re-serialised and re-fsynced in full on every new branch's
+    /// first page write — `sum(48·i) = 24·N²` bytes over a run. These are integers, so unlike a
+    /// latency they cannot be moved by what else the box is doing.
+    #[test]
+    fn a_claim_appends_one_record_where_it_used_to_rewrite_the_whole_image() {
+        let h = Harness::new();
+        let path = arm(&h);
+
+        for _ in 0..20 {
+            claim(&h);
+        }
+
+        let (rewrites, appends) = h.store.persist_counters();
+        assert_eq!(
+            (rewrites, appends),
+            (1, 19),
+            "20 claims must cost ONE image rewrite (the first, which has no image to append to) \
+             and 19 appends; {rewrites} rewrites means the tail is not being used"
+        );
+
+        let file = std::fs::metadata(&path).unwrap().len();
+        let image = h.store.state_bytes().len() as u64;
+        assert!(
+            file < image,
+            "the file ({file}) is the FIRST claim's tiny image plus 19 records and should be well \
+             under the current image ({image}); it is not, so the appends are not small"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The tail is bounded: once it outgrows its share of the image, the image is rewritten and
+    /// the tail goes with it.
+    ///
+    /// This is the half of the scheme that keeps total write volume LINEAR. Without compaction
+    /// the file grows without bound and replay gets slower every open; with it the amortised
+    /// per-claim cost is two record lengths, independent of how many branches are live.
+    #[test]
+    fn the_tail_is_compacted_before_it_outgrows_its_share_of_the_image() {
+        let h = Harness::new();
+        let path = arm(&h);
+
+        let mut worst_ratio = 0.0f64;
+        for _ in 0..400 {
+            claim(&h);
+            let file = std::fs::metadata(&path).unwrap().len() as f64;
+            let image = h.store.state_bytes().len() as f64;
+            worst_ratio = worst_ratio.max(file / image);
+        }
+
+        let (rewrites, appends) = h.store.persist_counters();
+        assert!(rewrites >= 2, "400 claims never compacted: the tail is unbounded ({rewrites})");
+        assert!(
+            appends > 300,
+            "400 claims produced only {appends} appends: the tail is barely being used"
+        );
+        assert!(
+            rewrites < 40,
+            "400 claims cost {rewrites} rewrites — compaction fires so often that the row buys \
+             nothing"
+        );
+        assert!(
+            worst_ratio < 1.75,
+            "the file peaked at {worst_ratio:.2}x the image; the tail is meant to stay under half"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The correctness claim.** A restart reads the image AND the tail, and lands in the state
+    /// the running store was in.
+    ///
+    /// The non-empty-tail assertion is what stops this being vacuous: without it the test passes
+    /// identically against the code D81 replaced.
+    #[test]
+    fn a_restart_recovers_the_claims_that_live_only_in_the_tail() {
+        let h = Harness::new();
+        let path = arm(&h);
+        let (parent, a1) = fully_populated(&h);
+        let mut claimed = Vec::new();
+        for _ in 0..10 {
+            claimed.push(claim(&h));
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        let image_len = ArenaPageStore::image_len(&bytes).unwrap();
+        assert!(
+            bytes.len() > image_len,
+            "nothing was appended, so this test would pass against the code D81 replaced"
+        );
+
+        let before = (
+            h.store.live_page_count().unwrap(),
+            h.store.reserved_page_count(),
+            h.store.pending_len(),
+            h.store.allocated_pages(a1),
+        );
+
+        let restored = h.fresh_store();
+        assert!(restored.restore(&path).unwrap());
+
+        assert_eq!(restored.live_page_count().unwrap(), before.0, "live pages");
+        assert_eq!(restored.reserved_page_count(), before.1, "reserved pages");
+        assert_eq!(restored.pending_len(), before.2, "pending log");
+        assert_eq!(restored.allocated_pages(a1), before.3, "a1 fill");
+        assert_eq!(restored.arena_owner(a1), Some(parent), "a1 owner");
+        for (owner, arena) in &claimed {
+            assert_eq!(
+                restored.arena_owner(*arena),
+                Some(*owner),
+                "extent {arena} was claimed after the last image and is not in the restored map"
+            );
+            assert_eq!(
+                restored.extent_range(*arena),
+                h.store.extent_range(*arena),
+                "extent {arena} came back at a different range"
+            );
+        }
+        assert_eq!(
+            restored.live_arenas(),
+            h.store.live_arenas(),
+            "the restored set of live extents differs from the running one"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The bump pointer must not rewind through a tail.** The sharpest consequence of losing a
+    /// tail record: the next claim hands out a range that is already in use.
+    #[test]
+    fn the_next_claim_after_a_tail_restore_does_not_overlap_an_extent_the_tail_named() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h);
+        let mut ranges = Vec::new();
+        for _ in 0..12 {
+            let (_, a) = claim(&h);
+            ranges.push(h.store.extent_range(a).unwrap());
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > ArenaPageStore::image_len(&bytes).unwrap(),
+            "fixture: nothing in the tail, so nothing is being tested"
+        );
+
+        let restored = h.fresh_store();
+        assert!(restored.restore(&path).unwrap());
+        let victim = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let fresh = restored.alloc_arena(victim.branch_id).unwrap();
+        let (fs, fl) = restored.extent_range(fresh).unwrap();
+        for (s, l) in &ranges {
+            assert!(
+                fs >= s + l || fs + fl <= *s,
+                "the extent handed out after a tail restore ({fs}..{}) overlaps {s}..{}: the \
+                 watermark rewound, which is two owners for one page range",
+                fs + fl,
+                s + l
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A free and an immediate re-claim of the same range must replay in that order.
+    ///
+    /// This is the case that forces the persist lock. Written down backwards, replay leaves the
+    /// range on the free list AND live in `extents`, and the next allocation issues pages a live
+    /// branch already owns. Nothing about the resulting file looks wrong.
+    #[test]
+    fn a_free_and_an_immediate_reclaim_of_one_range_survive_a_restart_in_that_order() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h); // the image
+        let (_b1, a1) = claim(&h);
+        let (start, pages) = h.store.extent_range(a1).unwrap();
+        h.store.free_arena(a1).unwrap();
+        let reclaimer = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a2 = h.store.alloc_arena(reclaimer.branch_id).unwrap();
+        assert_eq!(
+            h.store.extent_range(a2),
+            Some((start, pages)),
+            "fixture: the re-claim did not reuse the freed range, so the ordering is not tested"
+        );
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > ArenaPageStore::image_len(&bytes).unwrap(), "fixture: empty tail");
+
+        let restored = h.fresh_store();
+        assert!(restored.restore(&path).unwrap());
+        assert_eq!(restored.arena_owner(a2), Some(reclaimer.branch_id), "the re-claim was lost");
+        assert_eq!(restored.arena_owner(a1), None, "the freed extent came back to life");
+
+        // And the range must not ALSO be on the free list. Ask by allocating: a store that thinks
+        // it is free hands it straight back out.
+        let other = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a3 = restored.alloc_arena(other.branch_id).unwrap();
+        let (s3, l3) = restored.extent_range(a3).unwrap();
+        assert!(
+            s3 >= start + pages || s3 + l3 <= start,
+            "{s3}..{} was handed out although {start}..{} is live: the free and the re-claim \
+             replayed in the wrong order",
+            s3 + l3,
+            start + pages
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A torn final record — the one shape a crash during `append_durably` actually produces — is
+    /// dropped, and everything in front of it survives.
+    #[test]
+    fn a_torn_final_record_is_dropped_and_the_records_in_front_of_it_survive() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h); // the image
+        let (kept_owner, kept) = claim(&h);
+        let (_lost_owner, lost) = claim(&h);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let image_len = ArenaPageStore::image_len(&bytes).unwrap();
+        assert_eq!(bytes.len(), image_len + 2 * 45, "fixture: not two 45-byte claim records");
+
+        // Cut the last record short, as an interrupted append would.
+        for cut in [1usize, 20, 40] {
+            let torn = &bytes[..bytes.len() - cut];
+            let restored = h.fresh_store();
+            restored
+                .load_file(torn)
+                .unwrap_or_else(|e| panic!("a torn tail (cut {cut}) must open, not fail: {e}"));
+            assert_eq!(
+                restored.arena_owner(kept),
+                Some(kept_owner),
+                "the intact record before the torn one was dropped with it (cut {cut})"
+            );
+            assert_eq!(
+                restored.arena_owner(lost),
+                None,
+                "a half-written claim was applied (cut {cut}): it was never acknowledged"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A zero-filled extension is unwritten space, not a record. A crash can expose one, and
+    /// `kind` starts at 1 precisely so that it reads as "nothing here".
+    #[test]
+    fn a_zero_filled_extension_is_read_as_the_end_of_the_tail() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h);
+        let (owner, kept) = claim(&h);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0u8; 64]);
+
+        let restored = h.fresh_store();
+        restored.load_file(&bytes).expect("zero padding must not be an error");
+        assert_eq!(restored.arena_owner(kept), Some(owner));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Corruption in the MIDDLE is refused, and that is a different rule from a torn tail.**
+    ///
+    /// Stopping at a bad record is right only when it is last. With records behind it, stopping
+    /// would silently discard claims whose ranges the next allocation then re-issues — the
+    /// aliasing the whole map exists to prevent, arriving through the recovery path.
+    #[test]
+    fn a_bad_record_with_records_behind_it_is_refused_rather_than_silently_truncating_the_map() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h); // the image
+        claim(&h); // record 1
+        claim(&h); // record 2
+
+        let bytes = std::fs::read(&path).unwrap();
+        let image_len = ArenaPageStore::image_len(&bytes).unwrap();
+        let mut corrupt = bytes.clone();
+        corrupt[image_len + 10] ^= 0xff; // inside record 1's payload
+
+        let restored = h.fresh_store();
+        let err = restored
+            .load_file(&corrupt)
+            .expect_err("a bad record with another behind it must be refused, not stopped at");
+        assert!(
+            format!("{err}").contains("NOT the last record"),
+            "the refusal must name why it is not a torn append: {err}"
+        );
+
+        // **The control**, and without it this is a blanket refusal rather than a rule: the SAME
+        // damage in the LAST record is a torn append and must open.
+        let mut torn = bytes.clone();
+        let last = torn.len() - 10;
+        torn[last] ^= 0xff;
+        let restored2 = h.fresh_store();
+        restored2
+            .load_file(&torn)
+            .expect("the same damage in the LAST record is a torn append and must open");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record kind this build does not know is refused, not skipped.
+    ///
+    /// Skipping would apply every change except one and call the result the map.
+    #[test]
+    fn an_unknown_tail_record_kind_is_refused_rather_than_skipped() {
+        let h = Harness::new();
+        let path = arm(&h);
+        claim(&h);
+        claim(&h);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(0x7f, b"from the future"));
+
+        let restored = h.fresh_store();
+        let err = restored.load_file(&bytes).expect_err("an unknown kind must be refused");
+        assert!(format!("{err}").contains("newer build"), "unhelpful refusal: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A store must never append onto a tail it did not write.**
+    ///
+    /// That tail can end in a torn record, and a good record behind a bad one is the one
+    /// arrangement `replay_tail` cannot recover from — it must stop at the bad one, and would
+    /// then discard the good one silently. So the first persist after arming is a full rewrite,
+    /// which drops the torn bytes. Asserted through `reopen_from_checkpoint`, the path
+    /// `cli.rs:101` takes on every open.
+    #[test]
+    fn a_reopened_store_rewrites_the_image_before_it_appends_again() {
+        let h = Harness::new();
+        let path = arm(&h);
+        for _ in 0..6 {
+            claim(&h);
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            before.len() > ArenaPageStore::image_len(&before).unwrap(),
+            "fixture: no tail to be inherited"
+        );
+
+        let reopened = ArenaPageStore::reopen_from_checkpoint(
+            Arc::clone(&h.store.pool),
+            Arc::clone(&h.catalog),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(reopened.persist_counters(), (0, 0), "reopening must write nothing by itself");
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        reopened.alloc_arena(b.branch_id).unwrap();
+        assert_eq!(
+            reopened.persist_counters(),
+            (1, 0),
+            "the first persist after a reopen must be a full rewrite, not an append onto a tail \
+             this process did not write"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ArenaPageStore::image_len(&after).unwrap(),
+            after.len(),
+            "the rewrite must leave the file compact, with the inherited tail gone"
+        );
+
+        // ...and it appends again from there.
+        let b2 = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        reopened.alloc_arena(b2.branch_id).unwrap();
+        assert_eq!(reopened.persist_counters(), (1, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The pending-log guard, forced to fire and then forced not to.**
+    ///
+    /// A guard that has never been made to fire is not a guard. Parking a page changes the map in
+    /// a way no tail record describes, so the next claim must REWRITE rather than append; the
+    /// control — the identical sequence with nothing parked — must still append, or the guard is
+    /// really just "always rewrite" wearing a condition.
+    #[test]
+    fn parking_a_page_forces_the_next_claim_to_rewrite_instead_of_appending() {
+        // Control: claims alone append.
+        let c = Harness::new();
+        let cpath = arm(&c);
+        let (parent, _) = claim(&c);
+        c.store.alloc_for(parent, PageType::Heap, c.catalog.next_epoch()).unwrap();
+        claim(&c);
+        claim(&c);
+        assert_eq!(
+            c.store.persist_counters(),
+            (1, 2),
+            "control: with nothing parked, claims after the first must append"
+        );
+        let _ = std::fs::remove_file(&cpath);
+
+        // Now the same thing with a page parked against a live child in between.
+        let h = Harness::new();
+        let path = arm(&h);
+        let (parent, _) = claim(&h);
+        let page = h.store.alloc_for(parent, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        claim(&h);
+        assert_eq!(h.store.persist_counters(), (1, 1), "fixture: the second claim should append");
+
+        let _child = h.catalog.fork(parent, LeaseDeadline(0)).unwrap();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: the page was released, not parked");
+
+        claim(&h);
+        assert_eq!(
+            h.store.persist_counters(),
+            (2, 1),
+            "the claim after a park must rewrite the image: a tail record does not carry the \
+             pending log, and a lost entry is a page drain_pending never revisits"
+        );
+        // And the parked entry is in the file, not only in memory.
+        let restored = h.fresh_store();
+        assert!(restored.restore(&path).unwrap());
+        assert_eq!(restored.pending_len(), 1, "the parked page did not reach the file");
+
+        // ...and the store goes back to appending afterwards.
+        claim(&h);
+        assert_eq!(h.store.persist_counters(), (2, 2), "the guard latched instead of clearing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unarmed store writes nothing at all, tail included. `Harness` builds one, and most of
+    /// this file's other tests depend on it staying that way.
+    #[test]
+    fn an_unarmed_store_appends_nothing() {
+        let h = Harness::new();
+        for _ in 0..5 {
+            claim(&h);
+        }
+        assert_eq!(h.store.persist_counters(), (0, 0));
+    }
 }
