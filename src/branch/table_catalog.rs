@@ -1802,6 +1802,96 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    /// ⛔ **D124 — the guard, made to fire, and made not to fire spuriously.**
+    ///
+    /// A CHILD entry's value is a child branch id, and both resolvers used to resolve a MISSING
+    /// record in the DESTRUCTIVE direction: `child_liveness` answered `Gone`, which
+    /// `has_live_children` then skipped entirely, so the entry pinned nothing and the parent
+    /// became reclaimable; `live_child_at` swept the same case into a catch-all it shared with
+    /// the legitimate "reaped with nothing under it". A record key is never deleted anywhere in
+    /// `src/` — see `dangling_child` — so a missing record can only mean "never published", and
+    /// freeing on it is the pages of a live branch.
+    ///
+    /// Four parts, and the last two are what make the first two mean anything. A guard that
+    /// refuses everything is not a guard, and a guard whose only caller it refuses is worse.
+    #[test]
+    fn a_child_entry_naming_a_branch_with_no_record_is_refused_not_resolved_away() {
+        let (c, p, _pool) = cat("dangling");
+        let t = BranchId::TRUNK.id;
+        let ghost = 4242u64;
+        assert!(c.core(ghost).unwrap().is_none(), "fixture: the ghost must have no record");
+
+        // 1. UNREPRESENTABLE AT THE ENTRY POINT. `attach_child` is the only API that can write a
+        //    CHILD entry naming an arbitrary id, and it now refuses one with no record.
+        let ghost_epoch = c.next_epoch();
+        let err = c.attach_child(t, ghost_epoch, ghost).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "attach_child refused with the wrong error: {msg}");
+        assert!(
+            c.tree.search(&keys::child(t, ghost_epoch.0)).unwrap().is_none(),
+            "attach_child refused and wrote the entry anyway"
+        );
+        assert!(!c.has_live_children(t).unwrap(), "the refused attach still pinned trunk");
+
+        // 2. WRITTEN PAST THE ENTRY POINT, straight into the tree, exactly as a catalog corrupted
+        //    by some other means would hold it. Every reader must refuse rather than answer
+        //    "not a pin" — that answer is what frees the parent's pages.
+        c.upsert(keys::child(t, ghost_epoch.0), ghost.to_be_bytes().to_vec()).unwrap();
+        for (name, e) in [
+            ("has_live_children", c.has_live_children(t).map(|b| b.to_string())),
+            ("max_live_child", c.max_live_child(t).map(|m| format!("{m:?}"))),
+            (
+                "live_child_in_epoch_range",
+                c.live_child_in_epoch_range(t, ghost_epoch, Epoch(ghost_epoch.0 + 1))
+                    .map(|b| b.to_string()),
+            ),
+        ] {
+            let e = e.expect_err(&format!(
+                "{name} resolved a CHILD entry naming an unpublished branch instead of refusing \
+                 it — trunk reads as childless and its pages are freed underneath b{ghost}"
+            ));
+            let m = e.to_string();
+            // The error has to name the entry, or nobody can find it.
+            assert!(m.contains("parent 0"), "{name}: error does not name the parent: {m}");
+            assert!(
+                m.contains(&format!("fork epoch {}", ghost_epoch.0)),
+                "{name}: error does not name the fork epoch: {m}"
+            );
+            assert!(m.contains(&ghost.to_string()), "{name}: error does not name the child: {m}");
+        }
+
+        // 3. AND IT MUST NOT FIRE ON THE LEGITIMATE CASE. `reap` marks a child `Reaped` and then
+        //    removes its entry; a crash between those leaves a reaped child with nothing under it,
+        //    which is genuinely not a live child and must keep answering exactly that. This is the
+        //    arm `live_child_at`'s old catch-all shared with the impossible one.
+        assert!(c.detach_child(t, ghost_epoch).unwrap(), "fixture: the ghost entry is gone");
+        let doomed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_state(doomed.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        let (lo, hi) = keys::children_of(t);
+        assert_eq!(
+            c.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi)).unwrap().count(),
+            1,
+            "fixture: reap's crash window leaves the entry behind, or this proves nothing"
+        );
+        assert!(!c.has_live_children(t).unwrap(), "a reaped childless child now refuses");
+        assert_eq!(c.max_live_child(t).unwrap(), None, "a reaped childless child now refuses");
+        assert!(
+            !c.live_child_in_epoch_range(t, doomed.fork_epoch, Epoch(doomed.fork_epoch.0 + 1))
+                .unwrap(),
+            "a reaped childless child now refuses"
+        );
+
+        // 4. AND IT MUST STILL ACCEPT ITS ONLY CALLER'S SHAPE. `migrate_from` attaches a child
+        //    whose record it has just written; a guard that refused that would refuse production.
+        let real = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        assert!(c.detach_child(t, real.fork_epoch).unwrap(), "fixture: detach removed nothing");
+        let e2 = c.next_epoch();
+        c.attach_child(t, e2, real.branch_id.id).expect("the guard refused a legitimate attach");
+        assert!(c.has_live_children(t).unwrap(), "a live re-attached child stopped pinning");
+        assert_eq!(c.max_live_child(t).unwrap(), Some(e2));
+        let _ = std::fs::remove_file(p);
+    }
+
     /// A genuine close-and-reopen: the catalog is dropped, its pool with it, and the next open
     /// starts from nothing but the file. Everything before this used one long-lived pool, which
     /// cannot tell a durable write from a page still sitting in a frame.
