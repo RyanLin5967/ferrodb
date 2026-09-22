@@ -47,6 +47,11 @@ escape is not used for the verdict. It IS used for two subsidiary findings below
 
   **The floor is the durability barrier, not the handoff.** The section and the DISK trade off.
 
+  ⭐ THE NUMBER TO STATE A FUTURE CANDIDATE AGAINST, replacing the 21x/1.9x pair for that job:
+  **lock-attributable time (WAIT + HOLD_TOTAL) is 39.2% of the thread cycle at L0 and 1.5% at
+  L3.** That is the whole budget any "take work out of the critical section" mechanism is
+  bidding for, measured rather than inferred. See section 5.
+
 ================================================================================================
 1. THE INSTRUMENT FAILED ITS OWN POSITIVE CONTROL FIRST, AND THE PREMISE WAS WHAT WAS WRONG
 ================================================================================================
@@ -195,6 +200,22 @@ never been decomposed, and L3 is the rung the whole argument turns on.
     L3     17.98 ms   0.256 ( 1.4%)  0.011 (0.06%)   17.59 (97.8%)    99.3%
 
   L0 -> L3:  WAIT falls 46x.  DURABLE is flat (0.95x).  HOLD falls 41.5x.
+
+⭐ AND THE ONE NUMBER A CANDIDATE SHOULD BE STATED AGAINST — LOCK-ATTRIBUTABLE TIME, which is
+everything `logical` can possibly be blamed for, WAIT + HOLD_TOTAL, as a share of the cycle:
+
+    L0   (11.76194 + 0.44130) / 31.146 =  39.2% of the thread cycle
+    L3   ( 0.25570 + 0.01063) / 17.981 =   1.5% of the thread cycle
+
+⇒ **At L3 the entire mutex — waiting for it AND holding it — is 1.5% of the time.** A mechanism
+that deleted `logical` outright, made every acquisition free and every section instantaneous,
+could not buy more than that. At L0 the same quantity is 39.2%, which is why shortening the
+section works at first and stops working almost immediately.
+
+⚠ This is a DIRECT MEASUREMENT of a share, not a forecast. Turning it into "removing the lock
+buys 1.5%" adds a counterfactual: `durable()` is group-committed, so changing the arrival pattern
+into it would change its own duration. The 1.5% is the honest upper bound on the LOCK'S SHARE;
+what a mechanism would actually recover is not measured here and is not claimed.
 
 ⇒ **Time spent BLOCKED ON `logical` falls FASTER than the section does.** Threads are not piling
 up on the mutex at L3; they have essentially stopped touching it. The gap that grows is
