@@ -200,11 +200,19 @@ impl ServerContext {
     /// it is false by construction rather than by degree.** The announcer set is exhaustively
     /// enumerable and none of it is DDL-gated: `ServerContext::drain_readers` is the only writer
     /// of `writer_active`, [`ServerContext::catalog`] is its only caller, and `catalog()` has
-    /// exactly four callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl,
-    /// `pgwire::extended::Statement::parse_one`, the exclusive execution path, and
-    /// [`ServerContext::read_catalog`]'s snapshot refresh. **`parse_one` takes it unconditionally
-    /// for every `Kind::Sql`**, so a plain `SELECT 1` on the simple query protocol announces a
-    /// writer and drains every reader at parse time.
+    /// exactly three callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl, the
+    /// exclusive execution path, and [`ServerContext::read_catalog`]'s snapshot refresh.
+    ///
+    /// ⚠ **D151 REMOVED THE FOURTH, and this paragraph used to name it.** It read *"`parse_one`
+    /// takes it unconditionally for every `Kind::Sql`, so a plain `SELECT 1` on the simple query
+    /// protocol announces a writer and drains every reader at parse time."* **That was true and
+    /// is no longer**: `pgwire::extended::Statement::parse_one` reads the per-connection snapshot
+    /// through [`ServerContext::read_catalog`], so a statement that then runs on the shared path
+    /// announces nothing at all. Measured on `examples/e6_outer_lock_count.rs`, a count and not a
+    /// timing. ⚠ **The scope travels with the number, both halves together:** it was ~25% of
+    /// announcements (1,604 of 6,369 in the deciding arm), it is **NOT a W4 rescue**, and it moves
+    /// a system already pinned against its ceiling at high fork rates — worth several times as
+    /// much one decade of fork rate away.
     ///
     /// ⚠ **And do NOT replace that sentence with "the lease thread announces every
     /// `DEFAULT_SCAN_MILLIS`", which is the correction a previous pass tried and which is also

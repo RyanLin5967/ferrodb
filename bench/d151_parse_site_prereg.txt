@@ -1,0 +1,94 @@
+D151 — PRE-REGISTRATION OF THE PARSE-SITE ANNOUNCEMENT DROP
+Written 2026-09-22, BEFORE the first arm was run. Amendments append-only, at the bottom.
+
+WHAT IS BEING CHANGED
+  `pgwire::extended::Statement::parse_one` read the schema through `ServerContext::catalog()` —
+  the EXCLUSIVE acquisition, which announces a writer and drains every reader — for every
+  `Kind::Sql`, including statements `try_run_read` then admits to the shared path. It now reads
+  the per-connection snapshot through `ServerContext::read_catalog`.
+
+THE INSTRUMENT
+  `examples/e6_outer_lock_count.rs` under `--features lock_census`: one relaxed increment on a
+  process-global `AtomicU64` inside `ServerContext::catalog()` itself, read as a delta per arm.
+  A COUNT, not a timing. An integer is load-immune, so this needs no quiet box and does not take
+  the fleet measure lock. The harness refuses (exit 1) on an uninstrumented build, on any client
+  SQL error, and on a disagreement between its own fork counter and the branches the SERVER named.
+  Both arms are built from the SAME instrument commit (ed598e4, cherry-picked onto `main`'s tip
+  2a0a8fc), so BEFORE and AFTER differ in exactly the D151 diff and nothing else.
+
+THE ARMS AND THEIR STATEMENT COUNTS (F forks per thread, T threads)
+  A1 pgwire, persistent conn   T connections, each F x (BEGIN AGENT SESSION + ABANDON) = 2FT stmts
+  A2 pgwire, conn per fork     FT connections, 1 BEGIN AGENT SESSION each           =  FT stmts
+  A0 CONTROL, SELECT 1         FT connections, 1 SELECT 1 each                      =  FT stmts
+  B  direct, no ServerContext  no connection, no statement, no ServerContext        =   0 stmts
+
+THE PREDICTION, derived from the mechanism and not from any number yet seen
+  The removed site fired exactly once per statement that reached `Kind::Sql`. `Kind::Empty` and
+  `Kind::Session` (SET/SHOW/RESET and the server probes) return before it and are unaffected.
+  The per-connection first-use snapshot refresh is NOT removed — it MOVES from the first
+  `execute` to the first `parse`, so it nets to zero.
+
+  P1. Arm B is the CONTROL and must not move: 0 acquisitions before, 0 after, at every T.
+      If B moves, the two halves came from different bases and the comparison is void.
+
+  P2. At T=1 the drop is EXACTLY one acquisition per parsed `Kind::Sql` statement:
+        A1 at T=1:  -2F
+        A2 at T=1:  -F
+        A0 at T=1:  -F
+      The control arm A0 is expected to drop too. That is not a broken control — A0's `SELECT 1`
+      is a `Kind::Sql` statement and pays the parse site like any other. B is the control here.
+
+  P3. At T>1 the drop is AT LEAST the P2 per-statement amount, and may exceed it. A parse-time
+      announcement drains readers on OTHER connections, standing them down onto the exclusive
+      execution path, where they announce in turn. Removing the parse announcement can therefore
+      remove further acquisitions downstream. The feedback runs in one direction only: it cannot
+      ADD acquisitions. An observed drop SMALLER than P2 at any T falsifies this change.
+
+  P4. `ABANDON` is asserted to be a `Kind::Sql` statement, not a session probe. If it is a probe,
+      A1's drop is -F rather than -2F. This is checked against the A1/A2 ratio in the BEFORE arm,
+      whose numbers are not yet in hand.
+
+REFUSAL CONDITIONS
+  - `catalog_acquisitions()` returns None in either arm: the build was not instrumented, the run
+    collected nothing, and no number from it may be quoted.
+  - Arm B non-zero in either arm.
+  - Any arm's drop below P2.
+
+SCOPE — BOTH HALVES, ALWAYS TOGETHER
+  This is ~25% of announcements (1,604 of 6,369 in the deciding arm, recorded before this row was
+  built). It is NOT a W4 rescue, and it moves a system already pinned against its ceiling at high
+  fork rates — worth several times as much one decade of fork rate away. A number from this file
+  quoted without that sentence is misleading.
+
+-----------------------------------------------------------------------------------------------
+AMENDMENT 1 — 2026-09-22, STILL BEFORE ANY ARM WAS RUN. Reached by reading, not by measuring.
+
+P2/P4 above assumed arm A0's `SELECT 1;` is a `Kind::Sql` statement. IT IS NOT. `session::parse`
+routes every statement whose first word is `SELECT` through `parse_probe`, and `parse_probe` ends
+with the bare-integer case:
+
+    src/pgwire/session.rs:471-476
+    // `SELECT 1` -- the oldest connection-liveness check there is, and one no pool can be talked
+    // out of. A bare literal has no FROM clause, so the query engine cannot answer it at all.
+    if w.len() == 1 { ... t.chars().all(|c| c.is_ascii_digit()) ... SessionCommand::Probe
+
+So A0 issues `Kind::Session` statements, which return from `parse_one` BEFORE either catalog site
+and run through `run_session`, which touches no catalog at all. `ABANDON` is not in `session::parse`'s
+head table and does fall through to `Kind::Sql`, so P4's assertion about A1 stands.
+
+  ⇒ A0 IS A SECOND CONTROL, not an affected arm. It must not move. P2's "-F for A0" is WITHDRAWN.
+  ⇒ The corrected prediction, with the recorded generative rule (2 per parsed non-probe statement,
+    plus 1 per connection) written out per arm:
+
+    arm   statements (non-probe)   connections     BEFORE        AFTER        DROP
+    A1        2FT                      T           4FT + T      2FT + T       2FT
+    A2         FT                     FT           3FT          2FT            FT
+    A0          0  (probes only)      FT              0            0             0   CONTROL
+    B           0  (no ServerContext)  0              0            0             0   CONTROL
+
+  ⇒ P1 is now TWO controls: B and A0. Either one moving voids the comparison.
+  ⇒ P2 becomes: at T=1, DROP(A1) = 2F and DROP(A2) = F exactly.
+  ⇒ P3 is unchanged: at T>1 the drop may exceed P2 through removed stand-downs, never fall below.
+
+This amendment makes the prediction HARDER to satisfy, not easier: it converts an arm that was
+predicted to move into one that is forbidden to move.
