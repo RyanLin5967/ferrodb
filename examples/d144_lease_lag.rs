@@ -189,6 +189,12 @@ fn fork_locked(
 struct Row {
     delta_ms: u64,
     lease_ms: u64,
+    /// Median sweep gap measured DURING the run, from the lease thread's own `attempts` counter.
+    /// This, not the nominal constant, is the S in every Δ/S printed.
+    realised_scan_ms: u64,
+    /// The same quantity measured BEFORE forking, used to set the stagger.
+    cal_scan_ms: u64,
+    scan_spread_ms: (u64, u64),
     peak: usize,
     parked_parents: usize,
     /// Diagnostic only — see the note on [`SAMPLE_MS`]. Above `parked_parents` means a sample
@@ -218,10 +224,58 @@ fn run_point(
     )
     .expect("lease thread");
 
-    let scan_ms = scan.as_millis() as u64;
-    // Parent forks spread across EXACTLY one interval, so the phase of the first sweep after each
-    // parent's deadline is uniform on [0, S). Firing them together would sample one phase and
-    // turn a ramp into a coin flip.
+    let nominal_ms = scan.as_millis() as u64;
+
+    // ---- calibrate the REALISED sweep interval before forking anything --------------------
+    //
+    // ⛔ **`Δ/S` is a ratio of two DURATIONS, and only Δ was being measured.** The cadence comes
+    // from a `wait_timeout` plus however long the scan itself took, so the realised interval is
+    // never shorter than nominal and under load can be longer. Two things break if it is, and the
+    // second is the one that matters:
+    //
+    //   1. the x-axis. Plotting realised Δ against NOMINAL S overstates Δ/S, so the ramp would sit
+    //      systematically below P2 and worst at small Δ — which reads exactly like P2 being wrong.
+    //   2. **the premise.** The stagger below spreads parent forks across one interval precisely so
+    //      the sweep phase is uniform. Spread across NOMINAL S while the true period is longer, the
+    //      expiries cover only part of a period and the phase is no longer uniform — so P2's
+    //      `min(Δ/S, 1)` would not even be the right model. An axis fix alone would not catch this.
+    //
+    // So the interval is measured first, from the lease thread's own `attempts` counter, and
+    // everything downstream — stagger, end time, x-axis — is derived from what was measured.
+    // The first gap is dropped: it contains `LeaseThread::start`'s own immediate scan.
+    let mut sweep_at: Vec<u64> = Vec::new();
+    let cal0 = Instant::now();
+    let mut seen = lease.stats().attempts;
+    while sweep_at.len() < 4 {
+        let now_ms = cal0.elapsed().as_millis() as u64;
+        if now_ms > nominal_ms * 12 + 5000 {
+            refusals.push(format!(
+                "delta={delta_ms} lease={lease_ms}: only {} sweeps in {now_ms} ms while \
+                 calibrating a nominal {nominal_ms} ms interval — the cadence cannot be \
+                 characterised, so no Δ/S computed from it would mean anything",
+                sweep_at.len()
+            ));
+            break;
+        }
+        let a = lease.stats().attempts;
+        if a > seen {
+            seen = a;
+            sweep_at.push(now_ms);
+        }
+        std::thread::sleep(Duration::from_millis(SAMPLE_MS));
+    }
+    let cal_gaps: Vec<u64> =
+        sweep_at.windows(2).skip(1).map(|w| w[1] - w[0]).collect();
+    let realised_ms = if cal_gaps.is_empty() {
+        nominal_ms
+    } else {
+        cal_gaps.iter().sum::<u64>() / cal_gaps.len() as u64
+    };
+
+    let scan_ms = realised_ms.max(1);
+    // Parent forks spread across EXACTLY one REALISED interval, so the phase of the first sweep
+    // after each parent's deadline is uniform on [0, S). Firing them together would sample one
+    // phase and turn a ramp into a coin flip.
     let stagger_ms = scan_ms as f64 / pairs as f64;
 
     // (due_ms, is_child, index)
@@ -240,8 +294,11 @@ fn run_point(
     // Stop once every parent is reaped and the queue has had a couple of sweeps to show itself.
     // Not once the children drain: the peak is what is being measured.
     let end_ms = scan_ms + delta_ms + lease_ms + 4 * scan_ms;
+    let _ = nominal_ms;
 
     let t0 = Instant::now();
+    let mut run_sweeps: Vec<u64> = Vec::new();
+    let mut run_seen = lease.stats().attempts;
     let mut peak = 0usize;
     let mut prev = 0usize;
     let mut increments = 0usize;
@@ -268,6 +325,11 @@ fn run_point(
             next_event += 1;
         }
 
+        let a = lease.stats().attempts;
+        if a > run_seen {
+            run_seen = a;
+            run_sweeps.push(now_ms);
+        }
         let l = rig.store.pending_len();
         if l > peak {
             peak = l;
@@ -333,11 +395,47 @@ fn run_point(
         ));
     }
 
+    // The interval DURING the measurement, not only before it: load can arrive mid-run.
+    let mut run_gaps: Vec<u64> = run_sweeps.windows(2).map(|w| w[1] - w[0]).collect();
+    run_gaps.sort_unstable();
+    let (g_lo, g_med, g_hi) = if run_gaps.is_empty() {
+        (0, realised_ms, 0)
+    } else {
+        (run_gaps[0], run_gaps[run_gaps.len() / 2], run_gaps[run_gaps.len() - 1])
+    };
+    // One number can only stand for the cadence if the cadence is actually one number.
+    if g_med > 0 && !run_gaps.is_empty() && (g_hi - g_lo) * 4 > g_med {
+        refusals.push(format!(
+            "delta={delta_ms} lease={lease_ms}: sweep interval ranged {g_lo}..{g_hi} ms (median \
+             {g_med}) during the run — a spread over 25% of the median means no single S \
+             characterises the cadence, so Δ/S is not a well-defined axis for this row"
+        ));
+    }
+
+    // Calibration happened BEFORE the forks; the run median covers the measurement window. Load
+    // arriving in between would move one and not the other, and the stagger was set from the
+    // calibration — so a drift here means the forks were spread across the wrong period and the
+    // uniform-phase premise is broken for this row.
+    if g_med > 0 && realised_ms > 0 {
+        let drift = g_med.abs_diff(realised_ms);
+        if drift * 4 > g_med {
+            refusals.push(format!(
+                "delta={delta_ms} lease={lease_ms}: the sweep interval MOVED between calibration \
+                 ({realised_ms} ms, which set the fork stagger) and the run ({g_med} ms) — a \
+                 {drift} ms drift. The parent forks were therefore spread across the wrong \
+                 period, so the phase is not uniform and P2 is not the right model for this row"
+            ));
+        }
+    }
+
     let lo = realised.iter().copied().min().unwrap_or(0);
     let hi = realised.iter().copied().max().unwrap_or(0);
     Row {
         delta_ms,
         lease_ms,
+        realised_scan_ms: g_med,
+        cal_scan_ms: realised_ms,
+        scan_spread_ms: (g_lo, g_hi),
         peak,
         parked_parents: peak / pages as usize,
         increment_sum_parents: increments / pages as usize,
@@ -362,30 +460,43 @@ fn print_header(scan_ms: u64, lease_ms: u64, pairs: usize, pages: u32) {
     println!("  reaping          the REAL LeaseThread on a real clock. No faked time, no direct \
               reap() call.");
     println!();
+    println!("  S realis = the MEDIAN sweep gap this row actually achieved, from the lease");
+    println!("             thread's own `attempts` counter. Every Δ/S below divides realised by");
+    println!("             realised — one instrument, one moment. The nominal {scan_ms} ms is the");
+    println!("             REQUEST, and appears in no ratio. `S spread` is min..max of those gaps;");
+    println!("             a row whose spread exceeds 25% of its median REFUSES rather than");
+    println!("             pretending one number describes the cadence.");
+    println!();
     println!("  P1 = D144 as written: a STEP — 0 parked below S, all parked above.");
     println!("  P2 = refinement:      a KNEE — parked fraction = min(Δ/S, 1), so a RAMP below S.");
     println!();
     println!(
-        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
-        "Δ ms", "lease ms", "Δ/S", "parked", "P1", "P2", "peak pending", "realised Δ",
-        "scans a/s/r/f/reaped", "incsum"
+        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
+        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "peak", "realised Δ",
+        "S spread", "scans a/s/r/f/reaped", "incsum"
     );
 }
 
-fn print_row(r: &Row, scan_ms: u64, pairs: usize) {
+fn print_row(r: &Row, _nominal_ms: u64, pairs: usize) {
+    // ⭐ **S is the REALISED median sweep gap, measured in the same run and the same moment as the
+    // Δ it is divided by.** Using the nominal constant here would make the axis a ratio of one
+    // measured number to one assumed one, which is the shape this project has lost four results to.
+    let scan_ms = r.realised_scan_ms.max(1);
     let ratio = r.delta_ms as f64 / scan_ms as f64;
     let p1 = if r.delta_ms > scan_ms { pairs } else { 0 };
     let p2 = (pairs as f64 * ratio.min(1.0)).round() as usize;
     println!(
-        "  {:>8} {:>8} {:>10.3} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
+        "  {:>8} {:>8} {:>9} {:>8.3} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
         r.delta_ms,
         r.lease_ms,
+        format!("{}/{}", r.realised_scan_ms, r.cal_scan_ms),
         ratio,
         r.parked_parents,
         p1,
         p2,
         r.peak,
         format!("{}..{}", r.realised_delta_ms.0, r.realised_delta_ms.1),
+        format!("{}..{}", r.scan_spread_ms.0, r.scan_spread_ms.1),
         format!(
             "{}/{}/{}/{}/{}",
             r.stats.attempts, r.stats.scans, r.stats.refused, r.stats.failed, r.stats.reaped
@@ -442,9 +553,9 @@ fn main() {
     println!("  CONTROL — L varied at a fixed Δ={control_delta} ms. L is not in the window, so");
     println!("  these rows MUST agree. If they do not, the derivation above is wrong.");
     println!(
-        "  {:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>16} {:>15} {:>22} {:>7}",
-        "Δ ms", "lease ms", "Δ/S", "parked", "P1", "P2", "peak pending", "realised Δ",
-        "scans a/s/r/f/reaped", "incsum"
+        "  {:>8} {:>8} {:>9} {:>8} {:>7} {:>5} {:>5} {:>6} {:>13} {:>13} {:>20} {:>7}",
+        "Δ ms", "lease ms", "S run/cal", "Δ/S", "parked", "P1", "P2", "peak", "realised Δ",
+        "S spread", "scans a/s/r/f/reaped", "incsum"
     );
     let mut control_parked = Vec::new();
     for &l in &control_leases {
