@@ -4,6 +4,13 @@
 # artifact can be rebuilt and diffed rather than hand-edited.
 set -eu
 W=/Users/idide/wt/ferrodb-D123-serial-attribution
+# ⛔ REFUSE rather than emit an artifact with an unfilled section. A placeholder that ships reads
+# exactly like a finding nobody got round to, and this row has already produced two files that
+# looked like results and were not (Amendment 8).
+if grep -rq 'PENDING' "$W/bench/d123_sections/"; then
+  echo "⛔ REFUSING: a section still says PENDING:"; grep -rln 'PENDING' "$W/bench/d123_sections/"
+  exit 1
+fi
 S=$W/bench/d123_sections
 OUT=$W/bench/d123_serial_attribution.txt
 cat "$S/d123_head.txt" \
