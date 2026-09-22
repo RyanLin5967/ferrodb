@@ -1,0 +1,251 @@
+D124: a branch record that cannot be read must REFUSE, never free.
+Branch D124-child-liveness-refuse, base 52e1137.
+
+  SUITE GREEN CERTIFIES 927e5c8 (see SUITE below). Commits after it are the premise
+  correction: comments, plus one error-message string. No control flow changed; the
+  evidence for that is a `git diff` filtered to non-comment lines and a targeted re-run,
+  both recorded at the bottom. The full suite was NOT re-run for a doc change.
+
+
+THE PREMISE -- STATED WRONG FIRST, THEN MEASURED
+
+  The row was opened on this claim: "a record key is never removed anywhere in `src/`, so a
+  missing record can only mean 'not published yet'." I confirmed the grep and built the first
+  version of this change on it, writing "impossible" into eight comments.
+
+  THE CLAIM IS HALF TRUE, AND THE FALSE HALF IS THE ONE THAT MATTERS.
+
+  DURABLY it holds. Nothing ever leaves a record deleted: retirement is a state flip to
+  `Reaped`, the id-reuse path overwrites the recycled slot, and `keys::record` is only ever
+  inserted, searched and upserted -- the same fact `write_record_new`'s "provably new"
+  argument already rests on. `LogBranchCatalog::state.records` and `MemCatalog::records` have
+  no `remove` either.
+
+  TRANSIENTLY it fails, and the window is on the hot path. `BPlusTreeManager` has no replace
+  primitive -- `TableBranchCatalog::upsert`'s own comment says so and is why the catalog
+  open-codes delete-then-insert -- and `write_record` routes the RECORD key straight through
+  `upsert`. `BPlusTreeManager::delete` takes the leaf write latch, writes the page and
+  RETURNS, dropping the latch; `insert` then re-acquires it. Between those two calls the key
+  DOES NOT EXIST. `write_record` is reached from `set_state`, `set_root`, `renew_lease`,
+  `reparent`, `restrict_envelope` and `put` -- `set_root` and `renew_lease` are ordinary
+  statement-path writes. Every reader this row touches is LOCKLESS: `logical` is a
+  writers-only mutex and `core()` takes nothing.
+
+  So a reader can see "no record" for a perfectly healthy, live branch, and the four sites
+  below were FREEING ITS PAGES on that reading.
+
+  Verified in source, not accepted on assertion: `src/storage/index.rs` `BPlusTreeManager::
+  delete` (`let (page_id, _latch) = self.latch_leaf_for_write(key)?` -- scoped to the call),
+  `src/branch/table_catalog.rs` `upsert` and `write_record`, and the absence of any lock in
+  `core` / `child_liveness` / `live_child_at` / `has_live_children`.
+
+  This makes the defect WORSE than the row was opened on, and the fix more valuable: it is a
+  reachable data-loss race, not an impossible-state hardening. It does not change a line of
+  the fix. It changes the cost profile: under W4 the guard fires a refusal on a healthy
+  database rather than silently freeing, which is the right trade and not the end state.
+  SCALE-DESIGN D126 -- give the tree a real replace so `upsert` is atomic -- closes the window
+  and makes the original premise true. D126 is deliberately NOT in this row: it is a
+  storage-layer change and mixing it in would make this guard unreviewable.
+
+
+FOUR SITES, NOT TWO. All four resolved an unreadable record in the destructive direction.
+
+  1. table_catalog::child_liveness       None => ChildLiveness::Gone
+     `has_live_children` then skipped `Gone` entirely (`=> {}`), so the entry pinned nothing
+     and the parent became reclaimable.
+
+  2. table_catalog::live_child_at        `_ => Ok(None)`
+     The catch-all whose own comment admitted it lumped "reaped with nothing under it"
+     (legitimate) together with "gone entirely", answering the destructive way for both.
+
+  3. reaper::drain_pending_seeded        `Err(_) => false` -> release_page
+  4. arena::free_page                    `get_raw(owner).is_ok() && ...` -> release_page
+     The same defect on the PAGE path, and both stated the false premise in their own
+     comments ("no record at all: nothing can be forked off it"; "an owner with no record at
+     all pins nothing"). Sites 3 and 4 are the CONSUMER and the PRODUCER of the same
+     pending-free entry.
+
+  Site 4 was not in the brief. It was found by enumerating the other producers of
+  `PendingFree` while checking site 3's reachability. `cow/store.rs`'s `free_page` has the
+  same shape but is NOT this defect: it reads its own in-memory `live_children_of`, never a
+  catalog record.
+
+
+REACHABILITY, stated honestly
+
+  Not reachable in production TODAY. `reap_expired` runs inside `with_lock`
+  (`lease_thread.rs`), which in production is the pgwire per-statement mutex that every
+  `fork`, `set_root` and `renew_lease` also takes, so reader and writer are mutually
+  excluded. W4 exists to remove that lock. The defect must be gone BEFORE W4 lands, not
+  after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock`, which is where it is
+  reachable at all today.
+
+  An extent's owner is published BY CONSTRUCTION, which bounds what sites 3 and 4 can see:
+  `alloc_arena` is the only writer of the extent map and it ends in `catalog.add_arena`,
+  which both catalogs refuse for a branch with no record (`TableBranchCatalog::add_arena` and
+  `LogBranchCatalog::add_arena`, each `ok_or(BranchError::NotFound(branch))` before writing
+  anything). So those two sites were never seeing "an owner that never existed" -- only a
+  transient miss or a genuine read failure, and they freed on both.
+
+
+THE FIX
+
+  Entry point first. `attach_child` refuses a `child_id` with no record
+  (`BranchError::NotFound`), so the PERMANENT form cannot be created through the only API
+  that could create it. It does not and cannot remove the transient form, which is why the
+  resolvers still have to refuse. One extra point lookup; `migrate_from` is the only
+  production caller (D63 deleted `collapse`) and it already writes every record before it
+  attaches anything, precisely so this resolution can succeed.
+
+  Both resolvers return `BranchError::Corrupt` naming the entry (parent, fork epoch, child
+  id) instead of resolving it. `ChildLiveness::Gone` is DELETED rather than left
+  unconstructed -- prepush builds with `-D dead_code`, and an unconstructed variant only
+  invites the next reader to resolve into it again. A new `keys::child_parent_from_key`
+  exists so the error can name the entry from the key alone.
+
+  `live_child_at`'s `Some(_)` arm is split out of the catch-all and is UNCHANGED in
+  behaviour: reaped with nothing below stays "not a live child", which is what `reap`'s crash
+  window leaves.
+
+  Sites 3 and 4 propagate the error. One thing came with that and is not cosmetic:
+  `drain_pending_seeded` calls `take_pending()`, which has ALREADY emptied the durable log by
+  the time a refusal happens, so returning with entries still in hand would DROP them -- the
+  pages neither released nor ever revisited, turning a refusal into a permanent reservation.
+  Everything undecided now goes back through `put_pending` before the refusal. The
+  pre-existing `?` on `live_child_in_epoch_range` had the same hole and now goes through the
+  same path. This is D83's reasoning for the `touched` set, applied to the `entries` list.
+
+  Because the miss is usually transient, every refusal is RETRYABLE by construction: the
+  CHILD entry stays, the pending entry goes back in the log, and the next sweep succeeds.
+
+
+WHERE THE ERRORS GO, checked rather than assumed
+
+  The reaper's two `has_live_children` callers -- the cascade loop in `detach_from_parent` and
+  the fast-path guard in `reap` -- both use `?`, so a refusal aborts that reap and frees
+  nothing. `TableBranchCatalog::release_id` swallows errors into `reusable = false`, so a
+  refusal leaks an id slot rather than recycling one whose subtree cannot be resolved; that is
+  the trade that method's own comment already documents.
+
+  `reap_if_still_expired` converts any `FerroError::Branch(_)` from `reap` into "did not
+  reap". That now swallows a D124 refusal too. LEFT ALONE DELIBERATELY: the outcome is safe
+  (nothing is freed, the next sweep asks again), and propagating it would turn a benign
+  already-reaped race into a failed sweep for a whole pre-existing class of errors -- a change
+  well outside this row.
+
+
+THE GUARDS, MADE TO FIRE
+
+  A guard that has not been made to fire is not a guard. Each fix was reverted ALONE in a
+  throwaway worktree (D124-mutants, since removed) and the matching test had to fail.
+
+  M1  child_liveness: None => ChildLiveness::ReapedWithSubtree(child_id)
+      (behaviourally identical to the deleted `Gone` for `has_live_children`: an id with no
+      children contributes nothing to the walk, exactly as `Gone`'s `=> {}` did)
+        has_live_children resolved a CHILD entry naming an unpublished branch instead of
+        refusing it - trunk reads as childless and its pages are freed underneath b4242: "false"
+
+  M2  live_child_at: None => Ok(None)            (the original catch-all)
+        max_live_child resolved a CHILD entry naming an unpublished branch instead of refusing
+        it - trunk reads as childless and its pages are freed underneath b4242: "None"
+
+  M3  attach_child: the `core(child_id).is_none()` guard deleted
+        called `Result::unwrap_err()` on an `Ok` value: ()
+
+  M4  drain_pending_seeded: Err(_) => Ok(false)  (the original `Err(_) => false`)
+        drain_pending RELEASED a parked page because it could not read the owner's record: 1
+      BOTH catalogs failed; the two free_page tests still PASSED, so the mutant is LOCATED,
+      not merely detected.
+
+  M5  free_page: get_raw(owner.id).is_ok() && ... (the original)
+        free_page RELEASED a page whose owner record it could not read: ()
+      BOTH catalogs failed; the two drain_pending tests still PASSED.
+
+  AND AGAINST THE REAL PRE-FIX SOURCE, not only hand-cut mutants.
+  `src/branch/{table_catalog,reaper,arena,tree_keys}.rs` restored to 52e1137 with only the new
+  test hunks applied on top:
+
+      cargo test --lib branch::table_catalog::tests::a_child_entry_naming
+        FAILED -- called `Result::unwrap_err()` on an `Ok` value: ()   (the attach_child guard)
+      cargo test --test d124_owner_record_refusal
+        test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+
+  AND THEY MUST NOT FIRE SPURIOUSLY. Every test carries its negative control in the same body:
+    - reaped-with-nothing-below still answers "not live" from all three readers, no error;
+    - `attach_child` still ACCEPTS `migrate_from`'s shape (an id whose record was just written);
+    - `free_page` still PARKS a pinned page when nothing is hidden;
+    - `drain_pending` still leaves a pinned entry alone AND still RELEASES one nothing pins.
+      Without that last one, a refusal is indistinguishable from a drain that never releases.
+
+  NOT TOUCHED: `attach_child_puts_a_branch_into_a_parents_live_set_and_detach_takes_it_out`
+  asserts `has_live_children == false` after reaping a child. That path goes through
+  `Some(_) => ReapedWithSubtree`, not the arm this changes, and it passes unedited.
+
+
+HOW THE STATE IS CONSTRUCTED
+
+  Branch path: the CHILD entry is written straight into the tree with `upsert`, past
+  `attach_child`, naming branch 4242, which was never forked.
+
+  Page path: NOT by corrupting a catalog -- the arm catches an `Err`, not an absence, so an
+  absence would not reach it. A decorator (`HidesOneRecord`) makes `get_raw` return `NotFound`
+  for exactly ONE id and delegates every other method untouched, which is the same input the
+  transient `upsert` window produces. Run over BOTH catalogs, because sites 3 and 4 live in
+  code every catalog shares.
+
+
+SUITE
+
+  Harness: tools/verify-suite.sh, VERIFY_MODE=per-target, machine-wide suite lock held.
+
+  BASELINE, read from the harness's own artifact before this run overwrote it, not recalled:
+
+    land22-52e1137: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=52e1137
+    land22-52e1137: go rc=0 passed=97 failed=0
+
+  THIS CHANGE, at 927e5c8:
+
+    d124-927e5c8: mode=per-target rc=0 passed=2455 failed=0 build_errors=0 head=927e5c8
+    d124-927e5c8: go rc=0 passed=97 failed=0
+
+  2455 - 2449 = 6, which is exactly what this change adds: one test in
+  src/branch/table_catalog.rs, one in src/branch/tree_keys.rs, and four in
+  tests/d124_owner_record_refusal.rs. The arithmetic is stated because a total that merely
+  "looks fine" hides a target that silently stopped collecting.
+
+
+THE PREMISE CORRECTION (eb7b9a5), AND WHY IT WAS NOT RE-CERTIFIED BY A FULL SUITE
+
+  The correction is comments plus ONE error-message string. Filtering its diff to lines that
+  are not `//`, `///` or `//!` leaves 12 lines, and all 12 are the two halves of that one
+  `format!` literal inside `dangling_child`:
+
+    git diff 927e5c8..eb7b9a5 | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+        | grep -vE '^[+-]\s*(///|//|//!)'    ->  12 lines, the message string only
+
+  No test anywhere asserts on that prose. The D124 tests assert the message names the parent,
+  the fork epoch and the child id -- all three still present -- and `attach_child`'s test
+  matches "not found", which comes from `BranchError::NotFound` and is untouched.
+
+  Re-running 2455 tests for that would have taken the machine-wide suite lock off the fleet
+  for another ~18 minutes. Instead, the targets that contain every line the commit touches,
+  plus every target that exercises the four changed code paths:
+
+    cargo build --lib                       Finished, 0 errors
+    cargo test --lib branch::               ok. 312 passed; 0 failed; 2 ignored
+    cargo test --test d124_owner_record_refusal        ok. 4 passed; 0 failed
+    cargo test --test d15_concurrent_fork_and_reap     ok. 2 passed; 0 failed
+    cargo test --test d16_transitive_visibility        ok. 2 passed; 0 failed
+    cargo test --test d18_reaper_asks_the_catalog      ok. 2 passed; 0 failed
+    cargo test --test d19_leak_is_a_race               ok. 1 passed; 0 failed
+    cargo test --test d40_reserved_pages_return_to_baseline  ok. 2 passed; 0 failed
+    cargo test --test d41_narrow_ops_close_the_window  ok. 4 passed; 0 failed
+    cargo test --test d45_log_catalog_rmw              ok. 3 passed; 0 failed
+    cargo test --test w4_sweep_slot_recycle            ok. 1 passed; 0 failed
+
+  All run AFTER the fleet's suite lock was released by agent E6-ed598e4, not inside its
+  measurement window.
+
+  ⛔ SO: the 2455-test green certifies 927e5c8 and nothing later. A lander who wants a green
+  naming the tip should run tools/verify-suite.sh on it; this section says what changed since
+  and what was run, it does not claim to replace that.
