@@ -1,0 +1,334 @@
+IS THE 1.9x CEILING THE STRUCTURE, OR THE MUTEX?
+================================================================================================
+
+Pre-registration: frontier/INVENTION-TRIGGER.md (artie-research), section "IS THE 1.9x CEILING
+                  THE STRUCTURE, OR THE MUTEX?", three outcomes, plus AMENDMENT 1 (every number
+                  carries its LAYER) and AMENDMENT 2 (the experiment is re-cast as a COUNT).
+Scaffold branch:  CEILING-resume, off CEILING-park-or-structure (c00b26e).
+                  ⛔⛔ NEITHER MAY EVER LAND. See "WHAT MUST NOT LAND" at the end.
+Artifacts:        this file, bench/ceiling_INVENTIONS_patch.md, and bench/ceiling_raw/*.
+Harness:          examples/ceiling_lock_contention.rs, built with --features lock_census.
+Box:              NOT quiet. load_at_acquire 24-45 throughout, two swift-frontend compiles and
+                  mediaanalysisd resident; the fleet measure-lock was held for the whole run
+                  (acquired "CEILING-resume", load_at_acquire=8 at acquisition, rising after).
+                  EVERY DURATION BELOW IS AN UPPER BOUND. The counts are not.
+
+================================================================================================
+WHICH PRE-REGISTERED OUTCOME FIRED
+================================================================================================
+
+⭐ OUTCOME 2. "Gap unchanged ⇒ the remaining time is not scheduler wake-up."
+
+Amendment 2's discriminator, verbatim: *"If the gap is park/unpark latency, contention per
+operation must RISE as the section shortens. If it does not rise, the remaining time is not
+threads blocking on each other, and pre-registered outcome 1 is dead without a single duration
+being measured."*
+
+  contended/op, L0 -> L3, T=64, median of 5 reps:   0.98613 -> 0.90812   (0.92x)
+
+It does not rise. **Pre-registered OUTCOME 1 IS DEAD.** The section-shortening candidate family
+stays retired, and Round 4's forecast-against-the-curve requirement stands.
+
+No fourth outcome is added, and the counts DID discriminate, so the "result about the instrument"
+escape is not used for the verdict. It IS used for two subsidiary findings below, both labelled.
+
+⇒ AND A SEPARATE MEASUREMENT, NOT A FOURTH OUTCOME, SAYS WHAT THE REMAINING TIME ACTUALLY IS.
+  The pre-registration's own complaint is that the recorded pair "does NOT establish WHAT the
+  remaining time is". Outcome 2 as written only rules park/unpark out. The phase clock rules
+  everything else in:
+
+     WAIT (blocked acquiring `logical`)   11.76194 ms -> 0.25570 ms    46x DOWN
+     DURABLE (the group-commit fsync)     18.43231 ms -> 17.58789 ms   FLAT (0.95x)
+     at L3, DURABLE is 97.8% of the whole thread cycle.
+
+  **The floor is the durability barrier, not the handoff.** The section and the DISK trade off.
+
+================================================================================================
+1. THE INSTRUMENT FAILED ITS OWN POSITIVE CONTROL FIRST, AND THE PREMISE WAS WHAT WAS WRONG
+================================================================================================
+
+Raw: bench/ceiling_raw/00_model_POSITIVE_CONTROL_FAILED.txt (exit 1, banked before anything was
+touched).
+
+The scaffold carried a gate asserting that 64 threads doing nothing but take and release one
+`Mutex` must show contended/op near 1.0. First run:
+
+  NEG single-thread  T=1   contended/op 0.00000   acq/op 1.0000   -> PASSED
+  POS 64t all-lock   T=64  contended/op 0.04688   acq/op 1.0000   -> REFUSED against >= 0.5
+
+`acq/op` was exactly 1.0000 and the negative control exactly 0.00000, so the bookkeeping was
+sound and only the premise was not. **Mechanism, written into the commit before the replacement
+was run:** `std::sync::Mutex` barges. Unlocking is a store plus at most a wake syscall; the woken
+waiter needs a scheduler round trip, while the releasing thread's next `try_lock` CAS costs
+nanoseconds. With no work outside the section the releaser re-wins its own lock, so a permanently
+saturated mutex still reports `try_lock` SUCCESS.
+
+⇒ ⛔ **`try_lock`-failure counts "the lock was held by another thread at the instant I tried". It
+does NOT count "threads are blocked". THIS IS A BLIND SPOT IN AMENDMENT 2'S CHOSEN INSTRUMENT**,
+and it is measured, not argued — bench/ceiling_raw/03_model_closed_form.txt:
+
+  BARGE 64t no-out   contended/op 0.03828   queue_mean 55.91   queue_max 64
+
+56 of 64 threads were inside the acquire region on average, and the census read 0.038. Against
+the ~1.0 a saturated queue should produce, that is a 26x under-report; against the same file's
+genuinely-queued POS cell (0.52994) it is 14x. **Direction of the error: contended/op
+UNDER-reports blocking**, i.e. it errs toward killing outcome 1. Every low reading in this file
+inherits that, which is why outcome 2 is NOT rested on the count alone — see section 5.
+
+The queue gauge (`IN_ACQ`) that exposes this came from the paused session's uncommitted tree;
+see "PROVENANCE" below.
+
+================================================================================================
+2. THE INSTRUMENT, CALIBRATED AGAINST DERIVED VALUES RATHER THAN OBSERVED ONES
+================================================================================================
+
+Every other cell in this harness is gated on a threshold picked after seeing what the cell does.
+That catches a dead counter, not a live miscalibrated one. One cell removes re-acquisition
+entirely — 64 threads rendezvous on a barrier, then each takes the lock exactly once — which pins
+all three readings to closed forms **stated in the source before the run**:
+
+  quantity        derived           measured      (bench/ceiling_raw/03)
+  contended/op    (T-1)/T = 0.98438  0.98438      exact
+  queue_mean      (T+1)/2 = 32.50    32.50        exact
+  queue_max       T       = 64       64           exact
+
+⚠ MY FIRST DERIVATION OF THIS CELL WAS WRONG AND THE INSTRUMENT WAS RIGHT. Armed after the
+rendezvous, the gauge read queue_max 63 / queue_mean 31.58 (bench/ceiling_raw/02) because the
+first winner can beat the last thread's increment. `contended/op` read exactly 63/64 in that same
+run, because that form does not depend on the gauge. Fixed by arming the gauge before the
+rendezvous; the quantity under test was untouched.
+
+NEGATIVE CONTROL ON THE REAL LADDER, not just on a model mutex (bench/ceiling_raw/11, T=1):
+
+  contended/op   0.00000 at ALL FOUR rungs
+  WAIT           0.0003 ms          (nothing to block on)
+  closure        100.0% at all eight probe-carrying rungs
+
+CROSS-CHECK licensing the process-wide atomic mode the pgwire arm must use
+(bench/ceiling_raw/22):  thread-local 0.98650  vs  global-atomic 0.98762  ratio 1.0011.
+
+================================================================================================
+3. LAYER A — `TableBranchCatalog`, THE LAYER THE RECORDED TRIPLE WAS MEASURED AT
+================================================================================================
+
+⚠ AMENDMENT 1'S FOURTH CONDITION, IN THE SAME SENTENCE AS THE NUMBERS: **measured at the
+`TableBranchCatalog` layer, beneath the outer statement mutex that serialises forks in
+production.** `open_sidecar` + `cat.fork` directly, holding `logical` and nothing else. This is
+what `examples/fork_concurrency.rs` drives and what D123 measured. It is NOT what any shipped
+front-end does — section 5 is that.
+
+Raw: bench/ceiling_raw/12_paired_T64_N8000_warm0_reps5_WAITDUR.txt.
+T=64, N=8000, warm=0 (the recorded table's own shape), 5 reps, medians, configuration order AND
+rung order rotated per rep.
+
+⭐ AND THE TWO COLUMNS COME FROM ONE LOOP, WHICH IS THE WHOLE POINT OF THE RE-RUN. The interim
+reading this resumes from compared a count from this process against a utilisation from
+bench/d123_serial_attribution.txt — two instruments, two moments, which is the exact error that
+makes the 1.9x suspect. Configuration A below runs the census and D123's phase clock over the
+same threads in the same loop.
+
+  config A (census ON, probe ON) -- THE DELIVERABLE
+  stub  forks/sec    S_eff   HOLD_TOT      gap  U(hold)      WAIT   DURABLE  W/D  contended/op
+     0     2054.8  0.48666    0.44130  0.04536    90.7%  11.76194  18.43231 0.638     0.98613
+     1     3100.7  0.32251    0.14358  0.18738    40.2%   2.12649  18.24709 0.117     0.95725
+     2     2862.8  0.34930    0.16755  0.18296    45.4%   2.60489  19.03676 0.137     0.95725
+     3     3559.2  0.28096    0.01063  0.27126     3.7%   0.25570  17.58789 0.015     0.90812
+
+  config C (census OFF, probe ON) -- byte-identical acquire path to the shipped one, and
+  therefore ALSO the reproduction arm for the recorded collapse
+     0     2014.8  0.49633    0.44367  0.04843    89.4%  11.88387  18.88903 0.629         n/a
+     3     3833.4  0.26087    0.01089  0.24897     4.2%   0.25092  15.96972 0.016         n/a
+
+LICENSING. A paired reading is worthless if either instrument moves the other's number. All eight
+cross-controls are inside the 25% bar (worst 1.124):
+
+  L0-L3 contended/op   A(probe ON) vs B(probe OFF):  1.000  0.999  0.999  1.009
+  L0-L3 U(hold)        A(census ON) vs C(census OFF): 1.014  0.964  1.112  0.870
+
+CLOSURE IDENTITY (D123 §2b, WAIT + HOLD_TOTAL + DURABLE = T*S_eff): 97.2% - 100.4% at all eight
+probe-carrying rungs. The probe accounts for the whole loop, so WAIT is a real share of the gap.
+
+================================================================================================
+4. ⭐ DOES MY OWN UTILISATION COLLAPSE THE WAY THE RECORDED ONE DID? YES. AND TWO OF THE THREE
+   RECORDED MULTIPLIERS DO NOT REPRODUCE — SAY THIS LOUDLY.
+================================================================================================
+
+The brief's warning case was "if your utilisation does NOT collapse, that is a finding about the
+recorded number". It does collapse. But the three headline multipliers do not all survive.
+
+  quantity                recorded (quiet box)   measured here (load 24-45)   reproduced?
+  throughput L0->L3              1.9x            1.90x  (config C)            ✅ EXACTLY
+                                                 1.73x  (config A)
+  U(hold) collapse        96.1% -> 8.5% (11.3x)  90.7% -> 3.7% (24.7x)        ✅ IN KIND,
+                                                 89.4% -> 4.2% (21.2x)           2x LARGER
+  HOLD_TOT fall                  21x             41.5x (A) / 40.7x (C)        ❌ 2x LARGER
+  gap rise                      12.6x            6.0x (A) / 5.1x (C)          ❌ 2x SMALLER
+
+⇒ **The QUALITATIVE claim is robust and reproduces on a different box at 3-5x the load: HOLD
+collapses by more than an order of magnitude, utilisation collapses with it, and throughput moves
+about 1.9x. The specific multipliers 21x and 12.6x DO NOT REPRODUCE, and they move in OPPOSITE
+directions.** That is what a duration ratio does on a box with a measured 46x quiet-vs-loaded
+spread: L0's section is long and real, so load inflates it more than L3's near-empty one, which
+inflates the HOLD ratio and deflates the gap ratio by the same mechanism.
+
+⇒ ⛔ **THE TRIPLE SHOULD BE CITED AS "HOLD falls by more than an order of magnitude while
+throughput rises about 1.9x", NOT as "21x / 1.9x / 12.6x".** Only the throughput ratio — the one
+whose numerator and denominator are both throughputs from the same pair of runs — came back the
+same. This is a result about the INSTRUMENT, and it is labelled as one per Amendment 2.
+
+================================================================================================
+5. ⭐ WHAT THE REMAINING TIME IS — THE NUMBER NO COLLISION COUNT COULD HAVE GIVEN
+================================================================================================
+
+Every thread's cycle is wait -> hold -> durable, and the probe measures all three in nanoseconds.
+D123 §2b published WAIT and DURABLE at L0 only (T=64: WAIT 6.84 ms > DURABLE 5.35 ms). L1-L3 had
+never been decomposed, and L3 is the rung the whole argument turns on.
+
+  T=64 thread cycle = T * S_eff, median of 5 reps, configuration A:
+
+           cycle      WAIT           HOLD_TOT        DURABLE          accounted
+    L0     31.15 ms   11.76 (37.8%)  0.441 (1.4%)    18.43 (59.2%)    98.4%
+    L3     17.98 ms   0.256 ( 1.4%)  0.011 (0.06%)   17.59 (97.8%)    99.3%
+
+  L0 -> L3:  WAIT falls 46x.  DURABLE is flat (0.95x).  HOLD falls 41.5x.
+
+⇒ **Time spent BLOCKED ON `logical` falls FASTER than the section does.** Threads are not piling
+up on the mutex at L3; they have essentially stopped touching it. The gap that grows is
+`durable()`, and at L3 it is 97.8% of everything.
+
+⇒ This is strictly stronger evidence than the count, and it is immune to the section-1 blind
+spot: a parked thread's wall clock runs whether or not its `try_lock` ever failed. Both witnesses
+agree, and the one that cannot be fooled by barging is the emphatic one.
+
+⇒ AN INTERNAL CONTROL AGAINST "IT IS JUST THE LOADED BOX": L0 and L3 ran interleaved, in the same
+process, under the same load, with rung order rotated. Scheduler starvation would inflate WAIT at
+both rungs. WAIT differs by 46x between them.
+
+================================================================================================
+5b. ⭐ THE OBJECTION THIS MUST SURVIVE: "BUT contended/op IS 0.908 AT L3, WHICH IS HIGH"
+================================================================================================
+
+It is high, and it is HIGHER than a pure mutex reads at the same operating point. From the model
+(bench/ceiling_raw/03), a bare `Mutex` driven at each recorded rung's own arrival process — hold
+and cycle set to the recorded wall-clock values, the outside interval a SLEEP so the thread
+leaves the runnable set as it does in an fsync:
+
+  L0-like  hold 0.201 ms / cycle 13.365 ms   contended/op 0.78336  queue_mean 5.35  U_ach 74.2%
+  L3-like  hold 0.0094 ms / cycle 7.096 ms   contended/op 0.41383  queue_mean 1.89  U_ach  6.5%
+
+Real ladder L3: 0.90812 against a reference of 0.41383. So threads DO still collide on `logical`
+at L3, more than a memoryless arrival process would produce. Taken alone that reads as support
+for outcome 1, and it is exactly why the count alone cannot settle this.
+
+⇒ **IT IS RECONCILED BY WHAT THE COLLISIONS COST, AND BY WHAT CAUSES THEM.**
+
+  (i)  THE COST. At L3 the whole of WAIT is 0.25570 ms of a 17.98 ms cycle — **1.4%**. Deleting
+       `logical` outright, making every acquisition free, could buy at most that 1.4%. A 90%
+       collision rate on a lock that accounts for 1.4% of the cycle is not a ceiling.
+
+  (ii) THE CAUSE, and it is visible in a third number nobody had to go looking for. Bunched
+       arrivals are the only way a lock can be idle 96.3% of the time and still turn away 90% of
+       arrivals, and the thing doing the bunching is measured:
+
+         f/sync (forks per fsync)                23.8 at L0  ->  32.0 at L3
+         WAIT / HOLD_TOTAL (queue depth on arrival) 26.6    ->  24.1
+
+       A fork at L3 arrives behind about 24 hold-times of queue, against a commit batch of 32.
+       Same order, and it moves the right way. **The batch IS the queue**: an fsync completes,
+       releases its batch, the batch piles onto `logical`, drains in ~32 x 0.011 = 0.35 ms, and
+       every thread goes back to waiting on the disk.
+
+⇒ So both witnesses are telling the truth and they are not in conflict. The collisions are real
+and they are a DOWNSTREAM CONSEQUENCE of group-commit batching, not an independent handoff floor.
+Outcome 1 required the remaining time to BE park/unpark; the remaining time is 97.8% `durable()`.
+
+⇒ AND THE SERIALISATION DID NOT DISAPPEAR, IT MOVED. f/sync rises 23.8 -> 32.0 across the ladder
+(bench/ceiling_raw/22): group commit is batching more forks per fsync, and the threads are queued
+on that barrier instead of on the mutex.
+
+⚠ WHAT THIS DOES NOT SAY. It does not say the fsync is irreducible, and it proposes no mechanism —
+the pre-registration names flat combining, RCL, MCS/CLH and spin-then-park as prior art and
+concludes "a mechanism here would die of prior art and I should not propose one". That still
+holds. This section replaces a wrong attribution with a measured one and stops.
+
+================================================================================================
+6. LAYER B — pgwire, WHAT PRODUCTION ACTUALLY DOES
+================================================================================================
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per thread,
+forks issued as `BEGIN AGENT SESSION`. Locks held, outermost first: `ServerContext::catalog()` ->
+`AgentRuntime` state -> `TableBranchCatalog::logical`. E.6 (bench/e6_outer_lock_count.txt,
+outcome 1) established this is NOT the same experiment as layer A.
+
+⛔ THE LADDER CANNOT BE DRIVEN THROUGH THE SHIPPED FRONT-END ABOVE L0, AND THAT IS A RESULT.
+Raw: bench/ceiling_raw/20_pgwire_ladder_BREAKS_above_L0.txt (exit 1). L1 is defined as "skip
+`write_record`" — the child's record is never written — and `ABANDON` is a front-end statement
+that reads it back. The L1 arm dies with `branch error: branch b1@g0 not found`. Skipping ABANDON
+at L1+ would make the rungs different workloads and the ladder a lookalike, so layer B runs L0
+only and the asymmetry is stated here rather than papered over.
+
+Raw: bench/ceiling_raw/21_pgwire_L0_layerB.txt, L0, 40 forks per thread:
+
+  threads   outer/op  outerCont/op   inner/op  innerCont/op
+        1     4.0250       0.00000     3.0000       0.00000
+        8     4.0250       2.42500     3.0000       0.00000
+       64     4.0250       2.42148     3.0000       0.00000
+
+⇒ ⭐ **`TableBranchCatalog::logical` — the mutex this entire 21x/1.9x/12.6x argument is about —
+records ZERO contended acquisitions at 64 concurrent connections.** In the same process, in the
+same run, the outer statement mutex is contended 2.42 times per fork. The census is demonstrably
+alive there and demonstrably reads 0 when it should (T=1 row).
+⇒ The statement path takes `logical` 3.0000 times per fork where the direct path takes it 1.0000
+(bench/ceiling_raw/22), so layer B is not even the same number of acquisitions.
+⇒ Nothing about layer A's ladder is a production claim. That was already Amendment 1's condition;
+this is the measurement behind it.
+
+================================================================================================
+7. PROVENANCE, AND A QUARANTINE
+================================================================================================
+
+The brief said the previous session's work was fully committed on CEILING-park-or-structure and
+nothing was lost. **That was true of the 49 commits and NOT true of the working tree**:
+/Users/idide/wt/ferrodb-CEILING-park-or-structure held examples/ceiling_lock_contention.rs
+modified and uncommitted, +397/-24, containing the `IN_ACQ` queue gauge, the sleep-vs-spin
+operating-point references, and a first `mode_paired`.
+
+It was captured with `git stash create` (which does not touch the tree) as 540d5a5, pinned as
+branch CEILING-QUARANTINE-uncommitted, and inherited into CEILING-resume BYTE FOR BYTE in one
+labelled commit before being built on. The old worktree was never modified. I had independently
+re-derived the same barging mechanism before finding it — two derivations, one mechanism.
+
+⚠ A NEAR-MISS, RECORDED BECAUSE IT NEARLY BECAME A FALSE FINDING: two pgwire runs appeared to
+show `ABANDON` failing at T>=2 with stub=0, which would have been a production concurrency bug.
+It was my own argument-position error — `max_stub` is the 5th positional slot and I passed it
+4th, so those runs were still attempting L1. Caught before it was written anywhere.
+
+Every rung asserts `probe::stub_level()` and `probe::extra_upserts()` before and after its timed
+loop and refuses rather than prints; the process start values are in the header of every raw file
+(`stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false`).
+
+================================================================================================
+8. ⛔⛔ WHAT MUST NOT LAND
+================================================================================================
+
+CEILING-resume and CEILING-park-or-structure carry D123's scaffold. `src/branch/table_catalog.rs`
+gates a `None` return on the stub level:
+
+    let envelope = if stub >= 3 { None } else { self.envelope_bytes(parent.id)? };
+
+That is a CAPABILITY ESCAPE. L1 also never writes the child's record, L2 leaks retired slots, and
+L3 drops the parent's live-child entry (a GC hole). **A stubbed level is not a database.**
+
+The artifacts branch CEILING-artifacts carries bench/ only and is verified with:
+
+    git diff --name-only main...CEILING-artifacts -- src examples   # must be empty
+
+================================================================================================
+9. WHAT THE RECORD NOW NEEDS
+================================================================================================
+
+frontier/INVENTIONS.md still says "past some point the handoff, not the section, is what is
+left". That is withdrawn as written; it should read "the DURABILITY BARRIER, not the section".
+The exact append-only text is in bench/ceiling_INVENTIONS_patch.md. It is NOT applied here:
+INVENTIONS.md is in the artie-research repo, outside this agent's worktree, and other sessions
+were editing that repo during this run.
