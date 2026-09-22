@@ -573,6 +573,10 @@ impl CowTree {
                 stamp_checksum(&mut f.data);
                 entries
             } else {
+                // The refusal above compacted the leaf, and this guard drops before
+                // `write_leaf_chunked` runs its fallible allocations. No restamp is needed and
+                // none belongs here: `insert_cell_at`/`replace_cell_at` restamp on refusal, which
+                // is the only way to reach this arm (D113).
                 let mut entries = n.view().leaf_entries()?;
                 match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(i) => entries[i].1 = value.to_vec(),
@@ -688,6 +692,12 @@ impl CowTree {
             // The separators belong at consecutive slots from `at`. Place as many as the page
             // takes; `insert_cell_at` compacts before it refuses, so the first refusal means the
             // node is genuinely full and the rest have to go through the split path.
+            //
+            // The guard drops at the end of this block with the page **compacted** and, if any
+            // separator landed, logically changed — and `alloc_for` below is fallible. What makes
+            // that safe is `insert_cell_at`'s postcondition: a refusal restamps, and a refusal is
+            // the loop's only exit. Do not add a `stamp_checksum` here to say the same thing
+            // twice; a second stamp would mask every mutant of the first (D113).
             let mut placed = 0usize;
             for (j, (sep, right)) in promoted.iter().enumerate() {
                 if !n.insert_cell_at(at + j, &node::internal_cell(sep, *right))? {

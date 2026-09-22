@@ -217,6 +217,24 @@ fn long_key_of(i: u32) -> Vec<u8> {
     k
 }
 
+/// A key that sorts strictly **between** `long_key_of(base)` and `long_key_of(base + 1)`.
+///
+/// Every probe insert goes into one gap, so every leaf split under it promotes into the same
+/// parent and that parent fills in ~9 promotions. Scattering the probes instead leaves the
+/// refusal to chance: measured over 400 scattered inserts, 493 starved failures and not one of
+/// them a refusal, because a promotion has to arrive at a node that happens to be full.
+fn gap_key_of(base: u32, j: u32) -> Vec<u8> {
+    assert!(j < 14 * 14 * 14, "gap exhausted");
+    let mut k = long_key_of(base);
+    let n = k.len();
+    // Three trailing bytes drawn from 'm'..'z', all above the 'k' the key is padded with, so the
+    // result exceeds `base` and still differs from `base + 1` at the digit they disagree on.
+    k[n - 3] = b'm' + (j / 196 % 14) as u8;
+    k[n - 2] = b'm' + (j / 14 % 14) as u8;
+    k[n - 1] = b'm' + (j % 14) as u8;
+    k
+}
+
 /// Is this page's **logical** content untouched while its bytes moved? That is compaction's
 /// signature, and it is what distinguishes a page the refusal path rewrote from one an ordinary
 /// successful write changed.
@@ -263,8 +281,8 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
     let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
     let value = vec![b'v'; 8];
 
-    // Long keys, so separators are large and internal nodes overflow often. See `long_key_of`.
-    for i in 0..1500u32 {
+    // Long keys, so separators are large and internal nodes hold only ~9. See `long_key_of`.
+    for i in 0..600u32 {
         root = f.insert(root, &long_key_of(i), &value).unwrap();
     }
     assert!(f.leaves(root).len() > 200, "fixture: expected a deep tree");
@@ -273,8 +291,8 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
     let mut mutating_failures = 0usize;
     let mut compaction_failures = 0usize;
 
-    for i in 1500..1900u32 {
-        let key = long_key_of(i);
+    for j in 0..220u32 {
+        let key = gap_key_of(300, j);
         let mut allowance = 0i64;
         loop {
             // Snapshot every page the tree can reach, so a failure can be checked against the
@@ -369,15 +387,84 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
         mutating_failures
     );
 
-    // And the tree is still whole.
-    for i in 0..1500u32 {
-        assert_eq!(
-            f.tree.get(root, &long_key_of(i)).unwrap(),
-            Some(value.clone()),
-            "row {} was lost",
-            i
-        );
-    }
+    // Deliberately NOT asserted here: that the tree still holds every row. A starved insert
+    // leaves whatever it had already applied applied — on the trunk every page is private, so
+    // `cow_page` mutates in place and there is nothing to roll back to. That is a separate
+    // question from this one, with its own test below; folding it in here would make a D113
+    // regression and an unrelated atomicity gap fail the same assertion.
+}
+
+/// Does an aborted insert lose rows, and if so is it the abort that loses them?
+///
+/// Split out from the D113 test because it asks a different question, and stated as a comparison
+/// rather than a bare assertion because a bare "rows are lost" proves nothing about the cause:
+/// the identical insert sequence run with the budget never armed is the control, and only the
+/// difference between the two arms is attributable to the starvation.
+#[test]
+fn an_aborted_insert_is_not_atomic_and_the_control_says_the_abort_is_why() {
+    let probe_rows = |starve: bool| -> (usize, usize) {
+        let f = Fixture::new();
+        let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+        let value = vec![b'v'; 8];
+        for i in 0..600u32 {
+            root = f.insert(root, &long_key_of(i), &value).unwrap();
+        }
+        for j in 0..220u32 {
+            let key = gap_key_of(300, j);
+            if starve {
+                // One starved attempt per key, then let it through, so both arms end up having
+                // inserted exactly the same 220 keys.
+                let mut allowance = 0i64;
+                loop {
+                    f.store.allow(allowance);
+                    let outcome = f.insert(root, &key, &value);
+                    f.store.unlimited();
+                    match outcome {
+                        Ok(new_root) => {
+                            root = new_root;
+                            break;
+                        }
+                        Err(_) => {
+                            allowance += 1;
+                            assert!(allowance < 64, "fixture: never succeeded");
+                        }
+                    }
+                }
+            } else {
+                root = f.insert(root, &key, &value).unwrap();
+            }
+        }
+        let base_lost =
+            (0..600u32).filter(|&i| f.tree.get(root, &long_key_of(i)).unwrap().is_none()).count();
+        let gap_lost = (0..220u32)
+            .filter(|&j| f.tree.get(root, &gap_key_of(300, j)).unwrap().is_none())
+            .count();
+        (base_lost, gap_lost)
+    };
+
+    let (control_base, control_gap) = probe_rows(false);
+    let (starved_base, starved_gap) = probe_rows(true);
+    println!(
+        "rows missing -- control: {} base, {} gap;  starved: {} base, {} gap",
+        control_base, control_gap, starved_base, starved_gap
+    );
+
+    // The control is the premise: plain inserts of this sequence must lose nothing, or the
+    // fixture is broken and the starved arm's losses are not attributable to the starvation.
+    assert_eq!(
+        (control_base, control_gap),
+        (0, 0),
+        "fixture: the unstarved control lost rows, so nothing here is attributable to starvation"
+    );
+    assert_eq!(
+        (starved_base, starved_gap),
+        (0, 0),
+        "an insert that failed on a starved allocation lost {} of 600 base rows and {} of 220 \
+         gap rows that a later successful insert of the same key did not restore; the identical \
+         sequence without starvation loses none",
+        starved_base,
+        starved_gap
+    );
 }
 
 // ================================================================================================
@@ -557,5 +644,6 @@ fn a_partial_promotion_leaves_a_page_that_verifies() {
         promoted.len()
     );
 }
+
 
 
