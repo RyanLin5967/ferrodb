@@ -1,0 +1,27 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-agent-acf966798a3979f57)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.33s
+     Running tests/w4_stale_branch_crosses_agents.rs (target/debug/deps/w4_stale_branch_crosses_agents-56dece9702f8bcac)
+
+running 2 tests
+
+thread 'a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row' (263983822) panicked at tests/w4_stale_branch_crosses_agents.rs:217:5:
+connection A's session was reaped and slot 1 now belongs to agent-b at generation 1, yet A's SELECT on b1@g0 was answered: qty = Some(999). `workspaces` is keyed by the id slot alone, so A was handed agent-b's workspace. 999 is agent-b's staged, unmerged row.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session' (263983821) panicked at tests/w4_stale_branch_crosses_agents.rs:242:5:
+assertion `left == right` failed: b_1 must still name agent-b's live branch b1@g1; A's ABANDON of the dead b1@g0 unbound it
+  left: None
+ right: Some(BranchId { id: 1, generation: 1 })
+test a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session ... FAILED
+test a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row ... FAILED
+
+failures:
+
+failures:
+    a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session
+    a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `--test w4_stale_branch_crosses_agents`
+RC=101

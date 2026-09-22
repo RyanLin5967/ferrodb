@@ -719,7 +719,44 @@ pub struct DiffCost {
 
 #[derive(Default)]
 struct State {
-    workspaces: BTreeMap<u64, Workspace>,
+    /// **Keyed by the whole [`BranchId`], not by the id slot — D158 item 1.**
+    ///
+    /// This was `BTreeMap<u64, Workspace>` and eleven call sites asked it `get(&branch.id)`. The
+    /// catalog recycles a reaped branch's id SLOT (`reaper.rs` `release_id`, `catalog.rs` `fork`
+    /// pops it) and bumps the generation, so a caller holding a stale `BranchId` — and a
+    /// connection holds one for the life of its `AgentSession`, which nothing re-reads from the
+    /// catalog — was answered about the slot's NEW occupant: **another agent's workspace**.
+    ///
+    /// Measured over the real statement path in
+    /// `tests/w4_stale_branch_crosses_agents.rs`, against this file one commit earlier: a
+    /// reaped session's `SELECT` returned `qty = 999`, the live agent's staged and unmerged row,
+    /// and its `ABANDON;` unbound the live agent's name. **There is no automatic keepalive**: the
+    /// only production `renew_lease` is `simulate.rs:431`, which sets the lease on a candidate
+    /// branch `simulate` forked two lines above it, so it cannot extend a session that is idle.
+    /// An agent that pauses longer than [`DEFAULT_LEASE_MILLIS`] therefore loses its branch with
+    /// its connection still open, and the interleaving needs no race to win.
+    ///
+    /// ⚠ This paragraph first said `renew_lease` "has no caller in `src` outside the catalogs'
+    /// own tests", which is false — `simulate.rs:431` is production. Corrected before landing;
+    /// the conclusion is unchanged because the hazard is the absent keepalive, not the absent
+    /// symbol. `bench/w4/DECISION.md` addendum 6 carries the full reversal.
+    ///
+    /// `forget_one_branch` had already taken this argument and validated the whole `BranchId`
+    /// against `names`; only that one write path took it. Keying here retires the argument
+    /// instead of repeating it: a stale generation is a different key, so it MISSES, and a site
+    /// added later cannot forget a check it does not have to write. That is the one reason to
+    /// prefer this over a generation field on `Workspace` plus eleven comparisons.
+    ///
+    /// **Invariant, maintained by [`State::insert_workspace`] and relied on below: at most ONE
+    /// workspace per id slot.** A fork into a recycled slot evicts any entry still sitting on it,
+    /// exactly as `BTreeMap::insert` used to by colliding. Two consequences that are load-bearing
+    /// rather than incidental: `live_runs` can still report a bare slot without ambiguity, and
+    /// `forget_one_branch` can treat "the key is still here" as proof that the slot was not
+    /// recycled, so it needs no second authority to decide whether the name is still its own.
+    ///
+    /// Ordering is by `(id, generation)` — `BranchId` derives `Ord` in field order — so a slot's
+    /// entries are contiguous and the map still ranges in id-slot order for the chunked sweeps.
+    workspaces: BTreeMap<BranchId, Workspace>,
     names: BTreeMap<String, BranchId>,
     next_txn: u64,
     next_merge: u64,
@@ -741,7 +778,18 @@ struct State {
     /// `push_applied` is the only place that does either.
     applied_by_cell: std::collections::HashMap<(u32, u64, u32), Vec<u32>>,
     merges: BTreeMap<String, MergeRecord>,
-    /// Why each quarantined branch is being held, keyed by branch id slot.
+    /// Why each quarantined branch is being held, keyed by branch id SLOT.
+    ///
+    /// ⚠ **Still keyed by the slot after D158 item 1 moved `workspaces` off it, and that is a
+    /// decision rather than an oversight.** Every path that writes or reads it — `quarantine`,
+    /// `release_from_quarantine`, and `merge`'s refusal message — passes `self.branches.get()`
+    /// first, which refuses a stale generation, so a recycled slot is not reachable through them.
+    /// What IS reachable: `seal` does not clear this map, so a reaped quarantined branch leaves
+    /// its reason behind and a later fork into that slot would read the DEAD branch's string.
+    /// That is a wrong sentence in a diagnostic, not a cross-agent answer about data — which is
+    /// why it is recorded here instead of being bundled into a correctness fix that has a failing
+    /// test behind it. `forget_one_branch` does clear it, and may, because a surviving workspace
+    /// key proves the slot was not recycled (see [`State::workspaces`]).
     quarantine_reasons: BTreeMap<u64, String>,
     /// Reservations over bounded cells, so an overdraw fails when it is written.
     escrow: EscrowLedger,
@@ -820,19 +868,46 @@ impl State {
 
     /// Insert a workspace, taking the txn references it holds. One of the two doors into
     /// `workspaces`; see [`State::txn_refs`] for why there are only two.
-    fn insert_workspace(&mut self, id: u64, ws: Workspace) {
+    fn insert_workspace(&mut self, branch: BranchId, ws: Workspace) {
         for t in txn_refs_of(&ws) {
             *self.txn_refs.entry(t).or_insert(0) += 1;
         }
-        // An id slot is recycled after a reap, so an insert CAN land on an occupied key, and
-        // `BTreeMap::insert` hands back the workspace it displaced. That workspace's branch is
-        // dead by construction — nothing else could be occupying its slot — so everything the reap
-        // path releases has to be released here too. Dropping only the `txn_refs` and letting the
+        // An id slot is recycled after a reap, so an insert CAN land on an occupied slot, and the
+        // workspace sitting there has to be released. That workspace's branch is dead by
+        // construction — nothing else could be occupying its slot — so everything the reap path
+        // releases has to be released here too. Dropping only the `txn_refs` and letting the
         // capture go was exactly that leak: one permanently unreferenced `captures` entry per
         // recycled slot, because `forget_captures_unless_published` is the only site that calls
         // `captures.remove` and this path did not reach it. That is the unbounded growth
         // `forget_reaped_branches` exists to prevent, arriving through a second door.
-        if let Some(old) = self.workspaces.insert(id, ws) {
+        //
+        // **The eviction is now explicit, and it has to be.** While the map was keyed by the slot
+        // this was `BTreeMap::insert`'s return value: a recycled slot collided and handed the old
+        // workspace back. Keyed by the whole `BranchId` (D158 item 1) a recycled slot arrives at a
+        // NEW generation and therefore a DIFFERENT key, so it collides with nothing and the dead
+        // workspace would sit there for ever — the same leak, re-opened by the fix to a different
+        // defect. Scanning the slot's own contiguous range is what replaces the collision, and it
+        // is what maintains the one-workspace-per-slot invariant stated on `State::workspaces`
+        // that `live_runs` and `forget_one_branch` both rest on.
+        // **Order: take the displaced ones out, put the new one IN, and only then release them.**
+        //
+        // Not cosmetic. `forget_captures_unless_published` reaches `capture_is_protected`, whose
+        // `debug_assert` compares `txn_refs` against a live scan of `workspaces` — and the new
+        // workspace's references were counted into `txn_refs` at the top of this function. Release
+        // before inserting and any txn held only by the incoming workspace reads as indexed but
+        // unscannable, which fires that assertion for a state that is in fact consistent. The
+        // slot-keyed map got this ordering free, because `BTreeMap::insert` put the new value in
+        // and handed the old one back in the same call; keying by `BranchId` split that into two
+        // steps, so the order has to be written down rather than inherited.
+        let displaced: Vec<BranchId> = self
+            .workspaces
+            .range(BranchId::new(branch.id, 0)..=BranchId::new(branch.id, u32::MAX))
+            .map(|(b, _)| *b)
+            .collect();
+        let olds: Vec<Workspace> =
+            displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        self.workspaces.insert(branch, ws);
+        for old in olds {
             self.drop_txn_refs(&old);
             forget_captures_unless_published(self, &old);
         }
@@ -915,8 +990,8 @@ impl State {
     /// The references are released **before** the caller inspects the result, which is what makes
     /// `capture_is_protected` a question about the workspaces that REMAIN — the same thing the
     /// scan meant when it ran after `BTreeMap::remove` had already taken this one out.
-    fn remove_workspace(&mut self, id: &u64) -> Option<Workspace> {
-        let ws = self.workspaces.remove(id)?;
+    fn remove_workspace(&mut self, branch: &BranchId) -> Option<Workspace> {
+        let ws = self.workspaces.remove(branch)?;
         self.drop_txn_refs(&ws);
         self.audit_txn_refs();
         Some(ws)
@@ -1604,11 +1679,11 @@ impl AgentRuntime {
         // descent of the child's own tree with no parent pointer anywhere to walk. Both are tested
         // directly in `tests/d27_fork_shares_without_leaking.rs`, the second against an ancestor
         // chain abandoned out from under the child.
-        let (rows, base_rows, tables, unprobeable_rows) = match state.workspaces.get(&parent.id) {
+        let (rows, base_rows, tables, unprobeable_rows) = match state.workspaces.get(&parent) {
             Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone(), p.unprobeable_rows),
             None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new(), 0),
         };
-        let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
+        let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent) {
             Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
             None => (Arc::new(Vec::new()), PersistentMap::new()),
         };
@@ -1616,7 +1691,7 @@ impl AgentRuntime {
         // parent actually had staged state to hand over: a parent that staged nothing has no
         // published write for a descendant to protect, and naming it here would re-open exactly
         // the leak F6 closed -- a ghost task's scan blocking every revert forever.
-        let inherited: Vec<TxnId> = match state.workspaces.get(&parent.id) {
+        let inherited: Vec<TxnId> = match state.workspaces.get(&parent) {
             Some(p) if !p.rows.is_empty() || !p.schema_edits.is_empty() => {
                 let mut v = p.inherited.clone();
                 v.push(p.txn);
@@ -1625,7 +1700,7 @@ impl AgentRuntime {
             _ => Vec::new(),
         };
         state.insert_workspace(
-            branch.id,
+            branch,
             Workspace {
                 name: name.clone(),
                 prov,
@@ -1669,7 +1744,7 @@ impl AgentRuntime {
         // the pair deadlock-free; this is the one place the store answer does not need the guard.
         let prov = {
             let state = self.state.lock().unwrap();
-            state.workspaces.get(&branch.id)?.prov
+            state.workspaces.get(&branch)?.prov
         };
         self.prov_store.lookup(prov).ok()
     }
@@ -1691,13 +1766,18 @@ impl AgentRuntime {
     /// sessions rather than by branches ever forked, which is the number the view is actually about.
     ///
     /// `BTreeMap` order is id-slot order, so the result needs no sort — the same order the
-    /// branch-id-ordered scan it replaces produced.
+    /// branch-id-ordered scan it replaces produced. That is still true now the map is keyed by
+    /// the whole `BranchId`: `Ord` is derived in field order, so it sorts by slot first.
+    ///
+    /// The slot alone remains an unambiguous row key here because `insert_workspace` holds at
+    /// most one workspace per slot (see [`State::workspaces`]); without that invariant a
+    /// recycled slot could contribute two rows naming the same branch.
     pub fn live_runs(&self) -> Vec<(u64, RunEntity)> {
         // The guard is dropped before the store is touched, exactly as `run_of` does and for the
         // same reason: every other path takes state -> store and never the reverse.
         let slots: Vec<(u64, ProvId)> = {
             let state = self.state.lock().unwrap();
-            state.workspaces.iter().map(|(id, ws)| (*id, ws.prov)).collect()
+            state.workspaces.iter().map(|(b, ws)| (b.id, ws.prov)).collect()
         };
         slots
             .into_iter()
@@ -1771,17 +1851,14 @@ impl AgentRuntime {
         use crate::provenance::readset::ReadSet;
         let state = self.state.lock().unwrap();
         let mut out = Vec::with_capacity(state.workspaces.len());
-        for (id, ws) in state.workspaces.iter() {
-            // The generation lives in `names`, not in the workspace: `workspaces` is keyed by the id
-            // SLOT alone. Falling back to generation 0 would name a *different* branch after an id
-            // slot is recycled, so the name map is the authority and its absence is reported as
-            // generation 0 only when there is no name at all — which `seal` makes impossible while a
-            // workspace is present.
-            let branch = state
-                .names
-                .get(&ws.name)
-                .copied()
-                .unwrap_or_else(|| BranchId::new(*id, 0));
+        for (branch, ws) in state.workspaces.iter() {
+            // **The key IS the branch, generation included** (D158 item 1). This used to read the
+            // generation back out of `names`, because the map was keyed by the id SLOT and a
+            // fallback of generation 0 would name a *different* branch after a slot was recycled.
+            // The map now carries it, so the detour and its fallback are both gone — there is no
+            // longer a second place this answer could come from, and so no second place it could
+            // disagree.
+            let branch = *branch;
             // A `BTreeSet`, not a sorted `Vec`. `Vec::insert` memmoves the tail, so building the
             // distinct set was O(n^2) in the size of a branch's read-set — and it ran while holding
             // the one Mutex every write path also takes, so reading `ferro_run_activity` against a
@@ -1891,7 +1968,7 @@ impl AgentRuntime {
     /// Rows this branch wrote without ever reading. See [`blind_writes_of`].
     pub fn blind_writes(&self, branch: BranchId) -> Result<Vec<(TableId, RowId)>, FerroError> {
         let state = self.state.lock().unwrap();
-        let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
+        let ws = state.workspaces.get(&branch).ok_or_else(|| {
             FerroError::Branch(format!("no agent session on branch {branch}"))
         })?;
         let reads = state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default();
@@ -1966,7 +2043,7 @@ impl AgentRuntime {
         let rows = self.rows()?;
         let fork_root = {
             let state = self.state.lock().unwrap();
-            state.workspaces.get(&branch.id).map(|w| w.fork_root)
+            state.workspaces.get(&branch).map(|w| w.fork_root)
         }
         .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
         let current = self.root_of(branch)?;
@@ -2064,7 +2141,7 @@ impl AgentRuntime {
             //    an index for one.
             let staged = {
                 let state = self.state.lock().unwrap();
-                state.workspaces.get(&b.id).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
+                state.workspaces.get(&b).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
             };
             if let Some((staged, unprobeable_rows)) = staged {
                 let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
@@ -2223,7 +2300,7 @@ impl AgentRuntime {
         // rest of that session's surface already refuses — its next write fails with `no agent
         // session on branch` and its `MERGE` fails with `has been reaped` — so the read reporting
         // success was the one operation still lying about it.
-        let (txn, prov) = match state.workspaces.get(&reader.id) {
+        let (txn, prov) = match state.workspaces.get(&reader) {
             Some(ws) => (ws.txn, ws.prov),
             None => {
                 return Err(FerroError::Branch(format!(
@@ -2376,7 +2453,7 @@ impl AgentRuntime {
     /// `base_rows` is populated: a later call cannot move the fork point.
     fn note_base_shape(&self, branch: BranchId, table: &str, shape: Schema) {
         let mut state = self.state.lock().unwrap();
-        if let Some(ws) = state.workspaces.get_mut(&branch.id) {
+        if let Some(ws) = state.workspaces.get_mut(&branch) {
             ws.base_shapes.insert_if_absent(table.to_string(), shape);
         }
     }
@@ -2387,7 +2464,7 @@ impl AgentRuntime {
     /// twice in a row is refused when the agent types it rather than at merge.
     fn branch_shape(&self, branch: BranchId, table: &str, shared: &Schema) -> Schema {
         let state = self.state.lock().unwrap();
-        let Some(ws) = state.workspaces.get(&branch.id) else { return shared.clone() };
+        let Some(ws) = state.workspaces.get(&branch) else { return shared.clone() };
         let mut shape = ws.base_shapes.get(table).cloned().unwrap_or_else(|| shared.clone());
         for (t, edit) in ws.schema_edits.iter() {
             if t == table {
@@ -2443,7 +2520,7 @@ impl AgentRuntime {
         let mut state = self.state.lock().unwrap();
         let ws = state
             .workspaces
-            .get_mut(&branch.id)
+            .get_mut(&branch)
             .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
         Arc::make_mut(&mut ws.schema_edits).push((table.to_string(), edit));
         Ok(())
@@ -2455,7 +2532,7 @@ impl AgentRuntime {
             .lock()
             .unwrap()
             .workspaces
-            .get(&branch.id)
+            .get(&branch)
             .map(|ws| ws.schema_edits.as_ref().clone())
             .unwrap_or_default()
     }
@@ -2874,7 +2951,7 @@ impl AgentRuntime {
         // The session has to exist before the branch record is consulted, so that writing to a
         // sealed branch still reports "no agent session" rather than "reaped". Same refusal, same
         // place in the order, just hoisted ahead of the record read.
-        if !self.state.lock().unwrap().workspaces.contains_key(&branch.id) {
+        if !self.state.lock().unwrap().workspaces.contains_key(&branch) {
             return Err(FerroError::Branch(format!("no agent session on branch {}", branch)));
         }
 
@@ -2966,7 +3043,7 @@ impl AgentRuntime {
         let mut mirrored: Vec<(RowId, RowState)> = Vec::with_capacity(items.len());
         let frame = {
             let mut state = self.state.lock().unwrap();
-            let ws = state.workspaces.get_mut(&branch.id).ok_or_else(|| {
+            let ws = state.workspaces.get_mut(&branch).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {}", branch))
             })?;
             ws.tables.insert(tbl.0, table.to_string());
@@ -3029,7 +3106,7 @@ impl AgentRuntime {
     pub fn diff(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<ChangeSet, FerroError> {
         let (target, rows_meta) = {
             let state = self.state.lock().unwrap();
-            let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {}", branch))
             })?;
             let target = self.branches.get(branch)?.parent_id.unwrap_or(BranchId::TRUNK);
@@ -3396,7 +3473,7 @@ impl AgentRuntime {
         let mut images: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         {
             let state = self.state.lock().unwrap();
-            let ws = state.workspaces.get(&onto.id).ok_or_else(|| {
+            let ws = state.workspaces.get(&onto).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {onto}"))
             })?;
             for key in &rows_touched {
@@ -3769,10 +3846,10 @@ impl AgentRuntime {
         // Both workspaces, taken together under one lock so they describe the same instant.
         let (src, tgt, policy) = {
             let state = self.state.lock().unwrap();
-            let src = state.workspaces.get(&source.id).ok_or_else(|| {
+            let src = state.workspaces.get(&source).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {source}"))
             })?;
-            let tgt = state.workspaces.get(&target.id).ok_or_else(|| {
+            let tgt = state.workspaces.get(&target).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {target}"))
             })?;
             (
@@ -4143,7 +4220,7 @@ impl AgentRuntime {
         let target = self.branches.get(branch)?.parent_id.unwrap_or(BranchId::TRUNK);
         let snapshot = {
             let state = self.state.lock().unwrap();
-            let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {}", branch))
             })?;
             WorkspaceSnapshot {
@@ -5368,9 +5445,12 @@ impl AgentRuntime {
     /// no reconciliation can answer, since the answer changes while it is being computed.
     pub fn forget_reaped_branches(&self) -> usize {
         let mut forgotten = 0usize;
-        // Where the next chunk starts. `workspaces` is a `BTreeMap<u64, _>`, so a slot id is a
-        // resumable cursor into it and a chunk boundary needs nothing kept across the gap.
-        let mut cursor = 0u64;
+        // Where the next chunk starts. `workspaces` is a `BTreeMap<BranchId, _>` ordered by
+        // `(slot, generation)`, so the last key seen is a resumable cursor into it and a chunk
+        // boundary needs nothing kept across the gap. `None` is "the start of the map"; an
+        // EXCLUDED bound is what resumes, rather than key + 1, because there is no successor to
+        // add to at the top of the generation space.
+        let mut cursor: Option<BranchId> = None;
         loop {
             // ---- phase 1: ONE CHUNK of candidates, under the lock ---------------------------
             //
@@ -5392,21 +5472,21 @@ impl AgentRuntime {
             // which is why it is a note and not a defect.
             let (chunk, last_seen, examined) = {
                 let state = self.state.lock().unwrap();
-                let mut chunk: Vec<(u64, BranchId)> = Vec::with_capacity(FORGET_CHUNK);
-                let mut last_seen: Option<u64> = None;
+                let mut chunk: Vec<BranchId> = Vec::with_capacity(FORGET_CHUNK);
+                let mut last_seen: Option<BranchId> = None;
                 let mut examined = 0usize;
-                for (id, ws) in state.workspaces.range(cursor..).take(FORGET_CHUNK) {
+                let lo = cursor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                for (branch, _) in
+                    state.workspaces.range((lo, std::ops::Bound::Unbounded)).take(FORGET_CHUNK)
+                {
                     examined += 1;
-                    last_seen = Some(*id);
-                    // `ws.name` is the `b_{id}` this workspace was forked under and is already
-                    // allocated. `format!` here would allocate one `String` per workspace while
-                    // holding the lock, which is precisely the cost being bounded.
-                    match state.names.get(&ws.name) {
-                        // The name now points at a different slot: this workspace's own branch is
-                        // unreachable through it, so leave it rather than guess.
-                        Some(bid) if bid.id == *id => chunk.push((*id, *bid)),
-                        _ => {}
-                    }
+                    last_seen = Some(*branch);
+                    // **The key is the branch**, generation included, so there is nothing to
+                    // recover. This used to look the generation up in `names` by `ws.name` and
+                    // skip any workspace whose name had been rebound to another slot — a detour
+                    // the slot-keyed map forced, which also meant a rebound name silently
+                    // stranded its workspace here for ever. D158 item 1 removed the need for it.
+                    chunk.push(*branch);
                 }
                 (chunk, last_seen, examined)
             };
@@ -5416,16 +5496,14 @@ impl AgentRuntime {
             // Not held because the catalog takes its own lock and the two are taken in the other
             // order elsewhere. It is also the expensive half in wall-clock terms, and it costs no
             // statement anything.
-            let gone: Vec<(u64, BranchId)> = chunk
-                .into_iter()
-                .filter(|(_, bid)| self.branches.get(*bid).is_err())
-                .collect();
+            let gone: Vec<BranchId> =
+                chunk.into_iter().filter(|bid| self.branches.get(*bid).is_err()).collect();
 
             // ---- phase 3: forget them, under the lock ---------------------------------------
             if !gone.is_empty() {
                 let mut state = self.state.lock().unwrap();
-                for (id, bid) in &gone {
-                    if forget_one_branch(&mut state, *id, *bid) {
+                for bid in &gone {
+                    if forget_one_branch(&mut state, *bid) {
                         forgotten += 1;
                     }
                 }
@@ -5437,9 +5515,10 @@ impl AgentRuntime {
             if examined < FORGET_CHUNK {
                 return forgotten;
             }
-            match last_seen.and_then(|id| id.checked_add(1)) {
-                Some(next) => cursor = next,
-                // The map reached u64::MAX; there is nothing above it to visit.
+            // A full chunk always saw a last key, so this cannot lose the rest of the map; the
+            // `None` arm is unreachable and returning is the safe direction if it ever is not.
+            match last_seen {
+                Some(last) => cursor = Some(last),
                 None => return forgotten,
             }
         }
@@ -5487,7 +5566,7 @@ impl AgentRuntime {
             }
             let mut state = self.state.lock().unwrap();
             for bid in gone {
-                if forget_one_branch(&mut state, bid.id, bid) {
+                if forget_one_branch(&mut state, bid) {
                     forgotten += 1;
                 }
             }
@@ -5529,7 +5608,7 @@ impl AgentRuntime {
             // time, so all of those captures are now the premises of published rows and none of
             // them may be dropped by a later abandon or reap.
             if published {
-                if let Some(ws) = state.workspaces.get(&branch.id) {
+                if let Some(ws) = state.workspaces.get(&branch) {
                     let mut newly: Vec<u64> = ws.inherited.iter().map(|t| t.0).collect();
                     newly.push(ws.txn.0);
                     for t in newly {
@@ -5537,7 +5616,7 @@ impl AgentRuntime {
                     }
                 }
             }
-            if let Some(ws) = state.remove_workspace(&branch.id) {
+            if let Some(ws) = state.remove_workspace(&branch) {
                 state.names.remove(&ws.name);
                 // **A task that published nothing is not a dependent of anything.**
                 //
@@ -6259,41 +6338,44 @@ fn forget_captures_unless_published(state: &mut State, ws: &Workspace) {
 /// Drop one branch's in-memory state, if the runtime still holds exactly that branch. `true` when
 /// something was dropped. The caller holds the state lock.
 ///
-/// **Re-validates before touching anything, because the catalog was asked with the lock released.**
-/// The catalog releases a reaped branch's id SLOT for reuse and bumps the generation, while both
-/// `workspaces` and `names` are keyed by the slot alone — a new session forking into slot 5 takes
-/// the same `b_5` name and the same map key. Acting on a stale answer would then delete a LIVE
-/// agent's workspace, release its escrow and unbind its name, for a branch the catalog had never
-/// been asked about. The generation is what tells the two apart, so the check is against the whole
-/// `BranchId` and not its id half.
+/// **It cannot touch anything but this exact branch, because the map key IS this exact branch.**
+/// The catalog releases a reaped branch's id SLOT for reuse and bumps the generation, so a new
+/// session forking into slot 5 takes the same `b_5` name. Acting on a stale answer would then
+/// delete a LIVE agent's workspace, release its escrow and unbind its name, for a branch the
+/// catalog had never been asked about.
+///
+/// This used to be a re-validation written here — `workspaces.get(&id)` followed by a comparison
+/// of that workspace's name against `names` — because `workspaces` was keyed by the slot alone
+/// and this was the one path that had taken the argument. D158 item 1 keyed the map by the whole
+/// `BranchId`, which turns the check into a miss: a recycled slot is a different key. The name is
+/// removed only when the workspace was ours, which is exactly when the slot cannot have been
+/// recycled — `insert_workspace` evicts a slot's previous occupant, so a surviving key at `bid`
+/// is proof no fork took the slot (the invariant stated on [`State::workspaces`]). One authority,
+/// not two: a second guard on `names` here would mask every mutant of the key.
 ///
 /// Shared by the reconciliation and by [`AgentRuntime::forget_branches`] so that the fast path
 /// cannot drift from the backstop: the two differ in which branches they consider, and in nothing
 /// else.
-fn forget_one_branch(state: &mut State, id: u64, bid: BranchId) -> bool {
-    let still_ours = match state.workspaces.get(&id) {
-        Some(ws) => state.names.get(&ws.name) == Some(&bid),
-        None => false,
-    };
-    if !still_ours {
-        // The slot was recycled under us: the workspace, the name and the quarantine reason all
-        // belong to the LIVE branch now and none of them may be touched. The escrow claim is the
-        // exception and must still go. It is keyed by the whole `BranchId` (see `Pool::claimed`),
-        // so releasing names the dead generation and only the dead generation — the reborn
-        // branch's own claims are a different key and are untouched. Skipping it outright left a
-        // reaped branch holding pool headroom with nothing alive that could ever give it back,
-        // which is exactly the resource-stranding the ABANDON arm of `seal` releases to prevent.
-        state.escrow.release(bid);
-        return false;
-    }
+fn forget_one_branch(state: &mut State, bid: BranchId) -> bool {
     // Reaped without client cooperation, so nothing this branch buffered was published BY IT: the
     // same reasoning as the ABANDON arm of `seal`, and reached by a different door. A descendant
     // may still have published what this branch staged, so the same helper decides.
-    let Some(ws) = state.remove_workspace(&id) else { return false };
+    let Some(ws) = state.remove_workspace(&bid) else {
+        // The slot was recycled under us, or another door already forgot this branch: the
+        // workspace, the name and the quarantine reason all belong to the LIVE branch now and
+        // none of them may be touched. The escrow claim is the exception and must still go. It is
+        // keyed by the whole `BranchId` (see `Pool::claimed`), so releasing names the dead
+        // generation and only the dead generation — the reborn branch's own claims are a
+        // different key and are untouched. Skipping it outright left a reaped branch holding pool
+        // headroom with nothing alive that could ever give it back, which is exactly the
+        // resource-stranding the ABANDON arm of `seal` releases to prevent.
+        state.escrow.release(bid);
+        return false;
+    };
     forget_captures_unless_published(state, &ws);
     state.names.remove(&ws.name);
     state.escrow.release(bid);
-    state.quarantine_reasons.remove(&id);
+    state.quarantine_reasons.remove(&bid.id);
     true
 }
 
@@ -6892,38 +6974,47 @@ mod tests {
         }
     }
 
-    /// The two doors keep `txn_refs` balanced — including over a RECYCLED id slot, where an
-    /// insert lands on an occupied key and `BTreeMap::insert` discards the old value.
+    /// The two doors keep `txn_refs` balanced — including over a RECYCLED id slot, where the
+    /// insert lands on a slot that is already occupied and the old value is discarded.
     ///
     /// Asserted against a brute-force scan of `workspaces` rather than against a second copy of
     /// the arithmetic: the index exists to give the same answer as that scan, so that is what it
     /// is compared to.
+    ///
+    /// **D158 item 1 changed the spelling of "recycled", not the scenario.** `workspaces` is
+    /// keyed by the whole `BranchId` now, so a slot coming back is `(8, g0)` then `(8, g1)`
+    /// rather than `8` twice; the displacement it exercises is the same one, and it is now
+    /// `insert_workspace`'s own range scan rather than a `BTreeMap` key collision that performs
+    /// it. Every assertion below is unchanged.
     #[test]
     fn the_txn_ref_index_tracks_a_scan_of_the_workspaces() {
         let scan = |st: &State, t: u64| {
             st.workspaces.values().any(|w| w.txn == TxnId(t) || w.inherited.contains(&TxnId(t)))
         };
         let mut st = State::default();
-        st.insert_workspace(7, ws("b_7", 100, &[]));
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
         // A child of 7 inherits its parent's staged txn, so txn 100 now has TWO referents.
-        st.insert_workspace(8, ws("b_8", 101, &[100]));
+        st.insert_workspace(BranchId::new(8, 0), ws("b_8", 101, &[100]));
         assert_eq!(st.txn_refs.get(&100), Some(&2));
         for t in [100, 101] {
             assert_eq!(st.txn_refs.contains_key(&t), scan(&st, t), "txn {t} after inserts");
         }
 
-        // Slot 8 is reaped and recycled: the same key, a different branch and a different txn.
-        // The discarded workspace's references must go with it.
-        st.insert_workspace(8, ws("b_8", 102, &[]));
+        // Slot 8 is reaped and recycled: the same slot at a new generation, a different branch
+        // and a different txn. The discarded workspace's references must go with it.
+        st.insert_workspace(BranchId::new(8, 1), ws("b_8", 102, &[]));
         assert_eq!(st.txn_refs.get(&100), Some(&1), "the recycled slot kept its old reference");
         for t in [100, 101, 102] {
             assert_eq!(st.txn_refs.contains_key(&t), scan(&st, t), "txn {t} after recycling");
         }
 
-        assert!(st.remove_workspace(&7).is_some());
-        assert!(st.remove_workspace(&8).is_some());
+        assert!(st.remove_workspace(&BranchId::new(7, 0)).is_some());
+        assert!(st.remove_workspace(&BranchId::new(8, 1)).is_some());
         assert!(st.txn_refs.is_empty(), "left over: {:?}", st.txn_refs);
-        assert!(st.remove_workspace(&7).is_none(), "removing twice must not double-decrement");
+        assert!(
+            st.remove_workspace(&BranchId::new(7, 0)).is_none(),
+            "removing twice must not double-decrement"
+        );
     }
 
     /// **The differential assertion has to be able to FAIL**, and nothing in a passing suite shows
@@ -6938,7 +7029,7 @@ mod tests {
     #[should_panic(expected = "txn_refs disagrees with a scan")]
     fn the_index_scan_assertion_fires_on_a_desynchronised_index() {
         let mut st = State::default();
-        st.insert_workspace(7, ws("b_7", 100, &[]));
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
         assert!(capture_is_protected(&st, TxnId(100)), "a live workspace holds txn 100");
 
         // The under-count: the index forgets a reference a live workspace still holds. Left
@@ -6957,33 +7048,44 @@ mod tests {
     #[should_panic(expected = "txn_refs disagrees with a scan")]
     fn the_door_audit_fires_on_a_desynchronised_index() {
         let mut st = State::default();
-        st.insert_workspace(7, ws("b_7", 100, &[]));
-        st.insert_workspace(8, ws("b_8", 101, &[100]));
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
+        st.insert_workspace(BranchId::new(8, 0), ws("b_8", 101, &[100]));
         // An OVER-count: a reference to a txn no workspace holds. That is the direction a rewrite
         // going straight to `BTreeMap::insert` produces, and the one the audit alone can see — an
         // under-count is caught earlier and more loudly by `drop_txn_refs`, which refuses to
         // decrement below zero (proven by this test's first draft, which tripped that instead).
         st.txn_refs.insert(999, 1);
-        st.remove_workspace(&8);
+        st.remove_workspace(&BranchId::new(8, 0));
     }
 
     /// The capture of a workspace displaced by a RECYCLED SLOT is dropped, not stranded.
     ///
-    /// `BTreeMap::insert` hands back the old value and nothing else was releasing it, so each
-    /// recycled slot leaked one `captures` entry forever — the unbounded growth this module exists
-    /// to prevent, through a door that is not the sweep.
+    /// Nothing else was releasing the displaced value, so each recycled slot leaked one
+    /// `captures` entry forever — the unbounded growth this module exists to prevent, through a
+    /// door that is not the sweep.
+    ///
+    /// **This is also the guard on D158 item 1's eviction.** Keying `workspaces` by the whole
+    /// `BranchId` means a recycled slot no longer collides on the key, so `insert_workspace` has
+    /// to find the slot's previous occupant by range and evict it explicitly; delete that range
+    /// scan and the first assertion below fails with the stranded capture named.
     #[test]
     fn a_recycled_slot_does_not_strand_the_displaced_workspaces_capture() {
         let mut st = State::default();
-        st.insert_workspace(7, ws("b_7", 100, &[]));
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
         st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, BranchId::new(7, 0)));
 
         // Slot 7 comes back at a new generation with a new txn, displacing the old workspace.
-        st.insert_workspace(7, ws("b_7", 200, &[]));
+        st.insert_workspace(BranchId::new(7, 1), ws("b_7", 200, &[]));
         assert!(
             !st.captures.contains_key(&100),
             "the displaced workspace's capture was stranded: {:?}",
             st.captures.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            st.workspaces.len(),
+            1,
+            "a recycled slot must hold ONE workspace, not one per generation: {:?}",
+            st.workspaces.keys().collect::<Vec<_>>()
         );
 
         // And a capture that IS still needed survives the same path: `published_txns` is the
@@ -6991,9 +7093,98 @@ mod tests {
         // uses that rule rather than deleting unconditionally.
         st.captures.insert(300, TxnCapture::new(TxnId(300), ProvId::NONE, BranchId::new(9, 0)));
         st.published_txns.insert(300);
-        st.insert_workspace(9, ws("b_9", 300, &[]));
-        st.insert_workspace(9, ws("b_9", 301, &[]));
+        st.insert_workspace(BranchId::new(9, 0), ws("b_9", 300, &[]));
+        st.insert_workspace(BranchId::new(9, 1), ws("b_9", 301, &[]));
         assert!(st.captures.contains_key(&300), "a PUBLISHED capture must survive the displacement");
+    }
+
+    /// **The new workspace is INSTALLED before the displaced one is released, not after.**
+    ///
+    /// `insert_workspace` counts the incoming workspace's txn references first, then has to let
+    /// the slot's previous occupant go. Release before installing and any txn the incoming
+    /// workspace holds reads as indexed while no workspace in the map carries it, so
+    /// `capture_is_protected`'s differential assertion fires on a state that is in fact
+    /// consistent — and in release builds, where that assertion is compiled out, the capture is
+    /// kept for the wrong reason.
+    ///
+    /// The slot-keyed map could not get this wrong: `BTreeMap::insert` installed the new value
+    /// and handed the old one back in ONE call. Keying by `BranchId` (D158 item 1) split that in
+    /// two, which turned a free property into a decision — so it gets an input that tells the two
+    /// orders apart, rather than a comment claiming the order is right.
+    ///
+    /// That input is a session forking into a recycled slot while INHERITING a txn the displaced
+    /// workspace owned, which is what makes the incoming workspace the only holder of it at the
+    /// moment of release. Measured: with the two steps swapped this test panics inside
+    /// `capture_is_protected` with "txn_refs disagrees with a scan of workspaces about txn
+    /// TxnId(100)". The discriminator is a `debug_assert`, as it is for the two door-audit tests
+    /// above, so this one discriminates in debug and merely holds in release.
+    #[test]
+    fn a_recycled_slot_installs_the_new_workspace_before_releasing_the_old() {
+        let mut st = State::default();
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
+        st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, BranchId::new(7, 0)));
+
+        // Slot 7 comes back, and the new session inherits txn 100 — the displaced workspace's own.
+        st.insert_workspace(BranchId::new(7, 1), ws("b_7", 200, &[100]));
+
+        assert!(
+            st.captures.contains_key(&100),
+            "txn 100 is still held by the workspace that just took the slot, so its capture must \
+             survive the displacement: {:?}",
+            st.captures.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(st.txn_refs.get(&100), Some(&1), "exactly the new workspace holds txn 100");
+        assert_eq!(st.workspaces.len(), 1, "one workspace per slot");
+    }
+
+    /// **The chunked reconciliation must visit EVERY workspace, across a chunk boundary.**
+    ///
+    /// `forget_reaped_branches` walks `workspaces` `FORGET_CHUNK` at a time, releasing the state
+    /// lock between chunks and resuming from the last key it saw. D158 item 1 changed that key
+    /// from a `u64` slot to a `BranchId`, which changed how the cursor resumes: `key + 1` has no
+    /// meaning at the top of the generation space, so it is an EXCLUDED bound now. An off-by-one
+    /// there either skips workspaces — the unbounded growth this function exists to prevent — or
+    /// loops for ever on one key.
+    ///
+    /// **Nothing in the suite crossed that boundary.** Every other fixture that reaches this
+    /// function holds a handful of sessions, so the multi-chunk path ran zero times and a broken
+    /// cursor would have been invisible. That is what this test is for, and it lives in this
+    /// module rather than in `tests/` for one reason: `FORGET_CHUNK` is in scope here, so the
+    /// fixture is sized **by the constant**. A literal `1025` in an integration test silently
+    /// stops crossing the boundary the day the constant grows, which is the one way this could
+    /// pass while testing nothing.
+    #[test]
+    fn the_reconciliation_crosses_its_chunk_boundary_and_forgets_every_branch() {
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let rt = AgentRuntime::with_catalog(Arc::clone(&catalog) as Arc<dyn BranchCatalog>);
+
+        // One more than a chunk, so the walk must resume at least once.
+        let n = FORGET_CHUNK + 1;
+        let mut opened: Vec<BranchId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = rt
+                .begin_session("chunky", Some(&format!("r{i}")), BranchId::TRUNK)
+                .expect("fork");
+            opened.push(s.branch);
+        }
+        assert_eq!(rt.state.lock().unwrap().workspaces.len(), n, "fixture did not open n sessions");
+
+        // Reaped behind the runtime's back, which is what the reconciliation exists to notice.
+        // The slots are deliberately NOT released: recycling is a different property, tested in
+        // `tests/w4_sweep_slot_recycle.rs`, and releasing here would let a later fork displace a
+        // workspace this walk is supposed to find.
+        for b in &opened {
+            let rec = rt.branches().get(*b).expect("live before the reap");
+            rt.branches().set_state(*b, rec.state, BranchState::Reaped).expect("mark reaped");
+        }
+
+        assert_eq!(
+            rt.forget_reaped_branches(),
+            n,
+            "the walk must forget every branch it was left holding, not one chunk's worth"
+        );
+        let left = rt.state.lock().unwrap().workspaces.len();
+        assert_eq!(left, 0, "{left} workspaces survived a full reconciliation");
     }
 
     fn applied_at(seq: u64) -> AppliedOp {
