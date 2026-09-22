@@ -21,7 +21,26 @@ The brief listed five candidates. Four are eliminated by measurement or by struc
 
 ⛔ PAGE-LATCH CONTENTION BETWEEN FORKERS, ALLOCATOR CONTENTION BETWEEN FORKERS, CACHE-LINE
    BOUNCING BETWEEN FORKERS. Eliminated STRUCTURALLY, not statistically: `fork` does every tree
-   mutation under `logical`, so **only one thread is ever inside the section**. Two forkers cannot
+   mutation under `logical`, so **only one thread is ever inside the section**.
+
+   CHECKED AGAINST THE CODE THAT RAN, not from memory. Enumerating every tree access in `fork`
+   by line offset within the function (src/branch/table_catalog.rs):
+       +14  let g = self.logical.lock()            <- acquired
+       +26  self.core(parent.id)                   \
+       +38  self.envelope_bytes(parent.id)          |
+       +50  self.tree.range_scan(FREE_ID span)      |
+       +64  self.remove_if_present(free_id)         | EVERY tree access in the function
+       +65  self.core(id)                           | lies strictly between the two
+       +86  self.write_record  / +88 _new           |
+      +100  self.tree.insert(child key)             |
+      +115  self.upsert (F5 extras)                 |
+      +124  self.write_header()                     |
+      +129  self.stage()                           /
+      +141  drop(g)                                <- released
+      +148  self.durable(seq)                      <- THE ONLY THING OUTSIDE
+   There is no tree access before +14 or between +141 and +148. So the set of things that can run
+   concurrently with the section is exactly {`durable`}, and `durable` is
+   `pool.flush_all()` + `disk_manager.sync()`. Two forkers cannot
    contend on a page latch, an allocator or a cache line because two forkers are never in there at
    once. Combined with U(hold) = 94-97%, which puts the time INSIDE the section, the counterparty
    must be something that runs OUTSIDE the lock — and in this harness exactly one thing does:
