@@ -893,19 +893,15 @@ mod tests {
 
     /// Runs the whole reaper suite against both catalogs.
     ///
-    /// ⚠ **ONE `#[test]` WRITTEN IN HERE BECOMES *TWO* TESTS AT RUNTIME**, because this macro is
-    /// instantiated twice below (`log_catalog`, `table_catalog`) and both run in the SAME process,
-    /// in parallel. Nothing else in this file says so, and that single property has produced two
-    /// unrelated defects (SCALE-DESIGN D139):
+    /// ⚠ **The doubling is documented above, at the `mod tests` doc: *"one `cargo test` now runs
+    /// each case twice"*. It is NOT restated here on purpose** — two statements of one fact drift,
+    /// and the copy nobody reads is the one that goes stale.
     ///
-    /// * **A fixture race.** Any temp path keyed only on `std::process::id()` is IDENTICAL in both
-    ///   instances, so one clobbers the other's file. Give every fixture path a per-instantiation
-    ///   discriminator — `module_path!()` — or a per-thread one. Two sites had it wrong and one
-    ///   (the `d128-site3-blocker` path) already had it right, which is why the fix is a SWEEP of
-    ///   this file and not a patch of whichever test happened to fail.
-    /// * **A test-count surprise.** A pre-registered suite total derived by counting `#[test]` in a
-    ///   diff UNDERCOUNTS: a test added in here contributes 2. Counting 5 added tests and predicting
-    ///   +5 cost a landing an unexplained +1.
+    /// Its two CONSEQUENCES are commented where they bite, which is the only place a reader meets
+    /// them: at each `ferro-*-ckpt-` fixture path (a pid-only key collides across the two
+    /// instantiations) and in any pre-registered suite count (a `#[test]` added in here contributes
+    /// **two**, so counting attributes in a diff undercounts). **Both defects came from a property
+    /// that was already documented four lines up and that nobody read — see SCALE-DESIGN D139.**
     macro_rules! reaper_suite {
         ($modname:ident, $table:expr) => {
             mod $modname {
