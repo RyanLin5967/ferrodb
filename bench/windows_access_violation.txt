@@ -185,3 +185,52 @@ as suggestive that D138 introduced the access violation.
 ⚠ The instrument only reports because `eprintln!` was replaced: libtest's output capture
   swallows it under the plain `cargo test` CI runs, and the AV kills the process so
   captured buffers never flush. Two-armed fire-check: 0 lines before, 2 after.
+
+================================================================================
+⛔⛔ 2026-09-22T20:53Z — CORRECTION TO THE 20:39Z ENTRY ABOVE. I OVERSTATED ITS
+     EVIDENCE BY 3x. THE CONCLUSION SURVIVES; THE COUNT DOES NOT.
+================================================================================
+
+The 20:39Z entry claims "EVERY EARLIER OCCURRENCE RECORDED ABOVE" is an ancestor of
+b17ec58, and lists three: 0ee07fc, 0aaffb4, cc399de. It then says the access violation
+has been "observed on FOUR distinct shas".
+
+⛔ TWO OF THOSE THREE ARE NOT ACCESS VIOLATIONS, and this file already said so:
+
+  0aaffb4  ⛔ NOT AN OCCURRENCE AT ALL -- IT WAS GREEN. This file's own heading for it is
+           "THIRD SAMPLE: GREEN", and it records "success Test windows-latest" for run
+           35395893959. I counted a PASS as a crash.
+
+  cc399de  ⛔ A PANIC, NOT AN ACCESS VIOLATION. Run 35499141131 shows
+           "test result: FAILED. 34 passed; 1 failed." and "panicked at
+           tests\integration_cluster_agents.rs:1467:72" -- the NotLeader election panic,
+           which is the defect a7f40e2 and 7fc1698 fix. THIS FILE EXPLICITLY REFUSES THE
+           LINK, four lines above the entry I read: "⛔ THIS DOES NOT EXPLAIN THE ACCESS
+           VIOLATION. A panic is not a 0xc0000005 and no mechanism links them."
+           The AV signature is the ABSENCE of both of those lines. I used the presence of
+           a failure as if it were the signature.
+
+⇒ THE CORRECTED FACTS. Access violations (exit 0xc0000005, NO "test result: FAILED",
+  NO "panicked at") have occurred on TWO distinct shas, in THREE observations:
+      0ee07fc   run 35391545783                          1 observation
+      4685d80   run 35745462930 attempts 1 and 2         2 observations
+  and 4685d80 attempt 3 was GREEN, so that sha is 2-of-3.
+
+⇒ WHAT SURVIVES, AND IT IS STILL DECISIVE. 0ee07fc IS an ancestor of b17ec58 --
+  re-verified just now, not carried forward:
+      git merge-base --is-ancestor 0ee07fc b17ec58   ->   YES
+  So the arm used as the bisect's CLEAN CONTROL still CONTAINS a commit at which an access
+  violation occurred. A green control arm still exonerates nothing, and the D138 bisect
+  premise is still falsified. What changes is the WEIGHT: ONE prior occurrence inside the
+  control arm, not three.
+
+⇒ HOW I GOT IT WRONG, because the mechanism is the useful part. I grepped this file for
+  shas near the words "occurrence" and "0xc0000005" and read the LIST OF MATCHES rather
+  than what the file said about each one. That is a direct violation of this project's own
+  standing rule -- READ THE MATCHES, NEVER A COUNT -- committed by me while writing an
+  entry whose whole subject was somebody else's evidence being misread. A catalogue of
+  failure modes makes misattribution EASIER, not harder.
+
+⇒ CORRECTED IN: this file, bench/push_prereg_2026-09-22.txt (which said "four distinct
+  shas"), frontier/RESUME.md and frontier/LANDING-QUEUE.md. The 20:39Z entry above is left
+  UNEDITED so the overstatement and its correction can both be read.

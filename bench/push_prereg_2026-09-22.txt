@@ -14,15 +14,20 @@ WHAT IS BEING PUSHED
       (+ av-loop-counters, pre-registered +0 @ 6b129b3 / 2529, landing before the push)
 
 WHY THIS FILE EXISTS
-  origin/main's Windows job has crashed with STATUS_ACCESS_VIOLATION on four distinct shas.
+  origin/main's Windows job has crashed with STATUS_ACCESS_VIOLATION on TWO distinct shas
+  (0ee07fc once; 4685d80 twice in three attempts).  ⛔ CORRECTED 20:53Z from "four distinct
+  shas" -- that count wrongly included 0aaffb4, which was GREEN, and cc399de, which was a
+  PANIC and therefore not the AV signature. See bench/windows_access_violation.txt.
   A red Windows job after this push is therefore the EXPECTED background condition, and the
   failure mode this file guards against is reading that red as "the landings broke main".
   A pre-registration written afterwards can be re-described; one written now can only be read.
 
 ⛔ WHAT IS ALREADY KNOWN AND MUST NOT BE RE-DERIVED FROM THIS RUN
-  The access violation is a LONG-STANDING INTERMITTENT, not a regression: 0ee07fc, 0aaffb4 and
-  cc399de all predate — and are git ancestors of — b17ec58, the arm a bisect had been using as a
-  clean control. See bench/windows_access_violation.txt, entry 2026-09-22T20:39Z. The D138 bisect
+  The access violation is a LONG-STANDING INTERMITTENT, not a regression: 0ee07fc predates —
+  and is a git ancestor of — b17ec58, the arm a bisect had been using as a clean control.
+  ⛔ CORRECTED 20:53Z: an earlier version of this line also named 0aaffb4 and cc399de. 0aaffb4
+  was GREEN and cc399de was a PANIC, which is not the AV signature. ONE prior occurrence sits
+  inside the control arm, not three. The conclusion is unchanged; the weight is. See bench/windows_access_violation.txt, entry 2026-09-22T20:39Z. The D138 bisect
   is FALSIFIED and both of its draw-4 runs were cancelled.
 
 THE READING, FIXED IN ADVANCE — four outcomes, each with what it does and does NOT license
