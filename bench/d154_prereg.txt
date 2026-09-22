@@ -186,3 +186,39 @@ REVISED EXPECTATION FOR RUN 3
 swept. Checks 3, 4 and 5 (six new tests by name, the rewritten transport test by name, Go 97)
 stand unchanged, and I am adding a sixth: tests/d151_parse_reads_a_refreshed_snapshot.rs must
 appear BY NAME too, since its absence is what staleness flagged.
+
+
+AMENDMENT 3 — 2026-09-22, BOTH landing orders pre-registered (append-only)
+===========================================================================
+Run 3 (d154-9637308) produced NO NUMBER: killed at 16 of 135 targets, and verify-suite refused
+rather than reporting a partial ("aborted by SIGTERM after 391s. A suite cut short is not a
+count."). The kill's CONCLUSION was right — the base is going to move by design, so that run could
+never have landed — but its PREMISE was false and that is the part worth recording:
+
+⛔ I INFERRED ANOTHER LANE'S STATE INSTEAD OF MEASURING IT. I read "the suite lock is free" plus
+"I intend to land w4gen first" as "w4gen's suite is done and only its landing is pending", and
+acted on it. w4gen's suite was in fact QUEUED, with no verdict in existence, and its branch had
+moved twice since the tip it had reported. Verified after the fact: the lock was taken by d159
+**23 seconds** after I released it (87199 d159 16:24:38Z vs my release at ~16:24:15Z), because
+releasing a mkdir lock does not hand it to whoever you intended — it goes to whoever races first.
+⇒ The check was `cat /tmp/ferrodb-suite.lock/owner`, one command, and I had run it minutes earlier
+  and drawn a conclusion from its ABSENCE of an owner rather than from any statement about w4gen.
+⇒ Same shape as the origin/main error earlier in this row: a well-formed, plausible reading of a
+  state I did not measure. Twice in one row, in opposite directions.
+
+PRE-REGISTERING BOTH LANDING ORDERS, so the number is chosen before the data rather than fitted
+after. D154 is +6 per-target; every absolute below is that one claim evaluated at a base:
+
+    base                                   | absolute | status
+    ---------------------------------------|----------|-----------------------------------------
+    4685d80  (2511, D138 in)               |   2517   | MEASURED, hit exactly, RUNNER_EXIT=0
+    3a9a5f9  (2512, D151 in)               |   2518   | never run — base moved first
+    3a9a5f9 + w4gen (+4)  = 2516           |   2522   | ⭐ EXPECTED at gate time
+    (w4gen landing after me, +4 on 2518)   |   2518   | not expected; w4gen lands first by decision
+
+⇒ If the run returns 2522, D154 is +6 on a base that includes w4gen. If it returns 2518, w4gen did
+  NOT land first and the landing order changed without my being told. Either way the delta is the
+  claim and the absolute is derived, not carried forward.
+
+The +6 is: 6 tests in tests/d154_length_prefix_refusal.rs. The rewritten transport test is net
+zero (1 before, 1 after) and is checked BY NAME for that reason.
