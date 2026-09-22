@@ -1685,8 +1685,20 @@ impl PageStore for ArenaPageStore {
         // theirs.** `release_page` does this one id at a time; freeing an extent bypasses it
         // entirely (that bypass is the reaper's fast path and the reason arenas exist), so the
         // same forgetting has to happen here or a reissued range would carry stale bases.
-        let freed = start..start + pages;
-        st.shadow_base.retain(|shadow, _| !freed.contains(shadow));
+        //
+        // **D99 — ask the range, do not walk the map.** The `retain` this replaces visited every
+        // entry in `shadow_base` to drop the few that lie in this extent: that map is keyed by
+        // PAGE id and holds one entry per live copy-on-write shadow page in the whole store, so it
+        // grows with the database while the answer is bounded by `pages` — at most
+        // `ARENA_EXTENT_PAGES` (256). Probing the range is the spelling `release_page` already
+        // uses for exactly this forgetting, one id at a time, and it is bounded by the extent
+        // rather than by everything else that ever shadowed a page.
+        //
+        // Exactly equivalent: `retain` dropped precisely the entries whose KEY fell in
+        // `start..start + pages`, and these are those keys.
+        for shadow in start..start + pages {
+            st.shadow_base.remove(&shadow);
+        }
         if let Some(ext) = ext.as_ref() {
             // **D99 — RE-INDEX THE QUESTION, do not speed up the answer.** "Which branch is
             // currently filling this arena?" was answered by walking every entry in `current`,
@@ -2387,6 +2399,61 @@ mod tests {
             None,
             "a released id still named a base; the next page to get this id would decode as a \
              delta of an unrelated page"
+        );
+    }
+
+    /// **D99 — freeing an extent forgets the bases of ITS pages, and of no others.**
+    ///
+    /// The `retain` this replaced walked every entry in `shadow_base` — a map keyed by PAGE id
+    /// holding one entry per live shadow in the whole store — to drop the handful lying inside one
+    /// extent. Probing the extent's own range instead is equivalent only if it drops exactly the
+    /// same entries, so the assertion that carries the change is the BYSTANDER: a shadow in a
+    /// different extent must survive. An implementation that cleared the map, or that probed the
+    /// wrong range, still satisfies the first assertion and fails this one.
+    #[test]
+    fn freeing_an_extent_forgets_only_its_own_shadow_bases() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        // `alloc_for`, not `alloc_in_arena`: a branch's first extent is ONE page, so asking the
+        // same extent for a second one fails with "arena is exhausted". `alloc_for` grows the
+        // branch onto a fresh extent when it needs to.
+        let page_a = h
+            .store
+            .alloc_for(parent.branch_id, PageType::BTreeLeaf, h.catalog.next_epoch())
+            .unwrap();
+        let page_b = h
+            .store
+            .alloc_for(parent.branch_id, PageType::BTreeLeaf, h.catalog.next_epoch())
+            .unwrap();
+
+        // Two forks, so the two shadows land in two different extents.
+        let (child_a, shadow_a) = shadow_once(&h, parent.branch_id, page_a);
+        let (child_b, shadow_b) = shadow_once(&h, parent.branch_id, page_b);
+        assert!(h.store.shadow_base(shadow_a).is_some(), "fixture: no base recorded for a");
+        assert!(h.store.shadow_base(shadow_b).is_some(), "fixture: no base recorded for b");
+
+        // The arena each shadow ACTUALLY lives in, read from its own page header. Not
+        // `arena_for(child)`: that answers "which extent is this branch filling now", and a
+        // one-page extent filled by the shadow itself is already exhausted, so it would hand back
+        // a fresh extent that does not contain the page and the free would miss.
+        let a_arena = h.store.read_page(shadow_a).unwrap().header().unwrap().arena_id;
+        let b_arena = h.store.read_page(shadow_b).unwrap().header().unwrap().arena_id;
+        let _ = (child_a, child_b);
+        assert_ne!(
+            a_arena, b_arena,
+            "fixture: both shadows share one extent, so this test has no bystander to protect"
+        );
+
+        h.store.free_arena(a_arena).unwrap();
+
+        assert_eq!(
+            h.store.shadow_base(shadow_a),
+            None,
+            "a freed extent's page still names a base; a reissued id would decode as a delta of it"
+        );
+        assert!(
+            h.store.shadow_base(shadow_b).is_some(),
+            "freeing one extent forgot a DIFFERENT extent's base"
         );
     }
 

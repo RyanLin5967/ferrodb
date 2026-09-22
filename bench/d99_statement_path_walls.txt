@@ -259,6 +259,48 @@ B3  free_arena vs BRANCHES, persist ON — the configuration cli.rs ships.
   ownership and outside its scope.
 
 --------------------------------------------------------------------------------
+A FIFTH STEP, ARRIVED SINCE — AND REMOVED (rebase onto 1bf8abe)
+--------------------------------------------------------------------------------
+Rebasing this row onto current main brought D102's new `free_arena` block, which
+forgets the shadow bases of the extent's pages. It arrived spelled as a SCAN:
+
+    let freed = start..start + pages;
+    st.shadow_base.retain(|shadow, _| !freed.contains(shadow));
+
+`shadow_base` is `HashMap<PageId, (PageId, u8, Epoch)>` — keyed by PAGE id, one
+entry per live copy-on-write shadow page in the WHOLE store. So the `retain`
+walked everything that had ever shadowed a page in order to drop the handful
+lying inside one extent, whose count is bounded by `ARENA_EXTENT_PAGES` = 256.
+That is the same un-indexed question this row exists to remove, on the same
+function, newly arrived: it grows with the database while the answer does not.
+
+Replaced with the spelling `release_page` in this same file already uses for
+exactly this forgetting, one id at a time:
+
+    for shadow in start..start + pages { st.shadow_base.remove(&shadow); }
+
+Exactly equivalent — `retain` dropped precisely the entries whose KEY fell in
+`start..start + pages`, and these are those keys — and bounded by the extent
+instead of by the store. No timing was taken for it: the integer is the claim,
+and the integer is that the visited count goes from len(shadow_base) to at most
+256 with no measurement required to see it.
+
+Pinned by `freeing_an_extent_forgets_only_its_own_shadow_bases`, whose
+load-bearing assertion is the BYSTANDER — a shadow in a DIFFERENT extent must
+survive — because an implementation that cleared the map satisfies everything
+else. Both directions fire (see the mutation table below).
+
+⚠ That test took two tries to write, and both failures were in the fixture, which
+is worth recording because both look like the change failing:
+  * `alloc_in_arena` twice on the parent's first extent fails with "arena is
+    exhausted" — a branch's FIRST extent is one page. `alloc_for` grows it.
+  * `arena_for(child)` answers "which extent is this branch filling NOW", which
+    after a one-page extent has been filled by the shadow is a FRESH extent that
+    does not contain the page. Freeing that frees nothing and the assertion
+    reads as the cleanup having failed. The arena a page lives in comes from the
+    page's own header: `read_page(p).header().arena_id`.
+
+--------------------------------------------------------------------------------
 INSTRUMENT DEFECTS FOUND IN REV 1, AND WHAT REPLACED THEM
 --------------------------------------------------------------------------------
 1. SINGLE-CALL TIMING AGAINST A 41 ns CLOCK. rev1's A2 reported "42.0 ns" at
@@ -299,6 +341,12 @@ what the entry actually governs. Four mutations, each rebuilt and run:
   removal deleted             -> freeing_an_extent_forgets_its_owner_and_no_other FAILED
   removal on wrong key        -> freeing_an_extent_forgets_its_owner_and_no_other FAILED
   fill_unknown cleanup deleted-> freeing_an_extent_gives_back_its_fill_suspicion  FAILED
+  shadow cleanup deleted      -> freeing_an_extent_forgets_only_its_own_shadow..  FAILED
+  whole shadow map cleared    -> freeing_an_extent_forgets_only_its_own_shadow..  FAILED
+
+The last three were re-run AFTER the rebase onto 1bf8abe, because the code around
+them moved and a test that fired against the old neighbours is not evidence about
+the new ones.
 
 Suite at 9c9d26f in this worktree:
   cargo test --release --lib                     1362 passed; 0 failed; 1 ignored
