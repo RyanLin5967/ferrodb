@@ -71,6 +71,15 @@ is the best case for cache:
   write_header                    0.01756               0.02701    1.54x
   SUM                             0.07479               0.11788    1.58x
 
+⚠ AND ONE ROW OF THAT TABLE IS NOT A MEASUREMENT ON EITHER SIDE OF THE ORIGINAL. The artifact's
+`write_record_new = 0.02779` was never measured: it is `0.06316 x 0.44`, where 0.06316 is the cost
+of three UPSERTS and 0.44 is the insert/upsert ratio `0.01003/0.02280` taken on the CHILD KEY and
+then applied to three different keys. So the inherited 0.0748 is part measured, part modelled — the
+single largest of its six components is a scaled estimate resting on a ratio measured elsewhere.
+My 0.04793 is the operation `fork` actually performs, timed in place. The 1.72x on that row is
+therefore "measurement vs model", not "in-place vs isolated", and the honest statement of the other
+five rows is that isolated tight loops understate in-place cost by 1.12x-1.97x.
+
 So the 0.1532 ms decomposes as:
      0.04309 ms   28.1%   isolated microbenchmark understates the SAME work (regime iv)
      0.07168 ms   46.8%   REAL contention inflation, T=1 -> T=64
