@@ -37,7 +37,7 @@ HOLD falls **21x** (0.20079 -> 0.00941). Throughput rises only **1.9x**, because
 
 ⇒ **THE SECTION AND THE HANDOFF TRADE OFF AGAINST EACH OTHER.** A critical section that short
 cannot be handed between 64 parked threads fast enough to keep the lock busy, so park/unpark
-becomes the binding term. This is why F1 measures 2.05x and not the ~21x that `throughput = 1/S`
+becomes the binding term. This is why F1 measures ~2x and not the ~21x that `throughput = 1/S`
 would predict from the same numbers — **and it is a second, independent demonstration that
 `throughput = 1/serial_time` is not a law of this system.** It held in the L0 regime because the
 lock was 96% busy there; it fails by an order of magnitude as soon as the section is short.

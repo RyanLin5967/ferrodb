@@ -5,7 +5,8 @@
 
   F1  section driven toward zero    DOES NOT FIRE, BOTH REGIMES. Paired, probe OFF, 9 reps each:
                                     warm=0 median 2.08x (0/9 within +/-10% of 1.00x), warm=20k
-                                    median 1.86x (1/9). 17 of 18 paired draws above 1.10x.
+                                    median 1.86x (1/9). 17 of 18 paired draws above 1.10x;
+                                    combined median 2.00x.
                                     ⛔ My earlier "UNDECIDED at warm=20k" is WITHDRAWN: that was
                                     the unpaired summary of the same data. See section 1c.
   F2  residual grows with T?        DOES NOT FIRE. It grows (HOLD 1.25-1.71x), so it IS contention.
@@ -54,7 +55,8 @@
   out noise-dominated. The measure lock excludes other MEASURERS, not builds or suites, so "lock
   held" is not "box quiet" and is not claimed to be. EVERY duration here is an UPPER BOUND.
 * ⭐ WHAT IS NOT TRUSTWORTHY: any absolute millisecond figure, and the warm=20k F1 arm. What IS
-  trustworthy: the counters (f/sync, syncs x f/sync = N), the non-overlap of the F1 distributions,
+  trustworthy: the counters (f/sync, syncs x f/sync = N), the COUNT of paired F1 draws above
+  1.10x (17 of 18),
   and ratios of two durations taken by ONE instrument inside ONE process (U(hold), the 64/1
   column, per-upsert cost at fixed k) — which is where every conclusion above rests.
 * A tree-size confound exists in F1 and is bounded rather than removed: stubbed levels insert fewer

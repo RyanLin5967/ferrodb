@@ -7,8 +7,9 @@
 
 The claim "the serial section is the ceiling" is TRUE and is now backed by two measurements that
 could have come out the other way:
-  * F1 — driving the section toward zero moves throughput 2.05x, with non-overlapping
-    distributions (min stubbed 7699.4 > max unstubbed 5244.6).
+  * F1 — driving the section toward zero moves throughput by a paired median of 2.00x across 18
+    draws in two regimes (warm=0 2.08x, warm=20k 1.86x), with 17 of 18 individual draws above
+    1.10x against a falsifier that required 1.00x +/-10%.
   * F6 — M-FSYNC refuted on a pure counter: f/sync stalls at ~17 while T grows to 512.
 
 The evidence it was ORIGINALLY specified on — D8's "throughput = 1/serial_time, 0.15% agreement
@@ -27,7 +28,8 @@ Every clause of that needs replacing:
     physical cost, it was four regimes subtracted from each other.
   * "fsync-bound"          -> refuted on a counter, in both regimes, at six thread counts.
   * "even a serial section driven to ZERO cannot clear the bar" -> driven to its limit it gives
-    2.05x. Which is the real constraint on Round 3, and it is a budget, not a wall.
+    about 2x (paired median 2.00x). Which is the real constraint on Round 3, and it is a budget,
+    not a wall.
 
 ### WHAT ROUND 3 SHOULD BE TOLD, AND IT IS A DIFFERENT SHAPE OF TARGET
 1. **The budget for serial-section work is ~2x, measured.** L3 is the limit of that strategy and it
