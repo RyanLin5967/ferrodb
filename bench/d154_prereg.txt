@@ -250,3 +250,49 @@ The Windows failure does not touch this row, and that is MEASURED rather than ar
 names: integration_cluster_agents returned "ok. 35 passed; 0 failed" in my own complete run at
 4685d80 — the exact sha that reproduces on Windows — with 0 FAILED result lines in the whole run.
 A file-set argument is what staleness refused from us this morning, so it is not used here either.
+
+
+AMENDMENT 5 — 2026-09-22, d159 landed mid-run; base fixed at main 29801f0
+==========================================================================
+Run 4 (d154-3afec21) produced NO NUMBER: "REFUSING — aborted by SIGTERM after 1011s. A suite cut
+short is not a count." Stopped on request once D159 landed under it. The arithmetic for stopping
+rather than finishing is the landing queue's and it holds: ~3 min sunk against ~45 to restart,
+versus ~85 total if D159 had waited and then re-run STALE-GREEN.
+⚠ Minor correction to that account for the record: the runner reports 1011s, not ~3 minutes. Most
+of it was queue time, so the conclusion is unchanged — but "3 minutes in" understates what was
+spent and the number in the refusal line is the one to quote.
+
+⛔ CORRECTION I OWE THE RECORD, AGAINST MYSELF'S FAVOUR:
+**2529 was NOT pre-registered.** The table committed at 1f6b2ae registered BOTH w4gen orderings
+(2522 / 2518) and nothing about D159, which did not exist to me then. Describing 2529 as "the row
+your table pre-registered" would be retroactive fitting — precisely what pre-registration exists to
+prevent, and this row has already had one near-miss of that exact shape (outcome A in
+d141-basecheck would have HIT on a mechanism that was false).
+⇒ What IS pre-registered and untouched is the DELTA: **D154 = +6 per-target**. That claim has
+  survived four base changes without being re-derived once.
+⇒ 2529 is registered HERE, now, before the run and before any data: 2523 + 6.
+
+BASE, checked not taken:
+  d159: mode=per-target rc=0 passed=2523 failed=0 build_errors=0 head=da8e37e   (banked SUMMARY)
+  `git diff --stat da8e37e main -- src tests examples Cargo.toml` -> EMPTY, only bench/ differs.
+  ⇒ 2523 transfers to main 29801f0. Merged at 27d6262.
+  staleness RUN, not predicted: "0 behind, 14 ahead / COVERED".
+
+THE OVERLAP GUARD, RUN RATHER THAN EYEBALLED — and this is the check the landing queue asked for
+after D159's own merge found w4gen's fix had landed INSIDE its function on a shared file:
+    git log --oneline 5b814b8..main -- src/tel/log.rs src/wal/log.rs \
+        src/provenance/durable.rs src/consensus/     ->  EMPTY
+  ⇒ D159 landed no commit touching any file this row edits. That is a stronger statement than
+    "the file lists do not intersect", because it asks the history rather than comparing two
+    name sets.
+  Semantic re-check after the merge: the only two `write_str` calls not ending in `?;` are the two
+  adapters that map the error. Compiles clean under CI RUSTFLAGS, no unused-Result warnings.
+
+EXPECTATION FOR RUN 5
+---------------------
+    2523 + 6 = 2529 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+    DURABLE FORM: D154 = +6 @ base 29801f0 (LOCAL main; origin/main is 4685d80 and RED).
+
+2523 would mean my target was never swept. 2528 would mean one of the six did not collect. The six
+by name, the rewritten transport test by name, and tests/d151_… by name all still apply.
