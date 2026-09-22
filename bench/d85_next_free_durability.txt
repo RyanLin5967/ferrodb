@@ -1,0 +1,239 @@
+D85 -- `next_free` is not durable per page, and `extent_is_empty` trusts it
+===========================================================================
+
+VERDICT: **REAL.** Silent data loss, reproduced on both catalogs including the shipping
+`TableBranchCatalog`.
+
+It was already PROVEN and FIXED in this tree on 2026-09-20, before this pass was dispatched
+(76f7ace REPRODUCED -> 810d232 PROVEN -> d2c09ed FIX -> 8901dea merge, all ancestors of main
+at 2bc80fd). This pass re-derived it in a fresh context that never saw that work, and forced
+the reproduction to fail on purpose, because a repro that passes against both the hazard and
+its absence proves nothing.
+
+worktree /Users/idide/wt/ferrodb-d85-rederive   branch d85-rederive   base 2bc80fd
+Every run below held the machine-wide suite lock /tmp/ferrodb-suite.lock, acquired (mkdir,
+live holder pid) rather than polled-then-acted.
+
+
+1. WHY THE ROW READ "OPEN" WHEN IT WAS CLOSED
+----------------------------------------------
+The D85 row contradicted itself. Description cell opened "**UNPROVEN HAZARD, precisely
+located**" and later "why it is filed UNPROVEN"; the status cell opened "**OPEN, UNPROVEN --
+reproduction recipe, ahead of any fix**" and only in its last third said "PROVEN, THEN FIXED,
+2026-09-20". The resolution was appended without retiring either header, so anything reading
+the first bold phrase of either cell read OPEN.
+
+Corrected by the team lead at bc5a9d0, along with the two deeper causes the row alone would
+not have fixed: the session digest truncated the status cell at 600 chars with no marker (the
+resolution sits past the cut), and the digest's closed-row suppression read cells[2], which is
+STATUS for S-rows but IMPACT for every D-row -- so no D-row could ever be suppressed whatever
+its status said.
+
+
+2. THE ROW'S SOURCE CLAIMS, RE-CHECKED AT 2bc80fd
+--------------------------------------------------
+All hold. The row's LINE NUMBERS are stale; the substance is not.
+
+  claim                                      row      at 2bc80fd                     verdict
+  ----------------------------------------   ------   ----------------------------   -------
+  next_free advanced on the page path,       :1084    :1410, in `alloc_in_arena`      HOLDS
+  with no persist
+  persist sites, none on the page path       :581     :812  put_pending               HOLDS
+                                             :647     :956  retire_arenas_by_rule
+                                             :1265    :1665 alloc_arena
+                                             :1347    :1793 free_arena
+  extent_is_empty is recycled >= next_free   :589     :826-827                        HOLDS
+  load_state gives up the tail, alloc side   :866     :1174-1184                      HOLDS
+
+The precondition is structural: an extent is persisted when it is CREATED (`alloc_arena`),
+then its pages are handed out in memory only. A crash restores `next_free` as of extent
+creation -- zero -- while the extent holds written pages.
+
+
+3. MUTATION CAMPAIGN 1 -- filtered, `cargo test --lib -- d8 --test-threads=1`
+------------------------------------------------------------------------------
+6 tests. Each arm mutates one guard site, restores from memory (not `git checkout --`, which
+restores the INDEX and has eaten work in this project), and the tree is verified clean after.
+
+  arm                        disables                              rc     result
+  ------------------------   -----------------------------------   ----   -------------------
+  M0 baseline                nothing                               0      6 passed
+  M1 no-seed                 load_state marking restored extents   101    2 passed, 4 FAILED
+                             suspect -- the WHOLE fix
+  M2 probe-recovers-nothing  resolve_fill clears suspicion but     101    2 passed, 4 FAILED
+                             recovers no pages
+  M3 no-refusal              extent_is_empty's refusal             101    4 passed, 2 FAILED
+  M4 no-retire-probe         retire_arenas_by_rule's probe         0      6 passed  (survived)
+  M5 no-collectable-probe    extent_is_collectable's probe         0      6 passed  (survived)
+
+M1 IS THE ONE THAT DECIDES IT. With the fix disabled, both catalogs fail with the real thing:
+
+  branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_...   FAILED
+  branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_... FAILED
+    "D85 IS DATA LOSS: the extent holding 3 page(s) a LIVE CHILD can read was freed after a
+     crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked nothing
+     and `extent_is_empty` then reported it collectable"
+
+  branch::arena::tests::d85_next_free_after_a_crash_...                            FAILED
+    "REGRESSION: an extent holding 3 written page(s) reports extent_is_empty()=true after a
+     crash."
+
+The fixture did not pass vacuously -- its own printed line shows the crash shape was built:
+  "D85: arena ArenaId(4)  pages before checkpoint=0  after more writes=3  after restore=0
+   extent_is_empty=true"
+
+M3 reproduces the row's own masking note live: with the refusal removed the END-TO-END test
+stays GREEN, and only the direct guard test plus the arena test catch it. The refusal's
+dedicated test is load-bearing, and that is now measured rather than argued.
+
+
+4. MUTATION CAMPAIGN 2 -- widened, `cargo test --lib` (no filter)
+-------------------------------------------------------------------
+M4 and M5 surviving campaign 1 was a statement about a 6-of-1628 FILTER, not about the suite.
+Re-run with no filter, plus W6 (both probe sites removed at once) to separate mutual masking
+from dead code, and a baseline arm so a pre-existing failure cannot be misread as a kill.
+
+  arm                        rc     result
+  ------------------------   ----   ------------------------------------------------------
+  W0 baseline                0      1626 passed, 0 failed, 2 ignored   (52.40s)
+  W4 no-retire-probe         0      1626 passed, 0 failed              SURVIVES
+  W5 no-collectable-probe    101    1624 passed, 2 FAILED              KILLED
+  W6 neither probe           101    1624 passed, 2 FAILED              same 2 as W5
+
+W5/W6 both fail exactly:
+  branch::reaper::tests::{log_catalog,table_catalog}::
+    a_crash_orphaned_extent_is_collected_when_the_store_is_reopened
+
+=> M5's survival in campaign 1 WAS a filter artifact. Widening killed it. Only M4 survived.
+
+W6 IS NON-DISCRIMINATING, and does not show the retire-side probe is dead code. If it were
+merely masked by the collectable-side probe, removing the masker should expose it and W6 should
+fail MORE than W5. It does not -- because `reap` (reaper.rs:546) is
+
+    if !has_live_children { for arena { free_arena(arena) } } else { retire_arenas_by_rule(..) }
+
+and the `else` arm is the ONLY caller of the retire-side probe. Both failing tests reach the
+extent through the no-live-children branch, so they structurally cannot see that probe in
+either direction.
+
+
+5. CAMPAIGN 3 -- the integration targets, and a baseline arm that earned its keep
+----------------------------------------------------------------------------------
+"Survives the lib target" is still not "untested": 16 integration targets reference the reaper.
+Exactly two of them ever restore state (`integration_cluster_grants`, `integration_server_reaps`
+-- grep for reopen_from_checkpoint/load_state/restore/checkpoint), and only a restoring target
+can reach a restored extent.
+
+FIRST ATTEMPT WAS INVALID, AND THE BASELINE ARM IS WHAT CAUGHT IT. ARM A (baseline, unmutated)
+failed 5 of 8 in integration_server_reaps at tests/integration_server_reaps.rs:109 --
+
+    "<bin> is older than src/ or examples/ -- cargo test does not rebuild examples, so this
+     would test a stale binary. Run: cargo build --examples"
+
+`wt new` cp-farms target/ with mtimes predating the tree they land in, so the staleness guard
+correctly refuses. Those 5 tests NEVER RAN THEIR BODIES -- including
+`the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything`, the crash-plus-reap
+shape most likely to kill W4. Reporting that run as "W4 survived two integration targets" would
+have been reporting 5 unexecuted tests as evidence of survival.
+
+Re-run with `cargo build --examples` before the baseline AND AGAIN AFTER THE MUTATION -- because
+mutating src/ makes it newer than the example binary and re-fires the same guard, which would
+have made the mutant arm fail for the wrong reason:
+
+  arm                                          rc    integration_cluster_grants   integration_server_reaps
+  ------------------------------------------   ---   --------------------------   ------------------------
+  ARM A2 baseline                              0     35 passed, 0 failed          8 passed, 0 failed
+  ARM B2 W4 (retire-side probe removed)        0     35 passed, 0 failed          8 passed, 0 failed
+
+Identical. With every test actually executing, W4 still changes nothing.
+
+=> W4 SURVIVES 1626/1626 lib + 35/35 cluster_grants + 8/8 server_reaps.
+
+
+6. FINDING: THE RETIRE-SIDE PROBE IS AN UNTESTED GUARD (not dead code)
+------------------------------------------------------------------------
+`retire_arenas_by_rule`'s `self.resolve_fill(arena)` (arena.rs, D85 comment above it) can be
+deleted with no test anywhere failing.
+
+MECHANISM -- REASONED FROM SOURCE, NOT MEASURED. Without the probe, a restored extent's
+`allocated_pages` is `(0..understated next_free)` minus `recycled`, so the loop parks nothing
+and releases nothing. SAFETY STILL HOLDS: the `extent_is_empty` refusal plus the
+collectable-side probe keep the extent from being freed. What is lost is RECLAMATION --
+`recycled` never grows, the collectable-side probe later raises `next_free` to the truth, so
+`recycled >= next_free` stays false and the extent is never collected. That is a SPACE LEAK on
+the crash-plus-live-children path, not data loss, which is exactly why every safety-direction
+test passes and nothing fails.
+
+The missing test is the RECLAMATION direction on that path: crash-restore, reap a parent that
+HAS a live child, retire the child, then assert the extent is eventually collected. The
+existing D85 end-to-end test constructs that shape but asserts only the safety direction
+(`arena_owner(arena).is_some()`).
+
+⚠ This row already hit `two guards is one you cannot test` once and closed it for
+`extent_is_empty`'s refusal by giving that guard its own test rather than deleting it. Same
+remedy applies here. NOT FIXED IN THIS PASS -- the brief was prove-or-disprove.
+
+
+7. CORRECTION TO THE ROW'S STATED LIMIT: the "2 of 3" is misattributed
+------------------------------------------------------------------------
+The row says: "the probe recovers only pages that REACHED DISK (2 of 3 in the test); a page
+still in the buffer pool at crash time was never durable, so nothing is lost by missing it."
+
+The 2-of-3 is REAL (`D85 probe: recovered 2 page(s) (wanted 3)`, measured with --nocapture,
+since cargo swallows stdout for PASSING tests -- which is why this number was not visible in
+the earlier arms). BUT ITS STATED CAUSE IS WRONG. Arm 7, a diagnostic that prints `next_free`
+and `recycled` separately:
+
+  D85 arm7: image next_free=1 recycled=[8]
+  D85 arm7: wrote after the image [8, 9, 10] (of which REUSED a recycled id: [8])
+  D85 arm7: restored next_free=1 -> after probe 3
+  D85 arm7: recycled after restore=[8]  allocated_pages=[9, 10]
+
+The probe recovered the FULL truth: next_free 1 -> 3, all three pages. Nothing failed to reach
+disk. The page that "went missing" is page 8, hidden because `allocated_pages` SUBTRACTS the
+restored `recycled` list, and page 8 was recycled before the image and REUSED after it
+(`alloc_in_arena` pops `recycled` before bumping, arena.rs:1395).
+
+The row's general statement about the probe's disk limit remains true as a property of
+`resolve_fill` -- it stops at the first unreadable page. It is simply not what this measurement
+shows, and the "2 of 3" should not be cited as its evidence.
+
+IS THE STALE `recycled` ENTRY A SECOND HAZARD? NO -- checked and killed. Page 8 is listed free
+while holding live post-image data, but it is never handed out: the only consumer of
+`has_recycled` is `arena_for`'s fast path (arena.rs:1680), gated on `st.current.get(&branch)`,
+and `load_state` CLEARS `current` (:1184). A restored extent is never re-entered for
+allocation. Worth recording because load_state's own comment justifies keeping `recycled` as
+"those pages were durably recorded as free *before* the checkpoint, so handing them out again
+is correct" -- which is weaker than the guarantee the code actually rests on. It rests on
+`current.clear()`.
+
+
+8. THE FIX DID NOT TAKE THE ROUTE THE ROW FORBADE
+---------------------------------------------------
+The row: do not fix by persisting on every page allocation -- one `replace_atomically` (two
+fsyncs) per PAGE where D81 measured one per BRANCH as already dominant. Measured:
+
+  git show d2c09ed -- src/branch/{arena,reaper}.rs | grep '^+' | grep -E \
+    'persist_if_configured|fsync|replace_atomically|sync_all|flush\(\)'
+  -> one DOC-COMMENT line, no code
+  persist_if_configured() call sites: 4 at d2c09ed^, 4 at HEAD -- unchanged
+
+The fix is in-memory suspicion plus a lazy probe, bounded by ARENA_EXTENT_PAGES = 256 reads,
+once per extent per restore, asked only for DEAD owners (`extent_is_collectable` probes after
+`owner_gone`). Never paid at open; never paid by a database that did not crash.
+
+COVERAGE OF THE SEEDING: `StoreState` is constructed in exactly two places -- arena.rs:445
+(fresh store, empty set) and :1209 (`load_state`, seeds every restored extent). All three
+production restore paths funnel through `load_state`: arena.rs:1285 `restore`, arena.rs:1336
+`reopen_from_checkpoint`, consensus/snapshot.rs:1541 `install`. No gap.
+
+
+9. SCOPE -- what this pass did NOT run
+----------------------------------------
+- The other 14 reaper-referencing integration targets. Excluded by a source property, not by
+  convenience: none of them restore state, so none can reach a restored extent.
+- The remaining ~115 integration targets and the doctests. Not run; a full `cargo test` was
+  out of scope by brief and by lock contention.
+- The arm 7 diagnostic needed two test-only accessors (`debug_next_free`, `debug_recycled`)
+  that are NOT committed -- the brief was prove-or-disprove, so no test or accessor was landed.
+  Reproducing section 7 requires re-adding them.

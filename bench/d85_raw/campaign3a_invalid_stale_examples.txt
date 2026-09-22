@@ -1,0 +1,278 @@
+D85 final pass
+worktree: /Users/idide/wt/ferrodb-d85-rederive
+HEAD: 2bc80fda496333cb126fa8870f05678b879b90f1
+acquired the suite lock after 46s at 2026-09-22T10:26:45Z
+
+=== ARM A: baseline, the two restoring integration targets ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.88s
+     Running tests/integration_cluster_grants.rs (target/debug/deps/integration_cluster_grants-67065c5a27dc5eca)
+
+running 35 tests
+test a_lease_tick_never_moves_the_clusters_clock_backwards ... ok
+test a_member_with_no_lease_tick_refuses_to_answer_what_time_it_is ... ok
+test a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases ... ok
+test a_node_with_no_cluster_configured_grants_itself_everything ... ok
+test a_node_with_no_cluster_configured_still_begins_transactions ... ok
+test a_standalone_node_reaps_on_its_own_clock_exactly_as_before ... ok
+test a_standalone_node_refuses_a_lease_tick ... ok
+test a_redelivered_grant_does_not_hand_out_the_same_extent_twice ... ok
+test a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join ... ok
+test a_member_with_no_extent_grant_refuses_to_allocate_an_arena ... ok
+test a_replicated_tick_and_not_the_wall_clock_decides_a_reap ... ok
+test a_standalone_node_refuses_a_grant_it_was_never_supposed_to_get ... ok
+test a_granted_extent_is_filled_without_any_further_consensus ... ok
+test a_recycled_extent_start_from_a_previous_authority_is_not_handed_out_again ... ok
+test a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued ... ok
+test a_member_with_no_txn_grant_refuses_to_begin_a_transaction ... ok
+test a_replicated_checkpoint_command_is_what_truncates_on_a_member ... ok
+test a_member_begins_transactions_from_its_granted_range_and_no_further ... ok
+test a_grant_addressed_to_another_node_is_refused_by_this_one ... ok
+test a_standalone_node_still_checkpoints_on_its_own_commit_counter ... ok
+test is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick ... ok
+test an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name ... ok
+test a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out ... ok
+test an_authority_change_is_noticed_by_the_counters_and_not_merely_survived ... ok
+test the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote ... ok
+test the_reaper_trait_is_the_path_under_test ... ok
+test space_a_node_self_granted_while_standalone_is_revoked_when_it_joins ... ok
+test two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live ... ok
+test the_infallible_lease_clock_aborts_rather_than_inventing_a_time - should panic ... ok
+test a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter ... ok
+test recovery_raises_the_transaction_watermark_without_inventing_a_grant ... ok
+test an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards ... ok
+test the_three_appliers_take_exactly_the_frozen_commands_shape ... ok
+test two_nodes_with_disjoint_grants_never_hand_out_the_same_physical_page ... ok
+test two_nodes_with_disjoint_grants_never_issue_the_same_transaction_id ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.18s
+
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-2fe130781ef8f38a)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... FAILED
+test a_live_lease_survives_a_server_that_scans_continuously ... FAILED
+test a_healthy_database_resumes_nothing_on_startup ... FAILED
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... FAILED
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... FAILED
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+
+failures:
+
+---- both_binaries_refuse_to_start_on_an_unusable_scan_interval stdout ----
+
+thread 'both_binaries_refuse_to_start_on_an_unusable_scan_interval' (259058520) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_live_lease_survives_a_server_that_scans_continuously stdout ----
+
+thread 'a_live_lease_survives_a_server_that_scans_continuously' (259058517) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- a_healthy_database_resumes_nothing_on_startup stdout ----
+
+thread 'a_healthy_database_resumes_nothing_on_startup' (259058516) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- the_server_reaps_an_abandoned_branch_without_one_socket_being_opened stdout ----
+
+thread 'the_server_reaps_an_abandoned_branch_without_one_socket_being_opened' (259058523) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything stdout ----
+
+thread 'the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything' (259058522) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+
+failures:
+    a_healthy_database_resumes_nothing_on_startup
+    a_live_lease_survives_a_server_that_scans_continuously
+    both_binaries_refuse_to_start_on_an_unusable_scan_interval
+    the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything
+    the_server_reaps_an_abandoned_branch_without_one_socket_being_opened
+
+test result: FAILED. 3 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+error: test failed, to rerun pass `--test integration_server_reaps`
+--- rc=101 after 10s ---
+
+(W4 applied: retire-side probe removed)
+
+=== ARM B: W4, the two restoring integration targets ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.34s
+     Running tests/integration_cluster_grants.rs (target/debug/deps/integration_cluster_grants-67065c5a27dc5eca)
+
+running 35 tests
+test a_member_with_no_lease_tick_refuses_to_answer_what_time_it_is ... ok
+test a_node_with_no_cluster_configured_grants_itself_everything ... ok
+test a_node_with_no_cluster_configured_still_begins_transactions ... ok
+test a_lease_tick_never_moves_the_clusters_clock_backwards ... ok
+test a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases ... ok
+test a_standalone_node_reaps_on_its_own_clock_exactly_as_before ... ok
+test a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out ... ok
+test a_granted_extent_is_filled_without_any_further_consensus ... ok
+test a_member_with_no_extent_grant_refuses_to_allocate_an_arena ... ok
+test a_replicated_tick_and_not_the_wall_clock_decides_a_reap ... ok
+test a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued ... ok
+test a_recycled_extent_start_from_a_previous_authority_is_not_handed_out_again ... ok
+test a_member_with_no_txn_grant_refuses_to_begin_a_transaction ... ok
+test a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join ... ok
+test a_standalone_node_refuses_a_lease_tick ... ok
+test a_member_begins_transactions_from_its_granted_range_and_no_further ... ok
+test a_standalone_node_refuses_a_grant_it_was_never_supposed_to_get ... ok
+test a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter ... ok
+test a_grant_addressed_to_another_node_is_refused_by_this_one ... ok
+test a_standalone_node_still_checkpoints_on_its_own_commit_counter ... ok
+test an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name ... ok
+test an_authority_change_is_noticed_by_the_counters_and_not_merely_survived ... ok
+test an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards ... ok
+test a_replicated_checkpoint_command_is_what_truncates_on_a_member ... ok
+test the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote ... ok
+test the_infallible_lease_clock_aborts_rather_than_inventing_a_time - should panic ... ok
+test the_reaper_trait_is_the_path_under_test ... ok
+test two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live ... ok
+test is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick ... ok
+test space_a_node_self_granted_while_standalone_is_revoked_when_it_joins ... ok
+test a_redelivered_grant_does_not_hand_out_the_same_extent_twice ... ok
+test the_three_appliers_take_exactly_the_frozen_commands_shape ... ok
+test recovery_raises_the_transaction_watermark_without_inventing_a_grant ... ok
+test two_nodes_with_disjoint_grants_never_hand_out_the_same_physical_page ... ok
+test two_nodes_with_disjoint_grants_never_issue_the_same_transaction_id ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.33s
+
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-2fe130781ef8f38a)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... FAILED
+test a_live_lease_survives_a_server_that_scans_continuously ... FAILED
+test a_healthy_database_resumes_nothing_on_startup ... FAILED
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... FAILED
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... FAILED
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+
+failures:
+
+---- both_binaries_refuse_to_start_on_an_unusable_scan_interval stdout ----
+
+thread 'both_binaries_refuse_to_start_on_an_unusable_scan_interval' (259060477) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_live_lease_survives_a_server_that_scans_continuously stdout ----
+
+thread 'a_live_lease_survives_a_server_that_scans_continuously' (259060474) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- a_healthy_database_resumes_nothing_on_startup stdout ----
+
+thread 'a_healthy_database_resumes_nothing_on_startup' (259060473) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- the_server_reaps_an_abandoned_branch_without_one_socket_being_opened stdout ----
+
+thread 'the_server_reaps_an_abandoned_branch_without_one_socket_being_opened' (259060480) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+---- the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything stdout ----
+
+thread 'the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything' (259060479) panicked at tests/integration_server_reaps.rs:109:9:
+/Users/idide/wt/ferrodb-d85-rederive/target/debug/examples/pgserver is older than src/ or examples/ — cargo test does not rebuild examples, so this would test a stale binary. Run: cargo build --examples
+
+
+failures:
+    a_healthy_database_resumes_nothing_on_startup
+    a_live_lease_survives_a_server_that_scans_continuously
+    both_binaries_refuse_to_start_on_an_unusable_scan_interval
+    the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything
+    the_server_reaps_an_abandoned_branch_without_one_socket_being_opened
+
+test result: FAILED. 3 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+error: test failed, to rerun pass `--test integration_server_reaps`
+--- rc=101 after 7s ---
+
+=== ARM C: baseline lib d85 with --nocapture ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2177 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2177 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2178 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2178 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.37s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 4 tests
+test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... D85: arena ArenaId(4)  pages before checkpoint=0  after more writes=3  after restore=0  extent_is_empty=false
+D85 probe: recovered 2 page(s) (wanted 3); arena_owner=Some(BranchId { id: 1, generation: 0 })
+ok
+test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1624 filtered out; finished in 0.08s
+
+--- rc=0 after 4s ---
+
+tree clean at end: YES
+FINAL_COMPLETE
