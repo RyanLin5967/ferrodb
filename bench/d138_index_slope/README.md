@@ -358,3 +358,29 @@ N of N frames — verified, not assumed`.
 ⇒ **Both numbers, or neither:** 0.089% at 2000 frames and ~31% at 10⁶ are the same line of code at
 two log lengths. That is what it means for a percentage to be unable to price a complexity-class
 change.
+
+### AMENDMENT 5 — re-derived against `origin/main` `2655e3b` (D81 landed); supersedes 4, 2, 1
+
+Written before this run. **D81 landed while this row was being measured** — `origin/main`
+`b2991c6 → 2655e3b`, 38 commits, including an append-only arena (`src/branch/arena.rs` +1249,
+`src/storage/atomic_file.rs` +158). The greens at `e98c5d2` and `4c9944c` (both `2485/0`, go
+`97/0`, both exactly as pre-registered) therefore certify a tree **without D81**, which is not the
+tree that ships. Merged cleanly at `5dfaede`.
+
+| | `#[test]` lines in `src` + `tests` | certified suite |
+|---|---|---|
+| `origin/main` `2655e3b` | 2483 | **2508** |
+| this branch, merged (`5dfaede`) | 2486 | expected **2511** |
+
+Per-file delta is mine alone: `src/tel/log.rs` 5 → 7, `src/tel/tests_durable_log.rs` 24 → 25.
+`git grep 'macro_rules!'` over both returns nothing, so D139's once-per-instantiation rule leaves
+the delta at +3. (Main's +25 line-to-runtime gap is `reaper_suite` and friends; it cancels.)
+
+⇒ **Expected: per-target 2511 passed, 0 failed. Go 97 passed, 0 failed.**
+
+⚠ **A suite verdict is not a landing gate**, and the two earlier greens are kept here only as
+superseded evidence. `tools/land-gate.sh` runs `certify-head` (verdict names the landing commit),
+then `prepush` (the CI-parity checks a suite cannot see), and asks `staleness` **LAST** — after the
+suite, so it can see a base that moved *during* the run. Main moved by 38 commits of real code
+here, so `COVERED-NO-CODE` is not expected; if staleness returns `STALE-GREEN`, the answer is to
+merge and re-run, not to reason about whether arena changes reach `src/tel/`.
