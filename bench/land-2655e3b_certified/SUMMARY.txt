@@ -1,0 +1,73 @@
+CERTIFICATION — main b2991c6..2655e3b (35 commits), PUSHED 2026-09-22
+
+certified commit=   b17ec58   (the tree the suite and CI both named)
+pushed origin/main= 2655e3b9311e6f2855d9b8c743ca827d3251be6f
+git diff b17ec58 2655e3b9311e6f2855d9b8c743ca827d3251be6f -- src tests examples Cargo.toml = 0 lines
+CODE IDENTITY: VERIFIED EQUAL by git diff, not asserted.
+  The merge adds bench/ text only; the certified CODE is the code that shipped.
+
+SUITE (verbatim), pre-registered 2508 and HIT EXACTLY:
+  d81final: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d81final/suite-d81final.go.log
+  d81final: mode=per-target rc=0 passed=2508 failed=0 build_errors=0 head=b17ec58 log=/Users/idide/wt/artie-research/verify-out/d81final/suite-d81final.log
+
+LAND-GATE, all three, staleness asked LAST:
+  certify-head: OK — suite head=b17ec58 == landing b17ec58
+        COVERED-NO-CODE: the base moved 4 commit(s), none touching code.
+  PREPUSH: OK — the checks CI runs that the suite does not.
+  land-gate: OK — the evidence in /Users/idide/wt/artie-research/verify-out/d81final is about the tree that will ship.
+
+CI — PR #44, run 35737124919, headSha b17ec58 (SHA-MATCHED, not branch-matched):
+  macos-latest pass - ubuntu-latest pass - windows-latest pass - 0 pending
+  ⭐ This was a REAL gate, not a formality: a push to a feature branch runs NO CI
+     on this repo, and prepush's Windows step is a cargo check that does not link
+     and runs zero tests. The local green was macOS-only while D81 adds 158 lines
+     to src/storage/atomic_file.rs, the file carrying the cfg(windows) arms.
+
+WHAT THIS GREEN DOES NOT LICENSE:
+  * D81's TIME-axis exit criterion was NOT re-run, deliberately (SCALE-DESIGN D147):
+    it named the wrong axis. This box is fsync-bound -- a reap costs 16-38 ms in every
+    shape -- so a bytes win cannot appear in wall-clock, and D81's own OFF controls
+    disagreed. The BYTES axis is load-immune and reproduces: 446x, fsyncs halved,
+    'counters identical across rounds: True'.
+  * The free record has UNIT-TEST COVERAGE ONLY; every D81 arm is single-node; and L
+    is confounded with position-within-arm (round 2 reverses arm order, not the L loop).
+  * D139's reaper fixture fix is in this range and its own FIRE-CHECK DID NOT FIRE.
+    The collision it removes is real and removed by construction; the causal link to
+    'fixture: nothing was ever checkpointed' remains UNPROVEN.
+
+commits landed:
+  2655e3b Merge D81: <db>.arena is append-only in place -- the O(N^2) BYTES are gone
+  15ab12e Merge d141-cert-correction: retract the "one doctest" claim from D141's bank
+  1c904a8 D141 bank: retract my 'one doctest' correction -- there are TWO, and the total closes
+  7ec17e3 REVERT: d127's "+2 doctests" was RIGHT and my correction was wrong
+  7e4e072 d127's bank: correct a FALSE doctest constant contradicted by its own log
+  b17ec58 bench(D81): amendment 4 — pre-register the D141-merged tree at 2508
+  a3d8e55 Merge branch 'main' into d81-land
+  42b2ad5 D81 follow-up: band d90's arena section at the file head and at the check
+  c159987 bench(D81): amendment 3 — pre-register the stale-claims follow-up at 2500 + 0
+  3a8aa33 D81 follow-up: retract three claims that D81 makes false
+  1e56fa5 bank D141's certification, with the one number that does NOT reconcile banded at the head
+  6084883 Merge D141: refuse a catalog name its length prefix cannot express
+  d3be454 bench(D81): amendment 2 — main moved (bench-only); stopped the queued run, re-merged
+  c4769ff Merge branch 'main' into d81-land
+  6167bfd bank the certification for 98a44ef..b2991c6 (35 commits), tree identity CHECKED
+  6e61106 bench(D81): amendment 1 — the base is now MEASURED at 2482, not predicted
+  1c8e71f bench(D81): pre-register the merged tree's suite count at 2500, before any run
+  2cb227f Merge main into D81-fsm-append: keep ONE reaper fixture discriminator
+  28783ab D141: amend the pre-registration for the merged tree, and record run 1's refusal
+  dcac878 Merge branch 'main' into d141-catalog-narrowing
+  d7284b1 D141: pre-register the expected suite count before running it
+  2f06f96 D141: a refused catalog write must undo itself, not wedge the next one
+  59bbc8b D141: refuse a catalog name its length prefix cannot express
+  a2ed26b bench(D81): bank the c2e4688 certification, which lived only in a volatile VERIFY_OUT dir
+  f70d7c1 Merge branch 'main' into D81-fsm-append
+  c2e4688 bench(D81): the report, and the script that recomputes every number in it
+  754a813 bench(D81): raw eight-arm curve (two rounds, second reversed), before=a7b8c50 after=0f596da
+  b9b35d8 bench(D81): eight arms, each cell twice, second round reversed
+  0f596da bench(D81): time the PARK phase, because the cycle median cannot see this change
+  485e9b8 bench(D81): raw four-arm curve, one lock hold, before=0111764 after=e244b59
+  e244b59 chore(D81): make the curve runner executable
+  55d6560 D81: a map loaded from outside invalidates the tail accounting
+  be761ed test(D81): two generated reap tests shared one checkpoint path
+  53a6b66 D81: <db>.arena becomes append-only in place; a claim costs one record, not the map
+  0111764 D81: a durable APPEND primitive, and the per-phase fsync column that will judge it

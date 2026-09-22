@@ -1,0 +1,39 @@
+land-gate: landing   b17ec58 (b17ec58)
+land-gate: onto base main (15ab12e)
+land-gate: evidence  /Users/idide/wt/artie-research/verify-out/d81final
+
+land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+certify-head: OK — suite head=b17ec58 == landing b17ec58
+  d81final: mode=per-target rc=0 passed=2508 failed=0 build_errors=0 head=b17ec58 log=/Users/idide/wt/artie-research/verify-out/d81final/suite-d81final.log
+
+land-gate: [2/3] staleness.sh — has the base moved under this branch's files SINCE the suite ran?
+      branch b17ec58 vs 15ab12e779913bd8ee37726d12c3b58e5e3915a0: 4 behind, 22 ahead
+      COVERED-NO-CODE: the base moved 4 commit(s), none touching code.
+          bench/d127_certified/SUMMARY_d127invert.txt
+          bench/d141_certified/CERTIFICATION.txt
+
+land-gate: [3/3] prepush.sh — the CI-parity checks a green suite structurally cannot see.
+CI RUSTFLAGS (read from .github/workflows/tests.yml): -D duplicate_macro_attributes -D dead_code
+
+== FFI gate sweep (examples/ and src/) ==
+ok: no ungated extern "C"
+
+== RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo build --examples ==
+
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 1 warning (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.82s
+
+== RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo check --all-targets ==
+
+warning: `ferrodb` (test "integration_branch_attestation") generated 1 warning (run `cargo fix --test "integration_branch_attestation" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.41s
+
+== cargo check --target x86_64-pc-windows-msvc (compiles the cfg(not(unix)) arms) ==
+ok (note: this does NOT link, so it cannot see a missing POSIX symbol — check 1 is what covers that)
+
+PREPUSH: OK — the checks CI runs that the suite does not.
+  This is NOT a substitute for tools/verify-suite.sh, and it says nothing about head=.
+  Run all three: verify-suite.sh, certify-head.sh, and this.
+
+land-gate: OK — the evidence in /Users/idide/wt/artie-research/verify-out/d81final is about the tree that will ship.
+land-gate:   suite names the commit · base is covered · CI-parity passes · tree unmoved throughout.
