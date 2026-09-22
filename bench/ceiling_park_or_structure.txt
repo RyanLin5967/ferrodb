@@ -1,3 +1,49 @@
+⛔⛔⛔ CORRECTION PREPENDED 2026-09-22 BY THE DISPATCHING SESSION — READ THIS BEFORE THE REPORT.
+================================================================================================
+This report's headline verdict, "⭐ OUTCOME 2" (line ~34 below), IS WRONG, and I banked it into
+`frontier/INVENTION-TRIGGER.md` before checking it. A fresh-context auditor caught it; I then
+confirmed every point against `bench/ceiling_raw/` myself. Three findings:
+
+1. ⛔ OUTCOME 2 DID NOT FIRE — ARM B WAS NEVER BUILT. The pre-registration defines outcome 2 as
+   "Gap unchanged **under B**", where "Arm B = the same ladder with the acquire path spinning
+   before it parks. Nothing else may differ." All 1,525 lines of
+   `examples/ceiling_lock_contention.rs` and every file in `ceiling_raw/` use `std::sync::Mutex`
+   UNCHANGED. The only `spin_loop()` is the calibrated OUTSIDE-the-section work and the barrier
+   queue gauge — never an acquire path. `21_pgwire_L0_layerB.txt` is LAYER B (pgwire vs direct,
+   Amendment 1), not ARM B. The report reaches its headline by quoting outcome 2 with the words
+   "under B" DELETED.
+
+2. ⛔ AND THE LABEL IS INVERTED, not just unearned. Outcome 2's second sentence grants the
+   OPPOSITE licence to the one taken here: "The floor survives its first real attack and may then
+   be cited as a floor, which today it may not." This report WITHDRAWS the handoff floor. A fired
+   outcome 2 would have RE-INSTATED it.
+
+3. ⛔ OUTCOME 3 IS NEVER MENTIONED, though the pre-registration flags it "the one to watch for,
+   because it is the one that invalidates the instrument rather than the hypothesis" and requires
+   "the CONTROL's slope reported". `grep -nE 'OUTCOME 3|control.*slope'` over this file returns
+   NOTHING. "The harness is the wall" is therefore NOT excluded.
+
+✅ WHAT THIS REPORT DOES LICENSE, and it is real and worth having:
+   PRE-REGISTERED OUTCOME 1 IS DEAD. contended/op FELL 0.98613 -> 0.90812 (0.92x), T=64, L0->L3,
+   median of 5 reps, `12_paired_T64_N8000_warm0_reps5_WAITDUR.txt` config A. Amendment 2
+   pre-registered exactly that discriminator and exactly that licence. Section 5's line 33 below
+   ("Pre-registered OUTCOME 1 IS DEAD") is supported. Line 24's "⭐ OUTCOME 2" is not.
+
+⇒ SECTION 5's PHASE DECOMPOSITION (WAIT 46x DOWN, DURABLE FLAT, 97.8% of the cycle at L3) IS A
+   SEPARATE, UN-PRE-REGISTERED MEASUREMENT, not a fired outcome. It is supported by the
+   WAIT/DURABLE ratio taken inside one instrument at one moment plus the 98-99% closure identity,
+   and it is NOT supported by a quiet box or a control slope. Quote it with that caveat in the
+   same sentence, every time.
+
+⇒ ⛔⛔ `bench/ceiling_INVENTIONS_patch.md` MUST NOT BE APPLIED. Four wrong numbers; see the
+   DO-NOT-APPLY header now at the top of that file. It was cut BEFORE the run this report itself
+   calls THE DELIVERABLE.
+
+The full accounting, with the recomputations, is the banner at the top of
+`artie-research/frontier/INVENTION-TRIGGER.md` and Amendment 3 to its pre-registration.
+================================================================================================
+
+
 IS THE 1.9x CEILING THE STRUCTURE, OR THE MUTEX?
 ================================================================================================
 

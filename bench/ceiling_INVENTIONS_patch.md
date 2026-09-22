@@ -1,3 +1,32 @@
+# ⛔⛔⛔ DO NOT APPLY THIS PATCH. FOUR WRONG NUMBERS. Marked 2026-09-22.
+
+Verified **not** applied to `artie-research/frontier/INVENTIONS.md` (grep, rc=1) and it must stay
+that way. Every row below was checked against `bench/ceiling_raw/` by the dispatching session:
+
+| this patch says | the raw files say | where the patch's number came from |
+|---|---|---|
+| `PH_WAIT` falls **64×** | **46×** — `11.76194 → 0.25570`, printed `(0.02x)` | **nothing.** No file in `ceiling_raw/` contains `64x` or `64×`. |
+| DURABLE `21.8 → 17.1 ms` | `18.43231 → 17.58789 ms` | **nothing.** No file contains `21.8`. |
+| U(hold) `87.6% → 5.5%` (**15.9×**) | `90.7% → 3.7%` (**24.7×**) | run **10** (`10_paired_T64_N8000_warm0_reps5.txt`), superseded by run **12** |
+| `HOLD` falls **23.3×** | **41.5×** | run **10**, superseded by run **12** |
+
+Run **12** (`12_paired_T64_N8000_warm0_reps5_WAITDUR.txt`) is the one
+`ceiling_park_or_structure.txt` itself labels **THE DELIVERABLE**, and this patch was cut before
+it. That is `certification head= is a preimage` in its other direction: **an artifact written
+against an earlier run than the one the verdict rests on.**
+
+⛔ **And its headline claim — "Pre-registered outcome 2 fired" — is false.** Arm B (a spin-then-park
+acquire path) was never built; every arm is `std::sync::Mutex` unchanged. See the correction header
+at the top of `ceiling_park_or_structure.txt`.
+
+⇒ **If the `INVENTIONS.md` row is to be amended at all**, amend it from the corrected banner in
+`artie-research/frontier/INVENTION-TRIGGER.md`, not from this file. Kept only as evidence of how
+the wrong numbers got written.
+
+---
+--- ORIGINAL PATCH TEXT BELOW, UNALTERED, DO NOT APPLY ---
+---
+
 # APPEND-ONLY PATCH FOR `frontier/INVENTIONS.md`
 
 ⛔ **Not applied by me.** `frontier/INVENTIONS.md` lives in the `artie-research` repo, outside this
