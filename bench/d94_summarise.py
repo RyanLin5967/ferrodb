@@ -229,6 +229,11 @@ def main():
     w("    signal the workload can carry was planted deliberately -- k of the 8 rows per branch")
     w("    made identical across branches -- and the gain must come back as exactly k*(N-1) pages")
     w("    at N=100. Raw: bench/d94_zero_falsifier.txt")
+    for _fn, _fs in fals_stamps:
+        w(f"    falsifier built {_fs.split(chr(97)+chr(116),1)[1].strip()}")
+    if fals_stamps and stamps and {s for _, s in fals_stamps} != {s for _, s in stamps}:
+        w("    NOTE: the falsifier and the sweep were built at DIFFERENT commits; both are")
+        w("    named so the reader can check the delta rather than assume they agree.")
     w("")
     if fals_rows:
         w(f"      {chr(107):<4} {'dup_frac':>9} {'gain (pages)':>13} {'k*(N-1)':>9}  {'':<6}")
