@@ -252,6 +252,19 @@ pub mod phase {
     }
 }
 
+/// D148 — one batched lookup probe's result. `examined_per_rep` is the guard: a linear-scan
+/// control that short-circuits at position 0 measures a 1-element scan and reports it as if it
+/// were a full one, which is how a "the scan is free" conclusion gets manufactured.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeResult {
+    pub index_ns: u64,
+    pub scan_ns: u64,
+    pub frames: u64,
+    /// Mean elements the linear scan actually walked per repetition.
+    pub examined_per_rep: f64,
+    pub sink: u64,
+}
+
 /// The frames, and the position index that answers `(branch, txn_id)` without walking them.
 ///
 /// **This is D86's shape, copied rather than invented** — `State::push_applied` /
@@ -379,7 +392,12 @@ impl MemEffectLog {
     /// state, same moment, so the pair is comparable even on a loaded box. Returns
     /// `(index_ns, scan_ns, frames, checksum)`; the checksum is consumed by the caller so neither
     /// loop can be optimised away, and the caller requires the two loops to agree.
-    pub fn probe_lookup_batch(&self, branch: BranchId, txn: TxnId, reps: u64) -> (u64, u64, u64, u64) {
+    pub fn probe_lookup_batch(
+        &self,
+        branch: BranchId,
+        txn: TxnId,
+        reps: u64,
+    ) -> ProbeResult {
         let g = self.frames.lock().expect("effect log mutex poisoned");
         let mut sink = 0u64;
 
@@ -389,14 +407,28 @@ impl MemEffectLog {
         }
         let index_ns = t_idx.elapsed().as_nanos() as u64;
 
+        // ⛔ `examined` is counted, not assumed. The first cut of this probe used the key of the
+        // FIRST session, which sits at position 0, so `position()` short-circuited after ONE
+        // comparison and reported a 2000-frame scan as 1 ns. **A scan control that does not scan
+        // is the failure this counter exists to make impossible** — the caller asserts against it.
+        let mut examined = 0u64;
         let t_scan = std::time::Instant::now();
         for _ in 0..reps {
-            let hit = g.frames.iter().position(|f| f.branch == branch && f.txn_id == txn);
+            let hit = g.frames.iter().position(|f| {
+                examined += 1;
+                f.branch == branch && f.txn_id == txn
+            });
             sink = sink.wrapping_add(hit.map_or(0, |i| i as u64 + 1));
         }
         let scan_ns = t_scan.elapsed().as_nanos() as u64;
 
-        (index_ns, scan_ns, g.frames.len() as u64, sink)
+        ProbeResult {
+            index_ns,
+            scan_ns,
+            frames: g.frames.len() as u64,
+            examined_per_rep: examined as f64 / reps.max(1) as f64,
+            sink,
+        }
     }
 
     /// The frame for one transaction on one branch, if it was ever appended.
@@ -1776,7 +1808,7 @@ impl DurableEffectLog {
 
     /// The frame for one transaction on one branch, if it was ever appended.
     /// D148 — see [`MemEffectLog::probe_lookup_batch`].
-    pub fn probe_lookup_batch(&self, branch: BranchId, txn: TxnId, reps: u64) -> (u64, u64, u64, u64) {
+    pub fn probe_lookup_batch(&self, branch: BranchId, txn: TxnId, reps: u64) -> ProbeResult {
         self.mem.probe_lookup_batch(branch, txn, reps)
     }
 

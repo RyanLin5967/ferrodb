@@ -134,19 +134,36 @@ fn main() {
         let total = per(phase::TOTAL);
 
         // ⭐ THE LOOKUP, BATCHED — both shapes over the same Vec, under one lock, one moment.
-        let reps = env_usize("D148_REPS", 20_000) as u64;
-        let key_b = BranchId::new(1, 0);
-        let key_t = TxnId(1);
-        let (idx_ns, scan_ns, frames_now, sink) = log.probe_lookup_batch(key_b, key_t, reps);
-        std::hint::black_box(sink);
-        let idx_each = idx_ns as f64 / reps as f64;
-        let scan_each = scan_ns as f64 / reps as f64;
-        if idx_ns == 0 || scan_ns == 0 {
+        //
+        // ⛔ THE KEY MATTERS MORE THAN THE TIMER. `position()` scans from the FRONT and
+        // short-circuits, so probing session 0's key — which sits at position 0 — measures a
+        // ONE-element scan and reports a 2000-frame log as 1 ns. That is what the first cut of
+        // this harness did. D137 established the real access pattern: the frame for a
+        // recently-created txn sits at the BACK, so a hit costs about the whole Vec. This probes
+        // the MOST RECENT session's key, and asserts from `examined_per_rep` that the scan really
+        // walked the log rather than trusting that it did.
+        let reps = env_usize("D148_REPS", 5_000) as u64;
+        let newest = (b * block + block - 1) as u64;
+        let pr = log.probe_lookup_batch(BranchId::new(newest + 1, 0), TxnId(newest + 1), reps);
+        std::hint::black_box(pr.sink);
+        let want = pr.frames as f64 * 0.5;
+        if pr.examined_per_rep < want {
+            println!(
+                "⛔ the scan control walked {:.0} elements of {} — it short-circuited instead of \
+                 scanning. Not a result.",
+                pr.examined_per_rep, pr.frames
+            );
+            std::process::exit(1);
+        }
+        if pr.index_ns == 0 || pr.scan_ns == 0 {
             println!("⛔ a batched probe of {reps} reps measured ZERO ns. Not a result.");
             std::process::exit(1);
         }
+        let idx_each = pr.index_ns as f64 / reps as f64;
+        let scan_each = pr.scan_ns as f64 / reps as f64;
+        let frames_now = pr.frames;
         println!(
-            "    {:>8} {:>8} {} {} {} {} {} {:>8.2}%",
+            "    {:>8} {:>8} {} {} {} {} {} {:>8.3}%",
             frames_now,
             appends,
             fmt_ns(d.p[phase::ENCODE].per_call()),
@@ -154,8 +171,12 @@ fn main() {
             fmt_ns(d.p[phase::SYNC].per_call()),
             fmt_ns(Some(idx_each)),
             fmt_ns(Some(scan_each)),
-            // Two lookups per durable append: classify_append, then mem.append.
+            // Two keyed lookups per durable append: classify_append, then mem.append.
             100.0 * (2.0 * scan_each) / total.max(1e-9),
+        );
+        println!(
+            "             (scan control walked {:.0} of {} frames — verified, not assumed)",
+            pr.examined_per_rep, pr.frames
         );
         rows.push((frames_now as f64, 2.0 * scan_each, io));
         idx_rows.push((frames_now as f64, 2.0 * idx_each, total));
