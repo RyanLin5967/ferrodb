@@ -15,6 +15,16 @@ Box:              NOT quiet. The fleet measure-lock was held for the whole sessi
                   its own start and end stamp; across them the 1-minute load ranges from 7.98
                   (the very first model run, 07:05) to 48.87 (07:15), and sits at 25-38 for every
                   ladder run in sections 3-6.
+                  ⭐ WHAT ELSE THE FLEET WAS DOING, BY WALL CLOCK, because "the box was busy" is
+                  not a caveat unless it says WHEN. Three other sessions started long runs at
+                  07:33:07 (verify-suite d126), 07:33:18 (a full `cargo test`), 07:38:05
+                  (verify-suite d127) and 07:41:44 (a w4_standdown count harness).
+                  ⇒ **Every measurement the verdict rests on finished BEFORE 07:33**: the paired
+                  ladders ran 07:18:12-07:27:22, pgwire 07:30:12-07:31:27, the cross-check
+                  07:31:48-07:32:14.
+                  ⇒ The ONLY runs that overlap those suites are the operating-point reference
+                  draws in section 5b (07:38-07:41), which is consistent with the 2x calibration
+                  drift seen there and is one more reason nothing rests on them.
                   EVERY DURATION BELOW IS AN UPPER BOUND. The counts are not.
 
 ================================================================================================
