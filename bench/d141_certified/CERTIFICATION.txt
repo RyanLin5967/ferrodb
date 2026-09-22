@@ -31,50 +31,77 @@ PRE-REGISTRATION (bench/d141_prereg.txt, amended append-only before the run)
 1. rc=0, failed=0, build_errors=0 ................................... HIT
 2. Go 97 passed / 0 failed .......................................... HIT
 3. all EIGHT new tests present BY NAME, each "... ok" ............... HIT (grepped, not inferred)
-4. total == main's count + 8 ........................................ ⚠ DOES NOT CLOSE, see below
+4. total == main's count + 8 ........................................ HIT — 2482 + 8 + 2 = 2492
 
-⚠ WHAT THIS GREEN DOES NOT LICENSE
------------------------------------
-1. ⚠ THE TOTAL IS ONE TEST ADRIFT OF MAIN'S, AND I COULD NOT CLOSE IT.
-   Mine is mode=whole (2492); main's certification at b2991c6 is mode=per-target (2482).
-   The two modes are not comparable directly. Backing the difference out:
+⛔ CORRECTION, 2026-09-22, logged where the wrong claim was logged
+------------------------------------------------------------------
+THE PARAGRAPH THAT WAS HERE SAID THE TOTAL WAS "ONE TEST ADRIFT AND I COULD NOT CLOSE IT",
+AND IT ALSO "CORRECTED" THE PROJECT'S `whole = per-target + 2 doctests` RULE TO +1.
+BOTH WERE WRONG. The arithmetic closes exactly:
 
-     my whole-mode total                                        2492
-     minus my 8, counted BY NAME in the log                     2484   <- implied main whole
-     minus doctests (1: cow::diff::MemoIdentity)                2483   <- implied main per-target
-     main's certified per-target                                2482
+     main's certified per-target at b2991c6                     2482
+     plus D141's 8, counted BY NAME in the log                  + 8
+     plus doctests                                              + 2
                                                                 ----
-     UNEXPLAINED                                                   1
+     this run's whole-mode total                                2492   ✓ EXACT
 
-   Checked and ELIMINATED as causes:
+THERE ARE **TWO** DOCTESTS, not one. The second is a `compile_fail` doctest, and rustdoc runs it
+as a SEPARATE `running 1 test` block with its OWN `test result` line:
+
+     test src/cow/diff.rs - cow::diff::MemoIdentity (line 443) ... ok
+     test result: ok. 1 passed; ...
+     test src/cow/diff.rs - cow::diff::MemoIdentity (line 483) - compile fail ... ok
+     test result: ok. 1 passed; ...
+
+⇒ `whole = per-target + 2 doctests` WAS CORRECT ALL ALONG, as d127's bank said. Three of us
+  independently "corrected" it to +1 in the same hour and one of those edits reached d127's bank
+  before being reverted. **Wrongly correcting a right claim is the same failure as asserting a
+  false one**, and this file carried the false version — hence this band rather than a quiet edit.
+
+⚠ HOW ALL THREE OF US GOT IT WRONG, because the method is the reusable part:
+  we each grepped `Doc-tests` with a few lines of trailing context, saw `running 1 test`, and
+  stopped. That reads the FIRST doctest block only. **Counting `Doc-tests` SECTIONS is not
+  counting doctests** — there is one section and two blocks. A surprisingly small result is a
+  fact about the SCOPE of the detector before it is a fact about the world; the fix is to print
+  the section to end-of-file, which is how it was finally seen.
+
+⭐ AND WHAT ACTUALLY CLOSED IT WAS NOT THE TOTAL. It was diffing the two runs PER TARGET:
+
+     src/lib.rs                      per-target 1632   whole 1636   <- D141's 4 unit tests
+     tests/d141_long_identifier.rs   per-target    -   whole    4   <- D141's 4 new-target tests
+
+  No shared target differed except by D141's own additions. That eliminated the entire "a test is
+  hiding somewhere" class and left only the unattributed lines, which were the second doctest.
+  ⇒ **An aggregate disagreement is best attacked per-component. A total tells you a gap exists
+  and never where it is.**
+
+THE ELIMINATIONS BELOW STILL STAND and are what narrowed it to a single unattributed pass:
      * a bin target per-target's glob misses — src/main.rs IS run by whole mode, and has
        0 tests, so it contributes nothing.
      * a test target declared outside tests/*.rs — Cargo.toml declares none; 133 tests/*.rs
        files and exactly 133 "Running tests/" lines in the log.
-     * my branch adding 9 rather than 8 — `git diff main...HEAD -- src tests` adds 8
+     * D141 adding 9 rather than 8 — `git diff main...HEAD -- src tests` adds 8
        `#[test]` and removes 0, and all 8 are present by name at runtime.
      * a partial or truncated run — the sum of every "test result: ok. N passed" line is
        exactly 2492, so the run is internally self-consistent.
 
-   ⇒ The gap is NOT in this change: 8 added statically, 8 observed at runtime, 0 removed.
-     It is a question about main's own per-target certification, or about a test whose
-     collection differs between the two modes. It is handed to the team lead unresolved
-     rather than smoothed over. RESOLVING IT NEEDS a per-target run of this same tree,
-     which is one full suite and was not worth spending a reserved quiet box on.
+A whole-mode run at b2991c6 was pre-registered and QUEUED to settle this; it was cancelled
+before it ever acquired the suite lock, so it cost no machine time. Its pre-registration is kept
+at /Users/idide/wt/artie-research/verify-out/d141-basecheck-PREREG.txt — including outcome A,
+which predicted 2484 on the assumption of ONE doctest and would have been wrong for that reason.
 
-   ⚠ ALSO CORRECTED HERE: the widely-held "whole = per-target + 2 doctests" is WRONG at this
-     commit. This run has exactly ONE doctest. Anyone applying +2 is off by one, and that may
-     be the whole of the gap above.
+⚠ WHAT THIS GREEN DOES NOT LICENSE
+-----------------------------------
 
-2. The fire-check proves each guard FIRES and that the boundary still round-trips. It says
+1. The fire-check proves each guard FIRES and that the boundary still round-trips. It says
    nothing about identifier limits ABOVE the catalog layer — there are none in src/.
 
-3. `Catalog::persist` returns through `?` without unpinning the catalog page it fetched, so
+2. `Catalog::persist` returns through `?` without unpinning the catalog page it fetched, so
    every refusal leaks one pin. PRE-EXISTING on every error path there; D141 made it reachable
    from SQL for the first time. Bounded, not fixed: 300 consecutive refusals leave the database
    working, asserted by many_refused_statements_leave_the_database_working.
 
-4. `wal::log::write_str` (src/wal/log.rs:211) still writes `s.len() as u16` UNCHECKED, and its
+3. `wal::log::write_str` (src/wal/log.rs:211) still writes `s.len() as u16` UNCHECKED, and its
    doc comment one line above claims the opposite: "so a name containing anything at all cannot
    desync the reader." Out of D141's scope, scoped and handed over as its own row. tel/log.rs
    and consensus/log.rs are NOT affected — each already wraps it in a checked put_str.
