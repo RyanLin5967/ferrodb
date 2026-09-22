@@ -198,10 +198,17 @@ Lock-order graph, all edges:
   - shared path:    read slot     -> persist_lock   (a splitting DML persists while holding its
                                                      pass)
   - drain_readers:  catalog mutex -> waits on read slots
-  - persist_lock holder: waits on NOTHING. `persist` takes no slot, no catalog mutex and no
-    other lock; it fetches frames and writes them.
+  - persist_lock holder: waits on NOTHING RELEVANT. Audited rather than assumed — every lock-ish
+    call in the body of `persist` (catalog.rs:432-520) is a buffer-pool call and nothing else:
+    `fetch_page`, `frames[i].read()`, `frame_write`, `unpin_page`, `new_page`, and the orphan
+    `deallocate`. No catalog mutex, no read slot, no B+tree latch.
 Because persist_lock has out-degree zero it is a sink, so no cycle exists. A DML holding a slot
 can block behind another persist, and that persist always completes. PASSES.
+  THE ONE EDGE THAT WOULD BREAK THIS, stated so it is checked and not rediscovered: persist ->
+  buffer-pool page-table lock (via `new_page`/`deallocate`). A cycle would need some path that
+  holds the pool's page-table lock and then blocks on persist_lock. Nothing can today, because
+  persist_lock is new and `persist` is its only acquirer. Anyone who adds a second acquirer
+  inherits that obligation, and it belongs in the lock's own doc comment.
 
 Contrast with option (a), which died because it PUT THE TOKEN DOWN. (c3) never drops the pass,
 so the DDL exclusion the barrier provides holds for the whole statement — which is also why
