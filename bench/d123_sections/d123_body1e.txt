@@ -13,12 +13,16 @@ correct acquire can both precede a full test suite landing on the same CPU.
                                            on this very subsystem
   d77-walls       23:59:00 - 00:03:00Z     `cargo build --examples`, `cargo test --lib` (~72 s),
                                            8 integration targets — a rebase verification
-  ⛔ MYSELF       00:31:33Z (2 cargo builds) INSIDE 50_f1_clean, which had also acquired at
+  ⛔ MYSELF       00:31:10-00:31:35Z         2 cargo builds INSIDE 50_f1_clean, which had acquired at
                                            load_at_acquire=13. See 50_CONTAMINATION_BY_ME.txt.
                                            The measure lock protects a measurement from other
                                            agents, not from its own author rebuilding the
                                            worktree whose target/ holds the binary under test.
                                            HOLDING THE LOCK IS NOT A LICENCE TO BUILD.
+                                           ⭐ FIRST USE OF THE PER-REP STAMPS, and on my own
+                                           contamination: the builds map to reps 3 and 4 ONLY.
+                                           Build-free reps 0,1,2,5,6,7,8 median 1.66x, 0 of 7
+                                           near 1.00x. A lookup, not a reconstruction.
 
   arm                            ran (UTC)              intersection
   first battery F1 (both)        23:06 - 23:07Z         ENTIRELY inside diff-identity
@@ -31,13 +35,29 @@ reps 4-8, at 28.2 s per rep. Those five give **median 1.97x, 4 of 5 above 1.10x*
 that overstates the clean evidence; the phrasing is withdrawn.** F1 is therefore re-run in
 `bench/d123_final/51_f1_clean2.txt`, and the verdict below rests on that.
 
-⛔ AND A DIRECTION ARGUMENT I MADE AND HAVE SINCE NARROWED. I claimed contamination biases the F1
+⭐ THE DIRECTION QUESTION, NOW MEASURED ACROSS THREE ARMS INSTEAD OF ARGUED.
+Three independent paired F1 arms ran under three different load regimes:
+
+  arm                                    load (start -> end)   median   draws >1.10x
+  warm=0     (d77-walls inside)          5.31 -> 7.87           2.08x      9/9
+  warm=20k   (first 88 s inside)         7.87 -> 3.42           1.86x      8/9
+  50_f1      (loud throughout + my own
+              builds in reps 3 and 4)   13.64 -> 6.94           1.75x      9/9
+  ALL 27 DRAWS                                                  1.87x     26/27
+
+**The LOUDEST arm gives the LOWEST ratio.** Sustained heavy load DEFLATES the L3/L0 contrast, so
+every contaminated arm here is CONSERVATIVE for the verdict, and a genuinely quiet re-run should
+read higher rather than lower. That is a measured relation across three arms, not an inference from
+one.
+
+⛔ AND IT SUPERSEDES A DIRECTION ARGUMENT I MADE AND HAVE SINCE NARROWED TWICE. I claimed contamination biases the F1
 ratio UPWARD, because interference hurts L0 more than L3 (L0 spends ~21x longer inside the section).
-That holds for SEVERE degradation — warm=0's reps 5-8, where L0 collapsed to 303-2412 forks/sec,
-produced the highest ratios seen anywhere (2.90-6.58x). **It does not hold for mild load.** In
-warm=20k the contaminated reps 0-2 median 1.83x while the clean reps 4-8 median 1.97x, i.e. the
-contamination slightly DEFLATED the ratio there. So "contamination biases upward" is a property of
-severe degradation, not a general law, and it is not used here as a reason to trust a dirty arm.
+It holds ONLY for SEVERE degradation — warm=0's reps 5-8, where L0 collapsed to 303-2412 forks/sec,
+produced the highest ratios seen anywhere (2.90-6.58x). It does not hold for mild load (warm=20k's
+contaminated reps 0-2 median 1.83x against clean reps 4-8 at 1.97x), and the three-arm table above
+shows the OPPOSITE for sustained load. So the correct statement is: **severe degradation that
+collapses L0 inflates the ratio; sustained moderate load deflates it.** Neither is a reason to
+trust a dirty arm, which is why 51 exists.
 
 ⭐ THE METHOD FIX, WHICH MATTERS MORE THAN THIS PARTICULAR LEDGER. The rep-to-window mapping above
 was reconstructed by dividing an arm's wall duration by its rep count — arithmetic on two file
