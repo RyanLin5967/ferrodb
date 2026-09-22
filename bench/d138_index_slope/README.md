@@ -273,3 +273,33 @@ and a single keyed lookup is tens of ns, so per-call timing measures the clock a
 toward zero — "unresolvable" reading as "free". Nothing here times a single lookup; the lookup is
 measured by a batched probe of thousands of repetitions, both shapes over the same `Vec` under one
 lock at one moment.
+
+### AMENDMENT 4 — re-derived against `origin/main` `b2991c6` (append-only; supersedes 2 and 1)
+
+Written before the suite ran. `main` moved again while this row was being measured —
+`18e63ba → b2991c6`, 35 commits, including D127 and D139's reaper fixture fix — and is pushed and
+certified green at **2482 exact**. Merged in cleanly at `c9d0966`.
+
+Derived from the merged tree, per file, with `^[[:space:]]*#\[(test|tokio::test)\]`:
+
+| | `#[test]` lines in `src` + `tests` | certified suite |
+|---|---|---|
+| `origin/main` `b2991c6` | 2457 | **2482** |
+| this branch, merged (`c9d0966`) | 2460 | expected **2485** |
+
+Per file the only delta is mine: `src/tel/log.rs` 5 → 7, `src/tel/tests_durable_log.rs` 24 → 25.
+
+**D139's once-per-instantiation rule checked, not waved past:** `git grep 'macro_rules!'` over
+both files I touch returns **nothing**, so each of the three `#[test]`s compiles to exactly one
+runtime test. (The +25 gap between main's 2457 lines and its 2482 runtime tests is `reaper_suite`
+and friends — it is main's, not mine, and it cancels in the delta.)
+
+⇒ **Expected: per-target 2485 passed, 0 failed. Go 97 passed, 0 failed.**
+Amendments 1 (2478) and 2 (2479) were against `29ad1f5`/`18e63ba` and are superseded, not edited.
+
+⚠ **One known-intermittent is NOT mine:**
+`branch::reaper::tests::log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map`
+("fixture: nothing was ever checkpointed") is a test-isolation race — one PID-keyed temp path,
+`reaper_suite` instantiated twice, racing in parallel threads (SCALE-DESIGN D139). If the run fails
+**only** there it is re-run, not treated as falsifying this pre-registration. **Anything else
+failing is mine.** D139's fixture fix is in this merge, so it may already be gone.
