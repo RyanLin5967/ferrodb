@@ -636,12 +636,30 @@ impl TableBranchCatalog {
     /// as the one-entry answer its other callers want, now written in terms of this.
     /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
     ///
-    /// ⛔ **A missing record cannot mean "the child is gone."** No path anywhere deletes a
-    /// `RECORD` key — the only operations on `keys::record` are insert, search and upsert, which
-    /// is the same fact `write_record_new`'s "provably new" safety argument already rests on.
-    /// Retirement is a state FLIP to `Reaped`, and the id-reuse path OVERWRITES the recycled
-    /// slot's record rather than removing it. So the only thing a missing record can describe is
-    /// an entry naming a branch that was never published, and `fork` cannot produce one either:
+    /// ⛔ **A missing record cannot mean "the child is gone."** No path anywhere **durably**
+    /// deletes a `RECORD` key: retirement is a state FLIP to `Reaped`, and the id-reuse path
+    /// OVERWRITES the recycled slot's record rather than removing it.
+    ///
+    /// ⚠ **CORRECTED — an earlier version of this comment said "no path anywhere deletes a RECORD
+    /// key … the only operations are insert, search and upsert", and that is FALSE. It named the
+    /// operation that breaks it.** [`TableBranchCatalog::upsert`] is delete-then-insert with
+    /// nothing held across the two calls, and `write_record` routes every record rewrite through
+    /// it — `set_state`, `set_root`, `renew_lease`, `reparent`, `restrict_envelope`, `put`. Since
+    /// [`BPlusTreeManager`] is in-place latch-coupled, `delete` drops the leaf latch on return and
+    /// `insert` re-acquires, so the key is **transiently absent on every ordinary rewrite**, and
+    /// every reader below takes no lock (`logical` is writers-only).
+    ///
+    /// ⇒ **The state is not impossible; it is unobservable only because reader and writer are
+    /// both inside the per-statement mutex today.** It becomes reachable the moment W4 removes
+    /// that lock — which is the reason this guard exists, so the guard and the defect arrive
+    /// together. See the D126 row: making `upsert` atomic is what would make the original
+    /// sentence true, and until then a reader genuinely cannot distinguish "mid-rewrite" from
+    /// "never published".
+    ///
+    /// ⇒ **Refusing is still correct, and for a stronger reason than impossibility:** freeing on
+    /// that ambiguity destroys a live branch's pages, and no reading of a transiently-absent
+    /// record makes that safe. So the only thing a missing record can describe is an entry that is
+    /// either mid-rewrite or naming a branch never published, and `fork` cannot produce the latter:
     /// it writes the child's record BEFORE the child key, under one logical lock and one commit
     /// ticket, so no crash can leave the entry durable without it. `attach_child` is the only
     /// other writer of this span, and it now refuses to create one.
@@ -683,7 +701,8 @@ impl TableBranchCatalog {
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
-            // See `dangling_child` for why that state is impossible and why refusing is the only
+            // See `dangling_child`: that state is NOT impossible (upsert is delete-then-insert), and
+            // refusing rather than freeing is the only
             // safe answer to it.
             None => return Err(Self::dangling_child(key, child_id)),
         })
@@ -2357,7 +2376,8 @@ enum ChildLiveness {
     ReapedWithSubtree(u64),
     // There is deliberately no `Gone` variant. It existed until D124 and meant "no record at all
     // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a CHILD entry
-    // naming an unpublished branch let the parent be reclaimed. That state is impossible and is
+    // naming an unpublished branch let the parent be reclaimed. That state is reachable mid-upsert
+    // (see `dangling_child`), not impossible, and is
     // now an error rather than a value; see `TableBranchCatalog::dangling_child`. Keeping the
     // variant unconstructed would only invite the next reader to resolve into it again.
 }
