@@ -123,6 +123,77 @@ struct ModelCell {
     secs: f64,
 }
 
+/// ⛔⛔ **CORRECTION TO THIS SCAFFOLD'S OWN POSITIVE CONTROL. The premise was wrong, and the
+/// scaffold's refusal is what falsified it.** Raw evidence:
+/// `bench/ceiling_raw/00_model_POSITIVE_CONTROL_FAILED.txt`.
+///
+/// The cell `model_cell(64, 400, hold=20_000, outside=0)` was gated at `contended/op >= 0.5` on
+/// the claim *"64 threads doing nothing but hold one mutex must be contended nearly always"*.
+/// **Measured: 0.04688.** `acq/op` was exactly 1.0000 and the T=1 negative control was exactly
+/// 0.00000, so the acquisition and op bookkeeping are sound — only the *premise* is not.
+///
+/// ⭐ THE MECHANISM, stated before the replacement cell was run. `std::sync::Mutex` **barges**.
+/// Unlocking is a store (plus at most a wake syscall); the woken waiter must be scheduled, which
+/// costs microseconds, while the releasing thread's next `try_lock` CAS costs nanoseconds. With
+/// `outside = 0` the releasing thread re-acquires *immediately* and wins essentially every race.
+/// So with the lock permanently saturated, `try_lock` still SUCCEEDS ~95% of the time.
+///
+/// ⇒ **`try_lock`-failure counts "the lock was held by another thread at the instant I tried",
+/// which is NOT the same as "other threads are blocked".** Under a barging convoy 63 threads can
+/// be parked for the whole run and the census still reads ~0. The cell is the MINIMUM of the
+/// curve, not its maximum, and gating on it was gating on the wrong end.
+///
+/// ✅ THE REPLACEMENT, derived from the mechanism rather than from the observed number: remove the
+/// re-acquisition entirely. `T` threads rendezvous on a barrier, then each takes the lock
+/// **exactly once** and holds it for `hold` spins. Barging cannot help: nobody re-acquires. The
+/// first thread through finds it free, the other `T-1` cannot, so
+/// **`contended/op` must be `(T-1)/T`** — 0.984 at T=64 — by construction, provided the hold is
+/// long against the barrier's release skew. That is a structural prediction, not a tuned one, and
+/// the gate below is `>= 0.5`, the same bar the wrong cell was held to.
+fn model_cell_barrier(t: usize, hold: u64) -> ModelCell {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let arrived = Arc::new(AtomicUsize::new(0));
+    lk::set_global_mode(false);
+    lk::reset();
+    lk::set_enabled(true);
+    let t0 = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..t {
+            let m = Arc::clone(&m);
+            let arrived = Arc::clone(&arrived);
+            s.spawn(move || {
+                arrived.fetch_add(1, O::SeqCst);
+                while arrived.load(O::SeqCst) < t {
+                    std::hint::spin_loop();
+                }
+                {
+                    let mut g = lk::acquire_unwrap(&m, lk::LK_LOGICAL);
+                    *g += 1;
+                    spin(hold);
+                }
+                lk::bump_op();
+                lk::flush_thread();
+            });
+        }
+    });
+    let secs = t0.elapsed().as_secs_f64();
+    lk::set_enabled(false);
+    let c = lk::snapshot();
+    if c.threads as usize != t {
+        refuse(&format!("barrier cell lost a thread's accumulators: {} of {t} flushed", c.threads));
+    }
+    if c.ops != t as u64 {
+        refuse(&format!("barrier cell counted {} ops, ran {t}", c.ops));
+    }
+    ModelCell {
+        contended_per_op: c.contended_per_op(lk::LK_LOGICAL),
+        acq_per_op: c.acq_per_op(lk::LK_LOGICAL),
+        ops: c.ops,
+        secs,
+    }
+}
+
 /// T threads × `iters` iterations: hold the mutex for `hold` spins, then `outside` spins free.
 fn model_cell(t: usize, iters: u64, hold: u64, outside: u64) -> ModelCell {
     let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
@@ -184,15 +255,30 @@ fn mode_model() {
         ));
     }
 
-    // ── must fire ────────────────────────────────────────────────────────────────────────────
+    // ── the WITHDRAWN positive control, kept and still printed ───────────────────────────────
+    // Its gate is gone because its PREMISE was false, not because it was inconvenient. See
+    // `model_cell_barrier`'s doc comment and bench/ceiling_raw/00_model_POSITIVE_CONTROL_FAILED.txt.
+    // It is now reported as what it actually is: the BARGING cell, the minimum of the curve.
     let c = model_cell(64, 400, 20_000, 0);
-    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "POS 64t all-lock", 64, 20000, 0, c.ops, c.contended_per_op, c.acq_per_op);
+    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "(barging) 64t", 64, 20000, 0, c.ops, c.contended_per_op, c.acq_per_op);
+    println!("     ^ WITHDRAWN AS A GATE. 64 threads, saturated lock, zero outside work — and the");
+    println!("       census still reads near ZERO, because the releasing thread re-acquires before");
+    println!("       any woken waiter can be scheduled. `try_lock` failure means THE LOCK WAS HELD");
+    println!("       WHEN I TRIED, not THREADS ARE BLOCKED. This scaffold's earlier gate asserted");
+    println!("       the second and measured the first.");
+
+    // ── must fire, and now for a reason barging cannot defeat ────────────────────────────────
+    let c = model_cell_barrier(64, 2_000_000);
+    println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14.5} {:>10.4}", "POS 64t barrier", 64, 2000000, 0, c.ops, c.contended_per_op, c.acq_per_op);
+    println!("     ^ predicted (T-1)/T = {:.5} by construction, BEFORE the run.", 63.0 / 64.0);
     if c.contended_per_op < 0.5 {
         refuse(&format!(
-            "POSITIVE CONTROL FAILED: 64 threads doing nothing but hold one mutex reported only \
-             {:.4} contended acquisitions per op. The counter does not fire when contention is \
-             certain, so a low reading anywhere else in this run means nothing.",
-            c.contended_per_op
+            "POSITIVE CONTROL FAILED: 64 threads that rendezvous and then each take the lock \
+             exactly once reported only {:.5} contended acquisitions per op, against a structural \
+             prediction of {:.5}. No re-acquisition happens here, so barging cannot explain it and \
+             the counter genuinely does not fire. NOTHING else in this run is interpretable.",
+            c.contended_per_op,
+            63.0 / 64.0
         ));
     }
 
@@ -201,6 +287,16 @@ fn mode_model() {
     println!("  REFERENCE SHAPE — 64 threads, total work per iteration held CONSTANT at 20,000");
     println!("  spins, moved out of the section a step at a time. This is the stub ladder's own");
     println!("  transition (hold shrinks, outside grows) in a system with NO other term.");
+    println!();
+    println!("  ⭐ PREDICTED BEFORE THE RUN, from barging + saturation, and committed before it");
+    println!("     was executed (see model_cell_barrier's doc comment). Two terms, opposed:");
+    println!("       (i)  BARGING suppresses the count when `outside` is small, because the");
+    println!("            releasing thread re-wins its own lock. Maximal at outside=0.");
+    println!("       (ii) SATURATION is needed for the count to fire at all. Aggregate demand is");
+    println!("            T*hold/(hold+outside); it drops below 1.0 once hold/20000 < 1/64, i.e.");
+    println!("            at hold < 312 spins. So the last cell (hold=100) is UNDERSATURATED.");
+    println!("     ⇒ the column must be a HUMP: low at hold=20000, high in the middle, low at");
+    println!("       hold=100. A monotone column falsifies this reading of the instrument.");
     println!();
     println!("  {:>16} {:>4} {:>9} {:>9} {:>8} {:>14} {:>10}", "cell", "T", "hold", "outside", "ops", "contended/op", "acq/op");
     for (hold, outside) in [(20_000u64, 0u64), (10_000, 10_000), (2_000, 18_000), (500, 19_500), (100, 19_900)] {
