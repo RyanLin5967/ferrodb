@@ -1,0 +1,123 @@
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT?
+Run by bench/d130_run.sh under /tmp/ferrodb-suite.lock, so no other suite's fsyncs move D.
+tree: 624edf171b2e9f354171093b004d5187bc15b65d  worktree: /Users/idide/wt/ferrodb-agent-ad99f2a878b6869a3
+host: Darwin 25.6.0 arm64  started: 2026-09-22T20:14:46Z
+
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-agent-ad99f2a878b6869a3)
+    Finished `release` profile [optimized] target(s) in 11.48s
+
+================================================================================
+PROOF PASS — NOT EVIDENCE. Two threads, a handful of forks, both binaries.
+Its only purpose is to reach every refusal in both harnesses under this same lock
+hold, so a sweep that cannot run fails in minutes rather than at the end. Read no
+ratio out of it: at this size f/sync is dominated by whichever thread arrived first.
+================================================================================
+D6/D7: fork throughput vs concurrency. N=200 forks per arm, TableBranchCatalog, release.
+parent arenas = 0 (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY
+and this harness CANNOT see D7 -- see give_parent_arenas).
+Recorded 2026-09-22T16:14:58-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        2       200      1.187       168.4      5.937      198         1.0
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT? MODE=pgwire.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread or per fork, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost
+  first: `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog`'s
+  `logical`. E.6 measured that this is NOT the same experiment as MODE=direct, which
+  is `examples/fork_concurrency.rs`. Amendment 1 binds each number to its layer.
+
+  f/sync   = forks the server named, divided by fsyncs the catalog issued. A ratio of
+             two counters taken by one instrument over one run, so it is load-immune.
+  f/sync÷T = the pre-registered discriminator. ≈0.5 flat ⇒ outcome 1 (wake-up race);
+             falling in T ⇒ outcome 2 (the batch is not bounded by the threads);
+             ≈1.0 ⇒ outcome 3 (the batch already captures everyone).
+
+⛔ NO THROUGHPUT IS REPORTED. Each fork is a TCP round trip and the box is shared;
+   a rate from this harness would be a fact about the socket. The counts are the
+   evidence.
+
+# start: 2026-09-22T20:14:59Z  load: 14.53 14.50 12.68
+
+instrument self-check: two idle reads moved the counter by 0, and one serial fork moved it by exactly 1. OK
+
+  arm                                threads    forks    syncs    f/sync   f/sync÷T
+  P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+
+  S  persistent conn, BEGIN+ABANDON      2        8       40      0.20     0.1000
+
+  D  POSITIVE CONTROL, no socket        2        8        8      1.00     0.5000
+
+⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,
+   same process, a pgwire server listening throughout — it simply does not go through
+   the socket. If D shows a batch and P/S do not, the instrument can see batching and
+   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact
+   about pgwire and every cell in this run is a fact about this harness.
+# end: 2026-09-22T20:15:00Z  load: 14.53 14.50 12.68
+
+================================================================================
+MODE=pgwire — examples/d130_pgwire_batch.rs.
+================================================================================
+
+--- pgwire rep 1/1
+D130 — IS THE GROUP-COMMIT BATCH SET BY THE THREAD COUNT? MODE=pgwire.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread or per fork, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost
+  first: `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog`'s
+  `logical`. E.6 measured that this is NOT the same experiment as MODE=direct, which
+  is `examples/fork_concurrency.rs`. Amendment 1 binds each number to its layer.
+
+  f/sync   = forks the server named, divided by fsyncs the catalog issued. A ratio of
+             two counters taken by one instrument over one run, so it is load-immune.
+  f/sync÷T = the pre-registered discriminator. ≈0.5 flat ⇒ outcome 1 (wake-up race);
+             falling in T ⇒ outcome 2 (the batch is not bounded by the threads);
+             ≈1.0 ⇒ outcome 3 (the batch already captures everyone).
+
+⛔ NO THROUGHPUT IS REPORTED. Each fork is a TCP round trip and the box is shared;
+   a rate from this harness would be a fact about the socket. The counts are the
+   evidence.
+
+# start: 2026-09-22T20:15:00Z  load: 14.53 14.50 12.68
+
+instrument self-check: two idle reads moved the counter by 0, and one serial fork moved it by exactly 1. OK
+
+  arm                                threads    forks    syncs    f/sync   f/sync÷T
+  P  conn per fork, BEGIN only          1       40       40      1.00     1.0000
+  P  conn per fork, BEGIN only          2       80       80      1.00     0.5000
+  P  conn per fork, BEGIN only          4      160      160      1.00     0.2500
+  P  conn per fork, BEGIN only          8      320      320      1.00     0.1250
+  P  conn per fork, BEGIN only         16      640      640      1.00     0.0625
+  P  conn per fork, BEGIN only         32     1280     1280      1.00     0.0312
+  P  conn per fork, BEGIN only         64     2560     2560      1.00     0.0156
+  P  conn per fork, BEGIN only        128     5120     5120      1.00     0.0078
+
+  S  persistent conn, BEGIN+ABANDON      1       40      200      0.20     0.2000
+  S  persistent conn, BEGIN+ABANDON      2       80      400      0.20     0.1000
+  S  persistent conn, BEGIN+ABANDON      4      160      800      0.20     0.0500
+  S  persistent conn, BEGIN+ABANDON      8      320     1600      0.20     0.0250
+  S  persistent conn, BEGIN+ABANDON     16      640     3200      0.20     0.0125
+  S  persistent conn, BEGIN+ABANDON     32     1280     6400      0.20     0.0063
+  S  persistent conn, BEGIN+ABANDON     64     2560    12800      0.20     0.0031
+  S  persistent conn, BEGIN+ABANDON    128     5120    25600      0.20     0.0016
+
+  D  POSITIVE CONTROL, no socket        1       40       40      1.00     1.0000
+  D  POSITIVE CONTROL, no socket        2       80       80      1.00     0.5000
+  D  POSITIVE CONTROL, no socket        4      160       80      2.00     0.5000
+  D  POSITIVE CONTROL, no socket        8      320       81      3.95     0.4938
+  D  POSITIVE CONTROL, no socket       16      640       84      7.62     0.4762
+  D  POSITIVE CONTROL, no socket       32     1280      101     12.67     0.3960
+  D  POSITIVE CONTROL, no socket       64     2560      124     20.65     0.3226
+  D  POSITIVE CONTROL, no socket      128     5120      229     22.36     0.1747
+
+⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,
+   same process, a pgwire server listening throughout — it simply does not go through
+   the socket. If D shows a batch and P/S do not, the instrument can see batching and
+   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact
+   about pgwire and every cell in this run is a fact about this harness.
+# end: 2026-09-22T20:19:59Z  load: 15.20 13.38 12.58
+
+finished: 2026-09-22T20:19:59Z
