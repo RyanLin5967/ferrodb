@@ -4,7 +4,8 @@ Disk hit 0G during the run and every target/ on the box was deleted. D68 was SIG
 eleven blocks exited rc=127 because their binaries no longer existed. The runner then
 printed 'ALL FIVE COMPLETE' over the top of them — a banner that was false when written.
 Kept as the record of that failure. The runner is gated on per-block rc as of this commit.
-Re-run: bench/d101_rerun.txt
+Re-run: NOT DONE. There is no bench/d101_rerun.txt. This line used to cite one.
+        The sweep below is the only artifact; every number in it is void.
 ================================================================================
 ================================================================================
 D101 RE-RUN — the five harnesses, on the runtime they build.

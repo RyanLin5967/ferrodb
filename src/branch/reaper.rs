@@ -48,6 +48,61 @@ const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
 /// always collects rather than waiting out an interval measured from the epoch.
 const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 
+/// What one branch's turn in a lease sweep actually did.
+///
+/// # D127 — this was a `bool`, and `false` meant two unrelated things
+///
+/// [`TwoTierReaper::reap_if_still_expired`] answered `Ok(false)` both for *"the lease was renewed
+/// between the candidate query and here, so there is nothing to do"* — routine, expected, and
+/// correctly silent — and for *"the catalog would not answer, so this reaper declined to decide"*.
+/// The second is D124's guard firing: a refusal carrying text that names the parent, the fork
+/// epoch and the child whose record could not be read. Collapsed into the first, that text reached
+/// **no log, no counter and no operator**, and the branch it names becomes one that can never be
+/// reaped while looking exactly like a healthy one — an unbounded leak with no signal.
+///
+/// The conflation IS the defect, which is why the fix is the return type and not a match arm
+/// somewhere downstream. Recovering the distinction from the message string was the alternative
+/// and is rejected on sight: `From<BranchError> for FerroError` flattens every variant into
+/// `Branch(String)`, so a discriminator built on the wording is walked around by a reword.
+///
+/// # What did NOT change: a refusal still lets the sweep continue
+///
+/// That is what the swallow is *for* — **but not for the reason this row first gave.** The
+/// original argument was that a healthy branch's record goes missing for a moment: `upsert` was
+/// delete-then-insert holding no latch across the two, so an ordinary `set_root` or `renew_lease`
+/// removed the RECORD key briefly on a perfectly live branch, and a sweep must not abort on that.
+/// **D126 closed that window** — the tree now has an in-place replace and
+/// `TableBranchCatalog::upsert` is one line over it (`tests/d126_atomic_upsert.rs`) — so nothing
+/// benign reaches [`Self::Refused`] any more.
+///
+/// The swallow survives on the argument that was underneath it all along: **blast radius.** One
+/// branch the catalog cannot answer for must not cost every *other* expired branch its
+/// reclamation, and a reaper that stopped on the first oddity would be strictly worse than the bug
+/// this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the caller
+/// records it and moves to the next candidate. Only a non-`Branch` error still aborts.
+///
+/// ⚠ **Absorbing is not excusing.** Now that every refusal is an I/O error or a corrupt catalog,
+/// the sweep continuing is exactly why the count and the reason have to reach a reader — the
+/// absorption is what makes the branch look healthy, and D127 is what stops it doing so silently.
+#[derive(Debug)]
+#[must_use = "a refused reap that nobody looks at is exactly the D127 defect"]
+pub enum ReapOutcome {
+    /// The branch was reaped and its pages are back.
+    Reaped,
+    /// Its lease is no longer expired: the deadline moved between the candidate query and the
+    /// re-read inside the lock. Routine, and deliberately reported nowhere — the branch is
+    /// healthy and there is nothing for an operator to do.
+    NotExpired,
+    /// **The reaper declined to decide, and this is why.** Nothing was freed, so nothing is lost;
+    /// the branch keeps its pages and the next sweep asks again — but since D126 there is no
+    /// benign producer left, so a retry that keeps refusing is the normal case, not the odd one.
+    /// Carrying the error rather than a bare marker is the whole point: every refusal is an I/O
+    /// error or a corrupt catalog, and the text is the only thing that says WHICH — a failing disk
+    /// and a dangling CHILD entry need different people — so a caller handed only a count has a
+    /// number it cannot act on.
+    Refused(FerroError),
+}
+
 pub struct TwoTierReaper {
     catalog: Arc<dyn BranchCatalog>,
     store: Arc<ArenaPageStore>,
@@ -73,6 +128,14 @@ pub struct TwoTierReaper {
     /// until the next open. A non-zero reading here after a clean close is that producer saying so
     /// out loud, instead of a 60-second full scan quietly hiding it.
     open_sweep_freed: AtomicU64,
+    /// **D127.** Branch reaps this reaper declined to decide. See [`ReapOutcome::Refused`].
+    ///
+    /// Counted at the one site that produces a refusal rather than at each caller, because there
+    /// is more than one call shape — `lease_thread::scan_once` runs the halves of a sweep itself,
+    /// `Reaper::reap_expired` runs them back to back — and a counter each caller had to remember
+    /// to bump is a counter the next caller forgets. `scan_once` additionally *reports* the text;
+    /// this is the floor that makes a refusal impossible to drop entirely, whoever asked for it.
+    refused_reaps: AtomicU64,
 }
 
 impl TwoTierReaper {
@@ -85,12 +148,22 @@ impl TwoTierReaper {
             sweep_visits: AtomicU64::new(0),
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
+            refused_reaps: AtomicU64::new(0),
         }
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
     pub fn open_sweep_freed(&self) -> u64 {
         self.open_sweep_freed.load(Ordering::Relaxed)
+    }
+
+    /// **D127.** Reaps this reaper refused to decide, over its whole life.
+    ///
+    /// Not the same question as `LeaseStats::refused_branches`, which counts what the background
+    /// lease thread saw: this counts every caller's refusals, including `Reaper::reap_expired`'s,
+    /// which has no reporter of its own.
+    pub fn refused_reaps(&self) -> u64 {
+        self.refused_reaps.load(Ordering::Relaxed)
     }
 
     /// Arenas currently recorded as needing a narrowed sweep. Test/diagnostic read.
@@ -368,8 +441,35 @@ impl TwoTierReaper {
         // open half, the outer `RuntimeLock` held across the whole of `scan_once`
         // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
         // lock, and no landed change touches it.
+        // ⛔ **D128 SITE 3 — AND ITS FIX ALREADY EXISTED TWENTY LINES AWAY, UNUSED HERE.** This
+        // was a bare `mem::take` followed by TWO `?`. Either one returning dropped the whole
+        // deferred set on the floor: those arenas are then never swept by the cheap residue path,
+        // and only a later full `collect_orphaned_extents` scan can recover them. `DeferTouched`
+        // (below) is exactly the RAII answer and `drain_pending_seeded` already uses it — routing
+        // this call site through the guard the file itself defines is the whole fix.
+        //
+        // ⚠ Severity, not inflated: `deferred` is an in-memory `Mutex<BTreeSet<ArenaId>>`, so what
+        // was lost is a space leak a later full sweep can still recover — NOT the silent durable
+        // loss that site 2 (`cow/store.rs`) carried. Site 3 is recorded and fixed because it
+        // completes the pattern and because the fix is free, not because it is equally bad.
+        //
+        // ⚠ **AND THE ROW NAMED THE WRONG FUNCTION.** SCALE-DESIGN's D128 table calls this the
+        // "`drain_pending` tail". It is not: `drain_pending` only delegates to
+        // `drain_pending_seeded`, which has used `DeferTouched` since D83. The residue tail is
+        // HERE, in `collect_orphans_if_due`, and a test aimed at `drain_pending` returns `Ok(0)`
+        // through the cadence gate without ever reaching the defect — which is exactly what the
+        // first version of `a_failing_residue_sweep_puts_the_deferred_arenas_back` did.
         let residue = std::mem::take(&mut *self.deferred.lock().unwrap());
-        let recovered = if residue.is_empty() { 0 } else { self.sweep_touched_extents(&residue)? };
+        let mut guard = DeferTouched { deferred: &self.deferred, touched: residue, swept: false };
+        let recovered = if guard.touched.is_empty() {
+            0
+        } else {
+            // An `Err` here drops `guard` with `swept == false`, which puts every arena back.
+            self.sweep_touched_extents(&guard.touched)?
+        };
+        // Swept, so the guard must NOT restore: `collect_orphaned_extents` failing below is not a
+        // reason to re-sweep work that already succeeded.
+        guard.swept = true;
         Ok(recovered + self.collect_orphaned_extents()?)
     }
 
@@ -414,10 +514,17 @@ impl TwoTierReaper {
                     // This owner WAS published: the extent it names was created by `alloc_arena`,
                     // which ends in `catalog.add_arena`, and every catalog refuses that for a
                     // branch with no record. And a record that is missing *right now* has not
-                    // stopped existing — `TableBranchCatalog::upsert` is delete-then-insert with
-                    // no latch held across the two calls, and `write_record` routes the RECORD
-                    // key through it, so a concurrent `set_root` or `renew_lease` on the owner
-                    // makes this read miss on a perfectly healthy branch.
+                    // stopped existing: nothing ever deletes a record, and retirement is a state
+                    // flip to `Reaped`.
+                    //
+                    // ⚠ **D126 changed WHICH failures reach here, not what to do about them.**
+                    // This used to say the miss was routine: `TableBranchCatalog::upsert` was
+                    // delete-then-insert with no latch held across the two calls, so a concurrent
+                    // `set_root` or `renew_lease` on the owner made this read miss on a perfectly
+                    // healthy branch. D126 gave the tree an in-place replace and closed that
+                    // window (`tests/d126_atomic_upsert.rs`). An I/O error or a corrupt catalog
+                    // still reaches this arm, and for both of those refusing remains the only
+                    // answer that neither frees nor guesses.
                     //
                     // Answering "not pinned" to that hands back a page the interval rule had
                     // deliberately parked for a live child. Refusing keeps the entry in the
@@ -624,8 +731,20 @@ impl Reaper for TwoTierReaper {
         let candidates = self.expired_candidates(now_millis)?;
         let mut reaped = Vec::with_capacity(candidates.len());
         for rec in candidates {
-            if self.reap_if_still_expired(rec.branch_id(), now_millis)? {
-                reaped.push(rec.branch_id());
+            match self.reap_if_still_expired(rec.branch_id(), now_millis)? {
+                ReapOutcome::Reaped => reaped.push(rec.branch_id()),
+                ReapOutcome::NotExpired => {}
+                // **D127.** This shape hands back only the list of branches it reaped, and a
+                // refusal is by definition not one of them — there is nowhere in the signature to
+                // put it, and widening the signature would change every caller of a trait method
+                // that no production path uses (`scan_once` calls the two halves itself, so that
+                // it can bound how long it holds the statement lock).
+                //
+                // The refusal is therefore not lost and not reported here either: it is counted on
+                // the reaper by `reap_if_still_expired` itself, readable through
+                // `TwoTierReaper::refused_reaps`. That is deliberate rather than an oversight, and
+                // it is why the counter lives at the refusal site and not in the caller.
+                ReapOutcome::Refused(_) => {}
             }
         }
 
@@ -685,8 +804,8 @@ impl TwoTierReaper {
         Ok(candidates)
     }
 
-    /// Reap `branch`, but only if its lease is **still** expired at `now_millis`. Returns whether
-    /// it reaped.
+    /// Reap `branch`, but only if its lease is **still** expired at `now_millis`. Returns which of
+    /// the three things in [`ReapOutcome`] happened.
     ///
     /// # The re-check is not belt and braces; it is the guarantee the lock used to give
     ///
@@ -711,27 +830,51 @@ impl TwoTierReaper {
         &self,
         branch: BranchId,
         now_millis: u64,
-    ) -> Result<bool, FerroError> {
+    ) -> Result<ReapOutcome, FerroError> {
         match self.catalog.get_raw(branch.id) {
-            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
+            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => {
+                return Ok(ReapOutcome::NotExpired)
+            }
             Ok(_) => {}
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
-            // from the read, including the momentary miss `TableBranchCatalog::upsert` opens on a
-            // healthy branch. Declining to reap on one is the safe direction: it frees nothing,
-            // and the next sweep asks again. Same class as the `Branch` error below, which
+            // from the read. ⚠ This used to add "including the momentary miss
+            // `TableBranchCatalog::upsert` opens on a healthy branch" — **D126 closed that
+            // window** (`tests/d126_atomic_upsert.rs`; the same correction is spelled out on the
+            // `get_raw` match in `drain_pending_seeded`), so an I/O error or a corrupt catalog is
+            // all that is left to arrive here. Declining to reap on one is still the safe
+            // direction: it frees
+            // nothing, and the next sweep asks again. Same class as the `Branch` error below,
+            // which
             // likewise turns a refusal into "did not reap" rather than aborting the sweep —
             // deliberately left alone, because propagating it would turn a benign already-reaped
             // race into a failed sweep for a whole pre-existing class of errors.
-            Err(FerroError::Branch(_)) => return Ok(false),
+            //
+            // **D127 — it is no longer the same ANSWER as "not expired", though.** Both still
+            // decline to reap and both still let the sweep go on; what changed is that the caller
+            // can now tell them apart, so the refusal can be counted and printed instead of being
+            // rounded off into a healthy branch's routine reprieve.
+            Err(e @ FerroError::Branch(_)) => return Ok(self.refuse(e)),
             Err(e) => return Err(e),
         }
         match self.reap(branch) {
-            Ok(_) => Ok(true),
-            // A branch already reaped as a side effect of this same scan is not an error.
-            Err(FerroError::Branch(_)) => Ok(false),
+            Ok(_) => Ok(ReapOutcome::Reaped),
+            // A branch already reaped as a side effect of this same scan is not an error — and
+            // neither is D124's `Corrupt`, which arrives here from `has_live_children` when a
+            // CHILD entry names a record that cannot be read. **D127: this is the site whose
+            // silence the row exists to fix.** The refusal is still absorbed, because a corrupt
+            // entry on one branch must not stop the other expired branches from being reclaimed;
+            // it is now absorbed *with its reason attached*.
+            Err(e @ FerroError::Branch(_)) => Ok(self.refuse(e)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Count a refusal and hand it back as an outcome, so that no caller can produce one without
+    /// it being counted. See [`TwoTierReaper::refused_reaps`].
+    fn refuse(&self, why: FerroError) -> ReapOutcome {
+        self.refused_reaps.fetch_add(1, Ordering::Relaxed);
+        ReapOutcome::Refused(why)
     }
 }
 
@@ -748,6 +891,17 @@ mod tests {
     //! runs each case twice, and a divergence between the two implementations fails the build
     //! instead of waiting for someone to write a bespoke probe for it.
 
+    /// Runs the whole reaper suite against both catalogs.
+    ///
+    /// ⚠ **The doubling is documented above, at the `mod tests` doc: *"one `cargo test` now runs
+    /// each case twice"*. It is NOT restated here on purpose** — two statements of one fact drift,
+    /// and the copy nobody reads is the one that goes stale.
+    ///
+    /// Its two CONSEQUENCES are commented where they bite, which is the only place a reader meets
+    /// them: at each `ferro-*-ckpt-` fixture path (a pid-only key collides across the two
+    /// instantiations) and in any pre-registered suite count (a `#[test]` added in here contributes
+    /// **two**, so counting attributes in a diff undercounts). **Both defects came from a property
+    /// that was already documented four lines up and that nobody read — see SCALE-DESIGN D139.**
     macro_rules! reaper_suite {
         ($modname:ident, $table:expr) => {
             mod $modname {
@@ -947,18 +1101,37 @@ mod tests {
     #[test]
     fn a_fast_path_reap_reaches_the_durable_map_not_just_memory() {
         let (h, reaper) = setup();
-        // **`$modname` in the name, because `reaper_suite!` generates this test TWICE** — once
-        // per catalog — and both copies run in the same process at the same time. Without it
-        // they shared one file: each one's opening `remove_file` deleted the other's checkpoint
-        // mid-test. That was invisible while every durable write was a create-or-replace, and
-        // D81 made it visible, because an append to a file another test has just unlinked is
-        // ENOENT (deliberately — see `OsFileOps::append`). Measured: 3/3 parallel runs failed,
-        // `--test-threads=1` passed. The assertions below are unchanged; only the collision is.
-        let path = std::env::temp_dir().join(format!(
-            "ferro-reap-ckpt-{}-{}.bin",
-            stringify!($modname),
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .join(format!(
+                // **D139: `module_path!()` is load-bearing, not decoration.**
+                // This test lives inside `reaper_suite!`, which is instantiated TWICE
+                // (`log_catalog`, `table_catalog`). Keyed on the pid alone, BOTH
+                // instances computed this same path and raced: one `remove_file`d the
+                // checkpoint the other had just written, and the fixture guard below
+                // fired with "nothing was ever checkpointed". Intermittent, because it
+                // needs an unlucky interleaving -- it survived thousands of green runs
+                // and surfaced only under fleet load.
+                //
+                // ⭐ **D81 FOUND THE SAME COLLISION INDEPENDENTLY AND REPRODUCED IT ON
+                // DEMAND**, which D139's own fire-check did not manage: 3/3 parallel runs
+                // failed, `--test-threads=1` passed. ⛔ **AND IT CHANGES THE SYMPTOM ABOVE.**
+                // The race was survivable while every durable write was a create-or-replace;
+                // once `<db>.arena` became append-only, an append to a file the other copy
+                // has just unlinked is ENOENT -- deliberately, see `OsFileOps::append`, which
+                // is `append(true)` WITHOUT `create(true)`. So on this tree the first
+                // symptom is an io error, not the "nothing was ever checkpointed" guard.
+                //
+                // ⚠ ONE DISCRIMINATOR, NOT TWO. D81 fixed these same two paths with
+                // `stringify!($modname)`; that half was deleted in the merge rather than
+                // kept alongside, because two guards over one collision is one you cannot
+                // test. `module_path!()` is the survivor: it ENDS in the generated
+                // `$modname`, so it separates everything `$modname` separates and also two
+                // instantiations under different parents, and it is not a compile error if
+                // this body is ever lifted out of the macro.
+                "ferro-reap-ckpt-{}-{}.bin",
+                module_path!().replace("::", "_"),
+                std::process::id()
+            ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
@@ -1033,14 +1206,19 @@ mod tests {
     #[test]
     fn a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map() {
         let (h, reaper) = setup();
-        // Same collision as `a_fast_path_reap_reaches_the_durable_map_not_just_memory` above,
-        // fixed the same way: two generated copies, one filename. This one had not been seen to
-        // fail, which is a statement about scheduling luck rather than about the fixture.
-        let path = std::env::temp_dir().join(format!(
-            "ferro-slow-reap-ckpt-{}-{}.bin",
-            stringify!($modname),
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .join(format!(
+                // Same collision as `a_fast_path_reap_reaches_the_durable_map_not_just_memory`
+                // above, fixed the same way and with the same single discriminator; the long
+                // note is there, not repeated here.
+                //
+                // ⚠ **THIS ONE HAS NEVER BEEN SEEN TO FAIL**, which is a statement about
+                // scheduling luck and not about the fixture: the path it computed was just as
+                // shared as the other's. Both branches that found this independently say so.
+                "ferro-slow-reap-ckpt-{}-{}.bin",
+                module_path!().replace("::", "_"),
+                std::process::id()
+            ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
@@ -1569,6 +1747,66 @@ mod tests {
         (arenas, owner)
     }
 
+    // ---------------------------------------------------------------------------------------
+    // D128 SITE 3 — the deferred set must survive a failing residue sweep.
+    // ---------------------------------------------------------------------------------------
+
+    /// ⭐ **THE ROW'S TEST.** `drain_pending`'s tail took `deferred` with a bare `mem::take` and
+    /// then ran TWO `?`. An `Err` from the first dropped the whole set: those arenas are never
+    /// swept by the cheap residue path again, and only a later full `collect_orphaned_extents`
+    /// scan can recover them.
+    ///
+    /// Forcing the error without injecting a fault: point the store's free-space-map checkpoint
+    /// at a path whose PARENT IS A FILE. `free_arena` ends in `persist_if_configured()?`, the
+    /// atomic-file write cannot create its temp beside a non-directory, and the `?` fires — the
+    /// store's own durability path, not a mock.
+    ///
+    /// ⚠ Fire-checked: against the pre-fix `mem::take` this fails on the final assertion with the
+    /// set empty. See `bench/d128_firecheck.txt`.
+    #[test]
+    fn a_failing_residue_sweep_puts_the_deferred_arenas_back() {
+        let (h, reaper) = setup();
+
+        // An extent that is empty and whose owner has been reaped — `extent_is_collectable` says
+        // yes, so the sweep reaches `free_arena` rather than skipping every candidate.
+        let (arenas, _dead) = orphan_one_extent(&h);
+        let arena = arenas[0];
+
+        // Seed the residue the way an earlier early-return would have.
+        reaper.deferred.lock().unwrap().insert(arena);
+        assert_eq!(reaper.deferred_len(), 1, "fixture: one arena parked in the deferred set");
+
+        // Make the store's own durable write fail: `blocker` is a FILE, so nothing can be created
+        // inside it.
+        let blocker = std::env::temp_dir().join(format!(
+            "ferrodb-d128-site3-blocker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        h.store.checkpoint_to(blocker.join("map.arena"));
+
+        // `collect_orphans_if_due` is the function that holds the residue tail — `drain_pending`
+        // only delegates to `drain_pending_seeded`, which has used the guard since D83. Any
+        // `now_millis` fires on the first call: the cadence gate reads ORPHAN_SWEEP_NEVER.
+        let err = reaper.collect_orphans_if_due(1_000_000).expect_err(
+            "fixture: the residue sweep must actually fail, or this proves nothing",
+        );
+
+        assert_eq!(
+            reaper.deferred_len(),
+            1,
+            "D128 site 3: drain_pending returned Err ({err}) and the deferred set is EMPTY. Every \
+             arena it had not finished sweeping was dropped, so the cheap residue path will never \
+             look at them again.",
+        );
+        assert!(
+            reaper.deferred.lock().unwrap().contains(&arena),
+            "D128 site 3: the deferred set survived but does not hold the arena that was in it",
+        );
+    }
+
     #[test]
     fn the_crash_orphan_collector_fires_on_state_the_narrowed_sweep_cannot_see() {
         let (h, reaper) = setup();
@@ -2089,6 +2327,104 @@ mod tests {
             store2.reserved_page_count(),
             baseline_reserved,
             "reserved pages did not return to baseline across the restart"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // D127 — the three answers must be three answers.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D127.** `reap_if_still_expired` used to return a `bool`, and `false` was both *"the
+    /// lease moved, leave it alone"* and *"the catalog would not answer, I decline to decide"*.
+    /// This walks all three outcomes in one body so that each is the other two's control: a
+    /// mutant that answers `Refused` for everything fails on the first two arms, and the mutant
+    /// that shipped — `NotExpired` for a refusal — fails on the last two.
+    ///
+    /// The refusal counter is read before and after **every** arm, not only the refusing ones.
+    /// Without that, a counter that incremented unconditionally would satisfy every assertion
+    /// about the refusing arms and say nothing at all.
+    #[test]
+    fn a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved() {
+        let (h, reaper) = setup();
+
+        // ARM 1 — healthy and expired. Reaped, and nothing is refused.
+        let doomed = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        write_pages(&h, doomed, 2);
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(doomed, far_future()).unwrap(),
+                ReapOutcome::Reaped
+            ),
+            "an expired branch with a readable record must be REAPED"
+        );
+        assert_eq!(reaper.refused_reaps(), before, "a successful reap was counted as a refusal");
+
+        // ARM 2 — the lease moved under the sweep. Not expired, and STILL not a refusal: this is
+        // the arm whose answer a refusal used to be indistinguishable from.
+        let kept = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap().branch_id;
+        write_pages(&h, kept, 2);
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(kept, LeaseDeadline::now_millis()).unwrap(),
+                ReapOutcome::NotExpired
+            ),
+            "a branch whose lease has not expired must answer NOT EXPIRED"
+        );
+        assert_eq!(
+            reaper.refused_reaps(),
+            before,
+            "a healthy branch with a live lease was counted as a refusal; that turns the new \
+             signal into noise an operator learns to ignore, which is the defect again"
+        );
+        assert_eq!(
+            h.catalog.get_raw(kept.id).unwrap().state,
+            BranchState::Live,
+            "a NOT EXPIRED answer must not have touched the branch"
+        );
+
+        // ARM 3 — the record cannot be read at all (`get_raw`'s `Branch` arm). Post-D126 the only
+        // producers of this are an I/O error and a corrupt catalog; it is reached here through an
+        // id that was never minted, which produces the same `FerroError::Branch` without needing
+        // either. What is under test is the arm, not how a catalog came to trip it.
+        let before = reaper.refused_reaps();
+        let outcome = reaper.reap_if_still_expired(BranchId::new(9_999_999, 0), far_future());
+        let why = match outcome.unwrap() {
+            ReapOutcome::Refused(e) => e,
+            other => panic!(
+                "a branch whose record could not be read answered {other:?}. Rounded to \
+                 NOT EXPIRED it is indistinguishable from a healthy branch, which is how D124's \
+                 refusal reached no reader at all."
+            ),
+        };
+        assert!(
+            matches!(why, FerroError::Branch(_)),
+            "the refusal must carry the catalog's own error, or there is nothing to report: {why}"
+        );
+        assert_eq!(reaper.refused_reaps(), before + 1, "the refusal was not counted");
+
+        // ARM 4 — the record reads fine but `reap` itself refuses (`reap`'s `Branch` arm). This
+        // is the site D124's `Corrupt` arrives at from `has_live_children`; a stale generation is
+        // the same arm reached without a corrupt catalog.
+        let live = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        write_pages(&h, live, 2);
+        let stale = live.bump();
+        assert_eq!(stale.id, live.id, "fixture: bump must keep the slot and move the generation");
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(stale, far_future()).unwrap(),
+                ReapOutcome::Refused(_)
+            ),
+            "a reap the catalog refused answered something other than REFUSED"
+        );
+        assert_eq!(reaper.refused_reaps(), before + 1, "the refusal was not counted");
+        assert_eq!(
+            h.catalog.get_raw(live.id).unwrap().state,
+            BranchState::Live,
+            "a refusal must free nothing: refusing is the safe direction precisely because it \
+             leaves the branch exactly as it was"
         );
     }
 

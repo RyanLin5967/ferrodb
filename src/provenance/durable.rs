@@ -604,6 +604,14 @@ impl ProvenanceStore for DurableProvenanceStore {
         self.mem.attribute(rid)
     }
 
+    /// Delegated, like every other read: `mem` is not a cache of the page dictionaries, it *is*
+    /// them. `stamp` above writes memory first and the file second, so the two cannot disagree
+    /// about which runs a page carries without the store already being poisoned.
+    fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
+        self.refuse_if_poisoned()?;
+        self.mem.page_dictionary_lens()
+    }
+
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
         let file = self.file.lock().unwrap();
         // Under the lock; see `intern` for the race that checking it first opened.

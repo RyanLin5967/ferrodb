@@ -14,7 +14,12 @@ statements it timed. The configuration was fixed in one place and bypassed in an
 The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
 path. They are simply not a measurement of the path this file's headline names.
 Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
-Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+Harnesses corrected: commit fc443c4.  ⛔ THE RE-RUN HAS NOT HAPPENED. It was attempted and VOIDED — disk hit 0G mid-sweep and
+every target/ on the box was deleted; eleven of its blocks exited rc=127 while the runner
+printed 'ALL FIVE COMPLETE' over them. That record is kept at
+`bench/d101_rerun_VOID_disk_emergency.txt`. There is NO `bench/d101_rerun.txt` and this
+line used to cite one, which read as provenance for a run that does not exist.
+⇒ Everything above marked "plausibly survives" REMAINS A HYPOTHESIS, not a finding.
 ⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
 ===============================================================================================
 

@@ -1,0 +1,23 @@
+# CERTIFICATION EVIDENCE — main@83cb6e8, the tip D101 landed on
+
+Banked 2026-09-22. This verdict certifies the CURRENT main tip and existed ONLY in the
+shared $VERIFY_OUT/SUMMARY.txt, which verify-suite.sh:353 writes with a TRUNCATING redirect
+to a fixed path. The next run into that directory without a subdirectory destroys it.
+⚠ Distinct LABELS do not protect it — only a distinct VERIFY_OUT directory does.
+
+## The harness's own lines, verbatim
+```
+land101-83cb6e8: mode=per-target rc=0 passed=2459 failed=0 build_errors=0 head=83cb6e8 log=/Users/idide/wt/artie-research/verify-out/suite-land101-83cb6e8.log
+land101-83cb6e8: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/suite-land101-83cb6e8.go.log
+```
+
+## Provenance (sha256 recomputed here, not copied from a report)
+- suite-land101-83cb6e8.go.log  17285 bytes  sha256=4b53b036179e65c6db9022313c54de8a4b71ea4604a9b07ec1c29dd14b4d2975
+- suite-land101-83cb6e8.log  262556 bytes  sha256=36705e13cf76302a36dd3427f06b5115f676eb674cdb4bb71d02b91b0e9dbbf5
+
+## What it certifies
+head=83cb6e8 — D101's stub-runtime guard, the systemic fix for a class with 8 instances.
+certify-head confirmed suite head == landing commit; prepush OK; pushed 23da037..83cb6e8.
+
+⭐ 2459 was PRE-REGISTERED before the run (2455 + D101's 4) and hit exactly. A prediction
+registered in advance makes a surprise a finding instead of something rationalised after.

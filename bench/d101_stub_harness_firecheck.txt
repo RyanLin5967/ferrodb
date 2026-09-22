@@ -1,0 +1,69 @@
+D101 — THE LAST THREE STUB-RUNTIME HARNESSES: FIRE-CHECKED IN BOTH DIRECTIONS
+================================================================================
+Run 2026-09-22 at main 7a7e998 (the rewiring commit). Every line below is real output,
+produced by reverting the one line and running, then restoring and running again.
+
+⛔ AND IT CORRECTS THE REWIRING COMMIT'S OWN MESSAGE, which said the two harnesses that
+   issue agent statements "SWALLOW the refusal". THEY DO NOT. Both refuse a zero, by name,
+   and say it is not a result. That is the opposite of swallowing and it is to their credit.
+   The severity claim in 7a7e998 is wrong and this file is the correction.
+
+--------------------------------------------------------------------------------
+d114_ours_side_ops — BEFORE (Session::new()), D114_OPS=8 D114_MERGES=2 D114_DEBUG=1
+--------------------------------------------------------------------------------
+  [seq 0] BEGIN failed: internal error (this is a bug in ferrodb): this agent statement is
+  running on an AgentRuntime that no ServerContext designated. 1 ServerContext(s) in this
+  process own a different runtime, so the branch catalog, page store and effect log this
+  process BUILT are not the ones this statement would touch [...]
+        8    0 |  NO MERGE APPLIED — not a result, and not a zero
+
+⇒ n=0, and the harness REFUSES rather than printing a flat line.
+
+--------------------------------------------------------------------------------
+d114_ours_side_ops — AFTER (s.ctx.session()), same knobs
+--------------------------------------------------------------------------------
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+        8   2 |     54.913 |            32.0             8.0 |            20.663
+  (ARM DELTA, delta=4)  2064.0 examined, 4.0 matched, examined/(delta x ops) = 1.000
+
+⇒ n=2 and the counters are non-degenerate.
+
+--------------------------------------------------------------------------------
+d110_merge_page_reads — BEFORE, D110_SIZES=500 D110_MERGES=2
+--------------------------------------------------------------------------------
+  build provenance: at 7a7e99878046 +DIRTY (uncommitted changes — this commit does NOT
+                    describe the code that ran)
+  table rows   merges   writes reads   MERGE reads   reads per 1000 rows
+         500   NO MERGE APPLIED — not a result, and not a zero
+  ⛔ NO MERGE APPLIED AT ANY SIZE. A merge that did not happen reads no pages, which is
+     indistinguishable from an O(1) merge by this instrument. This is not a result.
+
+--------------------------------------------------------------------------------
+d110_merge_page_reads — AFTER
+--------------------------------------------------------------------------------
+  build provenance: at 7a7e99878046
+  table rows   merges   writes reads   MERGE reads   reads per 1000 rows
+         500        2           21.0           0.0                0.0000
+  ⛔ fewer than two sizes reached; a single point cannot show a slope.
+
+⇒ MERGE reads is 0.0 at one size. That is NOT yet a finding: the harness itself refuses a
+  single point, and D110's pre-registration needs a SLOPE. The row stays open.
+
+--------------------------------------------------------------------------------
+d50_reader_scaling — NOT THE SAME CASE, and it should not be described as one
+--------------------------------------------------------------------------------
+`grep -E 'BEGIN AGENT|AGENT SESSION'` over the file returns NOTHING. d50 execs only
+CREATE TABLE / INSERT / SELECT, and a Session's runtime is consulted only by agent
+statements (`run_agent_stmt`). So D101's guard would never have fired here and d50 was NOT
+mis-measuring: the catalog, buffer pool and txn manager all come from the `ServerContext`,
+which d50 always passed correctly. The rewiring is hygiene — it makes the harness match the
+landed pattern so the next reader does not have to re-derive that it was safe.
+
+================================================================================
+WHAT THIS MEANS FOR THE THREE BANKED CURVES THAT USED THESE HARNESSES
+================================================================================
+d110's and d114's numbers could not have been produced at any commit at or after D101's
+guard landed (83cb6e8) — the refusal predates any output. Either they were taken BEFORE the
+guard, in which case they were measured on the stub and must be RE-DERIVED, or they were
+taken after, in which case the harness printed "not a result" and there is nothing to
+re-derive. Check each banked file's own provenance line before trusting it.

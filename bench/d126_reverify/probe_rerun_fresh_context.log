@@ -1,0 +1,18 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wf_e78d06ad-550-2)
+    Finished `release` profile [optimized] target(s) in 8.04s
+     Running tests/d126_atomic_upsert.rs (target/release/deps/d126_atomic_upsert-e76119f9c96c1ab1)
+
+running 4 tests
+test a_growing_rewrite_that_splits_is_still_never_absent ... D126 split arm (growing upsert): misses=0 reads=3930
+ok
+test a_rewritten_key_is_never_absent_to_a_concurrent_reader ... D126 control  (delete+insert): misses=28008 reads=52445 errors=0
+D126 treatment (tree.upsert) : misses=0 reads=24629 errors=0
+ok
+test insert_still_does_not_replace ... ok
+test the_primary_index_rewrite_is_never_absent_either ... D126 primary index CONTROL  (delete+insert): misses=33573 reads=61937
+D126 primary index TREATMENT (upsert)      : misses=0 reads=31340
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+EXIT=0

@@ -1,0 +1,17 @@
+# W4 check 3 -- stand-downs at ServerContext::begin_read, as a fraction of attempts
+# layer: through pgwire over a loopback TCP socket; shipped `pgwire::handle` per
+#        connection; nothing drives AgentRuntime or Session directly.
+# clients=8 rounds=200 lease_scan_ms=30000 expiry_ms=0 fork_every=64 dml_every=8 announcers=default
+# a COUNT, not a timing: no duration is measured and none is reported.
+
+ROW arm=agent_dml proto=extended sh_att=1542 sh_stood=735 sh_frac=0.476654 dml_att=50 dml_frac=0.440000 exc_att=16 exc_frac=0.500000 all_frac=0.475746 ann_parse=12 ann_refr=0 ann_exec=801 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=1608 defining=8 minted=0
+## HEADLINE -- stand-down fraction by what the statement would be under W4
+arm        proto     |    sh_att  sh_stood SHARED_TODAY | dml_att dml_stood | exc_att exc_stood | all_stood
+agent_dml  extended  |      1542       735      47.67% |      50    44.00% |      16    50.00% |    47.57%
+
+## ANNOUNCERS -- which exclusive acquirer made a writer visible
+arm        proto      attempts  admitted  stood_dn stand_down  ann_parse ann_refr ann_exec ann_leas ann_unk
+agent_dml  extended       1608       843       765     47.57%         12        0      801        0       0
+
+# composition and statement counts
+#   agent_dml  extended  clients=2xDml+2xForker+4xReader      statements=1608 defining=8

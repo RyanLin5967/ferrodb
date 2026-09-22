@@ -165,7 +165,12 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
 
-    let mut sess = Session::new();
+    // ⛔ D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+    // log), so every agent statement below would run on a STUB and the arena-backed runtime
+    // this harness constructs would be built and never touched. `agent_sql::designated` now
+    // refuses such a statement rather than measuring it.
+    let mut sess = s.ctx.session();
     // THREE columns, not two. `c` is the churn column: the CHURN arm needs somewhere to put ops
     // that is not the delta, and doing it on a separate ROW would grow the outer loop instead and
     // confound the thing being measured with the row count.
@@ -201,7 +206,12 @@ struct Cycle {
 /// this axis had to be driven deliberately rather than falling out of a long run.
 fn one_cycle(s: &Server, seq: u64, target_ops: i64, delta: i64, arm: Arm) -> Option<Cycle> {
     let ids = delta_ids(delta);
-    let mut sess = Session::new();
+    // ⛔ D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+    // log), so every agent statement below would run on a STUB and the arena-backed runtime
+    // this harness constructs would be built and never touched. `agent_sql::designated` now
+    // refuses such a statement rather than measuring it.
+    let mut sess = s.ctx.session();
     // ⛔ ONE agent name for every cycle, not `a{seq}`. The provenance slot is declared per branch
     // and REFUSES to be redeclared under a different agent name: `a1` on the slot `a0` declared
     // errors with "provenance slot prov1 is already declared as agent=a0". A per-cycle name made

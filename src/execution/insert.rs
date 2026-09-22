@@ -127,20 +127,31 @@ impl Modify for Insert {
                     self.schema.columns.first().map(|c| c.name.as_str()).unwrap_or("?")
                 )))
             }
-            // The key is free, but the stale entry has to GO rather than be shadowed:
+            // The key is free, but the stale entry must be REPLACED rather than shadowed:
             // `insert_entry` appends, it does not overwrite, so leaving it would put two entries
             // for one key in a unique index and `search` would return whichever binary search
             // landed on. The deleted version itself stays in the heap, where a sequential scan
             // still finds it and resolves it as invisible - nothing needs the index to reach it,
             // because there is no temporal `AS OF` in the SQL surface, only `AS OF BRANCH`.
-            self.primary_index.delete(&vals[0])?;
+            //
+            // ⛔ **D126 — the `delete` that used to sit here has MOVED INTO the `upsert` below.**
+            // It was `primary_index.delete(&vals[0])` here and `primary_index.insert(..)` after
+            // the heap write, with `delete` dropping the leaf write latch on return: the primary
+            // key was absent from the index for the whole of a heap insert, and `search` descends
+            // with no latch at all. A concurrent point lookup on that key got "no such row" for a
+            // row that exists. Same defect the branch catalog had, same fix: one `upsert`, one
+            // page write, no window. See `BPlusTreeManager::upsert`.
         }
         let tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
         let rid = self.heap.insert(tuple)?;
         if let Some((prov, id)) = &self.author {
             prov.stamp(rid, *id)?;
         }
-        self.primary_index.insert(vals[0].clone(), rid)?;
+        // `upsert`, not `insert`: this both writes a brand-new key and REPLACES the stale entry
+        // of a primary key freed by a committed DELETE (the branch above). `insert` cannot do the
+        // second -- it appends -- and delete-then-insert could, but only through a window in which
+        // the key is absent to every lockless reader. D126.
+        self.primary_index.upsert(vals[0].clone(), rid)?;
         // **E66 — the same de-duplication UPDATE needs, on the path E63 opened.**
         //
         // DELETE leaves a secondary entry behind on purpose (see `execution::update`: an older

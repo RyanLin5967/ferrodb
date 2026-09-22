@@ -1,0 +1,19 @@
+CERTIFICATION — main 11faa54..98a44ef, pushed 2026-09-22
+
+suite head=          98a44ef
+pushed origin/main=  98a44efbc2963f4ac10ecc1836fbfdfa9462affa
+tree(suite head)=    de7cec4b35b48498178c9d79fbc3c65632ed8c1d
+tree(pushed)=        de7cec4b35b48498178c9d79fbc3c65632ed8c1d
+TREE IDENTITY: VERIFIED EQUAL by git rev-parse, not asserted.
+  (D126's bank claimed an equality that was false by 506 lines; this line is a check.)
+
+pre-registered: 2476 unchanged. Result (verbatim from the runner's own stdout):
+land98a44ef: mode=per-target rc=0 passed=2476 failed=0 build_errors=0 head=98a44ef log=/Users/idide/wt/artie-research/verify-out/land98a44ef/suite-land98a44ef.log
+land98a44ef: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/land98a44ef/suite-land98a44ef.go.log
+HARNESS_EXIT=0
+
+gate: certify-head OK (head==landing) · staleness COVERED (0 behind, 3 ahead) · prepush OK
+commits landed:
+98a44ef Correct begin_read's provenance note: the artifact IS on main now
+b6d3a70 W4 check 3 re-derived: the artifact and its raw data, WITHOUT the quarantined instrumentation
+bca8468 begin_read: repair a dangling citation I committed into main myself

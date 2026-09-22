@@ -84,10 +84,26 @@ impl TableBranchCatalog {
     /// means a crash between the tree write and the sidecar write leaves a database pointing at a
     /// stale root — silently, because a stale root is a perfectly valid B+tree of an older state.
     ///
-    /// A fixed indirection page moves the volatile value inside the database, where the buffer
-    /// pool's WAL gate already orders writes, and leaves the caller holding an id that is written
-    /// once and never changes. This is the superblock-pointer arrangement: a known location naming
-    /// a moving root, the same shape as SQLite finding `sqlite_schema` at page 1.
+    /// A fixed indirection page moves the volatile value inside the database, so there is ONE
+    /// write to order instead of two files to keep in step, and leaves the caller holding an id
+    /// that is written once and never changes. This is the superblock-pointer arrangement: a known
+    /// location naming a moving root, the same shape as SQLite finding `sqlite_schema` at page 1.
+    ///
+    /// ⚠ **This used to claim the page lands "where the buffer pool's WAL gate already orders
+    /// writes". THAT IS FALSE, and the replacement is stricter than the claim it removes — the
+    /// gate is a provable no-op here, so anything built on it was resting on nothing.**
+    ///
+    /// `BufferPoolManager::wal_gate` flushes only `if plsn > 0`, and `plsn` comes from
+    /// `page_lsn_of`, which is `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }` — an LSN exists
+    /// only for a heap page (0) and a B+tree internal/leaf page (2, 3). This page's first four
+    /// bytes are [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the
+    /// `_ => 0` arm: **the gate does nothing on it.** Nor does it help the tree this page names —
+    /// B+tree pages never set an LSN either, and index structure is not logged at all, because
+    /// `wal::recovery::rebuild_indexes` frees every index tree and builds a fresh one from the
+    /// heap. There is no ordering here for a gate to provide.
+    ///
+    /// ⇒ What the fixed page buys is the single-write sentence above, and nothing more.
+    /// **Do not build a durability argument on the WAL gate.**
     pub fn create_with_header(
         pool: Arc<BufferPoolManager>,
         trunk_root: PageId,
@@ -453,20 +469,23 @@ impl TableBranchCatalog {
         self.upsert(keys::header(), v)
     }
 
-    /// Replace a key's value.
+    /// Replace a key's value, **atomically** — the key is never absent to a concurrent reader.
     ///
-    /// **`BPlusTreeManager::insert` does not replace** — `insert_entry` always inserts, so writing
-    /// an existing key a second time leaves TWO entries and `search` returns whichever the binary
-    /// search lands on. For a catalog that would mean a branch with two records that disagree,
-    /// chosen nondeterministically. Delete-then-insert is the only upsert the storage layer offers.
+    /// `BPlusTreeManager::insert` still does not replace: `insert_entry` always inserts, so
+    /// writing an existing key through it a second time leaves TWO entries and `search` returns
+    /// whichever the binary search lands on. For a catalog that would mean a branch with two
+    /// records that disagree, chosen nondeterministically.
+    ///
+    /// ⛔ This used to be `tree.delete` then `tree.insert`, with **nothing held across the two**.
+    /// `delete` drops the leaf write latch on return and `insert` re-acquires it, so the key did
+    /// not exist for the length of a tree descent on **every ordinary rewrite** — and `core`,
+    /// `get_raw`, `has_live_children`, `max_live_child` and `live_child_in_epoch_range` all read
+    /// it with no lock at all (`logical` is writers-only). D124 is pre-positioned against exactly
+    /// that state on the page paths, and its comments described it as impossible; it was not.
+    /// [`BPlusTreeManager::upsert`] closes the window at the layer that owns the latch.
+    /// SCALE-DESIGN D126; probe in `tests/d126_atomic_upsert.rs` and `mod d126_record_key_probe`.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
-        match self.tree.delete(&key) {
-            Ok(()) => {}
-            // Absent is the normal case for a first write, not an error.
-            Err(FerroError::KeyNotFound) => {}
-            Err(e) => return Err(e),
-        }
-        self.tree.insert(key, value)
+        self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
@@ -518,13 +537,23 @@ impl TableBranchCatalog {
     /// `write_record` for a branch whose keys are **provably new**, which on the fork path means a
     /// freshly minted id.
     ///
-    /// `upsert` is delete-then-insert, because `BPlusTreeManager::insert` does not replace. For a
-    /// key that cannot exist, the delete is a **guaranteed miss: a full B+tree descent whose only
-    /// possible outcome is `KeyNotFound`**. Measured on the child key, same key space and same run:
-    /// `upsert` 0.02280 ms against `tree.insert` 0.01003 ms, so **the wasted delete is 56% of an
-    /// upsert** (`bench/serial_section_profile.txt`). This also skips the arena-span `range_scan`
-    /// that `write_record` performs to reconcile arenas, which for a brand-new child can only ever
-    /// find an empty span.
+    /// ⛔ **D126 RETIRED MOST OF THIS METHOD'S ORIGINAL JUSTIFICATION. Stated rather than left to
+    /// be discovered, because the retired half is the half that carried a number.**
+    ///
+    /// The argument was: `upsert` is delete-then-insert, so for a key that cannot exist the delete
+    /// is a guaranteed miss — a full B+tree descent whose only possible outcome is `KeyNotFound`.
+    /// Measured on the child key, same key space and same run, `upsert` 0.02280 ms against
+    /// `tree.insert` 0.01003 ms, so the wasted delete was 56% of an upsert
+    /// (`bench/serial_section_profile.txt`). **`upsert` is no longer delete-then-insert.** It is
+    /// one descent and one page write, the same shape as `insert`, and the delete it used to pay
+    /// for does not happen: `bench/d126_upsert_cost.txt` measures the replacement at 0.52-0.54x
+    /// the pair, which is that wasted descent going away.
+    ///
+    /// ⇒ What is left of the justification is the part that never depended on the delete: this
+    /// skips the arena-span `range_scan` that `write_record` performs to reconcile arenas, which
+    /// for a brand-new child can only ever find an empty span. **That saving is UNMEASURED** — the
+    /// only number this method ever had was the one D126 removed — so anyone pricing `fork`'s
+    /// serial section should re-take it rather than reusing 56% of anything.
     ///
     /// SAFETY OF "PROVABLY NEW", checked rather than assumed: no path anywhere deletes a `RECORD`
     /// key -- the only operations on `keys::record` are insert, search and upsert -- so a reaped
@@ -561,6 +590,18 @@ impl TableBranchCatalog {
     /// [`CoreRecord`]: the only things ever read from it are the state and deadline index keys, and
     /// typing it that way means a caller can pass the cheap read it already has without the
     /// signature implying the expensive one would be safer.
+    ///
+    /// ⚠ **D126 made the RECORD key's rewrite atomic. It did NOT make this method atomic, and the
+    /// difference is worth stating so the guarantee is not over-read.** The state and deadline
+    /// index keys are not rewritten in place, they MOVE: `remove_if_present(old)` below, then
+    /// `upsert(new)` a few lines later. Between those two a branch is in NEITHER state span and
+    /// neither deadline span, and `live_count`, `in_state` and `expired_before` scan exactly those
+    /// spans without the `logical` lock. No per-key primitive can close that window — the two keys
+    /// are different keys, in general on different pages — so it needs multi-key exclusion or an
+    /// ordering argument, and it is a separate row. The direction it fails in is benign for the
+    /// reaper (`expired_before` missing an entry means "not expired yet", and
+    /// `reap_if_still_expired` re-reads the record anyway), which is why it is noted here rather
+    /// than treated as the same defect.
     fn write_record(
         &self,
         rec: &BranchRecord,
@@ -636,28 +677,34 @@ impl TableBranchCatalog {
     /// as the one-entry answer its other callers want, now written in terms of this.
     /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
     ///
-    /// ⛔ **A missing record cannot mean "the child is gone" — but it does NOT mean "impossible"
-    /// either, and an earlier version of this comment said exactly that and was WRONG.**
+    /// ⛔ **A missing record cannot mean "the child is gone."** Nothing ever leaves a record
+    /// deleted: retirement is a state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled
+    /// slot, and `keys::record` is only ever inserted, searched and upserted — the same fact
+    /// `write_record_new`'s "provably new" argument rests on.
     ///
-    /// The DURABLE form of the claim holds: nothing ever leaves a record deleted. Retirement is a
-    /// state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled slot, and `keys::record`
-    /// is only ever inserted, searched and upserted — the same fact `write_record_new`'s
-    /// "provably new" argument rests on.
+    /// # What D126 changed here, and what it did not
     ///
-    /// The TRANSIENT form does not hold. `BPlusTreeManager` has no replace primitive (see
-    /// `upsert`, which says so), so `upsert` is DELETE-THEN-INSERT; `delete` drops its leaf write
-    /// latch when it returns and `insert` re-acquires, and `write_record` routes the RECORD key
-    /// straight through it. So during any `set_root`, `renew_lease`, `set_state`, `reparent`,
-    /// `restrict_envelope` or `put` — two of those are hot-path writes — the key is briefly
-    /// ABSENT. Every reader here is lockless: `logical` is writers-only. **A reader can therefore
-    /// see "no record" for a perfectly healthy, live branch.**
+    /// An earlier version of this comment called the state impossible. It was not, and the reason
+    /// was `upsert`: with no replace primitive on the tree it was DELETE-THEN-INSERT, `delete`
+    /// dropped its leaf write latch on return and `insert` re-acquired, and `write_record` routed
+    /// the RECORD key through the pair. Every `set_root`, `renew_lease`, `set_state`, `reparent`,
+    /// `restrict_envelope` and `put` — two of them hot-path writes — left the key briefly ABSENT,
+    /// and every reader here is lockless because `logical` is writers-only. **A reader could see
+    /// "no record" for a perfectly healthy, live branch.**
     ///
-    /// That is not a reason to resolve it; it is the reason refusing is right. A reader cannot
-    /// distinguish "mid-rewrite" from "never published", and freeing on that ambiguity destroys a
-    /// live branch's pages. Refusing costs a spurious error on a healthy database; resolving
-    /// costs the data. **SCALE-DESIGN D126 closes the window** by giving the tree a real replace,
-    /// after which this really is unreachable — that is a storage-layer change and deliberately
-    /// not part of D124.
+    /// **D126 closed that window** ([`crate::storage::index::BPlusTreeManager::upsert`]). Measured
+    /// on the RECORD key itself in `mod d126_record_key_probe`: the delete-then-insert control
+    /// misses 18,515 times in 156,409 lockless reads, the same rewrite through `upsert` misses 0
+    /// in 140,113, and a 300-iteration `set_root` loop misses 0 in 9,401,816.
+    ///
+    /// ⇒ This arm is no longer reachable from an ordinary write. It is still refused, for a
+    /// different reason than before: what remains is a branch that was never published — which
+    /// `attach_child` and `add_arena` refuse to create, so it means an older database or a bug —
+    /// or genuine corruption. Freeing is irreversible and refusing is retryable, so guessing the
+    /// destructive direction is wrong whichever of the two it is.
+    ///
+    /// ⚠ **That makes this `Corrupt` a REAL signal rather than an expected artefact of a hot-path
+    /// write — which makes D127, the reaper swallowing it, matter more rather than less.**
     ///
     /// **D124 — both resolvers used to answer "not a pin" here, which is the DESTRUCTIVE
     /// direction.** The parent then reads as childless, `reap_expired` frees its pages, and a
@@ -673,13 +720,14 @@ impl TableBranchCatalog {
             _ => format!("malformed CHILD key {key:02x?}"),
         };
         BranchError::Corrupt(format!(
-            "CHILD entry ({which}) names branch {child_id}, which has no record right now. That \
-             is either a branch that was never published, or — far more likely on a healthy \
-             database — one whose record is mid-rewrite: upsert is delete-then-insert and holds \
-             no latch across the two, so set_root/renew_lease/set_state briefly remove the key. \
-             A reader cannot tell those apart, so this refuses instead of resolving it to \"not \
-             a live child\", which would let the parent's pages be freed underneath a branch \
-             that may still be reading them. Retry is safe; see D124/D126."
+            "CHILD entry ({which}) names branch {child_id}, which has no record. Nothing ever \
+             deletes a record — retirement is a state flip to Reaped — and since D126 there is \
+             no rewrite window either: upsert replaces a value under one hold of the leaf latch, \
+             so an ordinary set_root/renew_lease/set_state no longer makes the key momentarily \
+             absent. What is left is a branch that was never published, or a corrupt entry. This \
+             refuses instead of resolving it to \"not a live child\", which would let the \
+             parent's pages be freed underneath a branch that may still be reading them. \
+             Refusing leaks at worst and is retryable; see D124/D126."
         ))
         .into()
     }
@@ -698,9 +746,10 @@ impl TableBranchCatalog {
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
-            // `dangling_child` has the reason: the state is NOT impossible — a concurrent
-            // `set_root` on this very child removes its RECORD key for the length of an upsert —
-            // and a reader that cannot tell "mid-rewrite" from "never existed" must not free.
+            // `dangling_child` has the reason. It used to be "a concurrent `set_root` on this
+            // very child removes its RECORD key for the length of an upsert"; D126 closed that
+            // window, and the arm stays because what is left — never published, or corrupt — is
+            // still not something to resolve in the direction that FREES pages.
             None => return Err(Self::dangling_child(key, child_id)),
         })
     }
@@ -1255,10 +1304,10 @@ impl BranchCatalog for TableBranchCatalog {
         // can create one; `fork` writes the record before the child key under this same lock, so
         // it cannot create one either.
         //
-        // ⚠ This removes the PERMANENT form and not the transient one. A record can also be
-        // missing for the length of an `upsert` on a perfectly healthy branch, which this check
-        // cannot prevent and the resolvers therefore still have to refuse — see `dangling_child`,
-        // and D126 for the fix that removes the window itself.
+        // ⚠ This removes the PERMANENT form. The transient one — a record missing for the length
+        // of an `upsert` on a perfectly healthy branch — was never preventable here, and is now
+        // gone at its source: D126 made `upsert` an in-place replace under one latch hold. The
+        // resolvers still refuse a dangling entry, for the residual reasons in `dangling_child`.
         //
         // One extra point lookup, and it is free where it matters: `migrate_from` is the only
         // production caller (D63 deleted `collapse`) and it already writes every record before it
@@ -1360,6 +1409,260 @@ impl BranchCatalog for TableBranchCatalog {
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)
+    }
+}
+
+#[cfg(test)]
+mod d126_record_key_probe {
+    //! **D126 at the key that matters: the branch RECORD key must never be transiently absent.**
+    //!
+    //! `tests/d126_atomic_upsert.rs` proves the tree primitive. This proves the catalog uses it,
+    //! on the exact key D124's page guards read, and it lives here rather than in `tests/` for one
+    //! reason: the CONTROL has to reproduce the old `upsert` on the real RECORD key, which means
+    //! reaching `self.tree` — private, and deliberately so.
+    //!
+    //! Three arms, in this order, because the later ones are only admissible after the first:
+    //!
+    //! 1. **CONTROL — `tree.delete` then `tree.insert` on `keys::record(id)`.** Exactly what
+    //!    `upsert` was. It MUST make `get_raw` miss, or the probe cannot see the defect and the
+    //!    two zeros below are worthless.
+    //! 2. **TREATMENT — `cat.upsert(keys::record(id), ..)`.** Same key, same readers, same write
+    //!    count, one call in place of two. Must be zero, with at least a comparable number of
+    //!    reads behind that zero.
+    //! 3. **REALISM — `set_root` in a loop.** The actual hot-path caller, fsync and all. Zero.
+    //!
+    //! The reader is `get_raw`, which is what `arena::free_page` and
+    //! `reaper::drain_pending_seeded` call, and it takes no lock: `logical` is writers-only.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    const READERS: usize = 3;
+
+    fn fresh(tag: &str) -> (Arc<TableBranchCatalog>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d126-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{tag}.branchcat"));
+        let _ = std::fs::remove_file(&path);
+        (Arc::new(TableBranchCatalog::open_sidecar(&path, 1).expect("open")), path)
+    }
+
+    #[derive(Debug, Default)]
+    struct Arm {
+        misses: u64,
+        reads: u64,
+    }
+
+    /// Spin `READERS` threads on `get_raw(id)` while the caller rewrites that branch's record.
+    fn probe<W: FnOnce()>(cat: &Arc<TableBranchCatalog>, id: u64, write: W) -> Arm {
+        let stop = Arc::new(AtomicBool::new(false));
+        let misses = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..READERS {
+            let (c, stop, misses, reads) =
+                (Arc::clone(cat), Arc::clone(&stop), Arc::clone(&misses), Arc::clone(&reads));
+            hs.push(std::thread::spawn(move || {
+                let (mut m, mut r) = (0u64, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    // `core`, not `get_raw`: `get_raw` hydrates, which adds an arena range_scan
+                    // between the record read and the answer and would let a miss be masked by
+                    // timing rather than by correctness. The record read is the thing on trial.
+                    if c.core(id).expect("core read").is_none() {
+                        m += 1;
+                    }
+                    r += 1;
+                }
+                misses.fetch_add(m, Ordering::Relaxed);
+                reads.fetch_add(r, Ordering::Relaxed);
+            }));
+        }
+        // Let the readers get going before the rewrites start; otherwise a fast writer can finish
+        // inside thread spawn and the arm reports a zero it never earned. The `reads > 0` assert
+        // at each call site is what actually enforces this.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write();
+        stop.store(true, Ordering::Relaxed);
+        for h in hs {
+            h.join().expect("reader");
+        }
+        Arm { misses: misses.load(Ordering::Relaxed), reads: reads.load(Ordering::Relaxed) }
+    }
+
+    /// Rewrites per arm. Arms 1 and 2 are raw key writes; arm 3 pays an fsync each, so it gets a
+    /// smaller count and its own `reads` assertion rather than a shared one.
+    const RAW_WRITES: usize = 4_000;
+    const SET_ROOT_WRITES: usize = 300;
+
+    #[test]
+    fn the_record_key_is_never_absent_while_it_is_rewritten() {
+        let lease = LeaseDeadline(u64::MAX);
+
+        // ---- 1. CONTROL: the delete-then-insert `upsert` used to be. It must fire. ----
+        let (c1, _p1) = fresh("control");
+        let child = c1.fork(BranchId::TRUNK, lease).expect("fork");
+        let id = child.branch_id.id;
+        let bytes = child.serialize_core();
+        let c1w = Arc::clone(&c1);
+        let control = probe(&c1, id, move || {
+            for _ in 0..RAW_WRITES {
+                match c1w.tree.delete(&keys::record(id)) {
+                    Ok(()) | Err(FerroError::KeyNotFound) => {}
+                    Err(e) => panic!("control delete: {e:?}"),
+                }
+                c1w.tree.insert(keys::record(id), bytes.clone()).expect("control insert");
+            }
+        });
+        println!("D126 catalog CONTROL  (delete+insert): misses={} reads={}", control.misses, control.reads);
+
+        // ---- 2. TREATMENT: the same rewrite through the catalog's own `upsert`. ----
+        let (c2, _p2) = fresh("treatment");
+        let child2 = c2.fork(BranchId::TRUNK, lease).expect("fork");
+        let id2 = child2.branch_id.id;
+        let bytes2 = child2.serialize_core();
+        let c2w = Arc::clone(&c2);
+        let treatment = probe(&c2, id2, move || {
+            for _ in 0..RAW_WRITES {
+                c2w.upsert(keys::record(id2), bytes2.clone()).expect("upsert");
+            }
+        });
+        println!("D126 catalog TREATMENT (upsert)      : misses={} reads={}", treatment.misses, treatment.reads);
+
+        // ---- 3. REALISM: the hot-path caller, whole. ----
+        let (c3, _p3) = fresh("set_root");
+        let child3 = c3.fork(BranchId::TRUNK, lease).expect("fork");
+        let bid = child3.branch_id;
+        let c3w = Arc::clone(&c3);
+        let real = probe(&c3, bid.id, move || {
+            for i in 0..SET_ROOT_WRITES {
+                c3w.set_root(bid, 900_000 + i as u32).expect("set_root");
+            }
+        });
+        println!("D126 catalog set_root                : misses={} reads={}", real.misses, real.reads);
+
+        // ---- Every arm has REPORTED before any assertion fires. ----
+        //
+        // Deliberate: the first cut asserted arm by arm, and the before-the-fix run therefore
+        // died on arm 2 and never printed arm 3 at all. The number that shows `set_root` -- the
+        // hot-path caller, the one that makes this more than a storage-layer curiosity -- was
+        // the one the ordering threw away. A probe should not hide its own evidence.
+        assert!(control.reads > 0, "the control's readers never ran");
+        assert!(
+            control.misses > 0,
+            "THE PROBE IS NOT DISCRIMINATING. delete-then-insert on the RECORD key leaves it \
+             absent between the two calls by construction, and {READERS} readers over \
+             {RAW_WRITES} rewrites saw it {} times in {} reads. The zeros below mean nothing \
+             until this fires.",
+            control.misses,
+            control.reads
+        );
+        assert_eq!(
+            treatment.misses, 0,
+            "the RECORD key was absent {} times in {} reads while `upsert` rewrote it",
+            treatment.misses, treatment.reads
+        );
+        assert!(
+            treatment.reads >= control.reads / 4,
+            "the treatment arm's readers did only {} reads against the control's {}; its zero is \
+             not comparable to the control's positive count",
+            treatment.reads,
+            control.reads
+        );
+        assert!(real.reads > 0, "the set_root arm's readers never ran");
+        assert_eq!(
+            real.misses, 0,
+            "`set_root` un-read a live branch's record {} times in {} reads",
+            real.misses, real.reads
+        );
+        // The rewrites actually landed, so the zero is not the zero of a writer that did nothing.
+        assert_eq!(
+            c3.get_raw(bid.id).expect("record").root_page_id,
+            900_000 + (SET_ROOT_WRITES - 1) as u32,
+            "set_root did not write what the arm counted"
+        );
+    }
+
+    /// The other hot-path rewrite, read through the method D124's page guards actually call —
+    /// and with a **NEIGHBOUR record that is never rewritten**, read on the same schedule by the
+    /// same threads.
+    ///
+    /// Two things the arms above do not say, which this one does:
+    ///
+    /// * `renew_lease` is the second hot-path caller named in SCALE-DESIGN and reaches `upsert`
+    ///   through `write_record` exactly as `set_root` does. Covered by argument is not covered.
+    /// * The reader here is `get_raw`, which is what `arena::free_page` and
+    ///   `reaper::drain_pending_seeded` call. `core` (above) is the tighter instrument; `get_raw`
+    ///   is the one whose answer the page paths act on, and it hydrates — so a zero from `core`
+    ///   does not by itself say the callers are safe.
+    /// * The neighbour is the negative control **inside the treatment arm**. It shares a leaf with
+    ///   the target, so every page write the rewriter performs passes straight over it. If the
+    ///   lockless reader were unsound in some way that had nothing to do with delete-then-insert —
+    ///   a torn snapshot, a descent that loses a page mid-write — the neighbour would miss too.
+    ///   It must not, and the target's zero is only worth something alongside it.
+    ///
+    /// **Fire-checked, and it fires.** With `upsert` put back to `tree.delete` then `tree.insert`
+    /// and nothing else changed, this arm reports `target_miss=255 neighbour_miss=0` in 125,170
+    /// reads — the target vanishes, the neighbour does not, which is exactly the discrimination
+    /// this arm claims. The miss count is a race and varies run to run (214 and 255 on two
+    /// consecutive runs); the neighbour's zero did not. Log: `bench/d126_probe_before.txt`.
+    #[test]
+    fn renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves() {
+        let lease = LeaseDeadline(u64::MAX);
+        let (cat, _p) = fresh("renew");
+        let target = cat.fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+        let neighbour = cat.fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+        cat.get_raw(target.id).expect("target readable before the probe");
+        cat.get_raw(neighbour.id).expect("neighbour readable before the probe");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let target_miss = Arc::new(AtomicU64::new(0));
+        let neighbour_miss = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..READERS {
+            let (c, stop, tm, nm, reads) = (
+                Arc::clone(&cat),
+                Arc::clone(&stop),
+                Arc::clone(&target_miss),
+                Arc::clone(&neighbour_miss),
+                Arc::clone(&reads),
+            );
+            hs.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if c.get_raw(target.id).is_err() {
+                        tm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if c.get_raw(neighbour.id).is_err() {
+                        nm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reads.fetch_add(2, Ordering::Relaxed);
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 0..SET_ROOT_WRITES {
+            cat.renew_lease(target, LeaseDeadline(u64::MAX - i as u64)).expect("renew_lease");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in hs {
+            h.join().expect("reader");
+        }
+        let (tm, nm, r) = (
+            target_miss.load(Ordering::Relaxed),
+            neighbour_miss.load(Ordering::Relaxed),
+            reads.load(Ordering::Relaxed),
+        );
+        println!("D126 catalog renew_lease/get_raw     : target_miss={tm} neighbour_miss={nm} reads={r}");
+        assert!(r > 0, "the readers never ran; this arm proves nothing");
+        assert_eq!(
+            nm, 0,
+            "the NEVER-REWRITTEN neighbour record went missing {nm} times in {r} reads. That is \
+             not the D126 window — nothing rewrites it — so it is an unsound reader or an \
+             unsound page write, and it would invalidate the target's zero."
+        );
+        assert_eq!(
+            tm, 0,
+            "`renew_lease` made `get_raw` miss a live branch's record {tm} times in {r} reads"
+        );
     }
 }
 
@@ -1470,7 +1773,11 @@ mod serial_section_profile {
         let t_publish = timed(N, || {
             cat.publish_root().unwrap();
         });
-        // One upsert on its own, to price the delete-then-insert that `write_record` does 3x.
+        // One upsert on its own, for scale against the 3 that `write_record` performs.
+        // ⚠ Since D126 this is an in-place replace, not the delete-then-insert it was when this
+        // profile was first taken, so the 0.01344 ms in `bench/serial_section_profile.txt` is a
+        // PRE-D126 number. `bench/d126_upsert_cost.txt` prices the change at 0.52-0.54x; re-run
+        // this profiler before quoting its upsert row again.
         let t_upsert = timed(N, || {
             cat.upsert(keys::state(child.state.as_u8(), child.branch_id.id), Vec::new()).unwrap();
         });

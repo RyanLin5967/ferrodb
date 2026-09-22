@@ -254,6 +254,16 @@ impl ProvenanceStore for MemProvenanceStore {
             .unwrap_or(ProvId::NONE))
     }
 
+    fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        let mut out: Vec<(u32, usize)> =
+            inner.pages.iter().map(|(p, d)| (*p, d.dictionary_len())).collect();
+        // `pages` is a `HashMap`, so the iteration order is not stable across calls and two
+        // samples of the same store would not line up. Ordering here rather than at every caller.
+        out.sort_unstable();
+        Ok(out)
+    }
+
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
         if id.is_none() {
             return Err(FerroError::Provenance(

@@ -1,0 +1,22 @@
+CI RUSTFLAGS (read from .github/workflows/tests.yml): -D duplicate_macro_attributes -D dead_code
+
+== FFI gate sweep (examples/ and src/) ==
+ok: no ungated extern "C"
+
+== RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo build --examples ==
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 1 warning (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.07s
+
+== RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo check --all-targets ==
+
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.05s
+
+== cargo check --target x86_64-pc-windows-msvc (compiles the cfg(not(unix)) arms) ==
+ok (note: this does NOT link, so it cannot see a missing POSIX symbol — check 1 is what covers that)
+
+PREPUSH: OK — the checks CI runs that the suite does not.
+  This is NOT a substitute for tools/verify-suite.sh, and it says nothing about head=.
+  Run all three: verify-suite.sh, certify-head.sh, and this.
+PREPUSH_EXIT=0
