@@ -280,6 +280,13 @@ impl Statement {
         let verb = command_tag_verb(&stmt);
         // The catalog is needed for both halves of the answer — what the parameters are and what
         // the columns are — and both are read under one acquisition.
+        //
+        // ⚠ This is an EXCLUSIVE acquisition on the path of every statement, read or write: it
+        // announces a writer and drains readers before a `SELECT` has even been dispatched. In the
+        // extended protocol it fires once per `Parse`, so a driver that caches prepared statements
+        // pays it once; in the simple query protocol it fires on every statement. W4 check 3
+        // counts it separately for exactly that reason.
+        crate::pgwire::standdown::note_site(crate::pgwire::standdown::Site::Parse);
         let catalog = ctx.catalog();
         let param_oids = params::infer_types(&stmt, nparams, declared, &catalog);
         let fields =
@@ -354,6 +361,9 @@ impl Statement {
                             // **The catalog lock, held for exactly one statement.** See
                             // `pgwire::serve` for why this is the outermost lock and why holding
                             // it for longer would rebuild the sequential server this replaced.
+                            crate::pgwire::standdown::note_site(
+                                crate::pgwire::standdown::Site::ExecExclusive,
+                            );
                             let mut catalog = ctx.catalog();
                             let o =
                                 run(stmt, &mut catalog, ctx.bp.clone(), ctx.txn.clone(), session)?;

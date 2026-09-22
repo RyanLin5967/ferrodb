@@ -6,6 +6,12 @@ edition = "2024"
 
 [dependencies]
 
+[features]
+# W4 check 3's stand-down counters. OFF by default so the shipped path carries no extra atomics;
+# `pgwire::standdown::counts()` answers `None` without it, which is what lets a harness tell
+# "not instrumented" from "instrumented and never stood down". See `src/pgwire/standdown.rs`.
+w4-standdown-count = []
+
 [dev-dependencies]
 tempfile = "3.27.0"
 proptest = "1.11.0"

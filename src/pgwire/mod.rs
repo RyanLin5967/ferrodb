@@ -20,6 +20,7 @@ pub mod extended;
 pub mod message;
 pub mod params;
 pub mod session;
+pub mod standdown;
 pub mod types;
 
 use std::io::{BufReader, Read, Write};
@@ -151,6 +152,10 @@ impl ServerContext {
         // returning `Option` instead of exposing `is_read()`. Draining unconditionally is
         // strictly stronger and costs nothing when no read is in flight, which is the common
         // case: the scan is N atomic loads over live connections.
+        //
+        // W4 check 3's instrument, counted HERE rather than at the call sites so that it counts
+        // every acquirer including ones nobody tagged; see `standdown` for why that matters.
+        standdown::note_acquire();
         self.drain_readers();
         CatalogGuard { inner, epoch: &self.epoch, writer_active: &self.writer_active }
     }
@@ -203,8 +208,10 @@ impl ServerContext {
         slot.store(true, SeqCst);
         if self.writer_active.load(SeqCst) {
             slot.store(false, SeqCst);
+            standdown::note_stood_down();
             return None;
         }
+        standdown::note_admitted();
         Some(ReadPass { slot })
     }
 
@@ -228,6 +235,7 @@ impl ServerContext {
             // Taking the exclusive lock here is correct and rare: only on first use and after a
             // schema change. It is the one place the read path can block, and it cannot livelock
             // because `now` is re-read on the next statement, not spun on.
+            standdown::note_site(standdown::Site::ReadRefresh);
             let snapshot = Arc::new(self.catalog().clone());
             *cache = Some((now, snapshot));
         }
