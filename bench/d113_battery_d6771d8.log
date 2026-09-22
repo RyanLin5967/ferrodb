@@ -1,0 +1,41 @@
+=== D113 battery  start=2026-09-22T00:35:43Z ===
+head=d6771d8  branch=D113-compact-refusal
+ACQUIRED D113-battery  load_at_acquire=2
+load_at_acquire above; counters only below, no durations are reported as results
+
+=== ARM 1: the D113 tests WITH the fix (expect every one to pass) ===
+running 5 tests
+refused insert rewrote 213 bytes
+refused replace rewrote 213 bytes
+partial promotion placed 1/3 separators
+test cow::tests_compact_refusal::a_refused_insert_leaves_a_page_that_verifies ... ok
+test cow::tests_compact_refusal::a_refused_replace_leaves_a_page_that_verifies ... ok
+test cow::tests_compact_refusal::a_partial_promotion_leaves_a_page_that_verifies ... ok
+rows missing -- control: 0 base, 0 gap;  starved: 28 base, 165 gap
+test cow::tests_compact_refusal::a_starved_insert_loses_no_row_that_the_unstarved_control_keeps ... FAILED
+starved failures: 300 (300 rewrote page bytes, 8 left a page compacted in place)
+test cow::tests_compact_refusal::a_starved_allocation_never_leaves_an_unverifiable_page ... ok
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 1587 filtered out; finished in 26.60s
+error: test failed, to rerun pass `--lib`
+
+=== ARM 2: FIRE-CHECK -- delete the stamp; the same tests must go RED ===
+ src/cow/node.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+running 5 tests
+test cow::tests_compact_refusal::a_partial_promotion_leaves_a_page_that_verifies ... FAILED
+test cow::tests_compact_refusal::a_refused_replace_leaves_a_page_that_verifies ... FAILED
+test cow::tests_compact_refusal::a_refused_insert_leaves_a_page_that_verifies ... FAILED
+test cow::tests_compact_refusal::a_starved_insert_loses_no_row_that_the_unstarved_control_keeps ... FAILED
+test cow::tests_compact_refusal::a_starved_allocation_never_leaves_an_unverifiable_page ... FAILED
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 1587 filtered out; finished in 0.72s
+error: test failed, to rerun pass `--lib`
+restore OK: node.rs matches HEAD and the pre-mutation backup byte for byte
+
+=== ARM 3: the whole cow suite WITH the fix ===
+failures:
+failures:
+    cow::tests_compact_refusal::a_starved_insert_loses_no_row_that_the_unstarved_control_keeps
+test result: FAILED. 146 passed; 1 failed; 0 ignored; 0 measured; 1445 filtered out; finished in 27.73s
+error: test failed, to rerun pass `--lib`
+
+=== end=2026-09-22T01:21:06Z  dirty_files=0 ===
