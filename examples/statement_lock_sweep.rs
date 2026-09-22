@@ -1,11 +1,24 @@
 //! W4 — how long does `forget_reaped_branches` block an unrelated statement?
 //!
 //! ⚠ **This file is about `AgentRuntime`'s `Mutex<State>` and nothing else.** It builds an
-//! `AgentRuntime` directly and never constructs a `RuntimeLock`, so it has never measured the
-//! server's per-statement mutex — the OUTER lock `lease_thread::scan_once` takes. Confusing the
-//! two is the error `bench/w4/DECISION.md` addendum 1 exists to correct, so it is said here as
-//! well as there. The outer lock is measured by `examples/outer_runtime_lock.rs` (D98), which
-//! wires a real `ServerContext` and probes the mutex statements actually take.
+//! `AgentRuntime` directly and never constructs a `RuntimeLock`, so it has never measured
+//! `ServerContext::catalog()`, the mutex a statement actually serialises on. Confusing the two is
+//! the error `bench/w4/DECISION.md` exists to correct, so it is said here as well as there. That
+//! mutex is measured by `examples/outer_runtime_lock.rs` (D98), which wires a real `ServerContext`.
+//!
+//! ⛔ **Corrected by D158 (2026-09-22): this paragraph used to cite `DECISION.md` ADDENDUM 1 and
+//! to call the thing it is not measuring "the OUTER lock `lease_thread::scan_once` takes".**
+//! Addendum 1 is the section that file's own head says not to quote (*"Addendum 5 (D98) closes it
+//! … do not quote a 'still open' list from addendum 1 or 3"*), and pointing at `scan_once` names
+//! the CLOSED half. `ServerContext::catalog()` has two distinct holders and the bare name `W4`
+//! covered both:
+//!   * **`W4-sweep`** — the lease thread's hold, via `RuntimeLock`. **Closed by D98**: one
+//!     `with_lock` per chunk at `REAP_CHUNK == 1`, everything else outside, 51.6 s → 161.8 ms p99.
+//!   * **`W4-statement`** — every connection's hold, `pgwire/extended.rs:283` and `:357`, taken
+//!     outermost for one statement. **Open, and it is the gate** — it is why wiring `CommitGroup`
+//!     is inert, since statements serialise before reaching the fsync.
+//! This harness is orthogonal to both: it measures a THIRD lock, `AgentRuntime`'s `Mutex<State>`.
+//! See `SCALE-DESIGN.md` D158 and amendment 1.
 //!
 //! `AgentRuntime` holds one `Mutex<State>`, taken by every statement that touches branch state.
 //! `forget_reaped_branches` runs in three phases: phase 1 walks `state.workspaces` **holding that
