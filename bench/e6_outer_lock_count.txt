@@ -2,6 +2,11 @@ E.6 -- DOES EVERY W-B SCALING NUMBER MEASURE A LAYER PRODUCTION NEVER REACHES UN
 =========================================================================================
 
 Base commit: ee24331
+branch:      E6-outer-lock-count   (created as E6-outer-lock-count-2 and renamed after
+             certification; a rename moves no sha, so the certification below still holds)
+head:        ed598e4 -- THE COMMIT THE TABLE BELOW WAS MEASURED AT. It carries the Cargo
+             feature, the counter in `ServerContext::catalog()` and the harness. This file is
+             committed on top of it and changes nothing the harness runs.
 Question:    count acquisitions of `ServerContext::catalog()` during a concurrent-fork workload
              driven THROUGH PGWIRE, against the same workload driven DIRECTLY.
 Instrument:  a process-global AtomicU64 incremented inside `ServerContext::catalog()` itself,
@@ -225,6 +230,44 @@ READING IT
 
 SUITE
 -----
+
+PROVENANCE OF THE 2449 BASELINE -- raised as UNBACKED, and it is in fact BACKED. Recorded here
+because the next reader will grep this file for why the number is trusted, and because the
+negative that raised the doubt was correct on its own terms and should not be read as sloppy.
+
+  THE DOUBT, as raised: `passed=2449` appeared in no file in the ferrodb working tree, and
+  `ee24331` appeared in no file either; the highest recorded count among the eleven
+  `bench/<row>_certified/` directories was `passed=2139 head=91270f9` in `bench/d60_certified/`.
+  That search was of a working tree and explicitly did not cover git history.
+
+  WHY IT CAME BACK EMPTY, AND WHY THAT IS NOT A CONTRADICTION. The evidence was banked at
+  commit 8b18fa2, `bank the 2449 certification evidence: it lived only in a volatile VERIFY_OUT
+  dir`, which adds `bench/land22_certified/{SUMMARY.txt,suite-land22-52e1137.log,.go.log}`.
+  8b18fa2 is on `main` but is NOT AN ANCESTOR OF ee24331 -- it landed after this row's base. So
+  a search of the tree at or below ee24331 structurally could not see it, and the scope limit
+  the negative stated for itself is exactly the gap the result fell through. `git log --all
+  --oneline -S2449` finds it; `git grep 2449 ee24331 -- bench tools` does not, and both are
+  right.
+
+  WHAT IT SAYS, verbatim from bench/land22_certified/SUMMARY.txt at 8b18fa2:
+    land22-52e1137: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=52e1137
+    land22-52e1137: go rc=0 passed=97 failed=0
+
+  THAT GREEN NAMES 52e1137, NOT ee24331, and its own text says so, adding that every later push
+  is bench-only and code-identical -- then instructs the reader to re-run the diff rather than
+  trust the sentence. Re-run here, not trusted:
+    git diff --stat 52e1137..ee24331 -- src examples tests tools Cargo.toml Cargo.lock cdc-consumer
+    -> EMPTY. ee24331 is code-identical to the commit the 2449 certifies.
+    git diff --stat 52e1137..ed598e4 -- <same paths>
+    -> exactly Cargo.toml (+7), examples/e6_outer_lock_count.rs (+636), src/pgwire/mod.rs (+41).
+       Nothing else in the code differs between the certified baseline and this row's head.
+
+  SO THE BASELINE IS CORROBORATED TWICE, BY TWO INDEPENDENT RUNS ON DIFFERENT COMMITS: 2449 at
+  52e1137 (banked) and 2449 at ed598e4 (below), with the Go suite at 97 in both. No second
+  baseline run was needed and none was made. The d60_certified 2139 is a real earlier
+  calibration point and is not in conflict -- it is an older head (91270f9), and the suite has
+  grown since.
+
 Baseline at ee24331: rc=0 passed=2449 failed=0
 This tree, DEFAULT FEATURES (lock_census off -- default features are what ships):
   rc=0 passed=2449 failed=0 build_errors=0     -- IDENTICAL TO THE BASELINE COUNT.
@@ -241,6 +284,17 @@ This tree, DEFAULT FEATURES (lock_census off -- default features are what ships)
   Certified:
     ./tools/certify-head.sh /Users/idide/wt/logs/e6-verify ed598e4
     certify-head: OK -- suite head=ed598e4 == landing ed598e4
+
+  EVIDENCE BANKED IN THE REPO, for the same reason 8b18fa2 banked land22's: a $VERIFY_OUT dir
+  is volatile and the next suite overwrites it. See `bench/e6_outer_lock_count_certified/`,
+  holding SUMMARY.txt and both raw logs.
+
+  Staleness, run before quoting the count (this row edits src/pgwire/mod.rs, which every
+  example links against, and this repo has had a stale-artifact run fail 53 tests):
+    ./tools/staleness.sh /Users/idide/wt/ferrodb-E6-outer-lock-count-2
+    -> "0 behind, 259 ahead"  COVERED  (rc=0)
+  verify-suite.sh also rebuilds examples itself before measuring and refuses if that build
+  fails, so the rebuild is part of the measurement rather than something the caller remembered.
 
   WHICH COMMIT THAT GREEN CERTIFIES, stated rather than implied. ed598e4 is the commit carrying
   the Cargo feature, the counter in `ServerContext::catalog()` and the harness -- everything the
