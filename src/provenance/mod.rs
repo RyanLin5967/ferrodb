@@ -169,6 +169,20 @@ pub trait ProvenanceStore: Send + Sync {
     /// Stamp a version with its author. Called on the write path, once per version, one `u32`.
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
 
+    /// Every page that carries attribution, as `(page_id, distinct runs in its dictionary)`.
+    ///
+    /// The per-page dictionary refuses past [`MAX_PAGE_DICT_ENTRIES`], so *how close a workload
+    /// runs to that cap* is a property of the workload rather than of any one page. Nothing else
+    /// on this trait can answer it: `attribute` speaks about one slot, and
+    /// `MemProvenanceStore::page_dictionary_len` about one page whose id you already knew. Those
+    /// cannot tell a single hot page from a saturated page population — which are opposite
+    /// findings — because both require enumerating the pages that exist.
+    ///
+    /// Deliberately a **required** method with no default. A default returning an empty `Vec`
+    /// would let an implementation report "no page is anywhere near the cap" for a store that had
+    /// simply never been asked, which is the one wrong answer that reads exactly like a clean one.
+    fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError>;
+
     // ── Logical row attribution ─────────────────────────────────────────────────────────────────
     //
     // `stamp` / `attribute` above are keyed by the PHYSICAL `(page_id, slot_num)`, because that is
