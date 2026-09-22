@@ -1,0 +1,2 @@
+d154-24ac53c: mode=per-target rc=0 passed=2529 failed=0 build_errors=0 head=24ac53c log=/Users/idide/wt/artie-research/verify-out/d154-24ac53c/suite-d154-24ac53c.log
+d154-24ac53c: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d154-24ac53c/suite-d154-24ac53c.go.log

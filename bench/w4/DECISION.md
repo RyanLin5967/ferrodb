@@ -3,10 +3,14 @@
 Status: done, measured, committed. Evidence files in this directory are the raw runs; every number
 below names the file it came from.
 
-**Read addendum 5 before acting on this record; there are five, and the last one moves things the
-first four called open.** Everything in the sections above is about `AgentRuntime`'s `Mutex<State>`
-and holds. It is not the only lock the sweep runs under, and the brief's 39.3 s headline is about
-the other one — the pgwire per-statement mutex that `scan_once` held across the *entire* call,
+**Read addenda 5 AND 6 before acting on this record; there are six, and each of the last two moves
+something every addendum before it called open.** Addendum 6 (D158 item 1) closes the
+generation-blind `workspaces` map that FOUR separate "still open" lists in this file leave standing
+— and it was not merely open, it was a **live cross-agent read and a live cross-agent delete over
+pgwire**, not the latent hazard those lists describe. Everything in the sections above is about
+`AgentRuntime`'s `Mutex<State>` and holds. It is not the only lock the sweep runs under, and the
+brief's 39.3 s headline is about the other one — the pgwire per-statement mutex that `scan_once`
+held across the *entire* call,
 phase 2 included. Addendum 1 found it and said the work here did not touch it; addendum 1 and
 addendum 3 both left it on their "still open" lists.
 
@@ -159,13 +163,18 @@ naming the slot.
    measurement's positive control — fixing it would remove the evidence that the prober can still
    see an O(sessions) hold at all. If it is fixed later, a replacement control has to be built in
    the same commit or the harness stops proving anything.
-2. **Workspace lookups are generation-blind.** `blind_writes` — and every other
+2. ⛔ **SUPERSEDED BY ADDENDUM 6 — DO NOT ACT ON THIS ITEM.** It was right that the lookups were
+   generation-blind and wrong to file it as something measured and left: it was reachable over
+   pgwire and it crossed agents. As written —
+   *"**Workspace lookups are generation-blind.** `blind_writes` — and every other
    `state.workspaces.get(&branch.id)` — is keyed by the id slot alone, so a caller holding a stale
-   `BranchId` is answered about the slot's *new* occupant instead of being refused. The catalog
+   `BranchId` is answered about the slot's new occupant instead of being refused. The catalog
    refuses a stale generation (`BranchError::Reaped`); the runtime's workspace map has no such
    check. Reproduction is recorded in `tests/w4_sweep_slot_recycle.rs` at the point that measured
    it. Closing it means a generation check at every workspace lookup — a different change from this
-   one, and a wider one.
+   one, and a wider one."*
+   The map is now keyed by the whole `BranchId`, which is neither "a generation check at every
+   lookup" nor wider — it is one key change that deletes the need for the check. See addendum 6.
 
 ## Addendum — the OTHER lock, found after this record said "done"
 
@@ -339,9 +348,10 @@ first draft tripping it instead, which is recorded in the test rather than tidie
 
 - "Two things measured and deliberately NOT fixed", item 2, said workspace lookups are
   generation-blind and left it. The **escrow half of that is now fixed** (`82b4eb0`): `Pool::claimed`
-  and `Pool::spent` are keyed by the whole `BranchId`. What remains open is the `workspaces` map
-  itself — `blind_writes` and every other `state.workspaces.get(&branch.id)` still answers a stale
-  `BranchId` about the slot's new occupant.
+  and `Pool::spent` are keyed by the whole `BranchId`. ⛔ The sentence that followed — *"What
+  remains open is the `workspaces` map itself — `blind_writes` and every other
+  `state.workspaces.get(&branch.id)` still answers a stale `BranchId` about the slot's new
+  occupant"* — **is false from addendum 6 onward**: the map is keyed by the whole `BranchId` too.
 - The 189x headline earlier in this record is a claim about `Mutex<State>` and nothing else. The
   addendum above is right that the server's per-statement lock is the outer `RuntimeLock`, held
   across the entire sweep including phase 2, and that chunking `State` does not touch it. The
@@ -423,7 +433,8 @@ its own numbers.
 - `run_activity` remains an O(open sessions) hold on the same lock and remains this measurement's
   positive control. Unchanged from the note above: fixing it needs a replacement control in the same
   commit.
-- `workspaces` lookups are still generation-blind. The escrow half is fixed; the map is not.
+- ⛔ *"`workspaces` lookups are still generation-blind. The escrow half is fixed; the map is not."*
+  **CLOSED by addendum 6** — the map is keyed by the whole `BranchId`.
 - The reconciliation's own wall time is still O(open sessions) on the error path, inside the
   server's statement lock. Addendum 1's closing note stands.
 
@@ -618,10 +629,95 @@ claimed "the largest fork loop anywhere in tests/ is ~200" without one).
 
 - `run_activity` remains an O(open sessions) hold on `AgentRuntime`'s state lock and remains this
   measurement's positive control. Unchanged.
-- `workspaces` lookups are still generation-blind; the escrow half is fixed, the map is not.
+- ⛔ *"`workspaces` lookups are still generation-blind; the escrow half is fixed, the map is not."*
+  **CLOSED by addendum 6** — the map is keyed by the whole `BranchId`.
 - The reconciliation's wall time is still O(open sessions). It is out of the statement lock now,
   which is what this row was about, but it is not cheaper.
 - `REAP_YIELD` is a fixed 1 ms, so its cost is a function of how fast a reap is — under 2% at the
   ~58 ms/reap measured here, dominant if reaps ever get 100× faster. Stated at the constant, with
   the reason a conditional yield was rejected (it declines to yield in exactly the fast regime
   where starvation returns).
+
+## Addendum 6 — D158 item 1: the generation-blind `workspaces` map, and it was LIVE
+
+**This record called it "measured and deliberately NOT fixed" (item 2), and three later "still
+open" lists repeated that. All four were too generous.** The brief that reopened it asked for the
+deflation first — *if every path into those eleven sites re-validates against the catalog inside
+the same statement lock, the window is closed by construction and this is latent, not live.* It
+does not, and it is not. What follows is the refutation, then the fix.
+
+### Why no race has to be won
+
+| link | where | what it does |
+|---|---|---|
+| a connection caches its branch | `execution/session.rs`, `Session::agent: Option<AgentSession>` | set once by `BEGIN AGENT SESSION` |
+| and hands it to the runtime unchecked | `agent_sql/dispatch.rs`, `run_in_session` | `let branch = a.branch` — never re-read from the catalog |
+| nothing renews it on its own | there is **no automatic keepalive**: the sole production `renew_lease` is `simulate.rs:431`, applied to a candidate branch `simulate` forked two lines above it | so an idle session's branch expires with the connection open |
+| the sweep reaps it and frees the slot | `reaper.rs` `set_state(..Reaped)` (bumps the generation) then `release_id` | `lease_thread.rs` then calls `runtime.forget_branches` |
+| the next session pops that slot | `catalog.rs` `fork` | same slot, generation + 1 |
+
+`DEFAULT_LEASE_MILLIS` is `15 * 60 * 1000` (`runtime.rs:96`). An agent that pauses longer than that
+— one LLM call — comes back holding a `BranchId` that names another agent's workspace. The SELECT
+path in particular (`visible_rows_where`, then `record_read`) consults the catalog **not at all**.
+
+⛔ **Correction to this table's third row, made before this record was acted on and logged here
+because this is where the claim was made.** It first read *"`renew_lease` has **no caller in `src`**
+outside the catalogs' own tests"*. **That is false.** `src/agent_sql/simulate.rs:431` is a
+production caller — enclosing `pub fn simulate` at `:367`, and there is no `mod tests` in that file
+at all. Found by a reviewer reading all 43 occurrences instead of trusting a count, with `grep -w
+fork` → 580 as a fired control on the instrument; re-checked here independently before this edit.
+
+**The conclusion is unchanged and the premise is now stricter, which is the only direction a
+premise may be revised.** The hazard was never "the symbol has no callers" — it is that **there is
+no automatic keepalive**. The one production renewal sets the lease on a branch the same function
+forked two lines earlier (`simulate.rs:429`), so it cannot extend a session that is *idle*, and an
+idle session is the session by hypothesis. No statement path renews anything. Stated the original
+way, the first reader to run `grep -w renew_lease src/` withdraws this addendum; stated this way it
+survives the re-check.
+
+### What it cost, measured over the real statement path
+
+`tests/w4_stale_branch_crosses_agents.rs` runs `Scanner` → `Parser` → `executor::run` with two
+`execution::session::Session`s on one `AgentRuntime` — the pgwire server's own shape. Against
+`708822e` + the test, both fail:
+
+```
+thread 'a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row' panicked:
+  connection A's session was reaped and slot 1 now belongs to agent-b at generation 1, yet
+  A's SELECT on b1@g0 was answered: qty = Some(999). ... 999 is agent-b's staged, unmerged row.
+
+thread 'a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session' panicked:
+  assertion `left == right` failed: b_1 must still name agent-b's live branch b1@g1;
+  A's ABANDON of the dead b1@g0 unbound it
+    left: None
+   right: Some(BranchId { id: 1, generation: 1 })
+```
+
+So: a cross-agent **read** of unmerged rows, and a cross-agent **delete** of a live session. The
+second is the exact hazard `forget_one_branch`'s own comment describes — *"would then delete a LIVE
+agent's workspace, release its escrow and unbind its name"* — reached through `seal`, which empties
+`workspaces` and `names` **before** its first catalog read, so its eventual `Reaped` refusal arrives
+after the damage. Only the reaper's write path had ever taken that argument.
+
+### The fix
+
+`State::workspaces` is `BTreeMap<BranchId, Workspace>`. Not a generation field plus eleven
+comparisons: a stale generation is a different key, so it MISSES, and a site added later cannot
+forget a check it never has to write. `forget_one_branch`'s hand-written re-validation is deleted
+with the need for it — one authority, the key, rather than two.
+
+One thing the slot-keyed map was giving away free had to be paid for explicitly: a recycled slot
+used to COLLIDE, and `BTreeMap::insert` handed back the displaced workspace, which is what
+`a_recycled_slot_does_not_strand_the_displaced_workspaces_capture` covers. At a new generation it
+no longer collides, so `insert_workspace` evicts the slot's previous occupant by range scan. **That
+is the one place where fixing this defect could have re-opened another**, and it is guarded by that
+existing test plus a new `workspaces.len() == 1` assertion in it.
+
+### Still open, and narrowed on purpose
+
+`quarantine_reasons` remains keyed by the slot. Every path that reads or writes it passes
+`self.branches.get()` first, so a recycled slot is not reachable through them; what IS reachable is
+that `seal` never clears it, so a reaped quarantined branch leaves its reason for the slot's next
+occupant to read. That is a wrong sentence in a diagnostic, not a cross-agent answer about data — a
+correctness fix with no failing test behind it is how the item above got mis-filed in the first
+place, so it is recorded at the field instead of bundled here.

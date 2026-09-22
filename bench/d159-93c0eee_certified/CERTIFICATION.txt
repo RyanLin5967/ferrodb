@@ -1,0 +1,51 @@
+CERTIFICATION — D159 landed, main 5b814b8..93c0eee, NOT PUSHED
+
+  landing merge   93c0eee     gated sha   da8e37e     previous main   5b814b8
+
+THE SUITE, from the verifier's own line
+  d159: mode=per-target rc=0 passed=2523 failed=0 build_errors=0 head=da8e37e
+  d159: go rc=0 passed=97 failed=0
+
+  ⚠ THE DURABLE FORM IS  +7 @ 624edf1 , per-target. 2523 is that claim evaluated at a base.
+    `whole` would be 2525. A bare 2523 is not comparable to anything without both labels.
+
+★ PRE-REGISTERED AT 653f7ac, BEFORE THE RUN REPORTED, WITH BOTH LANDING ORDERS:
+      2523  if d159 lands before d154   <- what happened
+      2529  if d154 lands first
+  So the number could not be fitted afterwards, and 2519 or 2525-as-per-target would have
+  falsified the lane's own +7 whatever the other lane did.
+  ⚠ 2519 was this lane's EARLIER figure, stale by exactly w4gen's +4. It caught that itself
+    by reading main's bank rather than carrying its own number forward.
+
+ALL THREE GATES, verbatim
+  certify-head: OK — suite head=da8e37e == landing da8e37e
+  staleness:    COVERED-NO-CODE — the base moved 1 commit(s), none touching code
+  prepush:      OK
+  land-gate: OK — suite names the commit · base is covered · CI-parity passes · tree unmoved.
+
+  ⚠ staleness was asked AFTER the run, against the commit the suite certified. That ordering is
+    the whole point: a base that moves DURING a suite is invisible to a check taken before it.
+
+CODE IDENTITY — computed, not asserted
+  git diff --stat da8e37e 93c0eee -- src tests examples Cargo.toml   ->   EMPTY
+
+WHAT LANDED, and the part worth more than the feature
+  The fork's durability ticket is taken inside the statement's catalog guard and DISCHARGED
+  outside it. Drop performs the sync rather than asserting on it: "staged but never synced"
+  stops being REPRESENTABLE rather than becoming DETECTED, and a forgotten complete() degrades
+  to a private ungrouped fsync -- the pre-split behaviour, slower and never wrong. A panicking
+  Drop would have ABORTED the process during unwinding, which is why the assert! I suggested
+  was the wrong fix.
+
+⭐ D164 CAME OUT OF THIS ROW AND NOW CONSTRAINS EVERY FSYNC MEASUREMENT HERE.
+  Fire-checking a conclusion of "NOT a hazard" -- removing durable()'s whole-pool flush_all --
+  left SIX OF SEVEN tests green, including this row's headline evidence and the safety net's own
+  proof test, while the branch catalog lost every staged fork. CommitGroup reported it durable
+  though its pages were never written.
+  => f/sync is a COUNTER RATIO: it answers "did a group form?" and is NOT evidence that anything
+     reached disk. Any row that moves, defers, batches or shares an fsync must carry at least one
+     assertion that REOPENS THE FILE and demands the data back.
+
+⛔ NOT PUSHED. origin/main = 4685d80 is RED on Windows with a reproduced 0xc0000005, and the
+  bisect now reads b17ec58 2-of-2 GREEN against 4685d80 2-of-2 RED -- suggestive at p~0.17 under
+  the null, NOT conclusive; a third draw on each arm is running.

@@ -1,0 +1,21 @@
+BASELINE (unmutated): rc=0 PASS
+THE GUARD ITSELF (write_str's u16 check): KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263714885) panicked at tests/d154_length_prefix_refusal.rs:90:5:
+Ddl / table name: KILLED — thread 'a_compensation_record_refuses_through_the_record_it_wraps' (263716423) panicked at tests/d154_length_prefix_refusal.rs:146:5:
+Ddl / column name: KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263718025) panicked at tests/d154_length_prefix_refusal.rs:91:5:
+AlterColumn::Add: KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263720551) panicked at tests/d154_length_prefix_refusal.rs:96:5:
+AlterColumn::Rename / from: KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263722781) panicked at tests/d154_length_prefix_refusal.rs:101:5
+AlterColumn::Rename / to: KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263724261) panicked at tests/d154_length_prefix_refusal.rs:106:5
+AlterColumn::Retype: KILLED — thread 'every_write_str_site_in_a_ddl_record_refuses_what_its_prefix_cannot_express' (263725593) panicked at tests/d154_length_prefix_refusal.rs:111:5
+RunIdentity / agent_id: KILLED — thread 'every_write_str_site_in_a_run_identity_record_refuses' (263728373) panicked at tests/d154_length_prefix_refusal.rs:130:5:
+RunIdentity / run_id: KILLED — thread 'every_write_str_site_in_a_run_identity_record_refuses' (263729688) panicked at tests/d154_length_prefix_refusal.rs:131:5:
+RunIdentity / model: KILLED — thread 'every_write_str_site_in_a_run_identity_record_refuses' (263731254) panicked at tests/d154_length_prefix_refusal.rs:132:5:
+RunIdentity / model_version: KILLED — thread 'every_write_str_site_in_a_run_identity_record_refuses' (263732897) panicked at tests/d154_length_prefix_refusal.rs:133:5:
+Clr / recursive redo: KILLED — thread 'a_compensation_record_refuses_through_the_record_it_wraps' (263734747) panicked at tests/d154_length_prefix_refusal.rs:146:5:
+provenance / agent_id: KILLED — thread 'the_durable_provenance_store_refuses_a_run_it_cannot_encode' (263735896) panicked at tests/d154_length_prefix_refusal.rs:255:22:
+provenance / run_id: KILLED — thread 'the_durable_provenance_store_refuses_a_run_it_cannot_encode' (263739352) panicked at tests/d154_length_prefix_refusal.rs:255:22:
+provenance / model: KILLED — thread 'the_durable_provenance_store_refuses_a_run_it_cannot_encode' (263741391) panicked at tests/d154_length_prefix_refusal.rs:255:22:
+provenance / model_version: KILLED — thread 'the_durable_provenance_store_refuses_a_run_it_cannot_encode' (263744145) panicked at tests/d154_length_prefix_refusal.rs:255:22:
+Ddl / column count: KILLED — thread 'a_ddl_record_refuses_a_column_count_its_prefix_cannot_express' (263745778) panicked at tests/d154_length_prefix_refusal.rs:124:5:
+
+RESULT: 17 killed, 0 survived, of 17
+SWEEP_EXIT=0

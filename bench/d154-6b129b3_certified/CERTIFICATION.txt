@@ -1,0 +1,40 @@
+CERTIFICATION -- D154 landed into main
+=======================================
+landed:        6b129b3  (merge of 24ac53c into main)
+base:          29801f0
+delta:         +6 @ 29801f0   absolute 2529 per-target
+gated sha:     24ac53c        (certify-head: suite head == landing sha, exact match)
+mode:          per-target     (⚠ totals compare only within a mode; whole = per-target + 2 doctests)
+
+PRE-REGISTRATION
+  The +6 was pre-registered in 24ac53c's own commit message, which fixes the base at 29801f0.
+  ⚠ The commit says so explicitly and against its own favour: "2529 was NOT pre-registered,
+  the +6 was." The absolute is therefore a DERIVED number (29801f0's banked 2523 + 6), not a
+  pre-registered one, and it is recorded here as derived.
+
+THE THREE GATES, run by tools/land-gate.sh at 2026-09-22T20:21:26Z
+  [1/3] certify-head  OK -- suite head=24ac53c == landing 24ac53c
+                      rc=0 passed=2529 failed=0 build_errors=0
+  [2/3] staleness     COVERED -- branch 24ac53c vs 29801f0: 0 behind, 15 ahead
+                      Asked LAST, against the commit the suite actually certified.
+  [3/3] prepush       OK -- FFI gate sweep; RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"
+                      cargo build --examples; cargo check --all-targets;
+                      cargo check --target x86_64-pc-windows-msvc (cfg(not(unix)) arms).
+                      ⚠ The msvc check does NOT link, so it cannot see a missing POSIX symbol.
+  go suite            rc=0 passed=97 failed=0  (cdc-consumer -- invisible to cargo test)
+
+CONTENTION
+  The run queued 135s behind a running suite (57969 d130-da8e37e) and acquired the lock before
+  proceeding -- recorded in runner.log. It did not run alongside it.
+  The landing itself held /tmp/ferrodb-suite.lock for the duration of prepush, because prepush
+  is the only gate step that builds and a build contaminates a concurrent measurement.
+
+BLIND SPOTS, per this repo's convention that a guard names its own
+  * land-gate reads verdicts; it re-runs nothing and cannot tell you any run was honest.
+  * It narrows but does not close the window in which a writer lands between two of its steps.
+  * This bank says nothing about whether D154 SHOULD have landed -- only that the evidence is
+    about the tree that shipped.
+
+certify-head.sh was run against THIS directory before it was committed; see the line below.
+certify-head.sh was run against this directory at 2026-09-22T20:22:34Z and returned:
+  certify-head: OK — suite head=24ac53c == landing 24ac53c
