@@ -369,3 +369,42 @@ work is, which is not.
 
 ⇒ Consequence to state when reporting: the new-key arm's ABSOLUTE ms/upsert will be higher at both
 thread counts, and that difference is the tree, not contention. Only the ratios are quoted.
+
+# ⛔ AMENDMENT 10 — THE FIRST NOVELTY RUN IS VOID. MY OWN RULE, ON THE ARM THAT DECIDES ROUND 4.
+
+`bench/d123_final/40_novelty_CONFOUNDED_unrotated.txt` is retained as evidence and MUST NOT be
+quoted as the verdict. It read FIXED 1.03x, NEW 1.54x — in the predicted direction — and that is
+precisely why it cannot stand.
+
+**THE DEFECT.** `mode_novelty` iterated `for [false, true]` with no rotation, so FIXED always ran
+FIRST and NEW always SECOND, at every thread count. Across that run:
+    # load_at_run_start:  3.79
+    # load_at_run_end:   13.64
+Load rose 3.6x monotonically (a `cargo test --release --lib` started in a sibling worktree while
+the lock was held). So the NEW arm ran systematically later, under systematically heavier load,
+than the FIXED arm it is compared against — **and the confound pushes in the SAME DIRECTION as the
+finding.** I cannot say how much of 1.54x-vs-1.03x is novelty and how much is "ran later".
+
+This is instance N of the rule this row exists to enforce, committed by me, in the arm the whole
+round turns on: **same instrument, different moment.** `mode_f1` rotates level order every rep and
+says so in its banner. I knew rotation mattered and did not carry it into this mode. Caught by the
+team lead reading the load stamps, not by me.
+
+**THE FIX, and it is the same one that rescued F1 from "undecided".** All FOUR cells
+— (T=1,fixed) (T=1,new) (T=64,fixed) (T=64,new) — now run ADJACENTLY inside one rep, in an order
+rotated each rep, with a wall-clock stamp per rep. The verdict is a PER-REP CONTRAST:
+
+    R_fixed = cost_fixed(T=64) / cost_fixed(T=1)     within one rep
+    R_new   = cost_new(T=64)   / cost_new(T=1)       within one rep
+    CONTRAST = R_new / R_fixed                       median over reps
+
+Drift is common-mode across four adjacent cells and cancels. **Decision rule, fixed now:
+CONTRAST >> 1 ⇒ novelty is the variable and the counterparty is the group-commit flush.
+CONTRAST ≈ 1 ⇒ UNATTRIBUTED per F3, reported as a complete answer.** The count of reps with
+CONTRAST > 1.00x is reported alongside the median, because a count of draws needs no estimator.
+
+**PROVENANCE NOTE.** The void run was `build at 4427df251512` while the F1 arms were `8665941`.
+Checked rather than assumed: `git diff 8665941..4427df2 -- src examples build.rs Cargo.toml` is 14
+lines in `examples/d123_serial_attribution.rs`, all of them `mode_f1`'s per-rep timestamps. It does
+not touch `mode_novelty`, `extra_new_keys`, or the fork extra-upsert path. So the binary moved but
+the code under test did not, and the void is the design, not the build.

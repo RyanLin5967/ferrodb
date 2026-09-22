@@ -569,46 +569,102 @@ fn mode_novelty(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize,
     banner("MODE=novelty (Amendment 7: new-key vs fixed-key work under the lock)");
     const K: u64 = 8;
     println!("k = {K} extra upserts per fork, probe ON (PH_EXTRA is read directly; no fit).");
-    println!("Per-upsert cost = PH_EXTRA / k, median of {reps} reps.");
     println!();
-    let mut cost: Vec<Vec<f64>> = vec![vec![f64::NAN; 2]; threads.len()];
-    for (ti, &t) in threads.iter().enumerate() {
-        for (ni, &new) in [false, true].iter().enumerate() {
+    println!("⭐ PAIRED AND ROTATED, and the first version of this mode was NEITHER — which is why");
+    println!("   it was re-run. It iterated FIXED then NEW at each thread count with no rotation, so");
+    println!("   NEW always ran LATER than the FIXED arm it is compared against. Load rose 3.79 ->");
+    println!("   13.64 across that run, so the contrast was confounded with the load trajectory in");
+    println!("   the SAME DIRECTION as the expected finding. Same instrument, different moment.");
+    println!("   Here all FOUR cells run adjacently inside one rep, in an order rotated each rep, so");
+    println!("   drift is common-mode within a rep and cancels in the per-rep contrast.");
+    println!();
+    // The four cells. Rotated by rep so no cell is systematically early or late.
+    let cells: Vec<(usize, bool)> = threads
+        .iter()
+        .flat_map(|&t| [(t, false), (t, true)])
+        .collect();
+    let nc = cells.len();
+    let mut cost: Vec<Vec<f64>> = vec![Vec::new(); nc];
+    let mut rep_start: Vec<u64> = Vec::new();
+    for rep in 0..reps {
+        rep_start.push(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        for i in 0..nc {
+            let ci = (i + rep) % nc;
+            let (t, new) = cells[ci];
             probe::set_extra_new_keys(new);
             probe::configure(true, 0, K);
-            let mut v: Vec<f64> = Vec::new();
-            for rep in 0..reps {
-                let tag = format!("nov_{t}_{}_{rep}", if new { "new" } else { "fix" });
-                let a = run_arm(dir, &tag, n, t, warm);
-                v.push(a.ms(probe::PH_EXTRA) / K as f64);
-            }
-            cost[ti][ni] = median(&mut v);
+            let tag = format!("nov_{t}_{}_{rep}", if new { "new" } else { "fix" });
+            let a = run_arm(dir, &tag, n, t, warm);
+            cost[ci].push(a.ms(probe::PH_EXTRA) / K as f64);
         }
     }
     probe::set_extra_new_keys(false);
-    println!("  {:>8} {:>18} {:>18}", "threads", "FIXED key ms/ups", "NEW key ms/ups");
-    for (ti, &t) in threads.iter().enumerate() {
-        println!("  {:>8} {:>18.5} {:>18.5}", t, cost[ti][0], cost[ti][1]);
+
+    println!("  RAW ms per upsert, rep x cell (cell order rotated each rep):");
+    print!("  {:>5}{:>13}", "rep", "started(utc)");
+    for (t, new) in &cells {
+        print!("{:>16}", format!("T{t}-{}", if *new { "NEW" } else { "fix" }));
     }
     println!();
-    if threads.len() >= 2 {
-        let (lo, hi) = (0, threads.len() - 1);
-        let fix = cost[hi][0] / cost[lo][0];
-        let nw = cost[hi][1] / cost[lo][1];
+    for rep in 0..reps {
+        print!("  {:>5}{:>13}", rep, rep_start.get(rep).copied().unwrap_or(0));
+        for c in 0..nc {
+            print!("{:>16.5}", cost[c][rep]);
+        }
+        println!();
+    }
+    println!();
+    // Per-rep contrast: how much more does NEW work respond to concurrency than FIXED work?
+    // Cells are ordered [(T_lo,fix),(T_lo,new),(T_hi,fix),(T_hi,new)] when two thread counts given.
+    if nc == 4 {
+        let mut r_fix: Vec<f64> = Vec::new();
+        let mut r_new: Vec<f64> = Vec::new();
+        let mut contrast: Vec<f64> = Vec::new();
+        println!("  PER-REP, all four cells adjacent in time:");
         println!(
-            "  T={}/T={} ratio:   FIXED key {:.2}x     NEW key {:.2}x",
-            threads[hi], threads[lo], fix, nw
+            "  {:>5}{:>12}{:>12}{:>14}",
+            "rep", "R_fixed", "R_new", "R_new/R_fixed"
+        );
+        for rep in 0..reps {
+            let rf = cost[2][rep] / cost[0][rep];
+            let rn = cost[3][rep] / cost[1][rep];
+            r_fix.push(rf);
+            r_new.push(rn);
+            contrast.push(rn / rf);
+            println!("  {:>5}{:>12.2}x{:>11.2}x{:>13.2}x", rep, rf, rn, rn / rf);
+        }
+        let (mf, mn, mc) = (
+            median(&mut r_fix.clone()),
+            median(&mut r_new.clone()),
+            median(&mut contrast.clone()),
+        );
+        contrast.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!();
+        println!("  R_fixed  = cost(T{}) / cost(T{}) for FIXED-key work   median {mf:.2}x", threads[1], threads[0]);
+        println!("  R_new    = same for NEW-key work                      median {mn:.2}x");
+        println!(
+            "  ⭐ CONTRAST R_new/R_fixed  median {:.2}x   min {:.2}x   max {:.2}x   reps>1.00x {}/{}",
+            mc,
+            contrast[0],
+            contrast[contrast.len() - 1],
+            contrast.iter().filter(|&&x| x > 1.0).count(),
+            reps
         );
         println!();
-        println!("  for reference, from bench/d123_raw/30_phases.txt at the same thread counts:");
-        println!("    write_record (new keys)     2.29x");
-        println!("    child_key_insert (new key)  2.43x");
-        println!("    core / envelope / header    0.76-0.78x   (reads and one hot page)");
-        println!();
-        println!("  NEW >> FIXED => novelty is the variable. Since only one thread is ever inside");
+        println!("  CONTRAST >> 1 => novelty is the variable. Since only one thread is ever inside");
         println!("  `logical`, the counterparty cannot be another forker, so it is the concurrent");
         println!("  group-commit flush draining the pages this section keeps creating.");
-        println!("  NEW ~= FIXED => novelty is NOT the variable; report UNATTRIBUTED per F3.");
+        println!("  CONTRAST ~= 1 => novelty is NOT the variable; report UNATTRIBUTED per F3.");
+        println!();
+        println!("  ⚠ ABSOLUTE ms/upsert is HIGHER for NEW at both thread counts because that arm");
+        println!("  grows the tree by 64,000 keys against 8 (Amendment 9). That is the tree, not");
+        println!("  contention, and it cancels in R_new because it is present at both thread counts.");
+        println!("  Only the ratios are quoted.");
     }
 }
 
