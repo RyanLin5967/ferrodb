@@ -197,7 +197,11 @@ walks no frames in either version, so the measured quantity could not have moved
 argument, and a re-run is a measurement, so the re-run was done.**
 
 `d138_ship_raw.txt` is the same instrument (harness `git diff` → 0 lines; `scan_count` module
-diffed identical) over **`66e726c`, the commit that lands**. Result, checked mechanically rather
+diffed identical) over **`66e726c`, this branch's final production code**. Every commit after it
+here touches `bench/` only — checked, not asserted: `git diff --name-only 66e726c HEAD` lists
+exactly `bench/d138_index_slope/README.md` and `bench/d138_index_slope/d138_ship_raw.txt`.
+(Stated that way rather than as "the commit that lands", which would stop being true the moment
+banking this artifact added a commit — a citation has to survive its own landing.) Result, checked mechanically rather
 than eyeballed — the extracted PARK tables diff **empty**:
 
     scan/hit 0.0 and scan/miss 0.0 at all 8 rows
