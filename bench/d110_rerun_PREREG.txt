@@ -1,0 +1,35 @@
+D110 RE-RUN — PRE-REGISTERED BEFORE THE FIRST MEASUREMENT, 2026-09-22
+=====================================================================
+WHY: the banked curve `bench/d110_merge_page_reads.txt` carries `build provenance: at
+62ee6e0ed909`, which `git merge-base --is-ancestor 62ee6e0 83cb6e8` confirms PREDATES the
+D101 designated-runtime guard. At that commit the harness ran every statement on
+`Session::new()`'s private `AgentRuntime::new()` — `storage: None`, i.e. NO PAGE STORE.
+
+⛔ SO ITS HEADLINE ZERO WAS ZERO BY CONSTRUCTION. `PageStore::read_page` cannot be called on
+   a runtime that has no `PageStore`. The banked conclusion — "retire the wire-merge3 row,
+   the production merge never touches the CoW tree" — rests on a measurement whose subject
+   was never on the path. That is `a fixture can miss the code under test`, exactly.
+
+WHAT IS RE-RUN: the same harness at main 2f15622, rewired onto `s.ctx.session()` (7a7e998),
+which is the designated, arena-backed runtime.
+
+THE INSTRUMENT IS A COUNT, SO LOAD DOES NOT BIND IT. The harness's own header says
+"PageStore::read_page call count, bracketing the MERGE statement alone. No wall clock."
+Two other suites are in flight on this box and that is fine for a count.
+
+POSITIVE CONTROL, AND IT IS ALREADY IN THE OUTPUT: the `writes reads` column comes from the
+SAME counter in the SAME process. A run whose `writes reads` is also 0 has a dead
+instrument and is not a result. The 500-row smoke run at 7a7e998 gave `writes reads 21.0`
+against `MERGE reads 0.0`, so the counter demonstrably counts.
+
+THREE OUTCOMES, WRITTEN DOWN BEFORE THE RUN:
+  1. MERGE reads RISES with table size  => the production merge DOES walk the table, D110's
+     retirement of the wire-merge3 row is WRONG, and merge3 has a shape to offer.
+  2. MERGE reads FLAT AND NON-ZERO      => merge is O(delta) in page reads. D110's
+     conclusion survives, but for the first time on evidence rather than on a stub.
+  3. MERGE reads is ZERO AT EVERY SIZE while `writes reads` is non-zero => the merge really
+     reads no pages through this counter. ⚠ Then the finding is about the COUNTER's
+     placement, not about the merge: report it as such and do NOT re-retire the row on it.
+     A zero is a fact about scope until something forces it to fire.
+
+SIZES: at least three, so a slope exists. The harness refuses fewer than two by itself.
