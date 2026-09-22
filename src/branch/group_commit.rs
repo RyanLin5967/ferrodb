@@ -106,7 +106,11 @@ impl CommitGroup {
             drop(st);
 
             self.syncs.fetch_add(1, Ordering::Relaxed);
+            // ⛔ ADVERSARIAL SCAFFOLD (CEILING-adv). Only the leader reaches here and only one
+            // leader runs at a time, so this sums to the wall time the fsync path was busy.
+            let t_sync = crate::branch::d123_probe::mark();
             let result = sync();
+            crate::branch::d123_probe::record(crate::branch::d123_probe::PH_SYNC, t_sync);
 
             let mut done = self.state.lock().unwrap();
             done.syncing = false;

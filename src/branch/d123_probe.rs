@@ -51,7 +51,18 @@ pub const PH_HOLD: usize = 13;
 /// Acquire → after the unlock. The lock is genuinely held for all of this.
 pub const PH_HOLD_TOTAL: usize = 14;
 pub const PH_DURABLE: usize = 15;
-pub const NPHASE: usize = 16;
+/// ⛔ ADVERSARIAL ADDITION (CEILING-adv), not part of the original scaffold.
+///
+/// `PH_DURABLE` is what a forker spends inside `wait_durable`, which for a FOLLOWER is condvar
+/// sleep and not disk at all. That makes "DURABLE is 97.8% of the cycle" compatible with two very
+/// different worlds: the fsync chain is saturated, or the fsync is cheap and the followers are
+/// simply slow to be woken. Nothing in the original harness separates them.
+///
+/// This brackets the LEADER's `sync()` closure only — exactly one thread is inside it at a time,
+/// because `syncing` serialises them. Summed over a rung it is the total wall time the fsync path
+/// was busy, so `PH_SYNC / elapsed` is the saturation of the thing the verdict blames.
+pub const PH_SYNC: usize = 16;
+pub const NPHASE: usize = 17;
 
 /// ⭐ WHY `PH_DROPS` AND `PH_UNLOCK` EXIST (pre-registration Amendment 1).
 ///
@@ -83,6 +94,7 @@ pub const PHASE_NAMES: [&str; NPHASE] = [
     "HOLD(work only)",
     "HOLD_TOTAL(to unlock)",
     "durable(after release)",
+    "SYNC(leader fsync only)",
 ];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);

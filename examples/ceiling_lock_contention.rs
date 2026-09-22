@@ -882,6 +882,24 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
                         c,
                         a.syncs
                     );
+                    // ⛔ ADVERSARIAL (CEILING-adv). The verdict says the ceiling is the fsync. That
+                    // is only true if the fsync path is BUSY; a cheap fsync with slow condvar
+                    // wake-ups produces the same DURABLE. PH_SYNC is leader-only and leaders are
+                    // serialised, so this ratio is the saturation of the accused component.
+                    if let Some(p) = a.phases {
+                        let sync_tot_ms = p.ns[probe::PH_SYNC] as f64 / 1e6;
+                        println!(
+                            "      ADV rep{rep} {name} L{stub}: SYNC_total {:.1} ms / elapsed {:.1} ms \
+                             = fsync path {:.1}% BUSY; syncs {} -> {:.3} ms per fsync; \
+                             DURABLE/fsync {:.2}",
+                            sync_tot_ms,
+                            a.secs * 1000.0,
+                            100.0 * sync_tot_ms / (a.secs * 1000.0),
+                            a.syncs,
+                            sync_tot_ms / a.syncs.max(1) as f64,
+                            dur_ms / (sync_tot_ms / a.syncs.max(1) as f64).max(1e-9),
+                        );
+                    }
                     let s = stub as usize;
                     ct[cfg][s].push(c);
                     uh[cfg][s].push(u);
