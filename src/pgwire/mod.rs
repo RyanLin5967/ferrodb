@@ -221,14 +221,21 @@ impl ServerContext {
     /// read falls back and therefore announces, so the rate and the announcer set drive each
     /// other. **Quote a rate only with the fork rate it was taken at.**
     ///
-    /// ⚠ **PROVENANCE, stated precisely because an earlier version of this comment got it wrong.**
-    /// The evidence is `bench/w4_check3_rederived.txt`, which is **NOT ON `main`** — it lives on
-    /// branch `w4-check3-rederive` at `cef94dc` and has not landed. This comment previously cited
-    /// it as a bare path, so a reader on `main` would `ls bench/` and find nothing, unable to tell
-    /// whether it was deleted or never produced. **A citation must name a tree it can be found
-    /// in.** ⚠ That artifact also cites `extended.rs:290`/`:387`; on `main` those sites are
-    /// `:283`/`:357` — the branch carries measurement instrumentation, so **line numbers are not
-    /// comparable across the two trees** and only the symbols are.
+    /// ⚠ **PROVENANCE, stated precisely because two earlier versions of this comment got it
+    /// wrong in opposite directions.** The evidence is `bench/w4_check3_rederived.txt`, and it
+    /// **IS on `main`**, landed by itself as a bench-only commit. The first version cited it as a
+    /// bare path while it existed only on a branch, so a reader would `ls bench/` and find
+    /// nothing; the second said "NOT ON `main`", which the landing then falsified. **A citation
+    /// must name a tree it can be found in — and it ages the moment either tree moves.**
+    ///
+    /// ⚠ **QUOTING it needs only this tree; RE-RUNNING it does not.** The harness
+    /// (`examples/w4_standdown_count.rs`) and the counters (`src/pgwire/standdown.rs`) are the
+    /// dead agent's QUARANTINED, UNREVIEWED work and deliberately did **not** land with the
+    /// artifact — they live on branch `w4-check3-rederive`, whose merge-base with `main` predates
+    /// all of it. ⚠ That artifact's own citations are branch line numbers: it cites
+    /// `extended.rs:290`/`:387` where `main` has `:283`/`:357`, because the branch carries the
+    /// instrumentation. **Only the symbols are comparable across the two trees**, and the
+    /// artifact carries a symbol table saying so for every site it names.
     pub fn begin_read<'a>(
         &self,
         slot: &'a std::sync::atomic::AtomicBool,
