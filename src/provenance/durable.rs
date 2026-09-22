@@ -571,6 +571,35 @@ impl ProvenanceStore for DurableProvenanceStore {
         // must refuse whole. Check-then-act on shared state, which is the shape that has produced
         // six separate defects in this codebase.
         self.refuse_if_poisoned()?;
+
+        // ⛔ EVERYTHING THAT CAN REFUSE IS ENCODED BEFORE ANYTHING IS MUTATED, and the order is
+        // the correctness argument rather than a style choice.
+        //
+        // D154 gave `wal::log::write_str` a length guard, which made this function able to return
+        // early for the first time. `self.mem.intern` below is a MUTATION. With the encode after
+        // it — where it used to sit, and where a comment of mine claimed "the refusal costs
+        // nothing here" — a refused run stayed in memory and never reached the file, so
+        // `run_count`/`runs` answered for a run that disappears on the next `open`. Measured, not
+        // reasoned about: `tests/d154_length_prefix_refusal.rs
+        // ::the_durable_provenance_store_refuses_a_run_it_cannot_encode` failed 1 != 0 on exactly
+        // that, and the claim that it cost nothing was wrong.
+        //
+        // Moving the encode earlier is NOT a second guard — it is the same guard, ahead of the
+        // state it would otherwise have to undo. Nothing needs rolling back if nothing changed.
+        //
+        // ⚠ It costs one ~96-byte encode on the REPEAT path, which previously allocated nothing.
+        // That is per transaction, not per row, behind a file lock and a mutex that both dwarf it.
+        // Stated rather than hidden, because it is a real if small regression on the common path.
+        let mut tail = Vec::with_capacity(96);
+        write_str(&mut tail, &run.agent_id, "an agent id")?;
+        write_str(&mut tail, &run.run_id, "a run id")?;
+        write_str(&mut tail, &run.model, "a model name")?;
+        write_str(&mut tail, &run.model_version, "a model version")?;
+        tail.extend_from_slice(&run.prompt_hash);
+        tail.extend_from_slice(&run.started_at.to_be_bytes());
+        tail.extend_from_slice(&run.parent_branch.id.to_be_bytes());
+        tail.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
+
         let before = self.mem.run_count();
         let id = self.mem.intern(run)?;
         if self.mem.run_count() == before {
@@ -578,17 +607,10 @@ impl ProvenanceStore for DurableProvenanceStore {
             return Ok(id);
         }
 
-        let mut body = Vec::with_capacity(96);
+        let mut body = Vec::with_capacity(tail.len() + 5);
         body.push(TAG_RUN);
         body.extend_from_slice(&id.0.to_be_bytes());
-        write_str(&mut body, &run.agent_id);
-        write_str(&mut body, &run.run_id);
-        write_str(&mut body, &run.model);
-        write_str(&mut body, &run.model_version);
-        body.extend_from_slice(&run.prompt_hash);
-        body.extend_from_slice(&run.started_at.to_be_bytes());
-        body.extend_from_slice(&run.parent_branch.id.to_be_bytes());
-        body.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
+        body.extend_from_slice(&tail);
         if let Err(e) = self.append_locked(&file, &body) {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(e);

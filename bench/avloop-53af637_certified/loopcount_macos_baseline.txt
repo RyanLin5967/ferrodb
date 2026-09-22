@@ -1,0 +1,16 @@
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=2
+LOOPCOUNT settle_to round=2 turns=0 bound=20000 ms=0
+LOOPCOUNT settle_to round=2 turns=3 bound=20000 ms=10
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=2
+LOOPCOUNT settle_to round=3 turns=1 bound=20000 ms=1
+LOOPCOUNT settle_to round=2 turns=0 bound=20000 ms=0
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=3
+LOOPCOUNT settle_to round=3 turns=0 bound=20000 ms=0
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=3
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=0
+LOOPCOUNT settle_to round=4 turns=3 bound=20000 ms=8
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=2
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=1
+LOOPCOUNT settle_to round=6 turns=3 bound=20000 ms=8
+LOOPCOUNT hold_leader want=0 turns=0 bound=100000 ms=3
+LOOPCOUNT settle_to round=7 turns=1 bound=20000 ms=1

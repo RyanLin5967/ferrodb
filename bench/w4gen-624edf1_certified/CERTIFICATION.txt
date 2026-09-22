@@ -1,0 +1,51 @@
+CERTIFICATION — D158 item 1 landed, main 3a9a5f9..624edf1, NOT PUSHED
+
+  landing merge   624edf1   (a MERGE commit; preimage note below)
+  gated sha       bfcfa0e   (branch tip, unmoved before and after the merge)
+  previous main   3a9a5f9
+
+THE SUITE, from the verifier's own line, never from the .log
+  w4gen: mode=per-target rc=0 passed=2516 failed=0 build_errors=0 head=bfcfa0e
+  w4gen: go rc=0 passed=97 failed=0
+  RUNNER_EXIT=0
+
+  ⚠ MODE AND BASE BOTH MATTER AND BOTH ARE NAMED: 2516 is PER-TARGET on base 3a9a5f9
+  (which carries D151 at 2512). The claim is +4; 2516 is that claim EVALUATED AT A BASE.
+  The durable form is "+4 @ 3a9a5f9", never a bare 2516.
+
+★ BOTH LANDING ORDERS WERE PRE-REGISTERED BEFORE ANY DATA EXISTED
+      land against 3a9a5f9 (d154 not landed)  ->  2516   <- what happened
+      land against 3a9a5f9 + d154's +6        ->  2522
+  So the number could not be fitted afterwards, and 2518 or 2520 would have falsified the
+  lane's own +4 whatever the other lane did. That turns a coordination assumption into
+  something the number itself can refute.
+
+ALL THREE GATES, verbatim
+  certify-head: suite names the commit (head=bfcfa0e == landing bfcfa0e)
+  staleness:    COVERED -- 0 behind, 14 ahead
+  prepush:      OK -- FFI gate clean; RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"
+                on both `cargo build --examples` and `cargo check --all-targets`; plus the
+                x86_64-pc-windows-msvc check (which does NOT link, so it cannot see a missing
+                POSIX symbol -- check 1 covers that).
+  land-gate: OK -- suite names the commit, base covered, CI-parity passes, tree unmoved.
+
+  ⚠ prepush mattered here specifically: this change DELETES callers (forget_one_branch's
+  names re-validation, run_activity's names lookup), which is the exact shape -D dead_code
+  turns red.
+
+CODE IDENTITY -- computed, not asserted
+  git diff --stat bfcfa0e 624edf1 -- src tests examples Cargo.toml   ->   EMPTY
+  A certification body can never quote a summary naming its own sha, because the merge commit
+  does not exist until the merge. The gate names bfcfa0e; this closes the gap by computation.
+
+⚠ THE BANK'S SOURCE WAS A WORKTREE scratchpad/ -- copied here at land time for exactly that
+  reason. D151's logs were lost to the session scratchpad and its run can no longer be
+  re-derived; its SUMMARY line survives only because it was banked. This directory holds the
+  verifier's OWN SUMMARY.txt, not retyped prose, so `certify-head.sh` can read it back.
+
+⛔ NOT PUSHED. origin/main = 4685d80 is RED on Windows with a REPRODUCED 0xc0000005 in
+  integration_cluster_agents -- 2 of 2 on that sha, same binary, same survivor by elimination,
+  no `test result: FAILED` and no `panicked at` in either attempt. That failure predates D138
+  by four days (identical crash on 0ee07fc, 2026-09-18) and is unrelated to this row
+  (src/agent_sql/, not integration_cluster_agents) -- verified on macOS by the d154 lane, which
+  ran that target 35/35 green at the same sha rather than inferring it from module names.

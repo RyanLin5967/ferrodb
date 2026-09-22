@@ -1,0 +1,151 @@
+PRE-REGISTRATION — D158 item 1, branch agent-acf966798a3979f57
+Written BEFORE the suite run, against a base whose certified count is published.
+
+BASE
+  origin/main           4685d80
+  certification         bench/land-ebdf002_certified/CERTIFICATION.txt
+  certified per-target  2511    head=5181d73, rc=0, failed=0, build_errors=0
+  go                    97      rc=0
+
+  MODE MATTERS. 2511 is PER-TARGET. `whole` = per-target + 2 doctests, the second a
+  compile_fail reported as its own block. A number quoted across modes is a phantom
+  regression. This run is per-target.
+
+  The 2508 in my own brief was STALE -- it is head=b17ec58, before D138 landed. Keeping
+  it would have put this branch three above what its own additions explain.
+
+WHAT THIS BRANCH ADDS -- counted from what RUNS
+  tests/w4_stale_branch_crosses_agents.rs                                        +2
+      a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row
+      a_reaped_sessions_abandon_must_not_retire_the_new_occupants_session
+  src/agent_sql/runtime.rs, mod tests                                            +1
+      the_reconciliation_crosses_its_chunk_boundary_and_forgets_every_branch
+  ---------------------------------------------------------------------------------
+  TOTAL                                                                          +3
+
+  Both files are plain `#[test]` fns, not macro-instantiated, so a `grep -c` and what
+  runs agree here. Checked rather than assumed: `cargo test --lib` reports 1658 on this
+  branch against 1657 at the merge base, which is exactly the one lib test above.
+
+PREDICTION
+  per-target  passed = 2514   failed = 0   build_errors = 0
+  go          97 (no Go source touched)
+
+  Above 2514 means tests appeared that these three do not explain.
+  Below 2514 means something that ran at 4685d80 stopped running.
+
+FALSIFIERS -- any one withdraws the row rather than adjusting the number
+  * the suite's head does not name the commit being landed            (certify-head)
+  * the base moved under src/ while the suite ran, asked LAST         (staleness)
+  * the fire-check's unmutated baseline had not passed first          (bench/w4_generation_keying/)
+
+--- AMENDMENT 1, appended before the run. Nothing above is edited. ---
+
++1 test since the original count, for a defect the original change INTRODUCED and that I found
+by reading my own diff rather than from a failure:
+
+  src/agent_sql/runtime.rs, mod tests                                            +1
+      a_recycled_slot_installs_the_new_workspace_before_releasing_the_old
+
+  `insert_workspace` released the displaced workspace BEFORE installing the incoming one. The
+  slot-keyed map got that order free from `BTreeMap::insert`, which installed and returned in
+  one call; keying by `BranchId` split it in two and made it a decision. Commit 5c06685.
+
+REVISED PREDICTION
+  per-target  passed = 2515   failed = 0   build_errors = 0
+  go          97
+  = 2511 base + 2 integration (w4_stale_branch_crosses_agents) + 2 lib (chunk boundary, order)
+
+  Checked, not assumed: `cargo test --lib` reports 1659 on this branch against 1657 at the
+  merge base (4685d80 merged in at b675a95) -- exactly the two lib tests above.
+
+FIRE-CHECK, run on the tree this prediction is about, baseline before any mutant was read:
+  BASELINE unmutated                                       PASS
+  evict          --lib                            KILLED
+  evict_order    --lib                            KILLED
+  chunk_stop     --lib                            KILLED
+  overlay        w4_stale_branch_crosses_agents   KILLED
+  record_read    w4_stale_branch_crosses_agents   KILLED
+  blind_writes   w4_stale_branch_crosses_agents   KILLED
+  seal           w4_stale_branch_crosses_agents   KILLED
+  forget         w4_sweep_slot_recycle            KILLED
+
+--- AMENDMENT 2, appended before any suite has completed. Nothing above is edited. ---
+
+THE BASE MOVED WHILE THE FIRST RUN WAS IN FLIGHT, AND THE RUN WAS DISCARDED, NOT QUOTED.
+
+`w4gen` acquired the suite lock at 16:08:48Z on base 4685d80 and was ~78/135 targets in when
+`tools/staleness.sh . main HEAD` — which takes no lock and so is free to run mid-suite — read:
+
+    branch agent-acf966798a3979f57 vs main: 14 behind, 11 ahead
+      base moved under: 3 Rust file(s), 0 other code file(s)
+    STALE-GREEN: the base moved under code this branch has not seen.
+      tests present on main but NOT on this branch:
+          tests/d151_parse_reads_a_refreshed_snapshot.rs
+
+D151 had landed into LOCAL `main` (`3a9a5f9`); `origin/main` was 14 commits stale and still read
+`4685d80`, which is why a fetch said "unmoved". The run was SIGTERMed; `verify-suite.sh` refused
+with "A suite cut short is not a count" and released the lock. No partial count exists and none is
+quoted. ⚠ The argument that the two file-sets are disjoint does NOT rescue a stale green, and the
+guard says so in its own output: a lock-order inversion is created by two files that never appear
+in the same diff, and it hangs rarely under load rather than failing loudly.
+
+NEW BASE
+  local main            3a9a5f9   (NOT origin/main, which is stale)
+  certification         bench/d151_certified/CERTIFICATION.txt
+  certified per-target  2512      head=cdf6434, rc=0, failed=0, build_errors=0
+  go                    97        rc=0
+  code identity         `git diff --stat cdf6434 main -- src tests examples Cargo.toml` -> EMPTY,
+                        so main ships exactly the code that total certifies. Computed, not assumed.
+  merged at             the merge commit below; staleness now reads COVERED, 0 behind.
+
+REVISED PREDICTION
+  per-target  passed = 2516   failed = 0   build_errors = 0
+  go          97
+  = 2512 base + 2 integration (w4_stale_branch_crosses_agents) + 2 lib (chunk boundary, order)
+
+  My +4 is unchanged; only the base it lands on moved, 2511 -> 2512.
+
+SIXTH CHECK, adopted from d154's lane: assert `tests/d151_parse_reads_a_refreshed_snapshot.rs`
+appears BY NAME in the run. Its absence is exactly what staleness flagged, so a total one short
+would mean D151's test did not come across in the merge — and a total alone cannot tell you that.
+Confirmed present in the tree with 1 `#[test]`; `ls tests/*.rs` is 135, was 134.
+
+--- AMENDMENT 3, appended before any suite has completed. Nothing above is edited. ---
+
+THE PRIMARY CLAIM IS A DELTA. THE ABSOLUTE IS DERIVED, AND ONLY MEANS ANYTHING BESIDE ITS BASE.
+
+  THIS BRANCH ADDS EXACTLY +4 TESTS.  That is invariant under landing order, and it is the
+  number this row is actually predicting:
+      +2  tests/w4_stale_branch_crosses_agents.rs      (integration, 2 plain #[test] fns)
+      +2  src/agent_sql/runtime.rs, mod tests          (chunk boundary; eviction order)
+
+WHY THIS IS BEING RESTATED. `d154-9637308` is in flight and predicts +6 on the same 2512 base.
+Two lanes, two correct predictions, ONE `main` -- and whichever lands second is wrong by the
+other's delta unless it re-derives. An absolute quoted without its base is not falsifiable; an
+absolute quoted WITH its base is, and a delta is falsifiable either way.
+
+PRE-REGISTERED, BOTH ORDERS, so that neither total can be chosen after the fact:
+
+  | what I land against                         | per-target passed |
+  |---------------------------------------------|-------------------|
+  | main = 3a9a5f9  (d154 NOT yet landed)       | 2516  = 2512 + 4  |
+  | main = 3a9a5f9 + d154's +6                  | 2522  = 2518 + 4  |
+
+  Any other number falsifies this row. In particular 2518 or 2520 would mean my own +4 is not
+  what I think it is, whatever d154 did.
+
+WHY THIS CANNOT SILENTLY GO WRONG, and why the table is belt-and-braces rather than the guard:
+`land-gate` step [2/3] is `staleness.sh`, asked LAST, against the commit the suite actually
+certified. If d154 lands while my run is queued or in flight, staleness reads STALE-GREEN and
+the gate REFUSES -- exactly as it did to my first run. So the base cannot move under a landing
+without the guard firing. The table above exists so that when it does fire, the number I re-derive
+was written down beforehand rather than computed to fit.
+
+⚠ AND THE INSTRUMENT THAT MISSED IT THE FIRST TIME, recorded so the next lane does not repeat it:
+`git fetch && git log origin/main` is the obviously correct base check AND IT IS WRONG HERE.
+`origin/main` is 14 commits behind local `main`; `cdf6434` is in the local ref and not in origin.
+Worktrees share one `.git`, and `land-gate` defaults to `main`, the shared LOCAL ref. A fetch
+cannot see a local commit and nothing warns. ⇒ COMPARE AGAINST LOCAL `main`, ALWAYS, and name the
+sha. `tools/staleness.sh . main HEAD` is free, takes no lock, and is the only check that answers
+this -- run it BEFORE spending a slot and again at the gate.

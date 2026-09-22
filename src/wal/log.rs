@@ -201,15 +201,39 @@ pub struct LogRecord {
     pub kind: RecKind
 }
 
-/// Length-prefixed string, so a name containing anything at all cannot desync the reader.
+/// Length-prefixed string, **refusing** any string the `u16` prefix cannot express.
 ///
 /// `pub(crate)` rather than private because the durable provenance store writes the same
 /// length-prefixed strings into its own file. One encoder means the two formats cannot disagree
 /// about what a string is, and a second hand-written one is a second place for the same
 /// off-by-two to live.
-pub(crate) fn write_str(buffer: &mut Vec<u8>, s: &str) {
-    buffer.extend_from_slice(&(s.len() as u16).to_be_bytes());
+///
+/// ⛔ **THE GUARD IS HERE AND DELIBERATELY NOWHERE ELSE.** Until D154 this wrote `s.len() as u16`
+/// unchecked, while the line above claimed *"so a name containing anything at all cannot desync
+/// the reader"* — false for any string of 65536 bytes or more, which landed with a length prefix
+/// of **zero** followed by its full bytes: durable, correctly checksummed over exactly the bytes
+/// intended, and permanently undecodable. Nothing downstream can catch that, because everything
+/// downstream checks the bytes against a checksum of themselves.
+///
+/// ⭐ **THREE separate callers had already found this and each fixed it LOCALLY** —
+/// `tel::log::put_str`, `consensus::log::put_str`, and `consensus::transport`'s re-encode check —
+/// while the root stayed unguarded and two more formats grew on top of it. That is the shape:
+/// a local fix is always cheaper than a root fix, so local fixes accumulate and the root never
+/// gets done. More than one hand-rolled wrapper around one primitive means the primitive is
+/// broken, and each wrapper is a datapoint proving somebody already knew.
+///
+/// The two `put_str`s are now error-type ADAPTERS, not guards — they exist so each format keeps
+/// its own error vocabulary. They must not re-check the length: a second check in front of this
+/// one would mask every mutant of it.
+pub(crate) fn write_str(buffer: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), FerroError> {
+    let len = u16::try_from(s.len()).map_err(|_| FerroError::Unrepresentable {
+        what: what.to_string(),
+        len: s.len(),
+        limit: u16::MAX as usize,
+    })?;
+    buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 // Bounds-checked readers. These bytes arrive from a disk or a socket, so every read has to be able
@@ -308,7 +332,7 @@ pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
 }
 
 impl RecKind {
-    pub fn serialize(&self, buffer: &mut Vec<u8>) {
+    pub fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), FerroError> {
         match self {
             RecKind::Begin => buffer.push(0),
             RecKind::Commit => buffer.push(1),
@@ -355,16 +379,16 @@ impl RecKind {
                         match alt {
                             ColumnAlteration::Add { column } => {
                                 buffer.push(0);
-                                write_str(buffer, column);
+                                write_str(buffer, column, "an added column's name")?;
                             }
                             ColumnAlteration::Rename { from, to } => {
                                 buffer.push(1);
-                                write_str(buffer, from);
-                                write_str(buffer, to);
+                                write_str(buffer, from, "a renamed column's old name")?;
+                                write_str(buffer, to, "a renamed column's new name")?;
                             }
                             ColumnAlteration::Retype { column, from } => {
                                 buffer.push(2);
-                                write_str(buffer, column);
+                                write_str(buffer, column, "a retyped column's name")?;
                                 write_data_type(buffer, from);
                             }
                         }
@@ -372,10 +396,17 @@ impl RecKind {
                 }
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&time_travel_root.to_be_bytes());
-                write_str(buffer, table);
-                buffer.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+                write_str(buffer, table, "a table name")?;
+                // Same hazard as the names, one field over: a DDL record with 65536 columns would
+                // carry a column count of ZERO and then all of them.
+                let n_cols = u16::try_from(columns.len()).map_err(|_| FerroError::Unrepresentable {
+                    what: "a DDL record's column count".to_string(),
+                    len: columns.len(),
+                    limit: u16::MAX as usize,
+                })?;
+                buffer.extend_from_slice(&n_cols.to_be_bytes());
                 for (name, ty, nullable) in columns {
-                    write_str(buffer, name);
+                    write_str(buffer, name, "a column name")?;
                     write_data_type(buffer, ty);
                     buffer.push(if *nullable { 1 } else { 0 });
                 }
@@ -383,10 +414,10 @@ impl RecKind {
             RecKind::RunIdentity { run } => {
                 buffer.push(10);
                 buffer.extend_from_slice(&run.prov_id.0.to_be_bytes());
-                write_str(buffer, &run.agent_id);
-                write_str(buffer, &run.run_id);
-                write_str(buffer, &run.model);
-                write_str(buffer, &run.model_version);
+                write_str(buffer, &run.agent_id, "an agent id")?;
+                write_str(buffer, &run.run_id, "a run id")?;
+                write_str(buffer, &run.model, "a model name")?;
+                write_str(buffer, &run.model_version, "a model version")?;
                 buffer.extend_from_slice(&run.prompt_hash);
                 buffer.extend_from_slice(&run.started_at.to_be_bytes());
                 buffer.extend_from_slice(&run.parent_branch.id.to_be_bytes());
@@ -396,9 +427,10 @@ impl RecKind {
                 buffer.push(8);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
                 buffer.extend_from_slice(&undo_next.to_be_bytes());
-                redo.serialize(buffer);
+                redo.serialize(buffer)?;
             }
         }
+        Ok(())
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, FerroError> {
@@ -675,7 +707,7 @@ impl WalManager {
         body.extend_from_slice(&lsn.to_be_bytes());
         body.extend_from_slice(&prev_lsn.to_be_bytes());
         body.extend_from_slice(&txn_id.to_be_bytes());
-        kind.serialize(&mut body);
+        kind.serialize(&mut body)?;
         let total_len = (4 + body.len() + 4) as u32;
 
         let start = buffer.bytes.len();
@@ -1037,7 +1069,7 @@ mod tests {
 
         for case in cases {
             let mut buf = Vec::new();
-            case.serialize(&mut buf);
+            case.serialize(&mut buf).unwrap();
             assert_eq!(RecKind::deserialize(&buf).unwrap(), case);
         }
     }
@@ -1148,7 +1180,7 @@ mod tests {
             (4, RecKind::Checkpoint),
         ] {
             let mut buf = Vec::new();
-            kind.serialize(&mut buf);
+            kind.serialize(&mut buf).unwrap();
             assert_eq!(buf[0], tag, "the tag of {kind:?} moved; an existing log now misdecodes");
             assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
         }
@@ -1160,7 +1192,7 @@ mod tests {
             time_travel_root: 2,
             columns: vec![("c".into(), DataType::Integer, true)],
         }
-        .serialize(&mut buf);
+        .serialize(&mut buf).unwrap();
         assert_eq!(buf[0], 9, "the DDL tag moved");
 
         let mut buf = Vec::new();
@@ -1176,7 +1208,7 @@ mod tests {
                 crate::branch::types::BranchId::TRUNK,
             ),
         }
-        .serialize(&mut buf);
+        .serialize(&mut buf).unwrap();
         assert_eq!(buf[0], 10, "run identity must be tag 10; 0..9 are taken by existing logs");
     }
 
@@ -1196,7 +1228,7 @@ mod tests {
             crate::branch::types::BranchId::new(2, 0),
         );
         let mut buf = Vec::new();
-        RecKind::RunIdentity { run }.serialize(&mut buf);
+        RecKind::RunIdentity { run }.serialize(&mut buf).unwrap();
         // Anti-vacuity: it decodes as written, so the refusal below is about the id and not about
         // the record being unreadable.
         RecKind::deserialize(&buf).expect("a well-formed run identity record was refused");
@@ -1224,7 +1256,7 @@ mod tests {
                 crate::branch::types::BranchId::new(1, 0),
             ),
         }
-        .serialize(&mut buf);
+        .serialize(&mut buf).unwrap();
         assert!(RecKind::deserialize(&buf).is_ok(), "the intact record was refused");
         for cut in 1..buf.len() {
             let err = RecKind::deserialize(&buf[..cut]);
@@ -1240,7 +1272,7 @@ mod tests {
 
     fn round_trip(rec: &RecKind) -> RecKind {
         let mut bytes = Vec::new();
-        rec.serialize(&mut bytes);
+        rec.serialize(&mut bytes).unwrap();
         RecKind::deserialize(&bytes).expect("a record this code just wrote did not read back")
     }
 
@@ -1282,7 +1314,7 @@ mod tests {
         for (op, tag) in [(DdlOp::CreateTable, 0u8), (DdlOp::DropTable, 1u8)] {
             let rec = ddl(op.clone(), shape.clone());
             let mut bytes = Vec::new();
-            rec.serialize(&mut bytes);
+            rec.serialize(&mut bytes).unwrap();
             assert_eq!(bytes[0], 9, "the record kind tag moved");
             assert_eq!(bytes[1], tag, "the ddl op tag moved");
             // dir_root is the next four bytes, exactly as before: nothing was inserted between.
@@ -1303,7 +1335,7 @@ mod tests {
             vec![("note".to_string(), DataType::Varchar(20), true)],
         );
         let mut bytes = Vec::new();
-        rec.serialize(&mut bytes);
+        rec.serialize(&mut bytes).unwrap();
         for cut in 2..bytes.len() {
             // Every prefix is either a clean refusal or, for a prefix that happens to be a valid
             // shorter record, something that is not this record. Never a panic.
@@ -1321,7 +1353,7 @@ mod tests {
             vec![("note".to_string(), DataType::Varchar(20), true)],
         );
         let mut bytes = Vec::new();
-        rec.serialize(&mut bytes);
+        rec.serialize(&mut bytes).unwrap();
         bytes[2] = 99; // the alteration sub-tag
         let err = RecKind::deserialize(&bytes).expect_err("an unknown alteration tag was accepted");
         assert!(format!("{err}").contains("column alteration tag"), "{err}");

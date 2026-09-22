@@ -1,0 +1,72 @@
+PRE-REGISTRATION — the batch push of 2026-09-22, written BEFORE the push and before its CI run
+==============================================================================================
+Cut at 2026-09-22T20:41Z. Nothing in this file may be edited after the run; corrections are
+appended below the line marked AMENDMENTS, with a timestamp, and the original stays readable.
+
+WHAT IS BEING PUSHED
+  origin/main = 4685d80        local main = (this commit's parent chain)        unpushed ~65
+  Rows landed locally tonight, each through tools/land-gate.sh (certify-head · staleness · prepush):
+      850a70d  D151          +1 @ cdf6434   2512
+      624edf1  D158 item 1   +4 @ 3a9a5f9   2516
+      93c0eee  D159          +7 @ 624edf1   2523
+      6b129b3  D154          +6 @ 29801f0   2529
+      27031fb  D130 raw gate artifacts — bench only, 0 code
+      (+ av-loop-counters, pre-registered +0 @ 6b129b3 / 2529, landing before the push)
+
+WHY THIS FILE EXISTS
+  origin/main's Windows job has crashed with STATUS_ACCESS_VIOLATION on four distinct shas.
+  A red Windows job after this push is therefore the EXPECTED background condition, and the
+  failure mode this file guards against is reading that red as "the landings broke main".
+  A pre-registration written afterwards can be re-described; one written now can only be read.
+
+⛔ WHAT IS ALREADY KNOWN AND MUST NOT BE RE-DERIVED FROM THIS RUN
+  The access violation is a LONG-STANDING INTERMITTENT, not a regression: 0ee07fc, 0aaffb4 and
+  cc399de all predate — and are git ancestors of — b17ec58, the arm a bisect had been using as a
+  clean control. See bench/windows_access_violation.txt, entry 2026-09-22T20:39Z. The D138 bisect
+  is FALSIFIED and both of its draw-4 runs were cancelled.
+
+THE READING, FIXED IN ADVANCE — four outcomes, each with what it does and does NOT license
+  1. Windows fails with the SAME signature — exit 0xc0000005, NO `test result: FAILED` line and
+     NO `panicked at` in the log, integration_cluster_agents the survivor by elimination.
+     ⇒ the known intermittent. Says NOTHING about any row landed tonight.
+  2. Windows fails DIFFERENTLY — any panic, any named failing test, any non-0xc0000005 exit.
+     ⇒ NEW. Attributable to this batch, and the first suspect is av-loop-counters, because it is
+     the only change to the crashing file.
+  3. ubuntu or macOS fails, in any way.
+     ⇒ NEW and unambiguous. Both are flat by construction here and the local per-target suite is
+     green at 2529 with 0 failures, so a failure there is a real regression, not the AV.
+  4. All three pass.
+     ⇒ informative about the AV's RATE ONLY. ⛔ It is NOT evidence the AV is fixed, NOT evidence
+     any row fixed it, and NOT evidence av-loop-counters perturbed it away. An intermittent
+     passes most of the time; that is what makes it an intermittent.
+
+⭐ THE ONE NEW THING THIS RUN CAN TELL US, and it is direct rather than statistical
+  av-loop-counters prints an iteration count out of both bounded loops in the crashing file, to
+  the REAL stderr (libtest's capture swallows eprintln! under the plain `cargo test` CI runs, and
+  the AV kills the process before captured buffers flush). Fire-checked two-armed: 0 lines with
+  eprintln!, 2 lines with the direct write, both call sites proven to fire.
+
+  macOS BASELINE, measured across 16 loop exits inside a full verifier run at cbf55d7:
+        max turns = 3          (bounds are 20 000 for settle_to and 100 000 for hold_leader)
+        max ms    = 10
+  Four orders of magnitude of headroom. So, from the Windows log:
+        turns near the bound     ⇒ the ELECTION is not converging
+        turns small but ms huge  ⇒ the SOCKET LAYER (transport.rs:944 already records that
+                                   WouldBlock and TimedOut are the same event on different
+                                   platforms)
+        LOOPCOUNT lines present, then nothing ⇒ it died AFTER a loop completed; the last line
+                                   bounds where
+        NO LOOPCOUNT line at all ⇒ it died before either loop ran to completion
+  ⚠ Absence of a line is only interpretable because the instrument was PROVEN to emit under the
+    exact command CI runs. Before db2aeed it emitted nothing at all, and the original commit
+    DEFINED a missing line as "it died before either loop" — a silent false negative that would
+    have rendered as the most interesting possible finding.
+
+⚠ WHAT WOULD FALSIFY THE INSTRUMENT ITSELF
+  LOOPCOUNT lines appearing on ubuntu/macOS in CI but not on Windows in a run that otherwise
+  reaches the same tests would mean the direct-stderr write is platform-conditional, and every
+  absence reading above would be void. Check the ubuntu log for LOOPCOUNT before reading the
+  Windows one.
+
+AMENDMENTS
+  (none yet)

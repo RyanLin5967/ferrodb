@@ -998,11 +998,20 @@ fn fits_u32(len: usize, what: &'static str) -> Result<u32, LogError> {
         .map_err(|_| LogError::Unrepresentable { what, len, limit: u32::MAX as usize })
 }
 
-/// `write_str` with the guard `wal::log`'s own `write_str` does not have.
+/// `wal::log::write_str`, with this module's error type on the refusal.
+///
+/// ⛔ **THIS NO LONGER CHECKS THE LENGTH, AND MUST NOT.** It used to call `fits_u16` first,
+/// because `write_str` wrote `s.len() as u16` unchecked; D154 moved the guard into `write_str`,
+/// which is the only place it can be the authority for all three formats built on it. A check
+/// here in front of that one would mask every mutant of it. What remains is the `LogError`
+/// translation, so a consensus caller still matches on `LogError::Unrepresentable` — and
+/// `tests_log.rs` asserts exactly that, including the `what` label.
 fn put_str(out: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), LogError> {
-    fits_u16(s.len(), what)?;
-    write_str(out, s);
-    Ok(())
+    write_str(out, s, what).map_err(|_| LogError::Unrepresentable {
+        what,
+        len: s.len(),
+        limit: u16::MAX as usize,
+    })
 }
 
 /// `total_len | term | round | payload | crc32`, the WAL's shape with a round where its LSN goes.
