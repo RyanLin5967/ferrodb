@@ -1,0 +1,126 @@
+D127 PROSE INVERSION (SCALE-DESIGN D134) — PRE-REGISTERED SUITE COUNT
+================================================================================
+Written BEFORE the first run of the suite on this branch. Amendments append-only.
+
+Branch:      d127-invert  (from D127-unswallow-refusal @ 01fc53b, main merged twice)
+Base at reg: main = 29ad1f5
+What changed on this branch vs D127-unswallow-refusal: COMMENTS, DOC COMMENTS AND ONE
+  OPERATOR-FACING STRING ONLY. No code, no test logic, no assertion. `git diff` confirms.
+
+PRE-REGISTERED EXPECTATION
+--------------------------------------------------------------------------------
+  mode=per-target   passed = 2481   failed = 0   build_errors = 0
+  go                passed = 97     failed = 0
+
+DERIVATION — every term has a named instrument, none is recalled.
+  a) main @ 98a44ef, mode=per-target, passed=2476.
+     Instrument: bench/land98a44ef_certified/SUMMARY.txt, verbatim from the runner's stdout.
+  b) main advanced 98a44ef -> 29ad1f5 by two commits, 21ae398 and 29ad1f5.
+     `git diff e62746c..main -- src/ tests/ | grep -c '^[+-].*#\[test\]'` = 0.
+     21ae398 is a 20/4-line comment edit in src/branch/table_catalog.rs; 29ad1f5 adds only
+     bench/w4_root_cell.txt. So (a) carries forward unchanged: 2476.
+  c) D127 adds 5 tests and removes none.
+     `git diff ac2ab26..D127-unswallow-refusal -- src/ tests/ | grep -c '^+.*#\[test\]'` = 5,
+     the `-` count is 0. Named:
+       d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep
+       d127_a_clean_sweep_reports_no_refusal_at_all
+       d127_a_capped_refusal_report_still_states_the_true_count
+       d127_the_trait_sweep_counts_a_refusal_it_cannot_report
+       a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved
+  d) This branch's own edits add and remove zero tests.
+  ⇒ 2476 + 5 = 2481, mode=per-target.
+
+⚠ MODE IS PART OF THE NUMBER. D127's own bank reads `mode=whole passed=2467`, and `whole`
+  = `per-target` + 2 doctests, so it is NOT comparable to 2476 term for term and is not used
+  above. The only two numbers combined here are both per-target-derived.
+
+⚠ THE PROXY IS `#[test]` ATTRIBUTES, not a collection. It would miss a test added behind a
+  macro or a cfg this grep does not see, and would overcount an `#[ignore]`. Both would show
+  up as a miss against 2481 and are to be reported as such, not absorbed.
+
+WHAT A MISS MEANS
+  passed != 2481  -> the count is wrong or the branch is; report the delta and find the name.
+                     Do NOT adjust this file to match the result.
+  failed > 0      -> report verbatim. This branch touched no test logic, so any failure is a
+                     real interaction with the 48 main commits merged in, not a prose edit.
+
+AMENDMENT 1 — cut 2026-09-22T12:11:43Z, BEFORE any result existed
+--------------------------------------------------------------------------------
+Ordering, stated because it is the whole value of the amendment: at the moment this
+was written the run was still in flight. `grep -E 'mode=|go rc=|REFUSING|HARNESS_EXIT'`
+over verify-out/d127invert/runner.out returned NO VERDICT, and `pgrep -f
+'verify-suite.sh d127invert'` returned live pids 7680/7683. So this corrects the
+expectation against the SOURCE, not against a number I had seen.
+
+⛔ THE PRE-REGISTERED 2481 IS WRONG. THE CORRECT EXPECTATION IS 2482.
+
+The original derivation counted D127's new tests with
+`git diff ac2ab26..D127-unswallow-refusal -- src/ tests/ | grep -c '^+.*#\[test\]'` = 5
+and treated 5 attributes as 5 tests. That is the failure mode this file's own
+"THE PROXY IS `#[test]` ATTRIBUTES" caveat named in advance: *"It would miss a test
+added behind a macro."* It did.
+
+FOUR of the five are ordinary, in src/branch/lease_thread/tests.rs:
+    :934   d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep
+    :1027  d127_a_clean_sweep_reports_no_refusal_at_all
+    :1089  d127_a_capped_refusal_report_still_states_the_true_count
+    :1136  d127_the_trait_sweep_counts_a_refusal_it_cannot_report
+
+THE FIFTH IS INSIDE A MACRO THAT IS INSTANTIATED TWICE:
+    src/branch/reaper.rs:2296  a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved
+    `macro_rules! reaper_suite` opens at reaper.rs:894 and its body closes at :2379;
+    2296 lies inside it. The macro is instantiated twice, at :2384 and :2385 —
+        reaper_suite!(log_catalog, false);
+        reaper_suite!(table_catalog, true);
+    so that one `#[test]` attribute compiles to TWO tests:
+        branch::reaper::tests::log_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved
+        branch::reaper::tests::table_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved
+
+⇒ D127 adds 4 + (1 x 2) = 6 tests, not 5.
+⇒ AMENDED EXPECTATION: 2476 + 6 = 2482, mode=per-target. go = 97, unchanged.
+
+Found while independently checking a teammate's diagnosis of a pre-existing intermittent
+in the same macro, rather than taking it at face value — the same doubling is what makes
+that race possible at all (two instantiations, one process, one PID-keyed temp path).
+
+SEPARATE NAMED TERM — a known pre-existing intermittent, NOT this branch's:
+    branch::reaper::tests::log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+    panics "fixture: nothing was ever checkpointed".
+  Verified from source at this tree's own line numbers, not taken on report:
+    reaper.rs:1170  `ferro-slow-reap-ckpt-{process::id()}.bin`  — PID-keyed ONLY
+    reaper.rs:1094  `ferro-reap-ckpt-{process::id()}.bin`       — same defect
+    reaper.rs:1732-1733  the DEFENDED site, which adds `thread::current().id()`
+  Both macro instantiations compute the identical path and run concurrently in one test
+  binary; one `remove_file`s while the other has just checkpointed. main @ 29ad1f5
+  (a doc-only commit) hit it at rc=101 passed=2475 failed=1.
+  ⇒ NOT FIXED HERE, deliberately: it is outside this row and entangling it with a
+    prose-only landing would make this branch unreviewable as what it is.
+  ⇒ If the run fails ONLY on that test name, the correct reading is the race, and the
+    action is to re-run — NOT to treat 2482 as falsified. A failure on ANY other name
+    is this branch's and is to be reported as such.
+
+RESULT — 2026-09-22, verbatim from the runner's own stdout
+--------------------------------------------------------------------------------
+d127invert: mode=per-target rc=0 passed=2482 failed=0 build_errors=0 head=3b0bee5 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.log
+d127invert: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.go.log
+HARNESS_EXIT=0
+
+⇒ 2482 = AMENDMENT 1's figure, exactly. The original 2481 was wrong and was
+  corrected BEFORE the result existed, not after. Nothing was absorbed.
+
+THE +1, PROVEN FROM THE RUN'S OWN LOG rather than from reading the macro:
+  suite-d127invert.log:331  test branch::reaper::tests::log_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved ... ok
+  suite-d127invert.log:368  test branch::reaper::tests::table_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved ... ok
+  One `#[test]` attribute, two executed tests. That is the whole of the +1.
+
+D139's pre-existing fixture race DID NOT FIRE in this run — both instantiations passed:
+  suite-d127invert.log:413  ...log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map ... ok
+  suite-d127invert.log:444  ...table_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map ... ok
+  ⚠ A PASS DOES NOT RETRACT THE RACE. It is a scheduling race between two threads over
+  one PID-keyed path; not firing once is what an intermittent does. The defect at
+  reaper.rs `ferro-reap-ckpt-{pid}.bin` and `ferro-slow-reap-ckpt-{pid}.bin` stands and
+  is D139's to fix. This run is evidence about THIS branch, not about that race.
+
+`grep -cE '^test .* FAILED|panicked'` over the log = 0. That zero is trustworthy because
+the same grep over the same file DID match on the four test names above, so the
+instrument demonstrably fires on this file.

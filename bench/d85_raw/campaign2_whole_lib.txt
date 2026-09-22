@@ -1,0 +1,41 @@
+D85 widened arms - whole lib target
+HEAD: 2bc80fda496333cb126fa8870f05678b879b90f1
+started: 2026-09-22T10:18:51Z
+
+==============================================================================
+### W0-baseline  (rc=0, 57s)
+    removes: nothing
+==============================================================================
+    test result: ok. 1626 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 52.40s
+
+==============================================================================
+### W4-no-retire-probe  (rc=0, 51s)
+    removes: retire_arenas_by_rule does not probe
+==============================================================================
+    test result: ok. 1626 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 47.87s
+
+==============================================================================
+### W5-no-collectable-probe  (rc=101, 52s)
+    removes: extent_is_collectable does not probe
+==============================================================================
+    thread 'branch::reaper::tests::log_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened' (258920024) panicked at src/branch/reaper.rs:2176:5:
+    thread 'branch::reaper::tests::table_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened' (258920154) panicked at src/branch/reaper.rs:2177:5:
+    test result: FAILED. 1624 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 47.91s
+    error: test failed, to rerun pass `--lib`
+    FAILING TESTS:
+      test branch::reaper::tests::log_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... FAILED
+      test branch::reaper::tests::table_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... FAILED
+
+==============================================================================
+### W6-neither-probe  (rc=101, 54s)
+    removes: NEITHER site probes - mutual masking vs dead code
+==============================================================================
+    thread 'branch::reaper::tests::log_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened' (258956577) panicked at src/branch/reaper.rs:2176:5:
+    thread 'branch::reaper::tests::table_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened' (258956702) panicked at src/branch/reaper.rs:2177:5:
+    test result: FAILED. 1624 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 51.26s
+    error: test failed, to rerun pass `--lib`
+    FAILING TESTS:
+      test branch::reaper::tests::log_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... FAILED
+      test branch::reaper::tests::table_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... FAILED
+
+WIDEN_COMPLETE

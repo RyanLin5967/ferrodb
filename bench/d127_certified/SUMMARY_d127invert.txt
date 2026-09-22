@@ -1,0 +1,41 @@
+CERTIFICATION — d127-invert (the D134 prose inversion), 2026-09-22
+================================================================================
+⚠ SUPERSEDES SUMMARY.txt in this directory, which certifies head=7ad789b in
+  mode=whole. That run is NOT about the tree that ships: it predates both the
+  prose inversion and 48 commits of main. Read this file, not that one.
+
+suite head=  3b0bee5   (branch d127-invert)
+mode=        per-target
+  ⚠ MODE IS PART OF THE NUMBER. `whole` = `per-target` + 2 doctests, so this 2482
+    is NOT comparable term-for-term with the superseded 2467 in SUMMARY.txt.
+
+pre-registered: 2482, in bench/d127_invert_prereg.txt as AMENDMENT 1, cut
+  2026-09-22T12:11:43Z while the run was still in flight and no verdict existed
+  on disk. The original figure in that file was 2481 and was WRONG; it is left
+  in place above the amendment rather than edited, so the correction is visible.
+
+Result (verbatim from the runner's own stdout):
+d127invert: mode=per-target rc=0 passed=2482 failed=0 build_errors=0 head=3b0bee5 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.log
+d127invert: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d127invert/suite-d127invert.go.log
+HARNESS_EXIT=0
+
+WHAT THIS GREEN DOES AND DOES NOT LICENSE
+  DOES: it is evidence about this branch's change — which is comments, doc
+    comments and ONE operator-facing string literal, and nothing else. The only
+    non-comment line in `git show 3b0bee5 -- src/` is that string.
+  DOES NOT: license a push. It certifies a tree that merged main at 29ad1f5.
+    main has since moved to 955e992 (D130-batch-vs-threads and d85-rederive
+    landed after this branch last synced), so `main + this branch` is a tree no
+    suite has seen. Merging and pushing on the strength of THIS green would be
+    the D126 failure exactly. The load-bearing run is the one over the merged
+    tree, and it is the team lead's to make.
+
+BLIND SPOTS, per this repo's convention that evidence names its own
+  * A commit added after 3b0bee5 is not covered. One exists: the commit carrying
+    this file and the prereg amendment. It is bench/*.txt only — zero src/, zero
+    tests — so it cannot move a test count, but it is not what ran.
+  * D139's fixture race (PID-keyed temp paths in reaper.rs) passed in this run.
+    That is one draw on an intermittent, not a retraction of it.
+  * This run never compiled examples/d130_pgwire_batch.rs, which arrived on main
+    after this branch synced. verify-suite.sh builds examples before it tests, so
+    the first run to compile that example alongside this branch is the merged one.

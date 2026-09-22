@@ -207,7 +207,14 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // Stop the scan before the checkpoints below. A scan that freed an extent after the free-space
     // map was written would leave a durable map that still charges pages nothing owns.
     let stats = lease.stop();
-    if stats.reaped > 0 || stats.refused > 0 || stats.failed > 0 {
+    // **D127** put `refused_branches` in this condition. A session that reaped nothing, refused no
+    // whole scan and failed nothing, but declined to decide about a branch, used to print no line
+    // at all — the exact shape of "a real event reaches no reader" this row closes.
+    if stats.reaped > 0
+        || stats.refused_scans > 0
+        || stats.refused_branches > 0
+        || stats.failed > 0
+    {
         println!("ferrodb: lease scan {stats:?}");
     }
     txn.checkpoint()?;

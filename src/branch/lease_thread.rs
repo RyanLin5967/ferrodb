@@ -77,8 +77,19 @@
 //! `Command::LeaseTick` on a cluster member. A member that has applied no tick does not know the
 //! time, and this thread **refuses to reap** and says so, rather than substituting a reading:
 //! reaping is destructive and a `BranchId` generation makes a wrong reap unrecoverable. The
-//! refusal is counted in [`LeaseStats::refused`] so "it is not reaping" and "it cannot" are
+//! refusal is counted in [`LeaseStats::refused_scans`] so "it is not reaping" and "it cannot" are
 //! distinguishable from outside.
+//!
+//! **4 — D127. A refusal about ONE branch is a reading too, and it must reach a reader.**
+//! Rule 3 is the whole-scan case and was always reported. The per-branch case was not:
+//! `reap_if_still_expired` returned a `bool`, `false` meant both *"the lease was renewed under
+//! us"* and *"the catalog would not answer"*, and this function dropped the second on the floor —
+//! so D124's guard, whose entire output is a sentence naming the parent, the fork epoch and the
+//! child, fired into nothing. The outcome type is now three-way
+//! ([`crate::branch::ReapOutcome`]), the refusals are counted in
+//! [`LeaseStats::refused_branches`], and their reasons are printed by [`refusal_report`]. The
+//! sweep still continues past one — that is what the absorption is FOR — it just no longer
+//! continues *quietly*.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -90,7 +101,7 @@ use crate::branch::types::{BranchId, LeaseDeadline};
 // inherent methods (`resume_interrupted_reaps`, `expired_candidates`, `reap_if_still_expired`,
 // `collect_orphans_if_due`), because the trait's `reap_expired` is the whole-sweep shape whose
 // hold time is what this row removed.
-use crate::branch::TwoTierReaper;
+use crate::branch::{ReapOutcome, TwoTierReaper};
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
 
@@ -258,8 +269,41 @@ pub struct LeaseStats {
     pub reaped: u64,
     /// Workspaces dropped by [`AgentRuntime::forget_reaped_branches`] afterwards.
     pub forgotten: u64,
-    /// Scans that refused because this node does not know the cluster's time.
-    pub refused: u64,
+    /// **Whole scans** that refused because this node does not know the cluster's time.
+    ///
+    /// Named `refused` until D127, when a second, unrelated refusal became countable. The rename
+    /// is the point of that row applied to its own instrument: a field called `refused` sitting
+    /// next to `refused_branches` is the same conflation one level up, and the first reader to
+    /// quote the wrong one would be reporting a node with no clock as a corrupt catalog.
+    pub refused_scans: u64,
+    /// **D127 — individual branches a scan declined to decide about**, summed over every scan.
+    ///
+    /// Distinct from [`LeaseStats::reaped`] (it freed nothing), from `candidates - reaped` (a
+    /// branch whose lease was renewed under the sweep is healthy and is not counted here), and
+    /// from [`LeaseStats::failed`] (the sweep did not stop; the other expired branches were still
+    /// reclaimed). Each one keeps its pages and is retried on the next scan, and each one is
+    /// printed with its reason — see `refusal_report`.
+    ///
+    /// **On a healthy database this reads ZERO, and every increment is worth acting on.**
+    ///
+    /// D127 first argued the opposite — that a steady trickle was the benign race
+    /// `TableBranchCatalog::upsert` opened, delete-then-insert with no latch across the two, so a
+    /// concurrent `set_root` or `renew_lease` un-read a healthy branch's record for a moment, and
+    /// only a number that climbed and never came back was a leak. **That premise is dead.** D126
+    /// gave the tree an in-place replace — `BPlusTreeManager::upsert` is one `LeafWrite::Replace`
+    /// over a single page write — and `TableBranchCatalog::upsert` is one
+    /// line over it, so there is no window in which a live branch's record is absent to a reader
+    /// (`tests/d126_atomic_upsert.rs`; `TwoTierReaper::reap_if_still_expired` says the same at its
+    /// `get_raw` arm).
+    ///
+    /// What still reaches this counter is an **I/O error or a corrupt catalog**, and neither is
+    /// routine. So the alarm is the FIRST increment, not the derivative: an operator told to wait
+    /// for a rising trend would be waiting out the signal itself. A number that does not come back
+    /// down is the worse reading — a branch that can no longer be reaped, pages that never return
+    /// — but it is worse than an already-actionable one, not the threshold for acting.
+    ///
+    /// Before D127 neither case reached any reader at all, which is what the row fixes.
+    pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
 }
@@ -270,7 +314,8 @@ struct Counters {
     scans: AtomicU64,
     reaped: AtomicU64,
     forgotten: AtomicU64,
-    refused: AtomicU64,
+    refused_scans: AtomicU64,
+    refused_branches: AtomicU64,
     failed: AtomicU64,
 }
 
@@ -281,7 +326,8 @@ impl Counters {
             scans: self.scans.load(Ordering::SeqCst),
             reaped: self.reaped.load(Ordering::SeqCst),
             forgotten: self.forgotten.load(Ordering::SeqCst),
-            refused: self.refused.load(Ordering::SeqCst),
+            refused_scans: self.refused_scans.load(Ordering::SeqCst),
+            refused_branches: self.refused_branches.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
         }
     }
@@ -373,7 +419,7 @@ impl LeaseThread {
                     if halt.is_stopping() {
                         return;
                     }
-                    scan_once(&reaper, &runtime, &*lock, &counters);
+                    scan_once(&reaper, &runtime, &*lock, &counters, &report);
                     if halt.wait(interval) {
                         return;
                     }
@@ -517,11 +563,20 @@ const REAP_YIELD: Duration = Duration::from_millis(1);
 /// back to the free-space map. That needs the reap of one branch to be inside the lock. It never
 /// needed the whole sweep to be inside one acquisition, and the difference between those two
 /// readings is this entire row.
+/// One lease scan.
+///
+/// `out` is where everything this pass has to say goes. It is a parameter rather than a direct
+/// call to [`report`] because of D127: the row is *"the refusal reaches no reader"*, and a
+/// function that writes to the process's stderr cannot be asked, by a test, whether a reader would
+/// have seen anything. Production passes `&report`; the tests pass a collector and assert on the
+/// text. Without this seam the only assertable half of a refusal would be its counter, and a
+/// counter with no accompanying reason is most of the defect still standing.
 fn scan_once(
     reaper: &TwoTierReaper,
     runtime: &AgentRuntime,
     lock: &dyn RuntimeLock,
     counters: &Counters,
+    out: &dyn Fn(String),
 ) {
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
@@ -536,8 +591,8 @@ fn scan_once(
     let now = match LeaseDeadline::try_now_millis() {
         Ok(now) => now,
         Err(e) => {
-            counters.refused.fetch_add(1, Ordering::SeqCst);
-            report(format!(
+            counters.refused_scans.fetch_add(1, Ordering::SeqCst);
+            out(format!(
                 "lease: NOT reaping — this node does not know the cluster's time ({e}). \
                  Expired branches keep their pages until a LeaseTick is applied; reaping on a \
                  local clock is the divergence this refusal exists to prevent."
@@ -551,7 +606,7 @@ fn scan_once(
         Ok(c) => c,
         Err(e) => {
             counters.failed.fetch_add(1, Ordering::SeqCst);
-            report(format!(
+            out(format!(
                 "lease: could not ask which branches have expired: {e}. Nothing was freed and \
                  nothing is lost; the next scan asks again."
             ));
@@ -564,16 +619,30 @@ fn scan_once(
     // Consumed in the order `expired_candidates` produced — deepest first — because reaping a
     // child is what lets its parent's own reap take the fast path. Chunking must not reorder it.
     let mut reaped_all: Vec<BranchId> = Vec::new();
+    // **D127.** Refusals seen this pass, with the reason each one carried. Accumulated across
+    // chunks and printed once at the end rather than inside `with_lock`: writing to stderr is I/O,
+    // and rule 2's whole point is that this function does no client-blocking work while it holds
+    // the statement lock. Bounded by the candidate list, which is what `reaped_all` is bounded by
+    // too, so this adds no new growth.
+    let mut refused_all: Vec<(BranchId, FerroError)> = Vec::new();
     let mut forgotten_all = 0usize;
     let mut failure: Option<FerroError> = None;
     let mut groups = candidates.chunks(REAP_CHUNK).peekable();
     while let Some(group) = groups.next() {
         let mut reaped: Vec<BranchId> = Vec::with_capacity(group.len());
+        let mut refused: Vec<(BranchId, FerroError)> = Vec::new();
         with_lock(lock, || {
             for rec in group {
                 match reaper.reap_if_still_expired(rec.branch_id(), now) {
-                    Ok(true) => reaped.push(rec.branch_id()),
-                    Ok(false) => {}
+                    Ok(ReapOutcome::Reaped) => reaped.push(rec.branch_id()),
+                    // Its lease moved between the candidate query and the re-read inside this
+                    // acquisition. The branch is healthy; there is nothing to say about it.
+                    Ok(ReapOutcome::NotExpired) => {}
+                    // **D127 — the arm this row exists for.** It used to be spelled the same as
+                    // the one above, which is how D124's refusal reached no reader. The sweep
+                    // still goes on to the next candidate; the difference is that this one is now
+                    // remembered, counted and printed with its reason.
+                    Ok(ReapOutcome::Refused(why)) => refused.push((rec.branch_id(), why)),
                     Err(e) => {
                         failure = Some(e);
                         return;
@@ -605,6 +674,7 @@ fn scan_once(
             forgotten_all += runtime.forget_branches(&reaped);
         });
         reaped_all.append(&mut reaped);
+        refused_all.append(&mut refused);
         if failure.is_some() {
             break;
         }
@@ -634,6 +704,17 @@ fn scan_once(
         }
     }
 
+    // **D127 — before the success/failure split, because a refusal is neither.**
+    //
+    // A sweep that refused on one branch and reaped six others is a successful sweep by every
+    // other measure here, and a sweep that later failed outright still refused on whatever it
+    // refused on. Putting this inside either arm would make the signal depend on what happened to
+    // a *different* branch afterwards, which is one more way for it to go quiet.
+    if !refused_all.is_empty() {
+        counters.refused_branches.fetch_add(refused_all.len() as u64, Ordering::SeqCst);
+        out(refusal_report(&refused_all));
+    }
+
     match failure {
         None => {
             // Counted once per pass, including a pass that found nothing: `scans` is what tells
@@ -643,7 +724,7 @@ fn scan_once(
             if !reaped_all.is_empty() {
                 counters.reaped.fetch_add(reaped_all.len() as u64, Ordering::SeqCst);
                 counters.forgotten.fetch_add(forgotten_all as u64, Ordering::SeqCst);
-                report(format!(
+                out(format!(
                     "lease: reaped {} expired branch(es) with no client cooperation ({}); {} \
                      workspace(s) forgotten",
                     reaped_all.len(),
@@ -672,7 +753,7 @@ fn scan_once(
             // never one atomic step with the reap.
             let forgotten = runtime.forget_reaped_branches();
             counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
-            report(format!(
+            out(format!(
                 "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
                  is re-entrant, so the next scan resumes rather than double-freeing. \
                  {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
@@ -698,7 +779,7 @@ fn scan_once(
     // must use is now an ordinary local — but the rule that produced that variable is unchanged
     // and is why `now` is read once for the whole pass rather than re-read here.
     if let Err(e) = reaper.collect_orphans_if_due(now) {
-        report(format!(
+        out(format!(
             "lease: orphan sweep failed: {e}. Nothing is lost — the complete answer is recomputed \
              at open by `resume_interrupted_reaps`, and the cadence retries."
         ));
@@ -707,6 +788,56 @@ fn scan_once(
 
 fn join_ids(ids: &[BranchId]) -> String {
     ids.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")
+}
+
+/// How many refusals a single scan spells out in full before it starts summarising.
+///
+/// Every refusal is counted; this bounds only how much of one pass's stderr one tick may be. The
+/// reasons are paragraphs — D124's is six lines naming a parent, a fork epoch and a child — so an
+/// uncapped list on a database with a thousand expired branches would be a log nobody reads,
+/// which is the same failure as a log nobody writes.
+const REFUSAL_DETAIL_CAP: usize = 4;
+
+/// **D127 — what a refused reap looks like to whoever is reading the server's stderr.**
+///
+/// A free function taking the list, rather than a `format!` buried in [`scan_once`], for one
+/// reason: it makes the operator-facing text assertable. The row's finding was that a real event
+/// reached no reader, and a test that can only check a counter cannot tell a report that names the
+/// branch from a report that says "something happened".
+///
+/// The count is always exact and always first; only the reasons are capped. That ordering is
+/// deliberate — since D126 closed the last window in which a healthy branch could be refused, the
+/// expected count is zero, so the number is what says an operator has to act **at all**. It must
+/// not be the thing that falls off the end of a truncated line.
+fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
+    let ids: Vec<BranchId> = refused.iter().map(|(b, _)| *b).collect();
+    let mut msg = format!(
+        "lease: REFUSED to decide on {} expired branch(es) ({}). Nothing was freed, so nothing is \
+         lost, and the rest of this sweep ran. These are NOT branches whose lease was renewed \
+         under the sweep — those are healthy and are not reported: the catalog would not answer \
+         for these. A refusal raised before the reap began leaves the branch Live and the next \
+         scan asks again; one raised after it began leaves the record Reaping, which the next \
+         scan cannot see (expired_before is Live-only) and which resume_interrupted_reaps \
+         re-enters at the next open. ACT ON THE FIRST ONE: since D126 made the catalog's record \
+         rewrite atomic, a healthy database refuses nothing here, so the expected count is ZERO \
+         and anything above it is an I/O error or a corrupt catalog. That zero baseline is also \
+         what makes the trend readable at all — against it, a count that does not come back down \
+         is a branch that can no longer be reaped: pages that never return.",
+        refused.len(),
+        join_ids(&ids)
+    );
+    for (branch, why) in refused.iter().take(REFUSAL_DETAIL_CAP) {
+        msg.push_str(&format!("\nlease:   {branch}: {why}"));
+    }
+    if refused.len() > REFUSAL_DETAIL_CAP {
+        msg.push_str(&format!(
+            "\nlease:   ... and {} more refusal(s) this scan, reasons not printed (cap {}); every \
+             one is counted in LeaseStats::refused_branches.",
+            refused.len() - REFUSAL_DETAIL_CAP,
+            REFUSAL_DETAIL_CAP
+        ));
+    }
+    msg
 }
 
 /// Say something on stderr, tolerating a closed one.

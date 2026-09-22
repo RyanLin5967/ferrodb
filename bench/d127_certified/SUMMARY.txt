@@ -1,0 +1,2 @@
+D127-unswallow: mode=whole rc=0 passed=2467 failed=0 build_errors=0 head=7ad789b log=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/tmp.EP9vQoIG8A/suite-D127-unswallow.log
+D127-unswallow: go rc=0 passed=97 failed=0 log=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/tmp.EP9vQoIG8A/suite-D127-unswallow.go.log
