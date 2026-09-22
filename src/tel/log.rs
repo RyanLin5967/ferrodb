@@ -124,6 +124,192 @@ use crate::wal::log::{
     write_str,
 };
 
+/// D129 — how many frames each of this file's three linear searches actually walks.
+///
+/// `frames` is keyed by `(branch, txn_id)` and searched by a front-to-back scan in three places.
+/// Whether that is a wall is a question about **counts**, not durations, and this module is the
+/// instrument that answers it: elements walked per call, bucketed by whether the key was found.
+/// The bucketing is the point — `position`/`find` short-circuit, so a hit costs `index + 1` and a
+/// miss costs the whole Vec, and the two therefore have to be read apart or the mean hides which
+/// one the workload has.
+///
+/// ⚠ Counted per CALL, not per element: `scanned` accumulates in the predicate closure and is
+/// published with **two** relaxed adds once the search is over, against a scan of up to thousands
+/// of comparisons. The instrument cannot create the slope it measures. This is the shape
+/// `agent_sql::runtime::ours_ops_on_cell` uses and it is copied deliberately, including the part
+/// that matters: `scanned` is taken from the iterator that *actually walks*, never computed as
+/// `frames.len()` from outside — that would be an assertion about the code rather than a reading
+/// of it, and on a hit it would be wrong.
+pub mod scan_count {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `MemEffectLog::append`'s `position` scan — the write path.
+    pub const SITE_APPEND: usize = 0;
+    /// `MemEffectLog::classify_append`'s `find` — reached on **every** `DurableEffectLog::append`,
+    /// which then calls `MemEffectLog::append` and pays `SITE_APPEND` as well.
+    pub const SITE_CLASSIFY: usize = 1;
+    /// `MemEffectLog::frame`'s `find` — the point read.
+    pub const SITE_FRAME: usize = 2;
+    /// `MemEffectLog::frames_for`'s `filter` — the **fourth** site, and the odd one out.
+    ///
+    /// D77's list said two of these searches existed and D129 corrected that to three; the trait
+    /// `EffectLog` declares exactly two methods, and enumerating the scans from the trait rather
+    /// than by eye turns up this one as well. It is counted for the same reason: a site left out
+    /// of an instrument is a site the instrument reports as absent. It does **not** short-circuit
+    /// — `filter` visits every element — so `scanned` here is always the whole `Vec`, in both
+    /// buckets, and the hit/miss split means only "did it match anything".
+    pub const SITE_FRAMES_FOR: usize = 3;
+    /// ⭐ **D138's SHADOW of `MemEffectLog::append`** — what the pre-D138 linear `position` scan
+    /// *would* have walked, recorded on the same call, in the same binary, at the same moment as
+    /// the real site.
+    ///
+    /// It exists because the before/after arms of D138 are **two different binaries**, and a zero
+    /// scan reported by a counter that has been accidentally disconnected reads exactly like a
+    /// zero scan reported by a scan that no longer happens. With this site the eliminated cost and
+    /// the actual cost are two columns of ONE table: the shadow must keep D137's slope-1 law while
+    /// `SITE_APPEND` reads zero. It is recorded ONLY by the indexed arm — in the unindexed arm it
+    /// stays empty and prints as `-`, which is the honest reading (there is no index to shadow).
+    pub const SITE_APPEND_SHADOW: usize = 4;
+    pub const SITES: usize = 5;
+
+    static HIT_SCANNED: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static HIT_CALLS: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static MISS_SCANNED: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static MISS_CALLS: [AtomicU64; SITES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Calls where the shadow scan and the index DISAGREED about a key's position.
+    ///
+    /// ⛔ **This must be zero, and it is not a summary statistic — it is an equality checked on
+    /// every single append of the whole run.** A count that is not zero invalidates the arm
+    /// outright: the index would be answering something other than what the log holds.
+    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+    /// The index and a fresh linear scan returned different positions for one key.
+    #[inline]
+    #[allow(dead_code)] // recorded only by the INDEXED arm; empty here is the honest reading.
+    pub(super) fn note_mismatch() {
+        MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One search, after it finished. `scanned` is what the predicate counted.
+    #[inline]
+    pub(super) fn record(site: usize, hit: bool, scanned: u64) {
+        let (s, c) = if hit {
+            (&HIT_SCANNED[site], &HIT_CALLS[site])
+        } else {
+            (&MISS_SCANNED[site], &MISS_CALLS[site])
+        };
+        s.fetch_add(scanned, Ordering::Relaxed);
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One site's four numbers. `scanned / calls` is the per-call scan length for that bucket.
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    pub struct SiteCount {
+        pub hit_scanned: u64,
+        pub hit_calls: u64,
+        pub miss_scanned: u64,
+        pub miss_calls: u64,
+    }
+
+    impl SiteCount {
+        pub fn calls(&self) -> u64 {
+            self.hit_calls + self.miss_calls
+        }
+        pub fn scanned(&self) -> u64 {
+            self.hit_scanned + self.miss_scanned
+        }
+        /// Mean elements walked per **hit**, or `None` when there were none — a zero here must be
+        /// readable as "no hits happened", never as "hits were free".
+        pub fn per_hit(&self) -> Option<f64> {
+            (self.hit_calls > 0).then(|| self.hit_scanned as f64 / self.hit_calls as f64)
+        }
+        pub fn per_miss(&self) -> Option<f64> {
+            (self.miss_calls > 0).then(|| self.miss_scanned as f64 / self.miss_calls as f64)
+        }
+    }
+
+    /// All three sites since process start. Read twice and [`Snapshot::since`] to scope a phase.
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    pub struct Snapshot {
+        pub sites: [SiteCount; SITES],
+        /// Index-vs-scan disagreements. Must be 0; see [`MISMATCHES`].
+        pub mismatches: u64,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        let mut out = Snapshot::default();
+        out.mismatches = MISMATCHES.load(Ordering::Relaxed);
+        for i in 0..SITES {
+            out.sites[i] = SiteCount {
+                hit_scanned: HIT_SCANNED[i].load(Ordering::Relaxed),
+                hit_calls: HIT_CALLS[i].load(Ordering::Relaxed),
+                miss_scanned: MISS_SCANNED[i].load(Ordering::Relaxed),
+                miss_calls: MISS_CALLS[i].load(Ordering::Relaxed),
+            };
+        }
+        out
+    }
+
+    impl Snapshot {
+        /// What happened between `earlier` and `self`. Saturating, so a caller that passes the two
+        /// the wrong way round gets zeros rather than a wrapped u64 that reads as a huge result.
+        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+            let mut out = Snapshot::default();
+            out.mismatches = self.mismatches.saturating_sub(earlier.mismatches);
+            for i in 0..SITES {
+                let (a, b) = (&self.sites[i], &earlier.sites[i]);
+                out.sites[i] = SiteCount {
+                    hit_scanned: a.hit_scanned.saturating_sub(b.hit_scanned),
+                    hit_calls: a.hit_calls.saturating_sub(b.hit_calls),
+                    miss_scanned: a.miss_scanned.saturating_sub(b.miss_scanned),
+                    miss_calls: a.miss_calls.saturating_sub(b.miss_calls),
+                };
+            }
+            out
+        }
+        pub fn append(&self) -> SiteCount {
+            self.sites[SITE_APPEND]
+        }
+        pub fn classify(&self) -> SiteCount {
+            self.sites[SITE_CLASSIFY]
+        }
+        pub fn frame(&self) -> SiteCount {
+            self.sites[SITE_FRAME]
+        }
+        pub fn frames_for(&self) -> SiteCount {
+            self.sites[SITE_FRAMES_FOR]
+        }
+        pub fn append_shadow(&self) -> SiteCount {
+            self.sites[SITE_APPEND_SHADOW]
+        }
+    }
+}
+
 /// The frames, and the position index that answers `(branch, txn_id)` without walking them.
 ///
 /// **This is D86's shape, copied rather than invented** — `State::push_applied` /
@@ -220,7 +406,11 @@ impl MemEffectLog {
     /// The frame for one transaction on one branch, if it was ever appended.
     pub fn frame(&self, branch: BranchId, txn: TxnId) -> Option<TxnFrame> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
-        frames.position(branch, txn).map(|i| frames.frames[i].clone())
+        let at = frames.position(branch, txn);
+        // 0 elements of `frames` visited. That is this counter's unit, and an index read visits
+        // none of them. `SITE_APPEND_SHADOW` is what makes a 0 here readable at all.
+        scan_count::record(scan_count::SITE_FRAME, at.is_some(), 0);
+        at.map(|i| frames.frames[i].clone())
     }
 
     /// Classify `frame` against what is stored **without changing anything**.
@@ -233,7 +423,9 @@ impl MemEffectLog {
     /// whether the append is legal at all, and a refused append must not reach the file.
     fn classify_append(&self, frame: &TxnFrame) -> Result<Option<Reappend>, FerroError> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
-        match frames.position(frame.branch, frame.txn_id) {
+        let at = frames.position(frame.branch, frame.txn_id);
+        scan_count::record(scan_count::SITE_CLASSIFY, at.is_some(), 0);
+        match at {
             None => Ok(None),
             Some(i) => classify(&frames.frames[i], frame).map(Some),
         }
@@ -356,7 +548,26 @@ impl EffectLog for MemEffectLog {
         let mut frames = self.frames.lock().expect("effect log mutex poisoned");
         // D138: an O(1) index read where this used to walk every frame ever appended. The two
         // arms below are unchanged — what changed is only how `i` is found.
-        if let Some(i) = frames.position(frame.branch, frame.txn_id) {
+        let at = frames.position(frame.branch, frame.txn_id);
+        scan_count::record(scan_count::SITE_APPEND, at.is_some(), 0);
+        // ⭐ THE SHADOW. Run the pre-D138 linear scan as well, count exactly what it walks, and
+        // require it to return the SAME position. This is what makes the 0 above a reading rather
+        // than an assertion: the scan that was removed is still measured, on this call, in this
+        // binary, and its answer is checked against the index's on every single append.
+        // ⚠ It also makes this build deliberately SLOWER than the code it measures. That is fine
+        // and it is the point of a counts-only harness — no timing is taken here.
+        {
+            let mut scanned = 0u64;
+            let by_scan = frames.frames.iter().position(|f| {
+                scanned += 1;
+                f.branch == frame.branch && f.txn_id == frame.txn_id
+            });
+            scan_count::record(scan_count::SITE_APPEND_SHADOW, by_scan.is_some(), scanned);
+            if by_scan != at {
+                scan_count::note_mismatch();
+            }
+        }
+        if let Some(i) = at {
             match classify(&frames.frames[i], frame)? {
                 Reappend::Retry => return Ok(()),
                 // The open frame grew. **Extended rather than replaced**, and the difference is
@@ -409,12 +620,17 @@ impl EffectLog for MemEffectLog {
     /// stored frames, so it does not disturb any position [`Frames::by_key`] holds.
     fn frames_for(&self, branch: BranchId, from_seq: u64) -> Result<Vec<TxnFrame>, FerroError> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
+        let mut scanned = 0u64;
         let mut out: Vec<TxnFrame> = frames
             .frames
             .iter()
-            .filter(|f| f.branch == branch && f.seq >= from_seq)
+            .filter(|f| {
+                scanned += 1;
+                f.branch == branch && f.seq >= from_seq
+            })
             .cloned()
             .collect();
+        scan_count::record(scan_count::SITE_FRAMES_FOR, !out.is_empty(), scanned);
         out.sort_by_key(|f| (f.seq, f.txn_id.0));
         Ok(out)
     }
