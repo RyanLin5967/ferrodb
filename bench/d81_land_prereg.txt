@@ -1,0 +1,110 @@
+D81 LANDING (SCALE-DESIGN D147) — PRE-REGISTERED SUITE COUNT
+================================================================================
+Cut BEFORE the first run of the suite on this branch. Amendments append-only.
+At the moment of writing, no suite has been started from this worktree:
+`ls ~/wt/artie-research/verify-out/d81land` does not exist, and the only
+ferrodb suite holding /tmp/ferrodb-suite.lock is `land-d93d23b` (pid 93177) in
+the MAIN checkout, which is not this tree.
+
+Branch:      d81-land  @ merge 2cb227f  (D81-fsm-append a2ed26b + main b2991c6)
+Base at reg: main = b2991c6
+
+PRE-REGISTERED EXPECTATION
+--------------------------------------------------------------------------------
+  mode=per-target   passed = 2500   failed = 0   build_errors = 0
+  go                passed = 97     failed = 0
+
+DERIVATION — every term has a named instrument, none is recalled.
+
+  a) 2482  main @ b2991c6, mode=per-target.
+     ⚠ THIS TERM IS ITSELF PRE-REGISTERED, NOT MEASURED — see the dependency
+     note below. Instrument: ~/wt/artie-research/verify-out/land-d93d23b/
+     PREREG.txt, whose own chain is
+        2476  main @ 98a44ef, MEASURED, banked at bench/land98a44ef_certified/
+          +0  D130 merge, d85-rederive, D136 merge, 21ae398/29ad1f5/7fdafb6
+          +6  D127 merge (5 `#[test]` attributes, but ONE sits inside
+              `macro_rules! reaper_suite`, instantiated TWICE, so 4 + 2 = 6)
+          +0  d93d23b, b2991c6 (fixture paths, comments; no assertion moved)
+
+  b) +18  what D81 adds ON TOP OF MAIN, counted against this merged tree:
+       `git diff main..2cb227f -- src/ tests/ examples/ | grep -c '^+.*#\[test\]'`
+         = 18   added
+       `... | grep -c '^-.*#\[test\]'`            = 0   removed
+       `... | grep -c '^+.*#\[ignore'`            = 0   ignored
+     Split by file, same instrument:
+       src/branch/arena.rs          15
+       src/storage/atomic_file.rs    3
+       src/branch/reaper.rs          0   (D81 touches 32 lines there; the
+                                          fixture path and comments, no test)
+       examples/d75_...rs            0
+
+     ⭐ EACH ATTRIBUTE IS EXACTLY ONE RUNTIME TEST HERE, and that was checked
+     rather than assumed, because this repo has already been bitten twice by the
+     opposite: `grep -n 'macro_rules!' src/branch/arena.rs src/storage/
+     atomic_file.rs` returns NOTHING, so neither file has a generated suite for
+     an attribute to be doubled by. The 18 fn names were read out of the diff
+     and are distinct. None carries a `#[cfg(...)]` of its own — checked on all
+     three atomic_file tests and spot-checked in arena — so none is gated off on
+     this platform.
+
+  ⇒ 2482 + 18 = 2500, mode=per-target.
+
+  ⛔ D81's OWN REPORT SAYS 17, AND IT IS WRONG BY ONE. `bench/d81_fsm_append.txt`
+     reads "14 new tests in `src/branch/arena.rs`, 3 in `src/storage/
+     atomic_file.rs`". The diff says 15 in arena.rs. The count above is derived
+     from the diff, which is the instrument; the report's 14 is prose. Recorded
+     here rather than silently corrected, because a disagreement noticed BEFORE
+     the run is evidence and the same disagreement noticed after it is an excuse.
+
+⛔ THE DEPENDENCY, STATED BECAUSE IT CAN FALSIFY THIS WITHOUT MY BRANCH BEING WRONG
+--------------------------------------------------------------------------------
+  Term (a) is a prediction, not a measurement: the run that would confirm 2482
+  at b2991c6 (`land-d93d23b`) was STILL IN FLIGHT when this was cut. So:
+    * if land-d93d23b lands on 2482, this expectation stands at 2500;
+    * if it lands on anything else, MY expectation moves by the SAME delta and
+      the fault is in main, not in D81. In that case report BOTH numbers and do
+      not adjust this file to match either.
+  The last per-target figure this repo actually MEASURED is 2482 at 3b0bee5
+  (bench/d127_certified/SUMMARY_d127invert.txt), which is a different tree.
+
+⚠ MODE IS PART OF THE NUMBER. `whole` = `per-target` + 2 doctests. Every figure
+  above is per-target-derived; a `whole` result is NOT comparable term for term
+  and must not be substituted.
+
+⚠ THE PROXY IS `#[test]` ATTRIBUTES IN A DIFF, not a collection. It would miss a
+  test added behind a macro or a cfg this grep does not see, and would overcount
+  an `#[ignore]`. Both show up as a miss against 2500 and are to be reported as
+  such, not absorbed.
+
+WHAT A MISS MEANS
+  passed != 2500  -> the count is wrong or the branch is. Report the delta and
+                     find the NAME. Do NOT adjust this file to match the result.
+  failed > 0      -> report verbatim.
+
+⚠ WATCH FOR, specifically on this merge:
+  * branch::reaper::tests::{log_catalog,table_catalog}::
+      a_fast_path_reap_reaches_the_durable_map_not_just_memory
+      a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+    These are the two fixtures whose discriminator this merge resolved down to
+    ONE (`module_path!()`; D81's `stringify!($modname)` deleted). D81 reproduced
+    the collision 3/3 under parallelism, and on THIS tree the symptom is an
+    ENOENT from `OsFileOps::append`, not the "nothing was ever checkpointed"
+    guard, because append is `append(true)` without `create(true)`
+    (src/storage/atomic_file.rs:65-70). A failure here means the surviving
+    discriminator is not enough, which would be a real finding and not a flake.
+  * Anything in `src/branch/arena.rs` touching `cow_page`/`free_page`: that file
+    auto-merged D125's all-or-nothing alloc against D81's +1249 lines with no
+    textual conflict, and a clean merge asserts only that no line collided.
+
+WHAT THIS RUN CANNOT SHOW, carried forward from D81 unchanged
+--------------------------------------------------------------------------------
+  * The free record has UNIT-TEST COVERAGE ONLY.
+  * Every arm of D81's measurement is SINGLE-NODE; it says nothing about a cluster.
+  * L is confounded with position-within-arm: round 2 reverses arm order but not
+    the L loop inside an arm. Named by D81, not solved.
+  * ⛔ NO MILLISECOND FIGURE FROM THIS LANDING DISCRIMINATES ANYTHING. D147: with
+    `checkpoint_to` set a reap costs 16-38 ms in every shape including one that
+    parks and walks nothing, so the box is fsync-bound and a bytes win cannot
+    appear in wall-clock. D81's own OFF controls — the arm its change cannot
+    affect — disagreed by up to 2.4x, which means two bases and a void
+    comparison. The axis is BYTES and FSYNC COUNTS; they are integers.
