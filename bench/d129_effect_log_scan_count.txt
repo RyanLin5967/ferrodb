@@ -79,6 +79,37 @@ REFUSALS PRE-REGISTERED IN THE INSTRUMENT (not in prose — the harness exits no
   - An empty bucket prints `-`, never `0.0`: "no calls landed here" is not "calls here were free".
 
 
+AMENDMENT 1 — appended before the first number, while the fleet suite lock was still held
+------------------------------------------------------------------------------------------
+A FOURTH scan site was added to the instrument: `MemEffectLog::frames_for`'s `filter`.
+
+Found by enumerating the scans from the `EffectLog` trait (which declares exactly two methods)
+rather than by eye, which is how D77 came to say "two" and D129 to correct it to "three". It does
+NOT short-circuit — `filter` visits every element — so it walks the whole `Vec` on every call.
+
+⚠ `grep -rn 'frames_for' src/` finds no production caller: the only callers are
+`src/tel/tests_durable_log.rs` and the trait declaration in `src/tel/mod.rs`. The expected reading
+on the axis is therefore ZERO, and it is counted rather than asserted for exactly that reason — a
+site left out of an instrument is a site the instrument reports as absent, and a grep that missed a
+caller and a site that has none look identical.
+
+No numbers had been taken when this was written; the harness had not been compiled.
+
+ALSO RECORDED BEFORE THE RUN, from reading rather than measuring:
+  - `MemEffectLog::frames` is mutated in exactly two ways: `frames.push(frame.clone())` at the
+    TAIL, and `extend_from_slice` in place on an existing frame. There is no `clear`, `truncate`,
+    `retain`, `drain`, `remove` or `pop` anywhere in `src/tel/log.rs`. The row's "It is NEVER
+    pruned" holds at this branch's base (ferrodb 2bc80fd).
+  - `DurableEffectLog::append` calls `self.mem.classify_append(frame)` and then
+    `self.mem.append(frame)` — TWO of the counted sites per logical append.
+  - `DurableEffectLog::open` replays the file with one `mem.append` per record, so opening a
+    K-frame file pays K scans of a Vec that grows by one each time.
+  - `examples/pgserver.rs` — the pgwire server — constructs `MemEffectLog::new()`.
+    `src/cli/cli.rs` constructs `DurableEffectLog::default_for_database`. So the
+    measurement-through-pgwire the row asks for can only exercise the Mem store, and the durable
+    store has no wire path at all. The addendum arm drives it directly and is labelled as such.
+
+
 RESULT
 ------
 (appended below, after the run)
