@@ -277,9 +277,107 @@ need that lock bypassed, which is a harness of its own. The window is in the
 index and so is the fix.
 
 ================================================================================
-7. VERIFICATION OF THE BRANCH AS A WHOLE
+7. THE ROW WAS DISPATCHED A THIRD TIME, AND THE REASON IS THE LANDING GAP
 ================================================================================
 
-Filled in by the commit that follows this one, which names the sha the suite
+Appended 2026-09-22 ~09:05Z by a THIRD dispatch of D126, in a fresh context that
+had seen none of the work above.
+
+Section 0 records that the row was dispatched twice because an unmerged branch
+with no worktree is invisible to every liveness check this fleet has. **That is
+still true, and it is why there was a third.** The second pass fixed the code and
+wrote this report; it did not fix the thing that causes the re-dispatch.
+
+⇒ **The branch had never been suite-certified.** Section 7 as written said it
+would be "filled in by the commit that follows this one" — no such commit was
+ever made. `bench/*certified*` was checked in every worktree on this box and in
+the main checkout: `d40 d41 d42 d52 d53 d54 d56 d57 d58 d59 d60 land22 land101
+land124`, and **no d126**. The repo's own rule is that push/merge to main is
+authorised ONLY behind a verified green suite, so with no certification the
+branch COULD not land, and an unlanded branch reads as an open row. The loop
+closes here and not before.
+
+================================================================================
+8. RE-VERIFIED IN A FRESH CONTEXT — MY OWN RUN, NOT QUOTED
+================================================================================
+
+Every number below was produced by this third pass on this worktree, after
+merging main (ac2ab26) in. Raw logs committed BEFORE interpretation, at
+`bench/d126_reverify/`. These are COUNTS, so box load does not touch them; no
+duration was re-taken, because the measure lock was held (see section 9).
+
+`cargo test --release --test d126_atomic_upsert -- --test-threads=1`, 4 passed:
+
+    a_rewritten_key_is_never_absent_to_a_concurrent_reader
+      CONTROL   (delete+insert)  misses=28008  reads=52445  errors=0   <- FIRES
+      TREATMENT (tree.upsert)    misses=0      reads=24629  errors=0
+    a_growing_rewrite_that_splits_is_still_never_absent
+                                 misses=0      reads=3930
+    insert_still_does_not_replace                                  ok
+    the_primary_index_rewrite_is_never_absent_either
+      CONTROL   (delete+insert)  misses=33573  reads=61937           <- FIRES
+      TREATMENT (upsert)         misses=0      reads=31340
+
+`cargo test --release --lib d126_record_key_probe -- --test-threads=1`, 2 passed:
+
+    the_record_key_is_never_absent_while_it_is_rewritten
+      CONTROL   (delete+insert)  misses=31188  reads=226921          <- FIRES
+      TREATMENT (cat.upsert)     misses=0      reads=202772
+      set_root  (hot path, fsync) misses=0     reads=5702750
+    renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves
+      target_miss=0  neighbour_miss=0  reads=1429296
+
+THE CONTROL FIRED IN ALL THREE ARMS, on a different run on a differently-loaded
+box from section 2's, at 53.4% / 54.2% / 13.7% of reads. The exit criterion asked
+for a probe that FAILS against today's `upsert` and passes after; the control IS
+today's `upsert`, open-coded on the same tree, key, threads and iteration count,
+and the test asserts `control.misses > 0` as a hard assertion. The zeros are
+admissible because of that.
+
+================================================================================
+9. WHAT THIS PASS CHECKED BY READING, AND WHAT IT DID NOT RE-TAKE
+================================================================================
+
+Read rather than assumed, because a fresh context's job is to attack the work and
+not to restate it:
+
+  - `apply_to_leaf`'s `let _ = leaf.remove_entry(&key)` discards a Result. Checked
+    `index_page.rs:416`: `remove_entry` has exactly one failure arm, `binary_search`
+    missing -> `KeyNotFound`. The comment's claim that "there is nothing else it
+    can fail on" is TRUE.
+  - **The sharpest hazard, and it is not one.** If `latch_leaf_for_write` could
+    return a leaf that does not hold the key — a concurrent split having moved it
+    right — then Replace would remove nothing and insert a second copy, which is
+    the duplicate-key corruption the primitive exists to avoid. It cannot:
+    `index.rs:474-489` keeps the PARENT's read latch across dropping the leaf read
+    latch and taking the leaf write latch, and re-checks the root-as-leaf case.
+    **`insert` already rests on that exact invariant** — without it an insert would
+    land in the wrong leaf and break key order — so Replace inherits it and adds
+    no new requirement.
+  - The open-coded-pair sweep was re-run independently from `grep -rn "\.delete("
+    src/ --include='*.rs'` rather than from section 6's list. It agrees: the only
+    `.delete(` left on a `BPlusTreeManager` are `remove_if_present` (a genuine
+    removal) and the probe's own control arm at `table_catalog.rs:1492`. Everything
+    else is `cow/`'s root-returning `delete(root, branch, epoch, key)`, a different
+    structure, or heap/WAL slot deletes. **No fourth site.**
+    ⚠ The first attempt at that sweep returned "no matches found" because zsh ate
+    the unquoted `--include=*.rs`. An unquoted glob failing looks EXACTLY like a
+    clean sweep. Quoted and re-run; the result above is the quoted one.
+
+NOT re-taken, and stated rather than quietly reused: the COST measurement. The
+measure lock was held by `CEILING-resume` (pid 86920, taken 07:05:12Z) for this
+whole pass, and another lane had a `cargo`/`rustc` fan-out live on the box. The
+0.52-0.54x figure in section 2 is the second pass's, from
+`bench/d126_upsert_cost.txt`, and is cited as theirs. The lock holder's pid is
+dead and its artifacts had not advanced in ~77 minutes, but this project's own
+rule is that the measure lock's owner pid is dead BY CONSTRUCTION, so a dead pid
+is not authority to take the lock. Counts were run instead; they are what the exit
+criterion needs.
+
+================================================================================
+10. CERTIFICATION AND THE STATE THIS BRANCH IS HANDED OVER IN
+================================================================================
+
+Filled in by the banking commit that follows, which names the sha the suite
 certified. A body cannot quote a summary naming its own sha.
 
