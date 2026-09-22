@@ -1539,17 +1539,24 @@ impl PageStore for ArenaPageStore {
 
         // The owner may be mid-reap or already reaped and its children are still the authority
         // over this page, so the query is generation-blind by construction: it takes an id slot,
-        // not a `BranchId`. An owner with no record at all answers `false` — nothing pins the page.
-        // An owner with no record at all pins nothing: the previous shape matched `None` into the
-        // same branch as "not pinned", so a missing owner and an unpinned page already behaved
-        // identically. `&&` short-circuits on the missing record, so the query is not asked of a
-        // slot that has none.
-        let pinned = self.catalog.get_raw(owner.id).is_ok()
-            && self.catalog.live_child_in_epoch_range(
-                owner.id,
-                header.birth_epoch,
-                free_epoch,
-            )?;
+        // not a `BranchId`.
+        //
+        // ⛔ **D124 — this was `get_raw(owner.id).is_ok() && …`, and the `&&` was a silent free.**
+        // The comment it replaces said "an owner with no record at all pins nothing", and that
+        // premise is false: no path in `src/` deletes a branch record — retirement is a state flip
+        // to `Reaped` and the id-reuse path overwrites the slot — so a missing record cannot mean
+        // "gone", only "never published". Resolving it to "not pinned" ran `release_page` on a
+        // page a live child may still be reading, which is silent data loss rather than a leak.
+        //
+        // An extent's owner is published BY CONSTRUCTION: `alloc_arena` is the only writer of
+        // `extents`, and it ends in `catalog.add_arena`, which both catalogs refuse for a branch
+        // with no record (`table_catalog.rs`, `catalog.rs`, each `ok_or(NotFound)`). So the only
+        // thing left for this `?` to propagate is a genuine read failure of the catalog — and
+        // freeing a parked page because a B+tree descent failed is the same loss by another door.
+        // Refusing leaves the page parked, which the next drain revisits.
+        self.catalog.get_raw(owner.id)?;
+        let pinned =
+            self.catalog.live_child_in_epoch_range(owner.id, header.birth_epoch, free_epoch)?;
 
         if pinned {
             self.state.lock().unwrap().pending.push(PendingFree {

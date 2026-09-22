@@ -407,8 +407,28 @@ impl TwoTierReaper {
                         pf.birth_epoch,
                         pf.free_epoch,
                     )?,
-                    // No record at all: nothing can be forked off it, so nothing can see the page.
-                    Err(_) => false,
+                    // ⛔ **D124 — this was `Err(_) => false`, i.e. RELEASE THE PAGE.** The comment
+                    // it replaces said "no record at all: nothing can be forked off it, so
+                    // nothing can see the page". That premise is false. No path in `src/` deletes
+                    // a branch record: retirement is a state flip to `Reaped`, the id-reuse path
+                    // overwrites the recycled slot, and neither `LogBranchCatalog` nor
+                    // `TableBranchCatalog` nor `MemCatalog` ever removes one. So a missing record
+                    // cannot mean "gone", only "never published" — and this owner WAS published,
+                    // because the extent it names was created by `alloc_arena`, which ends in
+                    // `catalog.add_arena` and that refuses a branch with no record.
+                    //
+                    // Which leaves a genuine read failure, and answering "not pinned" to one
+                    // hands back a page the interval rule had deliberately parked for a live
+                    // child. Refusing keeps the entry in the pending log for the next drain;
+                    // `DeferTouched` already records `touched` across this early return, which is
+                    // exactly what it exists for.
+                    //
+                    // Not reachable in production today — `reap_expired` runs under the
+                    // per-statement lock every `fork` also takes (`lease_thread.rs`) — but W4
+                    // exists to remove that lock, so this has to be gone before W4 lands, not
+                    // after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock` and
+                    // is where the fire-check for it lives.
+                    Err(e) => return Err(e),
                 };
                 if pinned {
                     still_pinned.push(pf);
