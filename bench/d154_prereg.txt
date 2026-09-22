@@ -121,3 +121,68 @@ Checks 1–5 from the original pre-registration stand unchanged except the total
 manufacture a pass. A FAILURE is not a finding until that target is re-run on a quiet box; this
 repo has a documented load-sensitive port race and timing-sensitive tests fail under load in a way
 that looks exactly like a regression.
+
+
+AMENDMENT 2 — 2026-09-22, STALE-GREEN forced a re-run (append-only)
+====================================================================
+Run 2 (d154-262113a) was GREEN and every pre-registered check hit:
+
+    d154-262113a: mode=per-target rc=0 passed=2517 failed=0 build_errors=0 head=262113a
+    d154-262113a: go rc=0 passed=97 failed=0
+    RUNNER_EXIT=0
+    certify-head: OK — suite head=262113a == landing 262113a
+
+⛔ AND IT IS STILL NOT LANDABLE. `tools/staleness.sh . <main> 262113a` returned:
+
+    branch 262113a vs 3a9a5f9…: 14 behind, 8 ahead
+      base moved under: 3 Rust file(s), 0 other code file(s)
+    STALE-GREEN: the base moved under code this branch has not seen.
+      (no file is edited by both sides -- lower risk, but still re-run: a lock-order
+       inversion does not fail loudly, it hangs rarely under load, and it can be created
+       by two files that never appear in the same diff.)
+      tests present on 3a9a5f9… but NOT on this branch:
+          tests/d151_parse_reads_a_refreshed_snapshot.rs
+
+⚠ BOTH I AND THE LANDING QUEUE PREDICTED **COVERED**, from the same correct premise — the file
+sets do not intersect (mine: consensus/{log,transport,tests_log,tests_transport},
+provenance/durable, tel/log, wal/log, the new test; D151's: src/pgwire/{extended,mod},
+tests/d151_…). The guard rejects that reasoning ON PURPOSE, and says so in its own output: two
+files that never appear in the same diff can still create a lock-order inversion, which does not
+fail loudly — it hangs rarely, under load. Its verdict line is "Do not reason about whether it
+matters: 'close enough' is the judgement these guards exist to delete."
+⇒ Recorded because the failure mode was US: a disjoint-file-set argument is exactly the shape that
+  feels conclusive and is not, and two people reached it independently.
+⇒ The armed land-gate was KILLED before its prepush ran: it would have refused at step [2/3]
+  anyway, and prepush is the step that builds. No machine time spent on a refusal.
+
+ALSO NOTE: run 2's number was a fact about a base that exists ONLY ON THIS MACHINE. `main` is 14
+ahead of `origin/main`, and `origin/main` == my merge base exactly. A commit count is meaningless
+without the ref it counted against, the same way a total is meaningless without its mode.
+
+BASELINE REPLACED AGAIN — 2511 -> 2512
+---------------------------------------
+D151 landed into local main since run 2's base and adds one test:
+
+    d151: mode=per-target rc=0 passed=2512 failed=0 build_errors=0 head=cdf6434
+    (bench/d151_certified/SUMMARY.txt on main, verbatim)
+
+Transfer checked, not assumed:
+    git diff --stat cdf6434 main -- src tests examples Cargo.toml   -> EMPTY
+    git diff --name-only cdf6434 main                               -> bench/ only
+⇒ 2512 is the baseline at main 3a9a5f9.
+
+⚠ D151's banked log PATH points into a session scratchpad that is wiped on restart, so its logs
+are gone; only the SUMMARY survives. It is still a usable baseline — the SUMMARY is the runner's
+own line — but it cannot be re-derived, and that is worth knowing before anyone tries.
+
+MERGED main at b9fe858. Staleness re-run AFTER the merge:  "0 behind, 9 ahead / COVERED".
+
+REVISED EXPECTATION FOR RUN 3
+-----------------------------
+    2512 + 6 = 2518 passed, 0 failed, 0 build_errors, mode=per-target
+    Go: 97 passed, 0 failed
+
+2517 would mean D151's test did not come across in the merge; 2512 would mean my target was never
+swept. Checks 3, 4 and 5 (six new tests by name, the rewritten transport test by name, Go 97)
+stand unchanged, and I am adding a sixth: tests/d151_parse_reads_a_refreshed_snapshot.rs must
+appear BY NAME too, since its absence is what staleness flagged.
