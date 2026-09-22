@@ -708,8 +708,18 @@ impl BranchCatalog for LogBranchCatalog {
     /// parent's array, so `has_live_children` answers true forever and the parent is **never
     /// reapable** -- a leak rather than a premature free, but unbounded.
     ///
-    /// The missing-record case still returns `Ok(false)` rather than an error, unchanged: the
-    /// caller is the reaper walking up a chain whose parent may already be gone.
+    /// The missing-record case still returns `Ok(false)` rather than an error, and that stays —
+    /// but **not for the reason this comment used to give**. It said "the caller is the reaper
+    /// walking up a chain whose parent may already be gone", and a parent does not go anywhere:
+    /// no catalog here removes a record, and retirement is a state flip to `Reaped`.
+    ///
+    /// `Ok(false)` is right for a different reason. "Nothing was removed" is the honest answer to
+    /// a detach of an epoch that is not there, and the direction it fails in is a LEAK, not a
+    /// free. **D124 is what that distinction is worth**: the same loose premise, written into
+    /// resolvers that DID free, cost the pages of a live branch at four sites. (This catalog also
+    /// has no transient window of its own — the record lives in a `HashMap` under one lock, not
+    /// behind a delete-then-insert. That is a difference from `TableBranchCatalog`, not a general
+    /// guarantee; see `TableBranchCatalog::dangling_child` and D126.)
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let mut st = self.state.write().unwrap();
         let Some(prec) = st.records.get_mut(&parent_id) else { return Ok(false) };

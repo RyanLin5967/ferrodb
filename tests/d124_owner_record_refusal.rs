@@ -9,14 +9,20 @@
 //! ```
 //!
 //! Both stated the same false premise in their own comments — *"an owner with no record at all
-//! pins nothing"*. No path in `src/` deletes a branch record: retirement is a state flip to
-//! `Reaped`, the id-reuse path overwrites the recycled slot, and none of the three catalog
-//! implementations ever removes one. So a missing record cannot mean "gone", only "never
-//! published" — and an extent's owner IS published by construction, because `alloc_arena` is the
-//! only writer of the extent map and it ends in `catalog.add_arena`, which every catalog refuses
-//! for a branch with no record. What is left for the arm to catch is a genuine catalog read
-//! failure, and handing back a page the interval rule deliberately parked for a live child
-//! because a B+tree descent failed is the same data loss by another door.
+//! pins nothing"*.
+//!
+//! An extent's owner IS published, by construction: `alloc_arena` is the only writer of the
+//! extent map and it ends in `catalog.add_arena`, which every catalog refuses for a branch with
+//! no record. And a record missing *right now* has not stopped existing — nothing deletes one,
+//! retirement is a state flip to `Reaped` — but `TableBranchCatalog::upsert` is delete-then-insert
+//! with no latch held across the two calls, and `write_record` routes the RECORD key through it,
+//! so an ordinary `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
+//! perfectly healthy branch. **That is the case these arms were freeing pages on.**
+//!
+//! Handing back a page the interval rule deliberately parked for a live child, because the
+//! owner's record happened to be mid-rewrite, is silent data loss. Refusing is retryable; the
+//! entry stays in the pending log and the next drain succeeds. SCALE-DESIGN D126 removes the
+//! window itself by giving the B+tree a replace primitive.
 //!
 //! **Not reachable in production today.** `reap_expired` runs inside the per-statement lock that
 //! every `fork` also takes, so the two are mutually excluded. W4 exists to remove that lock, so

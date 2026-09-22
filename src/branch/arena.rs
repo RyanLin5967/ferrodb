@@ -1542,18 +1542,20 @@ impl PageStore for ArenaPageStore {
         // not a `BranchId`.
         //
         // ⛔ **D124 — this was `get_raw(owner.id).is_ok() && …`, and the `&&` was a silent free.**
-        // The comment it replaces said "an owner with no record at all pins nothing", and that
-        // premise is false: no path in `src/` deletes a branch record — retirement is a state flip
-        // to `Reaped` and the id-reuse path overwrites the slot — so a missing record cannot mean
-        // "gone", only "never published". Resolving it to "not pinned" ran `release_page` on a
-        // page a live child may still be reading, which is silent data loss rather than a leak.
+        // The comment it replaces said "an owner with no record at all pins nothing". That is
+        // false in both directions it could be read.
         //
         // An extent's owner is published BY CONSTRUCTION: `alloc_arena` is the only writer of
-        // `extents`, and it ends in `catalog.add_arena`, which both catalogs refuse for a branch
-        // with no record (`table_catalog.rs`, `catalog.rs`, each `ok_or(NotFound)`). So the only
-        // thing left for this `?` to propagate is a genuine read failure of the catalog — and
-        // freeing a parked page because a B+tree descent failed is the same loss by another door.
-        // Refusing leaves the page parked, which the next drain revisits.
+        // `extents` and it ends in `catalog.add_arena`, which both catalogs refuse for a branch
+        // with no record. So the owner did exist. And "has no record *now*" does not mean it
+        // stopped existing: `TableBranchCatalog::upsert` is delete-then-insert with no latch held
+        // across the two, and `write_record` routes the RECORD key through it, so a concurrent
+        // `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
+        // perfectly healthy branch. Resolving that to "not pinned" ran `release_page` on a page a
+        // live child may still be reading: silent data loss, not a leak.
+        //
+        // So the `?`: refusing leaves the page PARKED, which the next drain revisits, and a
+        // retry succeeds. Freeing is the one outcome that cannot be retried.
         self.catalog.get_raw(owner.id)?;
         let pinned =
             self.catalog.live_child_in_epoch_range(owner.id, header.birth_epoch, free_epoch)?;
