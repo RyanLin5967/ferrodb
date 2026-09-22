@@ -3,9 +3,14 @@
 //! Design authority: DESIGN.md section 1.
 //!
 //! Nodes live entirely inside a page's **payload**, i.e. `page[PAGE_HEADER_SIZE..]`. The
-//! self-describing [`crate::cow::PageHeader`] owns the first 24 bytes and nothing here may touch
-//! them: `birth_epoch` and `arena_id` are what the GC algebra reads, so a node encoding that
-//! overwrote the header would silently break reclamation.
+//! self-describing [`crate::cow::PageHeader`] owns the first 24 bytes and no node *encoding* here
+//! may touch them: `birth_epoch` and `arena_id` are what the GC algebra reads, so a node encoding
+//! that overwrote the header would silently break reclamation.
+//!
+//! The one deliberate exception is the checksum, and only on one path:
+//! [`NodeMut::restamp_after_refusal`] rewrites those four bytes when a cell insert refuses, so
+//! that a node this module has compacted is never observable behind a checksum for the bytes it
+//! had before. It writes no other header field. That is why [`NodeMut`] holds the whole page.
 //!
 //! Deliberately **no leaf sibling pointers**. In a shadow-paging tree a `next_leaf` link makes
 //! shadowing one leaf require shadowing its left neighbour too, which cascades along the whole
@@ -239,18 +244,33 @@ impl<'a> Node<'a> {
 }
 
 /// Mutable view of a node.
+///
+/// Holds the **whole page**, not just the payload, for one reason: the two entry points that can
+/// refuse — [`NodeMut::insert_cell_at`] and [`NodeMut::replace_cell_at`] — compact before giving
+/// up, and have to restamp the page checksum on the way out so a caller cannot observe a rewritten
+/// payload behind a stale checksum. Everything else here still addresses the payload alone through
+/// [`NodeMut::payload`] / [`NodeMut::payload_mut`], so the header stays off limits to the node
+/// encoding exactly as the module brief says.
 pub struct NodeMut<'a> {
-    payload: &'a mut [u8],
+    page: &'a mut [u8; PAGE_SIZE],
 }
 
 impl<'a> NodeMut<'a> {
     pub fn new(page: &'a mut [u8; PAGE_SIZE]) -> Self {
-        NodeMut { payload: &mut page[PAGE_HEADER_SIZE..] }
+        NodeMut { page }
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.page[PAGE_HEADER_SIZE..]
+    }
+
+    fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.page[PAGE_HEADER_SIZE..]
     }
 
     /// Read-only view of the same node, for the searches a mutation has to do first.
     pub fn view(&self) -> Node<'_> {
-        Node { payload: self.payload }
+        Node { payload: self.payload() }
     }
 
     pub fn count(&self) -> usize {
@@ -258,7 +278,7 @@ impl<'a> NodeMut<'a> {
     }
 
     fn set_count(&mut self, n: usize) {
-        self.payload[OFF_COUNT..OFF_COUNT + 4].copy_from_slice(&(n as u32).to_be_bytes());
+        self.payload_mut()[OFF_COUNT..OFF_COUNT + 4].copy_from_slice(&(n as u32).to_be_bytes());
     }
 
     fn heap_end(&self) -> usize {
@@ -266,7 +286,7 @@ impl<'a> NodeMut<'a> {
     }
 
     fn set_heap_end(&mut self, v: usize) {
-        self.payload[OFF_HEAP_END..OFF_HEAP_END + 4].copy_from_slice(&(v as u32).to_be_bytes());
+        self.payload_mut()[OFF_HEAP_END..OFF_HEAP_END + 4].copy_from_slice(&(v as u32).to_be_bytes());
     }
 
     pub fn leftmost(&self) -> PageId {
@@ -274,12 +294,12 @@ impl<'a> NodeMut<'a> {
     }
 
     pub fn set_leftmost(&mut self, child: PageId) {
-        self.payload[OFF_LEFTMOST..OFF_LEFTMOST + 4].copy_from_slice(&child.to_be_bytes());
+        self.payload_mut()[OFF_LEFTMOST..OFF_LEFTMOST + 4].copy_from_slice(&child.to_be_bytes());
     }
 
     /// Reset the node to empty. Leaves the page header untouched.
     pub fn init(&mut self) {
-        for b in self.payload.iter_mut() {
+        for b in self.payload_mut().iter_mut() {
             *b = 0;
         }
         self.set_heap_end(PAYLOAD_LEN);
@@ -287,8 +307,8 @@ impl<'a> NodeMut<'a> {
 
     fn write_slot(&mut self, i: usize, off: usize, len: usize) {
         let at = SLOT_BASE + i * SLOT_SIZE;
-        self.payload[at..at + 4].copy_from_slice(&(off as u32).to_be_bytes());
-        self.payload[at + 4..at + 8].copy_from_slice(&(len as u32).to_be_bytes());
+        self.payload_mut()[at..at + 4].copy_from_slice(&(off as u32).to_be_bytes());
+        self.payload_mut()[at + 4..at + 8].copy_from_slice(&(len as u32).to_be_bytes());
     }
 
     /// Append `cell` to the cell heap, reserving room for `extra_slots` slots beyond the ones
@@ -306,7 +326,7 @@ impl<'a> NodeMut<'a> {
             return None;
         }
         let off = heap_end - cell.len();
-        self.payload[off..heap_end].copy_from_slice(cell);
+        self.payload_mut()[off..heap_end].copy_from_slice(cell);
         self.set_heap_end(off);
         Some(off)
     }
@@ -331,8 +351,15 @@ impl<'a> NodeMut<'a> {
         Ok(())
     }
 
-    /// Insert `cell` at slot `i`. Returns `false` (leaving the node untouched) when the node is
-    /// full even after compaction — the caller must split.
+    /// Insert `cell` at slot `i`. Returns `false` when the node is full even after compaction —
+    /// the caller must split.
+    ///
+    /// **A refusal does not leave the node untouched.** It compacts first, so the cell heap is
+    /// rewritten and the page's bytes move even though its logical contents do not; this comment
+    /// claimed the opposite until D113, and the claim was load-bearing. What a refusal *does*
+    /// guarantee is [`restamped`](Self::restamp_after_refusal): the page verifies on the way out.
+    /// See that method for why the guarantee is stated this way round rather than restoring the
+    /// pre-compaction bytes.
     pub fn insert_cell_at(&mut self, i: usize, cell: &[u8]) -> Result<bool, FerroError> {
         let count = self.count();
         if i > count {
@@ -344,20 +371,23 @@ impl<'a> NodeMut<'a> {
                 self.compact()?;
                 match self.write_cell(cell, 1) {
                     Some(off) => off,
-                    None => return Ok(false),
+                    None => return Ok(self.restamp_after_refusal()),
                 }
             }
         };
         // shift the slots above `i` up by one
         let from = SLOT_BASE + i * SLOT_SIZE;
         let to = SLOT_BASE + count * SLOT_SIZE;
-        self.payload.copy_within(from..to, from + SLOT_SIZE);
+        self.payload_mut().copy_within(from..to, from + SLOT_SIZE);
         self.write_slot(i, off, cell.len());
         self.set_count(count + 1);
         Ok(true)
     }
 
     /// Replace the cell at slot `i`. Returns `false` when it does not fit.
+    ///
+    /// Same shape as [`NodeMut::insert_cell_at`], and the same refusal contract: a refusal has
+    /// compacted the node, and has restamped it.
     pub fn replace_cell_at(&mut self, i: usize, cell: &[u8]) -> Result<bool, FerroError> {
         if i >= self.count() {
             return Err(FerroError::Cow(format!("replace slot {} out of range", i)));
@@ -368,12 +398,43 @@ impl<'a> NodeMut<'a> {
                 self.compact()?;
                 match self.write_cell(cell, 0) {
                     Some(off) => off,
-                    None => return Ok(false),
+                    None => return Ok(self.restamp_after_refusal()),
                 }
             }
         };
         self.write_slot(i, off, cell.len());
         Ok(true)
+    }
+
+    /// Restamp the page checksum and report the refusal. Always returns `false`.
+    ///
+    /// **The postcondition this establishes: a cell insert that returns `Ok(false)` leaves a page
+    /// that verifies.** Both refusal paths reach it, and both reach it *only* after `compact()`,
+    /// because `write_cell` writes nothing when it returns `None`.
+    ///
+    /// That postcondition is what the `btree` callers rest on, and they need it. `leaf_put` and
+    /// `internal_relink` both drop the page's write guard immediately after a refusal and then run
+    /// a **fallible** step — `alloc_for`, once per cut — before anything restamps. Failing there
+    /// used to return `Err` with the page compacted and carrying a checksum for bytes that had
+    /// moved, and `CowStore::read_page` verifies on every fetch: the rows were untouched and
+    /// correct, and reading them answered "refusing to return a torn page". `internal_relink` is
+    /// the reachable one — see `cow::tests_compact_refusal`.
+    ///
+    /// **Why restamp rather than restore.** Making the old "leaves the node untouched" wording
+    /// true would mean snapshotting the 4 KB payload before every compaction, on the insert path,
+    /// to serve an error case. Restamping costs one crc32 on the refusal path only — a path that
+    /// is about to rewrite the node into several pages anyway — and it makes the dangerous state
+    /// unreachable instead of documenting it.
+    ///
+    /// **Why here and not inside `compact()`.** `compact()` also runs on the success path, where
+    /// the caller immediately dirties the page again and restamps itself, so a stamp there would
+    /// be dead work on the hot path. It would also perturb `branch::delta`'s compaction-cost
+    /// fixture, which measures page diffs in bytes and would start seeing the four header bytes.
+    /// The refusal return is the only place the guarantee is observable, so it is the only place
+    /// that pays for it.
+    fn restamp_after_refusal(&mut self) -> bool {
+        crate::cow::page_header::stamp_checksum(self.page);
+        false
     }
 
     pub fn remove_at(&mut self, i: usize) -> Result<(), FerroError> {
@@ -383,7 +444,7 @@ impl<'a> NodeMut<'a> {
         }
         let from = SLOT_BASE + (i + 1) * SLOT_SIZE;
         let to = SLOT_BASE + count * SLOT_SIZE;
-        self.payload.copy_within(from..to, from - SLOT_SIZE);
+        self.payload_mut().copy_within(from..to, from - SLOT_SIZE);
         self.set_count(count - 1);
         Ok(())
     }
@@ -404,7 +465,7 @@ impl<'a> NodeMut<'a> {
             return Err(FerroError::Cow("slot does not hold a child pointer".into()));
         }
         let at = off + len - 4;
-        self.payload[at..at + 4].copy_from_slice(&child.to_be_bytes());
+        self.payload_mut()[at..at + 4].copy_from_slice(&child.to_be_bytes());
         Ok(())
     }
 
