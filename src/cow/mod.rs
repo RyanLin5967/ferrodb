@@ -135,6 +135,21 @@ pub struct CowPage {
     /// The page it was shadowed from. Equals `page_id` when `copied` is false.
     pub previous_page_id: PageId,
     pub copied: bool,
+    /// **The caller must free `previous_page_id`, and only once its operation commits.**
+    ///
+    /// True exactly when the page was shadowed *and* the writing branch owns the arena the
+    /// original came from. A page inherited from an ancestor is never the writer's to free —
+    /// the ancestor still points at it.
+    ///
+    /// ⛔ **The store used to do this free itself, and that was D125's second defect.** A store
+    /// cannot know when its caller's operation commits. `CowTree` rolls a failed operation back
+    /// to the old root, and that root still points at `previous_page_id` — so a free performed
+    /// inside `cow_page` had already been done on behalf of an operation that then never
+    /// happened, parking a live page in the pending-free list. It is the same mistake as D112
+    /// ("free before the parent stops pointing at it") and as the `unlink_up` half of D125, one
+    /// layer further down, and it is fixed the same way: the store reports, the caller frees at
+    /// its own commit point.
+    pub retire_previous: bool,
     pub handle: PageHandle,
 }
 
@@ -196,9 +211,12 @@ pub trait PageStore: Send + Sync {
     ///
     /// If the page lives in an extent this branch **owns** and was born at or after the branch's
     /// privacy barrier, the same page is returned with `copied == false`. Otherwise a new page is
-    /// allocated in the branch's arena, the contents are copied, the new header is stamped with
-    /// `epoch`, and the old page is handed to `free_page` at the same epoch. The caller must
-    /// relink the parent when `copied` is true.
+    /// allocated in the branch's arena, the contents are copied, and the new header is stamped
+    /// with `epoch`. The caller must relink the parent when `copied` is true.
+    ///
+    /// **This must not free the page it shadowed.** It reports `retire_previous` instead, and
+    /// the caller frees `previous_page_id` once its own operation commits — see [`CowPage`] for
+    /// why an implementation that frees here corrupts any caller that can roll back.
     ///
     /// **Ownership, not arena identity.** Asking whether the page sits in the writer's *current*
     /// extent gives the same answer only while a branch has exactly one, and shadows a branch's

@@ -1460,7 +1460,13 @@ impl PageStore for ArenaPageStore {
             // Nobody else can see it: mutate in place. This is what keeps a hot branch from
             // shadowing the same page on every single write.
             census::bump(&census::IN_PLACE, 1);
-            return Ok(CowPage { page_id, previous_page_id: page_id, copied: false, handle });
+            return Ok(CowPage {
+                page_id,
+                previous_page_id: page_id,
+                copied: false,
+                retire_previous: false,
+                handle,
+            });
         }
 
         let source = handle.read().data;
@@ -1522,11 +1528,20 @@ impl PageStore for ArenaPageStore {
         // alone: the ancestor still points at it, and the ancestor is not in its own
         // `live_children` array, so the interval rule would eventually declare it reclaimable and
         // corrupt the ancestor. Freeing is the owner's business and nobody else's.
-        if owner_of_source == Some(branch) {
-            self.free_page(page_id, epoch)?;
-        }
-
-        Ok(CowPage { page_id: new_id, previous_page_id: page_id, copied: true, handle: new_handle })
+        //
+        // ⛔ D125: AND IT IS NOT THIS FUNCTION'S BUSINESS *WHEN*. This used to call
+        // `self.free_page(page_id, epoch)?` right here. A store cannot know whether its caller's
+        // operation will commit, and `CowTree` rolls a failed one back to a root that still
+        // points at `page_id` — so the free had been taken on behalf of an operation that never
+        // happened. Reported through `retire_previous` and performed by the caller at its commit
+        // point. Same defect as D112 and as the `unlink_up` half of D125.
+        Ok(CowPage {
+            page_id: new_id,
+            previous_page_id: page_id,
+            copied: true,
+            retire_previous: owner_of_source == Some(branch),
+            handle: new_handle,
+        })
     }
 
     fn free_page(&self, page_id: PageId, free_epoch: Epoch) -> Result<(), FerroError> {

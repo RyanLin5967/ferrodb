@@ -153,8 +153,17 @@ struct WriteJournal {
 
 impl WriteJournal {
     /// Record `page`'s current bytes, unless this operation already has them or the store
-    /// shadowed it — a shadow leaves the tree the old root describes untouched, so there is
-    /// nothing to take back.
+    /// shadowed it.
+    ///
+    /// ⚠ **Skipping on `copied` is right about CONTENTS and says nothing about ALLOCATION.**
+    /// This comment used to read "a shadow leaves the tree the old root describes untouched, so
+    /// there is nothing to take back", and that is true of the bytes and false of the page. A
+    /// shadow of a page the writer owns also retires the original; the undo list is
+    /// contents-shaped and that hazard is allocation-shaped, so it is carried by
+    /// [`WriteJournal::retired`] via [`CowTree::shadow`] rather than here. Getting this wrong
+    /// left a rolled-back tree pointing at a page the store had already parked for freeing —
+    /// found in review, not by a test, because the one test that inspects free bookkeeping runs
+    /// on the trunk where nothing is ever shadowed.
     fn record(&mut self, page: &CowPage) -> Result<(), FerroError> {
         if page.copied || self.undo.iter().any(|(h, _)| h.page_id == page.page_id) {
             return Ok(());
@@ -388,6 +397,13 @@ impl CowTree {
     ) -> Result<CowPage, FerroError> {
         let cp = self.store.cow_page(page_id, branch, epoch)?;
         journal.record(&cp)?;
+        if cp.retire_previous {
+            // The store shadowed a page this branch owns. The tree stops pointing at the
+            // original only when this operation commits, so that is when it is freed — the
+            // same rule `unlink_up`'s retires follow, and the reason `cow_page` reports this
+            // instead of doing it.
+            journal.retired.push(cp.previous_page_id);
+        }
         Ok(cp)
     }
 
@@ -413,9 +429,22 @@ impl CowTree {
         // Committed. The new root describes the tree, so nothing reachable points at a retired
         // page and freeing one can only leak from here, never strand a live pointer. Every page
         // is attempted even if one fails, because stopping early would leak the rest for no
-        // gain; the first error is returned rather than swallowed. There is deliberately **no**
-        // rollback on this path — the operation succeeded, and a bookkeeping failure while
-        // releasing a page it had already finished with does not unmake it.
+        // gain. There is deliberately **no** rollback on this path: the operation succeeded, and
+        // a bookkeeping failure while releasing a page it had already finished with does not
+        // unmake it.
+        //
+        // ⛔ And for the same reason the error is **not returned**. An earlier cut of this
+        // propagated it, which contradicted the contract the rest of this function establishes
+        // and that `a_starved_delete_never_releases_a_page_the_tree_still_points_at` asserts:
+        // an `Err` from a write means nothing happened. Handing back `Err` after the tree had
+        // already moved would tell the caller to discard a root that is live, losing every row
+        // the operation wrote — the exact failure this row exists to close, re-introduced on the
+        // success path. This file's own reasoning already says which direction is safe: a leak
+        // is recoverable, a wrong answer is not.
+        //
+        // `debug_assert` rather than silence, because every way `free_page` can fail here is a
+        // bug (an unknown arena, or a double free), so it must be loud where tests run while
+        // still leaking rather than lying in release.
         let mut first_err = None;
         for page in journal.retired {
             if let Err(e) = self.store.free_page(page, epoch)
@@ -424,10 +453,12 @@ impl CowTree {
                 first_err = Some(e);
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(new_root),
-        }
+        debug_assert!(
+            first_err.is_none(),
+            "a committed operation could not release a page it retired: {:?}",
+            first_err
+        );
+        Ok(new_root)
     }
 
     /// Insert or overwrite `key`. Returns the branch's **new root page id**, which the caller must

@@ -1028,9 +1028,9 @@ fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
 
     let mut failures = 0usize;
     let mut failures_on_a_retiring_delete = 0usize;
-    let mut released_by_a_failure = 0usize;
+    let mut released: Vec<PageId> = Vec::new();
     let mut rows_lost = 0usize;
-    let mut reissued: Vec<PageId> = Vec::new();
+    let mut deepest_failure_on_a_retiring_delete = -1i64;
 
     // ⛔ The target keys are CHOSEN, not enumerated, and the choice is the whole fixture.
     //
@@ -1069,26 +1069,44 @@ fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
         // through `merge_right`'s tail, which is the only stretch where `unlink_up` has
         // already retired a page and the operation has not finished.
         let mut failures_here = 0usize;
+        let mut committed_while_starved = 0usize;
+        let mut deepest_here = -1i64;
         let pages_at_start = f.leaves_and_internals(root).len();
         for reads in 0..40i64 {
-            let live_before = f.store.live_page_count().unwrap();
             let rows_before = f.reachable(root).0;
+            let live_before: Vec<PageId> = f.leaves_and_internals(root);
 
             f.store.allow_reads(reads);
             let outcome = f.tree.delete(root, BranchId::TRUNK, f.tick(), &key);
             f.store.unlimited_reads();
 
             match outcome {
-                Ok(_) => break,
+                Ok(r) => {
+                    // ⚠ TAKE THE ROOT. An earlier cut wrote `Ok(_) => break` and left `root`
+                    // pointing at the pre-delete tree. On the trunk the root id usually does
+                    // not move, so it looked harmless — until an `unlink_up` cascade moved it,
+                    // after which every `leaves_and_internals(root)` below was reading a tree
+                    // that no longer existed and under-reporting what was live. A fixture that
+                    // loses sight of pages makes every assertion here quietly weaker.
+                    root = r;
+                    committed_while_starved += 1;
+                    break;
+                }
                 Err(_) => {
                     failures += 1;
                     failures_here += 1;
+                    deepest_here = deepest_here.max(reads);
 
-                    // A failed operation may leak a page it allocated. It may never RELEASE
-                    // one: the tree it rolled back to still points at everything it retired.
-                    let live_after = f.store.live_page_count().unwrap();
-                    if live_after < live_before {
-                        released_by_a_failure += 1;
+                    // ⛔ PER-PAGE, not a net count. `live_page_count` is
+                    // `next_free - free_pages.len()` summed over extents, and this journal
+                    // deliberately LEAKS pages the failed operation allocated while it must
+                    // never RELEASE one it retired. Those move the total in opposite
+                    // directions, so one leak cancels one release and a net comparison reports
+                    // nothing while the defect happens. Ask of each page individually instead.
+                    for p in &live_before {
+                        if f.inner.is_page_freed(*p) {
+                            released.push(*p);
+                        }
                     }
 
                     // Nor may it lose a row, which is the same journal and is asserted here
@@ -1096,54 +1114,51 @@ fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
                     // which the insert probe reaches.
                     let rows_after = f.reachable(root).0;
                     rows_lost += rows_before.difference(&rows_after).count();
-
-                    // Would the allocator now hand back a page the restored tree still uses?
-                    // `take_page` pops the arena's free list first, so a page released a
-                    // moment ago is the very next one out.
-                    let live: BTreeSet<PageId> =
-                        f.leaves_and_internals(root).into_iter().collect();
-                    for _ in 0..4 {
-                        let p = f
-                            .store
-                            .alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, f.tick())
-                            .unwrap();
-                        if live.contains(&p) {
-                            reissued.push(p);
-                        }
-                    }
                 }
             }
         }
-        // Commit the delete with nothing starved, so the tree keeps moving. This is also the
-        // loudest detector in the test: with the free deferral reverted, the run dies here
-        // with the store's own `double free of page N` — the failed attempt released a page
-        // and this retry released it a second time.
-        root = match f.tree.delete(root, BranchId::TRUNK, f.tick(), &key) {
-            Ok(r) => r,
-            Err(e) => panic!(
-                "after {} starved failures on this key, the same delete with NOTHING starved \
-                 failed: {}. A failed operation left the store inconsistent — it released \
-                 pages it had retired, which the tree it rolled back to still points at",
-                failures_here, e
-            ),
-        };
+
+        // Commit the delete with nothing starved, so the tree keeps moving — unless a starved
+        // attempt already committed it above.
+        //
+        // ⚠ No probe allocations anywhere in this loop, deliberately. An earlier cut asked the
+        // allocator for pages after each failure to see whether one came back still reachable.
+        // That DISARMED the louder detector: `release_page` reports `double free of page N`
+        // only while the page is still on `free_pages`, so popping pages off that list ate the
+        // very evidence the panic below depends on. Two detectors for one fact, one of which
+        // consumes the other. The per-page `is_page_free` check above answers the same question
+        // without touching the free list.
+        if committed_while_starved == 0 || f.tree.get(root, &key).unwrap().is_some() {
+            root = match f.tree.delete(root, BranchId::TRUNK, f.tick(), &key) {
+                Ok(r) => r,
+                Err(e) => panic!(
+                    "after {} starved failures on this key, the same delete with NOTHING \
+                     starved failed: {}. A failed operation left the store inconsistent — it \
+                     released pages it had retired, which the tree it rolled back to still \
+                     points at",
+                    failures_here, e
+                ),
+            };
+        }
 
         // Did this key's delete actually retire pages? If it did and it also failed at least
         // once, a failure landed on the operation shape that has something to release.
         if failures_here > 0 && f.leaves_and_internals(root).len() < pages_at_start {
             failures_on_a_retiring_delete += 1;
+            deepest_failure_on_a_retiring_delete =
+                deepest_failure_on_a_retiring_delete.max(deepest_here);
         }
     }
 
     println!(
         "D125 free-deferral: {} starved delete failures, {} of them on a delete that retires \
-         pages; {} failures reduced the store's live page count; {} rows lost; {} reissued \
-         pages were still reachable from the root",
+         pages (deepest such failure at read budget {}); {} rows lost; {} reachable pages had \
+         been handed to free_page after a failure",
         failures,
         failures_on_a_retiring_delete,
-        released_by_a_failure,
+        deepest_failure_on_a_retiring_delete,
         rows_lost,
-        reissued.len(),
+        released.len(),
     );
 
     // Premises. A run with no failures, or one where no failing delete was the kind that
@@ -1156,6 +1171,28 @@ fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
          nothing about the free deferral",
         failures
     );
+    // ⚠ The premise above is weaker than it looks, and saying so is the point. It pairs "this
+    // delete failed at least once" with "this delete retired a page", and those are two
+    // different attempts — the retirement is done by whichever attempt SUCCEEDED. On its own it
+    // is satisfied by a run where every failure happened at `reads == 0`, refused on the first
+    // `read_page` before `descend` even finished and long before `unlink_up` retired anything.
+    //
+    // So this one measures DEPTH instead. A plain delete that merges nothing reads about as
+    // many pages as the tree is deep; `merge_right` adds two further descents on top of
+    // `unlink_up`. A failure surviving well past the first descent is a failure that happened
+    // inside the operation's tail, which is the window.
+    //
+    // The proof that the window is genuinely covered is the fire-check, not this line: with the
+    // frees moved back inside `unlink_up` this test dies. An assertion cannot observe the
+    // window directly from outside, and pretending otherwise is how the two earlier fixtures
+    // here passed while proving nothing.
+    assert!(
+        deepest_failure_on_a_retiring_delete >= 8,
+        "fixture: the deepest failure on a page-retiring delete was at a read budget of {}, so \
+         every failure was refused during the opening descent. The tail after `unlink_up` -- \
+         the only place an early release does harm -- was never reached",
+        deepest_failure_on_a_retiring_delete
+    );
 
     assert_eq!(
         rows_lost, 0,
@@ -1163,18 +1200,122 @@ fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
          it found it",
         rows_lost, failures
     );
-    assert_eq!(
-        released_by_a_failure, 0,
-        "{} failed deletes reduced the store's live page count: a failed operation released \
-         pages it had retired, and the tree it rolled back to still points at them",
-        released_by_a_failure
-    );
     assert!(
-        reissued.is_empty(),
-        "the allocator handed back {} page(s) that the tree still reaches from its root after a \
-         failed delete -- {:?}. Those pages are live data about to be overwritten",
-        reissued.len(),
-        &reissued[..reissued.len().min(8)]
+        released.is_empty(),
+        "{} page(s) the tree still reaches from its root were on the allocator's free list \
+         after a failed delete -- {:?}. A failed operation released pages it had retired, and \
+         the allocator will hand them straight back out",
+        released.len(),
+        &released[..released.len().min(8)]
+    );
+}
+
+/// ⛔ **The intersection nothing else in the suite covers: the SHADOW path, inspected for
+/// ALLOCATION state.**
+///
+/// Found in review, not by a test, and the reason no test saw it is the finding:
+///
+/// * every test that inspects free bookkeeping runs on the **trunk with no children**, where
+///   `privacy` is always true, `cow_page` returns `copied == false`, and the shadow-path free
+///   never executes at all;
+/// * the one test that does exercise the shadow path
+///   (`d125_instrument_the_same_starvation_on_shadowed_pages`) counts **rows**.
+///
+/// Neither covers the intersection, so "free the shadowed source unconditionally" survived the
+/// entire suite.
+///
+/// What it guards: `cow_page` shadowing a page the writing branch owns used to call `free_page`
+/// on the original there and then. `CowTree` rolls a failed operation back to the old root —
+/// and that root still points at the original. So the free had been taken on behalf of an
+/// operation that never happened, parking a live page for reclamation. The bytes were fine,
+/// which is why a row count cannot see it; the *allocation* was not.
+///
+/// Note the predicate: [`CowStore::is_page_freed`], which asks about the pending-free log as
+/// well as the free lists. A shadow of an owned page always takes the `pending` branch, so a
+/// check that looked only at free lists would be blind on exactly this path.
+#[test]
+fn a_failed_write_on_shadowed_pages_frees_nothing_the_tree_still_points_at() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..300u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut next_branch = 1u64;
+    let mut failures = 0usize;
+    let mut shadowed = 0usize;
+    let mut freed_but_live: Vec<PageId> = Vec::new();
+
+    for j in 0..60u32 {
+        let key = gap_key_of(150, j);
+        let mut committed = false;
+        for reads in 0..24i64 {
+            // A live child forked immediately before the attempt, so every page of the build
+            // fails `privacy` and `cow_page` shadows instead of mutating in place.
+            f.inner
+                .register_branch(
+                    BranchId { id: next_branch, generation: 0 },
+                    Some(BranchId::TRUNK),
+                    f.tick(),
+                )
+                .unwrap();
+            next_branch += 1;
+
+            let live_before: Vec<PageId> = f.leaves_and_internals(root);
+
+            f.store.allow_reads(reads);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited_reads();
+
+            match outcome {
+                Ok(new_root) => {
+                    if new_root != root {
+                        shadowed += 1;
+                    }
+                    root = new_root;
+                    committed = true;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    // The operation failed, so the tree is the one `root` describes. Nothing it
+                    // reaches may have been handed to `free_page`.
+                    for p in &live_before {
+                        if f.inner.is_page_freed(*p) {
+                            freed_but_live.push(*p);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(committed, "fixture: key {} never landed within the read sweep", j);
+    }
+
+    println!(
+        "D125 shadow-path frees: {} starved failures, {} inserts shadowed, {} pages freed while \
+         still reachable",
+        failures,
+        shadowed,
+        freed_but_live.len()
+    );
+
+    // Premises: the sweep has to fail, and it has to actually be on the shadow path — a run
+    // where every `cow_page` mutated in place would pass this without testing anything.
+    assert!(failures > 0, "fixture: nothing was ever starved");
+    assert_eq!(
+        shadowed, 60,
+        "fixture: only {} of 60 inserts shadowed, so this is not the shadow path",
+        shadowed
+    );
+
+    assert!(
+        freed_but_live.is_empty(),
+        "{} page(s) reachable from the root had been handed to free_page by an operation that \
+         then FAILED -- {:?}. The tree still points at them and the store is free to reclaim \
+         them",
+        freed_but_live.len(),
+        &freed_but_live[..freed_but_live.len().min(8)]
     );
 }
 
