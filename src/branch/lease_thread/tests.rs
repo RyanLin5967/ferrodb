@@ -1004,30 +1004,76 @@ fn d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep() {
 /// A detector that fires on a clean run is not a detector. Same fixture, nothing armed, and it is
 /// the control that makes every assertion in the test above mean something: without it, a
 /// `scan_once` that counted and printed a refusal unconditionally would pass them all.
+///
+/// # ⛔ STRICTENED after a fire-check, because the stated control was not running
+///
+/// This body used to give `kept` a `FAR_FUTURE` lease and its comment claimed that made the pass
+/// answer `NotExpired` for it. **It did not.** `expired_before` never returns an unexpired branch,
+/// so `kept` was not a candidate and `reap_if_still_expired` was never called on it — the
+/// `NotExpired` arm was not exercised at all, and a mutant that pushed a refusal from that arm
+/// passed this test. (It was caught by `d98_a_branch_renewed_after_the_query_is_not_reaped`, which
+/// owns the large version of the same control; this one claimed a coverage it did not have — the
+/// header-against-body failure, in a test comment.)
+///
+/// The assertion is not weakened to match the body; the BODY is fixed to match the assertion.
+/// `kept` is now expired when the candidate query runs and is renewed **inside the lock
+/// acquisition**, which is the only way to reach `NotExpired`: `reap_if_still_expired` re-reads
+/// the record there and sees a deadline that has moved. Strictly more than before — the old shape
+/// asserted "a branch nothing asked about was not called a refusal".
 #[test]
 fn d127_a_clean_sweep_reports_no_refusal_at_all() {
+    /// Renews one branch on every acquisition, before the body runs — the keepalive race D98
+    /// opened by moving the candidate query outside the lock.
+    struct RenewsOneBranch {
+        statement: Mutex<()>,
+        catalog: Arc<dyn BranchCatalog>,
+        branch: BranchId,
+    }
+    impl RuntimeLock for RenewsOneBranch {
+        fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+            let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+            self.catalog.renew_lease(self.branch, FAR_FUTURE).unwrap();
+            body();
+        }
+    }
+
     let f = fixture();
     let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
     let reaper =
         TwoTierReaper::new(Arc::clone(&refusing) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
 
     let doomed = branch_with_pages(&f, EXPIRED, 3);
-    // Nothing armed. Also present: a branch whose lease has NOT expired, so the pass has
-    // something to leave alone as well as something to reap — the `NotExpired` answer must not
-    // land in `refused_branches` either.
-    let kept = branch_with_pages(&f, FAR_FUTURE, 3);
+    // Nothing armed, and both branches ARE candidates: `kept`'s lease has expired when the query
+    // runs, and the gate renews it before the reaps. So this pass produces one `Reaped` and one
+    // genuine `NotExpired`, and neither may land in `refused_branches`.
+    let kept = branch_with_pages(&f, EXPIRED, 3);
+    let gate = RenewsOneBranch {
+        statement: Mutex::new(()),
+        catalog: Arc::clone(&f.h.catalog),
+        branch: kept,
+    };
 
     let counters = Counters::default();
     let printed = Printed::default();
-    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| printed.push(m));
+    scan_once(&reaper, &f.runtime, &gate, &counters, &|m| printed.push(m));
     let stats = counters.snapshot();
     let text = printed.text();
 
-    assert_eq!(stats.refused_branches, 0, "a clean sweep counted a refusal: {stats:?}");
+    assert_eq!(
+        stats.refused_branches, 0,
+        "a clean sweep counted a refusal. The candidate whose lease moved under the sweep is a \
+         DECISION the reaper made on the record, not a refusal to make one — counting it here \
+         buries the refusals that matter under the ordinary keepalive race: {stats:?}"
+    );
     assert_eq!(stats.reaped, 1, "the expired branch was not reaped: {stats:?}");
     assert!(!text.contains("REFUSED"), "a clean sweep printed a refusal:\n{text}");
     assert_eq!(state_of(&f, doomed), BranchState::Reaped);
-    assert_eq!(state_of(&f, kept), BranchState::Live, "a live lease was reaped");
+    assert_eq!(
+        state_of(&f, kept),
+        BranchState::Live,
+        "the renewed branch was reaped anyway, so this body no longer exercises NotExpired and \
+         the control above proves nothing"
+    );
 }
 
 /// **D127 — the report is bounded, and the bound never eats the count.**
