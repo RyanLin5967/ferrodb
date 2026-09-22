@@ -1,0 +1,85 @@
+D110 RE-RUN ON THE DESIGNATED RUNTIME — OUTCOME 3 FIRED, AND IT UPHOLDS THE ROW
+FOR A DIFFERENT AND BETTER REASON THAN THE ONE ON THE RECORD.
+================================================================================
+Pre-registration: bench/d110_rerun_PREREG.txt, committed BEFORE this run.
+Tree: main 2f15622 (harness rewired onto s.ctx.session() at 7a7e998). Release build.
+Box: NOT quiet — two other suites in flight (D126 whole-mode, D127 per-target). THAT IS
+     FINE AND WAS PRE-REGISTERED: this instrument is a page-read COUNT with no wall clock,
+     and a count is load-immune.
+
+⭐ PRE-REGISTERED OUTCOME 3 FIRED: MERGE reads is ZERO AT EVERY SIZE while `writes reads`
+  is non-zero. The pre-registration said that makes the finding one about the COUNTER's
+  placement unless something forces the counter to fire. THE HARNESS FORCES IT, in the same
+  process and on the same runtime:
+
+      64 x AgentRuntime::put_row  -> 243 read_page calls
+      64 x AgentRuntime::get_row  -> 128 read_page calls
+
+  ⇒ the counter counts, so the zero in the MERGE column is a fact about the merge and not
+    about the instrument. This is the half the banked 62ee6e0 run could not have had: on
+    `Session::new()`'s runtime there is no PageStore at all, so both columns were zero by
+    construction and neither could falsify the other.
+
+--------------------------------------------------------------------------------
+  table rows   merges   writes reads   MERGE reads   reads per 1000 rows
+         500        4           18.5           0.0                0.0000
+        1000        4            8.0           0.0                0.0000
+        2000        4            8.0           0.0                0.0000
+        4000        4            8.0           0.0                0.0000
+--------------------------------------------------------------------------------
+
+⇒ THE PRODUCTION MERGE READS ZERO BRANCH-ENGINE PAGES AT EVERY TABLE SIZE. Not flat —
+  ABSENT. `MERGE;` never descends the CowTree that `cow::merge3` would merge.
+
+⇒ WHAT CHANGES ON THE RECORD. `bench/d110_merge_page_reads.txt` retired the wire-merge3 row
+  and its conclusion STANDS — but the reason written there ("the production merge is already
+  O(delta)") was never measured, and the run that appeared to support it had no page store.
+  The measured reason is stronger and different: **there is no CoW tree on the MERGE path at
+  all**, so wiring `cow::merge3` in is not a performance change, it is a STORAGE MIGRATION
+  (moving base tables into the tree), which runtime.rs's own doc already names as future work.
+
+⚠ BLIND SPOT, STATED AT THE POINT OF THE CLAIM: this counter sees the BRANCH ENGINE only. It
+  proves the CoW tree is untouched by a merge. It does NOT measure the heap side, which has
+  no public fetch counter in this build. So "merge reads zero pages" is false as a general
+  statement and was never claimed; what is claimed is "merge reads zero pages THROUGH THE
+  BRANCH ENGINE", which is the quantity wire-merge3 would have had to improve.
+
+================================================================================
+FULL RUN OUTPUT
+================================================================================
+ferrodb D110 — page reads per MERGE against TABLE SIZE, at fixed delta
+build provenance: at 058ee79de353
+instrument: PageStore::read_page call count, bracketing the MERGE statement alone. No wall clock.
+PRE-REGISTERED: if `merge reads` is FLAT in table size, the production merge is already O(delta)
+  and wiring cow::merge3 buys NO complexity change. If it RISES, merge3 has a shape to offer.
+
+workload: 4 merge cycles per size, 4 rows updated per branch.
+
+  table rows   merges   writes reads   MERGE reads   reads per 1000 rows
+         500        4           18.5           0.0                0.0000
+        1000        4            8.0           0.0                0.0000
+        2000        4            8.0           0.0                0.0000
+        4000        4            8.0           0.0                0.0000
+
+counter fire-check — a path that MUST read branch-engine COW pages:
+  64 x AgentRuntime::put_row  -> 243 read_page calls
+  64 x AgentRuntime::get_row  -> 128 read_page calls
+  -> the counter COUNTS. A zero in the MERGE column is a fact about the merge.
+
+=== READING ===
+  **THE PRODUCTION MERGE READS ZERO BRANCH-ENGINE PAGES, AT EVERY TABLE SIZE.**
+  Not flat — ABSENT. `MERGE;` never descends the CowTree that `cow::merge3` merges.
+
+  The SQL surface keeps base tables in ordinary heap/index pages. `PagedRows` is a
+  parallel store, reached only by put_row / get_row / scan_rows / page_changeset,
+  none of which the MERGE path calls — `self.rows()` has exactly five call sites in
+  runtime.rs and `evaluate_merge` is not one of them.
+
+  ⇒ Wiring cow::merge3 into MERGE is NOT a performance change. There is no tree on
+    that path whose subtrees it could skip. It is a STORAGE MIGRATION — moving base
+    tables into the CoW tree — which runtime.rs's own doc names as future work:
+    "when base tables live in the tree as well, the fork root will hold real rows".
+
+  ⚠ Blind spot, restated at the point of the claim: this counter sees the branch
+    engine only. It proves the CoW tree is untouched by a merge. It does NOT
+    measure the heap side, which has no public fetch counter in this build.
