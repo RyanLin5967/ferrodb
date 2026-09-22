@@ -1,0 +1,59 @@
+CERTIFICATION — main 98a44ef..b2991c6 (35 commits), PUSHED 2026-09-22
+
+suite head=         b2991c6
+pushed origin/main= b2991c653055b5fb3e4afa26ab3f70fca77483f5
+tree(suite head)=   8c47c5d1661fd9fc95552fb0a7f1e904ff266d62
+tree(pushed)=       8c47c5d1661fd9fc95552fb0a7f1e904ff266d62
+TREE IDENTITY: VERIFIED EQUAL by git rev-parse, not asserted.
+
+PRE-REGISTERED 2482 and HIT EXACTLY. Result, verbatim from the runner's stdout:
+land-d93d23b: mode=per-target rc=0 passed=2482 failed=0 build_errors=0 head=b2991c6 log=/Users/idide/wt/artie-research/verify-out/land-d93d23b/suite-land-d93d23b.log
+land-d93d23b: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/land-d93d23b/suite-land-d93d23b.go.log
+HARNESS_EXIT=0
+
+gate: certify-head OK - staleness COVERED (0 behind, 35 ahead, asked LAST) - prepush OK
+
+WHAT THIS GREEN DOES NOT LICENSE:
+  * The D139 reaper fixture fix is in this range and its own FIRE-CHECK DID NOT FIRE
+    (0/10 with the fix reverted). The collision it removes is real and removed by
+    construction; the CAUSAL link to 'fixture: nothing was ever checkpointed' is
+    UNPROVEN. Both instantiations passed here, but that is ONE DRAW on an intermittent
+    and does not distinguish 'fixed' from 'did not fire'. See SCALE-DESIGN D139.
+  * D81's append-only arena is NOT in this range; it is landing separately.
+
+commits landed:
+  b2991c6 reaper: remove a FALSE claim I committed in the D139 fix itself
+  d93d23b D139: give every reaper fixture path a per-instantiation discriminator
+  1c229de Merge D127: unswallow D124's refusal, with the argument INVERTED
+  18e63ba Merge D136: the provenance cap saturates the page population, it is not one hot page
+  bc66169 D127: bank the green at 3b0bee5, and the pre-registration correction
+  955e992 Merge d85-rederive: D85 re-derived in a fresh context, with the reproduction forced to fail
+  a1e08ba D136 run 2: rc=0, with the PARK liveness coda and the prediction held
+  92f8a17 Merge D130: the group-commit batch saturates, and over pgwire there is none
+  52287b9 D136: scope the zero-guard per arm, and turn the locality rate into a prediction
+  7fdafb6 repair 12 dangling citations of a re-run that never happened
+  dbadd8a D136 run 1: raw provenance-dictionary occupancy curve, banked before interpretation
+  8210f7a D136: enumerate page provenance dictionaries, and the harness that curves them
+  3b0bee5 D127: invert the argument -- D126 makes refusals RARE, not benign
+  ae25726 Merge branch 'main' into d127-invert
+  29ad1f5 land W4's raw root-cell measurements, with the refuted interpretation banded at the head
+  21ae398 table_catalog: remove a FALSE durability claim -- the WAL gate is a no-op on this page
+  a648802 Merge branch 'main' into d127-invert
+  e62746c bank the certification for 11faa54..98a44ef, with the tree identity CHECKED
+  33d9566 D130: state the load-bearing premise and re-check it at main's HEAD
+  894374f D130: re-run with the positive control; outcome 2 fired at both layers
+  5e85d61 D85 re-derived: the hazard is REAL, and the retire-side probe is an untested guard
+  dd2d1f5 D130: a positive control for the pgwire arms, in the same process
+  cd2e9ac D130: pre-registered outcome 2 fired, at both layers
+  4c1486d D130: the fork witness must survive slot recycling
+  054482f D130: a proof pass inside the lock hold, and a summariser that refuses
+  e524dc7 D130: the batch-vs-threads sweep at both layers, harness only
+  01fc53b D127: bank the full-suite green (2467+97, rc=0) and the base-commit citations
+  7ad789b D127: report -- the cargo-test-examples lesson was false, measured both arms
+  83feae1 D127: report -- option 2, six mutants, and the premise that was already fixed
+  59e1a8f D127: pin the refusal counter on the trait sweep, the caller with no reporter
+  7bf356c D127: make the clean-sweep control actually run the NotExpired arm
+  9e774fb D127: fix the second stats.refused use the rename missed
+  63d57ae Merge commit 'ac2ab26' into D127-unswallow-refusal
+  191512b D127: tests -- a refused reap is counted, printed, and does not stop the sweep
+  28dc54a D127: make reap_if_still_expired's refusal distinguishable from "not expired"
