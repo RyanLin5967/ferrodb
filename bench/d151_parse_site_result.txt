@@ -72,3 +72,42 @@ FOR THE DECIDING ARM IS ~25% OF ANNOUNCEMENTS: 1,604 of 6,369. Quote that one.
 And with it, always: this is **NOT a W4 rescue**, and it moves a system **already pinned against
 its ceiling at high fork rates** — it is worth several times as much one decade of fork rate away
 than it is here. A number from this file quoted without that sentence is misleading.
+
+-----------------------------------------------------------------------------------------------
+PROVENANCE OF THE ~25%, made checkable — it is in THIS repo, not only in the design doc
+-----------------------------------------------------------------------------------------------
+Every version of this row's scoping sentence has quoted "1,604 of 6,369 in the deciding arm"
+without naming a file anyone could open. It is in ferrodb's own tree and tracked on `main`:
+
+  bench/w4_standdown/rederive/e1_arm_agent.txt:8
+    ROW arm=agent proto=extended ... ann_parse=1604 ann_refr=0 ann_exec=4765 ann_lease=0
+        ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=1600
+
+  1604 + 4765 = 6369 announcements; the parse site is 1604 of them = 25.18%.
+
+That file's header states its own layer — "through pgwire over a loopback TCP socket; shipped
+`pgwire::handle` per connection; nothing drives AgentRuntime or Session directly", clients=8,
+rounds=400, fork_every=1 — and says, as this file does, that it is a COUNT and not a timing.
+
+⚠ THE SAME FILE HOLDS TWO MORE PROTOCOL ROWS, AND THEY ARE HIGHER. Stated because leaving them
+out would be choosing the smallest true number and calling it the whole picture:
+
+    proto=simple        ann_parse 4800 of 8071   59.47%
+    proto=extended      ann_parse 1604 of 6369   25.18%   <- THE DECIDING ARM. Quote this one.
+    proto=ext_reparse   ann_parse 4800 of 8250   58.18%
+
+The mechanism behind the spread is not a discrepancy: the extended protocol parses a prepared
+statement ONCE and executes it many times, so parse announcements are rare there, while the
+simple protocol re-parses every statement. **`extended` stays the number this row is scoped by**,
+because it is what real drivers send — that is what makes it the deciding arm, and a row that
+promoted 59% by quietly switching to the simple-protocol arm would be picking its own denominator.
+
+⚠ ONE CAVEAT ON THIS CITATION, which `pgwire::mod`'s own doc already records: the ARTIFACT is on
+`main`, but the harness that produced it (`examples/w4_standdown_count.rs`) and its counters
+(`src/pgwire/standdown.rs`) are QUARANTINED, UNREVIEWED work on branch `w4-check3-rederive` and
+deliberately did not land. So these rows can be QUOTED from this tree and cannot be RE-RUN in it.
+The E.6 census in the table above has no such caveat — its instrument is in the tree it measured,
+and both arms ran in this worktree today.
+
+⚠ And unchanged, travelling with every number in this file: NOT a W4 rescue, and it moves a
+system already pinned against its ceiling at high fork rates.
