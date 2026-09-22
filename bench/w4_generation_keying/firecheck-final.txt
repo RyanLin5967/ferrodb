@@ -1,0 +1,9 @@
+BASELINE unmutated                                       PASS
+evict          --lib                            KILLED
+evict_order    --lib                            KILLED
+chunk_stop     --lib                            KILLED
+overlay        w4_stale_branch_crosses_agents   KILLED
+record_read    w4_stale_branch_crosses_agents   KILLED
+blind_writes   w4_stale_branch_crosses_agents   KILLED
+seal           w4_stale_branch_crosses_agents   KILLED
+forget         w4_sweep_slot_recycle            KILLED

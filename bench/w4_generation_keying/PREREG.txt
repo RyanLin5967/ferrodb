@@ -38,3 +38,34 @@ FALSIFIERS -- any one withdraws the row rather than adjusting the number
   * the suite's head does not name the commit being landed            (certify-head)
   * the base moved under src/ while the suite ran, asked LAST         (staleness)
   * the fire-check's unmutated baseline had not passed first          (bench/w4_generation_keying/)
+
+--- AMENDMENT 1, appended before the run. Nothing above is edited. ---
+
++1 test since the original count, for a defect the original change INTRODUCED and that I found
+by reading my own diff rather than from a failure:
+
+  src/agent_sql/runtime.rs, mod tests                                            +1
+      a_recycled_slot_installs_the_new_workspace_before_releasing_the_old
+
+  `insert_workspace` released the displaced workspace BEFORE installing the incoming one. The
+  slot-keyed map got that order free from `BTreeMap::insert`, which installed and returned in
+  one call; keying by `BranchId` split it in two and made it a decision. Commit 5c06685.
+
+REVISED PREDICTION
+  per-target  passed = 2515   failed = 0   build_errors = 0
+  go          97
+  = 2511 base + 2 integration (w4_stale_branch_crosses_agents) + 2 lib (chunk boundary, order)
+
+  Checked, not assumed: `cargo test --lib` reports 1659 on this branch against 1657 at the
+  merge base (4685d80 merged in at b675a95) -- exactly the two lib tests above.
+
+FIRE-CHECK, run on the tree this prediction is about, baseline before any mutant was read:
+  BASELINE unmutated                                       PASS
+  evict          --lib                            KILLED
+  evict_order    --lib                            KILLED
+  chunk_stop     --lib                            KILLED
+  overlay        w4_stale_branch_crosses_agents   KILLED
+  record_read    w4_stale_branch_crosses_agents   KILLED
+  blind_writes   w4_stale_branch_crosses_agents   KILLED
+  seal           w4_stale_branch_crosses_agents   KILLED
+  forget         w4_sweep_slot_recycle            KILLED

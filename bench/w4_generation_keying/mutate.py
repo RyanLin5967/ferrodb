@@ -23,13 +23,13 @@ MUTANTS = {
             .range(BranchId::new(branch.id, 0)..=BranchId::new(branch.id, u32::MAX))
             .map(|(b, _)| *b)
             .collect();
-        for dead in displaced {
-            if let Some(old) = self.workspaces.remove(&dead) {
-                self.drop_txn_refs(&old);
-                forget_captures_unless_published(self, &old);
-            }
-        }
-        self.workspaces.insert(branch, ws);""",
+        let olds: Vec<Workspace> =
+            displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        self.workspaces.insert(branch, ws);
+        for old in olds {
+            self.drop_txn_refs(&old);
+            forget_captures_unless_published(self, &old);
+        }""",
         """        self.workspaces.insert(branch, ws);""",
     ),
     # visible_rows_where -- the staged-row overlay a SELECT reads.
@@ -72,6 +72,24 @@ MUTANTS = {
         + slot_range("bid")
         + ").next().map(|(k, _)| *k);\n"
         "    let Some(ws) = mutant_key.and_then(|k| state.remove_workspace(&k)) else {",
+    ),
+    # The eviction ORDER: release the displaced workspace before installing the new one, which is
+    # what the slot-keyed map could not get wrong because BTreeMap::insert did both in one call.
+    "evict_order": (
+        """        let olds: Vec<Workspace> =
+            displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        self.workspaces.insert(branch, ws);
+        for old in olds {
+            self.drop_txn_refs(&old);
+            forget_captures_unless_published(self, &old);
+        }""",
+        """        let olds: Vec<Workspace> =
+            displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        for old in olds {
+            self.drop_txn_refs(&old);
+            forget_captures_unless_published(self, &old);
+        }
+        self.workspaces.insert(branch, ws);""",
     ),
     # The chunked reconciliation's RESUME. D158 item 1 changed the cursor from a u64 slot to a
     # BranchId with an excluded bound; a resume that does not resume forgets one chunk's worth and
