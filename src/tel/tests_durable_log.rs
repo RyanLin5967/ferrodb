@@ -1561,15 +1561,25 @@ fn the_log_opens_on_a_real_file_and_recovers_from_it() {
 
 /// **D138 — the position index is rebuilt correctly by REPLAY, not only by live appends.**
 ///
-/// `DurableEffectLog::open` reconstructs its `MemEffectLog` by feeding every record back through
-/// `mem.append`, and replay is the one caller that drives both index paths — a `FrameOpen` pushes
-/// a new key, a `FrameExtend` grows a frame at the position the earlier open put it — in a
-/// different order from the live workload that wrote the file. An index maintained correctly in
-/// one and not the other passes every in-memory test and still hands the restarted store a
-/// position pointing at another transaction's frame.
+/// ⚠ **Scoped to what `replay` actually does, because the first version of this docstring claimed
+/// more than the path can deliver.** It said replay "drives both index paths — a `FrameOpen`
+/// pushes a new key, a `FrameExtend` grows a frame at the position the earlier open put it". It
+/// does not. `DurableEffectLog::replay` folds every `Record::Extend` into a **local** `built`
+/// map and only then runs `for key in order { mem.append(&built.remove(&key)) }` — exactly one
+/// `append` per *distinct* key, every one of them a miss taking `Frames::push`. **The
+/// `Reappend::Grew` arm is never reached during a replay**, and `recovery().extensions` counts
+/// `Record::Extend` records decoded from the FILE, which proves `DurableEffectLog::append` chose
+/// the delta encoding — not that the in-memory grow path ran. That path is covered instead by
+/// phase 2 of `tests::the_position_index_and_the_frames_agree_per_key`.
+///
+/// What this test does prove, which nothing else does: **replay rebuilds the index at the
+/// positions a live store would have pushed them**, in file order rather than in the
+/// nondeterministic iteration order of `built`. A replay that fed the HashMap's order would still
+/// recover every frame and still satisfy a membership check — and would put them at different
+/// positions, which is what the `order`-vs-index assertion below catches.
 ///
 /// Membership is asserted **per key in both directions** by `assert_index_agrees`; the
-/// `frame()`-per-key loop below is the behavioural half, so a correct-looking index that no lookup
+/// `frame()`-per-key loop is the behavioural half, so a correct-looking index that no lookup
 /// actually reads cannot pass this.
 #[test]
 fn the_position_index_survives_a_replay_intact() {

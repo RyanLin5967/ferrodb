@@ -106,6 +106,7 @@
 //! after a record's fields, a header whose CRC does not hold. Each of those means the file
 //! disagrees with itself, and guessing which half is right would produce a merge nobody can audit.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -159,16 +160,31 @@ struct Frames {
 impl Frames {
     /// The only way a frame enters — one door, so the `Vec` and the index cannot disagree.
     ///
-    /// The caller must have just found the key absent. That is true of the single call site, and
-    /// the `debug_assert` is here so a second one added later fails in the test suite rather than
-    /// silently orphaning the displaced frame's position.
+    /// The caller must have just found the key absent, which is true of the single call site in
+    /// `append`. A duplicate is **refused in release as well as debug**, and that is deliberate:
+    /// a `debug_assert` here is compiled out of the build that matters, and the release failure it
+    /// would have let through is silent corruption rather than a wrong number. `HashMap::insert`
+    /// would overwrite the position and **orphan** the frame already at the old one — it stays in
+    /// the `Vec`, so `len`, `all` and `frames_for` keep handing it to the merge path while all
+    /// three keyed lookups see only the newer one. Two frames wearing one `(branch, txn_id)` is
+    /// precisely what [`classify`] exists to make impossible, so this refuses instead of warning.
+    ///
+    /// The check rides the `entry` this has to do anyway, so it costs one hash lookup, not two.
     fn push(&mut self, frame: TxnFrame) {
         let at = self.frames.len();
-        debug_assert!(
-            !self.by_key.contains_key(&(frame.branch, frame.txn_id)),
-            "pushing a key the log already holds would orphan the frame at its old position"
-        );
-        self.by_key.insert((frame.branch, frame.txn_id), at);
+        match self.by_key.entry((frame.branch, frame.txn_id)) {
+            Entry::Occupied(held) => panic!(
+                "effect log: pushing {} on branch {}, which the index already holds at position \
+                 {}. The frame Vec is append-only, so re-pointing the key would orphan that \
+                 frame rather than replace it.",
+                frame.txn_id,
+                frame.branch,
+                held.get()
+            ),
+            Entry::Vacant(slot) => {
+                slot.insert(at);
+            }
+        }
         self.frames.push(frame);
     }
 
@@ -396,14 +412,22 @@ impl EffectLog for MemEffectLog {
     /// measured a need for.
     ///
     /// ⚠ **CORRECTION to D138's own text, which reads "a fourth, `frames_for()`, has no production
-    /// caller".** It has two: `SurfaceMerger::diff` (`tel/engine.rs`) and
-    /// `RuntimeMerger::diff` (`agent_sql/merge_engine.rs`), both outside `#[cfg(test)]`. The
-    /// D129 harness observed zero calls because its axes never merge, not because the callers do
-    /// not exist — an absence in one workload read as an absence in the code. What is true is the
-    /// weaker, sufficient statement: **this scan is on the MERGE/diff path, not the append write
-    /// path**, so it is not on the axis D137's slope-1 law measures and D138 is not about it.
-    /// Pricing it needs a merging workload, which D136's 255-entry per-page provenance cap
-    /// currently blocks.
+    /// caller".** It has two, both outside `#[cfg(test)]`: [`crate::tel::ThreeWayMerger`]'s
+    /// `Merger::diff` (`tel/engine.rs`) and `SurfaceMerger`'s `Merger::diff`
+    /// (`agent_sql/merge_engine.rs`). The D129 harness observed zero calls because its axes never
+    /// merge, not because the callers do not exist — an absence in one workload read as an absence
+    /// in the code. What is true is the weaker, sufficient statement: **this scan is on the
+    /// MERGE/diff path, not the append write path**, so it is not on the axis D137's slope-1 law
+    /// measures and D138 is not about it. Pricing it needs a merging workload, which D136's
+    /// 255-entry per-page provenance cap currently blocks.
+    ///
+    /// ⛔ **The first cut of this paragraph named the two callers with the types SWAPPED, and
+    /// invented a third.** It said `SurfaceMerger::diff` for the `tel/engine.rs` site (that one is
+    /// `ThreeWayMerger`) and `RuntimeMerger::diff` for the `agent_sql` site (that one is
+    /// `SurfaceMerger`; `RuntimeMerger` does not exist in this repo — `git grep` found it only in
+    /// that comment). Recorded because of *where* it landed: a paragraph whose whole job is to
+    /// correct a wrong citation is the worst place to put one, since the next reader greps the
+    /// invented name, gets nothing, and cannot tell whether the finding itself was real.
     ///
     /// Note `out` is a fresh `Vec`: the sort below touches the copy being returned, never the
     /// stored frames, so it does not disturb any position [`Frames::by_key`] holds.
@@ -1785,6 +1809,22 @@ mod tests {
         assert_eq!(back.ops.len(), 1);
     }
 
+    /// `Frames::push` refuses a key the index already holds, **in release as well as debug**.
+    ///
+    /// This is the guard that replaced a `debug_assert`, and a guard nothing forces to fire is not
+    /// a guard. It is unreachable through `append` — which is why it needs a test that reaches
+    /// `Frames` directly — but the failure it prevents is silent: `HashMap::insert` would move the
+    /// key to the new position and leave the earlier frame in the `Vec`, where `all`, `len` and
+    /// `frames_for` keep serving it to the merge path under a key that no longer points at it.
+    #[test]
+    #[should_panic(expected = "the index already holds")]
+    fn pushing_a_key_the_index_already_holds_is_refused_not_overwritten() {
+        let mut frames = Frames::default();
+        frames.push(decrement(7, 1, 0, 1));
+        // Same (branch, txn_id), different contents — exactly the case that would orphan.
+        frames.push(decrement(7, 1, 0, 99));
+    }
+
     /// `decrement`, plus `extra` further ops on distinct cells. The first op is byte-identical to
     /// what `decrement(txn, branch, seq, n)` builds, so this **extends** that frame rather than
     /// contradicting it.
@@ -1891,6 +1931,17 @@ mod tests {
                 "the index holds a key that was never appended"
             );
         }
+
+        // `all()` clones the frame Vec, and D138 changed the line that does it. Nothing else in
+        // this repo calls it — `git grep '\.all()'` finds no effect-log caller — so without this
+        // the changed line is untestable by mutation: it could return the wrong thing and every
+        // other test would still pass. Asserted against `order`, which this test built itself.
+        let all = log.all();
+        assert_eq!(
+            all.iter().map(|f| (f.branch, f.txn_id)).collect::<Vec<_>>(),
+            order,
+            "all() no longer returns every frame in append order"
+        );
 
         // And the three production lookups that now read the index return the right frame for
         // EVERY key — per key, so a lookup that works for one and not another cannot hide.
