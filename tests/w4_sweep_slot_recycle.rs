@@ -252,16 +252,22 @@ fn a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight() {
     let live: Vec<BranchId> = rt.run_activity().into_iter().map(|a| a.branch).collect();
     assert_eq!(live, vec![racer.branch], "exactly the racer's branch should be live");
 
-    // **A neighbouring defect this test deliberately does NOT assert away.** `blind_writes` and
-    // every other `workspaces.get(&branch.id)` lookup is keyed by the id SLOT alone, so a caller
-    // holding the STALE `BranchId` (generation 0) is answered about the slot's new occupant
-    // instead of being refused:
+    // **A neighbouring defect this test deliberately did NOT assert away — NOW CLOSED, and this
+    // note is banded rather than deleted because it is where the hazard was first recorded.**
+    //
+    // As written, this said: `blind_writes` and every other `workspaces.get(&branch.id)` lookup is
+    // keyed by the id SLOT alone, so a caller holding the STALE `BranchId` (generation 0) is
+    // answered about the slot's new occupant instead of being refused —
     //
     //     rt.blind_writes(doomed.branch).is_ok()   // true, and it is the racer's workspace
     //
-    // The catalog refuses a stale generation (`BranchError::Reaped`); the runtime's workspace map
-    // has no such check. That is a pre-existing generation-blindness, not something the sweep
-    // introduced, and closing it means a generation check at every workspace lookup rather than a
-    // change here. Recorded at the point that measured it. The assertion above is written against
-    // `run_activity`, which derives its branch from `names` and so does carry the generation.
+    // **That line is false at this commit.** D158 item 1 keyed `State::workspaces` by the whole
+    // `BranchId`, so a stale generation MISSES and `blind_writes(doomed.branch)` is now an error.
+    // What made it reachable over the wire, and what it cost, is in
+    // `tests/w4_stale_branch_crosses_agents.rs`, which fails on the parent commit with a reaped
+    // session's `SELECT` returning another agent's staged row.
+    //
+    // The assertion above is written against `run_activity`, which took its branch from `names`
+    // when this file was written and takes it from the map key now; both carry the generation, so
+    // the assertion is unchanged and still discriminates.
 }
