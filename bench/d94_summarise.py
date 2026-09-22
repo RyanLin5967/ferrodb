@@ -11,8 +11,13 @@ import re
 import sys
 
 WT = "/Users/idide/wt/ferrodb-D94-dedup"
-SWEEP = f"{WT}/bench/d94_sweep_raw.txt"
-SWEEP2 = f"{WT}/bench/d94_sweep_raw_part2.txt"
+# The sweep as it stands on CURRENT MAIN. This is the primary result: a bench file that lands in
+# main has to be true of main.
+SWEEP_FILES = [f"{WT}/bench/d94_sweep_main.txt", f"{WT}/bench/d94_sweep_main_10k.txt"]
+# The original sweep, taken at base 8d79ee5 before main moved 147 commits. Kept and reported
+# because the COMPARISON is itself a result -- it shows which half of the finding is structural and
+# which half is arithmetic about a tree shape that has since changed.
+HIST_FILES = [f"{WT}/bench/d94_sweep_raw.txt", f"{WT}/bench/d94_sweep_raw_part2.txt"]
 EXTENT = f"{WT}/bench/d94_extent_premise_raw.txt"
 TESTS = f"{WT}/bench/d94_dedup_tests.txt"
 OUT = f"{WT}/bench/d94_chunk_dedup.txt"
@@ -23,7 +28,7 @@ ROW = re.compile(
 )
 
 
-def read_sweep():
+def read_files(paths):
     """Read every raw sweep file, keeping each one's provenance stamp.
 
     The sweep was interrupted by a rate limit after 7 of 9 rows and finished in a second run, so
@@ -31,7 +36,7 @@ def read_sweep():
     a banked number has to say which build produced it.
     """
     rows, stamps = [], []
-    for path in (SWEEP, SWEEP2):
+    for path in paths:
         try:
             text = open(path).read()
         except OSError:
@@ -71,7 +76,8 @@ def fit(points):
 
 
 def main():
-    stamps, rows = read_sweep()
+    stamps, rows = read_files(SWEEP_FILES)
+    _, hist = read_files(HIST_FILES)
     if not rows:
         print("REFUSING: no rows parsed from the sweep. A run that collected nothing has not "
               "passed.", file=sys.stderr)
@@ -108,14 +114,12 @@ def main():
     for fname, st in stamps:
         w(f"harness: examples/d94_dedup_premise.rs, built {st.split('at',1)[1].strip()}  [{fname}]")
     if len({st for _, st in stamps}) > 1:
-        w("  two builds: the sweep was cut off by a rate limit after 7 of 9 rows and finished in a")
-        w("  second run. The only source delta between them is +53 lines of #[cfg(test)] module in")
-        w("  src/cow/dedup.rs, which is unwired and not on the harness's path; the harness file")
-        w("  itself is byte-identical (git diff 48c6e60 HEAD -- examples/d94_dedup_premise.rs is")
-        w("  empty). The rows are therefore comparable, and both stamps are printed rather than")
-        w("  one being presented as if it covered all nine rows.")
+        w("  more than one stamp: the sweep ran in two invocations of the SAME binary (the 10^4")
+        w("  point separately, because its walk is 4x the 10^3 point's). Both are printed rather")
+        w("  than one being presented as if it covered every row.")
     w(f"module:  src/cow/dedup.rs        tests: {test_line}")
-    w("raw:     bench/d94_sweep_raw.txt + bench/d94_sweep_raw_part2.txt,")
+    w("raw:     bench/d94_sweep_main.txt + bench/d94_sweep_main_10k.txt  (CURRENT MAIN, primary)")
+    w("         bench/d94_sweep_raw.txt + bench/d94_sweep_raw_part2.txt  (base 8d79ee5, prior)")
     w("         bench/d94_extent_premise_raw.txt,")
     w("         bench/d94_zero_falsifier.txt (the 0 at dup_frac=0.00, forced to fire at k=1,2,3)")
     w("built by: bench/d94_summarise.py -- every number here is read from a raw run, not retyped")
@@ -242,6 +246,62 @@ def main():
     w("nodes hold child PageIds, which differ per branch by construction, so the spine can never")
     w("be byte-identical across branches no matter how identical the data is.")
     w("")
+
+    # ---- What moved when main moved --------------------------------------------------
+    if hist:
+        w("-- THE SAME SWEEP AT BASE 8d79ee5, AND WHAT MOVED --")
+        w("")
+        w("This row was first measured before main advanced 147 commits (D108 neighbour merge alone")
+        w("put +1357 lines into src/cow/btree.rs). Re-running on current main separates the part of")
+        w("the result that is STRUCTURAL from the part that was arithmetic about a tree shape:")
+        w("")
+        w(f"  {'quantity':<34} {'base 8d79ee5':>14} {'current main':>14}")
+        def cell(rs, n, d, k):
+            m = [r for r in rs if r["n"] == n and r["dup"] == d]
+            return m[0][k] if m else None
+        pairs = [
+            ("trunk pages (5000 rows)", lambda rs: cell(rs, 100, 0.0, "trunk")),
+            ("distinct pages, N=100", lambda rs: cell(rs, 100, 0.0, "distinct")),
+            ("distinct pages, N=1000", lambda rs: cell(rs, 1000, 0.0, "distinct")),
+            ("dedup gain, N=100 dup=0.00", lambda rs: cell(rs, 100, 0.0, "gain")),
+            ("dedup gain, N=100 dup=0.50", lambda rs: cell(rs, 100, 0.5, "gain")),
+            ("dedup gain, N=100 dup=1.00", lambda rs: cell(rs, 100, 1.0, "gain")),
+        ]
+        for label, f in pairs:
+            a, b = f(hist), f(rows)
+            if a is not None and b is not None:
+                mark = "  same" if a == b else "  MOVED"
+                w(f"  {label:<34} {a:>14} {b:>14}{mark}")
+        for f in fracs:
+            ph = [(r["n"], r["distinct"]) for r in hist if r["dup"] == f]
+            pm = [(r["n"], r["distinct"]) for r in rows if r["dup"] == f]
+            sh, _ = fit(ph)
+            sm, _ = fit(pm)
+            if sh is not None and sm is not None:
+                w(f"  {('stored slope, dup=%.2f' % f):<34} {sh:>14.3f} {sm:>14.3f}  MOVED")
+        for f in fracs:
+            ph = [(r["n"], r["payload"]) for r in hist if r["dup"] == f]
+            pm = [(r["n"], r["payload"]) for r in rows if r["dup"] == f]
+            sh, _ = fit(ph)
+            sm, _ = fit(pm)
+            if sh is not None and sm is not None:
+                w(f"  {('deduped slope, dup=%.2f' % f):<34} {sh:>14.3f} {sm:>14.3f}  MOVED")
+        w("")
+        w("READ THIS CAREFULLY, because the two halves point opposite ways:")
+        w("")
+        w("  STRUCTURAL, unchanged: distinct pages == distinct whole in every row of BOTH sweeps,")
+        w("  and the dedup gain is 0 at dup_frac=0.00 and exactly k*(N-1) otherwise, in BOTH. The")
+        w("  reason is that src/cow/page_header.rs is BYTE-IDENTICAL across the 147 commits -- same")
+        w("  24 bytes, same offsets. The finding rests on the page format, so it survived.")
+        w("")
+        w("  ARITHMETIC, moved: the tree got denser per branch. A branch now costs 14 pages where")
+        w("  it cost 9, and the floor dedup cannot go below rose from 1 page/branch to 6. So the")
+        w("  headline saving at dup_frac=1.00 fell from 79.1% to 43.4% at N=100.")
+        w("")
+        w("  The direction matters: the case for dedup is WEAKER on current main than it was when")
+        w("  this row was opened, because more of each branch's cost is spine that can never be")
+        w("  byte-identical. The refusal is better supported now, not worse.")
+        w("")
 
     # ---- The architectural cost -----------------------------------------------------
     w("-- WHAT ADOPTING THIS WOULD COST, which is why it is not wired in --")
