@@ -14,20 +14,29 @@
 //! An extent's owner IS published, by construction: `alloc_arena` is the only writer of the
 //! extent map and it ends in `catalog.add_arena`, which every catalog refuses for a branch with
 //! no record. And a record missing *right now* has not stopped existing — nothing deletes one,
-//! retirement is a state flip to `Reaped` — but `TableBranchCatalog::upsert` is delete-then-insert
-//! with no latch held across the two calls, and `write_record` routes the RECORD key through it,
-//! so an ordinary `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
-//! perfectly healthy branch. **That is the case these arms were freeing pages on.**
+//! retirement is a state flip to `Reaped`. Handing back a page the interval rule deliberately
+//! parked for a live child, because the owner's record could not be read, is silent data loss.
+//! Refusing is retryable; the entry stays in the pending log and the next drain succeeds.
 //!
-//! Handing back a page the interval rule deliberately parked for a live child, because the
-//! owner's record happened to be mid-rewrite, is silent data loss. Refusing is retryable; the
-//! entry stays in the pending log and the next drain succeeds. SCALE-DESIGN D126 removes the
-//! window itself by giving the B+tree a replace primitive.
+//! ⚠ **When this was written there was a second, ROUTINE way to reach that state, and D126 has
+//! since removed it.** `TableBranchCatalog::upsert` was delete-then-insert with no latch held
+//! across the two calls, and `write_record` routes the RECORD key through it, so an ordinary
+//! `set_root` or `renew_lease` on the owner made `get_raw` miss for a moment on a perfectly
+//! healthy branch — and that is the case these arms were freeing pages on. `BPlusTreeManager`
+//! now replaces a value in place under one latch hold; `tests/d126_atomic_upsert.rs` and
+//! `table_catalog::d126_record_key_probe` assert zero absences against a control that fires.
 //!
-//! **Not reachable in production today.** `reap_expired` runs inside the per-statement lock that
-//! every `fork` also takes, so the two are mutually excluded. W4 exists to remove that lock, so
-//! the defect has to be gone before W4 lands, not after; `tests/d15_concurrent_fork_and_reap.rs`
-//! bypasses `RuntimeLock` and is the harness where it is reachable at all.
+//! **The arms under test here are unchanged and so is this test.** They catch an `Err`, and an
+//! I/O error or a corrupt catalog still produces one — which is exactly what the decorator below
+//! injects. What D126 changed is that a `Corrupt` from this path is now a real signal instead of
+//! an expected artefact of a hot-path write, which is what makes D127 (the reaper swallowing it)
+//! matter more rather than less.
+//!
+//! **W4.** `reap_expired` runs inside the per-statement lock that every `fork` also takes, so the
+//! two are mutually excluded and the mid-rewrite path was never reachable in production. W4 exists
+//! to remove that lock; D126 landed before it and removed the window rather than relying on the
+//! exclusion, so W4 no longer activates it. `tests/d15_concurrent_fork_and_reap.rs` bypasses
+//! `RuntimeLock` and is the harness where the D124 arms are reachable at all.
 //!
 //! **How the state is constructed.** Not by corrupting a catalog — that would prove nothing about
 //! the arm, since the arm catches an `Err` and not an absence. A decorator hides ONE record from

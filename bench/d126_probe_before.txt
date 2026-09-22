@@ -1,0 +1,145 @@
+============================================================================
+D126 -- THE PROBE MUST FAIL BEFORE IT PASSES. Two before-runs, both raw.
+host: Darwin 25.6.0 arm64   date: 2026-09-22T05:21:45Z
+============================================================================
+
+PART 1 -- a probe written in a FRESH context against the UNFIXED tree.
+  base sha 83cb6e8cbeab10cec0fb86fbde0dda198bf230c7 (no source change; the probe
+  file was the only thing in the tree). Reader is `BranchCatalog::get_raw`, which
+  is what arena::free_page and reaper::drain_pending_seeded call. A second branch
+  record, forked and never rewritten, is read by the same threads on the same
+  schedule -- CONTROL_MISS is that record.
+  command: cargo test --test d126_atomic_upsert -- --test-threads=1 --nocapture
+
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wf_ab92597e-f3f-2)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.20s
+     Running tests/d126_atomic_upsert.rs (target/debug/deps/d126_atomic_upsert-afd33fa128f9476a)
+
+running 3 tests
+test a_record_rewrite_never_removes_the_key ... [d126/setroot-4r] readers=4 writes=400 reads=307268 elapsed=2531ms TARGET_MISS=319 CONTROL_MISS=0
+[d126/setroot-4r] first target error: branch error: branch b1@g0 not found
+
+thread 'a_record_rewrite_never_removes_the_key' (252081312) panicked at tests/d126_atomic_upsert.rs:134:5:
+assertion `left == right` failed: a lockless reader saw branch 1's record ABSENT 319 times during 400 ordinary set_root calls. D126: upsert must replace the key in place under a single latch hold, never delete-then-insert. First error: Some("branch error: branch b1@g0 not found")
+  left: 319
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test renew_lease_never_removes_the_record_either ... [d126/renew] reads=238637 MISS=472
+
+thread 'renew_lease_never_removes_the_record_either' (252082439) panicked at tests/d126_atomic_upsert.rs:197:5:
+assertion `left == right` failed: renew_lease removed the RECORD key 472 times
+  left: 472
+ right: 0
+FAILED
+test still_never_absent_under_heavier_read_pressure ... [d126/setroot-12r] readers=12 writes=300 reads=808582 elapsed=2370ms TARGET_MISS=5142 CONTROL_MISS=0
+[d126/setroot-12r] first target error: branch error: branch b1@g0 not found
+
+thread 'still_never_absent_under_heavier_read_pressure' (252082773) panicked at tests/d126_atomic_upsert.rs:151:5:
+assertion `left == right` failed: record absent 5142 times at 12 readers (first error: Some("branch error: branch b1@g0 not found"))
+  left: 5142
+ right: 0
+FAILED
+
+failures:
+
+failures:
+    a_record_rewrite_never_removes_the_key
+    renew_lease_never_removes_the_record_either
+    still_never_absent_under_heavier_read_pressure
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.80s
+
+error: test failed, to rerun pass `--test d126_atomic_upsert`
+
+
+============================================================================
+PART 2 -- FIRE-CHECK of the committed probes against a deliberately broken
+  `TableBranchCatalog::upsert`. Branch D126-atomic-upsert with ONE edit: upsert
+  put back to `tree.delete` then `tree.insert`, nothing else touched. Both
+  committed probe arms must fail, and the never-rewritten neighbour must NOT.
+  command: cargo test --lib d126_record_key_probe -- --nocapture --test-threads=1
+  rc=101
+
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wf_ab92597e-f3f-2)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2009:17
+     |
+2009 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2083 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2009:17
+     |
+2009 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2083 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2009:17
+     |
+2009 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2084 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2009:17
+     |
+2009 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2084 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.83s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 2 tests
+test branch::table_catalog::d126_record_key_probe::renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves ... D126 catalog renew_lease/get_raw     : target_miss=255 neighbour_miss=0 reads=125170
+
+thread 'branch::table_catalog::d126_record_key_probe::renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves' (252197749) panicked at src/branch/table_catalog.rs:1621:9:
+assertion `left == right` failed: `renew_lease` made `get_raw` miss a live branch's record 255 times in 125170 reads
+  left: 255
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test branch::table_catalog::d126_record_key_probe::the_record_key_is_never_absent_while_it_is_rewritten ... D126 catalog CONTROL  (delete+insert): misses=6066 reads=19366
+D126 catalog TREATMENT (upsert)      : misses=5140 reads=17380
+D126 catalog set_root                : misses=1193 reads=403046
+
+thread 'branch::table_catalog::d126_record_key_probe::the_record_key_is_never_absent_while_it_is_rewritten' (252198981) panicked at src/branch/table_catalog.rs:1518:9:
+assertion `left == right` failed: the RECORD key was absent 5140 times in 17380 reads while `upsert` rewrote it
+  left: 5140
+ right: 0
+FAILED
+
+failures:
+
+failures:
+    branch::table_catalog::d126_record_key_probe::renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves
+    branch::table_catalog::d126_record_key_probe::the_record_key_is_never_absent_while_it_is_rewritten
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1616 filtered out; finished in 3.40s
+
+error: test failed, to rerun pass `--lib`

@@ -1,0 +1,428 @@
+D126 — make `upsert` atomic, so a RECORD key is never transiently absent.
+Branch: D126-atomic-upsert.  Base: ac2ab26 (main).
+Written 2026-09-22 ~07:30Z from worktree /Users/idide/wt/ferrodb-wf_e78d06ad-550-2.
+
+================================================================================
+0. THE ROW'S PREMISE WAS FALSE, AND THAT IS THE FIRST RESULT
+================================================================================
+
+I was dispatched to implement D126. **D126 was already implemented.** Branch
+`D126-atomic-upsert` existed at dispatch with six commits, the last written at
+2026-09-22 01:23:12 -0400, ~2h before I started. Its worktree had already been
+reaped, so nothing in `git worktree list` pointed at it and the row looked open.
+
+  b8f26aa D126: the cost artifact -- upsert is 0.52-0.54x delete+insert, not slower
+  d8218c5 D126: commit the raw before-and-fire-check logs, and cite the run in the probe
+  b3b8391 D126: cover renew_lease and a never-rewritten neighbour, and fix the example's duplicate detector
+  ff76bca D126: let every probe arm report before any assertion fires
+  b734ac2 D126: route TableBranchCatalog::upsert through the atomic tree primitive
+  8d923c7 D126: give BPlusTreeManager an atomic upsert, so a rewritten key is never absent
+
+It is NOT merged to main. `git merge-base ac2ab26 D126-atomic-upsert` = 83cb6e8,
+i.e. the branch forked before main's last two commits and has sat unmerged since.
+
+I had written an independent implementation before noticing. It is committed on
+branch `wf_e78d06ad-550-2` as `0c9bb44`, labelled SUPERSEDED, and ABANDONED —
+the existing branch is the better copy and I did not replace it with mine:
+
+  - it probes the real RECORD key at the catalog level, not only the tree;
+  - it has a splitting arm, an `insert`-still-does-not-replace arm, and a
+    never-rewritten NEIGHBOUR record as a negative control inside the treatment;
+  - it counts duplicates by walking the whole leaf chain, having found that a
+    bounded `range_scan` cannot answer the question (`slice::binary_search` on
+    duplicates returns *an* index, not the first, so a seeded scan can begin
+    after a duplicate and report 1 where there are 2);
+  - its cost measurement rotates arm order as a Latin square, carries a moving
+    CONTROL, runs two replicates back to back under the measure lock, and stamps
+    `load_at_acquire`.
+
+Mine had one thing that branch did not, and one thing neither had. Both are now
+on the branch (sections 3 and 4).
+
+================================================================================
+1. THE DEFECT, AND WHAT THE FIX IS
+================================================================================
+
+`TableBranchCatalog::upsert` was:
+
+    match self.tree.delete(&key) { Ok(()) | Err(KeyNotFound) => {}, Err(e) => return Err(e) }
+    self.tree.insert(key, value)
+
+`BPlusTreeManager::delete` takes the leaf's write latch and **drops it on
+return**; `insert` re-acquires it. Nothing is held across the two, so between
+them the key does not exist in the tree. `write_record` routes the branch RECORD
+key straight through that pair, reached from `set_state`, `set_root`,
+`renew_lease`, `reparent`, `restrict_envelope` and `put` — `set_root` and
+`renew_lease` being ordinary hot-path writes. Every reader of a record (`core`,
+`get_raw`, `has_live_children`, `max_live_child`, `live_child_in_epoch_range`)
+takes no lock at all: `logical` is writers-only.
+
+The fix is `BPlusTreeManager::upsert`, the replace primitive the tree did not
+have — which is precisely why the catalog open-coded the pair. The removal and
+the addition are applied to ONE in-memory leaf image, so the single `write_page`
+that publishes the new value is the same one that drops the old. The
+does-not-fit case splits that already-mutated image, and the existing split
+ordering (new right sibling written first, halved leaf second, because writing
+the halved leaf is what publishes `next`) keeps the key reachable throughout.
+
+================================================================================
+2. VERIFICATION — RE-RUN BY ME IN A FRESH CONTEXT, NOT QUOTED
+================================================================================
+
+Every number below is from my own run on this worktree, `cargo test --release`,
+2026-09-22 ~07:20Z, box load ~32 (13-agent fleet). These are COUNTS, not
+durations, so the load caveat does not touch them.
+
+`cargo test --release --test d126_atomic_upsert -- --test-threads=1`, 4 passed
+(the fourth arm is mine and is described in section 6):
+
+    a_rewritten_key_is_never_absent_to_a_concurrent_reader
+      CONTROL   (delete+insert)  misses=30826  reads=59976  errors=0   <- FIRES
+      TREATMENT (tree.upsert)    misses=0      reads=35992  errors=0
+    a_growing_rewrite_that_splits_is_still_never_absent
+                                 misses=0      reads=4643
+    insert_still_does_not_replace                                  ok
+    the_primary_index_rewrite_is_never_absent_either  (section 6)
+      CONTROL   (delete+insert)  misses=34675  reads=65026          <- FIRES
+      TREATMENT (upsert)         misses=0      reads=30354
+
+`cargo test --release --lib d126_record_key_probe -- --test-threads=1`, 2 passed:
+
+    the_record_key_is_never_absent_while_it_is_rewritten
+      CONTROL   (delete+insert)  misses=18515  reads=156409          <- FIRES
+      TREATMENT (cat.upsert)     misses=0      reads=140113
+      set_root  (hot path, fsync) misses=0     reads=9401816
+    renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves
+      target_miss=0  neighbour_miss=0  reads=1484312
+
+THE CONTROL IS THE POINT. A zero from a probe that cannot see the defect is not
+evidence. The control performs the pre-D126 delete-then-insert on the same tree,
+the same key, the same reader threads and the same iteration count, and it misses
+on 51% of reads at the tree level and 12% at the catalog level. The treatment's
+zero is admissible only because that fired first, and the test asserts it —
+`control.misses > 0` is a hard assertion, not a printout.
+
+THE NEIGHBOUR IS THE OTHER HALF. `renew_lease`'s arm reads a second record that
+nothing ever rewrites, on the same schedule, from the same threads, sharing a
+leaf with the target. If the lockless reader were unsound for some reason having
+nothing to do with delete-then-insert — a torn snapshot, a descent that loses a
+page mid-write — the neighbour would miss too. It does not, so the target's zero
+is about the rewrite and not about the reader.
+
+COST, cited from `bench/d126_upsert_cost.txt` (not re-taken by me; the measure
+lock was held by another agent for my whole session):
+
+    median delete+insert   24.14 / 24.56 us/op   (two replicates)
+    median upsert          12.99 / 12.81 us/op
+    median search (CONTROL) 7.43 /  7.46 us/op   <- did not move
+    upsert / (delete+insert) = 0.538x, 0.522x
+    CONTROL spread across rounds = 1.25x, 1.21x
+
+⇒ The replace is NOT slower; it is roughly half, which is one descent and one
+page write in place of two of each. That is the direction the row asked about,
+and it is the only thing this measurement is quoted for: the box was at
+load 15 when it was taken, so every absolute us/op is an upper bound.
+
+================================================================================
+3. WHAT I ADDED — (a) AN ENTRY LARGER THAN A PAGE NOW REFUSES INSTEAD OF PANICKING
+================================================================================
+
+Commit 7be7627.
+
+`BPlusTreeLeafPage::split` takes `mid = len / 2`. On a leaf holding ONE entry
+that is 0, so `split_off(0)` moves everything to the new page and leaves this
+leaf EMPTY — and `serialize` on the oversized half then indexes past `PAGE_SIZE`.
+
+MEASURED, before the guard, on the test that now covers it:
+
+    thread '...an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf'
+    panicked at src/storage/index_page.rs:117:
+    range end index 4143 out of range for slice of length 4096
+    (27 header + 12 key + 4104 value)
+
+**D126 is why this is written down now.** `insert` could only reach the case on
+an EMPTY leaf. `Replace` reaches it on a POPULATED one: a replacement value can
+grow a one-entry leaf past the page without ever making it two entries, which is
+a shape no `insert` can produce. The guard refuses by name, before anything is
+written, and it is strictly stricter than what it replaces — it refuses nothing
+that previously succeeded, because what it catches previously panicked.
+
+Fire-checked from both directions (upsert-grows and insert-into-empty), with a
+negative control in the same body: a 2000-byte value is still accepted, and 40
+ordinary inserts still split and are all still findable afterwards.
+
+Not reachable from the branch catalog — a serialized core record is tens of
+bytes — but `BPlusTreeManager` also backs every user table's primary index.
+
+================================================================================
+4. WHAT I ADDED — (b) THE SIX COMMENTS THAT STILL ASSERTED THE OLD MECHANISM
+================================================================================
+
+Commit 6a52c7f. The fix landed at the tree and at `TableBranchCatalog::upsert`,
+and six other places went on stating delete-then-insert as a live fact. One of
+them is operator-facing:
+
+  src/branch/table_catalog.rs  dangling_child   — the BranchError::Corrupt TEXT
+  src/branch/table_catalog.rs  child_liveness   — inline
+  src/branch/table_catalog.rs  attach_child     — inline
+  src/branch/arena.rs          free_page
+  src/branch/reaper.rs         drain_pending_seeded
+  src/branch/catalog.rs        LogBranchCatalog::detach_child
+  tests/d124_owner_record_refusal.rs  module doc
+
+`dangling_child`'s message told the reader the record is "far more likely on a
+healthy database — one whose record is mid-rewrite". After D126 that is WRONG
+ADVICE printed at the exact moment corruption is being reported.
+
+**No guard's behaviour changed.** Every one still refuses. What changed is the
+justification, and the change is not cosmetic:
+
+    before D126: a missing record means "mid-rewrite, or never published, and a
+                 reader cannot tell" — so the Corrupt was an EXPECTED artefact of
+                 a hot-path write, and under W4 it would fire on healthy databases.
+    after  D126: a missing record means "never published (which attach_child and
+                 add_arena refuse to create) or corrupt" — so the Corrupt is a
+                 REAL SIGNAL.
+
+⇒ **That strengthens D127 rather than closing it.** D127 is that
+`reaper.rs:732`'s `Err(FerroError::Branch(_)) => Ok(false)` swallows this
+refusal, so it reaches no log, no counter and no operator. D126 removes the
+benign reason the message could appear; what is left is worth hearing, and it is
+exactly what is being dropped. D127's own entry argues it must land before W4
+alongside D126 — that argument survives, with a different emphasis.
+
+Two further corrections the fix invalidated:
+
+  - `write_record_new`'s doc rested on "the wasted delete is 56% of an upsert"
+    (`bench/serial_section_profile.txt`, upsert 0.02280 ms vs tree.insert
+    0.01003 ms). There is no wasted delete now. What is left of the method's
+    justification is the arena-span `range_scan` it skips, and that saving is
+    **UNMEASURED** — the only number the method ever had was the one D126 removed.
+    Said so in the doc rather than leaving a retired figure standing.
+  - the S8 profiler's `(upsert)` row (0.01344 ms) is now a PRE-D126 number and is
+    labelled as such at the call site.
+
+================================================================================
+5. SCOPE — WHAT D126 DOES NOT DO. STATED SO THE GUARANTEE IS NOT OVER-READ.
+================================================================================
+
+**D126 makes one KEY's value change atomic. It does NOT make `write_record`
+atomic.** The state and deadline index keys are not rewritten in place, they
+MOVE: `remove_if_present(keys::state(old_state, id))` first, then
+`upsert(keys::state(new_state, id))` several lines later. Between those two a
+branch is in NEITHER state span and NEITHER deadline span, and `live_count`,
+`in_state` and `expired_before` scan exactly those spans without the `logical`
+lock. No per-key primitive can close that — they are different keys, in general
+on different pages.
+
+The direction it fails in is benign for the reaper: `expired_before` missing an
+entry reads as "not expired yet", and `reap_if_still_expired` re-reads the record
+anyway. `live_count` can undercount by one for the length of a rewrite. That is
+why this is noted rather than treated as the same defect — but it IS a real
+multi-key window and it is a separate row, not something D126 closed.
+
+Also unchanged: D124's guards, D127's swallow, and the fact that none of this is
+reachable in production today because reader and writer are both inside the
+per-statement mutex. W4 removes that mutex. D126 is now in front of it.
+
+================================================================================
+6. WHAT I ADDED — (c) THE THREE OPEN-CODED REWRITES STILL LEFT IN src/
+================================================================================
+
+Commits 5388fda and a3114d0. The primitive was added for the branch catalog,
+and the identical pair was left open-coded on a user table's PRIMARY INDEX in
+three places:
+
+  src/execution/update.rs   if new_rid != rid { primary_index.delete(&pk)?;
+                                                primary_index.insert(pk, new_rid)?; }
+  src/execution/insert.rs   primary_index.delete(&vals[0])?;
+                            ... heap.insert(tuple)? ...
+                            primary_index.insert(vals[0], rid)?;
+  src/catalog/alter.rs      if primary.search(&k)? == Some(rid) {
+                                primary.delete(&k)?; primary.insert(k, new_rid)?; }
+
+The second is the worst: a whole heap insert sits inside the window. All three
+are now one `upsert`.
+
+`update.rs` also loses an error path that could only fire AFTER the heap was
+already updated — `delete` returns `KeyNotFound` for a missing entry and
+propagating it aborted the statement with the index left disagreeing with the
+heap; `upsert` repairs the entry instead.
+
+`alter.rs` keeps its `search(&k) == Some(rid)` guard, and that is load-bearing:
+`upsert` INSERTS a key that is absent, which is exactly what a rewrite must not
+do — a deleted row keeps its heap tombstone AND its index entry. The guard
+decides whether to write; `upsert` only decides how.
+
+That is every open-coded delete-then-insert on a `BPlusTreeManager` in `src/`,
+enumerated from a grep for `.delete(` rather than from memory. What remains is
+`TableBranchCatalog::remove_if_present` (a genuine removal) and the CoW tree's
+own root-returning `delete(root, branch, epoch, key)`, which is a different
+structure with a different API and not this defect.
+
+Probed with the REAL types rather than assuming the `Vec<u8>` result carries
+over (`Value`/`RecordId` serialize differently and land differently in a leaf):
+
+    D126 primary index CONTROL  (delete+insert): misses=34675 reads=65026  <- FIRES
+    D126 primary index TREATMENT (upsert)      : misses=0     reads=30354
+
+plus a duplicate count walked over the whole leaf chain (1 entry) and the last
+value readable back.
+
+⚠ SCOPED IN THE TEST'S OWN DOC: this probes the INDEX, not a concurrent
+`UPDATE`. Two statements cannot reach the executor at once today — the pgwire
+server serialises whole statements behind `ServerContext::catalog()`, the same
+exclusion that keeps the catalog's window latent — so a SQL-layer probe would
+need that lock bypassed, which is a harness of its own. The window is in the
+index and so is the fix.
+
+================================================================================
+7. THE ROW WAS DISPATCHED A THIRD TIME, AND THE REASON IS THE LANDING GAP
+================================================================================
+
+Appended 2026-09-22 ~09:05Z by a THIRD dispatch of D126, in a fresh context that
+had seen none of the work above.
+
+Section 0 records that the row was dispatched twice because an unmerged branch
+with no worktree is invisible to every liveness check this fleet has. **That is
+still true, and it is why there was a third.** The second pass fixed the code and
+wrote this report; it did not fix the thing that causes the re-dispatch.
+
+⇒ **The branch had never been suite-certified.** Section 7 as written said it
+would be "filled in by the commit that follows this one" — no such commit was
+ever made. `bench/*certified*` was checked in every worktree on this box and in
+the main checkout: `d40 d41 d42 d52 d53 d54 d56 d57 d58 d59 d60 land22 land101
+land124`, and **no d126**. The repo's own rule is that push/merge to main is
+authorised ONLY behind a verified green suite, so with no certification the
+branch COULD not land, and an unlanded branch reads as an open row. The loop
+closes here and not before.
+
+================================================================================
+8. RE-VERIFIED IN A FRESH CONTEXT — MY OWN RUN, NOT QUOTED
+================================================================================
+
+Every number below was produced by this third pass on this worktree, after
+merging main (ac2ab26) in. Raw logs committed BEFORE interpretation, at
+`bench/d126_reverify/`. These are COUNTS, so box load does not touch them; no
+duration was re-taken, because the measure lock was held (see section 9).
+
+`cargo test --release --test d126_atomic_upsert -- --test-threads=1`, 4 passed:
+
+    a_rewritten_key_is_never_absent_to_a_concurrent_reader
+      CONTROL   (delete+insert)  misses=28008  reads=52445  errors=0   <- FIRES
+      TREATMENT (tree.upsert)    misses=0      reads=24629  errors=0
+    a_growing_rewrite_that_splits_is_still_never_absent
+                                 misses=0      reads=3930
+    insert_still_does_not_replace                                  ok
+    the_primary_index_rewrite_is_never_absent_either
+      CONTROL   (delete+insert)  misses=33573  reads=61937           <- FIRES
+      TREATMENT (upsert)         misses=0      reads=31340
+
+`cargo test --release --lib d126_record_key_probe -- --test-threads=1`, 2 passed:
+
+    the_record_key_is_never_absent_while_it_is_rewritten
+      CONTROL   (delete+insert)  misses=31188  reads=226921          <- FIRES
+      TREATMENT (cat.upsert)     misses=0      reads=202772
+      set_root  (hot path, fsync) misses=0     reads=5702750
+    renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves
+      target_miss=0  neighbour_miss=0  reads=1429296
+
+THE CONTROL FIRED IN ALL THREE ARMS, on a different run on a differently-loaded
+box from section 2's, at 53.4% / 54.2% / 13.7% of reads. The exit criterion asked
+for a probe that FAILS against today's `upsert` and passes after; the control IS
+today's `upsert`, open-coded on the same tree, key, threads and iteration count,
+and the test asserts `control.misses > 0` as a hard assertion. The zeros are
+admissible because of that.
+
+================================================================================
+9. WHAT THIS PASS CHECKED BY READING, AND WHAT IT DID NOT RE-TAKE
+================================================================================
+
+Read rather than assumed, because a fresh context's job is to attack the work and
+not to restate it:
+
+  - `apply_to_leaf`'s `let _ = leaf.remove_entry(&key)` discards a Result. Checked
+    `index_page.rs:416`: `remove_entry` has exactly one failure arm, `binary_search`
+    missing -> `KeyNotFound`. The comment's claim that "there is nothing else it
+    can fail on" is TRUE.
+  - **The sharpest hazard, and it is not one.** If `latch_leaf_for_write` could
+    return a leaf that does not hold the key — a concurrent split having moved it
+    right — then Replace would remove nothing and insert a second copy, which is
+    the duplicate-key corruption the primitive exists to avoid. It cannot:
+    `index.rs:474-489` keeps the PARENT's read latch across dropping the leaf read
+    latch and taking the leaf write latch, and re-checks the root-as-leaf case.
+    **`insert` already rests on that exact invariant** — without it an insert would
+    land in the wrong leaf and break key order — so Replace inherits it and adds
+    no new requirement.
+  - The open-coded-pair sweep was re-run independently from `grep -rn "\.delete("
+    src/ --include='*.rs'` rather than from section 6's list. It agrees: the only
+    `.delete(` left on a `BPlusTreeManager` are `remove_if_present` (a genuine
+    removal) and the probe's own control arm at `table_catalog.rs:1492`. Everything
+    else is `cow/`'s root-returning `delete(root, branch, epoch, key)`, a different
+    structure, or heap/WAL slot deletes. **No fourth site.**
+    ⚠ The first attempt at that sweep returned "no matches found" because zsh ate
+    the unquoted `--include=*.rs`. An unquoted glob failing looks EXACTLY like a
+    clean sweep. Quoted and re-run; the result above is the quoted one.
+
+NOT re-taken, and stated rather than quietly reused: the COST measurement. The
+measure lock was held by `CEILING-resume` (pid 86920, taken 07:05:12Z) for this
+whole pass, and another lane had a `cargo`/`rustc` fan-out live on the box. The
+0.52-0.54x figure in section 2 is the second pass's, from
+`bench/d126_upsert_cost.txt`, and is cited as theirs. The lock holder's pid is
+dead and its artifacts had not advanced in ~77 minutes, but this project's own
+rule is that the measure lock's owner pid is dead BY CONSTRUCTION, so a dead pid
+is not authority to take the lock. Counts were run instead; they are what the exit
+criterion needs.
+
+================================================================================
+10. CERTIFICATION — THE THING THAT WAS ACTUALLY MISSING, AND IS NOW DONE
+================================================================================
+
+**D126 IS LANDED.** main = `2bc80fd` "Merge D126-atomic-upsert: a rewritten
+catalog key is never momentarily absent", which contains `8d2b673`.
+
+Evidence in `bench/d126_certified/` (SUMMARY.txt, both suite logs with sha256s,
+the prepush log). The verdict:
+
+    d126-8d2b673: mode=whole rc=0 passed=2474 failed=0 build_errors=0 head=8d2b673
+    d126-8d2b673: go rc=0 passed=97 failed=0
+
+All four gates, at that tip: verify-suite rc=0 · certify-head OK (suite head ==
+landing commit) · staleness COVERED · prepush OK. prepush matters here more than
+usual and is the one a green suite cannot stand in for: D126 REMOVES caller
+sites, and `cargo test` compiles with `cfg(test)`, where a test module keeps an
+otherwise-orphaned item alive under CI's `-D dead_code`.
+
+⚠ **THE FIRST CERTIFICATION WAS THROWN AWAY, AND WHY IS THE USEFUL PART.**
+The suite was run and certified green at `34549e4` (2468 passed). While it ran,
+main moved from `ac2ab26` to `4e0bcc1` — D125 landed, touching
+`src/branch/arena.rs`, which is one of the files D126 edits. So the certified
+tree was no longer the tree that would ship. The run was discarded, main merged
+in, and the whole suite re-taken at `8d2b673` (2474 passed; the +6 is D125's
+tests, not anything of D126's).
+
+⇒ `certify-head.sh` catches a suite whose BRANCH moved after the run. This was a
+suite whose BASE moved after the run, and no guard in the repo catches that —
+`staleness.sh` asks the base question, but only when someone asks it, and asking
+it once at the start is not enough. **Both produce a green that names a tree
+nobody ships.** Recorded in `bench/d126_certified/SUMMARY.txt` next to the
+superseded verdict, so the 2468 is never re-quoted as D126's number.
+
+WHAT THE THIRD DISPATCH ADDED, in full, so it is not mistaken for a re-run:
+  1. The certification above — the reason the branch could not land, and the
+     reason the row kept reading as open. Sections 7 and 8.
+  2. An independent re-run of every probe arm in a fresh context, controls
+     firing at 53.4% / 54.2% / 13.7%. Section 8, raw logs in `bench/d126_reverify/`.
+  3. An adversarial read of the primitive that found no defect but two claims
+     worth checking rather than assuming — `remove_entry`'s discarded Result, and
+     whether `latch_leaf_for_write` can hand Replace a leaf that does not hold the
+     key (it cannot, and `insert` already depended on that). Section 9.
+  4. `tests/integration_index_debt.rs` — TWO stale claims that D126 itself
+     created, in the module doc and in the body: both said the key-reuse workload
+     calls `primary_index.delete`, and after D126 `grep -rn 'primary_index\.delete'
+     src/` matches only a comment. Corrected in the strict direction: the test's
+     conclusion is now reached by a SHORTER argument ("SQL cannot reach a primary
+     index removal" rather than "every removal is half of a pair"), and neither
+     the workload nor the assertion was touched. Commit `8d2b673`.
+  5. This section.
+

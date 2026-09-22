@@ -98,8 +98,18 @@ impl Modify for Update {
                 prov.stamp(new_rid, *id)?;
             }
             if new_rid != rid {
-                self.primary_index.delete(&pk)?;
-                self.primary_index.insert(pk.clone(), new_rid)?;
+                // ⛔ **D126 — this was `delete(&pk)` then `insert(pk, new_rid)`.** `delete` drops
+                // the leaf write latch when it returns and `insert` re-acquires it, so the primary
+                // key did not exist in the index between the two, and `search` descends with no
+                // latch at all: a concurrent point lookup on this key got "no such row" for a row
+                // that exists and was merely being moved. Same defect the branch catalog had on
+                // its RECORD key, same fix -- one page write, no window.
+                //
+                // It also removes an error path that could only fire AFTER the heap was already
+                // updated: `delete` returns `KeyNotFound` for a missing entry, and propagating
+                // that here aborted the statement with the index left disagreeing with the heap.
+                // `upsert` repairs the entry instead, which is the outcome that was wanted.
+                self.primary_index.upsert(pk.clone(), new_rid)?;
             }
 
             // **E66 — one entry per (value, key) pair, however many times history visits it.**

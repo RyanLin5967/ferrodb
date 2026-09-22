@@ -1,0 +1,546 @@
+W4 CHECK 3 — RE-DERIVED, AND THE INSTRUMENT ATTACKED
+=====================================================
+Re-derivation of the numbers banked UNREVIEWED at de1bb0f (`bench/w4_standdown/main/`) after the
+agent that produced them died on a weekly limit. Those numbers were a HYPOTHESIS. This file says
+which parts survived, which did not, and what check 3 actually licenses about W4.
+
+Worktree /Users/idide/wt/ferrodb-agent-a3242b062ca90442e, branch w4-check3-rederive, based on
+de1bb0f. The quarantine branch agent-a3242b062ca90442e is left exactly where it was.
+
+Harness: `examples/w4_standdown_count.rs` (feature `w4-standdown-count`), rebuilt from source here
+— the banked worktree's `target/` had been purged. Runners: `bench/w4_standdown/rederive.sh`,
+`rederive_load.sh`. Raw output: `bench/w4_standdown/rederive/`. Reduction:
+`bench/w4_standdown/reduce_rederive.py`.
+
+⚠ ONE DELIBERATE DIFFERENCE FROM THE BANKED RUN, and it turns out to matter.
+The banked run states that the fleet suite lock was deliberately NOT taken and that its window
+was shared with another lane. This run HELD that lock for its whole measured window (acquired
+2026-09-22T09:52:06Z, released 10:03:28Z to the next waiter). So: banked = contended box, this =
+quiet box. Section 3 measures what that is worth, and the answer is not uniform across rows.
+
+⚠ EVERY LINE NUMBER BELOW IS THIS TREE'S, AND THIS TREE IS NOT MAIN. LOCATE BY SYMBOL. Each row
+below was read out of `git show main:<file>` and out of this worktree separately — none is a
+main number inferred by subtracting an offset, because THERE IS NO SINGLE OFFSET:
+
+  symbol                                        file                        main    here
+  self.drain_readers()  (in `catalog()`)        src/pgwire/mod.rs            154     159
+  writer_active.store(true, SeqCst)             src/pgwire/mod.rs            173     178
+  self.writer_active.store(false)  (Drop)       src/pgwire/mod.rs            280     288
+  "A scan that finds nothing expired..."        src/branch/lease_thread.rs    66      66
+  pub const DEFAULT_SCAN_MILLIS                 src/branch/lease_thread.rs   109     109
+  with_lock(.. resume_interrupted_reaps())      src/branch/lease_thread.rs   352     356
+  const REAP_CHUNK: usize = 1                   src/branch/lease_thread.rs   461     465
+  candidates.chunks(REAP_CHUNK)                 src/branch/lease_thread.rs   569     573
+  note_site(LeaseScan); self.catalog()          src/branch/lease_thread.rs     —     209  (added here)
+  fn parse_one                                  src/pgwire/extended.rs       201     201
+  let catalog = ctx.catalog()  (in parse_one)   src/pgwire/extended.rs       283     290
+  LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS) src/agent_sql/runtime.rs    1477    1477
+
+⇒ THE OFFSET IS ZERO ABOVE EACH INSERTION POINT AND GROWS BELOW IT, so "this tree runs N lines
+  later" is itself a bug. `lease_thread.rs` is IDENTICAL at `:66` and `:109` and drifts by 4 only
+  below the `note_site(LeaseScan)` insertion at `:209`; `mod.rs` drifts by 5 and then by 8 as more
+  instrumentation accumulates. I asserted a uniform offset once while writing this section and
+  three of the twelve rows came out wrong — the table is what the two trees actually say.
+
+⚠ THIS ARTIFACT'S SUBJECT DOES NOT EXIST ON `main`, AND A CITATION OF IT FROM `main` MUST SAY SO.
+The harness (`examples/w4_standdown_count.rs`), the counters (`src/pgwire/standdown.rs`, 386 lines)
+and their call sites are the DEAD AGENT'S QUARANTINED, UNREVIEWED work. `de1bb0f` is NOT an
+ancestor of `main`: the branch adds 1818 lines across 7 non-bench files, 430 of them into `src/`.
+⇒ So this file may be landed on `main` BY ITSELF — it is text and changes no behaviour — but the
+  code it describes may NOT ride along with it. Anything reproducing these numbers must check out
+  the branch below. Quoting the numbers needs only this file; RE-RUNNING them needs the branch.
+      branch  w4-check3-rederive   artifact first committed at cef94dc
+
+⛔ Counts only. No duration is measured or reported anywhere here.
+⛔ Every number is through pgwire over a loopback TCP socket, the shipped `pgwire::handle` per
+   connection. Nothing constructs `Session::new()` or drives `ServerContext` directly. Verified by
+   reading the harness, not assumed.
+
+
+1. DO THE NUMBERS REPRODUCE?  MOSTLY — AND THE PART THAT DOES IS THE PART THAT DECIDES W4
+------------------------------------------------------------------------------------------
+Shared-today stand-down fraction (`sh_frac`), 8 clients, 400 rounds, same arms, same mix.
+
+  arm        proto         banked      mine    ratio
+  readonly   simple        21.28%    10.50%    2.03x
+  readonly   extended       0.00%     0.00%    both exactly 0 over 3200 attempts
+  readonly   ext_reparse   28.72%    12.19%    2.36x
+  agent  ⭐  simple        11.94%     4.44%    2.69x
+  agent  ⭐  extended      93.12%    97.81%    0.95x
+  agent  ⭐  ext_reparse   35.25%    15.62%    2.26x
+  agent_dml  simple         8.12%     0.75%   10.83x
+  agent_dml  extended      95.94%    98.19%    0.98x
+  agent_dml  ext_reparse   27.75%    25.25%    1.10x
+  merge      simple         6.25%    11.88%    0.53x
+  merge      extended      93.75%    96.88%    0.97x
+  merge      ext_reparse   28.12%    11.25%    2.50x
+  ddl        simple        17.06%    10.38%    1.64x
+  ddl        extended      37.62%    37.75%    1.00x
+  ddl        ext_reparse   17.81%    21.31%    0.84x
+
+⇒ THE `extended` COLUMN REPRODUCES: 0.95x, 0.98x, 0.97x, 1.00x, and an exact 0.00 that reproduces
+  as an exact 0.00. Every arm, same direction, same magnitude.
+⇒ THE `simple` AND `ext_reparse` COLUMNS DO NOT: 0.53x to 10.83x, in BOTH directions.
+
+That split is not noise to be averaged away — it is the single most useful fact about this
+instrument, and section 3 shows it is a property of the rows rather than of the two boxes.
+
+⚠ CORRECTION TO THE TABLE I WAS HANDED. The brief's table quotes the `all_stood` column
+(agent 78.88%, agent_dml 79.40%, merge 80.16%, ddl 36.48%). The harness itself labels that column
+"NOT the answer", because it pools in fork and MERGE statements that are exclusive under W4 too.
+The headline is `SHARED_TODAY`, and it is HIGHER: banked agent/extended is 93.12%, not 78.88%.
+The brief's conclusion direction is right and its magnitude is understated.
+
+
+2. IS THE INSTRUMENT SOUND?  THE COUNTERS ARE. TWO OF THE CONCLUSIONS DRAWN FROM THEM ARE NOT.
+-----------------------------------------------------------------------------------------------
+2a. THE COUNTERS CLOSE ARITHMETICALLY — on every row of both runs.
+From the dispatch code (`src/pgwire/extended.rs`, `Statement::execute`): an ExclusiveEither or Dml
+statement always reaches the exclusive path, and a SharedToday read reaches it exactly when it
+stood down. So every row must satisfy, from five independently incremented counters:
+
+      ann_exec  ==  (stmts - sh_att)  +  sh_stood
+
+All 15 rows of the banked run close. All 15 rows of this run close. `ann_parse` closes too, against
+the protocol's parse cadence (e.g. agent/extended 1604 = 1600 unique fork texts + 4 `ABANDON`;
+agent_dml/extended 804 = 800 + 2 + 2; merge/extended 168 = 160 + 4 + 4; readonly/extended 0).
+`mismatch=0` and `gap=0` everywhere.
+
+⇒ The counter counts what its name says. This is stronger evidence than reading the source,
+  because a double count, a missed path or a lost Relaxed increment would break the identity.
+⇒ It also makes a real mechanism visible: A READ THAT STANDS DOWN BECOMES AN ANNOUNCER ITSELF.
+  In agent/extended, announcements rise from 3200 (the forks) to 4765 — +49% — purely from
+  stood-down reads falling back. The barrier has positive feedback. It does not change this
+  verdict — the forks are still 3200 of those 4765, so removing the feedback entirely would leave
+  two thirds of the exclusive announcements standing — but it means the measured fraction is a
+  FIXED POINT of a self-reinforcing process, not a linear response to offered load.
+
+2a-bis. WHAT THE FIXED POINT IMPLIES FOR A PARTIAL FIX — including W4 itself.
+The feedback in 2a is not a footnote, it is the shape of the whole problem. Write the identity as
+a fixed-point equation: with S the structural exclusive statements, A the shared-path attempts and
+f the stand-down fraction,
+
+      announcements = S + f·A          and      f = g(S + f·A)
+
+because the fallback term IS an announcement. Any fix that removes announcements therefore gets
+amplified by the loop: its direct effect is multiplied by 1/(1 - A·g'), which is greater than one
+wherever the response curve g has slope.
+
+⇒ THE CONSEQUENCE, AND IT IS NOT THE ENCOURAGING ONE. The amplification is only available where
+  g' is LARGE. Section 5's curve is the measurement of g, and it is flat at both ends:
+    * SATURATED (fork_every 1-4, f = 82-95%): g' ≈ 0. The loop gain is ≈ 1, so a partial fix buys
+      almost exactly its direct effect — which, at f = 0.95, is almost nothing. Removing the parse
+      site (25% of announcements in agent/extended) or the DML announcements moves a system
+      already pinned against its ceiling.
+    * STEEP (fork_every 8-64, f = 9-66%): g' is large, the loop gain is well above one, and the
+      SAME fix is worth several times its direct effect.
+⇒ So "W4 buys the 2.19% that is left" is the wrong arithmetic in both directions at once: it
+  understates W4 where the curve is steep and overstates the value of any partial fix where it is
+  flat. A lever's worth here is not a property of the lever. It is a property of where the system
+  already sits on the fork-rate axis — which is, again, the one number neither run measures.
+⇒ And it makes the measured 93-98% NOT an upper bound on what W4 would leave behind: it is the
+  fixed point of TODAY's announcer set. Section 2h drives that perturbation directly.
+
+2b. FINDING 1 OF THE BANKED ARTIFACT STANDS — re-verified independently by call-site enumeration.
+`writer_active.store(true)` exists at exactly one site (`src/pgwire/mod.rs:178`, in
+`drain_readers`). `drain_readers` has exactly one caller (`:159`, in `catalog()`). `catalog()` has
+exactly four callers in all of `src/`:
+    src/branch/lease_thread.rs:209   the reaper
+    src/pgwire/extended.rs:290       `parse_one` — EVERY statement it parses, read or write
+    src/pgwire/extended.rs:387       the exclusive execution path
+    src/pgwire/mod.rs:239            `read_catalog` refreshing a stale snapshot
+None is DDL-gated. So `begin_read`'s doc — "It happens only while DDL is actually in flight" — is
+false by construction, and the file contradicts itself forty lines apart. Unchanged verdict.
+
+⚠ PRECISELY WHICH STATEMENTS PAY THE PARSE ACQUISITION, because "every statement" is too strong
+and the exceptions are easy to miscount. `parse_one` begins at `extended.rs:201` and the
+acquisition is at `:290`. FOUR paths return before it: the txn-control error at `:212`,
+`Kind::Session` for SET/SHOW/RESET at `:224` (and its `$`-parameter error at `:218`), `Kind::Empty`
+at `:266`, and the multi-statement error at `:273`. Everything that becomes `Kind::Sql` acquires —
+a plain `SELECT 1` included, which is the point.
+⇒ And the closure of 2a settles, without any reading, that NO measured statement took the
+  `Kind::Session` path: a `Kind::Session` statement never reaches `begin_read`, yet in every arm
+  `sh_att + dml_att + exc_att` equals `stmts` exactly (agent/simple: 1600 + 0 + 3200 = 4800). So
+  `BEGIN AGENT SESSION` and `ABANDON` are `Kind::Sql` despite their names, and the announcer
+  accounting is not quietly missing a class of statement.
+(That enumeration is also why `ann_unattr=0` is meaningful: the four `Site` tags are exhaustive
+over the call graph, not merely observed to be zero.)
+
+2c. ⛔ THE `ext_reparse` CONTROL ONLY PARTLY FIRES — AND THE BANKED ARTIFACT'S READING OF IT IS
+    WRONG IN THE ARM THAT DECIDES W4.
+The control was pre-registered to discriminate one explanation for `simple`'s low rate: that the
+client re-acquires the exclusive catalog for its own `Parse` immediately before its own
+`begin_read`. "If that is the cause, `ext_reparse` must track `simple`; if it tracks `extended`,
+the explanation is wrong." The banked artifact concludes: "`ext_reparse` tracks `simple`, not
+`extended`, in both. The protocol difference is the parse acquisition, confirmed."
+
+It cites two pieces of evidence: the `readonly` arm, and a `merge` SMOKE run at 4 clients x 10
+rounds (simple 30%, ext_reparse 35%). Both are unsound for the claim:
+
+  * The SMOKE run was superseded by the main run in the same banked commit set, and the artifact
+    was not updated. Main-run merge is simple 6.25% / ext_reparse 28.12% — a 4.5x gap, not the
+    5-point gap the smoke run showed. The conclusion rests on numbers the same commit replaced.
+  * The `readonly` arm CANNOT discriminate the mechanism at all. Its `extended` row reads 0.0000%
+    because it has ZERO announcements (`ann_parse=0`, `ann_exec=0`) — not because a reader lost a
+    race. Comparing anything to it is comparing to a workload with no contention in it. The
+    artifact calls that row "the control that makes the other two readable"; it is the one row
+    that makes nothing readable.
+
+In the arms with real announcers the control does NOT track `simple`. It lands between:
+    agent        simple 11.94%   ext_reparse 35.25%   extended 93.12%   (banked)
+    agent_dml    simple  8.12%   ext_reparse 27.75%   extended 95.94%   (banked)
+⇒ So the self-release explanation is at best PARTIAL and a second mechanism is unaccounted for.
+
+⇒⇒ SETTLED BY A NEW ROW, `ext_split` (added here; `Client::extended_split`). It re-parses on
+every statement exactly as `simple` and `ext_reparse` do — the re-parse is HELD CONSTANT at 4800
+announcements — and changes ONE thing: the `Parse` is acknowledged in its own round trip, so the
+client's `begin_read` arrives one loopback RTT after its own catalog release instead of a few
+hundred nanoseconds after it. Pre-registered before running: land on `extended` ⇒ the residual is
+the GAP; land on `ext_reparse` ⇒ the residual is something else.
+
+    agent, quiet box, 8 clients, 400 rounds, all four rows in one process:
+      proto         sh_stood/sh_att    fraction    ann_parse
+      simple             111/1600        6.94%        4800
+      ext_reparse        427/1600       26.69%        4800
+      ext_split         1413/1600       88.31%        4800    <-- re-parses, yet lands on extended
+      extended          1503/1600       93.94%        1604
+
+⇒ IT LANDS ON `extended`. The three protocol rows are NOT three protocols. They are ONE AXIS:
+  HOW RECENTLY DID THIS CONNECTION LAST HOLD THE EXCLUSIVE CATALOG ITSELF.
+  simple (same function, ~ns) -> ext_reparse (pipelined decode, ~µs) -> ext_split (one RTT) ->
+  extended (never). Whether it re-parsed is nearly irrelevant; WHEN it did is the whole effect.
+⇒ The mechanism is not self-CONTENTION, it is self-CLEARING: a connection that has just released
+  the mutex wins the next race against threads the OS has yet to wake. See section 4.
+⇒ Consequence for W4: `extended` is the right row, and for a sharper reason than "asyncpg caches
+  prepared statements". A DML moved to the shared path by W4 arrives at `begin_read` WITHOUT
+  having just held the catalog. That is the `extended`/`ext_split` position, not `simple`'s.
+
+2d. ⛔ THE `LeaseScan` TAG HAS NEVER BEEN MADE TO FIRE, AND CANNOT BE BY THIS HARNESS.
+Every row of both runs reports `ann_lease=0`. A detector that found nothing is not a clean result
+until it has been forced to fire, so I forced it — and it would not.
+
+    readonly/extended, 8 clients, 200 rounds, reaper scan interval swept:
+      3600000ms  1000ms  100ms  10ms  1ms  0ms   ->  ann_lease = 0 at EVERY setting
+                                                     sh_frac  = 0.000000 at every setting
+
+That is not a broken counter. `scan_once` (`src/branch/lease_thread.rs`) computes
+`expired_candidates` OUTSIDE the lock and takes the lock inside `candidates.chunks(REAP_CHUNK)`
+at `:573`. `REAP_CHUNK` is 1 (`:465`), so it is one acquisition per CANDIDATE — but the bound
+that matters is the one that does not depend on that constant: AN EMPTY CANDIDATE LIST TAKES THE
+LOCK ZERO TIMES, AT ANY CADENCE. The module says so itself at `:66` ("A scan that finds nothing
+expired now takes the lock **not at all**") and the `DEFAULT_SCAN_MILLIS` doc repeats it at
+`:109` (same line in both trees). A branch expires `DEFAULT_LEASE_MILLIS` after it is forked — hardcoded at 15 minutes
+(`src/agent_sql/runtime.rs:1477`, `LeaseDeadline::from_now`, no SQL parameter and no environment
+override) — and no arm runs for 15 minutes.
+
+⇒ So the driving quantity is EXPIRED BRANCHES PER TICK, not the scan period. Section 2f drives
+  that axis and turns this zero into a number.
+(One acquisition the lease thread's own doc omits: `resume_interrupted_reaps` at `:356`, taken
+unconditionally once at `LeaseThread::start`. In this harness that lands inside `build_engine`,
+BEFORE `standdown::reset()`, so it never reaches the counters either.)
+
+⇒ `ann_lease=0` is TRUE BY CONSTRUCTION in all 30 rows and measures nothing. The reaper's
+  contribution to the announcer set is UNMEASURED, in both runs.
+⇒ The fire-check the banked agent wrote into `bench/w4_standdown/sweeps.sh` — "drops the lease
+  interval to 50ms and the LeaseScan tag must become non-zero" — tests the WRONG KNOB and would
+  have failed for this reason. It was never run; its output is not in the banked commit.
+⇒ The tag itself is live. Two tests added here to pin exactly that boundary, both passing:
+     the_lease_scan_tag_fires_when_the_reaper_takes_the_statement_lock   (0 -> 1 via the real
+         `RuntimeLock` seam the lease thread uses)
+     the_lease_scan_tag_does_not_fire_for_an_ordinary_acquirer           (the does-not-fire half)
+  So: the tag works, the population is empty. Those are different claims and the bare zero
+  collapsed them.
+
+2f. E7 — THE REAPER FIRES END-TO-END. ⚠ BUT THE SWEEP DID NOT SWEEP, AND THAT IS MY ERROR.
+`readonly`/`extended` with expiries minted during the measured window (`W4_EXPIRY_MS`). The reaper
+is the only EXOGENOUS announcer such an arm can have: a cached prepared statement never touches
+the exclusive catalog, and there are no writers.
+
+  expiry_ms   minted   ann_lease   sh_stood/1600   SHARED     stderr
+      0 ctl        0           0          0/1600   0.0000%    empty
+    200            1           1         13/1600   0.8125%    1 reap line
+     50            1           1         44/1600   2.7500%    1 reap line
+     10            2           2         15/1600   0.9375%    1 reap line
+      2            6           2         16/1600   1.0000%    1 reap line
+
+WHAT THIS ESTABLISHES, and it is worth having:
+  * ⭐ `ann_lease` MOVES OFF ZERO IN A RUNNING SERVER — 0 → 1, 2 — through the real lease thread,
+    the real `RuntimeLock` seam and the shipped counter. 2d proved the tag fires in a unit test;
+    this proves it fires end to end. It is the first non-zero `ann_lease` in any run of this
+    harness.
+  * ⭐ THE CONTROL IS EXACT AND IT TESTS THE CLAIM 2d ONLY READ. At `expiry_ms=0` the scan runs
+    every 10 ms over an empty candidate list and announces NOTHING: `ann_lease=0`, stand-down
+    EXACTLY 0.000000 over 1600 attempts, and an EMPTY stderr. That is `lease_thread.rs:66`
+    ("a scan that finds nothing expired takes the lock **not at all**") measured rather than
+    quoted, and it is why sweeping the cadence could never have worked.
+  * The four non-empty `.err` files contain only the reaper's own report — "lease: reaped 1
+    expired branch(es) with no client cooperation (b1@g0)". That is the thing E7 exists to
+    provoke, not a failure. The control's `.err` is empty, which is what makes the other four
+    readable.
+  * Closure holds on every row: in a read-only arm `stmts == sh_att`, so the identity collapses to
+    `ann_exec == sh_stood`, and it does (13/13, 44/44, 15/15, 16/16, 0/0).
+
+⛔ WHAT IT DOES NOT ESTABLISH — THE RATE. `minted` came back 1, 1, 2, 6 against cadences of
+200/50/10/2 ms. That is not a rate-proportional series, so THE AXIS WAS NEVER DRIVEN and no
+reaper contribution can be read off these four points. The stand-down column is correspondingly
+meaningless as a curve: 0.81 / 2.75 / 0.94 / 1.00 is not monotone and every value sits inside the
+run-to-run spread section 3 measures.
+
+THE CAUSE IS A SCALE ERROR IN MY ARM, not anything about the engine. Solving the four `minted`
+counts for a common window — minted ≈ T/(fork_cost + expiry_ms) — gives fork_cost ≈ 2 ms and
+T ≈ 24 ms, consistently across all four. THE MEASURED WINDOW IS ABOUT TWENTY-FOUR MILLISECONDS:
+1600 cached-prepared single-row reads served in-process over loopback finish almost immediately.
+A 10 ms scan timer fires about twice in 24 ms, so `ann_lease` could not have exceeded a handful
+however fast branches expired.
+
+⇒ AND THIS RETROACTIVELY STRENGTHENS 2d. `ann_lease=0` in all 30 earlier rows had TWO independent
+  sufficient causes, not one: the 15-minute lease is unreachable, AND the arms are far too short
+  for a 30-SECOND scan timer to fire even once. Either alone guarantees the zero.
+⇒ E7b (`bench/w4_standdown/e7b_reaper_rate.sh`, queued) is the corrected arm: rounds raised 250x
+  so the window is seconds rather than milliseconds, and the scan interval dropped to 1 ms. The
+  fix is a LONGER WINDOW, not a faster knob.
+
+2h. E8 — WHERE DOES THE FIXED POINT MOVE WHEN DML STOPS ANNOUNCING?
+Pre-registered with predictions at `bf2b959`, BEFORE the first run. The perturbation is in the
+WORKLOAD, not the engine: `W4_DML_EVERY` makes a DML client write every n rounds and READ in
+between. Under W4 an admitted DML announces nothing and a stood-down one falls back and announces
+— which is exactly what a SELECT does today. Same position in the path, same
+announce-only-on-stand-down behaviour. ⚠ It models W4's ANNOUNCER SET exactly and its SERVICE TIME
+not at all, because a read does less work after admission than a write would.
+
+⛔ THE ARM THAT SUPPRESSES THE ANNOUNCEMENT DIRECTLY CANNOT BE BUILT, and that is a result about
+the code rather than a preference. `ServerContext::catalog()` performs the announcement, the
+reader drain and the mutex acquisition as ONE act with no seam between them. Patching out the
+announcement also removes the statement's drain-wait and shortens its critical section, so
+throughput would move together with the announcer set and neither could be attributed.
+
+VALIDATION FIRST — the perturbation must be shown to have moved only what it claims.
+  * `ann_exec == (stmts - sh_att) + sh_stood` holds on all 12 rows.
+  * The structural term falls by EXACTLY the drop in `dml_att`, and the fork term — structural
+    minus `dml_att` — is CONSTANT: 800 across every row of sweep A, 16 across every row of
+    sweep B, matching 2 x `defining` in both. The arms are matched; the comparison is not void.
+
+  dml_every    A: fork_every=1            B: fork_every=64
+              sh_stood/sh_att   SHARED   sh_stood/sh_att   SHARED
+      1          763/800        95.38%      1022/1192      85.74%
+      2          898/1000       89.80%      1065/1392      76.51%
+      4          933/1100       84.82%       924/1492      61.93%
+      8          939/1150       81.65%       735/1542      47.67%
+     32         1007/1186       84.91%       461/1578      29.21%
+    200         1043/1198       87.06%       198/1590      12.45%
+  fork term        800 (constant)               16 (constant)
+
+⇒ OUTCOME A CONFIRMED, as pre-registered: where forks are frequent the fixed point BARELY MOVES —
+  95.38% falls to a plateau around 82-87% and flattens. Removing the ENTIRE DML announcer
+  population buys about 8 points, and the residual sits far above the 1% threshold. The 800 fork
+  announcements are the binding term and W4 does not change them.
+⇒ OUTCOME B CONFIRMED: where forks are rare the fixed point COLLAPSES — 85.74% to 12.45%, a
+  factor of 6.9, with the DML term the only thing removed.
+⇒ CROSS-CHECK AGAINST AN INDEPENDENT ARM. Sweep B's endpoint (fork_every=64, DML essentially
+  gone) should be nearly the same system as E6's fork_every=64 point, reached by a different knob
+  from a different arm composition. E6 read 9.53%, E8 reads 12.45%. Same regime, two routes.
+
+⇒ WHAT IT MEANS. Two independent perturbations — the fork rate (section 5) and the announcer set
+  (here) — return the same answer: W4'S PAYOFF IS GOVERNED BY THE FORK RATE, NOT BY DML. And it
+  adds something section 5 could only bound: at a LOW fork rate, taking DML out of the announcer
+  set really does recover most of the win (85.74% → 12.45%). So W4 is not a dead lane; it is a
+  lane whose value is entirely decided by a number neither run has measured.
+
+2g. E7b — THE CORRECTED REAPER ARM. The axis IS driven, and it shows something better.
+Same arm as 2f (`readonly`/`extended`, reaper the only EXOGENOUS announcer) with the scale error
+fixed: rounds raised 250x so the measured window is seconds rather than ~24 ms, scan interval 1 ms.
+400,000 shared-path attempts per point instead of 1,600.
+
+  expiry_ms  minted  ann_lease   stand-downs    SHARED    stand-downs per ann_lease
+     0 ctl        0          0             0   0.0000%           —
+    32          105        105         7,497   1.8742%         71.4
+     8        4,594      4,088       103,110  25.7775%         25.2
+     2       12,439      3,976        83,953  20.9882%         21.1
+     1       14,156      3,896        99,306  24.8265%         25.5
+
+⭐ THE CONTROL IS EXACT AT SCALE. 400,000 attempts, 400,000 admitted, ZERO stood down,
+  `ann_parse=0 ann_exec=0 ann_lease=0`, and a ZERO-BYTE stderr — while a 1 ms scan ran throughout.
+  A scan that finds nothing expired announces nothing, at 250x the previous arm length. That is
+  `lease_thread.rs:66` tested to destruction rather than quoted, and it is the pre-registered
+  condition met exactly.
+⭐ THE REAPER IS A MATERIAL ANNOUNCER. 0.0000% -> 1.87% -> ~25% as reaping goes 0 -> 105 -> ~4,000.
+  "The reaper's contribution is unmeasured", which both previous runs had to report, is now a
+  number. Closure holds on all five rows (`ann_exec == sh_stood`, the read-only collapse).
+
+⚠ AND IT SATURATES, WHICH IS A FACT ABOUT THE REAPER AND NOT ABOUT THE KNOB. `ann_lease` pins near
+4,000 while `minted` climbs to 14,156: past ~8 ms the expiry rate stops being the limit, unreaped
+branches simply accumulate, and the fraction plateaus at 21-26% with NO monotone trend inside that
+plateau. The reaper self-throttles — `scan_once` chunks at `REAP_CHUNK=1` with a deliberate
+stand-off between chunks, precisely so a sweep cannot starve statements. ⇒ SO THE HEADLINE IS A
+CEILING, NOT A CURVE: however fast branches expire, the reaper caps its own interference at about
+a quarter of shared-path attempts in a pure-read workload.
+
+⚠ WHAT COUNTS ALONE CANNOT SETTLE HERE, stated because the flattering reading is available.
+This is the only arm whose exogenous announcer is isolated and countable, so it is the cleanest
+view of 2a-bis's loop anywhere in this experiment: 4,088 reaper acquisitions sit beside 103,110
+stand-downs, a ratio of 25. But TWO mechanisms produce identical counts —
+  (i) AMPLIFICATION: each stood-down read announces on its fallback, and those announcements turn
+      away further readers, the loop of 2a-bis; or
+  (ii) DURATION: one reap acquisition simply holds the catalog long enough to turn away ~25
+      readers by itself, the fallbacks being consequences rather than causes.
+Nothing in a count distinguishes them, and separating them needs a timing this experiment refuses
+to take. The ratio RISING as the rate FALLS (71 at 105 reaps, 25 at 4,088) is weak evidence for
+(ii) — overlapping windows would turn away the same reader once — but it is weak and I am not
+resting anything on it.
+
+⛔ AND THE RATE IS SYNTHETIC, which no amount of scale fixes. These points say what the reaper
+costs AT A CHOSEN EXPIRY RATE. They say nothing about the rate a real deployment sees, which
+depends on how often agent branches are abandoned and left to expire rather than merged or
+abandoned explicitly. That is a SECOND unmeasured workload number, alongside the fork rate of
+section 6, and it is now the other thing standing between check 3 and a verdict.
+
+2e. THE HARNESS'S OWN FIRE-CHECK IS REAL. `tests/w4_standdown_instrument.rs` exists and asserts
+what the artifact says it asserts. Re-run here: 6 passed / 0 failed with the feature ON, and 1
+passed with it OFF (the `None` vs `Some(0)` assertion, which must run in both builds).
+
+
+3. "A COUNT IS LOAD-IMMUNE" — THE INTEGERS ARE; THE RATIO IS NOT, AND THE ROWS DIFFER
+-------------------------------------------------------------------------------------
+The harness module doc says: "The discriminating quantity is a ratio of two integers ... and an
+integer is load-immune. Nothing in this harness is timed, and nothing in it needs a quiet box."
+The banked artifact's section 3 already hedges this correctly in prose. It is worth a number.
+
+The stand-down fraction is a sampled estimate of the DUTY CYCLE of `writer_active` — a ratio of
+two durations. Both move under scheduler pressure and need not move together.
+
+  E5, same arm, quiet vs beside 18 self-terminating CPU burners on an 18-core box:
+    agent/extended     quiet 94.19%   loaded 90.19%    (-4.0 points)
+    readonly/simple    quiet 11.88%   loaded 16.91%    (+5.0 points)
+
+They move in OPPOSITE directions, which is exactly what section 2c predicts: the saturated
+`extended` row is near its ceiling and can only come down; the `simple` row is a race won by
+microseconds, and load costs the self-clearing reader its head start.
+
+⚠ AND THE HONEST VERSION, which is stronger than blaming the other box. Three independent runs of
+the SAME config on the SAME quiet box:
+    agent/extended     97.81%   93.94%   94.19%     spread 3.9 points
+    readonly/simple    10.50%   17.69%   11.88%     spread 7.2 points  (1.68x)
+
+⇒ The `simple` and `ext_reparse` rows vary run-to-run by as much as the quiet-vs-loaded gap and by
+  as much as the banked-vs-mine gap. I CANNOT attribute their 2x movement to box load, and neither
+  could anyone else. What is established is weaker and sufficient: THOSE ROWS ARE NOT STABLE
+  ENOUGH TO CARRY A MECHANISM ARGUMENT — which is precisely the pair the banked artifact's
+  section 5 argument is built on.
+⇒ The `extended` row is reproducible to within ~5 points across runs AND across boxes. The row
+  that decides W4 is the row that holds still.
+
+
+4. DOES A CONNECTION STAND DOWN AGAINST ITS OWN ANNOUNCEMENT?  NO. SETTLED TWO WAYS.
+-------------------------------------------------------------------------------------
+BY READING. `parse_one` binds the guard to a local that is dropped when `parse_one` returns;
+`CatalogGuard::drop` stores `writer_active = false` (`src/pgwire/mod.rs:288`). `execute` then calls
+`read_catalog` and only afterwards `begin_read`. The guard is always released first. (It has to
+be: a connection holding its own `ReadPass` and then calling `catalog()` would have `drain_readers`
+spin forever on its own slot.)
+
+BY EXPERIMENT. ONE client, so there is no second connection, and the reaper pushed out to a 1-hour
+interval so it cannot be the announcer either:
+
+  e3_self_reader   1 client, pure reader, 400 reads, 400 parse announcements per re-parsing proto
+      simple 0/400   ext_reparse 0/400   ext_split 0/400   extended 0/400        ALL EXACTLY ZERO
+  e3_self_forker   1 client alternating a fork with a read: 400 exec + 600 parse announcements
+      simple 0/200   ext_reparse 0/200   ext_split 0/200   extended 0/200        ALL EXACTLY ZERO
+
+AND THE CONTROL, so the zero is an absence of contention and not a dead counter — the same config
+with a SECOND client added:
+      ext_reparse 17/800 = 2.13%      ext_split 9/800 = 1.13%      (simple and extended still 0)
+
+⇒ A connection never stands down against its own announcement, in any protocol.
+⇒ So the brief's framing is inverted, though its conclusion holds: the `simple` row is NOT
+  flattered by self-CONTENTION, it is flattered by self-CLEARING. The comparison is indeed not
+  apples to apples, and section 2c's `ext_split` row quantifies by how much: 6.94% -> 88.31% from
+  moving the same connection's own acquisition one round trip further back.
+
+
+5. FORCING THE COUNTER TO BOTH ENDS — ONE ARM, ONE PROTOCOL, ONE KNOB
+----------------------------------------------------------------------
+A ratio that never reaches its ends is not calibrated. E4's first attempt used the reaper's scan
+interval and could not move it at all (section 2d) — the wrong knob. The right one is the offered
+fork rate, which keeps the arm, the protocol and all 8 clients fixed:
+
+  agent / extended / 8 clients / 200 rounds.  `fork_every` = statements per fork.
+    fork_every   forks   exclusive stmts   sh_stood/sh_att    FRACTION
+        1          800        1600            761/800          95.13%
+        2          400         800           1087/1200         90.58%
+        4          200         400           1149/1400         82.07%
+        8          100         200            996/1500         66.40%
+       16           52         104            479/1548         30.94%
+       32           32          56            447/1572         28.44%
+       64           20          32            151/1584          9.53%
+       96           12          24             73/1588          4.60%
+      128            8          16             53/1592          3.33%
+      200            4           8             17/1596          1.07%
+
+  and the announcer-count axis, same arm and protocol, reaching the top:
+    announcers of 8:   1 -> 83.43%    2 -> 87.17%    4 -> 95.50%    6 -> 99.50%    7 -> 99.50%
+
+⇒ CEILING: 99.50% (199/200). FLOOR: 1.07% on the same dial, and EXACTLY 0.000000 in two
+  non-degenerate configurations — readonly/extended over 3200 attempts, and the single-client arm
+  of section 4 over 400 attempts WITH 400 announcements present. The last of those is the valuable
+  zero: announcers exist, the mechanism is live, and the answer is still exactly nought.
+⇒ The counter reads both ends and every value between, off a dial rather than off two special
+  cases. It is calibrated.
+
+
+6. WHAT CHECK 3 ACTUALLY LICENSES ABOUT W4
+-------------------------------------------
+LICENSED, and unchanged from the banked conclusion:
+  * `begin_read`'s "only while DDL is actually in flight" is FALSE by construction (2b).
+  * The deciding number is the `extended` row, and it is the row that reproduces (1, 3).
+  * At the banked operating point — `agent`, every forker statement a fork — 93-98% of the reads
+    the shared path already serves are refused it. A DML moved there by W4 sits in exactly that
+    position with exactly that announcer set, because the `agent` arm contains no DML and so its
+    announcer set is identical in both worlds. W4 would buy its win on roughly 1 attempt in 20.
+  * The pre-registered "material" threshold is 1%. Every `extended` row in every arm is one to two
+    ORDERS OF MAGNITUDE above it. That verdict is robust to everything in section 3.
+
+NOT LICENSED, and the banked artifact does not say it, but the brief's summary of it does:
+  * ⛔ "A KILL FOR W4's PREMISE" IS NOT LICENSED BY ONE POINT. The stand-down fraction is a
+    monotone function of the offered exclusive rate and nothing else fixes its level. `fork_every=1`
+    means four of eight clients fork on EVERY statement — 67% of all statements exclusive. That is
+    a fork storm, not an agent workload; a real agent forks once and then does work inside the
+    branch. Section 5 is the curve, and it is steep: 95% at 1-in-1, 9.5% at 1-in-64, 1.07% at
+    1-in-200.
+  * ⇒ THE HONEST STATEMENT: check 3 shows W4's payoff is governed by the fork rate, and that it
+    is destroyed anywhere above roughly one fork per 64 statements (still 9.5%, ~10x the
+    threshold) and survives only below roughly one per 200. The banked table samples the far end
+    of that curve. WHAT IS STILL MISSING IS THE ONE NUMBER THAT WOULD CLOSE IT: the fork rate of a
+    real BranchBench-shaped workload. Nothing in either run measures it, and without it check 3
+    bounds W4 rather than kills it.
+  * The reaper's contribution is unmeasured in both runs (2d) and could only raise the fraction.
+  * The `Parse` site is a real and separately fixable cost, but it is NOT a rescue for W4: in
+    agent/extended it is 1604 of 6369 announcements (25%), while the forks are the rest.
+
+⇒ E8 SETTLES THE OTHER HALF, and it moves the verdict toward W4 rather than away. The measured
+  93-98% is the fixed point of TODAY'S announcer set, not a bound on W4 (2a-bis). Perturbing that
+  set directly: where forks are frequent, removing ALL DML announcements buys ~8 points and the
+  lane stays dead; where forks are rare it takes stand-down from 85.74% to 12.45%. So W4 WORKS in
+  the low-fork regime and is worthless in the high-fork one, and nothing else about it matters
+  until the fork rate of a real BranchBench-shaped workload is measured.
+
+⇒ SCOREBOARD ROW 3: the pre-registered outcome is **B — material, check 3 FAILS for W4 at the
+  measured operating points**, with the amendment that the failure is a function of fork rate and
+  the curve, not the single point, is the result. Outcome C does NOT apply: the instrument
+  discriminates cleanly, closes arithmetically, and calibrates to both ends.
+
+
+7. WHAT I CHANGED IN THE TREE
+------------------------------
+  examples/w4_standdown_count.rs   + `Proto::ExtendedSplit` and `Client::extended_split`. Opt-in
+                                     via `W4_PROTOS=ext_split`; the DEFAULT three-row set is
+                                     unchanged, so every run already on record stays the same
+                                     experiment.
+  tests/w4_standdown_instrument.rs + the two `LeaseScan` fire-check tests of section 2d.
+  bench/w4_standdown/rederive.sh   + campaigns E1-E4, E6.
+  bench/w4_standdown/rederive_load.sh + campaign E5.
+  bench/w4_standdown/reduce_rederive.py + the reduction and the closure check of section 2a.
+  bench/w4_standdown/e7_reaper_announcer.sh, e8_fixed_point.sh, e7b_reaper_rate.sh
+                                   + the E7/E8/E7b campaigns, with E8's PRE-REGISTRATION and its
+                                     four predicted outcomes committed before its first run.
+  bench/w4_standdown/rederive/     + raw output, one file per point.
+Nothing in `src/` was modified. The subject of the measurement is untouched.

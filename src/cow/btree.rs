@@ -30,7 +30,7 @@ use crate::branch::types::{BranchId, Epoch, PageId};
 use crate::cow::chunker;
 use crate::cow::node::{self, Node, NodeMut};
 use crate::cow::page_header::{stamp_checksum, PageHeader, PageType};
-use crate::cow::{PageHandle, PageStore, WriteBuffer, WriteBufferEntry};
+use crate::cow::{CowPage, PageHandle, PageStore, WriteBuffer, WriteBufferEntry};
 use crate::error::FerroError;
 use crate::storage::disk_manager::PAGE_SIZE;
 
@@ -99,6 +99,89 @@ fn successor_of(key: &[u8]) -> Vec<u8> {
     s.extend_from_slice(key);
     s.push(0);
     s
+}
+
+/// What one write operation has done that a later failure inside it would have to take back.
+///
+/// # Why this exists
+///
+/// Shadow paging's atomicity comes from never touching a page the current root points at: the
+/// root swap publishes everything at once, so an error before it leaves the old tree intact.
+/// [`PageStore::cow_page`] gives that up every time it returns `copied == false` — the page is
+/// already private to the writing branch, so it is handed back for **in-place** mutation and the
+/// old root now points at a partly-rewritten tree. That fast path is worth keeping; what it was
+/// missing is an undo.
+///
+/// Measured (D125, `bench/d125_starved_insert.txt`): starving the allocator during 820 inserts
+/// on the trunk, where every page is private, lost **28 of 600 base rows and 165 of 220 gap
+/// rows**. The same fixture with a live child registered before every attempt — which makes
+/// `privacy` refuse, so the identical writes shadow instead of mutating in place — lost **0 and
+/// 0** against the same 220 refusals. That is the whole mechanism: it is in-place mutation, not
+/// the splits.
+///
+/// The failure is **not** where it looked. Of 300 starved failures, the 203 refused a *leaf*
+/// page lost zero rows: `write_leaf_chunked` allocates every piece before it overwrites the
+/// first, so a failure there leaves the leaf whole. All 97 losing failures were refused an
+/// *internal* page, after the leaf split had already completed and committed — the rows went
+/// into leaf pieces that were written, and then never linked in because the relink above them
+/// died. 235 of 235 lost rows were in a subtree the failing call had allocated and left
+/// unreachable.
+///
+/// # The two halves
+///
+/// * **Undo.** Every page handed back for in-place mutation is recorded with the bytes it held
+///   at that moment, once. A failure restores all of them, so the operation is all-or-nothing.
+/// * **Deferred frees.** A page retired by the operation is freed only once the operation
+///   commits. `unlink_up` already kept its own frees to the end for D112's reason ("each page is
+///   freed after its parent has stopped pointing at it"); that was sound inside `unlink_up` and
+///   not enough outside it, because `merge_right` calls `unlink_up` and then runs three more
+///   fallible steps. Rolling the tree back to a state that points at pages already handed to the
+///   free space map would trade lost rows for reissued pages, which is worse. The frees move out
+///   to the operation so the two halves cannot disagree.
+///
+/// Pages the operation *allocated* are deliberately not freed on rollback. They are referenced
+/// by nothing once the tree is restored, so they are a leak inside the branch's own arena — and
+/// `free_page` on the error path is precisely what D112 was. A leak is recovered by
+/// `free_arena`; a page reissued while something still points at it is not recovered at all.
+#[derive(Default)]
+struct WriteJournal {
+    /// `(a second pin on the page, the bytes it held before this operation touched it)`.
+    undo: Vec<(PageHandle, [u8; PAGE_SIZE])>,
+    /// Pages the operation has taken out of the tree, to be freed at commit.
+    retired: Vec<PageId>,
+}
+
+impl WriteJournal {
+    /// Record `page`'s current bytes, unless this operation already has them or the store
+    /// shadowed it.
+    ///
+    /// ⚠ **Skipping on `copied` is right about CONTENTS and says nothing about ALLOCATION.**
+    /// This comment used to read "a shadow leaves the tree the old root describes untouched, so
+    /// there is nothing to take back", and that is true of the bytes and false of the page. A
+    /// shadow of a page the writer owns also retires the original; the undo list is
+    /// contents-shaped and that hazard is allocation-shaped, so it is carried by
+    /// [`WriteJournal::retired`] via [`CowTree::shadow`] rather than here. Getting this wrong
+    /// left a rolled-back tree pointing at a page the store had already parked for freeing —
+    /// found in review, not by a test, because the one test that inspects free bookkeeping runs
+    /// on the trunk where nothing is ever shadowed.
+    fn record(&mut self, page: &CowPage) -> Result<(), FerroError> {
+        if page.copied || self.undo.iter().any(|(h, _)| h.page_id == page.page_id) {
+            return Ok(());
+        }
+        let handle = page.handle.repin()?;
+        let before = handle.read().data;
+        self.undo.push((handle, before));
+        Ok(())
+    }
+
+    /// Put every recorded page back exactly as it was. Order does not matter: each page appears
+    /// once and carries its own pre-operation image.
+    fn rollback(&self) {
+        for (handle, before) in &self.undo {
+            let mut f = handle.write();
+            f.data = *before;
+        }
+    }
 }
 
 pub struct CowTree {
@@ -302,6 +385,82 @@ impl CowTree {
 
     // ---- write path --------------------------------------------------------------------------
 
+    /// [`PageStore::cow_page`], with the pre-image recorded when it hands the page back for
+    /// in-place mutation. **Every** `cow_page` on the write path goes through this; a direct
+    /// call is a page the journal cannot put back.
+    fn shadow(
+        &self,
+        page_id: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+        journal: &mut WriteJournal,
+    ) -> Result<CowPage, FerroError> {
+        let cp = self.store.cow_page(page_id, branch, epoch)?;
+        journal.record(&cp)?;
+        if cp.retire_previous {
+            // The store shadowed a page this branch owns. The tree stops pointing at the
+            // original only when this operation commits, so that is when it is freed — the
+            // same rule `unlink_up`'s retires follow, and the reason `cow_page` reports this
+            // instead of doing it.
+            journal.retired.push(cp.previous_page_id);
+        }
+        Ok(cp)
+    }
+
+    /// Commit `outcome`'s operation, or take it back.
+    ///
+    /// This is the single place a write operation becomes visible, and the only place a page it
+    /// retired is freed. Both halves are stated here rather than at each call site so they
+    /// cannot drift apart: a rollback that ran after a free, or a free that ran before the last
+    /// fallible step, is the defect this exists to prevent.
+    fn finish(
+        &self,
+        outcome: Result<PageId, FerroError>,
+        journal: WriteJournal,
+        epoch: Epoch,
+    ) -> Result<PageId, FerroError> {
+        let new_root = match outcome {
+            Ok(r) => r,
+            Err(e) => {
+                journal.rollback();
+                return Err(e);
+            }
+        };
+        // Committed. The new root describes the tree, so nothing reachable points at a retired
+        // page and freeing one can only leak from here, never strand a live pointer. Every page
+        // is attempted even if one fails, because stopping early would leak the rest for no
+        // gain. There is deliberately **no** rollback on this path: the operation succeeded, and
+        // a bookkeeping failure while releasing a page it had already finished with does not
+        // unmake it.
+        //
+        // ⛔ And for the same reason the error is **not returned**. An earlier cut of this
+        // propagated it, which contradicted the contract the rest of this function establishes
+        // and that `a_starved_delete_never_releases_a_page_the_tree_still_points_at` asserts:
+        // an `Err` from a write means nothing happened. Handing back `Err` after the tree had
+        // already moved would tell the caller to discard a root that is live, losing every row
+        // the operation wrote — the exact failure this row exists to close, re-introduced on the
+        // success path. This file's own reasoning already says which direction is safe: a leak
+        // is recoverable, a wrong answer is not.
+        //
+        // `debug_assert` rather than silence, because every way `free_page` can fail here is a
+        // bug (an unknown arena, or a double free), so it must be loud where tests run while
+        // still leaking rather than lying in release.
+        let mut first_err = None;
+        for page in journal.retired {
+            if let Err(e) = self.store.free_page(page, epoch)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        debug_assert!(
+            first_err.is_none(),
+            "a committed operation could not release a page it retired: {:?}",
+            first_err
+        );
+        Ok(new_root)
+    }
+
     /// Insert or overwrite `key`. Returns the branch's **new root page id**, which the caller must
     /// publish; the tree is not visible to anyone until that pointer moves.
     pub fn insert(
@@ -311,6 +470,20 @@ impl CowTree {
         epoch: Epoch,
         key: &[u8],
         value: &[u8],
+    ) -> Result<PageId, FerroError> {
+        let mut journal = WriteJournal::default();
+        let outcome = self.insert_within(root, branch, epoch, key, value, &mut journal);
+        self.finish(outcome, journal, epoch)
+    }
+
+    fn insert_within(
+        &self,
+        root: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+        key: &[u8],
+        value: &[u8],
+        journal: &mut WriteJournal,
     ) -> Result<PageId, FerroError> {
         if node::leaf_entry_bytes(key, value) > node::MAX_ENTRY_BYTES {
             return Err(FerroError::Cow(format!(
@@ -340,16 +513,17 @@ impl CowTree {
             )));
         }
         let (path, leaf_id) = self.descend(root, key)?;
-        let cp = self.store.cow_page(leaf_id, branch, epoch)?;
+        let cp = self.shadow(leaf_id, branch, epoch, journal)?;
         let new_leaf = cp.page_id;
         let (split, unterminated) = self.leaf_put(&cp.handle, branch, epoch, key, value)?;
         drop(cp);
-        let root = self.relink_up(root, path, leaf_id, new_leaf, split, branch, epoch)?;
+        let root =
+            self.relink_up(root, path, leaf_id, new_leaf, split, branch, epoch, journal)?;
         if unterminated {
             // An overwrite can erase the terminating boundary of the leaf it lands in, exactly as
             // a delete can. `key` is the last entry of that run, so it still descends to the leaf
             // that lost its terminator even when the write above split the run.
-            return self.merge_right(root, key, branch, epoch);
+            return self.merge_right(root, key, branch, epoch, journal);
         }
         Ok(root)
     }
@@ -363,6 +537,19 @@ impl CowTree {
         epoch: Epoch,
         key: &[u8],
     ) -> Result<PageId, FerroError> {
+        let mut journal = WriteJournal::default();
+        let outcome = self.delete_within(root, branch, epoch, key, &mut journal);
+        self.finish(outcome, journal, epoch)
+    }
+
+    fn delete_within(
+        &self,
+        root: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+        key: &[u8],
+        journal: &mut WriteJournal,
+    ) -> Result<PageId, FerroError> {
         let (path, leaf_id) = self.descend(root, key)?;
         {
             let h = self.store.read_page(leaf_id)?;
@@ -371,7 +558,7 @@ impl CowTree {
                 return Ok(root);
             }
         }
-        let cp = self.store.cow_page(leaf_id, branch, epoch)?;
+        let cp = self.shadow(leaf_id, branch, epoch, journal)?;
         let new_leaf = cp.page_id;
         let (emptied, unterminated, first_key) = {
             let mut f = cp.handle.write();
@@ -410,14 +597,15 @@ impl CowTree {
         // The root is the exception: an empty root leaf IS the empty tree, and is what
         // [`CowTree::create`] hands out.
         if emptied && !path.is_empty() {
-            return self.unlink_up(root, path, new_leaf, branch, epoch);
+            return self.unlink_up(root, path, new_leaf, branch, epoch, journal);
         }
-        let root = self.relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch)?;
+        let root = self
+            .relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch, journal)?;
         if unterminated {
             // The leaf lost its terminating boundary. Join it with what follows, or the partition
             // stops being a function of the rows: `leaf_put`'s re-chunk only ever splits further,
             // so nothing else in the tree can ever rejoin these two.
-            return self.merge_right(root, &first_key, branch, epoch);
+            return self.merge_right(root, &first_key, branch, epoch, journal);
         }
         Ok(root)
     }
@@ -760,13 +948,14 @@ impl CowTree {
         mut promoted: Split,
         branch: BranchId,
         epoch: Epoch,
+        journal: &mut WriteJournal,
     ) -> Result<PageId, FerroError> {
         for (parent_id, slot) in path.into_iter().rev() {
             if child_new == child_old && promoted.is_empty() {
                 // the node was private and was mutated in place: its parent already points at it
                 return Ok(root);
             }
-            let cp = self.store.cow_page(parent_id, branch, epoch)?;
+            let cp = self.shadow(parent_id, branch, epoch, journal)?;
             let new_parent = cp.page_id;
             let taken = std::mem::take(&mut promoted);
             promoted = self.internal_relink(&cp.handle, slot, child_new, taken, branch, epoch)?;
@@ -871,6 +1060,7 @@ impl CowTree {
         key_in_left: &[u8],
         branch: BranchId,
         epoch: Epoch,
+        journal: &mut WriteJournal,
     ) -> Result<PageId, FerroError> {
         // 1. Locate the unterminated leaf afresh and find what is to its right.
         let (path_l, _) = self.descend(root, key_in_left)?;
@@ -891,15 +1081,15 @@ impl CowTree {
         // 2. Take the neighbour out of the tree. Shadow it first — freeing a page this branch
         //    does not own would corrupt the ancestor that still points at it, not this branch.
         let (path_r, r_live) = self.descend(root, &r_first)?;
-        let cpr = self.store.cow_page(r_live, branch, epoch)?;
+        let cpr = self.shadow(r_live, branch, epoch, journal)?;
         let r_shadow = cpr.page_id;
         drop(cpr);
-        let root = self.unlink_up(root, path_r, r_shadow, branch, epoch)?;
+        let root = self.unlink_up(root, path_r, r_shadow, branch, epoch, journal)?;
 
         // 3. Re-descend — step 2 shadowed ancestors the first path shared — and rewrite the left
         //    leaf with the merged run, re-cut by content.
         let (path_l, l_live) = self.descend(root, key_in_left)?;
-        let cpl = self.store.cow_page(l_live, branch, epoch)?;
+        let cpl = self.shadow(l_live, branch, epoch, journal)?;
         let l_shadow = cpl.page_id;
         let mut merged = {
             let f = cpl.handle.read();
@@ -913,7 +1103,7 @@ impl CowTree {
         let (promoted, _now_the_last_leaf) =
             self.write_leaf_chunked(&cpl.handle, merged, branch, epoch)?;
         drop(cpl);
-        self.relink_up(root, path_l, l_live, l_shadow, promoted, branch, epoch)
+        self.relink_up(root, path_l, l_live, l_shadow, promoted, branch, epoch, journal)
     }
 
     /// Drop `doomed` out of the tree, cascading while its removal leaves a parent with no children
@@ -956,9 +1146,18 @@ impl CowTree {
         mut doomed: PageId,
         branch: BranchId,
         epoch: Epoch,
+        journal: &mut WriteJournal,
     ) -> Result<PageId, FerroError> {
-        // ⛔ FREE LAST. Every page this cascade retires is collected here and handed back only
-        // once the new root is established.
+        // ⛔ FREE LAST. Every page this cascade retires goes on the operation's journal and is
+        // handed back only once the whole operation commits.
+        //
+        // ⛔ D125 moved that boundary OUT of this function, and the move is the point. Keeping
+        // the frees to the end of `unlink_up` was sound for `unlink_up` alone and not enough for
+        // its callers: `merge_right` calls it and then runs three more fallible steps
+        // (`descend`, `cow_page`, `write_leaf_chunked`, `relink_up`). Failing in one of those
+        // rolls the tree back to a shape that points at pages this loop had already released --
+        // trading lost rows for reissued pages, which is strictly worse. The journal owns both
+        // halves so they cannot disagree; see [`WriteJournal`].
         //
         // Freeing inside the loop broke this function's own documented ordering ("Each page is
         // freed AFTER its parent has stopped pointing at it, never before"), in TWO arms:
@@ -975,15 +1174,14 @@ impl CowTree {
         // In the happy path the dangling pointer is transient -- the next iteration frees the
         // parent too -- so this is an error-path defect, and `relink_up` never freed anything,
         // which means delete USED to be fail-safe and had stopped being so.
-        let mut retired: Vec<PageId> = Vec::new();
         let new_root = loop {
             let Some((parent_id, slot)) = path.pop() else {
                 // Cascaded past the root: every page is gone, so the tree is the empty tree.
-                retired.push(doomed);
+                journal.retired.push(doomed);
                 break self.create(branch, epoch)?;
             };
 
-            let cp = self.store.cow_page(parent_id, branch, epoch)?;
+            let cp = self.shadow(parent_id, branch, epoch, journal)?;
             let new_parent = cp.page_id;
             let childless = {
                 let mut f = cp.handle.write();
@@ -1009,7 +1207,7 @@ impl CowTree {
             drop(cp);
 
             // Retired, NOT yet freed -- see the note at the top of this function.
-            retired.push(doomed);
+            journal.retired.push(doomed);
 
             if childless {
                 doomed = new_parent;
@@ -1017,25 +1215,15 @@ impl CowTree {
             }
             // The parent survived but was copied, so its own parent still has to be repointed.
             // With an empty path this returns `new_parent`, which is then the new root.
-            break self.relink_up(root, path, parent_id, new_parent, Vec::new(), branch, epoch)?;
+            break self
+                .relink_up(root, path, parent_id, new_parent, Vec::new(), branch, epoch, journal)?;
         };
 
-        // The new root is established, so nothing reachable points at any retired page and a
-        // failure from here can only LEAK one, never strand a live pointer -- the safe direction.
-        // Every page is attempted even if one fails, because stopping early would leak the rest
-        // for no gain; the first error is still returned rather than swallowed.
-        let mut first_err = None;
-        for page in retired {
-            if let Err(e) = self.store.free_page(page, epoch) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(new_root),
-        }
+        // The retired pages stay on the journal. This cascade has established a new root, but
+        // its CALLER may not have finished, so "nothing points at these any more" is not yet
+        // true of the operation -- only [`CowTree::finish`] can say that, and it is where they
+        // are freed.
+        Ok(new_root)
     }
 }
 

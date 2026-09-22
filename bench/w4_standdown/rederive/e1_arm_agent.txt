@@ -1,0 +1,25 @@
+# W4 check 3 -- stand-downs at ServerContext::begin_read, as a fraction of attempts
+# layer: through pgwire over a loopback TCP socket; shipped `pgwire::handle` per
+#        connection; nothing drives AgentRuntime or Session directly.
+# clients=8 rounds=400 lease_scan_ms=30000 fork_every=1 announcers=default
+# a COUNT, not a timing: no duration is measured and none is reported.
+
+ROW arm=agent proto=simple sh_att=1600 sh_stood=71 sh_frac=0.044375 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.010937 all_frac=0.022083 ann_parse=4800 ann_refr=0 ann_exec=3271 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=1600
+ROW arm=agent proto=extended sh_att=1600 sh_stood=1565 sh_frac=0.978125 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.561250 all_frac=0.700208 ann_parse=1604 ann_refr=0 ann_exec=4765 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=1600
+ROW arm=agent proto=ext_reparse sh_att=1600 sh_stood=250 sh_frac=0.156250 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.073750 all_frac=0.101250 ann_parse=4800 ann_refr=0 ann_exec=3450 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=1600
+## HEADLINE -- stand-down fraction by what the statement would be under W4
+arm        proto     |    sh_att  sh_stood SHARED_TODAY | dml_att dml_stood | exc_att exc_stood | all_stood
+agent      simple    |      1600        71       4.44% |       0       n/a |    3200     1.09% |     2.21%
+agent      extended  |      1600      1565      97.81% |       0       n/a |    3200    56.12% |    70.02%
+agent      ext_reparse |      1600       250      15.62% |       0       n/a |    3200     7.38% |    10.12%
+
+## ANNOUNCERS -- which exclusive acquirer made a writer visible
+arm        proto      attempts  admitted  stood_dn stand_down  ann_parse ann_refr ann_exec ann_leas ann_unk
+agent      simple         4800      4694       106      2.21%       4800        0     3271        0       0
+agent      extended       4800      1439      3361     70.02%       1604        0     4765        0       0
+agent      ext_reparse      4800      4314       486     10.12%       4800        0     3450        0       0
+
+# composition and statement counts
+#   agent      simple    clients=4xForker+4xReader            statements=4800 defining=1600
+#   agent      extended  clients=4xForker+4xReader            statements=4800 defining=1600
+#   agent      ext_reparse clients=4xForker+4xReader            statements=4800 defining=1600

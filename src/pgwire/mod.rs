@@ -194,7 +194,48 @@ impl ServerContext {
     /// pages a writer is freeing.
     ///
     /// Standing down is not a failure: the caller falls back to the exclusive path, which blocks
-    /// on the mutex and is correct. It happens only while DDL is actually in flight.
+    /// on the mutex and is correct.
+    ///
+    /// ⛔ **This used to end "It happens only while DDL is actually in flight." That is FALSE, and
+    /// it is false by construction rather than by degree.** The announcer set is exhaustively
+    /// enumerable and none of it is DDL-gated: `ServerContext::drain_readers` is the only writer
+    /// of `writer_active`, [`ServerContext::catalog`] is its only caller, and `catalog()` has
+    /// exactly four callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl,
+    /// `pgwire::extended::Statement::parse_one`, the exclusive execution path, and
+    /// [`ServerContext::read_catalog`]'s snapshot refresh. **`parse_one` takes it unconditionally
+    /// for every `Kind::Sql`**, so a plain `SELECT 1` on the simple query protocol announces a
+    /// writer and drains every reader at parse time.
+    ///
+    /// ⚠ **And do NOT replace that sentence with "the lease thread announces every
+    /// `DEFAULT_SCAN_MILLIS`", which is the correction a previous pass tried and which is also
+    /// false.** `scan_once` computes its candidates OUTSIDE the lock and takes it once per
+    /// *reaped branch* (`REAP_CHUNK`), so a scan that finds nothing expired takes it **zero**
+    /// times — `lease_thread`'s own module doc says exactly that. Measured, the lease thread
+    /// announced zero times in every arm ever run, because a branch expires
+    /// `DEFAULT_LEASE_MILLIS` (15 min) after fork and no arm runs that long. Its real axis is
+    /// **expired branches per tick**, and it is still unmeasured.
+    ///
+    /// ⇒ **What governs the stand-down rate is the offered EXCLUSIVE rate, and it is measured:**
+    /// on the extended query protocol — what real drivers use — it runs from **1.07% at one fork
+    /// per 200 statements to 95% at one per one**. It is also a FIXED POINT, because a stood-down
+    /// read falls back and therefore announces, so the rate and the announcer set drive each
+    /// other. **Quote a rate only with the fork rate it was taken at.**
+    ///
+    /// ⚠ **PROVENANCE, stated precisely because two earlier versions of this comment got it
+    /// wrong in opposite directions.** The evidence is `bench/w4_check3_rederived.txt`, and it
+    /// **IS on `main`**, landed by itself as a bench-only commit. The first version cited it as a
+    /// bare path while it existed only on a branch, so a reader would `ls bench/` and find
+    /// nothing; the second said "NOT ON `main`", which the landing then falsified. **A citation
+    /// must name a tree it can be found in — and it ages the moment either tree moves.**
+    ///
+    /// ⚠ **QUOTING it needs only this tree; RE-RUNNING it does not.** The harness
+    /// (`examples/w4_standdown_count.rs`) and the counters (`src/pgwire/standdown.rs`) are the
+    /// dead agent's QUARANTINED, UNREVIEWED work and deliberately did **not** land with the
+    /// artifact — they live on branch `w4-check3-rederive`, whose merge-base with `main` predates
+    /// all of it. ⚠ That artifact's own citations are branch line numbers: it cites
+    /// `extended.rs:290`/`:387` where `main` has `:283`/`:357`, because the branch carries the
+    /// instrumentation. **Only the symbols are comparable across the two trees**, and the
+    /// artifact carries a symbol table saying so for every site it names.
     pub fn begin_read<'a>(
         &self,
         slot: &'a std::sync::atomic::AtomicBool,

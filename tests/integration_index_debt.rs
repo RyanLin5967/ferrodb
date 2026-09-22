@@ -17,6 +17,16 @@
 //!   key reuse *is*.
 //! - `execution::update` removes and re-adds the same key when a row's `RecordId` moves.
 //!
+//! ⚠ **D126 MADE THE LAST TWO BULLETS STRONGER, AND THEY ARE LEFT ABOVE AS THE HISTORY THEY NOW ARE.**
+//! Both were literally a `primary_index.delete` followed by a `primary_index.insert`, and D126
+//! replaced each pair with ONE `BPlusTreeManager::upsert`, which removes and re-adds inside a single
+//! in-memory leaf image. So there is no longer a removal STEP on either path at all: `grep -rn
+//! 'primary_index\.delete' src/` now matches only a comment. The conclusion below is therefore
+//! reached by a shorter argument than when it was written — not "every removal is one half of a
+//! pair", but "SQL cannot reach a primary-index removal". ⛔ **What this test asserts did not change
+//! and was not weakened**: the entry count still must not move, and it would still catch a net
+//! removal if one were ever introduced.
+//!
 //! So the `todo!()` is safe, and it is safe for a reason nobody chose: it is protected by the fact that
 //! the index never shrinks. That is not a rebalance being unnecessary — it is the same debt as E66's
 //! secondary entries, on the primary index, and it is what this file measures instead.
@@ -205,8 +215,14 @@ fn no_workload_drives_a_leaf_underfull() {
     let mut d = seeded(N);
     let before = d.leaf_stats("t");
 
-    // Reuse every key: delete then insert the same id. Each pair calls `primary_index.delete` followed
-    // by an insert of the identical key, which is the only removal path SQL can reach.
+    // Reuse every key: delete then insert the same id.
+    //
+    // ⚠ **D126 — this used to say "each pair calls `primary_index.delete` followed by an insert of
+    // the identical key, which is the only removal path SQL can reach". That is no longer true.**
+    // `execution::insert` now performs the key reuse as ONE `upsert`, so this loop reaches no
+    // `primary_index.delete` at all. The workload is unchanged and so is the assertion below; what
+    // changed is that it now exercises a path with no removal step in it, which makes a net removal
+    // even harder to produce than when this was written.
     for i in 1..=N {
         d.sql(&format!("DELETE FROM t WHERE id = {i};"));
         d.sql(&format!("INSERT INTO t VALUES ({i}, {});", i * 100));

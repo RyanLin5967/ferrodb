@@ -1,0 +1,60 @@
+
+=== target s20_live_count_is_maintained
+   Compiling ferrodb v0.1.0 (/Users/idide/projects/ferrodb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/s20_live_count_is_maintained.rs (target/debug/deps/s20_live_count_is_maintained-0c661209b21dcbb5)
+
+running 3 tests
+test an_idempotent_transition_does_not_move_the_counter ... ok
+test the_counter_agrees_with_a_scan_after_state_transitions ... ok
+test the_counter_agrees_with_a_scan_after_forks ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== target sim_durability
+   Compiling ferrodb v0.1.0 (/Users/idide/projects/ferrodb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running tests/sim_durability.rs (target/debug/deps/sim_durability-9e6ed92c7221a067)
+
+running 16 tests
+test under_sync_only_an_unflushed_write_does_not_survive ... ok
+test a_torn_write_lands_a_prefix_and_ends_the_run ... ok
+test undo_compensates_the_losers_in_ascending_transaction_id_order ... ok
+test with_no_fault_the_workload_completes_and_every_row_comes_back ... ok
+test the_same_seed_reproduces_the_same_byte_sequence_and_the_same_fault_point ... ok
+test the_durable_commit_detector_fires_and_stays_quiet ... ok
+test flush_all_writes_pages_in_ascending_page_id_order ... ok
+test two_different_seeds_crash_in_different_places ... ok
+test the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run ... ok
+test a_torn_table_page_is_served_as_a_row_that_was_never_written ... ok
+test a_garbled_wal_header_takes_the_database_down_with_its_data_intact ... ok
+test recovery_gives_every_missing_page_its_own_empty_page_in_ascending_order ... ok
+test recovery_itself_writes_the_same_sequence_three_times ... ok
+test recovery_holds_at_every_fault_point_sync_only ... ok
+test recovery_holds_at_every_fault_point_write_through ... ok
+test recovery_holds_at_every_fault_point_through_the_catalog ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.87s
+
+=== target w4_forget_branches
+   Compiling ferrodb v0.1.0 (/Users/idide/projects/ferrodb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/w4_forget_branches.rs (target/debug/deps/w4_forget_branches-0a41a5b3bd0a4bd7)
+
+running 3 tests
+test forget_branches_refuses_a_branch_that_is_still_live ... ok
+test a_reaped_branch_nobody_reported_is_still_reconciled ... ok
+test forget_branches_drops_the_branches_it_is_given ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== target w4_sweep_slot_recycle
+   Compiling ferrodb v0.1.0 (/Users/idide/projects/ferrodb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running tests/w4_sweep_slot_recycle.rs (target/debug/deps/w4_sweep_slot_recycle-6ee876f01aec3d39)
+
+running 1 test
+test a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

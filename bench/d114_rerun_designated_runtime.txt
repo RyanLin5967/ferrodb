@@ -1,0 +1,137 @@
+D114 RE-RUN ON THE DESIGNATED RUNTIME — THE ROW IS REAL, AND THE STUB DID NOT MOVE THE SHAPE
+=============================================================================================
+Pre-registration: bench/d114_rerun_PREREG.txt, committed BEFORE this run.
+Tree: main (harness rewired onto s.ctx.session() at 7a7e998). Release build.
+Box: NOT quiet — two other suites in flight. Pre-registered as acceptable BECAUSE THE FINDING
+     IS A COUNT. ⛔ The MERGE ms column is NOT a result from this run and is not quoted below;
+     one CHURN cell reads 72.799 ms against ~17 either side, which is the box, not the merge.
+
+VERDICT, against the harness's own pre-registered key
+-----------------------------------------------------
+  "REPEAT linear + CHURN linear -> the SCAN is real; D86's index is the right fix."
+
+  REPEAT `examined` = 4 x ops exactly:   128 / 256 / 512 / 1024 / 2048  at ops 32..512
+  CHURN  `examined` = 4 x ops + 16:      144 / 272 /  528 / 1040 / 2064  at ops 32..512
+  CHURN  `matched`  = 4.0 FLAT at every point.
+
+⇒ CHURN is the discriminator and it is LINEAR: 2x/4x/8x/16x the ops give 1.89x/3.67x/7.22x/
+  14.33x the `examined`, while `matched` never moves off 4. **The ours-side SCAN grows with ops
+  recorded and is independent of the delta.** The pre-registered falsifier ("FLAT in ops/branch
+  => the reading is WRONG, row closes") DID NOT FIRE. ⇒ **D114's row is REAL** and an index over
+  the op log is the right fix, because an index removes `examined` and does not remove `matched`.
+
+  DELTA arm, ops held at 512, axis = changed cells:
+    delta   4 ->  2064 examined    examined/(delta x ops) = 1.000
+    delta   8 ->  4160                                      1.000
+    delta  16 ->  8448                                      1.000
+    delta  32 -> 17408                                      1.000
+⇒ `examined` is the PRODUCT delta x ops, to three decimals, at every delta. That is a
+  complexity class, not a 4x constant — which is the one thing this arm exists to separate.
+
+MY PRE-REGISTERED CHECKS, ALL FOUR DISCHARGED
+---------------------------------------------
+  A. Ascending and descending passes must agree on SHAPE.
+     ✅ REPEAT asc 128/256/512/1024/2048 == desc. CHURN asc 144/272/528/1040/2064 == desc.
+        Exact agreement, as a count should give.
+  B. `n` must equal `merges` at every point.  ✅ n = 6 everywhere. No partial averaged over.
+  C. CHURN is the discriminator, not REPEAT.  ✅ used as such above; REPEAT alone could not
+     have separated scan from fold, since it grows both.
+  D. Compare to the banked file on SHAPE only. ✅ and see below.
+
+⭐ WHAT THE STUB DID AND DID NOT CHANGE — the reason this re-run was worth doing
+--------------------------------------------------------------------------------
+`bench/d114_before.txt` was taken at src 1bf8abe / harness 935b0c1, neither of which contains
+D101's guard (ca61e38), so every `BEGIN AGENT SESSION` landed on `Session::new()`'s private
+runtime: `storage: None`, private in-memory catalog, private effect log.
+
+  THE COUNTS WERE RIGHT.  Banked REPEAT `examined` = 4 x ops as well (16/64/256/1024/4096 at
+  ops 4/16/64/256/1024). Same law, different points. The op-log counters live on the runtime's
+  op log, which the stub also has, so the SHAPE survived the wrong backing.
+
+  THE MILLISECONDS WERE NOT.  Banked CONTROL writes: 0.048 ms at ops 4 and 4.108 ms at ops 256.
+  Measured here on the arena-backed runtime: 14.341 ms at ops 32 and 20.210 ms at ops 256 —
+  two to three orders of magnitude apart at comparable points, because the stub wrote to
+  nothing durable. Any banked D114 duration is an artifact of the missing storage.
+
+⇒ **The position registered in advance was "UNKNOWN, not WRONG", and UNKNOWN is what it was.**
+  The shape held; the durations did not. Both halves had to be measured to know which.
+
+=============================================================================================
+FULL RUN OUTPUT
+=============================================================================================
+D114 — merge cost against OPS RECORDED PER BRANCH, at FIXED changed cells (4).
+PRE-REGISTERED: FLAT in ops/branch => the ours-side-scan reading is WRONG, row closes.
+                LINEAR at fixed delta => the row is real.
+
+The counters are the finding; the milliseconds are an UPPER BOUND on a shared box.
+  examined/merge  = ops the ours-side scan WALKED   -> an index removes these
+  matched/merge   = ops compose_ops must FOLD       -> an index does NOT remove these
+
+table rows = 2000 (fixed; the table axis is D68/D69's and is closed), merges/point = 6
+
+=== ARM REPEAT (ops land ON the delta cells: scan AND fold grow) — delta held at 4 changed cells, axis = ops recorded per branch
+    (axis walked ASCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+       32   6 |     20.277 |           128.0            32.0 |            14.341    (ops actually recorded/merge = 32.0)
+       64   6 |     14.287 |           256.0            64.0 |            12.614    (ops actually recorded/merge = 64.0)
+          ^ 2x ops -> 0.70x MERGE ms,  2.00x examined
+      128   6 |     12.590 |           512.0           128.0 |            15.253    (ops actually recorded/merge = 128.0)
+          ^ 4x ops -> 0.62x MERGE ms,  4.00x examined
+      256   6 |     10.474 |          1024.0           256.0 |            20.210    (ops actually recorded/merge = 256.0)
+          ^ 8x ops -> 0.52x MERGE ms,  8.00x examined
+      512   6 |     14.689 |          2048.0           512.0 |            70.390    (ops actually recorded/merge = 512.0)
+          ^ 16x ops -> 0.72x MERGE ms,  16.00x examined
+
+=== ARM CHURN  (ops land OFF the delta cells: only the scan grows) — delta held at 4 changed cells, axis = ops recorded per branch
+    (axis walked DESCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+      512   6 |     22.189 |          2064.0             4.0 |            68.942    (ops actually recorded/merge = 516.0)
+      256   6 |     16.759 |          1040.0             4.0 |            23.738    (ops actually recorded/merge = 260.0)
+          ^ 0x ops -> 0.76x MERGE ms,  0.50x examined
+      128   6 |     13.349 |           528.0             4.0 |            17.569    (ops actually recorded/merge = 132.0)
+          ^ 0x ops -> 0.60x MERGE ms,  0.26x examined
+       64   6 |     10.842 |           272.0             4.0 |            10.138    (ops actually recorded/merge = 68.0)
+          ^ 0x ops -> 0.49x MERGE ms,  0.13x examined
+       32   6 |     11.482 |           144.0             4.0 |             9.786    (ops actually recorded/merge = 36.0)
+          ^ 0x ops -> 0.52x MERGE ms,  0.07x examined
+
+=== ARM REPEAT (ops land ON the delta cells: scan AND fold grow) — delta held at 4 changed cells, axis = ops recorded per branch
+    (axis walked DESCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+      512   6 |     11.093 |          2048.0           512.0 |            37.929    (ops actually recorded/merge = 512.0)
+      256   6 |     11.715 |          1024.0           256.0 |            21.993    (ops actually recorded/merge = 256.0)
+          ^ 0x ops -> 1.06x MERGE ms,  0.50x examined
+      128   6 |     10.832 |           512.0           128.0 |            12.208    (ops actually recorded/merge = 128.0)
+          ^ 0x ops -> 0.98x MERGE ms,  0.25x examined
+       64   6 |     10.806 |           256.0            64.0 |            10.113    (ops actually recorded/merge = 64.0)
+          ^ 0x ops -> 0.97x MERGE ms,  0.12x examined
+       32   6 |     10.673 |           128.0            32.0 |             7.496    (ops actually recorded/merge = 32.0)
+          ^ 0x ops -> 0.96x MERGE ms,  0.06x examined
+
+=== ARM CHURN  (ops land OFF the delta cells: only the scan grows) — delta held at 4 changed cells, axis = ops recorded per branch
+    (axis walked ASCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+       32   6 |     14.106 |           144.0             4.0 |            12.233    (ops actually recorded/merge = 36.0)
+       64   6 |     16.483 |           272.0             4.0 |            16.598    (ops actually recorded/merge = 68.0)
+          ^ 2x ops -> 1.17x MERGE ms,  1.89x examined
+      128   6 |     17.297 |           528.0             4.0 |            20.678    (ops actually recorded/merge = 132.0)
+          ^ 4x ops -> 1.23x MERGE ms,  3.67x examined
+      256   6 |     72.799 |          1040.0             4.0 |            58.563    (ops actually recorded/merge = 260.0)
+          ^ 8x ops -> 5.16x MERGE ms,  7.22x examined
+      512   6 |     22.798 |          2064.0             4.0 |            47.396    (ops actually recorded/merge = 516.0)
+          ^ 16x ops -> 1.62x MERGE ms,  14.33x examined
+
+=== ARM DELTA — ops per branch held at 512, axis = CHANGED CELLS per merge
+    (the arm that separates a 4x CONSTANT from a complexity class; read `examined`)
+    delta   n |   MERGE ms |  examined/merge  matched/merge | examined/(delta x ops)
+        4   6 |     17.200 |          2064.0             4.0 |                 1.000  (ops recorded/merge = 516.0)
+        8   6 |     40.449 |          4160.0             8.0 |                 1.000  (ops recorded/merge = 520.0)
+       16   6 |     30.386 |          8448.0            16.0 |                 1.000  (ops recorded/merge = 528.0)
+       32   6 |     24.995 |         17408.0            32.0 |                 1.000  (ops recorded/merge = 544.0)
+
+HOW TO READ IT:
+  Each arm appears TWICE, ascending and descending. If the two passes disagree on
+  the SHAPE, the machine moved and neither pass is a result.
+  REPEAT linear + CHURN flat  -> the slope is the FOLD. An index would NOT fix it.
+  REPEAT linear + CHURN linear-> the SCAN is real; D86's index is the right fix.
+  both flat                   -> the pre-registered falsifier FIRES. Close the row.

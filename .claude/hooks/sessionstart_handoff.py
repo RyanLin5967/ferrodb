@@ -99,7 +99,21 @@ def ledger():
         return ("  REFUSING: SCALE-LEDGER.md is unreadable or empty. A missing ledger is not an\n"
                 "  empty one -- read it by hand before assuming there is no work.")
     ROWID = re.compile(r"^[A-Za-z]{1,3}\d{1,3}[a-z]?$")
-    CLOSED = ("DONE", "WITHDRAWN", "NOT JUSTIFIED", "SUPERSEDED", "RETRACTED")
+
+    def _cut(full, n):
+        """Say so, loudly, when a cell was cut -- silence here is what wasted a dispatch.
+
+        D85's status cell opened `OPEN, UNPROVEN` and said `PROVEN, THEN FIXED` at 38% of its
+        length, past this 600-char cut. The digest printed the first half with no marker, every
+        session since read OPEN, and an agent was dispatched at a row that had been closed two
+        days earlier. A truncation that announces itself turns that into a visible question.
+        """
+        if len(full) <= n:
+            return ""
+        return (" \u26d4[TRUNCATED %d of %d chars -- a resolution appended to the END of this "
+                "cell is NOT visible here. Read the row in SCALE-LEDGER.md before acting on it.]"
+                % (n, len(full)))
+    CLOSED = ("DONE", "WITHDRAWN", "NOT JUSTIFIED", "SUPERSEDED", "RETRACTED", "CLOSED")
     out, suppressed, murky = [], [], []
     for l in txt.splitlines():
         if not l.startswith("|") or re.match(r"^\|[\s:-]+\|", l):
@@ -115,8 +129,35 @@ def ledger():
         if len(cells) < 4:                            # the walls table has 4 columns
             continue
         wall = re.sub(r"\s+", " ", cells[1])
-        st = cells[2].upper()
-        if any(k in st for k in CLOSED) or st.startswith(u"\u2705") or wall.startswith("~~"):
+        # \u26d4 THE STATUS COLUMN IS NOT AT A FIXED INDEX, AND ASSUMING IT WAS COST A DISPATCH.
+        # This table has TWO row shapes. Older S-rows are `| id | wall | STATUS | evidence |`, so
+        # cells[2] is the status. Newer D-rows are `| id | wall | IMPACT | STATUS |`, so cells[2]
+        # is "HIGH"/"HIGH if real" and the status is cells[3]. Reading only cells[2] meant NO D-ROW
+        # COULD EVER BE SUPPRESSED, whatever its status said -- which is why the digest's own
+        # caveat had to admit "two rows here read IN_PROGRESS three days after their work merged".
+        # Checking BOTH is strictly more accurate; see below for why it is also still safe.
+        #
+        # Only the HEAD of each cell is examined. A resolution belongs at the head -- that is the
+        # whole `status lives in the status cell` lesson -- and matching deep in a cell would let
+        # one word of narrative suppress a live wall, which is the expensive direction.
+        # \u26d4 AND IT MUST MATCH AT THE **START**, NOT "SOMEWHERE NEAR THE START".
+        # The first cut of this used `any(k in head[:140])` and immediately HID A LIVE WALL:
+        # D78's status reads `**OPEN, RESCOPED** -- W4 is no longer "invert the phase-3 scan"
+        # (done). What remains is the OUTER RuntimeLock`, and the substring `DONE` matched inside
+        # the parenthetical `(done)`. That is W4, the gating row, silently suppressed by a guard
+        # written to stop exactly this kind of silence. Caught only because the newly-suppressed
+        # rows were checked one by one instead of trusting the count.
+        #
+        # A status is the FIRST thing in its cell -- that is what `status lives in the status
+        # cell` means -- so the token has to lead. Markdown emphasis and spaces are stripped
+        # first; nothing else is.
+        def _status_is_closed(cell):
+            h = cell.strip().lstrip("*_ \t").upper()
+            if h.startswith(u"\u2705"):
+                return True
+            return any(h.startswith(k) for k in CLOSED)
+        closed = any(_status_is_closed(c) for c in (cells[2], cells[3]))
+        if closed or wall.startswith("~~"):
             suppressed.append(rid)
             continue
         # Extra cells mean an unescaped `|` inside the row, so cells[2] is NOT the status. SHOW it:
@@ -126,10 +167,11 @@ def ledger():
             out.append("  [%s] %s" % (rid, wall[:600]))
             out.append("        \u26a0 STATUS UNPARSEABLE (unescaped '|'); read this row by hand.")
             continue
-        out.append("  [%s] %s" % (rid, wall[:600]))
-        exit_c = re.sub(r"\s+", " ", cells[3])[:600]
+        out.append("  [%s] %s%s" % (rid, wall[:600], _cut(wall, 600)))
+        exit_full = re.sub(r"\s+", " ", cells[3])
+        exit_c = exit_full[:600]
         if exit_c:
-            out.append("        EXIT: %s" % exit_c)
+            out.append("        EXIT: %s%s" % (exit_c, _cut(exit_full, 600)))
     if not out:
         return ("  REFUSING: parsed the ledger but found ZERO open rows. Zero is not a pass --\n"
                 "  either every row is genuinely closed (then the ledger needs new rows) or this\n"

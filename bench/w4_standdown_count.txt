@@ -1,0 +1,231 @@
+W4 CHECK 3 — DOES STANDING DOWN STAY RARE?
+==========================================
+Settled 2026-09-22 in worktree /Users/idide/wt/ferrodb-agent-a3242b062ca90442e.
+Artifact for the W4 scoreboard row: "3 | Does standing down stay rare? | ⚠ OPEN — needs a
+measurement."
+
+OUTCOME: (filled below, after the data)
+
+
+0. PRE-REGISTRATION, AND ONE HONEST AMENDMENT
+---------------------------------------------
+Pre-registered in the harness module doc (`examples/w4_standdown_count.rs`), written and compiled
+BEFORE the harness was first executed, and committed at 2385960/b997ff2:
+
+  A — the stand-down fraction is near zero in workloads 1-3 ⇒ the source's "only while DDL is
+      actually in flight" claim holds and W4's payoff survives check 3.
+  B — it is material in workload 2 (agent-realistic) or 3 (merge-heavy) ⇒ CHECK 3 FAILS and W4's
+      win evaporates.
+  C — the counts cannot discriminate (e.g. the reaper's cadence dominates and cannot be
+      separated) ⇒ a fact about the INSTRUMENT, to be labelled as one, with what would settle it.
+
+  "Material" threshold, pre-registered rather than left to taste: 1% of attempts. W4's own model
+  is that the gain scales with the fraction of statements that keep the shared path; a 1-in-100
+  fallback leaves 99% of the win, a 1-in-5 does not.
+
+⚠ AMENDMENT, appended not rewritten, and it moved the number AGAINST W4, not for it.
+The first smoke run reported a single global stand-down fraction. That answers the wrong
+question: in an agent-realistic arm most attempts come from the fork statement itself, which is
+exclusive under W4 as well, so its stand-downs cost W4 nothing. The counters were split by what
+the statement would be under W4 (SharedToday / Dml / ExclusiveEither) and the headline was
+redefined as the SharedToday fraction. For the deciding arm this RAISED the reported number
+(agent/extended: 68% global -> 95% shared-today at smoke scale), i.e. the amendment made the
+result worse for W4, which is the direction that cannot be a rescue.
+
+
+1. THE LAYER — stated first, because ignoring it has invalidated three results here
+-----------------------------------------------------------------------------------
+Every number below is measured THROUGH PGWIRE: a real `TcpListener`, the shipped
+`pgwire::handle` per connection, the real v3 startup handshake, and real frontend messages over a
+loopback socket. Nothing drives `AgentRuntime`, `Session` or `ServerContext` directly — the trap
+D101 exists to refuse and that E.6 had to teach this project.
+
+Two deviations from a production deployment, both stated rather than discovered later:
+  * The client threads live in the same process as the server threads. That is what lets the
+    counters be read without an IPC channel. It changes scheduling, not which functions run.
+  * The accept loop is the harness's own, because `pgwire::serve` never returns and an arm must
+    stop accepting before the next arm resets the counters. Per connection it calls the same
+    `pgwire::handle` that `serve` calls, with nothing in between.
+
+The engine is built exactly as `examples/pgserver.rs` builds it: a real `ArenaPageStore`, a
+storage-backed `AgentRuntime` with a `TwoTierReaper`, and the `LeaseThread` that scans under the
+same catalog mutex a statement takes.
+
+
+2. THE INSTRUMENT
+------------------
+`src/pgwire/standdown.rs`, behind the `w4-standdown-count` cargo feature, OFF by default.
+
+  * Two counters in `ServerContext::begin_read` (`src/pgwire/mod.rs`), one per arm of its return.
+  * `counts()` returns `Option<Counts>`. None means NOT INSTRUMENTED, which is a different fact
+    from an observed zero; the harness exits 2 on None rather than defaulting it. Without the
+    feature the whole thing is empty inline functions.
+  * Attempts are additionally split by `classify(&Stmt)` at the one pgwire call site, into
+    SharedToday (what `try_run_read` admits today) / Dml (what W4 proposes to move) /
+    ExclusiveEither (fork, MERGE, DDL — exclusive under W4 too).
+  * `classify` is a SECOND predicate beside `try_run_read`, which this codebase deliberately
+    avoids having. It is admissible only because it decides nothing and is CHECKED: every
+    admitted statement compares it against `try_run_read`'s real answer, and the run refuses on
+    any disagreement. Measured `mismatch=0` everywhere below.
+  * Exclusive acquirers are tagged separately — Parse, ReadRefresh, ExecExclusive, LeaseScan —
+    and a total is counted inside `ServerContext::catalog()` itself, so an acquirer nobody tagged
+    surfaces as `ann_unattr` instead of silently skewing the breakdown. Measured `ann_unattr=0`.
+
+FIRE-CHECK — `tests/w4_standdown_instrument.rs`. A small fraction and a dead counter print the
+same thing, so the counter is not trusted until it has been made to fire:
+  * a forced stand-down moves `stood_down` by exactly 1 and `admitted` by 0;
+  * the same call with no writer announced moves `admitted` by 1 and `stood_down` by 0 — the
+    does-not-fire-spuriously half;
+  * an untagged acquirer raises `announce_unattributed`, so that detector can fire;
+  * `counts()` answers None without the feature and Some with it, asserted in BOTH builds.
+
+REFUSALS. The harness exits non-zero on: an uninstrumented build (2), zero shared-path attempts
+(3), any SQL or IO error from any client (4), an arm that ran zero of its defining statement (5),
+a classifier mismatch (6), and a gap between the class counters and `begin_read`'s own totals (7).
+Exit 4 and exit 5 both fired during development; see section 6.
+
+
+3. WHY THIS IS A COUNT AND NOT A TIMING
+----------------------------------------
+Other lanes share this box (46x quiet-vs-loaded spread measured here). `begin_read` either
+returned `Some(ReadPass)` or it did not; the question is the ratio of two integers. No duration is
+measured anywhere in the harness and none is reported.
+
+⚠ The INSTRUMENT is load-immune. The QUANTITY is a contention probability, and a contention
+probability is not perfectly scheduling-independent. That is why the readonly arm is run as a
+control under the same conditions (it reads 0.000000 over 3200 attempts under `extended`), why
+the arms are run SERIALLY, and why section 4's first finding is a code reading that needs no
+measurement at all.
+
+⚠ The fleet measure-lock was DELIBERATELY NOT TAKEN, per the brief: this is a counting run. It
+was held throughout by another lane (`CEILING-resume`, pid 86920, taken 2026-09-22T07:05:12Z).
+That lane's window was therefore contaminated by these runs, and these runs by that lane's.
+
+
+4. FINDING 1 — THE CLAIM IS FALSE BY CONSTRUCTION. This is a READING, not a measurement.
+-----------------------------------------------------------------------------------------
+`begin_read`'s doc (src/pgwire/mod.rs, "Standing down is not a failure..."):
+
+    "It happens only while DDL is actually in flight."
+
+That is checkable without running anything, and it is wrong. `writer_active` is stored `true` in
+exactly ONE place:
+
+    src/pgwire/mod.rs  fn drain_readers()   ->  self.writer_active.store(true, SeqCst);
+
+and `drain_readers` is called from exactly ONE place:
+
+    src/pgwire/mod.rs  fn catalog()         ->  self.drain_readers();
+
+`ServerContext::catalog()` is the general exclusive-borrow accessor. There is no DDL predicate
+anywhere on that path — and there deliberately is not, because the same function says so four
+lines above the call:
+
+    "EVERY exclusive borrow drains the readers, not only the ones that free pages. Deciding here
+     which statements will free pages would be a second predicate that can drift from what the
+     executor actually does..."
+
+⇒ THE FILE CONTRADICTS ITSELF. `catalog()` says every exclusive borrow announces; `begin_read`,
+forty lines below, says it happens only during DDL. The first is what the code does.
+
+Everything that announces a writer, all of it verified by call site, none of it DDL:
+  * every statement `try_run_read` refuses — all DML, MERGE, and the fork statement;
+  * `Statement::parse_one` (src/pgwire/extended.rs), on EVERY statement it parses, read or write;
+  * `ServerContext::read_catalog` when a connection's snapshot is stale;
+  * the reaper's `LeaseThread`, on a timer, via `impl RuntimeLock for ServerContext`.
+
+⇒ So check 3 could never have come out "only during DDL". What the measurement adds is HOW MUCH.
+
+
+5. FINDING 2 — THE READ-ONLY FLOOR IS NOT ZERO, AND THE CAUSE IS TYPE INFERENCE
+-------------------------------------------------------------------------------
+Workload 1 was predicted in the brief to be "the floor, should be ~0". Under a driver that caches
+prepared statements it is exactly that. Under the simple query protocol it is not.
+
+  arm=readonly  8 clients, all readers, 400 rounds, NO writes, NO forks, NO DDL, NO MERGE
+    proto=extended     3200 attempts    0 stand-downs    0.0000%    <- the control
+    proto=simple       3200 attempts  681 stand-downs   21.2812%
+    proto=ext_reparse  3200 attempts  919 stand-downs   28.7187%
+
+The `extended` row reading EXACTLY 0.000000 over 3200 attempts is what makes the other two
+readable: the harness, the client, the socket and the accept loop are identical across the three,
+so the difference is not the harness.
+
+CAUSE, verified at the call site rather than inferred. `Statement::parse_one`
+(src/pgwire/extended.rs) takes `ctx.catalog()` — the EXCLUSIVE borrow, which announces a writer
+and drains every reader — to call exactly two functions:
+
+    pub fn infer_types(stmt: &Stmt, nparams: usize, declared: &[i32], catalog: &Catalog) -> ...
+    fn describe_stmt(stmt: &Stmt, catalog: &Catalog) -> ...
+
+BOTH TAKE `&Catalog`. The acquisition is a READ. It is exclusive only because `catalog()` is the
+only accessor `parse_one` uses, and every acquisition through `catalog()` announces (finding 1).
+`ann_parse` confirms the volume: 3200 parse-time acquisitions in readonly/simple and 0 in
+readonly/extended, matching the protocol's parse cadence exactly.
+
+⇒ 21% of reads in a pure read-only workload lose the shared read path — the path the D58/D59 work
+exists to provide — to TYPE INFERENCE FOR A STATEMENT THAT HAS NOT RUN YET.
+
+⇒ CANDIDATE FIX, named but NOT verified: `parse_one` could read the per-connection snapshot
+(`ctx.read_catalog(cache)`) instead of the exclusive catalog. The snapshot is stale only about
+recorded index roots (safe since D53) and the epoch moves on exactly the schema changes
+`describe_stmt` cares about, so it is plausibly the same correctness the read path already
+relies on. ⚠ That is a design reading of the kind this project has had wrong before; it needs its
+own falsifier pass before a line is written. It is much smaller than W4 and independent of it.
+
+⇒ AND THE CONTROL THAT NAILS THE MECHANISM. `ext_reparse` is `extended` framing with a fresh
+statement name every round, so the client re-Parses — and therefore re-takes the exclusive
+catalog immediately before its own `begin_read` — exactly as `simple` does. It was pre-registered
+to discriminate: "if `simple`'s lower rate comes from that self-release, this row must track
+`simple`; if it tracks `extended`, that explanation is wrong."
+
+    readonly:  simple 21.3%   ext_reparse 28.7%   extended 0.0%
+    merge(smoke, 4x10): simple 30.0%   ext_reparse 35.0%   extended 85.0%
+
+⇒ `ext_reparse` tracks `simple`, not `extended`, in both. The protocol difference is the parse
+acquisition, confirmed. It also means the two protocols answer DIFFERENT questions: `simple` and
+`ext_reparse` are depressed by the reader having just released the mutex itself (it wins the next
+race against threads the OS still has to wake), so `extended` — what asyncpg and pg8000 actually
+do — is the honest measure of the barrier's duty cycle, and the other two are a lower bound.
+
+
+6. FINDING 3 — ⭐ THE DECIDING NUMBER. Workload 2, agent-realistic.
+-------------------------------------------------------------------
+8 clients = 4 readers + 4 forkers. 400 rounds each. NO DDL, NO MERGE, NO DML — the shape
+BranchBench names. Raw rows: bench/w4_standdown/main/arm_agent.txt.
+
+  arm=agent            SharedToday attempts   stood down    FRACTION
+    proto=extended            1600              1490        93.12%   <- ⭐
+    proto=ext_reparse         1600               564        35.25%
+    proto=simple              1600               191        11.94%
+
+  every row: mismatch=0  gap=0  ann_unattr=0  ann_lease=0
+
+⇒ A statement on the shared read path was refused it 93% of the time, with no DDL anywhere in the
+workload and nothing but `BEGIN AGENT SESSION` / `ABANDON` announcing.
+
+⇒ THIS TRANSFERS DIRECTLY TO W4, and that is the point of the arm having no DML in it. The
+announcer set here — the fork statement — is exclusive under W4 as well, so it is unchanged by
+W4. A DML moved onto the shared path would sit in exactly the position the readers are in, see
+exactly the same announcers, and stand down at the same rate.
+
+⇒ AND THE MEASUREMENT IS IF ANYTHING AN UNDER-ESTIMATE OF W4'S OWN RATE. Under W4 the fork
+statements are unchanged in count and in how long each holds the mutex, but they stop queueing
+behind DML, so the same exclusive time is spread over a SHORTER wall clock. The duty cycle of
+`writer_active` — which is what a stand-down is a sample of — goes UP, not down.
+
+PRE-REGISTERED THRESHOLD: 1% of attempts. MEASURED: 93.12%. That is 93x the threshold in the
+deciding arm.
+
+⇒ OUTCOME B FIRED.
+
+The per-class split is what makes this readable, and it is worth stating what the naive number
+would have said: the global fraction for the same run is 78.88%, because it mixes in the forkers'
+own attempts (exc_frac=71.75%), which stand down and then take the mutex — which is what a fork
+does today and costs W4 nothing. The headline is the SharedToday column and it is HIGHER, not
+lower, than the number that would have been reported without the split.
+
+OUTCOME C IS RULED OUT BY MEASUREMENT, not by assertion. The brief named "the reaper's cadence
+dominates and you cannot separate it" as the way this could fail to discriminate. `ann_lease`
+counts the lease thread's acquisitions separately and reads 0 in every row above, at the shipped
+30s cadence. The reaper contributed nothing; the announcers were client statements.

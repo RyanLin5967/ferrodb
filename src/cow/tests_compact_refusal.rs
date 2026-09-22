@@ -24,8 +24,9 @@
 //! starved failures without reaching the refusal path once, and passed.
 
 use std::fs::OpenOptions;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
@@ -55,11 +56,76 @@ struct StarvingStore {
     inner: Arc<CowStore>,
     /// Allocations still permitted, or `-1` for "no limit".
     budget: AtomicI64,
+    /// Every allocation this store has served or refused since [`StarvingStore::reset_log`],
+    /// in order. `None` is a refusal. D125's instrument reads this to attribute a failure to a
+    /// call site without putting a hook in production code: `alloc_for(BTreeLeaf)` is only
+    /// reached from `write_leaf_chunked`, and `alloc_for(BTreeInternal)` only from
+    /// `internal_relink` or the new-root tail of `relink_up`, so the type sequence says which
+    /// stage the operation died in.
+    log: Mutex<Vec<(Option<PageId>, PageType)>>,
+    /// Pages to photograph at the instant an allocation is refused, and the photograph.
+    ///
+    /// ⛔ **This is the only place from which a half-finished write operation can be seen.**
+    /// D125 gave `CowTree` a rollback, so by the time a failing `insert` returns, every page it
+    /// touched has been put back — which is the fix working, and which also means D113's
+    /// end-to-end falsifier can no longer observe the compacted page it exists to catch by
+    /// looking at the tree afterwards. It would have gone quietly vacuous: still green, still
+    /// asserting, and blind. The refusal is the moment the defect exists, so the refusal is
+    /// where the camera goes.
+    watch: Mutex<Vec<PageId>>,
+    at_refusal: Mutex<Vec<(PageId, [u8; PAGE_SIZE])>>,
+    /// Reads still permitted, or `-1` for "no limit".
+    ///
+    /// ⛔ Starving the ALLOCATOR cannot reach every error path, and this is not a convenience.
+    /// Measured on this fixture: 400-byte keys give the content-defined chunker ~1.2 entries
+    /// per leaf (496 leaves for 600 keys), so `merge_right`'s merged run is ~1 KB against a
+    /// 4060-byte page and never needs cutting — 98 merges, **0 allocations**. Everything
+    /// `merge_right` does after `unlink_up` returns is therefore allocation-free, so no
+    /// allocator budget can make it fail there, and the one window where releasing a retired
+    /// page early does damage is unreachable by starving allocations alone.
+    ///
+    /// `descend` reads. Refusing the nth read walks a failure through that tail.
+    read_budget: AtomicI64,
 }
 
 impl StarvingStore {
     fn new(inner: Arc<CowStore>) -> StarvingStore {
-        StarvingStore { inner, budget: AtomicI64::new(-1) }
+        StarvingStore {
+            inner,
+            budget: AtomicI64::new(-1),
+            log: Mutex::new(Vec::new()),
+            watch: Mutex::new(Vec::new()),
+            at_refusal: Mutex::new(Vec::new()),
+            read_budget: AtomicI64::new(-1),
+        }
+    }
+
+    /// Permit exactly `n` more reads through [`PageStore::read_page`], then refuse.
+    fn allow_reads(&self, n: i64) {
+        self.read_budget.store(n, Ordering::SeqCst);
+    }
+
+    fn unlimited_reads(&self) {
+        self.read_budget.store(-1, Ordering::SeqCst);
+    }
+
+    /// Photograph `ids` the next time an allocation is refused.
+    fn watch(&self, ids: &[PageId]) {
+        *self.watch.lock().unwrap() = ids.to_vec();
+        self.at_refusal.lock().unwrap().clear();
+    }
+
+    /// The photograph: each watched page as it stood mid-operation, at the refusal.
+    fn at_refusal(&self) -> Vec<(PageId, [u8; PAGE_SIZE])> {
+        self.at_refusal.lock().unwrap().clone()
+    }
+
+    fn reset_log(&self) {
+        self.log.lock().unwrap().clear();
+    }
+
+    fn log_entries(&self) -> Vec<(Option<PageId>, PageType)> {
+        self.log.lock().unwrap().clone()
     }
 
     /// Permit exactly `n` more allocations, then refuse every one after that. Sweeping `n`
@@ -85,12 +151,34 @@ impl PageStore for StarvingStore {
         if self.budget.load(Ordering::SeqCst) >= 0
             && self.budget.fetch_sub(1, Ordering::SeqCst) <= 0
         {
+            self.log.lock().unwrap().push((None, page_type));
+            // The camera. Read through the pool directly rather than `read_page`, because a
+            // page that fails its checksum is exactly what this is here to catch and
+            // `read_page` would refuse to hand it over.
+            let watch = self.watch.lock().unwrap().clone();
+            if !watch.is_empty() {
+                let mut shot = self.at_refusal.lock().unwrap();
+                if shot.is_empty() {
+                    for id in watch {
+                        let h = PageHandle::fetch(self.inner.pool().clone(), id).unwrap();
+                        let data = h.read().data;
+                        shot.push((id, data));
+                    }
+                }
+            }
             return Err(FerroError::Cow("starving store: allocation refused".into()));
         }
-        self.inner.alloc_in_arena(arena, page_type, birth_epoch)
+        let id = self.inner.alloc_in_arena(arena, page_type, birth_epoch)?;
+        self.log.lock().unwrap().push((Some(id), page_type));
+        Ok(id)
     }
 
     fn read_page(&self, page_id: PageId) -> Result<PageHandle, FerroError> {
+        if self.read_budget.load(Ordering::SeqCst) >= 0
+            && self.read_budget.fetch_sub(1, Ordering::SeqCst) <= 0
+        {
+            return Err(FerroError::Cow("starving store: read refused".into()));
+        }
         self.inner.read_page(page_id)
     }
 
@@ -173,6 +261,52 @@ impl Fixture {
         let h = PageHandle::fetch(self.inner.pool().clone(), id).unwrap();
         let f = h.read();
         f.data
+    }
+
+    /// Every key the tree can reach from `root`, and every page it reaches to get them.
+    ///
+    /// Reads pages through [`Fixture::raw`] rather than `read_page` so a tree that has been left
+    /// with a bad checksum can still be enumerated — the question here is which rows are
+    /// *reachable*, not whether the reader would hand them over.
+    fn reachable(&self, root: PageId) -> (BTreeSet<Vec<u8>>, BTreeSet<PageId>) {
+        let pages = self.leaves_and_internals(root);
+        let mut keys = BTreeSet::new();
+        for p in &pages {
+            let page = self.raw(*p);
+            if PageHeader::read_from(&page).unwrap().page_type != PageType::BTreeLeaf {
+                continue;
+            }
+            for (k, _) in Node::new(&page).leaf_entries().unwrap() {
+                keys.insert(k);
+            }
+        }
+        (keys, pages.into_iter().collect())
+    }
+
+    /// Every key in the subtree rooted at `page_id`, whether or not anything points at it.
+    ///
+    /// Recursive, because an orphaned **internal** node strands every leaf beneath it, and those
+    /// leaves are pages that existed long before the call that stranded them.
+    fn keys_under(&self, page_id: PageId, depth: usize, out: &mut BTreeSet<Vec<u8>>) {
+        if depth > 64 {
+            return;
+        }
+        let page = self.raw(page_id);
+        match PageHeader::read_from(&page) {
+            Ok(h) if h.page_type == PageType::BTreeLeaf => {
+                if let Ok(entries) = Node::new(&page).leaf_entries() {
+                    out.extend(entries.into_iter().map(|(k, _)| k));
+                }
+            }
+            Ok(h) if h.page_type == PageType::BTreeInternal => {
+                if let Ok(kids) = Node::new(&page).all_children() {
+                    for c in kids {
+                        self.keys_under(c, depth + 1, out);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Every leaf page id, left to right.
@@ -312,6 +446,7 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
                 assert!(verify_checksum(page), "fixture: page {} was already invalid", id);
             }
 
+            f.store.watch(&ids);
             f.store.allow(allowance);
             let outcome = f.insert(root, &key, &value);
             f.store.unlimited();
@@ -330,35 +465,64 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
                     );
                     starved_failures += 1;
 
+                    // The tree AS IT STOOD AT THE REFUSAL, not as it stands now — D125's
+                    // rollback has since put every page back, so "now" can no longer show the
+                    // state D113 is about. See `StarvingStore::watch`.
+                    let mid = f.store.at_refusal();
+                    assert_eq!(
+                        mid.len(),
+                        before.len(),
+                        "fixture: the refusal camera did not fire, so nothing below is an \
+                         observation of the failing operation"
+                    );
+
                     // Did this failure leave anything rewritten? Those are the failures that can
                     // expose the defect; a failure that mutated nothing proves nothing.
                     let changed: usize = before
                         .iter()
-                        .map(|(id, page)| {
-                            let now = f.raw(*id);
+                        .zip(mid.iter())
+                        .map(|((_, page), (_, now))| {
                             page.iter().zip(now.iter()).filter(|(a, b)| a != b).count()
                         })
                         .sum();
                     if changed > 0 {
                         mutating_failures += 1;
                     }
-                    if before.iter().any(|(id, page)| compacted_in_place(page, &f.raw(*id))) {
+                    if before
+                        .iter()
+                        .zip(mid.iter())
+                        .any(|((_, page), (_, now))| compacted_in_place(page, now))
+                    {
                         compaction_failures += 1;
                     }
 
-                    // The conclusion: a failed allocation may abandon the operation, but it may
-                    // not leave a page that the production reader refuses.
-                    for (id, _) in &before {
-                        let now = f.raw(*id);
+                    // D113's conclusion: a failed allocation may abandon the operation, but at
+                    // no point may it leave a page that the production reader would refuse.
+                    for (id, now) in &mid {
                         assert!(
-                            verify_checksum(&now),
-                            "D113: after a starved allocation (key {:?}, {} allowed) page {} has \
-                             a checksum that disagrees with its bytes; {} bytes were rewritten \
-                             across the tree and `read_page` now refuses this page as torn",
+                            verify_checksum(now),
+                            "D113: at the moment a starved allocation was refused (key {:?}, {} \
+                             allowed) page {} had a checksum that disagrees with its bytes; {} \
+                             bytes were rewritten across the tree and `read_page` would refuse \
+                             this page as torn",
                             String::from_utf8_lossy(&key[..12.min(key.len())]),
                             allowance,
                             id,
                             changed
+                        );
+                    }
+
+                    // D125's conclusion, which is strictly stronger and is why the check above
+                    // had to move: once the call has returned, the page is not merely readable,
+                    // it is byte-for-byte what it was before the call.
+                    for (id, page) in &before {
+                        let now = f.raw(*id);
+                        assert!(
+                            page[..] == now[..],
+                            "D125: page {} differs after a failed insert (key {:?}, {} allowed)",
+                            id,
+                            String::from_utf8_lossy(&key[..12.min(key.len())]),
+                            allowance
                         );
                         f.store.read_page(*id).unwrap_or_else(|e| {
                             panic!("D113: page {} is no longer readable: {}", id, e)
@@ -402,39 +566,48 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
     // regression and an unrelated atomicity gap fail the same assertion.
 }
 
-/// ⛔ **THIS TEST FAILS TODAY, AND NOT BECAUSE OF D113.** It is `#[ignore]`d so it does not gate
-/// the suite, and left in place because deleting it would delete the finding.
+/// D125. **This test used to fail, and was `#[ignore]`d with its numbers in this comment so the
+/// finding would survive.** It gates now; the history is kept because the numbers are the
+/// evidence.
 ///
-/// Measured at `d6771d8`, both arms inserting the identical 820 keys:
+/// Measured at `d6771d8` and reproduced unchanged at `dc2a2cf`, both arms inserting the
+/// identical 820 keys:
 ///
 /// ```text
 /// rows missing -- control: 0 base,  0 gap
 ///                 starved: 28 base, 165 gap
 /// ```
 ///
-/// The control is what makes that attributable. An insert that fails on a starved allocation
-/// does not roll back: on the trunk every page is private, so `cow_page` returns the same page
-/// and the descent mutates it **in place**, leaving a leaf truncated to its first piece while the
-/// other pieces sit allocated with nothing pointing at them. The rows in those pieces are gone —
-/// and the gap figure is the alarming half, because every one of those 220 keys was *eventually*
-/// inserted by a later call that returned `Ok`, and 165 of them are still missing afterwards.
+/// The control is what makes that attributable. The alarming half is the gap figure: every one
+/// of those 220 keys was *eventually* inserted by a later call that returned `Ok`, and 165 were
+/// still missing afterwards — silent loss on the write path, not a refusal.
 ///
-/// This is the same family as D112's "free before the parent stops pointing at it": a correct
-/// happy path with a broken error path. It is out of D113's scope — D113 is the checksum — and it
-/// wants its own row, because the fix is a design choice (shadow even a private page across a
-/// split, or stage the relink) and not a patch.
+/// ⚠ **The mechanism this comment used to give was wrong, and is corrected here rather than
+/// quietly dropped.** It read: "leaving a leaf truncated to its first piece while the other
+/// pieces sit allocated with nothing pointing at them", blaming a split that fails part-way.
+/// `d125_instrument_where_a_starved_insert_loses_rows` falsified that: of 300 starved failures,
+/// the 203 refused a *leaf* page lost **zero** rows, because `write_leaf_chunked` allocates
+/// every piece before it overwrites the first. All 97 losing failures were refused an
+/// *internal* page, after the leaf split had already completed and committed. The leaf really
+/// is left truncated and the pieces really are orphaned — but by a split that **succeeded**,
+/// with the relink above it failing afterwards and nothing rolling it back.
 ///
-/// It also fails with the D113 fix reverted, so it is not a D113 discriminator either way.
+/// The premise underneath was right, and is the whole defect: on the trunk every page is
+/// private, so `cow_page` mutates in place and an operation has nothing to roll back to. The
+/// same fixture with every page shadowed loses 0 and 0 against the same refusals.
+///
+/// Same family as D112's "free before the parent stops pointing at it": a correct happy path
+/// with a broken error path. Fixed by [`WriteJournal`]; `bench/d125_starved_insert.txt`.
 #[test]
-#[ignore = "documents a real pre-existing atomicity defect; see the doc comment. Not D113."]
 fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
-    let probe_rows = |starve: bool| -> (usize, usize) {
+    let probe_rows = |starve: bool| -> (usize, usize, usize) {
         let f = Fixture::new();
         let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
         let value = vec![b'v'; 8];
         for i in 0..600u32 {
             root = f.insert(root, &long_key_of(i), &value).unwrap();
         }
+        let mut failures = 0usize;
         for j in 0..220u32 {
             let key = gap_key_of(300, j);
             if starve {
@@ -451,6 +624,7 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
                             break;
                         }
                         Err(_) => {
+                            failures += 1;
                             allowance += 1;
                             assert!(allowance < 64, "fixture: never succeeded");
                         }
@@ -465,14 +639,25 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
         let gap_lost = (0..220u32)
             .filter(|&j| f.tree.get(root, &gap_key_of(300, j)).unwrap().is_none())
             .count();
-        (base_lost, gap_lost)
+        (base_lost, gap_lost, failures)
     };
 
-    let (control_base, control_gap) = probe_rows(false);
-    let (starved_base, starved_gap) = probe_rows(true);
+    let (control_base, control_gap, control_failures) = probe_rows(false);
+    let (starved_base, starved_gap, starved_failures) = probe_rows(true);
     println!(
-        "rows missing -- control: {} base, {} gap;  starved: {} base, {} gap",
-        control_base, control_gap, starved_base, starved_gap
+        "rows missing -- control: {} base, {} gap;  starved: {} base, {} gap  \
+         ({} starved failures)",
+        control_base, control_gap, starved_base, starved_gap, starved_failures
+    );
+
+    // ⚠ The premise this test did NOT state while it was `#[ignore]`d, and the one that would
+    // let it pass for the wrong reason now that it gates: a run in which nothing was ever
+    // refused an allocation loses no rows trivially. Zero starved failures is not a pass.
+    assert_eq!(control_failures, 0, "fixture: the unstarved control was starved");
+    assert!(
+        starved_failures > 0,
+        "fixture: not one allocation was refused in the starved arm, so it is the control run \
+         twice and proves nothing"
     );
 
     // The control is the premise: plain inserts of this sequence must lose nothing, or the
@@ -490,6 +675,647 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
          sequence without starvation loses none",
         starved_base,
         starved_gap
+    );
+}
+
+// ================================================================================================
+// D125 instrument: WHERE the rows go when a starved insert loses them
+// ================================================================================================
+
+/// The instrument behind D125, kept because the number without it is a mechanism-free fact.
+///
+/// It runs the probe's own sequence and, on **every** failure that loses a row, records three
+/// things that together separate the two candidate mechanisms:
+///
+/// * the [`PageType`] of the **refused** allocation. `alloc_for(BTreeLeaf)` is reached only from
+///   `write_leaf_chunked`; `alloc_for(BTreeInternal)` only from `internal_relink` or the
+///   new-root tail of `relink_up`. So the type says which stage died.
+/// * how many pages of each type the call had already been *served* before it was refused —
+///   i.e. whether the leaf split had completed.
+/// * for each lost key, whether it now sits on a page **allocated during this very call** and
+///   unreachable from the root (a fresh split piece nobody points at), or has vanished from a
+///   page that was there before.
+///
+/// Pre-fix, at `dc2a2cf`, it printed:
+///
+/// ```text
+/// 300 starved failures, 97 of them lost rows (235 rows total).
+/// refused allocation was a leaf page in 203 failures (0 of them losing),
+///                             an internal page in  97 failures (97 losing).
+/// leaf split had already completed in 97 of the 97 losing failures.
+/// lost rows: 235 into a subtree the failing call ALLOCATED and left unreachable,
+///              0 into a PRE-EXISTING subtree it detached, 0 unaccounted for.
+/// ```
+///
+/// which is what falsified the hypothesis this row opened with — the leaf split, the stage it
+/// blamed, is the one stage that never lost a row.
+///
+/// It now **gates**, because the table it prints is exactly the postcondition
+/// [`WriteJournal`] has to establish: the same refusals still happen, and none of them loses
+/// anything. The failure count falls from 300 to 220 with the fix in and that is the fix
+/// working — a failed attempt no longer damages the tree, so the budget sweep no longer needs
+/// extra rounds to get past its own wreckage.
+#[test]
+fn d125_instrument_where_a_starved_insert_loses_rows() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut failures = 0usize;
+    let mut losing = 0usize;
+    let mut refused_leaf = 0usize;
+    let mut refused_internal = 0usize;
+    let mut losing_refused_leaf = 0usize;
+    let mut losing_refused_internal = 0usize;
+    let mut lost_total = 0usize;
+    let mut lost_on_fresh_orphan = 0usize;
+    let mut lost_on_detached = 0usize;
+    let mut lost_elsewhere = 0usize;
+    let mut leaf_split_completed = 0usize;
+    let mut printed = 0usize;
+
+    for j in 0..220u32 {
+        let key = gap_key_of(300, j);
+        let mut allowance = 0i64;
+        loop {
+            let (before_keys, before_pages) = f.reachable(root);
+            f.store.reset_log();
+            f.store.allow(allowance);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited();
+            let entries = f.store.log_entries();
+            match outcome {
+                Ok(new_root) => {
+                    root = new_root;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    let refused = entries.iter().find(|(id, _)| id.is_none()).map(|(_, t)| *t);
+                    let served_leaf = entries
+                        .iter()
+                        .filter(|(id, t)| id.is_some() && *t == PageType::BTreeLeaf)
+                        .count();
+                    let served_internal = entries
+                        .iter()
+                        .filter(|(id, t)| id.is_some() && *t == PageType::BTreeInternal)
+                        .count();
+                    match refused {
+                        Some(PageType::BTreeLeaf) => refused_leaf += 1,
+                        Some(PageType::BTreeInternal) => refused_internal += 1,
+                        other => panic!("unexpected refusal of {:?}", other),
+                    }
+                    let (after_keys, after_pages) = f.reachable(root);
+                    let lost: Vec<Vec<u8>> =
+                        before_keys.difference(&after_keys).cloned().collect();
+                    if !lost.is_empty() {
+                        losing += 1;
+                        lost_total += lost.len();
+                        match refused {
+                            Some(PageType::BTreeLeaf) => losing_refused_leaf += 1,
+                            Some(PageType::BTreeInternal) => losing_refused_internal += 1,
+                            _ => unreachable!(),
+                        }
+                        // Did the leaf split finish before the call died? It allocates one page
+                        // per cut past the first, so "served at least one leaf and was not
+                        // refused a leaf" means the cut loop ran to completion.
+                        if refused != Some(PageType::BTreeLeaf) && served_leaf > 0 {
+                            leaf_split_completed += 1;
+                        }
+                        // Pages this call allocated and that nothing points at afterwards.
+                        let fresh_orphans: Vec<PageId> = entries
+                            .iter()
+                            .filter_map(|(id, _)| *id)
+                            .filter(|id| !after_pages.contains(id))
+                            .collect();
+                        let mut on_fresh = BTreeSet::new();
+                        for p in &fresh_orphans {
+                            f.keys_under(*p, 0, &mut on_fresh);
+                        }
+                        // Pages that WERE reachable before this call and are not now: a
+                        // pre-existing subtree the failure detached.
+                        let detached: Vec<PageId> =
+                            before_pages.difference(&after_pages).copied().collect();
+                        let mut on_detached = BTreeSet::new();
+                        for p in &detached {
+                            f.keys_under(*p, 0, &mut on_detached);
+                        }
+                        let here = lost.iter().filter(|k| on_fresh.contains(*k)).count();
+                        let there = lost
+                            .iter()
+                            .filter(|k| !on_fresh.contains(*k) && on_detached.contains(*k))
+                            .count();
+                        lost_on_fresh_orphan += here;
+                        lost_on_detached += there;
+                        lost_elsewhere += lost.len() - here - there;
+                        if printed < 8 {
+                            printed += 1;
+                            println!(
+                                "  loss #{}: budget={} refused={:?} served(leaf={},int={}) \
+                                 lost={} [fresh-orphan={} detached-preexisting={} other={}] \
+                                 fresh_orphan_pages={} detached_pages={} \
+                                 pages_before={} pages_after={}",
+                                losing,
+                                allowance,
+                                refused.unwrap(),
+                                served_leaf,
+                                served_internal,
+                                lost.len(),
+                                here,
+                                there,
+                                lost.len() - here - there,
+                                fresh_orphans.len(),
+                                detached.len(),
+                                before_pages.len(),
+                                after_pages.len(),
+                            );
+                        }
+                    }
+                    allowance += 1;
+                    assert!(allowance < 64, "fixture: never succeeded");
+                }
+            }
+        }
+    }
+
+    println!(
+        "D125 instrument: {} starved failures, {} of them lost rows ({} rows total).\n\
+         refused allocation was a leaf page in {} failures ({} of them losing), an internal \
+         page in {} ({} losing).\n\
+         leaf split had already completed in {} of the {} losing failures.\n\
+         lost rows by where they went: {} into a subtree the failing call ALLOCATED and left \
+         unreachable, {} into a PRE-EXISTING subtree the failing call detached, {} unaccounted \
+         for by either.",
+        failures,
+        losing,
+        lost_total,
+        refused_leaf,
+        losing_refused_leaf,
+        refused_internal,
+        losing_refused_internal,
+        leaf_split_completed,
+        losing,
+        lost_on_fresh_orphan,
+        lost_on_detached,
+        lost_elsewhere,
+    );
+
+    // Premises, in the order they can go vacuous. A sweep that never starved anything proves
+    // nothing; one that starved only the leaf path proves nothing either, because the leaf path
+    // was never the broken one — 203 of the 300 pre-fix failures were refused a leaf page and
+    // all 203 were harmless. The stage that has to be reached is the internal-page refusal.
+    assert!(failures > 0, "fixture: nothing was ever starved");
+    assert!(
+        refused_internal > 0,
+        "fixture: {} starved failures, but not one of them was refused an INTERNAL page. That \
+         is the only stage that ever lost a row (97 of 97 pre-fix), so this run exercised the \
+         clean path only and proves nothing about the defect",
+        failures
+    );
+
+    // The outcome. Stated over every failure, not just the probe's end state: a row that
+    // disappears and is put back by a later insert of the same key would not show up in a
+    // final count.
+    assert_eq!(
+        (losing, lost_total),
+        (0, 0),
+        "{} starved failures lost {} rows between them. Every failure must leave the tree \
+         exactly as it found it; see `WriteJournal`",
+        losing,
+        lost_total
+    );
+}
+
+/// The second half of D125's instrument: the **same** starvation on a tree whose pages are not
+/// private, which is the arm that pins the mechanism to in-place mutation.
+///
+/// Registering a child branch that forked *after* the build makes every page of that build fail
+/// `CowStore::privacy`, so `cow_page` shadows instead of handing the page back for in-place
+/// mutation. Nothing else about the fixture changes: same 600 + 220 keys, same budget sweep,
+/// same allocator refusals in the same places.
+///
+/// If the trunk's losses were caused by anything other than mutating a page the old root still
+/// points at, this arm would lose rows too.
+/// It gates as well as explains. The shadow path is the arm [`WriteJournal::record`]
+/// deliberately does **not** record (`copied == true` leaves the old root's tree untouched, so
+/// there is nothing to take back), which makes it the one path whose safety rests on the store
+/// rather than on the journal. Nothing else in the suite pins it.
+#[test]
+fn d125_instrument_the_same_starvation_on_shadowed_pages() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    // A live child forked immediately before every attempt below. `CowStore::privacy` refuses
+    // in-place mutation of a page born before a live child's fork epoch, so this makes every
+    // page the build produced non-private at the moment it is touched. One fork is not enough:
+    // a shadow is born at the *current* epoch, so it is private again on the next write, which
+    // is why an earlier cut of this arm shadowed 1 insert of 220 and reproduced the loss exactly.
+    let mut next_branch = 1u64;
+
+    let mut failures = 0usize;
+    let mut losing = 0usize;
+    let mut lost_total = 0usize;
+    let mut shadowed = 0usize;
+    for j in 0..220u32 {
+        let key = gap_key_of(300, j);
+        let mut allowance = 0i64;
+        loop {
+            let (before_keys, _) = f.reachable(root);
+            f.inner
+                .register_branch(
+                    BranchId { id: next_branch, generation: 0 },
+                    Some(BranchId::TRUNK),
+                    f.tick(),
+                )
+                .unwrap();
+            next_branch += 1;
+            f.store.reset_log();
+            f.store.allow(allowance);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited();
+            match outcome {
+                Ok(new_root) => {
+                    if new_root != root {
+                        shadowed += 1;
+                    }
+                    root = new_root;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    let (after_keys, _) = f.reachable(root);
+                    let lost = before_keys.difference(&after_keys).count();
+                    if lost > 0 {
+                        losing += 1;
+                        lost_total += lost;
+                    }
+                    allowance += 1;
+                    assert!(allowance < 64, "fixture: never succeeded");
+                }
+            }
+        }
+    }
+    let base_lost =
+        (0..600u32).filter(|&i| f.tree.get(root, &long_key_of(i)).unwrap().is_none()).count();
+    let gap_lost =
+        (0..220u32).filter(|&j| f.tree.get(root, &gap_key_of(300, j)).unwrap().is_none()).count();
+    println!(
+        "D125 shadowed arm: {} starved failures, {} of them lost rows ({} rows); \
+         end state: {} of 600 base and {} of 220 gap rows missing; \
+         {} of 220 inserts moved the root (i.e. actually shadowed).",
+        failures, losing, lost_total, base_lost, gap_lost, shadowed,
+    );
+
+    // Premises: this arm has to reach the same failures, and it has to actually be shadowing.
+    // The second one is not decoration — the first cut of this test registered a single child
+    // before the loop, shadowed 1 insert of 220, and reproduced the trunk's 28/165 exactly
+    // while reading as a confirming result.
+    assert!(failures > 0, "fixture: nothing was ever starved in the shadowed arm");
+    assert_eq!(
+        shadowed, 220,
+        "fixture: only {} of 220 inserts shadowed, so this is not the shadowed arm it claims \
+         to be — a shadow page is born at the current epoch and is private again on the next \
+         write, so every attempt needs its own live child",
+        shadowed
+    );
+    assert_eq!(
+        (losing, lost_total, base_lost, gap_lost),
+        (0, 0, 0, 0),
+        "a starved write on shadowed pages lost rows: {} failures lost {} rows, end state {} \
+         base and {} gap missing",
+        losing,
+        lost_total,
+        base_lost,
+        gap_lost
+    );
+}
+
+/// The half of D125 that the row counts cannot see: **a failed operation must not hand a page
+/// back to the free space map while the tree it rolled back to still points at that page.**
+///
+/// `merge_right` calls `unlink_up` and then runs four more fallible steps — `descend`,
+/// `cow_page`, `write_leaf_chunked` and `relink_up`, the last two of which allocate. Before
+/// D125 the pages `unlink_up` retired were released as it returned, so a failure in those later
+/// steps left the tree pointing at pages the allocator was free to reissue. A row count is
+/// blind to it: the rows are still on the page, correct and readable, right up until something
+/// unrelated is written over them.
+///
+/// ⛔ This test exists because the deferred-free half was **measured to be unguarded**: with it
+/// reverted to the pre-D125 ordering, the whole `cow` suite — 168 tests — stayed green. A
+/// second mechanism with no test of its own is a mechanism nobody can change safely.
+///
+/// Two assertions, both on outcomes rather than on bookkeeping:
+///
+/// * a failed operation never *reduces* the store's live page count (it may raise it — pages it
+///   allocated before failing are deliberately leaked rather than freed, see [`WriteJournal`]);
+/// * asking the allocator for pages straight after a failure never yields one the tree can
+///   still reach.
+#[test]
+fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut failures = 0usize;
+    let mut failures_on_a_retiring_delete = 0usize;
+    let mut released: Vec<PageId> = Vec::new();
+    let mut rows_lost = 0usize;
+    let mut deepest_failure_on_a_retiring_delete = -1i64;
+
+    // ⛔ The target keys are CHOSEN, not enumerated, and the choice is the whole fixture.
+    //
+    // `merge_right` is the only caller that runs fallible, allocating work AFTER `unlink_up`
+    // has retired a page, so it is the only way into the window this test guards. It fires
+    // when a delete erases a leaf's terminating content boundary -- i.e. when the deleted key
+    // was that leaf's LAST entry and others remain.
+    //
+    // Reaching it is not enough: step 3 has to ALLOCATE, which it does only when the merged
+    // run no longer fits one page. Two earlier fixtures failed here and passed while proving
+    // nothing. Deleting every third key never allocated at all (0 starved failures, caught by
+    // the premise below). Deleting all 600 descending emptied the leaves as it went, so by the
+    // time `merge_right` fired the merged run fitted in a single page: 1 starved failure, and
+    // the mutant that reverts the free deferral still passed.
+    //
+    // So: take each leaf's last key while the tree is still FULL, and give it a right
+    // neighbour to absorb. Two ~full leaves of 400-byte keys merge to roughly 7.6 KB, which
+    // must be cut, which allocates.
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    {
+        let leaves = f.leaves(root);
+        for &id in leaves.iter().take(leaves.len().saturating_sub(1)) {
+            let page = f.raw(id);
+            if let Ok(entries) = Node::new(&page).leaf_entries()
+                && entries.len() > 1
+            {
+                targets.push(entries[entries.len() - 1].0.clone());
+            }
+        }
+    }
+    assert!(targets.len() > 50, "fixture: only {} merge targets", targets.len());
+
+    for key in targets {
+        // Sweep the READ budget, not the allocation budget. Every read the delete makes is a
+        // place the operation can die; walking the cut-off point forward walks the failure
+        // through `merge_right`'s tail, which is the only stretch where `unlink_up` has
+        // already retired a page and the operation has not finished.
+        let mut failures_here = 0usize;
+        let mut committed_while_starved = 0usize;
+        let mut deepest_here = -1i64;
+        let pages_at_start = f.leaves_and_internals(root).len();
+        for reads in 0..40i64 {
+            let rows_before = f.reachable(root).0;
+            let live_before: Vec<PageId> = f.leaves_and_internals(root);
+
+            f.store.allow_reads(reads);
+            let outcome = f.tree.delete(root, BranchId::TRUNK, f.tick(), &key);
+            f.store.unlimited_reads();
+
+            match outcome {
+                Ok(r) => {
+                    // ⚠ TAKE THE ROOT. An earlier cut wrote `Ok(_) => break` and left `root`
+                    // pointing at the pre-delete tree. On the trunk the root id usually does
+                    // not move, so it looked harmless — until an `unlink_up` cascade moved it,
+                    // after which every `leaves_and_internals(root)` below was reading a tree
+                    // that no longer existed and under-reporting what was live. A fixture that
+                    // loses sight of pages makes every assertion here quietly weaker.
+                    root = r;
+                    committed_while_starved += 1;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    failures_here += 1;
+                    deepest_here = deepest_here.max(reads);
+
+                    // ⛔ PER-PAGE, not a net count. `live_page_count` is
+                    // `next_free - free_pages.len()` summed over extents, and this journal
+                    // deliberately LEAKS pages the failed operation allocated while it must
+                    // never RELEASE one it retired. Those move the total in opposite
+                    // directions, so one leak cancels one release and a net comparison reports
+                    // nothing while the defect happens. Ask of each page individually instead.
+                    for p in &live_before {
+                        if f.inner.is_page_freed(*p) {
+                            released.push(*p);
+                        }
+                    }
+
+                    // Nor may it lose a row, which is the same journal and is asserted here
+                    // because a delete exercises `unlink_up` and `merge_right`, neither of
+                    // which the insert probe reaches.
+                    let rows_after = f.reachable(root).0;
+                    rows_lost += rows_before.difference(&rows_after).count();
+                }
+            }
+        }
+
+        // Commit the delete with nothing starved, so the tree keeps moving — unless a starved
+        // attempt already committed it above.
+        //
+        // ⚠ No probe allocations anywhere in this loop, deliberately. An earlier cut asked the
+        // allocator for pages after each failure to see whether one came back still reachable.
+        // That DISARMED the louder detector: `release_page` reports `double free of page N`
+        // only while the page is still on `free_pages`, so popping pages off that list ate the
+        // very evidence the panic below depends on. Two detectors for one fact, one of which
+        // consumes the other. The per-page `is_page_free` check above answers the same question
+        // without touching the free list.
+        if committed_while_starved == 0 || f.tree.get(root, &key).unwrap().is_some() {
+            root = match f.tree.delete(root, BranchId::TRUNK, f.tick(), &key) {
+                Ok(r) => r,
+                Err(e) => panic!(
+                    "after {} starved failures on this key, the same delete with NOTHING \
+                     starved failed: {}. A failed operation left the store inconsistent — it \
+                     released pages it had retired, which the tree it rolled back to still \
+                     points at",
+                    failures_here, e
+                ),
+            };
+        }
+
+        // Did this key's delete actually retire pages? If it did and it also failed at least
+        // once, a failure landed on the operation shape that has something to release.
+        if failures_here > 0 && f.leaves_and_internals(root).len() < pages_at_start {
+            failures_on_a_retiring_delete += 1;
+            deepest_failure_on_a_retiring_delete =
+                deepest_failure_on_a_retiring_delete.max(deepest_here);
+        }
+    }
+
+    println!(
+        "D125 free-deferral: {} starved delete failures, {} of them on a delete that retires \
+         pages (deepest such failure at read budget {}); {} rows lost; {} reachable pages had \
+         been handed to free_page after a failure",
+        failures,
+        failures_on_a_retiring_delete,
+        deepest_failure_on_a_retiring_delete,
+        rows_lost,
+        released.len(),
+    );
+
+    // Premises. A run with no failures, or one where no failing delete was the kind that
+    // retires a page, cannot tell the deferral from its absence.
+    assert!(failures > 0, "fixture: no delete was ever starved");
+    assert!(
+        failures_on_a_retiring_delete > 0,
+        "fixture: {} starved delete failures, but not one of them was on a delete that ended up \
+         retiring a page. Nothing here could have been released early, so the run proves \
+         nothing about the free deferral",
+        failures
+    );
+    // ⚠ The premise above is weaker than it looks, and saying so is the point. It pairs "this
+    // delete failed at least once" with "this delete retired a page", and those are two
+    // different attempts — the retirement is done by whichever attempt SUCCEEDED. On its own it
+    // is satisfied by a run where every failure happened at `reads == 0`, refused on the first
+    // `read_page` before `descend` even finished and long before `unlink_up` retired anything.
+    //
+    // So this one measures DEPTH instead. A plain delete that merges nothing reads about as
+    // many pages as the tree is deep; `merge_right` adds two further descents on top of
+    // `unlink_up`. A failure surviving well past the first descent is a failure that happened
+    // inside the operation's tail, which is the window.
+    //
+    // The proof that the window is genuinely covered is the fire-check, not this line: with the
+    // frees moved back inside `unlink_up` this test dies. An assertion cannot observe the
+    // window directly from outside, and pretending otherwise is how the two earlier fixtures
+    // here passed while proving nothing.
+    assert!(
+        deepest_failure_on_a_retiring_delete >= 8,
+        "fixture: the deepest failure on a page-retiring delete was at a read budget of {}, so \
+         every failure was refused during the opening descent. The tail after `unlink_up` -- \
+         the only place an early release does harm -- was never reached",
+        deepest_failure_on_a_retiring_delete
+    );
+
+    assert_eq!(
+        rows_lost, 0,
+        "{} rows vanished across {} failed deletes; a failed delete must leave every row where \
+         it found it",
+        rows_lost, failures
+    );
+    assert!(
+        released.is_empty(),
+        "{} page(s) the tree still reaches from its root were on the allocator's free list \
+         after a failed delete -- {:?}. A failed operation released pages it had retired, and \
+         the allocator will hand them straight back out",
+        released.len(),
+        &released[..released.len().min(8)]
+    );
+}
+
+/// ⛔ **The intersection nothing else in the suite covers: the SHADOW path, inspected for
+/// ALLOCATION state.**
+///
+/// Found in review, not by a test, and the reason no test saw it is the finding:
+///
+/// * every test that inspects free bookkeeping runs on the **trunk with no children**, where
+///   `privacy` is always true, `cow_page` returns `copied == false`, and the shadow-path free
+///   never executes at all;
+/// * the one test that does exercise the shadow path
+///   (`d125_instrument_the_same_starvation_on_shadowed_pages`) counts **rows**.
+///
+/// Neither covers the intersection, so "free the shadowed source unconditionally" survived the
+/// entire suite.
+///
+/// What it guards: `cow_page` shadowing a page the writing branch owns used to call `free_page`
+/// on the original there and then. `CowTree` rolls a failed operation back to the old root —
+/// and that root still points at the original. So the free had been taken on behalf of an
+/// operation that never happened, parking a live page for reclamation. The bytes were fine,
+/// which is why a row count cannot see it; the *allocation* was not.
+///
+/// Note the predicate: [`CowStore::is_page_freed`], which asks about the pending-free log as
+/// well as the free lists. A shadow of an owned page always takes the `pending` branch, so a
+/// check that looked only at free lists would be blind on exactly this path.
+#[test]
+fn a_failed_write_on_shadowed_pages_frees_nothing_the_tree_still_points_at() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..300u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut next_branch = 1u64;
+    let mut failures = 0usize;
+    let mut shadowed = 0usize;
+    let mut freed_but_live: Vec<PageId> = Vec::new();
+
+    for j in 0..60u32 {
+        let key = gap_key_of(150, j);
+        let mut committed = false;
+        for reads in 0..24i64 {
+            // A live child forked immediately before the attempt, so every page of the build
+            // fails `privacy` and `cow_page` shadows instead of mutating in place.
+            f.inner
+                .register_branch(
+                    BranchId { id: next_branch, generation: 0 },
+                    Some(BranchId::TRUNK),
+                    f.tick(),
+                )
+                .unwrap();
+            next_branch += 1;
+
+            let live_before: Vec<PageId> = f.leaves_and_internals(root);
+
+            f.store.allow_reads(reads);
+            let outcome = f.insert(root, &key, &value);
+            f.store.unlimited_reads();
+
+            match outcome {
+                Ok(new_root) => {
+                    if new_root != root {
+                        shadowed += 1;
+                    }
+                    root = new_root;
+                    committed = true;
+                    break;
+                }
+                Err(_) => {
+                    failures += 1;
+                    // The operation failed, so the tree is the one `root` describes. Nothing it
+                    // reaches may have been handed to `free_page`.
+                    for p in &live_before {
+                        if f.inner.is_page_freed(*p) {
+                            freed_but_live.push(*p);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(committed, "fixture: key {} never landed within the read sweep", j);
+    }
+
+    println!(
+        "D125 shadow-path frees: {} starved failures, {} inserts shadowed, {} pages freed while \
+         still reachable",
+        failures,
+        shadowed,
+        freed_but_live.len()
+    );
+
+    // Premises: the sweep has to fail, and it has to actually be on the shadow path — a run
+    // where every `cow_page` mutated in place would pass this without testing anything.
+    assert!(failures > 0, "fixture: nothing was ever starved");
+    assert_eq!(
+        shadowed, 60,
+        "fixture: only {} of 60 inserts shadowed, so this is not the shadow path",
+        shadowed
+    );
+
+    assert!(
+        freed_but_live.is_empty(),
+        "{} page(s) reachable from the root had been handed to free_page by an operation that \
+         then FAILED -- {:?}. The tree still points at them and the store is free to reclaim \
+         them",
+        freed_but_live.len(),
+        &freed_but_live[..freed_but_live.len().min(8)]
     );
 }
 
@@ -674,6 +1500,3 @@ fn a_partial_promotion_leaves_a_page_that_verifies() {
         promoted.len()
     );
 }
-
-
-

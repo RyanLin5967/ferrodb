@@ -1,0 +1,65 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wf_e78d06ad-550-2)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2016:17
+     |
+2016 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2090 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2016:17
+     |
+2016 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2090 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2016:17
+     |
+2016 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2091 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2016:17
+     |
+2016 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2091 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 13.52s
+     Running unittests src/lib.rs (target/release/deps/ferrodb-bf1e976f161c07cf)
+
+running 2 tests
+test branch::table_catalog::d126_record_key_probe::renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves ... D126 catalog renew_lease/get_raw     : target_miss=0 neighbour_miss=0 reads=1429296
+ok
+test branch::table_catalog::d126_record_key_probe::the_record_key_is_never_absent_while_it_is_rewritten ... D126 catalog CONTROL  (delete+insert): misses=31188 reads=226921
+D126 catalog TREATMENT (upsert)      : misses=0 reads=202772
+D126 catalog set_root                : misses=0 reads=5702750
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1612 filtered out; finished in 2.14s
+
+EXIT=0
