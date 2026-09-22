@@ -1,0 +1,22 @@
+# CERTIFICATION EVIDENCE — D124's landing green at head=fb3e632
+
+Banked 2026-09-22. This verdict certified the code that D124 landed, and it existed ONLY in
+the shared $VERIFY_OUT/SUMMARY.txt — which verify-suite.sh:353 writes with a TRUNCATING
+redirect to a fixed path. A later run (land101) destroyed it. It survives because an agent
+archived it first; this puts it where evidence belongs.
+
+⚠ Distinct LABELS do not protect SUMMARY.txt — only a distinct VERIFY_OUT directory does.
+
+## The harness's own lines, verbatim
+```
+land124-fb3e632: mode=per-target rc=0 passed=2455 failed=0 build_errors=0 head=fb3e632 log=/Users/idide/wt/artie-research/verify-out/suite-land124-fb3e632.log
+land124-fb3e632: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/suite-land124-fb3e632.go.log
+```
+
+## Provenance
+- suite-land124-fb3e632.log  261633 bytes  sha256=b135dba843193282707568d1195881275c789410667baff54137bc248e01e49e
+- suite-land124-fb3e632.go.log  17285 bytes  sha256=91c5b3d4ae88c9b98cd2fb046f757cb8f54fb3d8466933f28699d48da558bead
+
+## What it certifies
+head=fb3e632 — the merge of D124 (four sites that refuse instead of freeing a live branch's
+pages). certify-head confirmed suite head == landing commit; prepush OK. Pushed 8b18fa2..fb3e632.
