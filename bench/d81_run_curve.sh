@@ -65,12 +65,26 @@ arm() { # arm <label> <binary> <persist>
   [ "$rc" -eq 0 ] || echo "⛔ ARM $1 DID NOT COMPLETE — its rows are not a result" >> "$OUT"
 }
 
-# Order: OFF, ON, OFF, ON. The two controls sit at opposite ends of the run, so drift across the
-# whole window shows up as the two OFF arms disagreeing — a moved control, which says the two
-# halves came from different boxes and the comparison is void.
-arm "BEFORE/OFF" "$BEFORE" ""
-arm "BEFORE/ON"  "$BEFORE" 1
-arm "AFTER/OFF"  "$AFTER"  ""
-arm "AFTER/ON"   "$AFTER"  1
+# EIGHT arms: each cell twice, and the second round runs the four in REVERSE.
+#
+# The first version of this ran each cell once, in a fixed order, and the result was unusable: the
+# two OFF controls — the arm the change cannot affect — disagreed by up to 2.4x
+# (`bench/d81_curve_raw.txt`). A single pass cannot tell a real effect from that, and it cannot
+# tell an effect of L from an effect of WHERE IN THE RUN a cell happened to land, because L and
+# position advance together inside each arm.
+#
+# Reversing the arm order in round 2 puts every cell at a different point in the window, so a
+# quantity that is a property of the code appears twice and one that is a property of the
+# afternoon does not. It does NOT reverse the L axis inside an arm — that is the harness's own
+# loop — so the L-versus-position confound within an arm remains, and is named in the report
+# rather than claimed to be solved.
+arm "R1 BEFORE/OFF" "$BEFORE" ""
+arm "R1 BEFORE/ON"  "$BEFORE" 1
+arm "R1 AFTER/OFF"  "$AFTER"  ""
+arm "R1 AFTER/ON"   "$AFTER"  1
+arm "R2 AFTER/ON"   "$AFTER"  1
+arm "R2 AFTER/OFF"  "$AFTER"  ""
+arm "R2 BEFORE/ON"  "$BEFORE" 1
+arm "R2 BEFORE/OFF" "$BEFORE" ""
 
 echo "ALL ARMS DONE $(date -u +%FT%TZ)" >> "$OUT"
