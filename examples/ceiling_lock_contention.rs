@@ -270,6 +270,96 @@ fn model_cell_ex(
     }
 }
 
+/// ⭐ THE ONLY CELL IN THIS FILE WHOSE EXPECTED VALUES ARE DERIVED RATHER THAN OBSERVED.
+///
+/// Every other calibration cell is gated on a threshold picked after seeing what the cell does.
+/// That is enough to catch a dead counter and not enough to catch a counter that is alive and
+/// miscalibrated, and `never let a test's expected value come from calling the subject` says so.
+/// This cell removes re-acquisition entirely, which pins BOTH witnesses to closed forms:
+///
+/// `T` threads rendezvous on a barrier, then each takes the lock **exactly once** and holds it for
+/// `hold` spins. Barging cannot help anyone, because nobody acquires twice. Therefore, provided
+/// the hold is long against the barrier's release skew:
+///
+/// * **`contended/op` = (T-1)/T** — the first thread through finds the lock free; every other
+///   thread's `try_lock` is issued while someone is still inside. At T=64 that is 0.98438.
+/// * **`queue_mean` = (T+1)/2** — `IN_ACQ` starts at T and each successful acquirer reads it on the
+///   way in, so the recorded values are exactly T, T-1, …, 1 and their mean is 32.5 at T=64.
+/// * **`queue_max` = T** — the first acquirer sees all of them.
+///
+/// The gates are ±15% on the two means and exact on `queue_max`. A counter that fires for the
+/// wrong reason will not land on both closed forms at once.
+///
+/// ⛔ CORRECTION, AND IT IS A CORRECTION TO THE DERIVATION, NOT TO THE GATE'S STRICTNESS.
+/// The first version of this cell armed `IN_ACQ` *after* the rendezvous, next to the acquire, and
+/// then asserted `queue_max == T`. It measured `queue_max = 63`, `queue_mean = 31.58`. **The
+/// instrument was right and my closed form was wrong:** with the gauge armed after the barrier,
+/// the first thread to win the lock can beat the last thread's `fetch_add`, so `queue_max` is only
+/// bounded by `T`, not equal to it, and `queue_mean` is correspondingly short. `contended/op` came
+/// back at exactly 0.98438 = 63/64 in that same run, because THAT closed form does not depend on
+/// the gauge at all.
+/// ⇒ The fix is to arm the gauge BEFORE the rendezvous, which is what a calibration cell is for:
+/// every thread is provably committed to acquiring before any acquisition happens, and all three
+/// closed forms become exact. The quantity under test — `contended/op` — is untouched by the move.
+/// Raw evidence for the failing version: `bench/ceiling_raw/02_barrier_queuemax_63.txt`.
+fn model_cell_barrier(t: usize, hold: u64) -> ModelCell {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let arrived = Arc::new(AtomicUsize::new(0));
+    lk::set_global_mode(false);
+    lk::reset();
+    IN_ACQ.store(0, std::sync::atomic::Ordering::SeqCst);
+    SUM_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+    MAX_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+    lk::set_enabled(true);
+    let t0 = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..t {
+            let m = Arc::clone(&m);
+            let arrived = Arc::clone(&arrived);
+            s.spawn(move || {
+                // Arm the gauge BEFORE the rendezvous, so all T increments provably precede any
+                // acquisition and queue_max/queue_mean have exact closed forms. See the doc
+                // comment's correction note — armed after the barrier, they do not.
+                IN_ACQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Every thread is spawned, running, and past its own bookkeeping before ANY thread
+                // touches the lock. Without this the cell measures thread-spawn skew.
+                arrived.fetch_add(1, O::SeqCst);
+                while arrived.load(O::SeqCst) < t {
+                    std::hint::spin_loop();
+                }
+                {
+                    let mut g = lk::acquire_unwrap(&m, lk::LK_LOGICAL);
+                    let seen = IN_ACQ.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    SUM_SEEN.fetch_add(seen, std::sync::atomic::Ordering::Relaxed);
+                    MAX_SEEN.fetch_max(seen, std::sync::atomic::Ordering::Relaxed);
+                    *g += 1;
+                    spin(hold);
+                }
+                lk::bump_op();
+                lk::flush_thread();
+            });
+        }
+    });
+    let secs = t0.elapsed().as_secs_f64();
+    lk::set_enabled(false);
+    let c = lk::snapshot();
+    if c.threads as usize != t {
+        refuse(&format!("barrier cell lost accumulators: {} of {t} flushed", c.threads));
+    }
+    if c.ops != t as u64 {
+        refuse(&format!("barrier cell counted {} ops, ran {t}", c.ops));
+    }
+    ModelCell {
+        contended_per_op: c.contended_per_op(lk::LK_LOGICAL),
+        acq_per_op: c.acq_per_op(lk::LK_LOGICAL),
+        queue_mean: SUM_SEEN.load(std::sync::atomic::Ordering::Relaxed) as f64 / c.ops.max(1) as f64,
+        queue_max: MAX_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+        ops: c.ops,
+        secs,
+    }
+}
+
 fn mode_model() {
     println!("CEILING — MODE=model. THE FIRE-CHECK, and the shape a PURE mutex produces.");
     println!("LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock. This cell exists");
@@ -317,6 +407,41 @@ fn mode_model() {
     // parked waiter can wake, so 63 threads sit blocked while the collision counter reads ~0.
     // That regime does not resemble either rung of the real ladder (both have milliseconds of
     // fsync outside the section), so it is reported as a blind spot rather than used as the gate.
+    // ── the CLOSED-FORM control: both witnesses gated on values derived, not observed ────────
+    let c = model_cell_barrier(64, 2_000_000);
+    row("POS 64t barrier", 64, 2_000_000, 0, &c);
+    println!("     ^ closed form, stated before the run: contended/op = (T-1)/T = {:.5},",
+        63.0 / 64.0);
+    println!("       queue_mean = (T+1)/2 = {:.2}, queue_max = T = 64. Gates: +/-15%, exact.",
+        32.5);
+    {
+        let want_c = 63.0 / 64.0;
+        let want_q = 32.5;
+        if (c.contended_per_op - want_c).abs() / want_c > 0.15 {
+            refuse(&format!(
+                "CLOSED-FORM CONTROL FAILED: 64 threads that rendezvous and then take the lock \
+                 exactly once each reported contended/op {:.5} against the derived {want_c:.5}. \
+                 No thread re-acquires here, so barging cannot explain it and the collision \
+                 counter is genuinely miscalibrated. NOTHING else in this run is interpretable.",
+                c.contended_per_op
+            ));
+        }
+        if (c.queue_mean - want_q).abs() / want_q > 0.15 {
+            refuse(&format!(
+                "CLOSED-FORM CONTROL FAILED on the second witness: queue_mean {:.2} against the \
+                 derived {want_q:.2}. IN_ACQ is not counting concurrent acquirers.",
+                c.queue_mean
+            ));
+        }
+        if c.queue_max != 64 {
+            refuse(&format!(
+                "CLOSED-FORM CONTROL FAILED: queue_max {} != T = 64. The first thread through the \
+                 barrier must see all 64 inside the acquire region.",
+                c.queue_max
+            ));
+        }
+    }
+
     let c = model_cell(64, 800, 20_000, 20_000);
     row("POS 64t queued", 64, 20_000, 20_000, &c);
     let pos = c.contended_per_op;

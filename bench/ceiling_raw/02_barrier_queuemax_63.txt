@@ -1,0 +1,18 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=model. THE FIRE-CHECK, and the shape a PURE mutex produces.
+LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock. This cell exists
+to make the counter fire on purpose and to show what it reads when it should read 0.
+# model_start: 2026-09-22T07:14:25Z  load_at_acquire=s: 36.72 23.08 17.11
+
+  queue_mean / queue_max = threads inside the acquire region when one got in, self
+  included (the SECOND witness; see IN_ACQ). 1 means nobody else was there at all.
+
+                cell    T      hold    outside      ops     secs   contended/op   acq/op queue_mean queue_max
+   NEG single-thread    1      2000          0    20000    0.037        0.00000   1.0000       1.00         1
+     POS 64t barrier   64   2000000          0       64    0.118        0.98438   1.0000      31.78        63
+     ^ closed form, stated before the run: contended/op = (T-1)/T = 0.98438,
+       queue_mean = (T+1)/2 = 32.50, queue_max = T = 64. Gates: +/-15%, exact.
+ceiling: REFUSING. CLOSED-FORM CONTROL FAILED: queue_max 63 != T = 64. The first thread through the barrier must see all 64 inside the acquire region.
