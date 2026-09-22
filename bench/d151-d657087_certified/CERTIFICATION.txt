@@ -1,0 +1,39 @@
+CERTIFICATION -- D151 parse-site landed into main
+==================================================
+landed:    d657087 (merge of 1634096)     base: 68e24de
+delta:     +0 @ 68e24de   absolute 2529 per-target   mode=per-target
+gated sha: 1634096        certify-head: exact match
+go suite:  rc=0 passed=97 failed=0
+
+PRE-REGISTERED in bench/d151_parse_site_prereg.txt BEFORE the run, with the zero derived
+from a command printed in that file (the branch adds no test: git diff over the merge-base
+| grep -c '#[test]' -> 0). The ABSOLUTE 2529 is derived from main's bank, and the prereg
+says so against its own favour.
+
+THE THREE GATES (tools/land-gate.sh, 2026-09-22T21:04:56Z)
+  [1/3] certify-head  OK -- suite head=1634096 == landing 1634096, rc=0 2529/0
+  [2/3] staleness     COVERED
+  [3/3] prepush       OK -- FFI sweep; CI RUSTFLAGS build --examples and check --all-targets;
+                      windows-msvc cfg arm. The msvc check does NOT link.
+
+⚠ THE CLEAN MERGE WAS NOT SUFFICIENT AND WAS NOT TREATED AS SUCH. This branch and
+av-loop-counters both edit tests/integration_cluster_agents.rs. git returned rc=0, which
+means no LINE collided -- not that the result is coherent. Checked by hand before the
+suite ran, and recorded in the prereg:
+    fn loopcount                  present at :1115
+    loopcount(format_args!)       2 call sites
+    d151's NotLeader retry        present at :1487
+    bare eprintln! call sites     0   (the regression that would silence the instrument)
+
+⛔ WHAT THIS DOES NOT MEAN. It is NOT a fix for the Windows STATUS_ACCESS_VIOLATION, and
+a green run is not evidence the AV is solved. The branch's own commit says so first.
+bench/windows_access_violation.txt records the AV as a long-standing intermittent on TWO
+distinct shas (corrected from a wrong count of four), whose D138 bisect is falsified
+because the control arm contains a commit that crashed.
+
+BLIND SPOTS
+  * land-gate reads verdicts; it re-runs nothing and cannot tell you a run was honest.
+  * A retry loop makes a test tolerate a documented-transient error. It cannot distinguish
+    "transient" from "happens every time now" except by exhausting its 10 attempts, which
+    fails loudly with the last error. That is the intended trade and it is stated here.
+certify-head.sh was run AGAINST THIS DIRECTORY at 2026-09-22T21:07Z and returned OK.

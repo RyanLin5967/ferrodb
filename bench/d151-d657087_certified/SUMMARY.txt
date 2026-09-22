@@ -1,0 +1,2 @@
+d151-1634096: mode=per-target rc=0 passed=2529 failed=0 build_errors=0 head=1634096 log=/Users/idide/wt/artie-research/verify-out/d151-1634096/suite-d151-1634096.log
+d151-1634096: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d151-1634096/suite-d151-1634096.go.log
