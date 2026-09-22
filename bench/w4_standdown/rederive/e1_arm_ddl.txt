@@ -1,0 +1,25 @@
+# W4 check 3 -- stand-downs at ServerContext::begin_read, as a fraction of attempts
+# layer: through pgwire over a loopback TCP socket; shipped `pgwire::handle` per
+#        connection; nothing drives AgentRuntime or Session directly.
+# clients=8 rounds=400 lease_scan_ms=30000 fork_every=1 announcers=default
+# a COUNT, not a timing: no duration is measured and none is reported.
+
+ROW arm=ddl proto=simple sh_att=1600 sh_stood=166 sh_frac=0.103750 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.049375 all_frac=0.067500 ann_parse=4800 ann_refr=3088 ann_exec=3366 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=400
+ROW arm=ddl proto=extended sh_att=1600 sh_stood=604 sh_frac=0.377500 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.394375 all_frac=0.388750 ann_parse=2003 ann_refr=3368 ann_exec=3804 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=400
+ROW arm=ddl proto=ext_reparse sh_att=1600 sh_stood=341 sh_frac=0.213125 dml_att=0 dml_frac=n/a exc_att=3200 exc_frac=0.218125 all_frac=0.216458 ann_parse=4800 ann_refr=3849 ann_exec=3541 ann_lease=0 ann_unattr=0 mismatch=0 gap=0 stmts=4800 defining=400
+## HEADLINE -- stand-down fraction by what the statement would be under W4
+arm        proto     |    sh_att  sh_stood SHARED_TODAY | dml_att dml_stood | exc_att exc_stood | all_stood
+ddl        simple    |      1600       166      10.38% |       0       n/a |    3200     4.94% |     6.75%
+ddl        extended  |      1600       604      37.75% |       0       n/a |    3200    39.44% |    38.88%
+ddl        ext_reparse |      1600       341      21.31% |       0       n/a |    3200    21.81% |    21.65%
+
+## ANNOUNCERS -- which exclusive acquirer made a writer visible
+arm        proto      attempts  admitted  stood_dn stand_down  ann_parse ann_refr ann_exec ann_leas ann_unk
+ddl        simple         4800      4476       324      6.75%       4800     3088     3366        0       0
+ddl        extended       4800      2934      1866     38.88%       2003     3368     3804        0       0
+ddl        ext_reparse      4800      3761      1039     21.65%       4800     3849     3541        0       0
+
+# composition and statement counts
+#   ddl        simple    clients=1xDdl+3xForker+4xReader      statements=4800 defining=400
+#   ddl        extended  clients=1xDdl+3xForker+4xReader      statements=4800 defining=400
+#   ddl        ext_reparse clients=1xDdl+3xForker+4xReader      statements=4800 defining=400
