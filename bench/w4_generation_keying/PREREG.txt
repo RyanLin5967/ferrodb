@@ -110,3 +110,42 @@ SIXTH CHECK, adopted from d154's lane: assert `tests/d151_parse_reads_a_refreshe
 appears BY NAME in the run. Its absence is exactly what staleness flagged, so a total one short
 would mean D151's test did not come across in the merge — and a total alone cannot tell you that.
 Confirmed present in the tree with 1 `#[test]`; `ls tests/*.rs` is 135, was 134.
+
+--- AMENDMENT 3, appended before any suite has completed. Nothing above is edited. ---
+
+THE PRIMARY CLAIM IS A DELTA. THE ABSOLUTE IS DERIVED, AND ONLY MEANS ANYTHING BESIDE ITS BASE.
+
+  THIS BRANCH ADDS EXACTLY +4 TESTS.  That is invariant under landing order, and it is the
+  number this row is actually predicting:
+      +2  tests/w4_stale_branch_crosses_agents.rs      (integration, 2 plain #[test] fns)
+      +2  src/agent_sql/runtime.rs, mod tests          (chunk boundary; eviction order)
+
+WHY THIS IS BEING RESTATED. `d154-9637308` is in flight and predicts +6 on the same 2512 base.
+Two lanes, two correct predictions, ONE `main` -- and whichever lands second is wrong by the
+other's delta unless it re-derives. An absolute quoted without its base is not falsifiable; an
+absolute quoted WITH its base is, and a delta is falsifiable either way.
+
+PRE-REGISTERED, BOTH ORDERS, so that neither total can be chosen after the fact:
+
+  | what I land against                         | per-target passed |
+  |---------------------------------------------|-------------------|
+  | main = 3a9a5f9  (d154 NOT yet landed)       | 2516  = 2512 + 4  |
+  | main = 3a9a5f9 + d154's +6                  | 2522  = 2518 + 4  |
+
+  Any other number falsifies this row. In particular 2518 or 2520 would mean my own +4 is not
+  what I think it is, whatever d154 did.
+
+WHY THIS CANNOT SILENTLY GO WRONG, and why the table is belt-and-braces rather than the guard:
+`land-gate` step [2/3] is `staleness.sh`, asked LAST, against the commit the suite actually
+certified. If d154 lands while my run is queued or in flight, staleness reads STALE-GREEN and
+the gate REFUSES -- exactly as it did to my first run. So the base cannot move under a landing
+without the guard firing. The table above exists so that when it does fire, the number I re-derive
+was written down beforehand rather than computed to fit.
+
+⚠ AND THE INSTRUMENT THAT MISSED IT THE FIRST TIME, recorded so the next lane does not repeat it:
+`git fetch && git log origin/main` is the obviously correct base check AND IT IS WRONG HERE.
+`origin/main` is 14 commits behind local `main`; `cdf6434` is in the local ref and not in origin.
+Worktrees share one `.git`, and `land-gate` defaults to `main`, the shared LOCAL ref. A fetch
+cannot see a local commit and nothing warns. ⇒ COMPARE AGAINST LOCAL `main`, ALWAYS, and name the
+sha. `tools/staleness.sh . main HEAD` is free, takes no lock, and is the only check that answers
+this -- run it BEFORE spending a slot and again at the gate.
