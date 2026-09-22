@@ -889,18 +889,28 @@ impl State {
         // defect. Scanning the slot's own contiguous range is what replaces the collision, and it
         // is what maintains the one-workspace-per-slot invariant stated on `State::workspaces`
         // that `live_runs` and `forget_one_branch` both rest on.
+        // **Order: take the displaced ones out, put the new one IN, and only then release them.**
+        //
+        // Not cosmetic. `forget_captures_unless_published` reaches `capture_is_protected`, whose
+        // `debug_assert` compares `txn_refs` against a live scan of `workspaces` — and the new
+        // workspace's references were counted into `txn_refs` at the top of this function. Release
+        // before inserting and any txn held only by the incoming workspace reads as indexed but
+        // unscannable, which fires that assertion for a state that is in fact consistent. The
+        // slot-keyed map got this ordering free, because `BTreeMap::insert` put the new value in
+        // and handed the old one back in the same call; keying by `BranchId` split that into two
+        // steps, so the order has to be written down rather than inherited.
         let displaced: Vec<BranchId> = self
             .workspaces
             .range(BranchId::new(branch.id, 0)..=BranchId::new(branch.id, u32::MAX))
             .map(|(b, _)| *b)
             .collect();
-        for dead in displaced {
-            if let Some(old) = self.workspaces.remove(&dead) {
-                self.drop_txn_refs(&old);
-                forget_captures_unless_published(self, &old);
-            }
-        }
+        let olds: Vec<Workspace> =
+            displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
         self.workspaces.insert(branch, ws);
+        for old in olds {
+            self.drop_txn_refs(&old);
+            forget_captures_unless_published(self, &old);
+        }
         self.audit_txn_refs();
     }
 
@@ -7039,6 +7049,45 @@ mod tests {
         st.insert_workspace(BranchId::new(9, 0), ws("b_9", 300, &[]));
         st.insert_workspace(BranchId::new(9, 1), ws("b_9", 301, &[]));
         assert!(st.captures.contains_key(&300), "a PUBLISHED capture must survive the displacement");
+    }
+
+    /// **The new workspace is INSTALLED before the displaced one is released, not after.**
+    ///
+    /// `insert_workspace` counts the incoming workspace's txn references first, then has to let
+    /// the slot's previous occupant go. Release before installing and any txn the incoming
+    /// workspace holds reads as indexed while no workspace in the map carries it, so
+    /// `capture_is_protected`'s differential assertion fires on a state that is in fact
+    /// consistent — and in release builds, where that assertion is compiled out, the capture is
+    /// kept for the wrong reason.
+    ///
+    /// The slot-keyed map could not get this wrong: `BTreeMap::insert` installed the new value
+    /// and handed the old one back in ONE call. Keying by `BranchId` (D158 item 1) split that in
+    /// two, which turned a free property into a decision — so it gets an input that tells the two
+    /// orders apart, rather than a comment claiming the order is right.
+    ///
+    /// That input is a session forking into a recycled slot while INHERITING a txn the displaced
+    /// workspace owned, which is what makes the incoming workspace the only holder of it at the
+    /// moment of release. Measured: with the two steps swapped this test panics inside
+    /// `capture_is_protected` with "txn_refs disagrees with a scan of workspaces about txn
+    /// TxnId(100)". The discriminator is a `debug_assert`, as it is for the two door-audit tests
+    /// above, so this one discriminates in debug and merely holds in release.
+    #[test]
+    fn a_recycled_slot_installs_the_new_workspace_before_releasing_the_old() {
+        let mut st = State::default();
+        st.insert_workspace(BranchId::new(7, 0), ws("b_7", 100, &[]));
+        st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, BranchId::new(7, 0)));
+
+        // Slot 7 comes back, and the new session inherits txn 100 — the displaced workspace's own.
+        st.insert_workspace(BranchId::new(7, 1), ws("b_7", 200, &[100]));
+
+        assert!(
+            st.captures.contains_key(&100),
+            "txn 100 is still held by the workspace that just took the slot, so its capture must \
+             survive the displacement: {:?}",
+            st.captures.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(st.txn_refs.get(&100), Some(&1), "exactly the new workspace holds txn 100");
+        assert_eq!(st.workspaces.len(), 1, "one workspace per slot");
     }
 
     /// **The chunked reconciliation must visit EVERY workspace, across a chunk boundary.**
