@@ -1,3 +1,18 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+Same defect as `d55_after_quick.txt`, same harness: a `ServerContext` was built and the timed
+statements ran on `Session::new()`'s private in-memory runtime instead. The SHARED arm here was
+not shared, so the shared-vs-private gap this file reports is between two configurations that
+were both effectively private. The `timeout 2400` truncation this file already declares is a
+SECOND, unrelated limitation and still stands.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D55-AGENT-READ-PATH — BASELINE (before the pushdown fix)
 ========================================================
 [HERE] 2026-09-19, this session, 18-core box, release. Started at 1-min load 5.40 after waiting

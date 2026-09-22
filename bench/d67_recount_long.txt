@@ -1,3 +1,16 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+Same harness, same defect as `d67_merge_contention.txt`. The window-length argument this file
+makes — that 2-second windows gave too few applied merges to be outside Poisson — is a statistical
+point about the instrument and survives. The merges counted were against an in-memory stub.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D67-RECOUNT-LONG — the curve with ENOUGH EVENTS TO TRUST, corrected counter, medians of 3.
 
 WHY THIS EXISTS: the first recount used 2-second windows and produced 38-142 events per point and

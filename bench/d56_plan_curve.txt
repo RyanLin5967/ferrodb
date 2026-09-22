@@ -1,3 +1,22 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+`examples/d56_plan_curve.rs` built a `ServerContext` over a real `TableBranchCatalog` sidecar and
+then ran `measure()` on `Session::new()`. The `arm=agent` column therefore measured
+`BEGIN AGENT SESSION` and the staged reads against a private in-memory runtime, not against the
+branch catalog the harness opened on disk. The `arm=plain` column is UNAFFECTED: ordinary
+statements outside an agent session never touch the runtime.
+⚠ A LEDGER ROW WAS CLOSED ON THIS CURVE. `bench/d56_certified/` is a separate artifact and is
+NOT withdrawn by this correction — it records a per-target test suite (2105 passed, head=444f88d),
+which certifies the CODE CHANGE and never rested on this harness. What this correction reaches is
+the agent-arm half of the CURVE that motivated the row.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D56 — point-read throughput vs TABLE SIZE. The instrument is the SLOPE, not a ratio.
 [HERE] 2026-09-19T02:15:43Z  examples/d56_plan_curve.rs, one agent / one plain reader, staged=10
 FIX  = /Users/idide/wt/ferrodb-D56-statsless-index (aafe7ce, the unique-key fact)

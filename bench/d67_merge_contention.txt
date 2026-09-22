@@ -1,3 +1,23 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+`examples/d67_merge_contention.rs` built a `ServerContext` over `AgentRuntime::with_storage` (a
+real `ArenaPageStore`) and then ran every cycle on `Session::new()`. Every `BEGIN AGENT SESSION`,
+every staged write and every `MERGE` counted here ran against a private, in-memory, storage-less
+runtime created milliseconds earlier — no arena, no CoW pages, no reaper.
+⚠ SPECIFICALLY FATAL TO THE CONTENTION QUESTION THIS FILE ASKS. The predicted mechanism was
+shared-mutex contention (`Mutex<Catalog>` plus the `AgentRuntime`'s own state). With a private
+runtime per thread, the agent-side half of that contention DOES NOT EXIST in these numbers. The
+file's own header comment — "`with_storage`, NOT `with_catalog` — D67's first configuration was
+WRONG and the numbers are withdrawn" — was true of the `ServerContext` it built and false of the
+statements it timed. The configuration was fixed in one place and bypassed in another.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D67 — DOES CONCURRENT BRANCH MANAGEMENT SCALE? merges/sec against thread count.
 [HERE] 2026-09-20T15:28:03Z  examples/d67_merge_contention at 3cd3034
 load before: 21.83 13.31 8.84

@@ -1,0 +1,150 @@
+⛔⛔ THIS SWEEP IS VOID — DO NOT QUOTE ANY NUMBER FROM IT.
+Disk hit 0G during the run and every target/ on the box was deleted. D68 was SIGKILLed
+(rc=137) partway through its curve, D71 arm=PLAIN completed (rc=0), and the remaining
+eleven blocks exited rc=127 because their binaries no longer existed. The runner then
+printed 'ALL FIVE COMPLETE' over the top of them — a banner that was false when written.
+Kept as the record of that failure. The runner is gated on per-block rc as of this commit.
+Re-run: bench/d101_rerun.txt
+================================================================================
+================================================================================
+D101 RE-RUN — the five harnesses, on the runtime they build.
+[HERE] 2026-09-21T05:21:29Z  worktree=/Users/idide/wt/ferrodb-D101-stub-runtime-guard  sha=fc443c4
+ACQUIRED d101-rerun  load_at_acquire=27
+CAVEAT: load 27 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=27 beside it and say it is an upper bound.
+⚠ Durations are UPPER BOUNDS. Counters (fsyncs, bytes/fsync) are not.
+================================================================================
+
+#### D68 — merge latency vs TABLE SIZE at fixed delta (banked: bench/d68_merge_is_o_table.txt)
+# load before: 27.65 22.61 23.54
+# cmd: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d68_merge_is_o_table
+D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).
+One thread: no contention, so the slope is the merge's own cost.
+PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.
+
+delta (rows written per branch) = 4
+
+  table    n   total ms | begin ms  writes ms  MERGE ms | merge fsyncs  bytes/fsync
+           merge latency: first 2 = 59.970 ms, last 2 = 154.858 ms  -> 2.58x drift
+           CONTROL writes: first 2 = 30.356 ms, last 2 = 36.569 ms  -> 1.20x drift (this one must stay ~1.0 or the machine moved)
+    1000   25    100.093 |   12.508     36.445    48.008 |         1.12        946.9
+           merge latency: first 2 = 46.448 ms, last 2 = 24.656 ms  -> 0.53x drift
+           CONTROL writes: first 2 = 35.172 ms, last 2 = 36.111 ms  -> 1.03x drift (this one must stay ~1.0 or the machine moved)
+    2000   25     78.882 |   10.222     29.463    38.718 |         1.00       1053.0
+         ^ 2.0x rows -> 0.79x TOTAL, 0.81x MERGE
+           merge latency: first 2 = 66.639 ms, last 2 = 94.211 ms  -> 1.41x drift
+           CONTROL writes: first 2 = 125.678 ms, last 2 = 107.944 ms  -> 0.86x drift (this one must stay ~1.0 or the machine moved)
+    4000   25    194.977 |   16.362     70.643    87.852 |         1.00       1053.0
+         ^ 4.0x rows -> 1.95x TOTAL, 1.83x MERGE
+# rc=137  elapsed=278s
+# load after: 16.15 20.89 22.77
+
+#### D71 arm=PLAIN — ordinary UPDATE (banked: bench/d71_point_update_curve.txt)
+# load before: 16.15 20.89 22.77
+# cmd: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d71_point_update_curve
+D71 — point UPDATE on the primary key: descent or scan?
+at fc443c437027
+arm = PLAIN, 60 updates per size
+
+  table rows   median ms   ms per 1000 rows   fsyncs/update
+        1000      13.926            13.9256            1.03
+        2000      15.885             7.9425            1.03
+             ^ 2.0x the rows, 1.14x the time
+        4000      15.985             3.9962            1.00
+             ^ 4.0x the rows, 1.15x the time
+        8000      14.043             1.7554            1.00
+             ^ 8.0x the rows, 1.01x the time
+       16000      12.249             0.7655            1.00
+             ^ 16.0x the rows, 0.88x the time
+
+FLAT median ms  -> a DESCENT (O(log N), the index is used).
+LINEAR median ms -> a SCAN (O(N)); flat 'ms per 1000 rows' is the signature.
+# rc=0  elapsed=442s
+# load after: 10.77 12.63 17.62
+
+#### D71 arm=STAGED — the same UPDATE inside an agent session
+# load before: 10.77 12.63 17.62
+# cmd: D71_ARM=staged /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d71_point_update_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d71_point_update_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D67 — merges/sec vs thread count (banked: bench/d67_merge_contention.txt)
+# load before: 10.39 12.52 17.55
+# cmd: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d67_merge_contention
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d67_merge_contention: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D55 QUICK shared arm staged=10 (banked: bench/d55_after_quick.txt, AFTER column)
+# load before: 10.39 12.52 17.55
+# cmd: D55_QUICK=1 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d55_agent_read_scaling
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d55_agent_read_scaling: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r1 rows=1000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=1000 D56_STAGED=10 D56_LABEL=r1 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=1s
+# load after: 10.39 12.52 17.55
+
+#### D56 r1 rows=4000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=4000 D56_STAGED=10 D56_LABEL=r1 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r1 rows=16000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=16000 D56_STAGED=10 D56_LABEL=r1 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r2 rows=4000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=4000 D56_STAGED=10 D56_LABEL=r2 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r2 rows=16000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=16000 D56_STAGED=10 D56_LABEL=r2 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r2 rows=1000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=1000 D56_STAGED=10 D56_LABEL=r2 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r3 rows=16000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=16000 D56_STAGED=10 D56_LABEL=r3 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r3 rows=1000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=1000 D56_STAGED=10 D56_LABEL=r3 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### D56 r3 rows=4000 (banked: bench/d56_plan_curve.txt, FIX rows)
+# load before: 10.39 12.52 17.55
+# cmd: D56_ROWS=4000 D56_STAGED=10 D56_LABEL=r3 D101 /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve
+env: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d56_plan_curve: No such file or directory
+# rc=127  elapsed=0s
+# load after: 10.39 12.52 17.55
+
+#### ALL FIVE COMPLETE 2026-09-21T05:33:30Z

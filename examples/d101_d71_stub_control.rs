@@ -1,3 +1,23 @@
+//! D101 CONTROL — the PRE-D101 d71 harness, byte-for-byte, built against TODAY'S engine.
+//!
+//! **Why this file exists.** The banked benchmarks were produced ~60 commits ago, so a raw
+//! old-vs-new delta conflates the configuration fix with every engine change in between —
+//! including D71's own predicate pushdown, which deliberately changed one of these curves. A
+//! comparison against the banked numbers therefore cannot say what the STUB CONFIGURATION cost.
+//!
+//! This is the control that can. It is `examples/d71_point_update_curve.rs` exactly as it stood
+//! at `fc443c4^` (no `AgentRuntime`, no `ServerContext`, every statement on `Session::new()`'s
+//! private in-memory runtime with `storage: None`), compiled against the SAME lib as the fixed
+//! harness. Run the two back to back and the only difference is the configuration.
+//!
+//! ⚠ It is NOT refused by `agent_sql::designated`, and that is by design rather than by oversight:
+//! it builds no `ServerContext`, so nothing in the process is designated and there is no
+//! contradiction to detect. That is the blind spot the guard's own module doc states. The four
+//! harnesses that DID build a `ServerContext` cannot be reproduced this way — the guard refuses
+//! them, which is the whole point of it.
+//!
+//! ⛔ NOT A RESULT ON ITS OWN. Only the paired difference against
+//! `examples/d71_point_update_curve.rs`, run on the same box in the same window, means anything.
 //! D71 — is `UPDATE t SET v = ? WHERE id = <primary key>` a DESCENT or a SCAN?
 //!
 //! This is the wall D68/D69 spent three rows attributing to the merge. `bench/d69_fsync_counted.txt`
@@ -25,47 +45,25 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::branch::arena::ArenaPageStore;
-use ferrodb::branch::table_catalog::TableBranchCatalog;
-use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::cow::PageStore;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
-use ferrodb::pgwire::ServerContext;
 use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::tel::MemEffectLog;
 use ferrodb::wal::log::{fsync_counters, WalManager};
 use ferrodb::wal::txn::TxnManager;
 
-/// ⛔ **D101 — WHAT THE FIRST VERSION OF THIS HARNESS MEASURED, AND WHY IT IS NOT WHAT IT SAID.**
-///
-/// The banked run in `bench/d71_point_update_curve.txt` built NO `AgentRuntime` at all. It ran
-/// every statement on `Session::new()`, which quietly constructs `AgentRuntime::new()` —
-/// `with_catalog(LogBranchCatalog::in_memory(..))`, so `storage: None`, no `ArenaPageStore`, no
-/// CoW pages, no reaper, and a private in-memory effect log (`execution/session.rs:20`).
-///
-/// That is a real path, but it is NOT the path the shipped engine takes. `src/cli/cli.rs` builds
-/// `with_storage`/`reopen_with_storage` over an `ArenaPageStore`, so the STAGED arm's "agent
-/// staging path" was the in-memory overlay rather than the arena the product actually writes to.
-/// The PLAIN arm was unaffected — ordinary DML never touches the runtime — which is exactly why
-/// the defect was invisible: one arm of a two-arm comparison silently changed meaning.
-///
-/// This is the `d90_delta_vs_chunk` / `cli.rs` wiring: a real branch-catalog sidecar, a real
-/// arena, a `ServerContext` that designates the runtime, and every session built from it.
 struct Db {
-    ctx: Arc<ServerContext>,
+    catalog: Catalog,
     bp: Arc<BufferPoolManager>,
     txn: Arc<TxnManager>,
     _dir: tempfile::TempDir,
 }
 
 impl Db {
-    fn new(rows: i64) -> Self {
+    fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
@@ -75,46 +73,21 @@ impl Db {
         let wal = Arc::new(WalManager::new(dir.path().join("p.wal")).unwrap());
         let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
         bp.attach_wal(wal);
-        let cat = Arc::new(TableBranchCatalog::open_sidecar(&dir.path().join("b.branchcat"), 1).unwrap());
-        let branches: Arc<dyn BranchCatalog> = cat;
-        // The arena floor must sit ABOVE where the ordinary table grows to, or the build runs out
-        // of pages below the reserved region. Sized off the row count for the reason D90 records:
-        // a copied constant fails as a mid-run allocation error at the largest size only.
-        let arena_base: u32 = ((rows / 40) as u32 + 4096).next_power_of_two();
-        let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), arena_base).unwrap());
-        // `cli.rs:120` does this, so the measured configuration matches the shipped one. ⚠ It can
-        // only ADD cost to a staged write (the free-space map is persisted rather than dropped),
-        // never remove it, so it cannot flatter the STAGED arm this harness is testing.
-        store.checkpoint_to(dir.path().join("p.arena"));
-        let runtime = Arc::new(
-            AgentRuntime::with_storage(
-                branches,
-                Arc::new(MemEffectLog::new()),
-                store as Arc<dyn PageStore>,
-            )
-            .expect("attach arena storage"),
-        );
-        let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
-        Db { ctx, bp, txn, _dir: dir }
+        Db { catalog, bp, txn, _dir: dir }
     }
     fn exec(&mut self, sql: &str, s: &mut Session) -> Outcome {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
         let mut stmts = p.parse();
         assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
-        let mut cat = self.ctx.catalog();
-        let out = run(stmts.remove(0), &mut cat, self.bp.clone(), self.txn.clone(), s);
-        drop(cat);
-        out.unwrap_or_else(|e| panic!("{sql}: {e}"))
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), s)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 }
 
 fn build(rows: i64) -> (Db, Session) {
-    let mut db = Db::new(rows);
-    // `ctx.session()`, never `Session::new()` — see the block on `Db`. Both this session and the
-    // agent session in `main` now come from the same designated runtime, which is what
-    // `src/pgwire/mod.rs` does for every connection.
-    let mut s = db.ctx.session();
+    let mut db = Db::new();
+    let mut s = Session::new();
     db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut s);
     for i in 1..=rows {
         db.exec(&format!("INSERT INTO t VALUES ({i}, 0);"), &mut s);
@@ -142,7 +115,7 @@ fn main() {
     let mut first: Option<(i64, f64)> = None;
     for &rows in &sizes {
         let (mut db, mut s) = build(rows);
-        let mut a = db.ctx.session();
+        let mut a = Session::new();
         if staged {
             db.exec("BEGIN AGENT SESSION AS 'd71';", &mut a);
         }

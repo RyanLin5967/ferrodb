@@ -1,3 +1,24 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+`examples/d55_agent_read_scaling.rs` built a `ServerContext` over an `AgentRuntime::with_catalog`
+on a real `TableBranchCatalog` sidecar, and then ran every statement on `Session::new()` — which
+constructs its OWN `AgentRuntime::new()`: an in-memory branch catalog, `storage: None`, a private
+effect log and private branch state. So the SHARED arm was NOT shared: each of the N threads had
+its own private runtime, and the `ONE ServerContext` label describes a context none of the timed
+statements consulted.
+⚠ THIS IS LOAD-BEARING FOR THIS FILE SPECIFICALLY. The whole point of the shared arm is
+contention on one `AgentRuntime`'s `Mutex<State>`; with a private runtime per thread there is no
+such contention, so the scaling shown here is closer to the PRIVATE control than to the shared
+arm it is labelled as. The x1.44-at-1-thread reading, and the honest note that the pushdown
+bought far less than expected, are unaffected — they are single-threaded.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D55 — AFTER the predicate pushdown, quick mode (shared arm, staged=10). ⛔ NOT WHAT WAS CLAIMED.
 =================================================================================================
 [HERE] 2026-09-19, this session, same box, same harness block as the baseline.

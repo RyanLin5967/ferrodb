@@ -405,6 +405,15 @@ pub fn run_agent_stmt(
     session: &mut Session,
 ) -> Result<Outcome, FerroError> {
     let runtime = session.runtime.clone();
+    // D101 — refuse a statement that is about to run on a runtime this process did not designate.
+    //
+    // This is the ONE place it is checked, and it is checked here because this function is the
+    // gateway: `session.agent` can only be set by the `BeginAgentSession` arm below, and
+    // `executor::run` routes to `run_in_session` and `run_agent_alter` only when it is already set
+    // (`execution/executor.rs:166`). An `AS OF BRANCH` read with no session open also arrives here.
+    // So nothing reaches the agent layer without passing through this line, and a second check
+    // downstream would only mask mutants of this one.
+    crate::agent_sql::designated::check(&runtime)?;
     let current = session.agent.as_ref().map(|a| a.branch);
     let bound = Binder::new(catalog).bind_agent(&stmt, runtime.as_ref(), current)?;
     let mut ctx = ExecCtx { catalog, bp, txn };

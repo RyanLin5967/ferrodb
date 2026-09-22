@@ -1,3 +1,21 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+Same harness, same defect as `d71_point_update_curve.txt`: no `AgentRuntime` and no
+`ServerContext` were built, so BOTH the BEFORE and the AFTER arms of this A/B ran the staged path
+against `Session::new()`'s in-memory overlay rather than the arena the product ships.
+⚠ READ THIS ONE CAREFULLY. Because both arms share the defect, the A/B is INTERNALLY consistent
+and the direction of the effect (the predicate pushdown removes the table-size term) is the kind
+of claim a shared-defect A/B can still support. What it CANNOT support is that the fix delivers a
+descent ON THE SHIPPED PATH: the arena write path was never in either arm. The 0.013 ms AFTER
+figure is a number from the overlay, not from the engine.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D71 FIX — THE AGENT WRITE PATH GOES FROM O(table) TO A DESCENT. A/B, INTERLEAVED, 3 PAIRS.
 
 [HERE] `examples/d71_point_update_curve.rs`, staged arm, 60 updates per size, keys spread across
