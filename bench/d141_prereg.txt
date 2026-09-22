@@ -1,0 +1,47 @@
+D141 SUITE PRE-REGISTRATION — written BEFORE the run, amendments append-only
+============================================================================
+
+worktree: /Users/idide/wt/ferrodb-d141-catalog-narrowing
+branch:   d141-catalog-narrowing
+base:     92f8a17 (main)
+head at pre-registration: 2f06f96
+
+BASELINE, and where it comes from
+---------------------------------
+2476 passed, mode=per-target, at 98a44ef — bench/land98a44ef_certified/SUMMARY.txt,
+quoted verbatim from that runner's own stdout. Not re-measured by me.
+
+That certification is 3 commits behind my base. `git diff 98a44ef..92f8a17 -- src tests`
+touches examples/d130_pgwire_batch.rs and src/branch/table_catalog.rs and adds
+`0` lines matching `^+.*#\[test\]`, so the baseline carries forward to 92f8a17 unchanged.
+
+Go suite baseline: 97 passed (same SUMMARY.txt). I touched no Go files, so it must not move.
+
+WHAT I ADDED
+------------
+src/catalog/catalog_page.rs, mod tests — 7 tests before, 11 after: +4
+  a_name_too_long_for_its_length_field_never_yields_a_page_that_misparses_the_next_entry
+  a_long_name_s_own_bytes_are_not_parsed_as_catalog_entries
+  every_length_prefix_refuses_the_first_value_it_cannot_express
+  the_largest_value_each_prefix_can_express_still_round_trips
+
+tests/d141_long_identifier.rs — new file: +4
+  a_three_hundred_byte_table_name_does_not_corrupt_the_catalog
+  a_refused_create_table_does_not_wedge_the_next_one
+  many_refused_statements_leave_the_database_working
+  the_longest_expressible_table_name_still_works_from_sql
+
+PRE-REGISTERED EXPECTATION
+--------------------------
+  2476 + 8 = 2484 passed, 0 failed, mode=per-target
+  Go: 97 passed, 0 failed
+
+A count that is not 2484 is a result about this change, not a rounding error, and is to be
+explained before anything is called green. In particular 2476 would mean the new tests were
+not collected at all.
+
+KNOWN INTERMITTENT, DECIDED IN ADVANCE
+--------------------------------------
+branch::reaper::tests::…a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+("fixture: nothing was ever checkpointed") is a known flake unrelated to this change — D139.
+If it is the ONLY failure, re-run. Any other failure is mine until shown otherwise.
