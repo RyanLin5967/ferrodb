@@ -902,8 +902,18 @@ mod tests {
     #[test]
     fn a_fast_path_reap_reaches_the_durable_map_not_just_memory() {
         let (h, reaper) = setup();
-        let path = std::env::temp_dir()
-            .join(format!("ferro-reap-ckpt-{}.bin", std::process::id()));
+        // **`$modname` in the name, because `reaper_suite!` generates this test TWICE** — once
+        // per catalog — and both copies run in the same process at the same time. Without it
+        // they shared one file: each one's opening `remove_file` deleted the other's checkpoint
+        // mid-test. That was invisible while every durable write was a create-or-replace, and
+        // D81 made it visible, because an append to a file another test has just unlinked is
+        // ENOENT (deliberately — see `OsFileOps::append`). Measured: 3/3 parallel runs failed,
+        // `--test-threads=1` passed. The assertions below are unchanged; only the collision is.
+        let path = std::env::temp_dir().join(format!(
+            "ferro-reap-ckpt-{}-{}.bin",
+            stringify!($modname),
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
@@ -978,8 +988,14 @@ mod tests {
     #[test]
     fn a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map() {
         let (h, reaper) = setup();
-        let path = std::env::temp_dir()
-            .join(format!("ferro-slow-reap-ckpt-{}.bin", std::process::id()));
+        // Same collision as `a_fast_path_reap_reaches_the_durable_map_not_just_memory` above,
+        // fixed the same way: two generated copies, one filename. This one had not been seen to
+        // fail, which is a statement about scheduling luck rather than about the fixture.
+        let path = std::env::temp_dir().join(format!(
+            "ferro-slow-reap-ckpt-{}-{}.bin",
+            stringify!($modname),
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
