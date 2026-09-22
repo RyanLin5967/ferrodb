@@ -1,9 +1,17 @@
 # D113 — a refused cell insert left the node compacted and unstamped
 
 Branch `D113-compact-refusal`, worktree `/Users/idide/wt/ferrodb-D113-compact-refusal`,
-rebased onto `6feb006` (main tip after D105-diff-memo, D99-statement-walls, D94-dedup).
-All numbers below are from the battery at `3f680f9`; raw log `bench/d113_battery.log`, and the
-earlier pre-rebase run is kept as `bench/d113_battery_d6771d8.log`.
+rebased onto `8249c50`. The full battery (all four arms, including the fire-check) ran at
+`3f680f9` — raw log `bench/d113_battery.log`, earlier pre-rebase run kept as
+`bench/d113_battery_d6771d8.log`. `8249c50` touches neither `src/cow` nor `src/branch`, and the
+cow suite was re-confirmed after the rebase:
+
+```
+=== cargo test --lib cow @ d5ced61 ===
+test result: ok. 163 passed; 0 failed; 1 ignored; 0 measured; 1447 filtered out; finished in 28.28s
+```
+
+`d5ced61` is the code tip that green names. Only this file changes above it.
 
 ## The defect, as confirmed
 
