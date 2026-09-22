@@ -8,6 +8,15 @@ raw:     bench/d94_sweep_main.txt + bench/d94_sweep_main_10k.txt  (CURRENT MAIN,
          bench/d94_zero_falsifier.txt (the 0 at dup_frac=0.00, forced to fire at k=1,2,3)
 built by: bench/d94_summarise.py -- every number here is read from a raw run, not retyped
 
+PROVENANCE, because an old copy of this file is still out there and reads plausibly.
+  Every figure below was produced on CURRENT MAIN, at the stamps named above.
+  An EARLIER version carried different figures: trunk 101 pages, 9 pages per branch,
+  and 79.1% saving at dup_frac=1.00. Those were measured on branch D94-dedup at tip
+  ed6566e (harness builds 48c6e60 and 808273c) against base 8d79ee5, BEFORE D108
+  neighbour merge and the chunking work added 1357 lines to src/cow/btree.rs. They
+  are superseded, not wrong-at-the-time: they described the tree that existed then.
+  If you hold a copy quoting 79.1% or 9 pages/branch, it predates that move.
+
 VERDICT: REFUSE. The mechanism is built and tested; it is NOT adopted and NOT wired into
 any write path. The deciding result is not that dedup wins too little -- it is that the
 frontier's mechanism CANNOT FIRE IN THIS ENGINE AT ALL, and that this is deliberate:
@@ -97,6 +106,28 @@ TWO RESULTS, and the first one is the one that matters most:
     branches writing DIFFERENT content, which is what independent agents do -- it is
     EXACTLY ZERO at every N. Not small: zero.
 
+(c) AND THAT ZERO WAS FORCED TO FIRE BEFORE IT WAS BELIEVED. A detector that has never
+    produced a non-zero result is indistinguishable from one that cannot. So the smallest
+    signal the workload can carry was planted deliberately -- k of the 8 rows per branch
+    made identical across branches -- and the gain must come back as exactly k*(N-1) pages
+    at N=100. Raw: bench/d94_zero_falsifier_main.txt
+    falsifier built d28191e92c5f
+    NOTE: the falsifier and the sweep were built at DIFFERENT commits; both are
+    named so the reader can check the delta rather than assume they agree. The only
+    delta on the measurement path is src/cow/diff.rs, which the harness does not use,
+    and bench/d94_sweep_recheck_main.txt re-runs the N=100 sweep row at the falsifier's
+    own commit and reproduces it exactly, which closes the gap.
+
+      k     dup_frac  gain (pages)   k*(N-1)        
+      0        0.000             0         0  MATCH   
+      1        0.120            99        99  MATCH   
+      2        0.250           198       198  MATCH   
+      3        0.380           297       297  MATCH   
+
+    Every row matches k*(N-1) with no slack, down to k=1. The instrument resolves a
+    SINGLE duplicated page per branch, so the 0 at dup_frac=0.00 is a measurement and
+    not a detector that never ran.
+
 -- THE SWEEP: bytes stored with and without dedup, and the SLOPE --
 
   branches   dup     stored today B        deduped B    saving
@@ -152,12 +183,16 @@ the result that is STRUCTURAL from the part that was arithmetic about a tree sha
 
 READ THIS CAREFULLY, because the two halves point opposite ways:
 
-  STRUCTURAL, unchanged: distinct pages == distinct whole in every row of BOTH sweeps,
+  THE DURABLE HALF -- structural, unchanged, safe to cite without a commit:
+  distinct pages == distinct whole in every row of BOTH sweeps,
   and the dedup gain is 0 at dup_frac=0.00 and exactly k*(N-1) otherwise, in BOTH. The
   reason is that src/cow/page_header.rs is BYTE-IDENTICAL across the 147 commits -- same
-  24 bytes, same offsets. The finding rests on the page format, so it survived.
+  24 bytes, same offsets. That was CHECKED by diffing the mechanism, not inferred
+  from the number still looking plausible. Re-reading a number cannot tell you which
+  half you are holding; diffing the thing it rests on can.
 
-  ARITHMETIC, moved: the tree got denser per branch. A branch now costs 14 pages where
+  THE PERISHABLE HALF -- arithmetic about a tree shape, and it MOVED. Never cite
+  these without naming the commit. A branch now costs 14 pages where
   it cost 9, and the floor dedup cannot go below rose from 1 page/branch to 6. So the
   headline saving at dup_frac=1.00 fell from 79.1% to 43.4% at N=100.
 
