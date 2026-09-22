@@ -41,3 +41,13 @@ misplaces the boundary. The harness now stamps **each rep with wall-clock UTC in
 so any declaration arriving later can be intersected with the data exactly, by anyone, without
 re-deriving it. A derived quantity standing in for a recorded one is the same defect as section 0's
 reciprocal, in a different costume.
+
+⚠ AND THE `# other cargo/rustc/suite at acquire:` BLOCK IN EACH ARM OVER-REPORTS. It is a
+`pgrep -fl 'cargo|rustc|verify-suite'`, which matches any shell whose command line merely CONTAINS
+those strings — including this row's own polling shells, which carry
+`export PATH="$HOME/.cargo/bin:$PATH"`. So entries there are an UPPER BOUND on what was building,
+not a list of builders, and a reader should check `ppid`/`command` before counting one. This is the
+same `pgrep -f` self-match that broke a wait loop in this row earlier; it is harmless here because
+the block is a record rather than a gate, but a record that over-reports in the direction of "the
+box was busy" would make a clean arm look dirty, which is the expensive direction for this artifact.
+The trustworthy quantity in that header is `load_at_acquire`, which is not pattern-matched.
