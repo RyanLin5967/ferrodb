@@ -7041,6 +7041,56 @@ mod tests {
         assert!(st.captures.contains_key(&300), "a PUBLISHED capture must survive the displacement");
     }
 
+    /// **The chunked reconciliation must visit EVERY workspace, across a chunk boundary.**
+    ///
+    /// `forget_reaped_branches` walks `workspaces` `FORGET_CHUNK` at a time, releasing the state
+    /// lock between chunks and resuming from the last key it saw. D158 item 1 changed that key
+    /// from a `u64` slot to a `BranchId`, which changed how the cursor resumes: `key + 1` has no
+    /// meaning at the top of the generation space, so it is an EXCLUDED bound now. An off-by-one
+    /// there either skips workspaces — the unbounded growth this function exists to prevent — or
+    /// loops for ever on one key.
+    ///
+    /// **Nothing in the suite crossed that boundary.** Every other fixture that reaches this
+    /// function holds a handful of sessions, so the multi-chunk path ran zero times and a broken
+    /// cursor would have been invisible. That is what this test is for, and it lives in this
+    /// module rather than in `tests/` for one reason: `FORGET_CHUNK` is in scope here, so the
+    /// fixture is sized **by the constant**. A literal `1025` in an integration test silently
+    /// stops crossing the boundary the day the constant grows, which is the one way this could
+    /// pass while testing nothing.
+    #[test]
+    fn the_reconciliation_crosses_its_chunk_boundary_and_forgets_every_branch() {
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let rt = AgentRuntime::with_catalog(Arc::clone(&catalog) as Arc<dyn BranchCatalog>);
+
+        // One more than a chunk, so the walk must resume at least once.
+        let n = FORGET_CHUNK + 1;
+        let mut opened: Vec<BranchId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = rt
+                .begin_session("chunky", Some(&format!("r{i}")), BranchId::TRUNK)
+                .expect("fork");
+            opened.push(s.branch);
+        }
+        assert_eq!(rt.state.lock().unwrap().workspaces.len(), n, "fixture did not open n sessions");
+
+        // Reaped behind the runtime's back, which is what the reconciliation exists to notice.
+        // The slots are deliberately NOT released: recycling is a different property, tested in
+        // `tests/w4_sweep_slot_recycle.rs`, and releasing here would let a later fork displace a
+        // workspace this walk is supposed to find.
+        for b in &opened {
+            let rec = rt.branches().get(*b).expect("live before the reap");
+            rt.branches().set_state(*b, rec.state, BranchState::Reaped).expect("mark reaped");
+        }
+
+        assert_eq!(
+            rt.forget_reaped_branches(),
+            n,
+            "the walk must forget every branch it was left holding, not one chunk's worth"
+        );
+        let left = rt.state.lock().unwrap().workspaces.len();
+        assert_eq!(left, 0, "{left} workspaces survived a full reconciliation");
+    }
+
     fn applied_at(seq: u64) -> AppliedOp {
         AppliedOp {
             seq,
