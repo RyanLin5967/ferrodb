@@ -1112,3 +1112,66 @@ fn d127_a_capped_refusal_report_still_states_the_true_count() {
         "the cap did not actually cap anything, so this test proves nothing about it:\n{text}"
     );
 }
+
+/// **D127 — the OTHER caller shape: `Reaper::reap_expired` has no reporter, and must still not
+/// lose a refusal.**
+///
+/// `scan_once` runs the two halves of a sweep itself and prints; the trait's whole-sweep method
+/// runs them back to back and hands back only *the branches it reaped*. A refusal is by
+/// construction not one of those, and there is nowhere in `Result<Vec<BranchId>>` to put it — so
+/// this is the call shape where the row's defect could quietly survive its own fix.
+///
+/// It does not, because the counter lives at the refusal SITE (`TwoTierReaper::refuse`) rather
+/// than in each caller, which is the part of the design that was argued in a comment and pinned
+/// nowhere. **This test is that pin.** A counter moved into `scan_once` — the obvious tidier
+/// shape, and the one a future reader is most likely to reach for — passes every other D127 test
+/// in this file and fails here.
+///
+/// The reaped branch is the anti-vacuity control: a sweep that refused on everything, or that
+/// aborted on the first refusal, fails on it rather than on the counter.
+#[test]
+fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&refusing) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+
+    let doomed = branch_with_pages(&f, EXPIRED, 3);
+    let corrupt = branch_with_pages(&f, EXPIRED, 3);
+    let with_both = f.h.store.live_page_count().unwrap();
+    refusing.arm(corrupt.id);
+
+    let before = reaper.refused_reaps();
+    let reaped = reaper.reap_expired(LeaseDeadline::now_millis()).expect(
+        "a refusal must not be propagated as a sweep error: one odd branch stopping the sweep is \
+         strictly worse than the silent leak D127 fixes",
+    );
+
+    assert_eq!(
+        reaper.refused_reaps(),
+        before + 1,
+        "the trait sweep dropped a refusal. It has no reporter and its return type has no room \
+         for one, so this counter — incremented where the refusal is PRODUCED, not where it is \
+         consumed — is the only thing standing between this call shape and the original defect."
+    );
+    assert_eq!(
+        reaped,
+        vec![doomed],
+        "exactly one of the two expired branches was reapable, and the sweep must have gone on \
+         past the refused one to reach it"
+    );
+    assert!(
+        f.h.store.live_page_count().unwrap() < with_both,
+        "the healthy branch's pages did not come back, so the refusal aborted the reclamation"
+    );
+    assert_eq!(
+        state_of(&f, corrupt),
+        BranchState::Reaping,
+        "a refusal must free nothing. `reap` publishes Live -> Reaping before it consults \
+         has_live_children, so this branch is mid-reap and keeps every page — which is the safe \
+         direction, and is also why the lease thread cannot see it again: expired_before is \
+         Live-only and resume_interrupted_reaps runs at open, not per tick."
+    );
+}
