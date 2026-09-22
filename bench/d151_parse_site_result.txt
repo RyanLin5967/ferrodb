@@ -1,0 +1,74 @@
+D151 — THE PARSE-SITE ANNOUNCEMENT IS GONE. EVERY CELL LANDED ON THE PRE-REGISTRATION.
+=======================================================================================
+
+Pre-registration: bench/d151_parse_site_prereg.txt, committed at 5bf89a4 (the row) and 42dc3f8
+(amendment 2, the exact integers) BEFORE the first arm was run.
+Raw artifacts:    bench/d151_e6_before.txt, bench/d151_e6_after.txt — the harness's own stdout,
+                  unedited, each carrying its own timestamp and its own instrument self-check.
+Instrument:       examples/e6_outer_lock_count.rs under --features lock_census. A COUNT, not a
+                  timing. No duration appears anywhere in this file.
+Bases:            BOTH arms built from `main`'s tip 2a0a8fc + the instrument commit ed598e4,
+                  cherry-picked identically. The AFTER arm is that plus the D151 commit and
+                  nothing else. One instrument, one box, one afternoon, two builds.
+
+THE TABLE. Pre-registered value in brackets; every one of the sixteen cells matched.
+---------------------------------------------------------------------------------------
+  arm                        T   forks    BEFORE    AFTER          DROP    per-fork before/after
+  A1 pgwire, persistent conn  1       8      33        17  [17]      16         4.125 -> 2.125
+  A1 pgwire, persistent conn  4      32     132        68  [68]      64         4.125 -> 2.125
+  A1 pgwire, persistent conn 16     128     528       272 [272]     256         4.125 -> 2.125
+  A1 pgwire, persistent conn 64     512    2112      1088 [1088]   1024         4.125 -> 2.125
+  A2 pgwire, conn per fork    1       8      24        16  [16]       8         3.000 -> 2.000
+  A2 pgwire, conn per fork    4      32      96        64  [64]      32         3.000 -> 2.000
+  A2 pgwire, conn per fork   16     128     384       256 [256]     128         3.000 -> 2.000
+  A2 pgwire, conn per fork   64     512    1536      1024 [1024]    512         3.000 -> 2.000
+  A0 CONTROL, SELECT 1      all       --       0         0   [0]       0        CONTROL, unmoved
+  B  CONTROL, direct fork   all       --       0         0   [0]       0        CONTROL, unmoved
+
+  A1+A2 over the sweep:  4845 -> 2805.  DROP 2040, which is 42.1% of this harness's announcements.
+  Instrument self-check passed in BOTH arms: one explicit ctx.catalog() moved the census by
+  exactly 1, so neither zero above is a silent counter.
+
+WHAT MAKES THIS CHECKABLE RATHER THAN PLAUSIBLE
+-----------------------------------------------
+1. THE BEFORE ARM REPRODUCES A NUMBER I DID NOT PRODUCE. bf1834a banked 33/132/528/2112 and
+   24/96/384/1536 on base ee24331. My BEFORE arm, on base 2a0a8fc — 35 commits later — returned
+   the same sixteen integers. The disagreement that would have voided everything downstream did
+   not happen, and it was checked FIRST.
+2. TWO CONTROLS, BOTH STILL ZERO. Arm B never constructs a `ServerContext`; arm A0's `SELECT 1`
+   is answered by `session::parse` as a liveness probe and never reaches either catalog site. A
+   change that moved either would be reaching somewhere it has no business reaching.
+3. THE RESIDUAL IS ZERO PER SITE, NOT JUST IN TOTAL. bf1834a attributed every BEFORE acquisition
+   to three sites: (i) `parse_one`, (ii) `read_catalog`'s stale-snapshot refresh, (iii) the
+   exclusive execute arm. D151 removes (i) and only (i), so:
+     A2 after = (ii) + (iii) = 2 per fork.                        Measured 2.000, at every T.
+     A1 after = 2 statements x (iii) + (ii) once per connection
+              = (16 x 1 + 1) per connection = 17T.                Measured 17T, at every T.
+   The per-fork constants do not move by a thousandth from T=1 to T=64, before or after.
+
+⚠ WHAT THIS MEASUREMENT DOES NOT SHOW, AND THE PRE-REGISTRATION SAID TO SAY SO
+------------------------------------------------------------------------------
+P3 predicted the drop might EXCEED the per-statement amount at T>1, because a parse-time
+announcement drains readers on other connections and pushes them onto the exclusive execute path,
+where they announce in turn. **That extra drop is exactly zero here, and the reason is the
+harness, not the change.** Every statement in arms A1 and A2 is `BEGIN AGENT SESSION` or
+`ABANDON`; neither is a read, so `try_run_read` answers `None` for both and they take the
+exclusive path regardless. There was never a shared-path read in flight for a parse-time
+announcement to stand down. **P3 was untestable on this harness, not falsified**, and this file
+claims nothing about it. Measuring it needs a concurrent arm with real readers, which E.6 does
+not have and which this row did not build.
+
+The code fact that is NOT a measurement, stated as such: a statement that only reads now takes
+the exclusive lock at neither parse nor execute. Before D151 it took it once, at parse, however
+pure a reader it was. That is visible in the diff; it is not what the table above measures,
+because this harness runs no such statement outside the A0 control.
+
+⚠ SCOPE — BOTH HALVES, ALWAYS TOGETHER. THE 42.1% ABOVE IS NOT THE HEADLINE NUMBER.
+------------------------------------------------------------------------------------
+42.1% is this harness's figure, and this harness is 100% non-probe statements on a fork-dense
+workload — the friendliest possible population for a per-statement removal. THE RECORDED FIGURE
+FOR THE DECIDING ARM IS ~25% OF ANNOUNCEMENTS: 1,604 of 6,369. Quote that one.
+
+And with it, always: this is **NOT a W4 rescue**, and it moves a system **already pinned against
+its ceiling at high fork rates** — it is worth several times as much one decade of fork rate away
+than it is here. A number from this file quoted without that sentence is misleading.

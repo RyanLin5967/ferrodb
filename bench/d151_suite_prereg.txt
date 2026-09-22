@@ -1,0 +1,32 @@
+D151 — SUITE PRE-REGISTRATION. Written before `tools/verify-suite.sh` was invoked.
+
+MODE:     per-target (VERIFY_MODE=per-target). Quoted with the mode, because `whole` and
+          `per-target` are not the same number: `whole` = `per-target` + 2 doctests, and mixing
+          them manufactures a phantom regression. This file's number is a PER-TARGET number.
+
+BASE:     `main` tip 2a0a8fc, whose bank (bench/land-2655e3b_certified) records
+          `suite per-target rc=0 passed=2508 failed=0 head=b17ec58`.
+
+DIFF:     bench/ text plus src/pgwire/extended.rs and src/pgwire/mod.rs. No file under tests/ is
+          touched, no target is added or removed.
+
+TESTS ADDED BY THIS BRANCH: ZERO. Counted from what RUNS, not from the diff text:
+  - `git diff 2a0a8fc..d151-parse-site -- src tests examples | grep -cE '^\+[[:space:]]*#\[(test|tokio::test)\]'`
+    returns 0. `[[:space:]]`, not `\s` — `git grep -E` does not honour `\s` on this platform, and
+    a pattern that silently matches nothing returns a zero that reads exactly like a real zero.
+  - The diff adds no `macro_rules!` body either, so the `reaper_suite` trap (one `#[test]` inside
+    that macro compiles to TWO tests, once per invocation) cannot apply: a count taken from the
+    diff would be wrong in the same direction whether or not I had noticed it, and here there is
+    no macro to be wrong about.
+
+PRE-REGISTERED RESULT:  rc=0, passed=2508, failed=0, per-target.
+
+FALSIFIERS
+  - passed != 2508: a test appeared or vanished that this diff does not explain. Name it before
+    quoting any total.
+  - failed > 0 or rc != 0: the row does not land, whatever the announcement count says.
+  - passed = 0, or any target collecting nothing: a run that collected nothing has not passed.
+  - a whole-mode number compared against this one: refuse it; they are different quantities.
+
+A SUITE VERDICT IS NOT A LANDING GATE. `tools/land-gate.sh` asks three questions — certify-head,
+staleness, prepush — and the suite is one input to the first. All three are run and recorded.
