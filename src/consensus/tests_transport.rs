@@ -1726,12 +1726,20 @@ fn a_send_after_shutdown_is_refused_rather_than_silently_discarded() {
 
 #[test]
 fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
-    // `wal::log::write_str` writes `s.len() as u16`, UNCHECKED. A name over 65535 bytes gets a
-    // truncated length prefix followed by its full bytes, so `encode` would emit a frame the peer
-    // misparses. The receiver's re-encode check catches it — on the wrong side of the wire, where
-    // the useful information (that THIS node produced rubbish) is gone.
-    let long = "x".repeat(70_000);
-    let m = Message {
+    // THE INVARIANT, and deliberately NOT an assertion about which check refuses: a name the wire
+    // format cannot express must never be FRAMED AND SENT.
+    //
+    // This test used to assert the send-side re-encode check's message. That coupled it to a
+    // mechanism rather than to the property, and D154 exposed the coupling precisely: when the
+    // guard moved into `wal::log::write_str`, the test failed while its own failure text quoted a
+    // refusal — "framed instead of refused: a table name is 70000 bytes ... refused rather than
+    // written truncated". The name WAS refused; only the mechanism had changed.
+    //
+    // D154 then deleted the send-side re-encode check as unfirable (the `?` below refuses first,
+    // so no mutant of it could be caught, and `decode_catalog` runs the byte-identical round trip
+    // on the receive side). The section that hand-built a 65540-byte payload to make that check
+    // fire once went with the code it tested — a test for deleted code goes with the code.
+    let msg = |table: String, columns: Vec<(String, DataType, bool)>| Message {
         from: NodeId(1),
         to: NodeId(2),
         term: 1,
@@ -1741,119 +1749,37 @@ fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
             entries: vec![Entry {
                 term: 1,
                 round: 1,
-                command: Command::Catalog {
-                    op: DdlOp::CreateTable,
-                    table: long.clone(),
-                    columns: vec![("id".into(), DataType::Integer, false)],
-                },
+                command: Command::Catalog { op: DdlOp::CreateTable, table, columns },
             }],
             commit: 0,
         },
     };
-    let e = format!("{}", encode(&m).unwrap_err());
-    // Either refusal is correct and which one fires depends on how the truncated length happens to
-    // reparse: the record may come back as a DIFFERENT readable record, or as no readable record at
-    // all. What must never happen is that it is framed and sent.
+
+    let long = "x".repeat(70_000);
+    let err = encode(&msg(long.clone(), vec![("id".into(), DataType::Integer, false)]))
+        .expect_err(
+            "a 70,000-byte table name was FRAMED instead of refused, so the peer would have had \
+             to parse a record whose length prefix wrapped to 4464",
+        );
+    let e = format!("{err}");
     assert!(
-        e.contains("does not survive its own encoding")
-            || e.contains("did not encode to a readable log record"),
-        "a 70,000-byte table name was framed instead of refused: {}",
+        e.contains("70000") && e.contains("65535"),
+        "the refusal must name the length it could not express AND the limit, or the operator \
+         cannot tell what would fit; got: {}",
         &e[..e.len().min(300)]
     );
 
-    // **The case only the re-encode check can catch**, and the reason the assertion above is not
-    // enough on its own: a truncation that reparses SUCCESSFULLY, but to a different record.
-    //
-    // A mutant that deleted the re-encode check SURVIVED the assertion above, because an all-'x'
-    // name makes the truncated record unparseable and the sibling branch refuses it instead. So the
-    // check was untested. This name is built so the record parses cleanly and wrongly:
-    //
-    //   * its length is 65536 + 4, so `write_str`'s `as u16` writes a prefix of 4;
-    //   * `take_str` therefore reads four bytes as the whole table name;
-    //   * the next two bytes are NUL, so the column count reads as ZERO and parsing stops there;
-    //   * `RecKind::deserialize`'s `Ddl` arm never compares its cursor to the buffer length, so the
-    //     remaining 65534 bytes are silently discarded and it returns `Ok`.
-    //
-    // The result is a valid-looking `Ddl` for a table called "aaaa" with no columns. Only
-    // re-encoding it and comparing the bytes notices that it is not what was sent.
-    let mut sneaky = String::from("aaaa");
-    sneaky.push('\0');
-    sneaky.push('\0');
-    sneaky.push_str(&"b".repeat(65536 + 4 - 6));
-    assert_eq!(sneaky.len(), 65536 + 4, "the construction depends on this exact length");
-
-    let m3 = Message {
-        from: NodeId(1),
-        to: NodeId(2),
-        term: 1,
-        body: Body::Append {
-            prev_round: 0,
-            prev_term: 0,
-            entries: vec![Entry {
-                term: 1,
-                round: 1,
-                command: Command::Catalog {
-                    op: DdlOp::CreateTable,
-                    table: sneaky.clone(),
-                    columns: vec![("id".into(), DataType::Integer, false)],
-                },
-            }],
-            commit: 0,
-        },
-    };
-    let e3 = format!("{}", encode(&m3).unwrap_err());
+    // A COLUMN name is the same hazard one field over, and a DIFFERENT call site inside
+    // `RecKind::serialize`. A guard on the table name alone would satisfy the assertion above and
+    // still emit a wrapped frame, so this is what stops that half passing vacuously.
     assert!(
-        e3.contains("does not survive its own encoding"),
-        "a name that reparses to a DIFFERENT record was framed and sent; only the re-encode check \
-         can see this, and it did not fire. Got: {}",
-        &e3[..e3.len().min(200)]
+        encode(&msg("t".into(), vec![(long, DataType::Integer, false)])).is_err(),
+        "a 70,000-byte COLUMN name was framed; the table-name guard does not cover this site"
     );
 
-    // And prove the premise rather than assuming it: the record really does deserialize cleanly to
-    // the wrong thing. If this ever stops being true the test above stops testing anything, so the
-    // premise is asserted rather than described.
-    let rec = crate::wal::log::RecKind::Ddl {
-        op: DdlOp::CreateTable,
-        table: sneaky,
-        dir_root: 0,
-        time_travel_root: 0,
-        columns: vec![("id".into(), DataType::Integer, false)],
-    };
-    let mut bytes = Vec::new();
-    rec.serialize(&mut bytes).unwrap();
-    match crate::wal::log::RecKind::deserialize(&bytes) {
-        Ok(crate::wal::log::RecKind::Ddl { table, columns, .. }) => {
-            assert_eq!(table, "aaaa", "the truncated prefix no longer yields a short table name");
-            assert!(columns.is_empty(), "the NUL bytes no longer read as a zero column count");
-        }
-        other => panic!(
-            "the premise of this test no longer holds: the record does not reparse cleanly, it \
-             gives {other:?}. The re-encode check is then untested again"
-        ),
-    }
-
-    // Anti-vacuity: a name one byte inside the limit still encodes and round-trips, so the refusal
-    // is about the truncation and not about long names in general.
-    let ok = "y".repeat(u16::MAX as usize);
-    let m2 = Message {
-        from: NodeId(1),
-        to: NodeId(2),
-        term: 1,
-        body: Body::Append {
-            prev_round: 0,
-            prev_term: 0,
-            entries: vec![Entry {
-                term: 1,
-                round: 1,
-                command: Command::Catalog {
-                    op: DdlOp::CreateTable,
-                    table: ok,
-                    columns: vec![("id".into(), DataType::Integer, false)],
-                },
-            }],
-            commit: 0,
-        },
-    };
+    // Anti-vacuity: a name exactly at the limit still encodes and round-trips, so the refusal is
+    // about what the prefix can express and not about long names in general.
+    let m2 = msg("y".repeat(u16::MAX as usize), vec![("id".into(), DataType::Integer, false)]);
     assert_eq!(decode_frame(&encode(&m2).unwrap()).unwrap(), m2, "a maximal name must round trip");
 }
 

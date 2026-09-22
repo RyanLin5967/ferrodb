@@ -325,45 +325,30 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
                 columns: columns.clone(),
             };
             let mut rec_bytes = Vec::new();
-            // D154: this `?` is now the truncation refusal. `wal::log::write_str` checks its own
-            // `u16` prefix, so an over-long name is refused HERE, at the encoder, rather than
-            // being written truncated and detected afterwards.
+            // D154: this `?` IS the refusal now. `wal::log::write_str` checks its own `u16`
+            // prefix, so an over-long table or column name is refused here, at the encoder,
+            // instead of being written truncated and detected afterwards.
             rec.serialize(&mut rec_bytes)?;
 
-            // ⚠ THE COMMENT HERE USED TO SAY `RecKind::serialize` writes every string length as
-            // `s.len() as u16` UNCHECKED, and the refusal below used to say so too. **Both were
-            // true when written and are false since D154**, which moved the guard into
-            // `write_str` itself. This block is one of the three local workarounds that proved
-            // the root was broken; it is kept, but no longer for that reason.
+            // ⛔ A SEND-SIDE RE-ENCODE CHECK WAS REMOVED HERE BY D154, and it is worth saying why
+            // rather than leaving a silent gap where a guard used to be.
             //
-            // What it still earns: it is a TOTAL check, the same one `decode_catalog` applies, so
-            // it catches non-canonical spellings and trailing bytes — which the length guard does
-            // not and cannot. It costs one encode of a schema description on a DDL path.
+            // It round-tripped the record and compared bytes, to catch a truncation that reparsed
+            // SUCCESSFULLY but to a different record — the case a length check could not see while
+            // `write_str` was unchecked. It was one of THREE local workarounds around that one
+            // unguarded primitive. With the guard moved into `write_str`, it became unfirable: the
+            // `?` above refuses first, so a mutant deleting the round trip could not be caught,
+            // and its own test had ALREADY needed a hand-built 65540-byte payload to make it fire
+            // once. **A guard nobody can force to fire is the appearance of protection, not
+            // protection.**
             //
-            // ⛔ It does, however, MASK a mutant of `write_str`'s guard along this path: delete
-            // that guard and this round trip would still refuse an over-long name. So the
-            // fire-check for the guard deliberately does NOT come through here — see
-            // `tests/d154_write_str_refuses.rs`, which drives `WalManager::append` directly.
-            match RecKind::deserialize(&rec_bytes) {
-                Ok(back) => {
-                    let mut again = Vec::new();
-                    back.serialize(&mut again)?;
-                    if again != rec_bytes {
-                        return Err(FerroError::Wal(format!(
-                            "a Catalog command for table {table:?} does not survive its own \
-                             encoding, so the frame would be misparsed by the peer rather than \
-                             refused. This is a canonicality failure, not a truncated length \
-                             prefix — `wal::log::write_str` refuses those at the encoder"
-                        )));
-                    }
-                }
-                Err(e) => {
-                    return Err(FerroError::Wal(format!(
-                        "a Catalog command for table {table:?} did not encode to a readable log \
-                         record ({e}); refused here rather than sent for a peer to choke on"
-                    )))
-                }
-            }
+            // Its forward-looking justification — "catches every present and future truncation in
+            // an encoder this file does not own" — is discharged by `decode_catalog`, which runs
+            // the byte-for-byte IDENTICAL round trip on the receive side and is the total check
+            // for non-canonical spellings. The receiver also has the job the sender structurally
+            // cannot do: trailing bytes arriving off a socket, which `RecKind::deserialize`
+            // silently ignores because it stops at its last field. That one is independently
+            // testable from hand-crafted bytes, and it is the case a signature cannot survive.
             put_bytes(b, &rec_bytes)?;
         }
         Command::Branch { op } => {
