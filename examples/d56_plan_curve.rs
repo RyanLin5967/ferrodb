@@ -169,7 +169,7 @@ fn build(dir: &std::path::Path, rows: i64, analyze: bool) -> Server {
 
 /// stmt/s for one point, as the MEDIAN of `ROUNDS` timed windows. Refuses on a window that did no
 /// work, or on a statement that did not return exactly one row.
-fn measure(s: &Server, agent: bool, rows: i64, staged: usize) -> (f64, Vec<f64>) {
+fn measure(s: &Server, agent: bool, rows: i64, staged: usize, demote: bool) -> (f64, Vec<f64>) {
     let mut sess = s.ctx.session();
     let mut cache: Option<(u64, Arc<Catalog>)> = None;
     let slot = Arc::new(AtomicBool::new(false));
@@ -191,6 +191,32 @@ fn measure(s: &Server, agent: bool, rows: i64, staged: usize) -> (f64, Vec<f64>)
                 &slot,
             );
             }
+
+        // **D167 — the DEMOTED arm.** One PK-moving UPDATE makes `Workspace::unprobeable_rows`
+        // non-zero, and `visible_rows_where` then WALKS instead of probing for every read on this
+        // branch (`runtime.rs:2172` gates on `== 0`).
+        //
+        // Why a PK move and not a variant mismatch: both doors reach the same counter, but
+        // `git grep -nE "VALUES \([0-9]+\.[0-9]"` finds the variant door only inside d57's own
+        // tests, while the PK move is the plausible one — trunk REFUSES it (`value_fits`,
+        // `tuple.rs:47`, reached only through `Tuple::serialize`) so an agent must reach for a
+        // branch, and the branch path (`paged_rows::encode_row`) takes `&[Value]` and never sees
+        // the schema. Trunk refuses; branch accepts silently.
+        //
+        // The moved key is deliberately OUTSIDE the table and is NOT the key under test: the read
+        // must still come from the base table, so the two arms differ in ONE thing only — whether
+        // the probe is enabled. That is the control.
+        if demote {
+            let victim = 1i64;
+            assert!(victim != rows, "the demoting UPDATE must not move the key under test");
+            exec(
+                s,
+                &format!("UPDATE t SET id = {} WHERE id = {victim};", rows + 1_000_000),
+                &mut sess,
+                &mut cache,
+                &slot,
+            );
+        }
     }
 
     // Read a row this branch did NOT stage: the answer comes from the base table.
@@ -225,6 +251,8 @@ fn main() {
     let analyze = std::env::var("D56_ANALYZE").is_ok();
     let arm = std::env::var("D56_ARM").unwrap_or_else(|_| "both".into());
     let staged: usize = std::env::var("D56_STAGED").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    // D167: when set, one PK-moving UPDATE demotes the branch so every read WALKS the overlay.
+    let demote = std::env::var("D56_DEMOTE").map(|v| v == "1").unwrap_or(false);
     let label = std::env::var("D56_LABEL").unwrap_or_else(|_| "unlabelled".into());
     let dir = std::env::temp_dir().join(format!("ferrodb-d56-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -234,10 +262,10 @@ fn main() {
             continue;
         }
         let s = build(&dir, rows, analyze);
-        let (median, per_round) = measure(&s, is_agent, rows, staged);
+        let (median, per_round) = measure(&s, is_agent, rows, staged, demote);
         let detail: Vec<String> = per_round.iter().map(|v| format!("{v:.0}")).collect();
         println!(
-            "{label}  arm={name}  rows={rows}  staged={staged}  analyze={analyze}  median={median:.0} stmt/s  rounds=[{}]",
+            "{label}  arm={name}  rows={rows}  staged={staged}  demote={demote}  analyze={analyze}  median={median:.0} stmt/s  rounds=[{}]",
             detail.join(", ")
         );
     }
