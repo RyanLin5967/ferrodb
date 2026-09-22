@@ -1504,6 +1504,14 @@ impl AgentRuntime {
         let (record, fork_seq_ticket) = self
             .branches
             .fork_staged(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
+        // ⛔ CONSTRUCTED HERE, on the line after staging, and that placement is the guarantee —
+        // not a tidiness choice. From this point every early exit, including any `?` added to this
+        // function in future, drops `durability`, and `Drop` discharges the sync. Holding the
+        // ticket as a bare `Option<u64>` across the body instead (as the first version did) means
+        // the next `?` anyone adds silently recreates a staged fork that nothing ever syncs, with
+        // no compiler signal and no test signal.
+        let durability =
+            ForkDurability { branches: Arc::clone(&self.branches), seq: fork_seq_ticket };
         let branch = record.branch_id;
 
         let run = run_id.unwrap_or("<unnamed>").to_string();
@@ -1548,7 +1556,14 @@ impl AgentRuntime {
         // `prompt_hash`, so re-beginning one run under a different prompt is refused here rather
         // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
-        let prov = match self.prov_store.intern(&RunEntity::new(
+        // A plain `?` again, deliberately. `intern` refusing a re-intern whose actor tuple
+        // disagrees is the one reachable failure after the fork has been staged, and it used to
+        // need a hand-written recovery arm here. It does not any more: `durability` was built on
+        // the line after `fork_staged`, so this `?` drops it and `Drop` discharges the sync. That
+        // is the difference between an invariant maintained at every call site and one maintained
+        // by the type — and the reason to prefer the second is that this `?` is exactly the shape
+        // of the next edit someone makes to this function.
+        let prov = self.prov_store.intern(&RunEntity::new(
             ProvId::NONE,
             agent_id,
             run.clone(),
@@ -1557,24 +1572,7 @@ impl AgentRuntime {
             prompt_hash,
             started,
             parent,
-        )) {
-            Ok(prov) => prov,
-            // ⛔ The one reachable failure AFTER the fork has been staged — `intern` refuses a
-            // re-intern whose actor tuple disagrees. The branch record is already in the buffer
-            // pool, so returning here without the sync would be the single path that stages and
-            // never awaits, and the invariant this type is built on would have an exception.
-            // Sync it, so this leaves exactly the durable orphan the unsplit fork left; the lease
-            // reaps it either way. The sync's own error is discarded rather than reported,
-            // because `e` is the failure the caller asked about.
-            Err(e) => {
-                let _ = ForkDurability {
-                    branches: Arc::clone(&self.branches),
-                    seq: fork_seq_ticket,
-                }
-                .complete();
-                return Err(e);
-            }
-        };
+        ))?;
         // No second copy of the entity is kept here, because `intern` is ITSELF first-wins: it
         // returns the existing `ProvId` when `same_actor` holds and leaves the stored entity
         // untouched, so the store already holds the record this used to mirror into `State::runs`
@@ -1657,7 +1655,7 @@ impl AgentRuntime {
                 prov,
                 txn,
             },
-            ForkDurability { branches: Arc::clone(&self.branches), seq: fork_seq_ticket },
+            durability,
         ))
     }
 

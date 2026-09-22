@@ -43,6 +43,15 @@ fn one_run() -> RunIdentity<'static> {
     RunIdentity { agent_id: "d159", run_id: Some("one-run"), ..RunIdentity::default() }
 }
 
+/// `fallback_syncs()` is a PROCESS-WIDE counter and cargo runs these tests on parallel threads, so
+/// the two tests that read it must not interleave: one of them increments it, and the other
+/// asserts it did not move. Without this the second would flake exactly when the first happened to
+/// run beside it — a failure that looks like a real defect and is not.
+///
+/// Only these two tests need it. Every other test here completes its ticket explicitly and so never
+/// touches the counter.
+static COUNTER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The seam itself: staging a fork does everything except the disk, and the returned ticket is
 /// what carries the disk.
 #[test]
@@ -123,6 +132,77 @@ fn the_durable_spelling_still_syncs_before_it_returns() {
         before + 1,
         "begin_session_as must be durable when it returns: it promises the fork is on disk, and a \
          caller with no wider lock has nowhere else to complete it"
+    );
+}
+
+/// ⭐ **The safety net, FORCED TO FIRE.** A `ForkDurability` dropped without `complete()` must
+/// still make the fork durable — the dangerous state is unrepresentable, not merely asserted
+/// against.
+///
+/// This test exists because the first version of that guarantee was **two guards that could not
+/// fire**: `#[must_use]` is satisfied by any binding (and every call site binds), and the
+/// `debug_assert!` in `Drop` is compiled out under `--release`, which is the profile that serves
+/// pgwire — this crate has no `[profile]` in `Cargo.toml` and no `.cargo/config.toml`. A guarantee
+/// nobody has watched fire is not a guarantee.
+///
+/// Both halves are asserted: the sync **happened** (the counter the client depends on), and the
+/// fallback **was used** (the counter an operator would watch). Asserting only the first would
+/// pass even if `complete()` had been called somewhere unseen.
+#[test]
+fn dropping_a_staged_fork_without_completing_it_still_syncs_and_is_counted() {
+    use ferrodb::agent_sql::session::fallback_syncs;
+
+    let _serial = COUNTER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    let (cat, rt, _dir) = rig();
+    let syncs_before = cat.syncs_issued();
+    let fallbacks_before = fallback_syncs();
+
+    {
+        let (_session, durability) = rt.begin_session_as_staged(one_run(), BranchId::TRUNK).unwrap();
+        assert_eq!(
+            cat.syncs_issued(),
+            syncs_before,
+            "staging must not have synced, or this test is not exercising the net"
+        );
+        drop(durability); // the forgotten `complete()`, made explicit
+    }
+
+    assert_eq!(
+        cat.syncs_issued(),
+        syncs_before + 1,
+        "a dropped ForkDurability must still issue the sync. If this reads +0 the branch is in the \
+         buffer pool with nothing to make it durable, which is precisely the hole the earlier \
+         debug_assert! pretended to guard and could not, being compiled out of release."
+    );
+    assert_eq!(
+        fallback_syncs(),
+        fallbacks_before + 1,
+        "the fallback must be COUNTED as well as performed: it is correct but it forfeits the \
+         batching, and an operator needs to be able to see that it happened in a release build"
+    );
+}
+
+/// The mirror of the test above, and the reason it is not redundant: the normal path must **not**
+/// touch the fallback counter. Without this, a `Drop` that always synced would pass the test above
+/// while quietly double-syncing every well-behaved caller.
+#[test]
+fn completing_a_staged_fork_does_not_touch_the_fallback_counter() {
+    use ferrodb::agent_sql::session::fallback_syncs;
+
+    let _serial = COUNTER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    let (cat, rt, _dir) = rig();
+    let syncs_before = cat.syncs_issued();
+    let fallbacks_before = fallback_syncs();
+
+    let (_session, durability) = rt.begin_session_as_staged(one_run(), BranchId::TRUNK).unwrap();
+    durability.complete().unwrap();
+
+    assert_eq!(cat.syncs_issued(), syncs_before + 1, "exactly one sync on the normal path");
+    assert_eq!(
+        fallback_syncs(),
+        fallbacks_before,
+        "an explicitly completed ticket must not also run the fallback: `complete()` takes the seq, \
+         so the Drop that follows has nothing left to do"
     );
 }
 
