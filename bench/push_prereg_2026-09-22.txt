@@ -68,5 +68,26 @@ THE READING, FIXED IN ADVANCE — four outcomes, each with what it does and does
   absence reading above would be void. Check the ubuntu log for LOOPCOUNT before reading the
   Windows one.
 
-AMENDMENTS
-  (none yet)
+AMENDMENTS — append-only, each timestamped. The predictions above are NOT edited.
+
+[2026-09-22T20:52Z] OBSERVATION, not a change of prediction: THE INSTRUMENT'S OWN
+FALSIFIER IS DISCHARGED FOR UBUNTU.
+  The file above says "Check the ubuntu log for LOOPCOUNT before reading the Windows one",
+  because lines on ubuntu but absent on Windows would make the direct-stderr write
+  platform-conditional and void every absence reading.
+  Run 35782161642, job 106930057295 (Test ubuntu-latest): CONCLUSION success.
+      LOOPCOUNT lines: 16
+      sanity check:    146 'test result:' lines in the same log
+  ⚠ THE SANITY CHECK IS LOAD-BEARING AND IT CAUGHT A REAL FALSE NEGATIVE. My first two
+  attempts to fetch this log returned an EMPTY FILE -- `gh run view --job --log` produced 0
+  lines, and `gh api .../logs` refused with "the response contains terminal escape
+  sequences; pass --allow-escape-sequences". Both times `grep -c LOOPCOUNT` returned 0,
+  which is indistinguishable from "the instrument did not fire". Only grepping for a string
+  KNOWN to be present ('test result:') exposed that the file was empty rather than clean.
+  A grep over a missing or empty file looks exactly like a clean one.
+  Observed values on ubuntu: turns 0-2, ms 0-3 -- tighter than the macOS baseline of max 3
+  turns / max 10 ms, and consistent with it. Both platforms sit four orders of magnitude
+  below the bounds of 20000 and 100000.
+  ⇒ A Windows run with NO LOOPCOUNT line is therefore interpretable as "it died before a
+  loop completed", CONDITIONAL on Windows reaching those tests at all -- which the log
+  itself shows, since the tests run in a named target.
