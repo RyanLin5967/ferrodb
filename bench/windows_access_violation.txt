@@ -126,3 +126,62 @@ access violation remains UNEXPLAINED, one occurrence, never reproduced. Fixing a
 the same test does not retire it — and if anything this makes the case stronger that the test is
 where to look, not weaker.
 ================================================================================================
+
+================================================================================
+⛔⛔ 2026-09-22T20:39Z — THE D138 BISECT'S PREMISE IS FALSIFIED BY THIS FILE'S OWN
+     EARLIER ENTRIES. THE CONTROL ARM IS NOT A CONTROL.
+================================================================================
+
+The bisect drew b17ec58 (pre-D138) against 4685d80 and read 0-red-of-3 vs 2-red-of-3
+as suggestive that D138 introduced the access violation.
+
+⇒ EVERY EARLIER OCCURRENCE RECORDED ABOVE IS AN ANCESTOR OF b17ec58. Tested, not
+  assumed, with `git merge-base --is-ancestor <sha> b17ec58`:
+
+    0ee07fc   run 35391545783   ancestor-of-b17ec58 = YES
+    0aaffb4   run 35395893959   ancestor-of-b17ec58 = YES
+    cc399de   run 35499141131   ancestor-of-b17ec58 = YES
+
+⇒ The "clean" arm CONTAINS three prior access violations. A green b17ec58 therefore
+  exonerates nothing: it is an intermittent fault that did not happen to fire in three
+  draws of an arm whose own history holds three firings.
+
+⇒ THE CORRECT STATEMENT, replacing the bisect's: the access violation is a
+  LONG-STANDING INTERMITTENT, present since at least 0ee07fc, observed on FOUR distinct
+  shas (0ee07fc, 0aaffb4, cc399de, 4685d80), and the 0/3-vs-2/3 split is consistent
+  with a constant background rate. One-sided Fisher exact p ≈ 0.20 — and the third draw
+  MADE IT WEAKER (0.17 → 0.20) because it came up green.
+
+⚠ THE READING THAT WAS RETRACTED ALONG THE WAY: "RED AND REPRODUCIBLE, 2 OF 2 on
+  4685d80" is wrong. Read per-attempt rather than run-level, that run is
+  FAIL · FAIL · SUCCESS = 2 of 3, and run-level colour follows the LATEST attempt, so
+  origin/main reads GREEN while two of its three Windows attempts crashed.
+
+⚠ AND THE ARMS WERE NOT COMPARABLE ANYWAY: 4685d80's run is event=push on main;
+  b17ec58's is event=pull_request on d81-land. Almost certainly causally irrelevant to
+  an access violation, but it is a difference between arms and it was never stated.
+
+⇒ ACTION TAKEN: both draw-4 runs CANCELLED at 20:39Z. They could no longer
+  discriminate, and they were the only thing holding the batch push — the CI
+  concurrency group (`ci-${event_name}-${ref}`, cancel-in-progress: true) means a push
+  to main cancels an in-flight push-run on main. Cancelling converts a dead statistical
+  instrument into an immediate DIRECT one:
+
+⭐ THE REPLACEMENT INSTRUMENT IS DIRECT, NOT STATISTICAL. `av-loop-counters` prints an
+  ITERATION COUNT out of both bounded loops in the crashing file, and it is in the push
+  batch. Its macOS baseline, measured across 16 loop exits in a full verifier run:
+
+      max turns = 3        (bounds are 20 000 and 100 000)
+      max ms    = 10
+
+  Four orders of magnitude of headroom, so a Windows line in the thousands is
+  unmissable. Reading, pre-registered here BEFORE the Windows run:
+      turns near the bound      -> the ELECTION is not converging
+      turns small but ms huge   -> the SOCKET LAYER (transport.rs:944 already records
+                                   that WouldBlock and TimedOut are the same event on
+                                   different platforms)
+      no LOOPCOUNT line at all  -> it died before either loop, which is the AV itself
+
+⚠ The instrument only reports because `eprintln!` was replaced: libtest's output capture
+  swallows it under the plain `cargo test` CI runs, and the AV kills the process so
+  captured buffers never flush. Two-armed fire-check: 0 lines before, 2 after.
