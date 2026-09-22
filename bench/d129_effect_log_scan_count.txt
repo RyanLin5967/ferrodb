@@ -110,6 +110,26 @@ ALSO RECORDED BEFORE THE RUN, from reading rather than measuring:
     store has no wire path at all. The addendum arm drives it directly and is labelled as such.
 
 
+AMENDMENT 2 — the unit, recorded before the first number (run still queued behind the fleet lock)
+-------------------------------------------------------------------------------------------------
+Prompted by a sibling lane's retraction of "3-4 acquisitions per fork": the figure died because
+per-fork was never a unit — the two arms being compared sent different statement counts, so a
+per-fork total measured the workload's shape rather than the mechanism's cost.
+
+⚠ THE SAME TRAP IS AVAILABLE HERE AND IS REFUSED IN ADVANCE. The PARK and CHURN arms do NOT send
+the same statements: CHURN adds a `MERGE;` per session and PARK does not. So:
+
+  - **PER-APPEND is the unit** — `scanned / calls` within a bucket, which is a property of the
+    structure at the moment of the call.
+  - **PER-SESSION totals are NOT comparable across the two arms** and no cross-arm claim is made
+    from them. Where a session count appears it is the AXIS (how much history exists), never the
+    denominator of a cross-arm ratio.
+  - Within one arm, block-over-block growth in `scanned/call` is comparable, because the statements
+    per session are identical from block to block by construction.
+
+No per-fork, per-session or per-statement cost figure is quoted anywhere in the RESULT below.
+
+
 RESULT
 ------
 (appended below, after the run)
