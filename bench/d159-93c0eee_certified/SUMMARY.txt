@@ -1,0 +1,2 @@
+d159: mode=per-target rc=0 passed=2523 failed=0 build_errors=0 head=da8e37e log=/Users/idide/wt/verify-out/d159/suite-d159.log
+d159: go rc=0 passed=97 failed=0 log=/Users/idide/wt/verify-out/d159/suite-d159.go.log
