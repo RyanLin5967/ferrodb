@@ -210,6 +210,13 @@ impl Frames {
 /// one element to every subsequent scan, forever, at an integer slope of 1 across all 8 sampled
 /// rows — which is the axis the 10⁶-branch objective moves along. All three now go through
 /// [`Frames::position`]. See [`Frames`] for the precondition that makes storing positions legal.
+///
+/// ⚠ **Of those three, only `append` and `classify_append` are reachable from production.**
+/// [`MemEffectLog::frame`] is `pub` but has no caller outside this file's own tests — see its own
+/// note. D138's text calls all three "production scan sites"; that is one more than is true, and
+/// it is the mirror of the same document's claim that `frames_for` has none. **Both mis-statements
+/// come from reading call sites off a workload's counter instead of off the code**, which is why
+/// the D129 count harness reported `frame() calls 0` in every arm it ran.
 #[derive(Default)]
 pub struct MemEffectLog {
     frames: Mutex<Frames>,
@@ -234,6 +241,17 @@ impl MemEffectLog {
     }
 
     /// The frame for one transaction on one branch, if it was ever appended.
+    ///
+    /// ⚠ **No production caller, checked at HEAD rather than assumed.** `frame` is not on the
+    /// [`crate::tel::EffectLog`] trait — that declares `append` and `frames_for` and nothing else
+    /// — so it can only be called on a concrete store, and nothing outside this file does:
+    /// `git grep '\.frame('` over `src`, `tests`, `examples`, `bench` and `tools` returns this
+    /// file, its test children, and `consensus/log.rs`, whose `frame(Round)` belongs to an
+    /// unrelated type. It goes through D138's index anyway — one index serves every keyed lookup,
+    /// and a second shape beside it would be the thing worth avoiding — but **it carries none of
+    /// D138's load, and the slope artifact cannot speak for it**: no workload harness can call
+    /// what production never calls. Its coverage is
+    /// `tests::the_position_index_and_the_frames_agree_per_key`, which exercises it per key.
     pub fn frame(&self, branch: BranchId, txn: TxnId) -> Option<TxnFrame> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
         frames.position(branch, txn).map(|i| frames.frames[i].clone())
@@ -1591,6 +1609,8 @@ impl DurableEffectLog {
     }
 
     /// The frame for one transaction on one branch, if it was ever appended.
+    /// ⚠ Like [`MemEffectLog::frame`] it delegates to, this has **no production caller** — it is
+    /// not on the [`crate::tel::EffectLog`] trait and nothing outside this file calls it.
     pub fn frame(&self, branch: BranchId, txn: TxnId) -> Option<TxnFrame> {
         self.mem.frame(branch, txn)
     }

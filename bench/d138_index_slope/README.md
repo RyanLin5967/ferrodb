@@ -45,13 +45,25 @@ Plus: **index-vs-scan disagreements over the axis: 0**, an equality checked on *
 | `MemEffectLog::append` | ✅ PARK axis, 6000 calls | 1875.5 → **0.0** |
 | `classify_append` | ✅ durable addendum, 1000 calls | 499.5 → **0.0** |
 | `DurableEffectLog` replay at open | ✅ addendum, K=1000 | 499500 elements → **0** |
-| `frame()` | ⛔ **ZERO calls in both arms** | **not measured here** |
+| `frame()` | ⛔ **ZERO calls in both arms** | **unreachable from production — see below** |
 | `frames_for()` | linear in both arms, by design | unchanged (it is the control) |
 
-⚠ **`frame()` is routed through the index in the code, and this harness never calls it.** Neither
-axis nor any fire-check reaches it — both arms report `frame() calls 0`. Its coverage is the unit
-test `the_position_index_and_the_frames_agree_per_key`, which asserts `frame()` returns the right
-frame for *every* key. **Do not quote this artifact as evidence about `frame()`.**
+⛔ **`frame()` reports zero calls because NOTHING IN PRODUCTION CALLS IT — not because the harness
+misses it.** Checked at HEAD: `frame` is not on the `EffectLog` trait (which declares only `append`
+and `frames_for`), so it can only be called on a concrete store, and `git grep '\.frame('` over
+`src`, `tests`, `examples`, `bench` and `tools` finds only this file, its test children, and
+`consensus/log.rs` — a different type with its own `frame(Round)`.
+
+⇒ ⭐ **So D138's "all three production scan sites" is one more than is true, and it is the exact
+mirror of the same document's claim that `frames_for` has no production caller.** Both come from
+reading call sites off a workload's counter rather than off the code: the D129 run labelled
+`frames_for` "[no prod caller]" because its axes never merge, and `frame()` looked like a site
+because it is `pub` and sits beside two that are. **Corrected in both directions:** the production
+keyed scan sites are `append` and `classify_append` — two, not three — and `frames_for` has two
+production callers on the merge path. `frame()` is still routed through the index (one index for
+every keyed lookup beats a second shape) but carries none of D138's load. Its coverage is the unit
+test `the_position_index_and_the_frames_agree_per_key`. **Do not quote this artifact about
+`frame()`.**
 
 ⚠ **CHURN died at session 495 in BOTH arms**, on D136's 255-entry per-page provenance cap. That is
 unchanged by D138 and is why both arms exit rc=1. It is not a regression signal.
