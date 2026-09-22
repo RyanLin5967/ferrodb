@@ -27,7 +27,8 @@ on this branch that names the old candidate is describing a rejected proposal, n
 1. **Memo keyed on a reused `PageId`.** Resolved by deletion: merge3 owns no memo. ⚠ **Not**
    resolved by consolidating onto `cow::diff` — `SubtreeHash` and `MemoIdentity` are keyed on
    `PageId` too. Reproduced and pinned by
-   `merge3::tests::a_stale_subtree_hash_makes_merge3_drop_a_change_silently`.
+   `merge3::tests::a_subtree_hash_reused_across_an_in_place_write_refuses_its_stale_row`,
+   which was a pinned hazard and is now inverted into a guard that `fddf13c`'s fix HOLDS.
    ⚠ **`(PageId, birth_epoch)` would have caught one route of three** — a recycled id yes, an
    in-place write no, an in-place write to a *descendant* no. Measured in
    `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write`.
@@ -51,10 +52,12 @@ on this branch that names the old candidate is describing a rejected proposal, n
 - Fire-checks, all taken pre-rebase and all still expected to hold: the `read_node` guard fails
   against the restored `_ =>` catch-all; the store-property test fails when route B's premise is
   flipped; `proof()` without a default reproduces `error[E0046]` in `tests/review_cow_adv.rs:368`.
-- ⚠ `a_stale_subtree_hash_makes_merge3_drop_a_change_silently` was a PINNED HAZARD and its own doc
-  says to delete it once `cow::diff` grew a staleness guard. `fddf13c` is that guard, so this test
-  is **expected to fail now** and must be converted into a guard that the fix HOLDS, not deleted
-  outright. Confirm by running it before changing it.
+- ✅ The pinned hazard resolved itself as designed. `cargo test --lib cow` at `f511792` returned
+  `143 passed; 1 failed`, the one failure being that test asserting the OLD broken behaviour:
+  `left: Some([118, 84])` ("vT", the correct merge) vs `right: Some([118, 48])` ("v0", the
+  hazard). `fddf13c` is the guard its doc always said to watch for, so it is inverted, not
+  deleted, and now asserts the mechanism (`nodes_under` refuses a stale row) as well as the
+  outcome.
 
 ## Open, and NOT mine
 - `examples/d92_merge3_curve.rs` was **red on main** at `1758b3b`, verified by running it there

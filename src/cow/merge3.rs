@@ -1067,41 +1067,46 @@ mod tests {
         );
     }
 
-    // ---- the memo hazard, made to fire --------------------------------------------------------
+    // ---- the memo staleness guard, and that it HOLDS ------------------------------------------
 
-    /// **A HAZARD, PINNED. This is not desired behaviour.**
+    /// **A guard that `cow::diff`'s version key holds. This was a pinned HAZARD until `fddf13c`.**
     ///
-    /// The review that started this work found `merge3`'s own `MerkleId` memo keyed on `PageId`,
-    /// with a soundness argument ("a modified page gets a NEW id, so a memoised entry can never go
-    /// stale") that is false twice over:
+    /// History, kept because the guard is only legible with it. The review that started this work
+    /// found `merge3`'s own `MerkleId` memo keyed on `PageId`, arguing it could never go stale
+    /// because "a modified page gets a NEW id". That is false by two routes, neither needing a
+    /// reap:
     ///
     /// 1. `ArenaPageStore::cow_page` hands a branch its own page straight back for **in-place**
-    ///    mutation when the branch owns the arena and the page was born at or after its privacy
-    ///    barrier. Same page id, different contents, and `birth_epoch` is **not** restamped —
-    ///    which is also why keying on `(page_id, birth_epoch)` would not have helped. Needs no
-    ///    reap; fires on a branch's second write, which is what this test drives.
-    ///    `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write` measures that,
-    ///    route by route, rather than leaving it as an assertion in a comment.
-    /// 2. `ArenaPageStore` recycles freed page ids: `release_page` pushes onto
-    ///    `recycled: HashMap<ArenaId, Vec<PageId>>` and `alloc_page` pops from it before touching
-    ///    the bump pointer. Measured separately: free page 1, allocate, get page 1 back.
+    ///    mutation once it owns the arena and the page was born at or after its privacy barrier.
+    ///    Same page id, different contents, and `birth_epoch` is **not** restamped — which is why
+    ///    the first proposed repair, `(PageId, birth_epoch)`, would not have caught it. This test
+    ///    drives that route.
+    /// 2. `ArenaPageStore` recycles freed page ids, which `birth_epoch` *does* catch.
     ///
-    /// `merge3` no longer owns that memo — it owns no identity at all. **But the defect was not
-    /// resolved by consolidating onto `cow::diff`: `SubtreeHash` and `MemoIdentity` are keyed on
-    /// `PageId` too**, so a provider stamped before a write answers from the stale stamp
-    /// afterwards. This test holds that fact visible at the place the damage shows up — a merge
-    /// reported clean with the other side's edit silently dropped and zero conflicts.
+    /// `merge3` owns no memo any more, but the defect did **not** die with it: `cow::diff`'s
+    /// `SubtreeHash` and `MemoIdentity` were keyed on `PageId` too. This test used to pin that as
+    /// a silent wrong answer — a merge reported clean with the other side's edit dropped — and
+    /// said in its own doc that the day it failed would be the day the fix landed.
     ///
-    /// **If this test ever fails because `cow::diff` grew a staleness guard, that is the fix
-    /// landing. Delete this test and the warning it cites in `SubtreeHash`'s doc.** Until then the
-    /// rule for callers is the one `merge3`'s own doc states: stamp a provider and use it for one
-    /// merge, and never across a write.
+    /// **It failed. `fddf13c` keyed the memos on `(birth_epoch, checksum)`** — crc32 covers the
+    /// header, so it moves on an in-place write where `birth_epoch` alone does not. So the test is
+    /// inverted rather than deleted: it now asserts the fix, and will fail again if the version
+    /// key is ever weakened back.
+    ///
+    /// It asserts the **mechanism** and not only the outcome. A correct merge here could also come
+    /// from the provider never having stamped anything, so the middle assertion checks that the
+    /// row was taken and is then *refused* — which is the version key doing its job.
+    ///
+    /// Route C — an in-place write to a *descendant* — is still open by construction and no
+    /// per-page key reaches it; `cow::diff` asserts that limit on its own side, and
+    /// `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write` measures all three.
     #[test]
-    fn a_stale_subtree_hash_makes_merge3_drop_a_change_silently() {
+    fn a_subtree_hash_reused_across_an_in_place_write_refuses_its_stale_row() {
         let fx = Fx::new();
         let (base, ob, tb) = fx.forked(&[(b"k", b"v0")]);
 
-        // Convergent edit: ours and theirs hold equal CONTENT at different page ids.
+        // Convergent edit: ours and theirs hold equal CONTENT at different page ids, so content
+        // identity retires the whole merge at the root and the stamp is really consulted.
         let ours = fx.put(base, ob, b"a", b"1");
         let theirs1 = fx.put(base, tb, b"a", b"1");
         assert_ne!(ours, theirs1, "a convergent edit must land on two different page ids");
@@ -1119,39 +1124,34 @@ mod tests {
             Some(RootFastPath::SidesAgree),
             "the stamps have to be populated by a merge that really compared the two roots"
         );
+        assert!(
+            hash.nodes_under(theirs1).is_some(),
+            "precondition: theirs' root must be stamped before we invalidate it"
+        );
 
-        // The write that breaks the premise. If the store ever stops taking the in-place path here
-        // this assertion says so, rather than the test quietly proving nothing.
+        // The write that used to break everything. If the store ever stops taking the in-place
+        // path here, this says so rather than the test quietly proving nothing.
         let theirs2 = fx.put(theirs1, tb, b"k", b"vT");
         assert_eq!(
             theirs2, theirs1,
             "this test needs cow_page's in-place arm; the store shadowed the page instead"
         );
+
+        // THE MECHANISM. The row is still in the memo, and the provider must now refuse it.
+        assert!(
+            hash.nodes_under(theirs2).is_none(),
+            "the stamp must go stale when its page is rewritten in place — if this is Some, the \
+             version key has been weakened and the merge below is about to drop a change"
+        );
+
+        // THE CONSEQUENCE. Same provider, reused across the write, and the merge is correct.
+        let r = merge3(&fx.tree, base, ours, theirs2, &hash, into, fx.tick()).unwrap();
+        assert!(r.is_clean(), "{:?}", r.conflicts);
         assert_eq!(
-            fx.get(theirs2, b"k"),
+            fx.get(r.merged_root, b"k"),
             Some(b"vT".to_vec()),
-            "theirs really did change k under the same page id"
+            "a reused provider must not drop theirs' edit"
         );
-
-        // The hazard itself: the stamp for theirs' root is now a fingerprint of contents that page
-        // no longer holds, and it still equals ours'.
-        let stale = merge3(&fx.tree, base, ours, theirs2, &hash, into, fx.tick()).unwrap();
-        assert!(stale.conflicts.is_empty(), "the hazard is a SILENT wrong answer, not a conflict");
-        assert_eq!(
-            fx.get(stale.merged_root, b"k"),
-            Some(b"v0".to_vec()),
-            "PINNED HAZARD: a stale SubtreeHash dropped theirs' k = vT. If this now reads vT, \
-             cow::diff grew a staleness guard — delete this test, it has done its job."
-        );
-
-        // And the discipline that avoids it: a provider stamped after the write is correct.
-        let fresh = SubtreeHash::new(fx.store.clone() as Arc<dyn PageStore>);
-        for r in [base, ours, theirs2] {
-            fresh.stamp(r).unwrap();
-        }
-        let good = merge3(&fx.tree, base, ours, theirs2, &fresh, into, fx.tick()).unwrap();
-        assert!(good.is_clean(), "{:?}", good.conflicts);
-        assert_eq!(fx.get(good.merged_root, b"k"), Some(b"vT".to_vec()));
     }
 
     /// A page that is not a B+tree node must be refused, not decoded as an internal node and its
