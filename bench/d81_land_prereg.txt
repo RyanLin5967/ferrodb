@@ -131,3 +131,49 @@ Nothing else in this file is edited. The dependency note above is left standing
 as written, because it was true when it was written and a reader needs to see
 that the base was predicted first and confirmed second, not looked up after the
 fact.
+
+AMENDMENT 2 — cut 2026-09-22, STILL BEFORE ANY RUN FROM THIS WORKTREE
+--------------------------------------------------------------------------------
+Ordering again, because it is again the whole value: still no completed suite
+from this tree. A first attempt was QUEUED behind `d144-lease-lag` and was
+STOPPED BEFORE IT EVER ACQUIRED THE LOCK, deliberately and for the reason below;
+it produced no verdict, no SUMMARY.txt and no partial log, and its three
+processes were confirmed gone with no orphan left behind.
+
+WHY IT WAS STOPPED. `main` moved underneath the queued run:
+    b2991c6 -> 6167bfd
+A queued run still owns the worktree, so merging into the tree while it waited
+would have been a write to a tree with a run in flight against it — the failure
+`tools/land-gate.sh` was written for, arriving one step earlier than usual. The
+cheap and honest move at that point is to stop, absorb, and re-queue, because a
+run that has not started has nothing to lose.
+
+WHAT MOVED, AND WHY THE EXPECTATION DOES NOT.
+  `git diff --stat b2991c6..6167bfd` is THREE FILES, ALL UNDER bench/:
+    bench/land-b2991c6_certified/{PREREG.txt,SUMMARY.txt,suite.log}
+  Zero src/, zero tests/, zero examples/. It is the banking of the very
+  land-d93d23b verdict AMENDMENT 1 quotes, so the evidence for term (a) is now
+  committed inside this repository rather than living only in a volatile
+  VERIFY_OUT directory — `bench/land-b2991c6_certified/SUMMARY.txt` reads
+  `head= b2991c6` and `passed=2482 failed=0`.
+
+  Merged into this branch at c4769ff, CLEANLY: zero conflicted paths.
+
+RE-DERIVED AGAINST THE NEW BASE rather than assumed to carry over:
+    git diff main..HEAD -- src/ tests/ examples/ | grep -c '^+.*#\[test\]'  = 18
+    git diff main..HEAD -- src/ tests/ examples/ | grep -c '^-.*#\[test\]'  =  0
+    files touched: examples/d75_live_branch_scaling.rs, src/branch/arena.rs,
+                   src/branch/reaper.rs, src/storage/atomic_file.rs
+  Unchanged from the original derivation, as a bench-only base move requires.
+
+  ⇒ EXPECTATION UNCHANGED AT 2500 per-target, 97 go.
+
+⭐ AND ONE FACT WORTH RECORDING ABOUT THE CONFLICT RESOLUTION, checked here
+  because it is checkable and because it is the claim a reviewer should attack:
+    git diff main..HEAD -- src/branch/reaper.rs
+  changes 24 lines and removes 8, and EVERY ONE OF THEM IS A `//` COMMENT.
+  So `src/branch/reaper.rs` on this branch is FUNCTIONALLY IDENTICAL to main's:
+  the surviving discriminator is main's `module_path!()`, D81's
+  `stringify!($modname)` is gone, and no assertion, fixture or expression
+  differs. "Keep exactly one" is therefore not a judgement to be taken on trust
+  — it is a diff that reduces to comments.
