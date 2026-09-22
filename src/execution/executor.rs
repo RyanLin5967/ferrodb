@@ -4,7 +4,7 @@ use crate::wal::txn::DdlRecord;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_alter, run_agent_stmt, run_in_session, AgentOutput};
+use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_alter, run_agent_stmt_staged, run_in_session, AgentOutput};
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
@@ -145,7 +145,28 @@ pub fn try_run_read(
     }
 }
 
+/// Run one statement, durable when it returns.
+///
+/// The spelling for every caller that is not holding a lock wider than the runtime's own.
+/// Delegates to [`run_staged`] and completes any deferred fork sync itself.
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    let mut pending = None;
+    let outcome = run_staged(stmt, catalog, bp, txn, session, &mut pending);
+    if let Some(d) = pending {
+        d.complete()?;
+    }
+    outcome
+}
+
+/// [`run`], with `BEGIN AGENT SESSION`'s fsync deferred into `pending`.
+///
+/// ⛔ **The caller must complete anything left in `pending`**, and the reason to accept that
+/// obligation is the only reason this exists: a caller holding a statement-wide lock —
+/// `ServerContext::catalog()` over pgwire — must be able to release it *before* the sync, or
+/// concurrent forkers never meet inside `CommitGroup::wait_durable` and the branch catalog's group
+/// commit stays inert. Measured at exactly `f/sync` 1.00 for every thread count from 1 to 128
+/// before this split (`bench/d130_batch_vs_threads.txt`).
+pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session, pending: &mut Option<crate::agent_sql::session::ForkDurability>) -> Result<Outcome, FerroError> {
     // B9 — read-only system views over the agent layer, checked BEFORE every other route.
     //
     // The order is not a preference. A view name is not in `Catalog::tables`, so every other route
@@ -158,7 +179,7 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
     }
     // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
     if is_agent_stmt(&stmt) {
-        return run_agent_stmt(stmt, catalog, bp, txn, session);
+        return run_agent_stmt_staged(stmt, catalog, bp, txn, session, pending);
     }
     // Inside an agent session, DML is captured on that session's branch instead of being applied
     // to the shared tables — that is what makes a branch's writes invisible until MERGE.
