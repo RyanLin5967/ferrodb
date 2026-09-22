@@ -76,8 +76,9 @@ draining writer.
 DEFLATION, first, because the answer is "isn't this just X" and X is in the tree:
 
 **It is just `TableBranchCatalog::create_with_header` / `publish_root` / `open_from_header`**
-(`src/branch/table_catalog.rs:88`, `:355`, `:104`), applied to user-table trees instead of to the
-branch-catalog tree. That code:
+(all three in `src/branch/table_catalog.rs` — cited by SYMBOL because this commit's own doc edit
+moves their line numbers), applied to user-table trees instead of to the branch-catalog tree.
+That code:
 
   - allocates ONE header page at create time, whose id never changes, and returns it;
   - stamps it with a magic so opening the wrong page id is an error rather than a plausible root;
@@ -125,11 +126,11 @@ Check 4 is a deadlock: reader holds slot → wants catalog mutex; writer holds c
 for slot. Publishing to a home page takes NO catalog mutex, so the cycle needs a different edge.
 There is none, and the reason is checkable rather than asserted:
 
-  a) `ServerContext::catalog()` (`pgwire/mod.rs:143-156`) acquires the mutex and THEN calls
-     `drain_readers()`. While spinning it holds the catalog mutex and NOTHING ELSE — it copies the
-     slot list and releases the readers registry lock before the spin (`:172-176`).
+  a) `ServerContext::catalog()` (`pgwire/mod.rs:143`) acquires the mutex and THEN calls
+     `drain_readers()` (`:171`). While spinning it holds the catalog mutex and NOTHING ELSE — it
+     copies the slot list and releases the readers registry lock before the spin.
   b) `ctx.catalog()` has exactly FOUR callers in the crate: `extended.rs:283`, `extended.rs:357`,
-     `pgwire/mod.rs:231` (`read_catalog`'s refresh) and `lease_thread.rs:205`. Every one is at
+     the snapshot refresh inside `ServerContext::read_catalog` and `lease_thread.rs:205`. Every one is at
      statement/scan top level. **No path holds a page latch or a frame lock and then acquires the
      catalog mutex.** So a publisher blocked on a frame lock cannot be blocked behind the drainer.
   c) The lock order the publish uses is DOWNWARD and already legal:
@@ -160,14 +161,15 @@ The brief says removing the tail write makes check 3 (stand-down rate) dissolve.
 Standing down is caused by SOMEBODY ELSE ANNOUNCING `writer_active`, not by what this statement
 does at its tail. (c) removes no announcer.
 
-And check 3's stated premise is false in the shipped code. `begin_read`'s doc
-(`pgwire/mod.rs:197`) said: *"It happens only while DDL is actually in flight."* Read against the
+And check 3's stated premise is false in the shipped code. `ServerContext::begin_read`'s doc said,
+at base 83cb6e8: *"It happens only while DDL is actually in flight."* (No line number: this commit
+replaces that sentence, so any number would name a tree that no longer exists.) Read against the
 four `ctx.catalog()` callers:
 
   - `extended.rs:283` and `:357` — the statement-level exclusive path. `try_run_read`
     (`executor.rs:93-145`) admits ONLY `Stmt::Explain` and two `Stmt::Select` arms, so TODAY every
     INSERT, UPDATE, DELETE, MERGE and `BEGIN AGENT SESSION` announces. Not DDL.
-  - `pgwire/mod.rs:231` — `read_catalog`'s snapshot refresh. Rare, but not DDL.
+  - `ServerContext::read_catalog`'s snapshot refresh (`self.catalog().clone()`). Rare, not DDL.
   - ⭐ `branch/lease_thread.rs:205` — `impl RuntimeLock for ServerContext` does
     `let _statement = self.catalog(); body();`, so the guard is held across the ENTIRE reap scan,
     every `DEFAULT_SCAN_MILLIS = 30_000` ms by default (`lease_thread.rs:109`). Not a statement, not
