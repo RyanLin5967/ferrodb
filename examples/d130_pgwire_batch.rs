@@ -226,18 +226,46 @@ fn decode_row(body: &[u8], out: &mut Vec<String>) {
 
 /// The branch identities a reply announced, as the SERVER named them.
 ///
-/// The independent witness that a fork happened. The loop counter says how many forks were *asked
-/// for*; this says how many distinct branches the server *reported*, and the two are checked
-/// against each other before anything is printed. Matching `b_<digits>` over every text field
-/// rather than indexing one column keeps it from silently reading the wrong field if
+/// Half of the independent witness that a fork happened. Matching `b_<digits>` over every text
+/// field rather than indexing one column keeps it from silently reading the wrong field if
 /// `session_started_columns()` is ever reordered — a wrong column returns no matches, which fails
 /// loudly, instead of returning a plausible string.
+///
+/// ⛔ **A BRANCH NAME IS NOT UNIQUE ACROSS A RUN THAT ABANDONS**, which is why this is only half.
+/// `TableBranchCatalog::fork` recycles a retired slot when one is free (`table_catalog.rs`, "Recycle
+/// a retired slot if one is free, otherwise mint a new one"); the identity that survives is the
+/// (id, generation) pair, and `b_<id>` drops the generation. Counting DISTINCT names as the fork
+/// total therefore under-counts arm S by the recycling factor — it reported 2 for 8 forks at T=2,
+/// which is what the proof pass refused on. The run id below is the half that stays unique.
 fn branch_names(reply: &Reply) -> Vec<String> {
     reply
         .texts
         .iter()
         .filter(|s| {
             s.strip_prefix("b_").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The run ids a reply echoed back, as the SERVER recorded them.
+///
+/// Every `BEGIN AGENT SESSION` in this harness carries a run id unique across the whole cell
+/// (`r<thread>_<iteration>`), and a `SessionStarted` row exists only for a statement that
+/// succeeded. So the count of DISTINCT run ids in the replies is a server-side statement that this
+/// many distinct fork statements ran — and unlike the branch name it cannot be deflated by slot
+/// recycling, because the catalog never invents a run id.
+fn run_ids(reply: &Reply) -> Vec<String> {
+    reply
+        .texts
+        .iter()
+        .filter(|s| {
+            s.strip_prefix('r').and_then(|t| t.split_once('_')).is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            })
         })
         .cloned()
         .collect()
@@ -364,6 +392,8 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
     let before = rig.branches.syncs_issued();
 
     let mut reported: BTreeSet<String> = BTreeSet::new();
+    let mut runs: BTreeSet<String> = BTreeSet::new();
+    let mut named = 0usize;
     let mut asked = 0usize;
     let addr = rig.addr;
     std::thread::scope(|s| {
@@ -371,6 +401,8 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
         for th in 0..t {
             hs.push(s.spawn(move || {
                 let mut names: Vec<String> = Vec::new();
+                let mut mine_runs: Vec<String> = Vec::new();
+                let mut named = 0usize;
                 let mut asked = 0usize;
                 let mut persistent = match arm {
                     Arm::Persistent => Some(Client::connect(addr).expect("connect")),
@@ -383,7 +415,10 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
                             let mut c = Client::connect(addr).expect("connect");
                             let r = c.query(&sql).expect("BEGIN AGENT SESSION round trip");
                             refuse_on_error(&r, "BEGIN AGENT SESSION");
-                            names.extend(branch_names(&r));
+                            let b = branch_names(&r);
+                            named += b.len();
+                            names.extend(b);
+                            mine_runs.extend(run_ids(&r));
                             asked += 1;
                             let _ = c.terminate();
                         }
@@ -391,7 +426,10 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
                             let c = persistent.as_mut().expect("persistent client");
                             let r = c.query(&sql).expect("BEGIN AGENT SESSION round trip");
                             refuse_on_error(&r, "BEGIN AGENT SESSION");
-                            names.extend(branch_names(&r));
+                            let b = branch_names(&r);
+                            named += b.len();
+                            names.extend(b);
+                            mine_runs.extend(run_ids(&r));
                             asked += 1;
                             let r = c.query("ABANDON;").expect("ABANDON round trip");
                             refuse_on_error(&r, "ABANDON");
@@ -401,23 +439,54 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
                 if let Some(mut c) = persistent {
                     let _ = c.terminate();
                 }
-                (names, asked)
+                (names, mine_runs, named, asked)
             }));
         }
         for h in hs {
-            let (names, a) = h.join().expect("client thread");
-            reported.extend(names);
+            let (n, r, nm, a) = h.join().expect("client thread");
+            reported.extend(n);
+            runs.extend(r);
+            named += nm;
             asked += a;
         }
     });
 
     let after = rig.branches.syncs_issued();
 
-    if reported.len() != asked {
+    // THE WITNESS. `asked` is this harness's own loop counter and is not evidence of anything;
+    // these three are the server's.
+    //
+    // (a) every reply carried exactly one branch name, so every statement minted a branch;
+    // (b) the distinct run ids equal the statements issued, so no statement was silently skipped
+    //     or double-counted — and a run id, unlike a branch name, cannot be deflated by slot
+    //     recycling;
+    // (c) for arm P only, the distinct branch names also equal the forks. Nothing is abandoned in
+    //     that arm, so no slot is ever retired and none can be recycled; the stronger check is
+    //     therefore valid there and is kept. It is NOT valid for arm S, and was the proof pass's
+    //     refusal.
+    if named != asked {
         eprintln!(
-            "d130: REFUSING. {} at T={t}: asked for {asked} forks but the server named {} distinct \
-             branches. The fork total cannot be taken from this harness's own counter when the two \
+            "d130: REFUSING. {} at T={t}: {asked} statements returned {named} branch names. A \
+             `SessionStarted` row without a branch is not a fork.",
+            arm.label()
+        );
+        std::process::exit(1);
+    }
+    if runs.len() != asked {
+        eprintln!(
+            "d130: REFUSING. {} at T={t}: asked for {asked} forks but the server echoed {} distinct \
+             run ids. The fork total cannot be taken from this harness's own counter when the two \
              witnesses disagree.",
+            arm.label(),
+            runs.len()
+        );
+        std::process::exit(1);
+    }
+    if arm == Arm::PerFork && reported.len() != asked {
+        eprintln!(
+            "d130: REFUSING. {} at T={t}: {asked} forks but only {} distinct branch names. Nothing \
+             is abandoned in this arm, so no retired slot exists to recycle and every fork must \
+             have minted a fresh id.",
             arm.label(),
             reported.len()
         );
@@ -433,7 +502,9 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
         std::process::exit(1);
     }
 
-    Cell { forks: reported.len(), syncs: after - before }
+    // `runs.len()`, not `reported.len()`: the run ids are the witness that survives slot recycling,
+    // and in arm S the distinct branch names are FEWER than the forks by construction.
+    Cell { forks: runs.len(), syncs: after - before }
 }
 
 // ---------------------------------------------------------------------------------------------
