@@ -72,3 +72,35 @@ tests/d151_parse_reads_a_refreshed_snapshot.rs — which was fire-checked agains
 bench/w4_standdown/rederive/e1_arm_agent.txt:8, `proto=extended`. It is **NOT a W4 rescue**, and
 it moves a system **already pinned against its ceiling at high fork rates**: worth several times
 as much one decade of fork rate away than it is here.
+
+-----------------------------------------------------------------------------------------------
+⛔ CORRECTION TO THIS FILE — THE `main` GATE [2/3] COMPARED AGAINST IS A **LOCAL** REF
+-----------------------------------------------------------------------------------------------
+Above, this file says *"`main` moved from 4685d80 to 0bd5c4a DURING the suite"*, and in the report
+that accompanied it I wrote that this was a bench-only PUSH landing, prefixed "I assume."
+**The gate result is unaffected and the mechanism was wrong.**
+
+  * `origin/main` was `4685d80` throughout and never moved. Verified here:
+    `git merge-base --is-ancestor 0bd5c4a origin/main` → false. 0bd5c4a is LOCAL ONLY.
+  * `0bd5c4a` is `bank-ebdf002: add the verifier's own SUMMARY.txt — the bank was not
+    re-checkable`, held locally and deliberately unpushed so that main's in-flight CI on
+    4685d80 would not be cancelled a third time.
+  * **Worktrees share one `.git`.** `tools/land-gate.sh` defaults its base to `main`, which is
+    the shared LOCAL ref — not `origin/main`, and not a ref private to this worktree. So a
+    teammate committing to local main in a different worktree moves the base this gate reads,
+    with nothing pushed anywhere.
+
+  ⇒ The [2/3] verdict stands unchanged: `COVERED-NO-CODE` against
+    bench/land-ebdf002_certified/{CERTIFICATION.txt,SUMMARY.txt} is correct whether that commit
+    is local or remote, because neither file is code.
+
+⭐ **WHY THIS IS WORTH A CORRECTION RATHER THAN A SHRUG.** I did not measure "a push landed"; I
+inferred it from a ref moving, wrote "I assume", and shipped the sentence anyway. A hedge is not a
+measurement, and a certification is the last place an unverified causal story belongs — it is read
+later by someone deciding what the guard saw. **The one-character check that would have settled it
+(`merge-base --is-ancestor 0bd5c4a origin/main`) cost less than the hedge did.**
+
+⚠ A TOOLING NOTE FROM THE SAME CHECK, because it fails toward looking like a missing ref:
+`git rev-parse --short A B C` answers `fatal: Needed a single revision` — `--short` takes an
+optional value and swallows the next argument. Without `--short` the same command prints all
+three. It bit twice in this session and reads exactly like "one of these refs does not exist."
