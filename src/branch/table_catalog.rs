@@ -453,20 +453,39 @@ impl TableBranchCatalog {
         self.upsert(keys::header(), v)
     }
 
-    /// Replace a key's value.
+    /// Replace a key's value, **without the key ever being absent**.
     ///
     /// **`BPlusTreeManager::insert` does not replace** — `insert_entry` always inserts, so writing
     /// an existing key a second time leaves TWO entries and `search` returns whichever the binary
     /// search lands on. For a catalog that would mean a branch with two records that disagree,
-    /// chosen nondeterministically. Delete-then-insert is the only upsert the storage layer offers.
+    /// chosen nondeterministically.
+    ///
+    /// # D126: this used to be delete-then-insert, and that was a real window
+    ///
+    /// ```text
+    /// match self.tree.delete(&key) { .. }   // drops the leaf write latch on return
+    /// self.tree.insert(key, value)          // re-acquires it
+    /// ```
+    ///
+    /// Nothing was held across the two calls, so between them **the key did not exist in the
+    /// tree**. `write_record` routes the RECORD key straight through here and is reached from
+    /// `set_state`, `set_root`, `renew_lease`, `reparent`, `restrict_envelope` and `put` — two of
+    /// those are hot-path writes — while every reader of a record (`core`, `get_raw`,
+    /// `has_live_children`, `max_live_child`, `live_child_in_epoch_range`) takes no lock at all:
+    /// `logical` is writers-only. A reader could therefore see "no record" for a healthy, live
+    /// branch, which is the ambiguity D124's guards were built to refuse rather than resolve.
+    ///
+    /// `BPlusTreeManager::upsert` is that missing primitive: the value moves from old to new in
+    /// one page write under one uninterrupted hold of the leaf's write latch, and the
+    /// does-not-fit case splits a leaf image that already carries the new value. Proven by
+    /// `tests/d126_upsert_is_atomic.rs`, whose fire check asserts the old shape WAS observable.
+    ///
+    /// ⚠ **Scope, so this is not over-read.** This makes one KEY's value change atomic. It does
+    /// not make `write_record` atomic: that also MOVES the state and deadline index keys, with
+    /// `remove_if_present(old)` before `upsert(new)`, so a branch is transiently in neither state
+    /// span. No per-key primitive can close that — it is a multi-key window and a separate row.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
-        match self.tree.delete(&key) {
-            Ok(()) => {}
-            // Absent is the normal case for a first write, not an error.
-            Err(FerroError::KeyNotFound) => {}
-            Err(e) => return Err(e),
-        }
-        self.tree.insert(key, value)
+        self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
@@ -636,28 +655,35 @@ impl TableBranchCatalog {
     /// as the one-entry answer its other callers want, now written in terms of this.
     /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
     ///
-    /// ⛔ **A missing record cannot mean "the child is gone" — but it does NOT mean "impossible"
-    /// either, and an earlier version of this comment said exactly that and was WRONG.**
+    /// ⛔ **A missing record cannot mean "the child is gone".** Nothing ever leaves a record
+    /// deleted: retirement is a state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled
+    /// slot, and `keys::record` is only ever inserted, searched and upserted — the same fact
+    /// `write_record_new`'s "provably new" argument rests on.
     ///
-    /// The DURABLE form of the claim holds: nothing ever leaves a record deleted. Retirement is a
-    /// state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled slot, and `keys::record`
-    /// is only ever inserted, searched and upserted — the same fact `write_record_new`'s
-    /// "provably new" argument rests on.
+    /// # What D126 changed here, and what it did not
     ///
-    /// The TRANSIENT form does not hold. `BPlusTreeManager` has no replace primitive (see
-    /// `upsert`, which says so), so `upsert` is DELETE-THEN-INSERT; `delete` drops its leaf write
-    /// latch when it returns and `insert` re-acquires, and `write_record` routes the RECORD key
-    /// straight through it. So during any `set_root`, `renew_lease`, `set_state`, `reparent`,
-    /// `restrict_envelope` or `put` — two of those are hot-path writes — the key is briefly
-    /// ABSENT. Every reader here is lockless: `logical` is writers-only. **A reader can therefore
-    /// see "no record" for a perfectly healthy, live branch.**
+    /// An earlier version of this comment claimed the state was outright impossible. It was not,
+    /// and the reason was `upsert`: with no replace primitive on the tree it was
+    /// DELETE-THEN-INSERT, `delete` dropped its leaf write latch on return and `insert`
+    /// re-acquired, and `write_record` routed the RECORD key through the pair. Every
+    /// `set_root`, `renew_lease`, `set_state`, `reparent`, `restrict_envelope` and `put` — two of
+    /// them hot-path writes — left the key briefly ABSENT, and every reader here is lockless
+    /// because `logical` is writers-only. **A reader could see "no record" for a healthy, live
+    /// branch.**
     ///
-    /// That is not a reason to resolve it; it is the reason refusing is right. A reader cannot
-    /// distinguish "mid-rewrite" from "never published", and freeing on that ambiguity destroys a
-    /// live branch's pages. Refusing costs a spurious error on a healthy database; resolving
-    /// costs the data. **SCALE-DESIGN D126 closes the window** by giving the tree a real replace,
-    /// after which this really is unreachable — that is a storage-layer change and deliberately
-    /// not part of D124.
+    /// **D126 closed that window.** `BPlusTreeManager::upsert` replaces a value under one
+    /// uninterrupted hold of the leaf's write latch, so no page is ever written without the key;
+    /// `tests/d126_upsert_is_atomic.rs` races lockless readers against a `set_root` loop and
+    /// asserts zero absences, with a fire check proving the old shape WAS observable.
+    ///
+    /// ⇒ So this arm is no longer reachable from an ordinary write. It is still refused, and the
+    /// reason is now a different one: what remains is a record that was never published (which
+    /// `attach_child` and `add_arena` refuse to create, so it means an older database or a bug)
+    /// or genuine corruption. Freeing is irreversible and refusing is retryable, so guessing the
+    /// destructive direction is wrong whichever of the two it is.
+    ///
+    /// ⚠ **That makes the `Corrupt` this returns a REAL signal rather than an expected artefact
+    /// of a hot-path write — which makes D127 (the reaper swallowing it) matter more, not less.**
     ///
     /// **D124 — both resolvers used to answer "not a pin" here, which is the DESTRUCTIVE
     /// direction.** The parent then reads as childless, `reap_expired` frees its pages, and a
@@ -673,13 +699,14 @@ impl TableBranchCatalog {
             _ => format!("malformed CHILD key {key:02x?}"),
         };
         BranchError::Corrupt(format!(
-            "CHILD entry ({which}) names branch {child_id}, which has no record right now. That \
-             is either a branch that was never published, or — far more likely on a healthy \
-             database — one whose record is mid-rewrite: upsert is delete-then-insert and holds \
-             no latch across the two, so set_root/renew_lease/set_state briefly remove the key. \
-             A reader cannot tell those apart, so this refuses instead of resolving it to \"not \
-             a live child\", which would let the parent's pages be freed underneath a branch \
-             that may still be reading them. Retry is safe; see D124/D126."
+            "CHILD entry ({which}) names branch {child_id}, which has no record. Nothing ever \
+             deletes a record — retirement is a state flip to Reaped — and since D126 the \
+             rewrite window is gone too: upsert replaces a value under one hold of the leaf \
+             latch, so an ordinary set_root/renew_lease/set_state no longer makes the key \
+             momentarily absent. What is left is a branch that was never published or a corrupt \
+             entry. This refuses rather than resolving it to \"not a live child\", which would \
+             let the parent's pages be freed underneath a branch that may still be reading them. \
+             Refusing leaks at worst and is retryable; see D124/D126."
         ))
         .into()
     }
@@ -698,9 +725,10 @@ impl TableBranchCatalog {
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
-            // `dangling_child` has the reason: the state is NOT impossible — a concurrent
-            // `set_root` on this very child removes its RECORD key for the length of an upsert —
-            // and a reader that cannot tell "mid-rewrite" from "never existed" must not free.
+            // `dangling_child` has the reason. It used to be "a concurrent `set_root` on this
+            // very child removes its RECORD key for the length of an upsert"; D126 closed that
+            // window, and the arm stays because what remains — never published, or corrupt — is
+            // still not something to resolve in the direction that FREES pages.
             None => return Err(Self::dangling_child(key, child_id)),
         })
     }
@@ -1255,10 +1283,10 @@ impl BranchCatalog for TableBranchCatalog {
         // can create one; `fork` writes the record before the child key under this same lock, so
         // it cannot create one either.
         //
-        // ⚠ This removes the PERMANENT form and not the transient one. A record can also be
-        // missing for the length of an `upsert` on a perfectly healthy branch, which this check
-        // cannot prevent and the resolvers therefore still have to refuse — see `dangling_child`,
-        // and D126 for the fix that removes the window itself.
+        // ⚠ This removes the PERMANENT form. The transient one — a record missing for the length
+        // of an `upsert` on a perfectly healthy branch — was never preventable here, and is now
+        // gone at its source: D126 made `upsert` an in-place replace under one latch hold. The
+        // resolvers still refuse a dangling entry, for the residual reasons in `dangling_child`.
         //
         // One extra point lookup, and it is free where it matters: `migrate_from` is the only
         // production caller (D63 deleted `collapse`) and it already writes every record before it
@@ -1545,6 +1573,118 @@ mod serial_section_profile {
         println!("If SUM is far below that, the cost is NOT this work -- it is lock handoff/convoy,");
         println!("and D8's options 1 and 4 are aimed at the wrong thing. That is the single most");
         println!("useful thing this measurement can say, so it is printed either way.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **D126 prices the replace.** Does making `upsert` atomic cost anything?
+    ///
+    /// It should not — an in-place replace is one descent and one page write where
+    /// delete-then-insert was two of each — but "should not" is an argument, and `set_root` and
+    /// `renew_lease` are hot-path writes, so a replace that is SLOWER than the pair would trade
+    /// one problem for another. This measures it.
+    ///
+    /// **Three arms, one catalog, one run, one key space**, because a ratio taken across two
+    /// harnesses or two moments on this box is worthless:
+    ///
+    /// - `upsert`          — the new primitive, replacing an existing key's value in place.
+    /// - `delete+insert`   — the shape the catalog open-coded before D126, on the same key.
+    /// - `tree.insert`     — a fresh key, the floor. This is the arm `write_record_new`'s
+    ///   justification rests on, so D126 moves that argument and the number has to be re-taken.
+    ///
+    /// **Order is reversed within each block** (`U D D U`) so a monotone drift in the box
+    /// contributes equally to both arms rather than to whichever ran first, and the per-block
+    /// results are reported as a MEDIAN rather than a mean so one descheduled block cannot carry
+    /// the answer. The insert floor is taken twice, once before the blocks and once after, so the
+    /// tree growth it causes is visible instead of hidden.
+    ///
+    ///   cargo test --release d126_replace_is_not_slower -- --ignored --nocapture
+    #[test]
+    #[ignore = "profiling, not a correctness test; run with --ignored --nocapture"]
+    fn d126_replace_is_not_slower() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d126-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.branchcat");
+        let _ = std::fs::remove_file(&path);
+        let cat = TableBranchCatalog::open_sidecar(&path, 1).expect("open");
+        let lease = LeaseDeadline(u64::MAX);
+
+        // A tree with real depth, matching `where_the_serial_section_goes` so the two profiles
+        // are comparable.
+        const WARM: usize = 20_000;
+        for _ in 0..WARM {
+            cat.fork(BranchId::TRUNK, lease).expect("warm fork");
+        }
+
+        const N: usize = 2_000;
+        const BLOCKS: usize = 5;
+        let child = cat.get_raw(1).expect("some child");
+        // The key under test: an existing RECORD key, which is exactly the key D126 is about.
+        let key = keys::record(child.branch_id.id);
+        let val = child.serialize_core();
+
+        let mut fresh = 0u64;
+        let mut insert_floor = || {
+            timed(N, || {
+                fresh += 1;
+                cat.tree
+                    .insert(keys::child(BranchId::TRUNK.id, 700_000 + fresh), val.clone())
+                    .unwrap();
+            })
+        };
+
+        let t_insert_pre = insert_floor();
+
+        let mut upserts = Vec::new();
+        let mut pairs = Vec::new();
+        let mut run_upsert = || {
+            timed(N, || {
+                cat.tree.upsert(key.clone(), val.clone()).unwrap();
+            })
+        };
+        let mut run_pair = || {
+            timed(N, || {
+                // The pre-D126 shape, open-coded here so the comparison is against what the
+                // catalog actually did and not against a description of it.
+                match cat.tree.delete(&key) {
+                    Ok(()) | Err(FerroError::KeyNotFound) => {}
+                    Err(e) => panic!("{e}"),
+                }
+                cat.tree.insert(key.clone(), val.clone()).unwrap();
+            })
+        };
+        for _ in 0..BLOCKS {
+            upserts.push(run_upsert());
+            pairs.push(run_pair());
+            pairs.push(run_pair());
+            upserts.push(run_upsert());
+        }
+
+        let t_insert_post = insert_floor();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let u = median(upserts.clone());
+        let d = median(pairs.clone());
+
+        println!();
+        println!("D126: in-place replace against delete-then-insert.");
+        println!("  {WARM} branches resident, {N} iters/block, {BLOCKS} blocks, order U D D U.");
+        println!("  arm                           ms/op");
+        println!("  tree.upsert (replace)       {u:8.5}   median of {} blocks", upserts.len());
+        println!("  tree.delete + tree.insert   {d:8.5}   median of {} blocks", pairs.len());
+        println!("  tree.insert, fresh key      {t_insert_pre:8.5}   before the blocks");
+        println!("  tree.insert, fresh key      {t_insert_post:8.5}   after  the blocks");
+        println!("  => replace / pair            {:8.4}x", u / d);
+        println!("  => replace / insert floor    {:8.4}x", u / t_insert_pre);
+        println!("  raw upsert blocks: {upserts:?}");
+        println!("  raw pair   blocks: {pairs:?}");
+        println!();
+        println!("  The claim this run can support is the SIGN, not the magnitude: this box has");
+        println!("  been measured at a 46x spread between quiet and loaded, so a ratio from one");
+        println!("  run prices the direction of the change and nothing finer.");
+        // Not an assertion on a timing number -- a threshold here would be a flaky test on a
+        // shared box. The arms are printed and the report reads them.
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,20 +14,26 @@
 //! An extent's owner IS published, by construction: `alloc_arena` is the only writer of the
 //! extent map and it ends in `catalog.add_arena`, which every catalog refuses for a branch with
 //! no record. And a record missing *right now* has not stopped existing — nothing deletes one,
-//! retirement is a state flip to `Reaped` — but `TableBranchCatalog::upsert` is delete-then-insert
-//! with no latch held across the two calls, and `write_record` routes the RECORD key through it,
-//! so an ordinary `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
-//! perfectly healthy branch. **That is the case these arms were freeing pages on.**
+//! retirement is a state flip to `Reaped`.
+//!
+//! ⚠ **When this was written there was a second, routine way to hit it**, and D126 has since
+//! removed that one: `TableBranchCatalog::upsert` was delete-then-insert with no latch held
+//! across the two calls, and `write_record` routes the RECORD key through it, so an ordinary
+//! `set_root` or `renew_lease` on the owner made `get_raw` miss for a moment on a perfectly
+//! healthy branch. `BPlusTreeManager::upsert` now replaces in place under one latch hold and
+//! `tests/d126_upsert_is_atomic.rs` asserts zero absences. **The arms under test here are
+//! unchanged and so is this test**: they catch an `Err`, and an I/O error or a corrupt catalog
+//! still produces one — which is precisely what the decorator below injects.
 //!
 //! Handing back a page the interval rule deliberately parked for a live child, because the
-//! owner's record happened to be mid-rewrite, is silent data loss. Refusing is retryable; the
-//! entry stays in the pending log and the next drain succeeds. SCALE-DESIGN D126 removes the
-//! window itself by giving the B+tree a replace primitive.
+//! owner's record could not be read, is silent data loss. Refusing is retryable; the entry stays
+//! in the pending log and the next drain succeeds.
 //!
-//! **Not reachable in production today.** `reap_expired` runs inside the per-statement lock that
-//! every `fork` also takes, so the two are mutually excluded. W4 exists to remove that lock, so
-//! the defect has to be gone before W4 lands, not after; `tests/d15_concurrent_fork_and_reap.rs`
-//! bypasses `RuntimeLock` and is the harness where it is reachable at all.
+//! **What W4 means for this now.** The mid-rewrite path was never reachable in production —
+//! `reap_expired` runs inside the per-statement lock that every `fork` also takes, so the two are
+//! mutually excluded, and W4 exists to remove that lock. D126 landed before W4 and removed the
+//! window rather than relying on that exclusion, so W4 no longer activates it. The arms here stay
+//! because an I/O error or a corrupt catalog is not excluded by any lock.
 //!
 //! **How the state is constructed.** Not by corrupting a catalog — that would prove nothing about
 //! the arm, since the arm catches an `Err` and not an absence. A decorator hides ONE record from

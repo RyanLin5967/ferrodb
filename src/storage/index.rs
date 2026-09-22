@@ -78,6 +78,22 @@ use crate::storage::page_latch::{PageLatches, PageReadGuard, PageWriteGuard};
 use std::sync::atomic::Ordering;
 use std::ops::Bound;
 
+/// How a write should treat a key that is already in the leaf. **D126.**
+///
+/// The two modes share every line of the descent, the latching and the split; they differ in
+/// exactly one call on the in-memory leaf copy. Passing a mode rather than duplicating
+/// `write_splitting`/`write_into_latched_leaf` is deliberate — the split ordering in
+/// `write_into_latched_leaf` is the subtle part of this file and a second copy of it that drifted
+/// would be a silent leaf-chain bug.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteMode {
+    /// Add an entry unconditionally. A key already present ends up with TWO entries, which is
+    /// what `insert` has always done and what every existing caller relies on for new keys.
+    Insert,
+    /// Replace the value of an existing key in place, or insert when the key is absent.
+    Upsert,
+}
+
 pub struct BPlusTreeManager<K, V> {
     /// The tree's current root page, **shared** with every other handle on the same tree.
     ///
@@ -167,16 +183,55 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         self.write_page(page_id, leaf.serialize()?)
     }
 
-    /// Insert one entry.
+    /// Insert one entry, **unconditionally**.
     ///
-    /// Fast path first: if the leaf has room, only that leaf is latched for writing and only that
-    /// leaf is written. If it would split, nothing has been written yet and the whole insert is
-    /// retried with write latches on the entire root-to-leaf path.
+    /// ⚠ This does not replace. A key already in the tree ends up with two entries and `search`
+    /// returns whichever the binary search lands on, so a caller writing a key that may already
+    /// exist wants [`upsert`](Self::upsert), not this.
     pub fn insert(&self, key: K, value: V) -> Result<(), FerroError> {
-        if self.try_insert_without_split(&key, &value)? {
+        self.write(key, value, WriteMode::Insert)
+    }
+
+    /// Set a key's value, **atomically**: replace an existing entry, or insert when absent.
+    ///
+    /// # Why this exists — D126
+    ///
+    /// There was no replace primitive here, and that absence had a consequence. `insert` does not
+    /// replace, so `TableBranchCatalog::upsert` open-coded `delete` then `insert` — and `delete`
+    /// **drops the leaf write latch when it returns**, `insert` re-acquires it. Between the two
+    /// the key does not exist in the tree. The branch catalog routes its RECORD key through that
+    /// pair on every `set_root`, `renew_lease`, `set_state`, `reparent`, `restrict_envelope` and
+    /// `put`, and every reader of a record is lockless, so a reader could see "no record" for a
+    /// perfectly healthy, live branch. That ambiguity is what D124's refusal guards exist to
+    /// survive; this removes the state instead of guarding it.
+    ///
+    /// # The property, stated so it can be checked
+    ///
+    /// **No page this ever writes omits the key.** The fits case replaces `vals[i]` on a copy of
+    /// the leaf and writes that copy once, under a single uninterrupted hold of the leaf's write
+    /// latch — one page write where the pair did two, so a reader sees the old value or the new
+    /// one and never neither. The does-not-fit case mutates the same copy and then splits it, and
+    /// the split writes the new right sibling **before** the halved leaf publishes `next` to it
+    /// (the ordering `insert` already relies on), so the key is reachable from the old image, the
+    /// new image, or the sibling at every instant. Nothing is ever written with the key removed
+    /// because nothing ever removes it.
+    ///
+    /// Proven rather than argued: `tests/d126_upsert_is_atomic.rs` races lockless readers against
+    /// both shapes on one key. The delete-then-insert arm is asserted to be observably absent —
+    /// that is the instrument's fire check — and both `upsert` arms, fitting and splitting, are
+    /// asserted to be zero.
+    pub fn upsert(&self, key: K, value: V) -> Result<(), FerroError> {
+        self.write(key, value, WriteMode::Upsert)
+    }
+
+    /// Fast path first: if the leaf has room, only that leaf is latched for writing and only that
+    /// leaf is written. If it would split, nothing has been written yet and the whole write is
+    /// retried with write latches on the entire root-to-leaf path.
+    fn write(&self, key: K, value: V, mode: WriteMode) -> Result<(), FerroError> {
+        if self.try_write_without_split(&key, &value, mode)? {
             return Ok(());
         }
-        self.insert_splitting(key, value)
+        self.write_splitting(key, value, mode)
     }
 
     // uses sibling pointers to traverse leaves and does range scan from start -> end (inclusive)
@@ -435,10 +490,25 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// The fast path. Returns `Ok(true)` if the entry was inserted, `Ok(false)` if it would have
     /// split the leaf — in which case **nothing has been written** and the caller must retry
     /// pessimistically.
-    fn try_insert_without_split(&self, key: &K, value: &V) -> Result<bool, FerroError> {
+    /// **D126 — this is the whole of the atomicity claim for the fits case.** `_latch` is the
+    /// leaf's write latch and it is held from the descent through `write_page` and dropped only
+    /// when this function returns. An `Upsert` therefore takes the key's value from old to new in
+    /// **one** page write under **one** hold, where delete-then-insert took two of each with the
+    /// latch released in between. There is no point at which a page is written without the key.
+    fn try_write_without_split(
+        &self,
+        key: &K,
+        value: &V,
+        mode: WriteMode,
+    ) -> Result<bool, FerroError> {
         let (page_id, _latch) = self.latch_leaf_for_write(key)?;
         let mut leaf = self.read_leaf_raw(page_id)?;
-        leaf.insert_entry(key.clone(), value.clone());
+        match mode {
+            WriteMode::Insert => leaf.insert_entry(key.clone(), value.clone()),
+            WriteMode::Upsert => {
+                leaf.upsert_entry(key.clone(), value.clone());
+            }
+        }
         if leaf.is_full() {
             return Ok(false);
         }
@@ -454,7 +524,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// the decision is made. Estimating it would be a guard that silently stops excluding when the
     /// estimate is low. Splits are rare — one per leaf-full of inserts — and the common case never
     /// reaches this function at all.
-    fn insert_splitting(&self, key: K, value: V) -> Result<(), FerroError> {
+    fn write_splitting(&self, key: K, value: V, mode: WriteMode) -> Result<(), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
             let mut guards: Vec<PageWriteGuard<'_>> = vec![self.latches().write(root)];
@@ -474,7 +544,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     }
                 }
             };
-            let result = self.insert_into_latched_leaf(leaf_id, &mut stack, key, value);
+            let result = self.write_into_latched_leaf(leaf_id, &mut stack, key, value, mode);
             drop(guards);
             return result;
         }
@@ -486,11 +556,37 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// written before the old one, because writing the old leaf is what publishes
     /// `next -> new_page_id`, and a concurrent scanner following that pointer must not land on a
     /// page that has not been written yet.
-    fn insert_into_latched_leaf(&self, leaf_id: u32, stack: &mut Vec<u32>, key: K, value: V) -> Result<(), FerroError> {
+    /// **D126 — the does-not-fit half of the atomicity claim.** In `Upsert` mode the replacement
+    /// happens on this in-memory copy before anything is written, so the leaf image that gets
+    /// split already carries the new value and the key is in exactly one of the two halves. The
+    /// write ordering below then keeps it reachable throughout: the new right sibling is written
+    /// first, and the halved leaf — which is what publishes `next -> new_page_id` — second, so a
+    /// reader is looking at the whole pre-split image or at a chain that already leads to the key.
+    fn write_into_latched_leaf(&self, leaf_id: u32, stack: &mut Vec<u32>, key: K, value: V, mode: WriteMode) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
-        leaf.insert_entry(key, value);
+        match mode {
+            WriteMode::Insert => leaf.insert_entry(key, value),
+            WriteMode::Upsert => {
+                leaf.upsert_entry(key, value);
+            }
+        }
         if !leaf.is_full() {
             return self.write_page(leaf_id, leaf.serialize()?);
+        }
+        // A full leaf holding ONE entry cannot be split into two that fit: the entry itself is
+        // larger than a page. Refuse by name here rather than letting `serialize` below panic in
+        // `copy_from_slice` with a length mismatch that says nothing about what went wrong.
+        //
+        // Reachable for `Upsert` in a way it is not for `Insert` — a replacement value can grow a
+        // one-entry leaf past the page without ever making it two entries — which is why the check
+        // is stated rather than assumed. It also covers the `Insert` case that used to panic
+        // (an oversized first entry into an empty leaf), so this is strictly stricter than what
+        // it replaces and refuses nothing that previously succeeded.
+        if leaf.key_arr.len() < 2 {
+            return Err(FerroError::Io(format!(
+                "a single entry does not fit in a {PAGE_SIZE}-byte leaf page (page {leaf_id}); \
+                 splitting cannot help and would leave an empty leaf"
+            )));
         }
 
         let new_page_id = self.buffer_pool.new_page()?;

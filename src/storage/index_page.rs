@@ -412,8 +412,39 @@ impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTree
         self.num_keys += 1;
     }
 
+    /// Set `key`'s value, **replacing** an existing entry rather than adding a second one.
+    ///
+    /// Returns `true` if an entry was replaced and `false` if one was inserted. This is the leaf
+    /// half of [`crate::storage::index::BPlusTreeManager::upsert`]: the replace case touches
+    /// `vals[i]` and nothing else, so the key is still in `key_arr` at every point — there is no
+    /// intermediate value of this page in which the key is absent, and therefore none that can be
+    /// serialized and published to a reader.
+    ///
+    /// ⚠ `insert_entry` is NOT this. It inserts unconditionally, so writing an existing key
+    /// through it leaves TWO entries under one key and `binary_search` returns whichever of them
+    /// it lands on. That is why the branch catalog used to open-code delete-then-insert, and why
+    /// closing the absence window needed a new primitive rather than a call to the old one.
+    ///
+    /// **This does not check whether the result fits the page.** A replacement value may be
+    /// larger than the one it displaces; the caller re-checks `is_full()` afterwards, exactly as
+    /// it does after `insert_entry`, and splits if it must. See `write_into_latched_leaf`.
+    pub fn upsert_entry(&mut self, key: K, value: V) -> bool {
+        match self.key_arr.binary_search(&key) {
+            Ok(i) => {
+                self.vals[i] = value;
+                true
+            }
+            Err(i) => {
+                self.key_arr.insert(i, key);
+                self.vals.insert(i, value);
+                self.num_keys += 1;
+                false
+            }
+        }
+    }
+
     // find and remove a key/value
-    pub fn remove_entry(&mut self, key: &K) -> Result<(), FerroError>{ 
+    pub fn remove_entry(&mut self, key: &K) -> Result<(), FerroError>{
         let index = match self.key_arr.binary_search(key) {
             Ok(i) => i,
             Err(_) => return Err(FerroError::KeyNotFound)

@@ -718,8 +718,9 @@ impl BranchCatalog for LogBranchCatalog {
     /// free. **D124 is what that distinction is worth**: the same loose premise, written into
     /// resolvers that DID free, cost the pages of a live branch at four sites. (This catalog also
     /// has no transient window of its own — the record lives in a `HashMap` under one lock, not
-    /// behind a delete-then-insert. That is a difference from `TableBranchCatalog`, not a general
-    /// guarantee; see `TableBranchCatalog::dangling_child` and D126.)
+    /// behind a delete-then-insert. `TableBranchCatalog` DID have one until D126 gave the tree an
+    /// in-place replace; the two now agree, which was not true when this was written. See
+    /// `TableBranchCatalog::dangling_child` and `BPlusTreeManager::upsert`.)
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let mut st = self.state.write().unwrap();
         let Some(prec) = st.records.get_mut(&parent_id) else { return Ok(false) };
