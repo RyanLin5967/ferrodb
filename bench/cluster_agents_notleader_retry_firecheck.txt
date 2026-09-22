@@ -1,0 +1,45 @@
+FIRE-CHECK — the NotLeader retry added to `a_followers_committed_log_holds_the_merge_and_not_one_agent_row`
+Run 2026-09-22 in /Users/idide/wt/ferrodb-d151-parse-site. Tree committed at 7fc1698 BEFORE the
+first mutation and restored after each with `git restore --source=HEAD --worktree` — source named
+explicitly, because `git checkout --` restores the INDEX and has eaten a fix on this project.
+
+⛔ THIS FIRE-CHECKS A RETRY, NOT THE STATUS_ACCESS_VIOLATION. Nothing in this file says anything
+about the 0xc0000005. See bench/windows_access_violation.txt, which refuses that link in its own
+text: "A panic is not a 0xc0000005 and no mechanism links them."
+
+WHY. a7f40e2 fixed the identical four-line shape in the neighbouring test and recorded that it
+was "FIRE-CHECKED by forcing the first attempt to return NotLeader". Copying the fix without
+copying the check would ship a recovery path that compiles and has never run.
+
+THREE ARMS. One shows the retry works; the other two show it does not pass spuriously.
+
+1. RECOVERY — force the FIRST attempt to return the transient error:
+       let forced = if attempt == 0 { Err(FerroError::NotLeader { leader: None }) }
+                    else { agents.merge(&mut ctx, cs.branch()) };
+   → test a_followers_committed_log_holds_the_merge_and_not_one_agent_row ... ok
+     test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+   The whole target stays green, so the retry re-establishes leadership and the merge completes.
+
+2. THE BOUND IS REAL AND THE FAILURE IS LOUD — force EVERY attempt (`if true`):
+   → panicked at tests/integration_cluster_agents.rs:1440:23:
+     merge after 10 NotLeader retries: not the leader, and this node does not currently know who
+     is - an election is in progress or this node is partitioned from the cluster. Retry shortly;
+     do not treat this as the leader being down.
+     test result: FAILED. 0 passed; 1 failed
+   Exactly 10 retries, then a red test naming the last error. A merge that never succeeds is
+   still a failure — the retry cannot turn one into a pass.
+
+3. A NON-TRANSIENT ERROR STILL FAILS IMMEDIATELY — force `FerroError::KeyNotFound` at attempt 0:
+   → panicked at tests/integration_cluster_agents.rs:1440:23:
+     merge after 0 NotLeader retries: key wasn't found
+     test result: FAILED. 0 passed; 1 failed
+   Zero retries. The guard is scoped to the one documented-retryable variant and swallows nothing
+   else, which is what keeps it from being a blanket "try again until it works".
+
+AFTER RESTORE, mutant confirmed absent by grep, whole target re-run:
+   test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+WHAT THIS DOES NOT SHOW. It exercises the retry by INJECTING the error, never by reproducing the
+race that produces it — no test here makes a lease actually lapse. So this says the recovery path
+is correct when NotLeader arrives; it does not say NotLeader arrives for the reason the comment
+gives. That mechanism is a1743's reading of the Windows log, not a measurement made here.

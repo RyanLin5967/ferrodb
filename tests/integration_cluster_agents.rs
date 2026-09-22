@@ -1451,7 +1451,42 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     let bp = db.bp.clone();
     let txn = db.txn.clone();
     let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
-    let report = agents.merge(&mut ctx, cs.branch()).unwrap();
+    // ⚠ THE SAME DEFECT a7f40e2 FIXED FOUR LINES AWAY IN THE NEIGHBOURING TEST, LEFT HERE.
+    // `hold_leader` above establishes leadership and waits for every replica to agree, but
+    // NOTHING PUMPS HEARTBEATS between that call and this one, so on a slow machine the lease
+    // lapses and a follower starts an election in the gap. `FerroError::NotLeader` is TRANSIENT
+    // BY CONTRACT and its own text says so — "Retry shortly; do not treat this as the leader
+    // being down" — so a bare `unwrap()` here turns a documented-retryable condition into a red
+    // CI job. a7f40e2 called that "a defect in this test, not in the merge" and guarded
+    // `a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log`;
+    // this neighbour has the identical four-line shape and kept the bare unwrap.
+    //
+    // ⛔ THIS IS NOT THE FIX FOR THE STATUS_ACCESS_VIOLATION, and a green run after it is NOT
+    // evidence that the access violation is solved. `bench/windows_access_violation.txt` refuses
+    // that link in its own text — "A panic is not a 0xc0000005 and no mechanism links them" — and
+    // the 2026-09-22 occurrence on THIS test was confirmed to be the access violation and not a
+    // panic: the recovered attempt-1 log has NO `test result: FAILED` line and NO `panicked at`,
+    // because the process dies before libtest writes a summary. The AV remains unexplained, three
+    // occurrences, never reproduced on demand. An intermittent fault passes most of the time.
+    //
+    // NOT a weakening of the assertion: the claim is still that the merge succeeds and publishes.
+    // The retry only re-establishes the precondition the merge was always entitled to assume; any
+    // OTHER error fails immediately, and running out of attempts fails loudly with the last one.
+    let mut attempt = 0;
+    let report = loop {
+        match agents.merge(&mut ctx, cs.branch()) {
+            Ok(r) => break r,
+            Err(FerroError::NotLeader { .. }) if attempt < 10 => {
+                attempt += 1;
+                drop(ctx);
+                fleet.hold_leader(leader);
+                let bp = db.bp.clone();
+                let txn = db.txn.clone();
+                ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+            }
+            Err(e) => panic!("merge after {attempt} NotLeader retries: {e}"),
+        }
+    };
     drop(ctx);
     fleet.settle_to(report.merge_round.unwrap());
 
