@@ -23,9 +23,46 @@ d126-8d2b673: go rc=0 passed=97 failed=0 log=/Users/idide/wt/ferrodb-wf_e78d06ad
   compiles with `cfg(test)`, where a test module can keep an otherwise-orphaned item alive.
 
 ## What it certifies
-head=8d2b673 — the D126 branch tip AFTER merging main's D125 / D101 / D110 / D114 work in, i.e.
-the exact tree that main's merge commit 2bc80fd landed. certify-head.sh confirmed suite head ==
-landing commit; staleness.sh reported COVERED; prepush.sh OK.
+
+⛔ **CORRECTED 2026-09-22 — THIS SECTION CLAIMED SOMETHING FALSE AND THE FALSE VERSION IS QUOTED
+BELOW, because a correction that hides what it corrects teaches nothing.**
+
+It read: *"head=8d2b673 — the D126 branch tip AFTER merging main's D125 / D101 / D110 / D114 work
+in, **i.e. the exact tree that main's merge commit 2bc80fd landed**."*
+
+**The trees are not equal, and it takes one command to see it:**
+
+    git rev-parse 8d2b673^{tree}   ->  5f8e2575108e4940bee9ff7a390ab85affa79ab0
+    git rev-parse 2bc80fd^{tree}   ->  50b756468a5692af16b3356aa6fe5eef61ff2d9c
+
+`git diff --stat 8d2b673 2bc80fd` names the gap — **506 lines this suite never ran**, and two of
+the five files are engine code:
+
+    bench/d114_rerun_designated_runtime.txt | 137 +
+    bench/d128_firecheck.txt                |  69 +
+    src/branch/reaper.rs                    |  89 +   <- D128 site 3
+    src/cow/store.rs                        |  44 +   <- D128 site 2
+    src/cow/tests_d128_queue_restore.rs     | 174 +   <- and its tests
+
+⇒ ✅ **WHAT THIS FILE ACTUALLY CERTIFIES: the D126 branch tip `8d2b673`, and nothing else.** That
+is still exactly what it was needed for — it is the green that authorised the merge — and
+`certify-head.sh` was right, because it compares the suite's head to the commit being landed and
+**8d2b673 was that commit**. The overreach is in this prose, not in the guard.
+
+⇒ ⭐ **THE TREE THAT SHIPPED IS CERTIFIED BY A DIFFERENT RUN:** `bench/land2bc80fd_certified/`,
+`mode=per-target rc=0 passed=2476 failed=0 head=2bc80fd`, taken against the merge commit itself.
+**Quote that one for any claim about `2bc80fd`.**
+
+⇒ ⚠ **HOW IT GOT HERE, because the lesson is the reusable part.** This bank was handed over by
+another session's agent and merged after I verified three things: that the diff was `bench/`-only,
+that `main` was an ancestor of it, and that its numbers matched a `SUMMARY.txt` I had read myself.
+All three were true. **I did not diff its CLAIMS** — and the project's own standing rule says
+exactly that: *a clean merge means no line collided, not that the result is coherent; diff the
+CLAIMS, not the lines.* A certification artifact is prose about a tree, and prose about a tree is
+checkable with `rev-parse`.
+
+The rest of the original section stands: certify-head.sh confirmed suite head == landing commit;
+staleness.sh reported COVERED; prepush.sh OK.
 
 ## An earlier green on this same branch — SUPERSEDED, recorded so it is not re-quoted
 head=34549e4: mode=whole rc=0 passed=2468 failed=0 build_errors=0, go rc=0 passed=97 failed=0.
