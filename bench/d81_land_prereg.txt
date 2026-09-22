@@ -108,3 +108,26 @@ WHAT THIS RUN CANNOT SHOW, carried forward from D81 unchanged
     appear in wall-clock. D81's own OFF controls — the arm its change cannot
     affect — disagreed by up to 2.4x, which means two bases and a void
     comparison. The axis is BYTES and FSYNC COUNTS; they are integers.
+
+AMENDMENT 1 — cut 2026-09-22, STILL BEFORE ANY RUN FROM THIS WORKTREE
+--------------------------------------------------------------------------------
+Ordering, which is the whole value of the amendment: no suite has been started
+from this tree. `~/wt/artie-research/verify-out/d81land` does not exist, and
+/tmp/ferrodb-suite.lock is now held by `20012 d144-lease-lag`, a different lane.
+
+⭐ TERM (a) IS NO LONGER A PREDICTION. `land-d93d23b` finished while this file
+was being written, and its own stdout reads, verbatim:
+
+  land-d93d23b: mode=per-target rc=0 passed=2482 failed=0 build_errors=0 head=b2991c6
+  land-d93d23b: go rc=0 passed=97 failed=0
+
+So main @ b2991c6 is MEASURED at 2482 per-target, at exactly the commit this
+branch merged, and the dependency named above is discharged in the direction
+that leaves the expectation unchanged.
+
+  ⇒ EXPECTATION UNCHANGED AT 2500 per-target, 97 go.
+
+Nothing else in this file is edited. The dependency note above is left standing
+as written, because it was true when it was written and a reader needs to see
+that the base was predicted first and confirmed second, not looked up after the
+fact.
