@@ -1,9 +1,18 @@
 D123 — WHERE FORK'S SERIAL SECTION GOES, AND WHETHER IT IS THE CEILING.
 
 Falsifiers pre-registered and committed BEFORE the first measurement: bench/d123_PREREGISTRATION.md
-(f05283b), amendments 1-7 append-only. Scaffold branch D123-serial-attribution; the src/ edits are a
+(f05283b), amendments 1-8 append-only. Scaffold branch D123-serial-attribution; the src/ edits are a
 MEASUREMENT SCAFFOLD and MUST NEVER MERGE (same status as D35-gate-stubtouch, buffer_pool.rs:158).
-Raw: bench/d123_raw/ (warm=20,000), bench/d123_raw_warm0/ (warm=0), bench/d123_rerun/ (clean F1).
+RAW, in the order taken:
+  bench/d123_raw/         battery A, warm=20,000        bench/d123_raw_warm0/  battery B, warm=0
+  bench/d123_rerun/       probe-off F1, perturb2, phases x3, extra x2
+  bench/d123_final/       PAIRED F1 (both regimes), the novelty intervention, and the clean F1
+This artifact is assembled by bench/d123_assemble.sh from bench/d123_sections/, which REFUSES to
+emit if any section still says PENDING and warns on any arm lacking a `# harness_exit=0` sentinel.
+
+⛔ WHICH NUMBERS IN HERE ARE CLEAN. Two agents declared activity overlapping this row's measure-lock
+windows (section 1e has the ledger). The F1 verdict rests on bench/d123_final/50_f1_clean.txt, taken
+on a box the team lead deliberately quieted. Earlier F1 arms are reported, and reported as dirty.
 
 ⚠ PROVENANCE. The first battery was run by the team lead on the rate-limit window after this agent
 hit its session limit with zero arms run (bench/D123_LEAD_RAN_THIS.md). It rebuilt a stale binary
