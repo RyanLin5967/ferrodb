@@ -164,6 +164,10 @@ pub struct CowStore {
     extent_pages: u32,
 }
 
+#[cfg(test)]
+#[path = "tests_d128_queue_restore.rs"]
+mod tests_d128_queue_restore;
+
 impl CowStore {
     /// Build a store over `pool`. The trunk is registered automatically at `Epoch::ZERO`.
     pub fn new(pool: Arc<BufferPoolManager>) -> Self {
@@ -257,20 +261,48 @@ impl CowStore {
     /// everything that has since become reclaimable. Returns pages released.
     pub fn drain_pending_free(&self) -> Result<u32, FerroError> {
         let mut inner = self.inner.lock().unwrap();
-        let pending = std::mem::take(&mut inner.pending);
-        let mut still_pending = Vec::with_capacity(pending.len());
         let mut released = 0u32;
-        for pf in pending {
+        // ⛔ **D128 SITE 2 — THE QUEUE NEVER LEAVES SHARED STATE.** This used to
+        // `mem::take(&mut inner.pending)` into a local, rebuild a `still_pending` beside it, and
+        // write that back on the LAST line — with `release_page(..)?` in between. Any `Err` there
+        // returned through the `?` and dropped BOTH the entries already decided to stay pending
+        // AND every entry the loop had not reached: silently, permanently, from a DURABLE
+        // pending-free log. Not a leak that a later pass recovers — those pages are never
+        // revisited, because nothing names them any more.
+        //
+        // The fix is not a write-back on the error path and not a `Drop` guard: `inner` is a live
+        // `MutexGuard` here, so a guard that restored into it could not be written, and a second
+        // write-back is just a second thing a future `?` can jump over. Instead the vector is
+        // mutated IN PLACE and an entry is removed **only after** the fallible step that consumes
+        // it has already succeeded. There is then no window in which the queue is out of shared
+        // state, so the dangerous state is unrepresentable rather than documented — a `?` added
+        // here later is safe by construction, which a comment could never guarantee.
+        //
+        // `swap_remove` rather than `remove` keeps this O(pending) instead of O(pending²), which
+        // matters on the 10⁶-branch axis. It does not preserve order and does not need to: each
+        // `PendingFree` is an independent (arena, page, epoch range) decided only against
+        // `live_children_of`, never against its neighbours.
+        //
+        // The cursor invariant: `[0, i)` are examined and staying pending, `[i, len)` are
+        // unexamined. `swap_remove(i)` drops the current entry and pulls the last — necessarily
+        // an unexamined one — into its slot, which the next iteration examines without advancing.
+        let mut i = 0usize;
+        while i < inner.pending.len() {
+            let pf = inner.pending[i];
             let clear = reclaimable(inner.live_children_of(pf.owner), pf.birth_epoch, pf.free_epoch);
             if !clear {
-                still_pending.push(pf);
-            } else if inner.extents.contains_key(&pf.arena_id.0) {
+                i += 1;
+                continue;
+            }
+            if inner.extents.contains_key(&pf.arena_id.0) {
+                // If this returns, `inner.pending` is INTACT — `pf` included — and the next drain
+                // retries the whole set. That is the entire point of removing afterwards.
                 inner.release_page(pf.arena_id, pf.page_id)?;
                 released += 1;
             }
             // else: the whole extent already went back to the free pool, nothing left to release
+            inner.pending.swap_remove(i);
         }
-        inner.pending = still_pending;
         Ok(released)
     }
 

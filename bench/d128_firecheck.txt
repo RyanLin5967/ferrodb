@@ -1,0 +1,69 @@
+D128 — BOTH OPEN SITES FIXED, AND BOTH FIRE-CHECKED IN BOTH DIRECTIONS
+========================================================================
+2026-09-22, on main. A restoration test that passes against the broken code certifies the
+defect, so each test below was run against the PRE-FIX shape as well as the fixed one.
+
+--------------------------------------------------------------------------------
+SITE 2 — `cow/store.rs::drain_pending_free`. DURABLE pending-free log.
+--------------------------------------------------------------------------------
+Tests: src/cow/tests_d128_queue_restore.rs (a child module of `cow::store`, so it can build
+the double-free precondition directly instead of reproducing the race D125 fixed).
+
+AGAINST THE FIX:
+  test cow::store::tests_d128_queue_restore::a_failed_release_mid_drain_loses_no_pending_entry ... ok
+  test cow::store::tests_d128_queue_restore::the_next_drain_finishes_what_the_failed_one_left ... ok
+
+AGAINST THE PRE-FIX `mem::take` + `?` + write-back-on-the-last-line:
+  panicked at tests_d128_queue_restore.rs:107:
+    D128 site 2: the drain returned Err and the pending-free log is EMPTY. Every entry it had
+    not finished with was dropped — silently, from a durable log, never revisited.
+  panicked at tests_d128_queue_restore.rs:162:
+    D128 site 2: after removing the one bad entry there is nothing left to retry, which means
+    the failed drain had already thrown the rest away.
+  test result: FAILED. 0 passed; 2 failed.
+
+THE ERROR IS THE STORE'S OWN, NOT AN INJECTED FAULT: `release_page`'s "double free of page
+103" refusal, reached by pre-freeing one page in the extent.
+
+THE FIX IS NOT A WRITE-BACK ON THE ERROR PATH AND NOT A GUARD. `inner` is a live `MutexGuard`,
+so a `Drop` guard could not restore into it, and a second write-back is just a second thing a
+future `?` can jump over. The vector is mutated IN PLACE and an entry is removed only AFTER the
+fallible step that consumes it succeeds (`swap_remove`, O(pending) not O(pending²)). There is
+then no window in which the queue is out of shared state ⇒ **the dangerous state is
+unrepresentable rather than documented**, and a `?` added here later is safe by construction.
+
+--------------------------------------------------------------------------------
+SITE 3 — the residue tail. IN-MEMORY deferred arena set.
+--------------------------------------------------------------------------------
+Test: `a_failing_residue_sweep_puts_the_deferred_arenas_back`, inside `reaper_suite!`, so it
+runs against BOTH catalog flavours.
+
+AGAINST THE FIX:
+  test branch::reaper::tests::log_catalog::a_failing_residue_sweep_puts_the_deferred_arenas_back ... ok
+  test branch::reaper::tests::table_catalog::a_failing_residue_sweep_puts_the_deferred_arenas_back ... ok
+
+AGAINST THE PRE-FIX BARE `mem::take`:
+  assertion `left == right` failed:
+    D128 site 3: drain_pending returned Err (io error: Not a directory (os error 20)) and the
+    deferred set is EMPTY. Every arena it had not finished sweeping was dropped, so the cheap
+    residue path will never look at them again.
+    left: 0    right: 1
+  test result: FAILED. 0 passed; 2 failed.
+
+FORCING THE ERROR WITHOUT A MOCK: `Reaper.store` is a concrete `Arc<ArenaPageStore>`, so there
+is nothing to substitute. `free_arena` ends in `persist_if_configured()?`, so pointing
+`checkpoint_to` at a path whose PARENT IS A FILE makes the store's own durability write fail —
+`Not a directory (os error 20)`. The store's real code path, not an injected fault.
+
+⛔ ================================================================================
+   AND THE ROW NAMED THE WRONG FUNCTION. THIS IS A CORRECTION TO SCALE-DESIGN's D128.
+   ================================================================================
+SCALE-DESIGN's D128 table says site 3 is `reaper.rs:371`, the "`drain_pending` tail".
+**`drain_pending` does not contain it.** `drain_pending` is three lines and delegates to
+`drain_pending_seeded`, which has used `DeferTouched` since D83 — i.e. the function the row
+names was already the FIXED one. The residue tail is in `collect_orphans_if_due`.
+
+This is not pedantry: the first version of the test called `drain_pending()` and got `Ok(0)`,
+because `collect_orphans_if_due`'s cadence gate returns early and `drain_pending` never
+reaches the residue at all. **A test aimed at the function the row named would have passed
+against the broken code and certified the defect.** Which is the whole reason this file exists.

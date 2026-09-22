@@ -368,8 +368,35 @@ impl TwoTierReaper {
         // open half, the outer `RuntimeLock` held across the whole of `scan_once`
         // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
         // lock, and no landed change touches it.
+        // ⛔ **D128 SITE 3 — AND ITS FIX ALREADY EXISTED TWENTY LINES AWAY, UNUSED HERE.** This
+        // was a bare `mem::take` followed by TWO `?`. Either one returning dropped the whole
+        // deferred set on the floor: those arenas are then never swept by the cheap residue path,
+        // and only a later full `collect_orphaned_extents` scan can recover them. `DeferTouched`
+        // (below) is exactly the RAII answer and `drain_pending_seeded` already uses it — routing
+        // this call site through the guard the file itself defines is the whole fix.
+        //
+        // ⚠ Severity, not inflated: `deferred` is an in-memory `Mutex<BTreeSet<ArenaId>>`, so what
+        // was lost is a space leak a later full sweep can still recover — NOT the silent durable
+        // loss that site 2 (`cow/store.rs`) carried. Site 3 is recorded and fixed because it
+        // completes the pattern and because the fix is free, not because it is equally bad.
+        //
+        // ⚠ **AND THE ROW NAMED THE WRONG FUNCTION.** SCALE-DESIGN's D128 table calls this the
+        // "`drain_pending` tail". It is not: `drain_pending` only delegates to
+        // `drain_pending_seeded`, which has used `DeferTouched` since D83. The residue tail is
+        // HERE, in `collect_orphans_if_due`, and a test aimed at `drain_pending` returns `Ok(0)`
+        // through the cadence gate without ever reaching the defect — which is exactly what the
+        // first version of `a_failing_residue_sweep_puts_the_deferred_arenas_back` did.
         let residue = std::mem::take(&mut *self.deferred.lock().unwrap());
-        let recovered = if residue.is_empty() { 0 } else { self.sweep_touched_extents(&residue)? };
+        let mut guard = DeferTouched { deferred: &self.deferred, touched: residue, swept: false };
+        let recovered = if guard.touched.is_empty() {
+            0
+        } else {
+            // An `Err` here drops `guard` with `swept == false`, which puts every arena back.
+            self.sweep_touched_extents(&guard.touched)?
+        };
+        // Swept, so the guard must NOT restore: `collect_orphaned_extents` failing below is not a
+        // reason to re-sweep work that already succeeded.
+        guard.swept = true;
         Ok(recovered + self.collect_orphaned_extents()?)
     }
 
@@ -1558,6 +1585,66 @@ mod tests {
         // reason a global scan is the only instrument that can find them.
         h.catalog.set_state(owner, BranchState::Live, BranchState::Reaped).unwrap();
         (arenas, owner)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // D128 SITE 3 — the deferred set must survive a failing residue sweep.
+    // ---------------------------------------------------------------------------------------
+
+    /// ⭐ **THE ROW'S TEST.** `drain_pending`'s tail took `deferred` with a bare `mem::take` and
+    /// then ran TWO `?`. An `Err` from the first dropped the whole set: those arenas are never
+    /// swept by the cheap residue path again, and only a later full `collect_orphaned_extents`
+    /// scan can recover them.
+    ///
+    /// Forcing the error without injecting a fault: point the store's free-space-map checkpoint
+    /// at a path whose PARENT IS A FILE. `free_arena` ends in `persist_if_configured()?`, the
+    /// atomic-file write cannot create its temp beside a non-directory, and the `?` fires — the
+    /// store's own durability path, not a mock.
+    ///
+    /// ⚠ Fire-checked: against the pre-fix `mem::take` this fails on the final assertion with the
+    /// set empty. See `bench/d128_firecheck.txt`.
+    #[test]
+    fn a_failing_residue_sweep_puts_the_deferred_arenas_back() {
+        let (h, reaper) = setup();
+
+        // An extent that is empty and whose owner has been reaped — `extent_is_collectable` says
+        // yes, so the sweep reaches `free_arena` rather than skipping every candidate.
+        let (arenas, _dead) = orphan_one_extent(&h);
+        let arena = arenas[0];
+
+        // Seed the residue the way an earlier early-return would have.
+        reaper.deferred.lock().unwrap().insert(arena);
+        assert_eq!(reaper.deferred_len(), 1, "fixture: one arena parked in the deferred set");
+
+        // Make the store's own durable write fail: `blocker` is a FILE, so nothing can be created
+        // inside it.
+        let blocker = std::env::temp_dir().join(format!(
+            "ferrodb-d128-site3-blocker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        h.store.checkpoint_to(blocker.join("map.arena"));
+
+        // `collect_orphans_if_due` is the function that holds the residue tail — `drain_pending`
+        // only delegates to `drain_pending_seeded`, which has used the guard since D83. Any
+        // `now_millis` fires on the first call: the cadence gate reads ORPHAN_SWEEP_NEVER.
+        let err = reaper.collect_orphans_if_due(1_000_000).expect_err(
+            "fixture: the residue sweep must actually fail, or this proves nothing",
+        );
+
+        assert_eq!(
+            reaper.deferred_len(),
+            1,
+            "D128 site 3: drain_pending returned Err ({err}) and the deferred set is EMPTY. Every \
+             arena it had not finished sweeping was dropped, so the cheap residue path will never \
+             look at them again.",
+        );
+        assert!(
+            reaper.deferred.lock().unwrap().contains(&arena),
+            "D128 site 3: the deferred set survived but does not hold the arena that was in it",
+        );
     }
 
     #[test]
