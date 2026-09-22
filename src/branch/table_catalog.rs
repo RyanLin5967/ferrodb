@@ -634,6 +634,41 @@ impl TableBranchCatalog {
     /// reaped chain. This returns the reaped child's id instead and lets the caller's explicit
     /// stack explore it, which is the same answer with no stack growth. `live_child_at` is kept
     /// as the one-entry answer its other callers want, now written in terms of this.
+    /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
+    ///
+    /// ⛔ **A missing record cannot mean "the child is gone."** No path anywhere deletes a
+    /// `RECORD` key — the only operations on `keys::record` are insert, search and upsert, which
+    /// is the same fact `write_record_new`'s "provably new" safety argument already rests on.
+    /// Retirement is a state FLIP to `Reaped`, and the id-reuse path OVERWRITES the recycled
+    /// slot's record rather than removing it. So the only thing a missing record can describe is
+    /// an entry naming a branch that was never published, and `fork` cannot produce one either:
+    /// it writes the child's record BEFORE the child key, under one logical lock and one commit
+    /// ticket, so no crash can leave the entry durable without it. `attach_child` is the only
+    /// other writer of this span, and it now refuses to create one.
+    ///
+    /// **D124 — both resolvers used to answer "not a pin" here, which is the DESTRUCTIVE
+    /// direction.** The parent then reads as childless, `reap_expired` frees its pages, and a
+    /// branch that can still reach them through the root it inherited loses them: silent data
+    /// loss, not a leak. The `value.len() != 8` arm above already takes the parking (safe)
+    /// direction for an entry that cannot be verified at all. There is no parking direction left
+    /// for an entry that CAN be verified and fails — "assume live" would pin the parent's pages
+    /// for ever on a genuinely corrupt entry — so this refuses and names the entry instead, which
+    /// is the one answer that neither frees nor leaks.
+    fn dangling_child(key: &[u8], child_id: u64) -> FerroError {
+        let which = match (keys::child_parent_from_key(key), keys::child_epoch_from_key(key)) {
+            (Some(p), Some(e)) => format!("parent {p}, fork epoch {e}"),
+            _ => format!("malformed CHILD key {key:02x?}"),
+        };
+        BranchError::Corrupt(format!(
+            "CHILD entry ({which}) names branch {child_id}, which has no record. A record key is \
+             never deleted — retirement is a state flip to Reaped and id reuse overwrites — so \
+             this entry can only name a branch that was never published. Refusing rather than \
+             resolving it to \"not a live child\", which would let the parent's pages be freed \
+             underneath a branch that may still be reading them."
+        ))
+        .into()
+    }
+
     fn child_liveness(&self, key: &[u8], value: &[u8]) -> Result<ChildLiveness, FerroError> {
         if value.len() != 8 {
             // An entry written before the value carried an id. There is no id to resolve, so it
@@ -641,13 +676,16 @@ impl TableBranchCatalog {
             return Ok(ChildLiveness::Live);
         }
         let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
-        let _ = key;
         Ok(match self.core(child_id)? {
             Some(rec) if rec.state() != BranchState::Reaped => ChildLiveness::Live,
             // **D16 — a reaped branch that still has live children is a PIN, not a stale hint.**
             // Its subtree is explored by the caller (see `has_live_children`), not from here.
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
-            None => ChildLiveness::Gone,
+            // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
+            // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
+            // See `dangling_child` for why that state is impossible and why refusing is the only
+            // safe answer to it.
+            None => return Err(Self::dangling_child(key, child_id)),
         })
     }
 
@@ -692,8 +730,15 @@ impl TableBranchCatalog {
             Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
-            // Reaped with nothing under it, or gone entirely: a stale hint. Not a live child.
-            _ => Ok(None),
+            // Reaped with nothing under it: a stale hint, and LEGITIMATELY not a live child. This
+            // is the state `reap` leaves behind when it marks a child `Reaped` and crashes before
+            // removing the entry, and it must keep answering exactly this.
+            Some(_) => Ok(None),
+            // **D124 — split out of the catch-all these two arms used to share.** That arm's own
+            // comment admitted it lumped "reaped with nothing under it" (legitimate, above)
+            // together with "gone entirely" (impossible), and answered the destructive way for
+            // both. See `dangling_child`.
+            None => Err(Self::dangling_child(key, child_id)),
         }
     }
 
@@ -1136,7 +1181,6 @@ impl BranchCatalog for TableBranchCatalog {
                     // A reaped child is not itself a pin, but anything live BELOW it is — D16.
                     // Explored here rather than by recursing, so the stack cannot grow with depth.
                     ChildLiveness::ReapedWithSubtree(child) => pending.push(child),
-                    ChildLiveness::Gone => {}
                 }
             }
         }
@@ -1188,6 +1232,19 @@ impl BranchCatalog for TableBranchCatalog {
         child_id: u64,
     ) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
+        // **D124 — the entry point is where the impossible state is made unrepresentable.** The
+        // value written here is a child branch id, and both resolvers (`child_liveness`,
+        // `live_child_at`) later ask that child's own record whether the entry is a pin. An entry
+        // naming a branch with no record is a question neither can answer safely, so it is
+        // refused at the only place in the API that can create one — `fork` writes the record
+        // before the child key under this same lock, so it cannot.
+        //
+        // One extra point lookup, and it is free where it matters: `migrate_from` is the only
+        // production caller (D63 deleted `collapse`) and it already writes every record before it
+        // attaches anything, precisely so this resolution can succeed.
+        if self.core(child_id)?.is_none() {
+            return Err(BranchError::NotFound(BranchId::new(child_id, 0)).into());
+        }
         self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -2208,7 +2265,10 @@ enum ChildLiveness {
     /// A reaped child that may still have live descendants (D16). Carries its id so the caller
     /// can explore it without recursing.
     ReapedWithSubtree(u64),
-    /// No record at all — a stale hint, pinning nothing.
-    Gone,
+    // There is deliberately no `Gone` variant. It existed until D124 and meant "no record at all
+    // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a CHILD entry
+    // naming an unpublished branch let the parent be reclaimed. That state is impossible and is
+    // now an error rather than a value; see `TableBranchCatalog::dangling_child`. Keeping the
+    // variant unconstructed would only invite the next reader to resolve into it again.
 }
 
