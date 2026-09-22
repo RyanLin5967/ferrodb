@@ -1208,10 +1208,17 @@ mod tests {
 
     /// **What a memo may be keyed on, measured rather than argued.**
     ///
-    /// Two memos in `src/cow/` are keyed on `PageId` and both went stale; the proposed repair is
-    /// to key on `(PageId, birth_epoch)` instead, on the grounds that a recycled page is restamped
-    /// with a fresh epoch. That is true, and it is one of three routes. This test measures all
-    /// three so the next person does not have to take anybody's word for which are covered.
+    /// Two memos in `src/cow/` were keyed on `PageId` and both went stale. The repair first
+    /// proposed was `(PageId, birth_epoch)`, on the grounds that a recycled page is restamped with
+    /// a fresh epoch — true, and one of three routes. This test measures all three, so the next
+    /// person proposing a per-page key is answered by the suite rather than by a document.
+    ///
+    /// **What actually shipped is `(birth_epoch, checksum)`** (`cow::diff::PageVersion`, landed in
+    /// `fddf13c`), which catches A **and** B: crc32 covers the header, so it moves on an in-place
+    /// write where `birth_epoch` alone does not. This test is about `birth_epoch`, which is still
+    /// exactly as measured below, and it is deliberately **not** duplicated into `diff.rs` — two
+    /// tests asserting one store property is the shape where a mutant in either is masked by the
+    /// other. Route C is asserted as a limit on `diff`'s side too.
     ///
     /// | route | discriminates? |
     /// |---|---|
@@ -1230,9 +1237,10 @@ mod tests {
     /// page type and checksum are all identical while the subtree id it stands for is not. Any
     /// per-page key is blind here, by construction.
     ///
-    /// The conclusion the callers need: `(PageId, birth_epoch)` is a real improvement over
-    /// `PageId` and is **not** a fix. The only scope that is sound for a recursive digest is a
-    /// window in which nothing writes to the stamped trees — stamp, use, discard.
+    /// The conclusion the callers need, and it survives the better key: **no per-page key makes a
+    /// recursive digest's memo sound**, because of route C. `(birth_epoch, checksum)` closes A and
+    /// B and leaves C open by construction. The only scope that is sound is a window in which
+    /// nothing writes to the stamped trees — stamp, use, discard.
     #[test]
     fn birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write() {
         use crate::cow::page_header::PageHeader;

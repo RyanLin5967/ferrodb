@@ -377,13 +377,6 @@ impl NodeIdentity for SubtreeHash {
             None => page_id_identity(page),
         }
     }
-
-    /// A fingerprint: 120 effective bits of FNV-1a, which this type's own doc is explicit is not
-    /// a cryptographic commitment. The page-identity fallback is exact, but a provider cannot say
-    /// which answer a caller will get, so the weaker of the two is the honest answer for both.
-    fn proof(&self) -> IdentityProof {
-        IdentityProof::Fingerprint
-    }
 }
 
 /// Memoising adapter for an identity function that is **computed on demand and keeps no memo of
@@ -649,11 +642,6 @@ where
         // be answered by the *wrong* id with `misses()` reading zero.
         self.misses.fetch_add(1, AtomicOrdering::Relaxed);
         page_id_identity(page)
-    }
-
-    /// The wrapped digest's strength, which this adapter cannot know and must not overstate.
-    fn proof(&self) -> IdentityProof {
-        IdentityProof::Fingerprint
     }
 }
 
