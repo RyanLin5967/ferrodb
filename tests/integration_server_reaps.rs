@@ -24,15 +24,25 @@
 //!
 //! # Where the page numbers come from, and what each one can prove
 //!
-//! `<db>.arena` is the durable free-space map, and `ArenaPageStore` rewrites it on every **extent**
-//! event — a claim, a free, a slow-path retire, a pending-free drain — plus once more on a clean
-//! exit. So:
+//! `<db>.arena` is the durable free-space map, and `ArenaPageStore` makes it durable on every
+//! **extent** event — a claim, a free, a slow-path retire, a pending-free drain — plus once more on
+//! a clean exit. So:
+//!
+//! ⚠ **D81 CHANGED THE MECHANISM AND NOT THE PROPERTY, AND THIS PARAGRAPH USED TO NAME THE
+//! MECHANISM.** It said `ArenaPageStore` *"rewrites it"* on every extent event. It no longer
+//! rewrites: `<db>.arena` is `[image][tail record]*`, a claim appends 45 bytes and a free 25, and
+//! the whole image is rewritten only when the tail outgrows its share of it. **What every number
+//! below rests on is untouched** — a record still reaches the device, fsynced, at each extent
+//! event, so "the map is durable as of the last extent event" is exactly as true as before. Only
+//! the sentence describing HOW was false, and a header that mis-names the mechanism is how the
+//! next reader concludes these assertions are stale when they are not.
 //!
 //! * `reserved_page_count` is exact whenever the map is read, because it only ever changes at an
-//!   extent event, which is the moment the map is written.
+//!   extent event, which is the moment the map is made durable.
 //! * `live_page_count` counts individual pages, and those are handed out **between** extent events.
 //!   It is exact after a clean exit (the CLI reaches `store.checkpoint`), and after a reap (the
-//!   `free_arena` rewrite carries the live count as of that moment). A `SIGKILL` in the middle of a
+//!   `free_arena` record carries the live count as of that moment — it is written as an ABSOLUTE
+//!   for this reason). A `SIGKILL` in the middle of a
 //!   write-heavy phase would leave it lagging, which is why the phases that write finish cleanly.
 //!
 //! Both are read here by the *test*, out of the file, rather than reported by the process under
@@ -549,8 +559,17 @@ fn the_server_reaps_an_abandoned_branch_without_one_socket_being_opened() {
 
     let after = arena_state(&db);
     // Exact even though the server was killed: the last thing that touched the map was the reap's
-    // own `free_arena`, which rewrites it, and nothing allocated in this phase because nothing
-    // connected. See the module header on which of these two numbers survives a `SIGKILL`.
+    // own `free_arena`, which makes it durable, and nothing allocated in this phase because
+    // nothing connected. See the module header on which of these two numbers survives a `SIGKILL`.
+    //
+    // ⚠ **D81: "which rewrites it" was the old spelling and is now false** — `free_arena` appends
+    // a record and fsyncs rather than rewriting the image. This assertion is unaffected, and that
+    // is a fact about the record's CONTENTS rather than luck: the free record carries `live_pages`
+    // as an ABSOLUTE snapshot, not a delta (`arena.rs` writes it beside the extent, and the replay
+    // beside `TAIL_EXTENT_FREED` explains the asymmetry — `reserved_pages` can be a delta because
+    // it only moves on the two paths that write a record, while `live_pages` moves on every
+    // `alloc_in_arena`/`release_page`, which persist nothing). So a restore is exactly as fresh as
+    // it was when every claim rewrote the whole image, which is what keeps `after.live` exact here.
     assert_eq!(
         after.live, baseline.live,
         "allocated page count did not return to baseline ({} at baseline, {} after the branch \

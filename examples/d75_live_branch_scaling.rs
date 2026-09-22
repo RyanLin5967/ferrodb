@@ -199,14 +199,35 @@ fn main() {
     println!("{threads} threads doing fork/write/merge cycles; L other branches sit LIVE underneath.");
     println!("PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.");
     println!();
-    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   bytes/replace");
+    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked");
+    println!("  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)");
+    println!("  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)");
     println!("  persistence: {}", if std::env::var("D75_PERSIST").map(|v| v=="1").unwrap_or(false) { "ON (as cli.rs:120 does)" } else { "OFF (as every 10^6 harness here does)" });
     let mut first: Option<(usize, f64)> = None;
     for &l in &lives {
         let dir = std::env::temp_dir().join(format!("ferrodb-d75-{}-{}", std::process::id(), l));
         let _ = std::fs::remove_dir_all(&dir);
+        // **D81: snapshot the durability counters around the WHOLE phase**, so each row reports
+        // what that L cost rather than what every L before it also cost. The earlier
+        // `bench/d81_bytes_vs_fsyncs.txt` printed these cumulatively and subtracted by hand.
+        let (reps0, rbytes0) = ferrodb::storage::atomic_file::atomic_replace_counters();
+        let (apps0, abytes0) = ferrodb::storage::atomic_file::durable_append_counters();
         let s = build(&dir);
+        // **D81 — TIME THE PARK, not only the cycle.**
+        //
+        // The measured cycle is `BEGIN AGENT SESSION` + 4 UPDATEs + `MERGE`, and exactly ONE of
+        // those events claims an extent. So the free-space map is a small share of a cycle's
+        // cost, and `bench/d81_bytes_vs_fsyncs.txt` already noticed the consequence — *"the
+        // per-cycle median is not measuring the map at these sizes at all"* — without drawing the
+        // instrument conclusion from it. Parking is the opposite: L branches, one claim each,
+        // nothing else. `us per parked branch` is therefore the per-claim cost almost neat, and
+        // it is the quantity the D79 -> D81 story is actually about.
+        //
+        // ⚠ It is still a DURATION on a shared box. It is reported next to the counters, never
+        // instead of them.
+        let park_t = Instant::now();
         park_live_branches(&s, l);
+        let park_ms = park_t.elapsed().as_secs_f64() * 1000.0;
 
         // ⚠ Refuse rather than report a number that cannot be attributed. If the parked branches
         // are not actually live, the whole axis is meaningless and a printed row would hide that.
@@ -261,13 +282,19 @@ fn main() {
         flat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = flat[flat.len() / 2];
         let map_bytes = std::fs::metadata(&s.arena_path).map(|m| m.len()).unwrap_or(0);
-        // **D81 falsifier.** Separate the CONSTANT from the GROWING part of the checkpoint cost.
-        // Each `replace_atomically` is two fsyncs (file + dir) whatever the image size, so if the
-        // penalty tracks the REPLACE COUNT a delta scheme buys nothing; if it tracks BYTES, it does.
-        let (reps, rbytes) = ferrodb::storage::atomic_file::atomic_replace_counters();
-        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}   {reps:>9}   {:>12}",
+        // **D81 falsifier, and then D81's fix measured against it.** Separate the CONSTANT from the
+        // GROWING part of the checkpoint cost. Each `replace_atomically` is two fsyncs (file +
+        // dir) whatever the image size; each `append_durably` is ONE, over one record. `fsyncs` is
+        // therefore the column the falsifier said the penalty tracks, and `durable KB` the one it
+        // said it does not — printing both is what lets the after-run be read against the before.
+        let (reps1, rbytes1) = ferrodb::storage::atomic_file::atomic_replace_counters();
+        let (apps1, abytes1) = ferrodb::storage::atomic_file::durable_append_counters();
+        let (reps, rbytes) = (reps1 - reps0, rbytes1 - rbytes0);
+        let (apps, abytes) = (apps1 - apps0, abytes1 - abytes0);
+        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}   {reps:>9}   {apps:>7}   {:>6}   {:>10}   {park_ms:>7.0}   {:>9.1}",
                  med / (l as f64 / 1000.0), flat.len(),
-                 if reps == 0 { 0 } else { rbytes / reps });
+                 2 * reps + apps, (rbytes + abytes) / 1024,
+                 park_ms * 1000.0 / l as f64);
         if first.is_none() { first = Some((l, med)); }
         if let Some((l0, m0)) = first {
             if l != l0 {

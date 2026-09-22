@@ -1,5 +1,32 @@
 //! D90 — **the wall content-defined chunking does not climb: a tens-of-bytes change costs a page.**
 //!
+//! ---
+//! ⛔⛔ **BANDED 2026-09-22 — THE ARENA SECTION'S INTERPRETATION IS CONTAMINATED BY D81. THE RAW
+//! NUMBERS AND THE CHUNK-VS-DELTA RESULT ARE NOT.**
+//!
+//! This banner covers ONE section of this harness — "THE ARENA FREE-SPACE MAP", near the end. That
+//! section models `arena B` as `replaces x image` and SELF-CHECKS that every flat-region cycle
+//! performs exactly one `replace_atomically`. **D81 made `<db>.arena` append-only**: a claim
+//! appends 45 bytes and a free 25, and the whole image is rewritten only when the tail outgrows
+//! its share. So a cycle now performs **ZERO** replaces and N appends, the `arena_replaces != 1`
+//! check falls to its **"NOT confirmed"** branch **BY DESIGN**, and that print is the correct
+//! answer rather than a broken harness.
+//!
+//! ⇒ **AND THE SECTION'S STATED CONCLUSION IS NOW A DESCRIPTION OF A FIXED PROBLEM.** It reads:
+//! *"a database that has done N merges rewrites O(N) bytes on every subsequent merge... That is a
+//! real scaling problem and it belongs to whoever owns the free-space map."* **That is the exact
+//! wall D81 removed** — measured at 530 MB -> 1.19 MB (446x) over four phases, with fsyncs per
+//! claim going 2.000 -> 1.00. Read it as the statement of a problem that has SINCE BEEN SOLVED,
+//! not as a finding about the current tree.
+//!
+//! ⚠ **NOT REPAIRED, DELIBERATELY, AND THE REST OF THIS FILE IS UNAFFECTED.** Re-modelling
+//! `arena B` for an append-only map is this lane's own measurement decision, not a side effect of
+//! landing D81; and making the section's premise true again would be repairing the fixture to fit
+//! the assertion. Nothing outside that one section makes any claim about the arena, so **the
+//! amplification sweep, the order control and the chunk-vs-delta finding stand as measured.**
+//! Whoever next runs d90 should re-cut the arena model — and delete this banner then, not before.
+//! ---
+//!
 //! # The claim being turned into a number
 //!
 //! ForkBase's paper concedes in its footnote 2 that content-defined dedup LOSES to delta encoding
@@ -843,14 +870,48 @@ fn main() {
     // number of bytes per merge, then a database that has done N merges rewrites O(N) bytes on
     // every subsequent merge, whatever that merge changed. That is a real scaling problem and it
     // belongs to whoever owns the free-space map, not to chunk-vs-delta.
+    //
+    // ⛔⛔ **EVERYTHING IN THE TWO PARAGRAPHS ABOVE DESCRIBES THE PRE-D81 ARENA, AND D81 HAS
+    // LANDED.** Read them as the statement of a problem that has since been FIXED, not as a
+    // finding about the current tree. `<db>.arena` is now `[image][tail record]*`: a claim appends
+    // 45 bytes and a free 25, and `replace_atomically` fires only when the tail outgrows its share
+    // of the image. The O(N)-bytes-per-merge scaling problem this section identified — and handed
+    // to "whoever owns the free-space map" — is the wall D81 removed, measured at 530 MB -> 1.19 MB
+    // (446x) over four phases with fsyncs per claim going 2.000 -> 1.00.
+    //
+    // ⚠ **SO THIS SECTION'S SELF-CHECK IS EXPECTED TO REPORT "NOT confirmed" NOW, AND THAT IS THE
+    // CORRECT ANSWER RATHER THAN A BROKEN HARNESS.** It asserts every flat-region cycle performs
+    // EXACTLY ONE `replace_atomically`; post-D81 a cycle performs ZERO replaces and N appends until
+    // compaction, so `arena_replaces` is 0 and the `odd` branch fires. The counter is still real
+    // and still measures what it says — what changed is the system under it.
+    //
+    // ⇒ **NOT REPAIRED HERE, DELIBERATELY.** Making this section's premise true again would be
+    // editing the fixture to fit the assertion, and re-modelling `arena B` for an append-only map
+    // is a measurement decision belonging to d90's own lane, not a side effect of landing D81.
+    // The honest state is: the numbers below are still measured, and the MODEL around them is
+    // stale. Whoever next runs d90 should re-cut the model, not delete this note.
     {
         println!();
         println!("  THE ARENA FREE-SPACE MAP — a SECOND flat cost, and a different axis:");
-        println!("    `arena B` is bytes WRITTEN during the cycle, not the image's size: one");
-        println!("    `replace_atomically` rewrites the whole map, so bytes ~ replaces x image.");
+        println!("    `arena B` is bytes WRITTEN during the cycle, not the image's size. PRE-D81:");
+        println!("    one `replace_atomically` rewrote the whole map, so bytes ~ replaces x image.");
+        println!("    POST-D81 the map is append-only and a cycle may perform ZERO replaces, so");
+        println!("    that model no longer holds and (1) below is EXPECTED to read NOT confirmed.");
         println!();
         // Checked against the rows, not asserted in prose: the claim is that one whole rewrite
         // serves every r in the flat region, and a single cycle with two replaces would break it.
+        //
+        // ⛔ **D81: THIS CHECK NOW REPORTS "NOT confirmed", AND THAT IS THE CORRECT ANSWER.** See
+        // the banner at the head of this file. `<db>.arena` is append-only as of D81, so a cycle
+        // performs ZERO `replace_atomically` calls and N appends until compaction — `arena_replaces`
+        // is 0, `!= 1` is true for every cycle, and the `odd` branch below fires for all of them.
+        // ⚠ **The counter is NOT broken and the branch is NOT a failure**: `arena_replaces` still
+        // counts exactly what it says, and what moved is the system underneath it. The premise
+        // being tested — "one whole rewrite serves every r in the flat region" — is what stopped
+        // being true, because whole rewrites stopped being how the map is maintained.
+        // ⇒ Left to fire rather than rewritten: a check quietly adjusted to keep printing
+        // CONFIRMED would be repairing the fixture to fit the assertion, which is the one edit
+        // this repo refuses. Re-cut the model, then delete this note and the banner together.
         let flat_cycles: Vec<&Cycle> =
             up.iter().chain(down.iter()).filter(|c| c.r <= flat_hi).collect();
         let odd: Vec<&&Cycle> = flat_cycles.iter().filter(|c| c.arena_replaces != 1).collect();
