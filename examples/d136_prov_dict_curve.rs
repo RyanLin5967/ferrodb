@@ -506,6 +506,24 @@ struct AxisResult {
     sessions_run: usize,
 }
 
+/// What an arm is pre-registered to collect.
+///
+/// ⛔ Run 1 of this harness applied a single "an arm that collected nothing has not passed" rule
+/// to every arm, and exited 1 because the PARK **control** collected zero — which is the result
+/// the control exists to produce. The rule is right and the scope was wrong: anti-vacuity is a
+/// property of the *instrument*, not of every arm.
+///
+/// Stating the direction per arm is strictly STRONGER than the rule it replaces. `Zero` does not
+/// merely tolerate a zero; it **fails on a non-zero**, so a change that made a parked, unmerged
+/// session stamp a page dictionary would now break this arm — and that is precisely the
+/// regression the control is here to catch. And a `Zero` arm is not believed on the strength of
+/// its own silence: `axis` forces it to fire on its own server before accepting the zero.
+#[derive(Clone, Copy, PartialEq)]
+enum Expect {
+    NonZero,
+    Zero,
+}
+
 /// Run one arm, sampling the whole page population every `block` sessions, until `max_sessions`
 /// or until the store refuses.
 fn axis(
@@ -516,6 +534,7 @@ fn axis(
     merge: bool,
     block: usize,
     max_sessions: usize,
+    expect: Expect,
 ) -> AxisResult {
     let s = build(dir, tag, rows);
     println!("=== AXIS: {what} ===");
@@ -544,13 +563,105 @@ fn axis(
     }
 
     tail_print(&last, 10);
-    // A run that collected nothing has not passed.
-    let ok = last.sum > 0 && last.pages > 0;
-    if !ok {
-        println!("    ⛔ ZERO dictionary entries across the whole arm. Not a result.");
-    }
+
+    let ok = match expect {
+        // A run that collected nothing has not passed.
+        Expect::NonZero => {
+            let ok = last.sum > 0 && last.pages > 0;
+            if !ok {
+                println!("    ⛔ ZERO dictionary entries in an arm registered NON-ZERO. Not a result.");
+            }
+            ok
+        }
+        // A control's zero is only a result once the instrument has been forced to fire ON THIS
+        // SERVER. The fire-checks ran against a different server; a store this one never wrote to
+        // would produce exactly the zero above and look like a clean control.
+        Expect::Zero => {
+            let stayed = last.sum == 0 && last.pages == 0;
+            if !stayed {
+                println!(
+                    "    ⛔ an arm registered ZERO stamped {} entries across {} pages. \
+                     A parked, unmerged session is reaching the page dictionaries.",
+                    last.sum, last.pages
+                );
+            }
+            // The coda: one merged session on this very server must move it off zero.
+            // A session id distinct from every one this arm used, and small enough that `k * 97`
+            // in `one_session` cannot wrap: a wrapped id goes negative through `as i64`, selects
+            // no row, stamps nothing, and would fail this coda for a reason that is not the store.
+            let coda = one_session(&s, done + 1_000_000, true)
+                .map(|()| Dist::of(&s.dict_lens()))
+                .map(|d| d.sum > 0)
+                .unwrap_or(false);
+            println!(
+                "      LIVENESS CODA on this server: one MERGED session after the arm moves sum \
+                 {} -> {}  => {}",
+                last.sum,
+                Dist::of(&s.dict_lens()).sum,
+                if coda { "PASS (the zero above was measured by a live instrument)" } else { "FAIL (the zero is vacuous)" }
+            );
+            stayed && coda
+        }
+    };
     println!();
     AxisResult { ok, refused_at, last, sessions_run: done }
+}
+
+/// The locality model, stated as a PREDICTION and only then tested.
+///
+/// The locality table measures a fill rate of roughly `1/pages` dictionary entries per session.
+/// If that is the mechanism rather than a coincidence of two small tables, a workload spreading
+/// over `pages` pages must refuse at about `MAX_PAGE_DICT_ENTRIES / rate` sessions. This takes
+/// the rate at a checkpoint far below the cap, **prints the prediction before the refusal is
+/// observed**, and only then runs on.
+///
+/// ⚠ What this is and is not: an extrapolation of the subject's own early behaviour across a ~5x
+/// range. It tests whether the linear model reaches the cap. It is NOT an independent oracle for
+/// the cap's value, and a refutation here is a finding, not a broken run — so it does not gate
+/// the exit code, and the output says which it was either way.
+fn prediction_arm(dir: &std::path::Path, rows: i64, checkpoint: usize, ceiling: usize) -> bool {
+    println!("=== PREDICTION — the locality model run out to the cap ===");
+    let s = build(dir, "predict", rows);
+    for k in 0..checkpoint {
+        if one_session(&s, k, true).is_err() {
+            println!("    ⛔ refused before the checkpoint at {checkpoint}; no prediction possible.");
+            return false;
+        }
+    }
+    let at_checkpoint = Dist::of(&s.dict_lens());
+    let rate = at_checkpoint.max as f64 / checkpoint as f64;
+    let predicted = (MAX_PAGE_DICT_ENTRIES as f64 / rate).round() as usize;
+    println!("    rows {rows}, checkpoint {checkpoint} sessions: {} pages, max {}, 2nd {}.",
+        at_checkpoint.pages, at_checkpoint.max, at_checkpoint.second);
+    println!("    fill rate {rate:.4} entries/session on the fullest page (1/pages would be {:.4}).",
+        1.0 / at_checkpoint.pages.max(1) as f64);
+    println!("    ⇒ PRE-REGISTERED PREDICTION, written before the refusal is observed:");
+    println!("      the store must refuse at about session {predicted} (ceiling {ceiling}).");
+
+    let mut refused = None;
+    for k in checkpoint..ceiling {
+        if one_session(&s, k, true).is_err() {
+            refused = Some(k);
+            break;
+        }
+    }
+    let end = Dist::of(&s.dict_lens());
+    match refused {
+        Some(k) => {
+            let err = (k as f64 - predicted as f64).abs() / predicted as f64;
+            let held = err <= 0.15;
+            println!("    OBSERVED: refused at session {k}. predicted {predicted}. error {:.1}%.", err * 100.0);
+            println!("    => PREDICTION {}", if held { "HELD" } else { "REFUTED — the model does not reach the cap linearly" });
+            tail_print(&end, 8);
+            held
+        }
+        None => {
+            println!("    OBSERVED: no refusal within the {ceiling}-session ceiling (max reached {}).", end.max);
+            println!("    => PREDICTION NOT TESTED — the ceiling was too low to reach {predicted}.");
+            tail_print(&end, 8);
+            false
+        }
+    }
 }
 
 // =================================================================================================
@@ -592,6 +703,7 @@ fn main() {
         false,
         block,
         max_sessions,
+        Expect::Zero,
     );
 
     // CHURN — every session MERGEs. This is the arm that died at 495.
@@ -603,6 +715,7 @@ fn main() {
         true,
         block,
         max_sessions,
+        Expect::NonZero,
     );
 
     // LOCALITY — the arm that separates the two explanations. Same merge workload, same session
@@ -649,16 +762,29 @@ fn main() {
     }
     println!();
 
+    // The locality model, run out to the cap on a table 4x the one it was fitted on.
+    let predicted_ok = prediction_arm(
+        &dir,
+        env_usize("D136_PRED_ROWS", 800) as i64,
+        env_usize("D136_PRED_CHECKPOINT", 400),
+        env_usize("D136_PRED_CEILING", 4000),
+    );
+    println!();
+
     // =============================================================================================
     // What the numbers say, stated only as far as they reach.
     // =============================================================================================
     println!("=== READING ===");
     println!(
-        "  CONTROL (PARK): {} sessions, max occupancy {} on page {}, {} pages. {}",
+        "  CONTROL (PARK): {} sessions, max occupancy {}, {} pages{}. {}",
         park.sessions_run,
         park.last.max,
-        park.last.argmax,
         park.last.pages,
+        if park.last.argmax == u32::MAX {
+            " (no page carries any attribution at all)".to_string()
+        } else {
+            format!(", fullest page {}", park.last.argmax)
+        },
         match park.refused_at {
             Some(k) => format!("REFUSED at session {k}."),
             None => "never refused.".to_string(),
@@ -704,7 +830,15 @@ fn main() {
         );
     }
     println!(
+        "  PREDICTION: the locality model {} when run out to the cap on a larger table.",
+        if predicted_ok { "HELD" } else { "did NOT hold (see the arm above)" }
+    );
+    println!(
         "  ⚠ Every number above is a COUNT. No wall-clock figure was taken anywhere in this run."
+    );
+    println!(
+        "  ⚠ The exit code gates COLLECTION INTEGRITY only — fire-checks, and each arm matching \
+         its pre-registered direction. A refuted prediction is a finding and does NOT set it."
     );
 
     let ok = park.ok && churn.ok && loc_rows.iter().all(|(_, d, _, _)| d.sum > 0);
