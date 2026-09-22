@@ -1,0 +1,25 @@
+# CERTIFICATION EVIDENCE — the 2449 baseline, banked 2026-09-22
+
+Banked because it existed only in a volatile $VERIFY_OUT dir that the next suite overwrites.
+An agent searching the repo for 'passed=2449' found nothing and correctly reported the number
+as unbacked. It was real; it was just not where evidence goes. This fixes that.
+
+## The harness's own SUMMARY.txt lines, verbatim
+```
+land22-52e1137: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=52e1137 log=/Users/idide/wt/artie-research/verify-out/suite-land22-52e1137.log
+land22-52e1137: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/suite-land22-52e1137.go.log
+```
+
+## What this certifies
+head=52e1137, which is the merge of D123-artifacts + D92-merge3-fix + D113-compact-refusal
++ D114-ours-side-scan. certify-head.sh confirmed suite head == landing commit; prepush OK.
+Pushed as 8249c50..52e1137.
+
+⚠ Every later push (dc2a2cf, ee24331) is bench-only and code-identical to 52e1137, verified
+with 'git diff 52e1137..HEAD -- src examples tests tools Cargo.toml Cargo.lock cdc-consumer'
+returning empty. So this green still certifies the CODE at ee24331. Re-run that diff rather
+than trusting this sentence.
+
+## Provenance of the log files
+- suite-land22-52e1137.log  260763 bytes  sha256=1c52025c917deeef0e7fba959fc85f411e8e262b8c21676c8aba0ca504889827
+- suite-land22-52e1137.go.log  17285 bytes  sha256=8f5f4672b36d7121d97bb761bcc0e9a3f3dd4bdfc84e2a162873cba9d29b65c8

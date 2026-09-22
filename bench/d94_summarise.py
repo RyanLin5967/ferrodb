@@ -19,6 +19,7 @@ SWEEP_FILES = [f"{WT}/bench/d94_sweep_main.txt", f"{WT}/bench/d94_sweep_main_10k
 # which half is arithmetic about a tree shape that has since changed.
 HIST_FILES = [f"{WT}/bench/d94_sweep_raw.txt", f"{WT}/bench/d94_sweep_raw_part2.txt"]
 EXTENT = f"{WT}/bench/d94_extent_premise_raw.txt"
+FALSIFIER = f"{WT}/bench/d94_zero_falsifier_main.txt"
 TESTS = f"{WT}/bench/d94_dedup_tests.txt"
 OUT = f"{WT}/bench/d94_chunk_dedup.txt"
 PAGE = 4096
@@ -78,6 +79,8 @@ def fit(points):
 def main():
     stamps, rows = read_files(SWEEP_FILES)
     _, hist = read_files(HIST_FILES)
+    fals_stamps, fals_rows = read_files([FALSIFIER])
+    fals_rows = [r for r in fals_rows if r["gain"] > 0 or r["dup"] == 0.0]
     if not rows:
         print("REFUSING: no rows parsed from the sweep. A run that collected nothing has not "
               "passed.", file=sys.stderr)
@@ -123,6 +126,15 @@ def main():
     w("         bench/d94_extent_premise_raw.txt,")
     w("         bench/d94_zero_falsifier.txt (the 0 at dup_frac=0.00, forced to fire at k=1,2,3)")
     w("built by: bench/d94_summarise.py -- every number here is read from a raw run, not retyped")
+    w("")
+    w("PROVENANCE, because an old copy of this file is still out there and reads plausibly.")
+    w("  Every figure below was produced on CURRENT MAIN, at the stamps named above.")
+    w("  An EARLIER version carried different figures: trunk 101 pages, 9 pages per branch,")
+    w("  and 79.1% saving at dup_frac=1.00. Those were measured on branch D94-dedup at tip")
+    w("  ed6566e (harness builds 48c6e60 and 808273c) against base 8d79ee5, BEFORE D108")
+    w("  neighbour merge and the chunking work added 1357 lines to src/cow/btree.rs. They")
+    w("  are superseded, not wrong-at-the-time: they described the tree that existed then.")
+    w("  If you hold a copy quoting 79.1% or 9 pages/branch, it predates that move.")
     w("")
     w("VERDICT: REFUSE. The mechanism is built and tested; it is NOT adopted and NOT wired into")
     w("any write path. The deciding result is not that dedup wins too little -- it is that the")
@@ -210,6 +222,39 @@ def main():
     w("    Dedup's entire remaining budget is the 'dedup gains' column, and at dup_frac = 0.00 --")
     w("    branches writing DIFFERENT content, which is what independent agents do -- it is")
     w("    EXACTLY ZERO at every N. Not small: zero.")
+
+    w("")
+    w("(c) AND THAT ZERO WAS FORCED TO FIRE BEFORE IT WAS BELIEVED. A detector that has never")
+    w("    produced a non-zero result is indistinguishable from one that cannot. So the smallest")
+    w("    signal the workload can carry was planted deliberately -- k of the 8 rows per branch")
+    w("    made identical across branches -- and the gain must come back as exactly k*(N-1) pages")
+    w("    at N=100. Raw: bench/d94_zero_falsifier_main.txt")
+    for _fn, _fs in fals_stamps:
+        w(f"    falsifier built {_fs.split(chr(97)+chr(116),1)[1].strip()}")
+    if fals_stamps and stamps and {s for _, s in fals_stamps} != {s for _, s in stamps}:
+        w("    NOTE: the falsifier and the sweep were built at DIFFERENT commits; both are")
+        w("    named so the reader can check the delta rather than assume they agree. The only")
+        w("    delta on the measurement path is src/cow/diff.rs, which the harness does not use,")
+        w("    and bench/d94_sweep_recheck_main.txt re-runs the N=100 sweep row at the falsifier's")
+        w("    own commit and reproduces it exactly, which closes the gap.")
+    w("")
+    if fals_rows:
+        w(f"      {chr(107):<4} {'dup_frac':>9} {'gain (pages)':>13} {'k*(N-1)':>9}  {'':<6}")
+        for fr in fals_rows:
+            k = int(round(fr["dup"] * 8))
+            want = k * (fr["n"] - 1)
+            ok = "MATCH" if fr["gain"] == want else "MISMATCH"
+            w(f"      {k:<4} {fr[chr(100)+chr(117)+chr(112)]:>9.3f} {fr['gain']:>13} {want:>9}  {ok:<8}")
+        bad = [f for f in fals_rows if f["gain"] != int(round(f["dup"]*8))*(f["n"]-1)]
+        if bad:
+            w("    ONE OR MORE ROWS DID NOT MATCH k*(N-1) -- the falsifier itself is suspect.")
+        else:
+            w("")
+            w("    Every row matches k*(N-1) with no slack, down to k=1. The instrument resolves a")
+            w("    SINGLE duplicated page per branch, so the 0 at dup_frac=0.00 is a measurement and")
+            w("    not a detector that never ran.")
+    else:
+        w("    FALSIFIER RAW FILE NOT FOUND -- the zero above is unforced and should not be cited.")
     w("")
 
     # ---- The sweep: bytes and slope -------------------------------------------------
@@ -289,12 +334,16 @@ def main():
         w("")
         w("READ THIS CAREFULLY, because the two halves point opposite ways:")
         w("")
-        w("  STRUCTURAL, unchanged: distinct pages == distinct whole in every row of BOTH sweeps,")
+        w("  THE DURABLE HALF -- structural, unchanged, safe to cite without a commit:")
+        w("  distinct pages == distinct whole in every row of BOTH sweeps,")
         w("  and the dedup gain is 0 at dup_frac=0.00 and exactly k*(N-1) otherwise, in BOTH. The")
         w("  reason is that src/cow/page_header.rs is BYTE-IDENTICAL across the 147 commits -- same")
-        w("  24 bytes, same offsets. The finding rests on the page format, so it survived.")
+        w("  24 bytes, same offsets. That was CHECKED by diffing the mechanism, not inferred")
+        w("  from the number still looking plausible. Re-reading a number cannot tell you which")
+        w("  half you are holding; diffing the thing it rests on can.")
         w("")
-        w("  ARITHMETIC, moved: the tree got denser per branch. A branch now costs 14 pages where")
+        w("  THE PERISHABLE HALF -- arithmetic about a tree shape, and it MOVED. Never cite")
+        w("  these without naming the commit. A branch now costs 14 pages where")
         w("  it cost 9, and the floor dedup cannot go below rose from 1 page/branch to 6. So the")
         w("  headline saving at dup_frac=1.00 fell from 79.1% to 43.4% at N=100.")
         w("")

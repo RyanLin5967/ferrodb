@@ -108,6 +108,10 @@ impl ServerContext {
         runtime: Arc<crate::agent_sql::runtime::AgentRuntime>,
     ) -> Self {
         let e = catalog.epoch();
+        // D101 — building a `ServerContext` is this process stating which engine its statements
+        // run on. From here an agent statement on any OTHER runtime is refused; see
+        // `agent_sql::designated` for the defect that motivates it and for the blind spots.
+        crate::agent_sql::designated::designate(&runtime);
         ServerContext {
             catalog: Mutex::new(catalog),
             epoch: std::sync::atomic::AtomicU64::new(e),
@@ -117,6 +121,17 @@ impl ServerContext {
             txn,
             runtime,
         }
+    }
+
+    /// A `Session` bound to **this** context's runtime.
+    ///
+    /// The one-call correct way to make a session beside a `ServerContext`, and the reason to
+    /// reach for it is that `Session::new()` beside a `ServerContext` is a bug: it builds a
+    /// private `AgentRuntime::new()` with `storage: None` and runs every agent statement against
+    /// that instead of the engine this context owns. `agent_sql::designated` refuses such a
+    /// statement; this exists so the refusal has an obvious answer rather than only a diagnosis.
+    pub fn session(&self) -> crate::execution::session::Session {
+        crate::execution::session::Session::with_runtime(Arc::clone(&self.runtime))
     }
 
     /// The catalog, for the duration of one statement.

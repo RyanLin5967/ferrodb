@@ -2075,17 +2075,26 @@ impl PageStore for ArenaPageStore {
 
         // The owner may be mid-reap or already reaped and its children are still the authority
         // over this page, so the query is generation-blind by construction: it takes an id slot,
-        // not a `BranchId`. An owner with no record at all answers `false` — nothing pins the page.
-        // An owner with no record at all pins nothing: the previous shape matched `None` into the
-        // same branch as "not pinned", so a missing owner and an unpinned page already behaved
-        // identically. `&&` short-circuits on the missing record, so the query is not asked of a
-        // slot that has none.
-        let pinned = self.catalog.get_raw(owner.id).is_ok()
-            && self.catalog.live_child_in_epoch_range(
-                owner.id,
-                header.birth_epoch,
-                free_epoch,
-            )?;
+        // not a `BranchId`.
+        //
+        // ⛔ **D124 — this was `get_raw(owner.id).is_ok() && …`, and the `&&` was a silent free.**
+        // The comment it replaces said "an owner with no record at all pins nothing". That is
+        // false in both directions it could be read.
+        //
+        // An extent's owner is published BY CONSTRUCTION: `alloc_arena` is the only writer of
+        // `extents` and it ends in `catalog.add_arena`, which both catalogs refuse for a branch
+        // with no record. So the owner did exist. And "has no record *now*" does not mean it
+        // stopped existing: `TableBranchCatalog::upsert` is delete-then-insert with no latch held
+        // across the two, and `write_record` routes the RECORD key through it, so a concurrent
+        // `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
+        // perfectly healthy branch. Resolving that to "not pinned" ran `release_page` on a page a
+        // live child may still be reading: silent data loss, not a leak.
+        //
+        // So the `?`: refusing leaves the page PARKED, which the next drain revisits, and a
+        // retry succeeds. Freeing is the one outcome that cannot be retried.
+        self.catalog.get_raw(owner.id)?;
+        let pinned =
+            self.catalog.live_child_in_epoch_range(owner.id, header.birth_epoch, free_epoch)?;
 
         if pinned {
             // **D81.** Parking a page persists nothing — it never did — but under full-image

@@ -394,7 +394,7 @@ impl TwoTierReaper {
             }
             let mut still_pinned = Vec::new();
             let mut moved = false;
-            for pf in entries {
+            for (i, pf) in entries.iter().copied().enumerate() {
                 let pinned = match self.catalog.get_raw(pf.owner.id) {
                     // **D18, second site.** This read `rec.live_children` too, and on the table
                     // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
@@ -406,9 +406,48 @@ impl TwoTierReaper {
                         pf.owner.id,
                         pf.birth_epoch,
                         pf.free_epoch,
-                    )?,
-                    // No record at all: nothing can be forked off it, so nothing can see the page.
-                    Err(_) => false,
+                    ),
+                    // ⛔ **D124 — this was `Err(_) => false`, i.e. RELEASE THE PAGE.** The comment
+                    // it replaces said "no record at all: nothing can be forked off it, so
+                    // nothing can see the page". That premise is false.
+                    //
+                    // This owner WAS published: the extent it names was created by `alloc_arena`,
+                    // which ends in `catalog.add_arena`, and every catalog refuses that for a
+                    // branch with no record. And a record that is missing *right now* has not
+                    // stopped existing — `TableBranchCatalog::upsert` is delete-then-insert with
+                    // no latch held across the two calls, and `write_record` routes the RECORD
+                    // key through it, so a concurrent `set_root` or `renew_lease` on the owner
+                    // makes this read miss on a perfectly healthy branch.
+                    //
+                    // Answering "not pinned" to that hands back a page the interval rule had
+                    // deliberately parked for a live child. Refusing keeps the entry in the
+                    // pending log for the next drain, so the transient case simply succeeds on
+                    // retry; `DeferTouched` already records `touched` across this early return,
+                    // which is exactly what it exists for.
+                    //
+                    // Not reachable in production today — `reap_expired` runs under the
+                    // per-statement lock every `fork` also takes (`lease_thread.rs`) — but W4
+                    // exists to remove that lock, so this has to be gone before W4 lands, not
+                    // after. `tests/d15_concurrent_fork_and_reap.rs` bypasses `RuntimeLock`, which
+                    // is what makes it reachable at all outside production. The transient window
+                    // above is why W4 makes this urgent rather than theoretical: with the lock
+                    // gone, the old code frees a live branch's pages on an ordinary `set_root`.
+                    Err(e) => Err(e),
+                };
+                let pinned = match pinned {
+                    Ok(p) => p,
+                    // **D83's reasoning, applied to `entries` rather than to `touched`.**
+                    // `take_pending` has ALREADY emptied the durable log, so returning from here
+                    // with entries still in hand drops them: the pages would be neither released
+                    // nor ever revisited, which turns a refusal into a permanent reservation.
+                    // Put back everything not yet decided — this entry and the rest — and only
+                    // then refuse. The pre-existing `?` on `live_child_in_epoch_range` had the
+                    // same hole and now goes through here too.
+                    Err(e) => {
+                        still_pinned.extend_from_slice(&entries[i..]);
+                        self.store.put_pending(still_pinned)?;
+                        return Err(e);
+                    }
                 };
                 if pinned {
                     still_pinned.push(pf);
@@ -676,8 +715,14 @@ impl TwoTierReaper {
         match self.catalog.get_raw(branch.id) {
             Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
             Ok(_) => {}
-            // The slot is gone entirely between the query and here: nothing to reap, and nothing
-            // wrong. Same class as the `Branch` error below.
+            // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
+            // did not vanish between the query and here; what this catches is any `Branch` error
+            // from the read, including the momentary miss `TableBranchCatalog::upsert` opens on a
+            // healthy branch. Declining to reap on one is the safe direction: it frees nothing,
+            // and the next sweep asks again. Same class as the `Branch` error below, which
+            // likewise turns a refusal into "did not reap" rather than aborting the sweep —
+            // deliberately left alone, because propagating it would turn a benign already-reaped
+            // race into a failed sweep for a whole pre-existing class of errors.
             Err(FerroError::Branch(_)) => return Ok(false),
             Err(e) => return Err(e),
         }

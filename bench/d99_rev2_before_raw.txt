@@ -1,0 +1,20 @@
+ACQUIRED d77-walls  load_at_acquire=4
+
+D99 rev2 — D77's two walls, each measured with the others held down.
+at 39ef6b04095b
+  arm label: BEFORE-fix (39ef6b0, pre-D99 free_arena, same rev2 harness)   padding catalog: mem
+  load: 22:23  up 3 days,  1:26, 22 users, load averages: 4.65 4.12 3.87
+
+READING: durations on this box are UPPER BOUNDS (build fleet). The integer
+scan_steps column is len(current) = the entries the REPLACED retain would walk,
+by HashMap::retain's contract -- arithmetic, not a measurement. The fixed code
+does one hash probe regardless.
+
+B1  free_arena vs BRANCHES. pending=0, persist OFF. Isolates the named scan.
+      branches M   scan_steps   verified    ns/free_arena    ns per 1000 M
+          1000         1001        100           750.0           750.00
+         10000        10001        200          6917.0           691.70
+        100000       100001        200         90916.0           909.16
+       1000000      1000001        200       1902000.0          1902.00
+
+arm-rc=0

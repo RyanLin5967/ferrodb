@@ -1,6 +1,33 @@
+===============================================================================================
+⛔⛔ D101 CORRECTION — 2026-09-21. THE NUMBERS BELOW TIMED AN IN-MEMORY STUB.
+`examples/d68_merge_is_o_table.rs` built a `ServerContext` over `AgentRuntime::with_storage` (a
+real `ArenaPageStore`) and then ran every cycle on `Session::new()` — a private, storage-less,
+in-memory runtime. LINE 3 OF THIS FILE, which asserted the opposite, is corrected in place below.
+⚠ WHAT PLAUSIBLY SURVIVES, stated as a hypothesis for the re-run to settle and NOT as a finding:
+the mechanism this file names — `evaluate_merge` scanning the whole table (`runtime.rs:2691`),
+`fingerprint_tables` scanning it again, `fingerprint_rows` hashing every row — reads the SHARED
+table through `ExecCtx`'s catalog and buffer pool, which the harness built for real. That work is
+therefore expected to happen either way, so the O(table) SHAPE may well hold. The absolute
+milliseconds and the fitted 1.87 us/row coefficient are withdrawn regardless.
+
+The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
+path. They are simply not a measurement of the path this file's headline names.
+Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
+Harnesses corrected: commit fc443c4.  Re-run on the corrected harnesses: `bench/d101_rerun.txt`.
+⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
+===============================================================================================
+
 D68 — IS A MERGE O(TABLE) OR O(DELTA)? The falsifiable test of D67's successor claim.
 [HERE] 2026-09-20T15:54:27Z at a8fc8e6
-Harness uses AgentRuntime::with_storage (real arenas) — D67's configuration bug is fixed.
+⛔ D101 CORRECTION, IN PLACE. The original line read:
+      "Harness uses AgentRuntime::with_storage (real arenas) — D67's configuration bug is fixed."
+  IT IS FALSE AS WRITTEN, and it is false in the most specific way possible. The harness does
+  CONSTRUCT `AgentRuntime::with_storage` over a real `ArenaPageStore`, and it does hand it to a
+  `ServerContext` — so the first half of the sentence is true of an object that exists. It then
+  ran every timed statement on `Session::new()`, which builds its own `AgentRuntime::new()`
+  (`storage: None`). The arenas were real and were never touched. D67's configuration bug was
+  fixed in the constructor and reintroduced at the session, which is why fixing it once was not
+  enough and why the fix is now a refusal in the engine rather than a line in a harness.
 load before: 80.44 38.76 24.67
 
 D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).

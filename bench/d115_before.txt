@@ -1,0 +1,72 @@
+D115 — stage_all phase attribution
+  ops axis        : [32, 128, 512, 2048, 8192]
+  delta (cells)   : 32
+  reps per point  : 3
+  table rows      : 2000
+  effect log      : mem  (⛔ production ships `durable`, cli.rs:141)
+  load at start   : 22:36  up 3 days,  1:39, 22 users, load averages: 4.49 4.11 4.07
+
+  ⚠ Every millisecond below is an UPPER BOUND — this box runs a build fleet.
+    The integer columns are the claim; the durations confirm the magnitude.
+
+=== ASCENDING — ops axis, delta fixed at 32, 5 points
+       ops   n |  writes ms    exp |   decide    apply    clone     drop   append   mirror | exp(t)
+               |   (median)        |  ms/sess  ms/sess  ms/sess  ms/sess  ms/sess  ms/sess |       
+        32   3 |      0.446    NaN |    0.002    0.024    0.032    0.017    0.012    0.000 |    NaN
+       128   3 |      1.982   1.08 |    0.006    0.054    0.350    0.208    0.121    0.000 |   1.53
+       512   3 |     17.182   1.56 |    0.031    0.263    5.128    4.142    2.384    0.000 |   2.00
+      2048   3 |    163.357   1.62 |    0.097    0.740   60.668   55.555   28.266    0.000 |   1.80
+      8192   3 |   2353.566   1.92 |    0.467    3.070  940.812  904.164  436.730    0.000 |   1.99
+
+    integers — per session, exact, immune to fleet load
+       ops | stage_calls   clone_ops extends_cmp eq_guard_cmp  eq_op_cmp  tail_ops pos_scan mirror_rows
+        32 |          32         528         496           0          0        31       31           0
+       128 |         128        8256        8128           0          0       127      127           0
+       512 |         512      131328      130816           0          0       511      511           0
+      2048 |        2048     2098176     2096128           0          0      2047     2047           0
+      8192 |        8192    33558528    33550336           0          0      8191     8191           0
+
+    share of stage_all, per session (%) — the attribution the row needs
+       ops |  stage ms  decide   apply   clone    drop  append  mirror | stage/writes    sum/stage
+        32 |     0.091    1.9%   26.1%   35.1%   19.0%   13.3%    0.0% |        20.4%        95.4%
+       128 |     0.753    0.8%    7.2%   46.5%   27.7%   16.0%    0.0% |        38.0%        98.1%
+       512 |    12.027    0.3%    2.2%   42.6%   34.4%   19.8%    0.0% |        70.0%        99.3%
+      2048 |   145.565    0.1%    0.5%   41.7%   38.2%   19.4%    0.0% |        89.1%        99.8%
+      8192 |  2286.176    0.0%    0.1%   41.2%   39.5%   19.1%    0.0% |        97.1%       100.0%
+
+=== DESCENDING (same axis, walked backwards) — ops axis, delta fixed at 32, 5 points
+       ops   n |  writes ms    exp |   decide    apply    clone     drop   append   mirror | exp(t)
+               |   (median)        |  ms/sess  ms/sess  ms/sess  ms/sess  ms/sess  ms/sess |       
+        32   3 |      0.369    NaN |    0.002    0.016    0.022    0.013    0.012    0.000 |    NaN
+       128   3 |      1.852   1.16 |    0.008    0.064    0.343    0.269    0.157    0.000 |   1.81
+       512   3 |     16.237   1.57 |    0.030    0.211    4.896    3.964    2.251    0.000 |   1.87
+      2048   3 |    163.082   1.66 |    0.097    0.715   60.887   56.331   28.150    0.000 |   1.84
+      8192   3 |   2348.340   1.92 |    0.445    2.908  929.396  895.880  435.705    0.000 |   1.98
+
+    integers — per session, exact, immune to fleet load
+       ops | stage_calls   clone_ops extends_cmp eq_guard_cmp  eq_op_cmp  tail_ops pos_scan mirror_rows
+        32 |          32         528         496           0          0        31       31           0
+       128 |         128        8256        8128           0          0       127      127           0
+       512 |         512      131328      130816           0          0       511      511           0
+      2048 |        2048     2098176     2096128           0          0      2047     2047           0
+      8192 |        8192    33558528    33550336           0          0      8191     8191           0
+
+    share of stage_all, per session (%) — the attribution the row needs
+       ops |  stage ms  decide   apply   clone    drop  append  mirror | stage/writes    sum/stage
+        32 |     0.070    2.9%   23.3%   31.0%   18.9%   17.2%    0.0% |        18.8%        93.2%
+       128 |     0.857    1.0%    7.5%   40.0%   31.3%   18.3%    0.0% |        46.3%        98.1%
+       512 |    11.429    0.3%    1.8%   42.8%   34.7%   19.7%    0.0% |        70.4%        99.3%
+      2048 |   146.422    0.1%    0.5%   41.6%   38.5%   19.2%    0.0% |        89.8%        99.8%
+      8192 |  2265.224    0.0%    0.1%   41.0%   39.5%   19.2%    0.0% |        96.5%       100.0%
+
+=== ASC vs DESC — the contamination control
+    A point whose two readings disagree by more than the effect being claimed is a
+    contaminated point. D114 saw 36.121 vs 9.798 ms on one point of this same box.
+       ops |     asc ms    desc ms   ratio |  asc clone desc clone   ratio
+        32 |      0.446      0.369    1.21 |      0.032      0.022    1.48
+       128 |      1.982      1.852    1.07 |      0.350      0.343    1.02
+       512 |     17.182     16.237    1.06 |      5.128      4.896    1.05
+      2048 |    163.357    163.082    1.00 |     60.668     60.887    1.00
+      8192 |   2353.566   2348.340    1.00 |    940.812    929.396    1.01
+
+  load at end     : 22:37  up 3 days,  1:41, 22 users, load averages: 4.20 4.11 4.07

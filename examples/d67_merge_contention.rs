@@ -133,6 +133,12 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     const ARENA_BASE: u32 = 1024;
     let arena_base = ARENA_BASE;
     let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), arena_base).unwrap());
+    // D101 — ARM PERSISTENCE, because production does and this harness did not.
+    // `ArenaPageStore` persists its free-space map through `persist_if_configured`, which is a
+    // NO-OP until a checkpoint path is set. `src/cli/cli.rs:120` and `examples/pgserver.rs:101`
+    // both set one, so a run without it measures a configuration nobody ships — and it measures
+    // it in the flattering direction, since the persistence work is simply skipped.
+    store.checkpoint_to(d.join("main.arena"));
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             branches,
@@ -144,7 +150,12 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
 
-    let mut sess = Session::new();
+    // D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private
+    // effect log), so every agent statement below would run on a stub and the arena/durable
+    // catalog built above would be constructed and never touched. `agent_sql::designated`
+    // now refuses this rather than measuring it.
+    let mut sess = s.ctx.session();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
     for i in 1..=ROWS {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
@@ -154,7 +165,7 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
 
 /// One agent's whole life: fork, write, merge. Returns true if the cycle completed.
 fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
-    let mut sess = Session::new();
+    let mut sess = s.ctx.session();
     if exec(s, &format!("BEGIN AGENT SESSION AS 'a{tid}';"), &mut sess).is_err() {
         return false;
     }
@@ -197,7 +208,7 @@ fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
     let slot = Arc::new(AtomicBool::new(false));
     s.ctx.register_reader(Arc::clone(&slot));
     let mut cache: Option<(u64, Arc<Catalog>)> = None;
-    let mut sess = Session::new();
+    let mut sess = s.ctx.session();
     let sql = "SELECT v FROM t WHERE id = 7;";
     while !stop.load(Ordering::Relaxed) {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
