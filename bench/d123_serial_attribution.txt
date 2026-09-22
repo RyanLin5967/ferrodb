@@ -1,0 +1,697 @@
+D123 — WHERE FORK'S SERIAL SECTION GOES, AND WHETHER IT IS THE CEILING.
+
+Falsifiers pre-registered and committed BEFORE the first measurement: bench/d123_PREREGISTRATION.md
+(f05283b), amendments 1-8 append-only. Scaffold branch D123-serial-attribution; the src/ edits are a
+MEASUREMENT SCAFFOLD and MUST NEVER MERGE (same status as D35-gate-stubtouch, buffer_pool.rs:158).
+RAW, in the order taken:
+  bench/d123_raw/         battery A, warm=20,000        bench/d123_raw_warm0/  battery B, warm=0
+  bench/d123_rerun/       probe-off F1, perturb2, phases x3, extra x2
+  bench/d123_final/       PAIRED F1 (both regimes), the novelty intervention, and the clean F1
+This artifact is assembled by bench/d123_assemble.sh from bench/d123_sections/, which REFUSES to
+emit if any section still says PENDING and warns on any arm lacking a `# harness_exit=0` sentinel.
+
+⛔ WHICH NUMBERS IN HERE ARE CLEAN. Two agents declared activity overlapping this row's measure-lock
+windows (section 1e has the ledger). The F1 verdict rests on bench/d123_final/51_f1_clean2.txt.
+Earlier F1 arms are reported, and reported as dirty — including 50_f1_clean.txt, which I
+CONTAMINATED MYSELF by running two cargo builds 2 m 50 s into it (50_CONTAMINATION_BY_ME.txt).
+
+⚠ PROVENANCE. The first battery was run by the team lead on the rate-limit window after this agent
+hit its session limit with zero arms run (bench/D123_LEAD_RAN_THIS.md). It rebuilt a stale binary
+(ff8339e -> dd65665) before any arm, and declared a 4.34 s `cargo build --lib` that overlapped one
+arm (bench/d123_raw/00_LEAD_CONTAMINATION.txt). ⛔ That note names the overlapped arm "20_threads —
+the F1 arm". The arm is right, the label is wrong: 20_threads is F6; F1 is 40_stub, which ran
+afterwards (mtimes 18:40 vs 18:43; the build was 18:37-18:38 local). So F1 carries no known
+contamination, and F6's verdict (measured/bound 1.00x -> 0.03x) is nowhere near a boundary a 4 s
+spike could move.
+
+================================================================================================
+0. ⭐ THE FINDING THAT MATTERS MOST: THE EVIDENCE W-B WAS BUILT ON IS AN IDENTITY, NOT A MODEL.
+================================================================================================
+
+D8's result, quoted into INVENTION-TRIGGER.md as what established W-B: "throughput = 1/serial_time
+predicted 4,386 against 4,382.7 measured — 0.15% agreement across four runs."
+
+That is division. In fork_concurrency.rs the two printed columns are
+
+    per-fork ms = secs*1000/total          forks/sec = total/secs
+
+which are algebraic reciprocals, so "1/per-fork-ms agrees with forks/sec" is true of ANY numbers
+the harness could ever print. Checked against this row's own runs, where the same two columns are
+computed the same way:
+
+    T=1    forks/sec  244.7   1000/S_eff  244.7   ratio 0.999878
+    T=8    forks/sec 1165.8   1000/S_eff 1165.8   ratio 0.999965
+    T=64   forks/sec 5057.3   1000/S_eff 5057.1   ratio 1.000031
+    T=512  forks/sec 4942.7   1000/S_eff 4942.7   ratio 1.000007
+
+And the inherited residual is reproduced exactly as a ROUNDING artifact:
+
+    measured 4382.7/sec -> exact per-fork 0.228170 ms -> PRINTED to 3 dp as 0.228
+    1 / 0.228 ms = 4385.96/sec         discrepancy vs measured  +0.074%
+                                       discrepancy from rounding +0.074%   <- identical
+
+⇒ The 0.15% was the third decimal place of a rounded reciprocal. **It is not evidence that the
+serial section is the binding constraint, and never was.** The trigger file's own lesson — "a tight
+fit is the most persuasive way to be wrong" — is stronger than it knew: this fit could not have
+failed. (Caught by the team lead on the throughput columns; confirmed here and traced back to the
+inherited D8 claim, which is where it does damage.)
+
+⇒ The section IS the ceiling, but that is established below by F1 and F6, on evidence that could
+have come out the other way. W-B was right by accident.
+
+================================================================================================
+1. Q2 — IS THE SERIAL SECTION THE CEILING?  YES. F1 DOES NOT FIRE. M-FSYNC IS REFUTED.
+================================================================================================
+
+1a. THE ADVERSARY'S BOUND, EVALUATED RATHER THAN ASSERTED.
+INVENTION-TRIGGER.md:148: "a closed 64-thread harness is fsync-bound at 64 forks per 3.574 ms
+round, so even a serial section driven to ZERO cannot clear the bar." That bound is 64/3.574 ms =
+17,907 forks/sec — 4.09x ABOVE the 4,382/sec it was invoked to explain. A bound four times above
+the observation cannot be what pins it. Measured directly (bench/d123_raw/20_threads.txt), taking
+each arm's OWN fsync round duration rather than inheriting the 3.574 ms residual:
+
+  threads  forks/sec   f/sync   M-FSYNC bound   measured/bound       (warm=20,000)
+        1      215.3      1.0             215            1.00x
+        8     1197.0      4.0            2422            0.49x
+       64     5262.8     17.5           19199            0.27x
+      128     5053.6     17.4           37073            0.14x
+      256     5158.2     16.6           79786            0.06x
+      512     4942.7     15.7          161516            0.03x
+
+M-FSYNC requires throughput proportional to T. Throughput is FLAT from 64 to 512 (5262 -> 4942)
+while the bound grows 8x. ⛔ REFUTED.
+
+⭐ AND IT IS REFUTED ON A PURE COUNTER, WHICH NEEDS NO CLOCK AT ALL. `f/sync` is two integers from
+`syncs_issued()`. Under M-FSYNC a round commits every in-flight thread, so f/sync MUST equal T:
+1, 8, 64, 128, 256, 512. Measured: 1.0, 4.0, 17.5, 17.4, 16.6, 15.7 — it stops at ~17 and stays
+there while T grows 8x. Immune to the 41.67 ns tick and to the 46x load spread. This also
+reproduces the already-banked 1.0/3.9/14.5/13.8 from fork_concurrency_after.txt, so that artifact
+contained the refutation of the premise built on top of it.
+
+
+1b. F1 — THE SECTION DRIVEN TOWARD ZERO. PROBE OFF, 9 REPS, LEVEL ORDER ROTATED, PAIRED.
+(bench/d123_final/20_f1_paired_warm0.txt. Probe OFF because F1's load-bearing columns are forks/sec
+and the L3/L0 ratio, neither of which needs the instrument.)
+
+⭐ RAW, BANKED AS A MATRIX SO THE CLAIM NEEDS NO ESTIMATOR. Levels within one rep run back to back
+inside ~25 s, so drift is common-mode WITHIN a rep and cancels in the ratio; comparing level
+medians ACROSS reps lets drift masquerade as a level effect.
+
+    rep          L0          L1          L2          L3       L3/L0
+      0      4765.1      9224.8      9249.3      9706.7       2.04x
+      1      4662.4      8160.4      8566.8      8848.9       1.90x
+      2      4330.2      8649.7      8019.5      7166.9       1.66x
+      3      4497.0      7837.3      6680.5      9337.6       2.08x
+      4      4487.1      7456.4      6683.3      8105.8       1.81x
+      5      2412.7      7403.2      7828.6      9477.6       3.93x   box degraded from here
+      6      1043.2      1213.2      1907.2      3024.9       2.90x
+      7       303.1      1398.0      2253.9      1993.0       6.58x
+      8      1220.0      2797.7      3030.3      3743.2       3.07x
+
+  PAIRED L3/L0   all 9 reps: median 2.08x, min 1.66x, max 6.58x
+                 reps 0-4  : median 1.90x, min 1.66x, max 2.08x   <- the conservative figure
+
+AND THE SAME EXPERIMENT AT warm=20,000 (bench/d123_final/30_f1_paired_warm20k.txt), 9 more reps:
+
+    rep          L0          L1          L2          L3       L3/L0
+      0      4836.4      5513.6      6484.2     10485.1       2.17x
+      1      4317.2      6095.6      2722.1      7910.2       1.83x
+      2      4593.0      6762.7      7752.3      7631.5       1.66x
+      3      5291.4      8575.8      6745.6      9710.6       1.84x
+      4      4991.4      7611.3      5865.1      5139.9       1.03x
+      5      5018.4      7298.7      7881.8      9354.8       1.86x
+      6      5204.4      7858.7      7604.3     10267.2       1.97x
+      7      3984.0      8658.8      7796.8      9625.3       2.42x
+      8      4848.5      6809.0      8186.1      9923.5       2.05x
+
+  PAIRED L3/L0   median 1.86x, min 1.03x, max 2.42x
+
+  ⭐ BOTH REGIMES, 18 INDEPENDENT PAIRED DRAWS:
+       warm=0     median 2.08x    0 of 9 reps within +/-10% of 1.00x
+       warm=20k   median 1.86x    1 of 9 reps within +/-10% of 1.00x
+       COMBINED   median 2.00x    1 of 18
+
+⇒ **F1 DOES NOT FIRE, IN BOTH REGIMES.** The falsifier required L3/L0 within +/-10% of 1.00x.
+**17 of 18 paired draws are above 1.10x** and the combined median is 2.00x. No estimator, no
+averaging across arms — the count of individual draws carries it.
+
+⇒ AND THE CONTAMINATION BIASES THE RATIO THE SAFE WAY. warm=0's reps 5-8 ran while the box
+degraded (L0 collapsing to 2412 / 1043 / 303 / 1220 forks/sec) and their ratios are HIGHER
+(2.90-6.58x), because interference hurts L0 more than L3 - L0 spends 21x longer inside the section
+where the interference lands. So the clean reps' **1.90x is a floor, not a midpoint**, and the
+honest headline number is the warm=20k median of **1.86x** on an uncontaminated run.
+
+  THE VOID GUARD, BY CONSERVATION. `syncs` falls 465 -> 250 as the section shortens. That is group
+  commit batching more forks behind a shorter section, not lost durability, and the two are told
+  apart by syncs x f/sync = 8000 = N, which holds EXACTLY at every level in every run.
+
+1c. ⛔ I REPORTED THIS ARM AS "F1 UNDECIDED" AND THAT WAS THE WRONG INSTRUMENT, NOT A WRONG ARM.
+Earlier I ran warm=20k UNPAIRED and reported "F1 undecided at this N", because within-level spreads
+of 51-139% swamped level differences of 14-54%. That was the correct call for the summary I was
+looking at. But the same regime, measured PAIRED, decides cleanly at 1.86x. The identical 9 reps
+above, summarised the unpaired way, still look hopeless:
+   stub  median f/s     min      max   spread   vs L0        (warm=0 arm, same 9 reps)
+      0      4330.2   303.1   4765.1   103.0%   1.00x
+      1      7456.4  1213.2   9224.8   107.4%   1.72x
+      2      6683.3  1907.2   9249.3   109.9%   1.54x
+      3      8105.8  1993.0   9706.7    95.2%   1.87x
+Spreads of 95-110%, non-monotone in L2 - and yet every paired draw from those very numbers is
+>= 1.66x. **The ratio-of-medians and the median-of-ratios are not the same quantity when the box
+drifts, and only the second answers F1.** Logging the reversal here, where the original call was
+made: the data was always sufficient; my summary statistic was throwing the answer away.
+
+That is the same defect as section 0's reciprocal and section 2e's 1.42x, and all three are one
+rule: **a ratio is evidence only when both sides come from the same instrument and the same
+moment.** Reciprocals share both and prove nothing; cross-regime ratios share neither; a
+ratio-of-medians across a drifting box shares the instrument but not the moment.
+
+1e. THE CONTAMINATION LEDGER, AND WHY THE CLEAN-DRAW COUNT IS SMALLER THAN THE DRAW COUNT
+================================================================================================
+
+Two agents declared activity overlapping this row's measure-lock windows. Neither was at fault: the
+measure lock excludes other MEASURERS and does not exclude builds or suites, so a correct poll and a
+correct acquire can both precede a full test suite landing on the same CPU.
+
+  declarer        window (UTC)             what
+  diff-identity   23:04:00 - 23:12:54Z     near-continuous cargo in a sibling worktree, incl. a
+                                           full `cargo test --lib` (1577 tests, 61.91 s) which
+                                           itself contains a >60 s concurrency-heavy reaper test
+                                           on this very subsystem
+  d77-walls       23:59:00 - 00:03:00Z     `cargo build --examples`, `cargo test --lib` (~72 s),
+                                           8 integration targets — a rebase verification
+  ⛔ MYSELF       00:31:10-00:31:35Z         2 cargo builds INSIDE 50_f1_clean, which had acquired at
+                                           load_at_acquire=13. See 50_CONTAMINATION_BY_ME.txt.
+                                           The measure lock protects a measurement from other
+                                           agents, not from its own author rebuilding the
+                                           worktree whose target/ holds the binary under test.
+                                           HOLDING THE LOCK IS NOT A LICENCE TO BUILD.
+                                           ⭐ FIRST USE OF THE PER-REP STAMPS, and on my own
+                                           contamination: the builds map to reps 3 and 4 ONLY.
+                                           Build-free reps 0,1,2,5,6,7,8 median 1.66x, 0 of 7
+                                           near 1.00x. A lookup, not a reconstruction.
+
+  arm                            ran (UTC)              intersection
+  first battery F1 (both)        23:06 - 23:07Z         ENTIRELY inside diff-identity
+  20_f1_paired_warm0             23:59:46 - 00:01:32Z   ENTIRELY inside d77-walls
+  30_f1_paired_warm20k           00:01:32 - 00:05:46Z   first 88 s of 254 s inside d77-walls
+
+⇒ **OF THE 18 PAIRED DRAWS, ONLY FIVE FALL OUTSIDE EVERY DECLARED WINDOW** — `30_f1_paired_warm20k`
+reps 4-8, at 28.2 s per rep. Those five give **median 1.97x, 4 of 5 above 1.10x**. One of them (rep
+4, 1.03x) sits inside the falsifier's band. **An earlier draft of this artifact said "17 of 18" and
+that overstates the clean evidence; the phrasing is withdrawn.** F1 is therefore re-run in
+`bench/d123_final/51_f1_clean2.txt`, and the verdict below rests on that.
+
+⭐ THE DIRECTION QUESTION, NOW MEASURED ACROSS THREE ARMS INSTEAD OF ARGUED.
+Three independent paired F1 arms ran under three different load regimes:
+
+  arm                                    load (start -> end)   median   draws >1.10x
+  warm=0     (d77-walls inside)          5.31 -> 7.87           2.08x      9/9
+  warm=20k   (first 88 s inside)         7.87 -> 3.42           1.86x      8/9
+  50_f1      (loud throughout + my own
+              builds in reps 3 and 4)   13.64 -> 6.94           1.75x      9/9
+  ALL 27 DRAWS                                                  1.87x     26/27
+
+**The LOUDEST arm gives the LOWEST ratio.** Sustained heavy load DEFLATES the L3/L0 contrast, so
+every contaminated arm here is CONSERVATIVE for the verdict, and a genuinely quiet re-run should
+read higher rather than lower. That is a measured relation across three arms, not an inference from
+one.
+
+⛔ AND IT SUPERSEDES A DIRECTION ARGUMENT I MADE AND HAVE SINCE NARROWED TWICE. I claimed contamination biases the F1
+ratio UPWARD, because interference hurts L0 more than L3 (L0 spends ~21x longer inside the section).
+It holds ONLY for SEVERE degradation — warm=0's reps 5-8, where L0 collapsed to 303-2412 forks/sec,
+produced the highest ratios seen anywhere (2.90-6.58x). It does not hold for mild load (warm=20k's
+contaminated reps 0-2 median 1.83x against clean reps 4-8 at 1.97x), and the three-arm table above
+shows the OPPOSITE for sustained load. So the correct statement is: **severe degradation that
+collapses L0 inflates the ratio; sustained moderate load deflates it.** Neither is a reason to
+trust a dirty arm, which is why 51 exists.
+
+⭐ THE METHOD FIX, WHICH MATTERS MORE THAN THIS PARTICULAR LEDGER. The rep-to-window mapping above
+was reconstructed by dividing an arm's wall duration by its rep count — arithmetic on two file
+mtimes. That assumes every rep took the same time, and **the reps we most care about are exactly the
+ones that ran LONG because the box was loaded**, so the estimate is biased in the direction that
+misplaces the boundary. The harness now stamps **each rep with wall-clock UTC in the raw matrix**,
+so any declaration arriving later can be intersected with the data exactly, by anyone, without
+re-deriving it. A derived quantity standing in for a recorded one is the same defect as section 0's
+reciprocal, in a different costume.
+
+⚠ AND THE `# other cargo/rustc/suite at acquire:` BLOCK IN EACH ARM OVER-REPORTS. It is a
+`pgrep -fl 'cargo|rustc|verify-suite'`, which matches any shell whose command line merely CONTAINS
+those strings — including this row's own polling shells, which carry
+`export PATH="$HOME/.cargo/bin:$PATH"`. So entries there are an UPPER BOUND on what was building,
+not a list of builders, and a reader should check `ppid`/`command` before counting one. This is the
+same `pgrep -f` self-match that broke a wait loop in this row earlier; it is harmless here because
+the block is a record rather than a gate, but a record that over-reports in the direction of "the
+box was busy" would make a clean arm look dirty, which is the expensive direction for this artifact.
+The trustworthy quantity in that header is `load_at_acquire`, which is not pattern-matched.
+1d. THE HEADROOM, WHICH IS THE NUMBER ROUND 3 ACTUALLY NEEDS.
+L3 removes write_record, the FREE_ID scan, the envelope lookup and the child-key insert, keeping
+only write_header + stage. It is not implementable — it drops the child's record (the branch does
+not exist), its envelope (a capability escape) and its entry in the parent's live set (a GC hole).
+It is the LIMIT of serial-section work removal, and it buys a **paired median of 2.00x**
+(warm=0 2.08x, warm=20k 1.86x, 18 draws). So:
+
+  ⇒ ANY W-B candidate that works by removing work from fork's serial section has a hard ceiling of
+    about 2x, and the 22 candidates were aimed at a real target with a small budget.
+
+================================================================================================
+2. Q1 — WHAT IS THE 0.1532 ms?  IT IS NOT HANDOFF, IT IS INSIDE THE SECTION, AND MOST OF IT IS
+   NOT A PHYSICAL COST AT ALL.
+================================================================================================
+
+2a. F4 — HOLD vs HANDOFF. DECIDED BY ONE NUMBER, MEASURED FOUR TIMES.
+Only one thread can hold `logical`, so S_eff = HOLD_TOTAL + gap EXACTLY, with no third term.
+HOLD_TOTAL is stamped to the UNLOCK, not to the end of the work: the guard is declared first so it
+drops LAST, and the record drops before it are lock-held too (Amendment 1 — without bracketing
+those, allocator work would have been misreported as handoff).
+
+  run                              S_eff    HOLD_TOTAL      gap    U(hold)   sum_ph  in_resid
+  first battery, warm=20k        0.19774      0.19202   0.00572     97.1%   0.18971   0.00025
+  first battery, warm=0          0.20765      0.20136   0.00629     97.0%   0.19884   0.00024
+  re-run rep 1,   warm=20k       0.20898      0.19651   0.01247     94.0%   0.19423   0.00023
+  re-run rep 2,   warm=20k       0.22163      0.20932   0.01231     94.4%   0.20726   0.00022
+
+⇒ **U(hold) = 94-97%. H-HANDOFF IS DEAD.** The mutex sits idle for 0.006-0.012 ms per fork, 3-6%
+of the interval. The predicted H-HANDOFF signature was U ~ 33%; it is not close.
+⇒ **THE NAMED PHASES ACCOUNT FOR THE SECTION TO 0.13%** (in_resid 0.00022-0.00025 ms of a ~0.20 ms
+section). The partition is complete; there is no hidden limb inside the lock.
+
+2b. THE CLOSURE IDENTITY (Amendment 5) — THE INSTRUMENT CHECKED AGAINST THE WALL CLOCK.
+Every thread's cycle is wait -> hold -> durable, so WAIT + HOLD_TOTAL + DURABLE must equal T*S_eff.
+All three come from the probe; T*S_eff comes from the wall clock.
+    T=1    4.08588 vs 4.08614   -0.01%
+    T=8    6.84263 vs 6.86200   -0.28%
+    T=64  12.37919 vs 12.65536  -2.18%
+Inside the pre-registered +/-5% at every T. The probe accounts for the whole loop.
+And the pre-registered second read on Q2 from the same numbers: at T=64, WAIT = 6.84 ms exceeds
+DURABLE = 5.35 ms, so the threads ARE queueing on the mutex rather than on the disk — independent
+of F1, and agreeing with it.
+
+2c. F2 — IT IS CONTENTION, AND IT IS CONFINED TO EXACTLY TWO PHASES.
+64/1 ratios, in place, replicated (first battery warm=20k / warm=0, then re-run reps 1 and 2):
+
+  phase                    w20k    w0   rep1   rep2     what it does
+  write_record             2.29x 2.36x 2.21x  1.72x     INSERTS 3 NEW KEYS
+  child_key_insert         2.43x 2.61x 2.33x  2.11x     INSERTS 1 NEW KEY
+  ---------------------------------------------------------------------
+  core(parent)             0.78x 0.74x 0.80x  0.43x     point READ
+  envelope(parent)         0.76x 0.85x    -      -      point READ
+  free_id_scan             0.78x 0.89x    -      -      range READ
+  write_header             0.76x 0.92x 0.92x  0.65x     rewrites ONE hot page
+  HOLD (whole section)     1.61x 1.71x 1.66x  1.25x
+
+**F2 DOES NOT FIRE** — the cost does grow with thread count, so it is contention. But it is not the
+section that inflates; it is the two phases that INSERT NEW KEYS. Every read and the single-page
+header write get FASTER at 64 threads (0.43-0.92x, below 1.0 in all four runs) — a hotter pool.
+Magnitudes vary run to run (write_record 1.72-2.36x); the SIGN is identical in all four.
+
+2d. ⭐ THE RECONCILIATION — WHY 67.2% WAS "UNATTRIBUTED", AND WHAT IT REALLY WAS.
+The inherited subtraction took S_eff from one regime and the named components from another. It
+mixes FOUR, not the one the brief named:
+  (i)   1 thread            vs 64 threads
+  (ii)  uncontended         vs contended
+  (iii) 20k-key tree        vs a tree growing 0 -> 4k during the timed window
+  (iv)  ISOLATED TIGHT LOOP vs in place inside a real fork      <- nobody had named this one
+
+(iv) is systematic and it is large. Every component measured in place at T=1 costs MORE than the
+same component measured alone in a 2,000-iteration loop, because a tight loop over one operation
+is the best case for cache:
+
+  component            artifact (isolated)   mine (in place, T=1)   ratio
+  core                            0.00533               0.01050    1.97x
+  envelope                        0.00693               0.00900    1.30x
+  free_scan                       0.00715               0.00798    1.12x
+  write_record_new                0.02779               0.04793    1.72x
+  child_key                       0.01003               0.01546    1.54x
+  write_header                    0.01756               0.02701    1.54x
+  SUM                             0.07479               0.11788    1.58x
+
+⚠ AND ONE ROW OF THAT TABLE IS NOT A MEASUREMENT ON EITHER SIDE OF THE ORIGINAL. The artifact's
+`write_record_new = 0.02779` was never measured: it is `0.06316 x 0.44`, where 0.06316 is the cost
+of three UPSERTS and 0.44 is the insert/upsert ratio `0.01003/0.02280` taken on the CHILD KEY and
+then applied to three different keys. So the inherited 0.0748 is part measured, part modelled — the
+single largest of its six components is a scaled estimate resting on a ratio measured elsewhere.
+My 0.04793 is the operation `fork` actually performs, timed in place. The 1.72x on that row is
+therefore "measurement vs model", not "in-place vs isolated", and the honest statement of the other
+five rows is that isolated tight loops understate in-place cost by 1.12x-1.97x.
+
+So the 0.1532 ms decomposes as:
+     0.04309 ms   28.1%   isolated microbenchmark understates the SAME work (regime iv)
+     0.07168 ms   46.8%   REAL contention inflation, T=1 -> T=64
+     0.00572 ms    3.7%   mutex handoff (the lock actually idle)
+     0.00025 ms    0.2%   in-section residual in no named phase
+     ---------------------------------------------------------------
+     0.12074 ms   78.8%   ACCOUNTED
+    +0.03246 ms   21.2%   box speed and tree depth between two runs taken days apart
+
+⇒ **F3 IS SATISFIED: 78.8% is attributed to named, measured causes** — but the headline is that
+only about HALF of the "unattributed 0.1532 ms" was ever a physical cost. The rest was the
+measurement method. Measured within ONE regime, the section is accounted for to 0.13%.
+
+⚠ CONTAMINATION APPLYING TO 2a-2d. Every `phases` arm quoted above ran inside a window another
+agent (`diff-identity`) later declared: near-continuous cargo in a sibling worktree from
+23:04:00-23:12:54Z, including a full unfiltered `cargo test --lib` (1577 tests, 61.91 s) that
+contains `branch::reaper::tests::table_catalog::
+a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent` — >60 s, concurrency-heavy,
+on this very subsystem. Full declaration: bench/d123_rerun/00_CONTAMINATION_diff_identity.txt.
+
+These arms are NOT re-run and here is the reason, which is about what kind of quantity they are.
+U(hold), the 64/1 column and the per-upsert cost at fixed k are all RATIOS OF TWO DURATIONS TAKEN
+BY ONE INSTRUMENT INSIDE ONE ARM. Load inflates numerator and denominator together; it cannot make
+`write_record` inflate 2.29x while `core` DEFLATES to 0.78x in the same microseconds of the same
+process. The signs are structural. What load CAN do is move the absolute milliseconds, which is why
+none of them is quoted as a physical constant. The one arm whose verdict a common-mode shift could
+plausibly have moved — F1's — was re-run, and the re-run is section 1b.
+
+================================================================================================
+2e. ⛔ F5 RESTATED — AND A CORRECTION TO HOW ITS NUMBER HAS BEEN USED
+================================================================================================
+
+F5 adds k identical `upsert`s to the critical section on a FIXED key set. Two ways to express the
+result, and they disagree because one of them crosses regimes:
+
+  (A) SAME INSTRUMENT, same process, my T=64 against my own in-place T=1:
+        first battery 0.64x | re-run 41 0.84x | re-run 42 0.74x    -> MEDIAN 0.74x
+      i.e. identical work under the lock is ~26% CHEAPER at 64 threads than at 1.
+
+  (B) The harness's own `slope/u` column: my contended slope divided by the ARTIFACT's
+      u = 0.01344 ms (bench/serial_section_profile.txt):
+        41: 0.01911/0.01344 = 1.42x | 42: 0.01690/0.01344 = 1.26x
+
+⛔ **(B) IS NOT A CONTENTION MULTIPLIER AND MUST NOT BE QUOTED AS ONE.** Its denominator is an
+ISOLATED TIGHT-LOOP microbenchmark, and section 2d measures that those understate in-place cost by
+1.58x across all six components. Re-basing (B) on my own in-place T=1 (0.02563 ms, median of three
+runs) gives 0.75x and 0.66x — which agrees with (A). The 1.42x is the regime error of section 2d
+wearing a ratio's clothing, in a column of my own harness. The label is the bug, not the slope.
+
+⚠ **THIS MATTERS BEYOND BOOKKEEPING: 1.42x was used to kill a Round 3 candidate (flat combining).**
+The number points the OPPOSITE way once same-instrument: adding work to the critical section costs
+LESS per unit under contention, not more. That kill should be re-examined — though NOT simply
+reversed, because flat combining would batch REAL fork work, which is NEW-key insertion, and
+new-key work is the one thing here that does inflate (2.29x / 2.43x). The right multiplier for
+flat combining is the new-key one, which is what the novelty arm (section 3c) measures. Neither
+0.74x nor 1.42x is the number that decides it.
+
+================================================================================================
+3. NAMING THE MECHANISM — WHAT SURVIVES ELIMINATION
+================================================================================================
+
+The brief listed five candidates. Four are eliminated by measurement or by structure.
+
+⛔ MUTEX HANDOFF / PARK-UNPARK. Eliminated by F4: the lock is idle 0.006-0.012 ms per fork, 3-6%
+   of the interval (U(hold) 94-97%). The unlock itself is separately bracketed at 0.002 ms and the
+   record drops at 0.00002 ms. This was the mechanism the brief thought most likely and it is the
+   smallest term measured.
+
+⛔ BUFFER-POOL EVICTION. Eliminated FREE, from the two regimes already banked. The pool is capped
+   at 1024 pages (buffer_pool.rs:442). The warm=20,000 tree (~100k keys) strains it; the warm=0
+   tree does not. Eviction predicts the LARGE tree inflates more. It inflates LESS:
+       64/1          warm=20k (large)   warm=0 (small)
+       write_record       2.29x            2.36x
+       child_key          2.43x            2.61x
+       HOLD               1.61x            1.71x
+   Wrong direction in both phases and in the total. No extra arm was needed and none was run.
+
+⛔ PAGE-LATCH CONTENTION BETWEEN FORKERS, ALLOCATOR CONTENTION BETWEEN FORKERS, CACHE-LINE
+   BOUNCING BETWEEN FORKERS. Eliminated STRUCTURALLY, not statistically: `fork` does every tree
+   mutation under `logical`, so **only one thread is ever inside the section**.
+
+   CHECKED AGAINST THE CODE THAT RAN, not from memory. Enumerating every tree access in `fork`
+   by line offset within the function (src/branch/table_catalog.rs):
+       +14  let g = self.logical.lock()            <- acquired
+       +26  self.core(parent.id)                   \
+       +38  self.envelope_bytes(parent.id)          |
+       +50  self.tree.range_scan(FREE_ID span)      |
+       +64  self.remove_if_present(free_id)         | EVERY tree access in the function
+       +65  self.core(id)                           | lies strictly between the two
+       +86  self.write_record  / +88 _new           |
+      +100  self.tree.insert(child key)             |
+      +115  self.upsert (F5 extras)                 |
+      +124  self.write_header()                     |
+      +129  self.stage()                           /
+      +141  drop(g)                                <- released
+      +148  self.durable(seq)                      <- THE ONLY THING OUTSIDE
+   There is no tree access before +14 or between +141 and +148. So the set of things that can run
+   concurrently with the section is exactly {`durable`}, and `durable` is
+   `pool.flush_all()` + `disk_manager.sync()`. Two forkers cannot
+   contend on a page latch, an allocator or a cache line because two forkers are never in there at
+   once. Combined with U(hold) = 94-97%, which puts the time INSIDE the section, the counterparty
+   must be something that runs OUTSIDE the lock — and in this harness exactly one thing does:
+   `durable()` -> `pool.flush_all()` + `disk_manager.sync()`, the group-commit flush.
+
+⛔ CACHE-LINE BOUNCING ON SHARED TREE PAGES specifically. Eliminated by F5, and this was
+   pre-registered in Amendment 3 as the reading the fixed-key design would license: the extra
+   upserts hit the SAME few pages from all 64 threads, which is the best case for residency and
+   the WORST case for line bouncing. If lines were bouncing, that arm would inflate most. It is
+   the CHEAPEST thing measured:
+       identical fixed-key upsert work:  T=1 0.02994 ms/upsert  ->  T=64 0.02038 ms/upsert = 0.68x
+
+✅ SURVIVING, NAMED: INTERFERENCE BETWEEN THE SECTION'S NEW-PAGE WRITES AND THE CONCURRENT
+   GROUP-COMMIT FLUSH. Four counters select it and they all point the same way:
+     1. only the two phases that insert NEW keys inflate      (2.29x, 2.43x)
+     2. reads and the single hot header page get FASTER       (0.43-0.92x)
+     3. identical work on ALREADY-DIRTY pages gets faster     (0.68x)
+     4. inflation tracks how many forks each flush must drain:
+            f/sync     1.0    4.0   17.5
+            write_record 1.00x 1.59x 2.29x     monotone
+   At T=64, DURABLE is 5.35 ms against S_eff 0.19 ms, so a flush is in progress essentially all the
+   time; at T=1 the section and the flush strictly alternate and never overlap. The inflation
+   appears as soon as they can overlap (T=8, 1.27x) and grows with how much they overlap.
+
+⚠ WHAT IS STILL NOT SEPARATED, STATED PLAINLY PER F3. "Interference with the flush" covers both a
+  latch/pool path and a file-extension/IO path, and this row does not separate them. Nor has an arm
+  been run with the flush REMOVED, because removing it removes durability and macOS then
+  short-circuits F_FULLFSYNC — the confound guarded against throughout. The mechanism is named by
+  elimination plus four selectivity counters plus a structural argument, NOT by direct
+  intervention on the flush itself.
+
+================================================================================================
+3c. ⭐ THE INTERVENTION — NEW-KEY vs FIXED-KEY WORK UNDER THE LOCK. MECHANISM NAMED.
+================================================================================================
+
+bench/d123_final/41_novelty_paired.txt. k=8 identical `upsert` calls added to the critical section;
+in one arm they hit a FIXED key set (re-dirtying pages already dirty, allocating nothing), in the
+other a key unique per fork (allocating and dirtying NEW pages). Same call, same value, same place
+in the section. **Key novelty is the only variable.**
+
+All four cells run ADJACENTLY inside one rep, order rotated each rep, each rep wall-clock stamped,
+so a load trajectory is common-mode across the cells and divides out in the per-rep contrast. (The
+first attempt at this arm was NOT rotated and is VOID — Amendment 10.)
+
+    rep   started(utc)      T1-fix     T1-NEW    T64-fix    T64-NEW
+      0     1790040067     0.03558    0.03563    0.02040    0.03911
+      1     1790040160     0.03707    0.03518    0.01916    0.03574
+      2     1790040252     0.03235    0.03114    0.01844    0.03404
+      3     1790040348     0.03564    0.03490    0.01867    0.05808
+      4     1790040450     0.03628    0.03358    0.01994    0.03692
+
+    rep     R_fixed      R_new   R_new/R_fixed
+      0       0.57x      1.10x           1.91x
+      1       0.52x      1.02x           1.97x
+      2       0.57x      1.09x           1.92x
+      3       0.52x      1.66x           3.18x
+      4       0.55x      1.10x           2.00x
+
+  R_fixed (FIXED-key work, T=64/T=1)   median 0.55x   <- gets FASTER under concurrency
+  R_new   (NEW-key work,   T=64/T=1)   median 1.10x   <- gets SLOWER
+  ⭐ CONTRAST R_new/R_fixed   median 1.97x   min 1.91x   max 3.18x   reps above 1.00x: 5 of 5
+
+⇒ **NEW >> FIXED. NOVELTY IS THE VARIABLE, AND THE MECHANISM IS NOW NAMED BY INTERVENTION RATHER
+THAN BY ELIMINATION.** Four of five draws cluster in 1.91-2.00x; even the minimum is 1.91x. The
+pre-registered alternative — CONTRAST ~= 1, report UNATTRIBUTED per F3 — is not close.
+
+⇒ Combined with the structural fact that **only one thread is ever inside `logical`** (section 3,
+enumerated line by line), the counterparty cannot be another forker. It is `durable()` —
+`pool.flush_all()` + `disk_manager.sync()` — the group-commit flush draining the pages the section
+keeps creating. That is the answer to Q1's "name it with a counter, not a guess."
+
+⚠ THE CONFOUND, TESTED RATHER THAN ASSUMED. A reviewer raised that new-key inflation might be
+TREE GROWTH: new keys are the only component that enlarges the tree, so if higher T completed more
+forks per window it would grow the tree more and deepen every descent. That objection requires a
+TIME-bounded run. This harness is FORK-bounded: `run_arm` does `let per = n / t.max(1)`, so N=8,000
+is the TOTAL divided across threads. The same 8,000 forks insert the same 64,000 keys at T=1 and at
+T=64 — identical final tree, identical growth trajectory, present in both numerator and denominator
+of `R_new`. **It cancels, as Amendment 9 pre-registered before the run.**
+
+⚠ And the absolute ms/upsert is higher for NEW at BOTH thread counts, for that same reason. That
+difference is the tree, not contention. Only the ratios are quoted.
+
+================================================================================================
+3b. ⭐ OF WHAT IS INSIDE THE SECTION, HOW MUCH IS THE FIVE DURABLE KEYS?  88%.
+    (Asked by the lead after round 3 closed on "multi-key atomicity over five durable keys".)
+================================================================================================
+
+The five keys are: `write_record` = 3 (record, state, deadline), `child_key_insert` = 1, and
+`write_header` = 1. Split of HOLD at T=64, three independent runs:
+
+                                  warm=20k        warm=0     re-run rep1
+  FIVE DURABLE KEYS                 88.4%          88.4%         88.0%
+    of which 4 NEW keys             77.6%          76.4%            -     <- the ONLY inflating part
+    of which 1 hot key (header)     10.8%          12.0%            -     <- gets FASTER with T
+  everything else                   11.5%          11.5%            -     2 point reads, 1 range
+                                                                          scan, id mint, ticket
+  cost per NEW key at T=64        0.03686 ms     0.03800 ms
+
+⇒ **The section essentially IS the five keys.** Reads, the id mint and the commit ticket together
+are 11.5%, so no amount of cleverness about them matters. Whatever replaces this section has to
+replace the key writes.
+⇒ **But the four NEW keys are the whole problem, and the fifth is not.** `write_header` rewrites
+one already-hot page every fork and gets CHEAPER under concurrency (0.65-0.92x). A mechanism that
+reduced five keys to four by folding the header away would remove the one key that costs nothing
+extra under load.
+
+### ⛔ AND THE RETURN ON REMOVING KEYS SATURATES — THIS IS THE NUMBER ROUND 3 NEEDS MOST
+From the warm=0 stub table at T=64:
+
+   stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)
+      0     4788.6   0.20883   0.20079   0.00804    96.1%
+      1     8447.6   0.11838   0.07707   0.04131    65.1%
+      2     8988.9   0.11125   0.07188   0.03937    64.6%
+      3     9019.1   0.11088   0.00941   0.10147     8.5%
+
+HOLD falls **21x** (0.20079 -> 0.00941). Throughput rises only **1.9x**, because the GAP rises
+**12.6x** (0.00804 -> 0.10147) and lock utilisation collapses 96.1% -> 8.5%.
+
+⇒ **THE SECTION AND THE HANDOFF TRADE OFF AGAINST EACH OTHER.** A critical section that short
+cannot be handed between 64 parked threads fast enough to keep the lock busy, so park/unpark
+becomes the binding term. This is why F1 measures ~2x and not the ~21x that `throughput = 1/S`
+would predict from the same numbers — **and it is a second, independent demonstration that
+`throughput = 1/serial_time` is not a law of this system.** It held in the L0 regime because the
+lock was 96% busy there; it fails by an order of magnitude as soon as the section is short.
+
+⇒ So the answer to "fewer keys, or a different atomicity mechanism" is: **fewer keys buys at most
+~2x and the curve is already flat by L1** (8447 -> 9019 from removing three more keys' worth of
+work, i.e. 6.8% for the last two levels). A different atomicity mechanism is the only thing in
+this data with more than 2x in it, and it has to remove the SERIALISATION, not the work — because
+the work is already only 88% of a term that stops binding once you shrink it.
+
+================================================================================================
+4. VERDICT ON W-B, AND WHAT CHANGES FOR ROUND 3
+================================================================================================
+
+⭐ **W-B IS CORRECTLY SPECIFIED. THE EVIDENCE IT WAS SPECIFIED ON WAS NOT.**
+
+The claim "the serial section is the ceiling" is TRUE and is now backed by two measurements that
+could have come out the other way:
+  * F1 — driving the section toward zero moves throughput by a paired median of 2.00x across 18
+    draws in two regimes (warm=0 2.08x, warm=20k 1.86x), with 17 of 18 individual draws above
+    1.10x against a falsifier that required 1.00x +/-10%.
+  * F6 — M-FSYNC refuted on a pure counter: f/sync stalls at ~17 while T grows to 512.
+
+The evidence it was ORIGINALLY specified on — D8's "throughput = 1/serial_time, 0.15% agreement
+across four runs" — is an algebraic identity between two columns that are reciprocals by
+construction, and its 0.15% residual is exactly the rounding of 0.228170 to 0.228. It could not
+have failed, so it never discriminated anything. **W-B was right by accident.**
+
+The adversary's kill was ALSO wrong, and wrong in a way arithmetic alone disposes of: 64 forks per
+3.574 ms is 17,907/sec, four times ABOVE the 4,382/sec it was invoked to explain.
+
+### So both of Round 2's closing statements about W-B were wrong, in opposite directions.
+INVENTION-TRIGGER.md:148 currently reads "⛔ MIS-SPECIFIED ... 67.2% unattributed ... fsync-bound
+at 64 forks per 3.574 ms round, so even a serial section driven to ZERO cannot clear the bar."
+Every clause of that needs replacing:
+  * "67.2% unattributed"  -> 78.8% attributed; and roughly half of the 0.1532 ms was never a
+    physical cost, it was four regimes subtracted from each other.
+  * "fsync-bound"          -> refuted on a counter, in both regimes, at six thread counts.
+  * "even a serial section driven to ZERO cannot clear the bar" -> driven to its limit it gives
+    about 2x (paired median 2.00x). Which is the real constraint on Round 3, and it is a budget,
+    not a wall.
+
+### WHAT ROUND 3 SHOULD BE TOLD, AND IT IS A DIFFERENT SHAPE OF TARGET
+1. **The budget for serial-section work is ~2x, measured.** L3 is the limit of that strategy and it
+   is not implementable. A candidate promising more than 2x from shortening fork's critical section
+   is promising more than the section contains.
+2. **The two phases worth attacking are the two that insert NEW KEYS** — `write_record` and the
+   child-key insert. They are 76% of the section at 64 threads and they are the ONLY parts that get
+   worse with concurrency. Everything else gets faster.
+3. **Handoff is not worth attacking.** The lock is idle 3-6% of the interval. A better mutex, a
+   lock-free queue or elision buys at most that.
+4. **⭐ THE LARGER PRIZE IS OUTSIDE THE SECTION ENTIRELY, and this row can see it but did not
+   measure it as a candidate.** At T=64 a thread spends 0.19 ms in the section and 12.2 ms waiting
+   (WAIT 6.84 + DURABLE 5.35). The section is the CEILING ON THROUGHPUT because it serialises, but
+   it is 1.5% of LATENCY. A mechanism that lets forks commit without every one of them passing
+   through one mutex — sharding the catalog by parent, or batching fork admission the way group
+   commit already batches fsync — changes the shape rather than the constant. D6's own note already
+   points at this ("option 4, pre-minting ids in durable blocks"), and it is the only direction in
+   this row's data with more than 2x in it.
+
+================================================================================================
+5. FALSIFIER SCORECARD — every one pre-registered before the first measurement
+================================================================================================
+
+  F1  section driven toward zero    DOES NOT FIRE, BOTH REGIMES. Paired, probe OFF, 9 reps each:
+                                    warm=0 median 2.08x (0/9 within +/-10% of 1.00x), warm=20k
+                                    median 1.86x (1/9). 17 of 18 paired draws above 1.10x;
+                                    combined median 2.00x.
+                                    ⛔ My earlier "UNDECIDED at warm=20k" is WITHDRAWN: that was
+                                    the unpaired summary of the same data. See section 1c.
+  F2  residual grows with T?        DOES NOT FIRE. It grows (HOLD 1.25-1.71x), so it IS contention.
+  F3  >50% attributed?              SATISFIED. 78.8% of the 0.1532 ms on named, measured causes.
+  F4  hold vs handoff               H-HANDOFF DEAD. U(hold) 94-97% across four runs.
+  F5  marginal cost of added work   0.68x. Identical fixed-key work is CHEAPER at 64 threads.
+  F6  thread axis                   M-FSYNC REFUTED. f/sync stalls at ~17 while T grows to 512.
+  A1  drops/unlock seam             Immaterial: gap 0.006-0.012 ms, below the 0.02 ms threshold
+                                    that would have required a second iteration. Bracketed anyway.
+  A2  stale 3.574 residual          Confirmed stale: reproduces only against the SUPERSEDED
+                                    SUM=0.1148. Immaterial (0.006 ms) but it is in a quoted file.
+  A3  fixed-key bias                Honoured: 0.68x rules out line bouncing on shared pages and is
+                                    explicitly NOT read as ruling out page-diversity effects.
+  A4  warm=0 reproduction check     PASS ON THE MEDIAN, and reported with its failures:
+                                       4788.6  +9.3% PASS      5177.8 +18.1% OUTSIDE
+                                       4815.8  +9.9% PASS      5069.5 +15.7% OUTSIDE
+                                       median 4942.6 +12.8% PASS (band +/-15%)
+                                    Two of four arms fall outside individually. The direction is
+                                    expected — this box was quieter tonight than when the 4,382 was
+                                    taken — but it is a marginal pass and is not dressed up as more.
+  A5  closure identity              HOLDS. -0.01% / -0.28% / -2.18% at T=1/8/64, band +/-5%.
+  A6  clean F1                      Run twice. Probe perturbation -1.20% / -1.83%, inside +/-2%,
+                                    so no duration in this row is quarantined. The paired
+                                    within-rep ratio was added after the first attempt and is what
+                                    decided both regimes.
+  A8  truncation sentinel           Added after two runs produced result-shaped files that were
+                                    not results. bench/d123_assemble.sh refuses to quote any arm
+                                    lacking `# harness_exit=0`.
+  A7  eviction + the missing arm    Eviction eliminated from banked data.
+
+================================================================================================
+6. INSTRUMENT, LOAD, AND WHAT IS NOT TRUSTWORTHY HERE
+================================================================================================
+
+* Probe perturbation MEASURED, not assumed: -1.20% (warm=20k) and -1.83% (warm=0), 5 reps each,
+  ON/OFF order alternated. Inside the pre-registered +/-2%. The first battery's single-shot
+  +87.95% does not reproduce; that cell was n=1 and its OFF value (2796.6) was the outlier, not
+  its ON value — the reading had inverted which cell was anomalous.
+* The probe adds ~13 clock reads inside the section. That is common-mode between T=1 and T=64, so
+  it DILUTES the 64/1 ratios toward 1.0. The inflation figures are therefore understated, not
+  manufactured.
+* `Instant::elapsed` quantises to 41.67 ns here. Every figure is a sum over >=8,000 samples
+  (>=4,500 ticks for a 0.19 ms section). No single-operation duration is reported anywhere.
+* LOAD. Lock held for every timed run. `load_at_acquire=4` for the re-run; no CAVEAT line printed
+  (threshold is 8). But load RAMPED to 11.05 during 10_f1_warm20k and that arm is the one that came
+  out noise-dominated. The measure lock excludes other MEASURERS, not builds or suites, so "lock
+  held" is not "box quiet" and is not claimed to be. EVERY duration here is an UPPER BOUND.
+* ⭐ WHAT IS NOT TRUSTWORTHY: any absolute millisecond figure, and the warm=20k F1 arm. What IS
+  trustworthy: the counters (f/sync, syncs x f/sync = N), the COUNT of paired F1 draws above
+  1.10x (17 of 18),
+  and ratios of two durations taken by ONE instrument inside ONE process (U(hold), the 64/1
+  column, per-upsert cost at fixed k) — which is where every conclusion above rests.
+* A tree-size confound exists in F1 and is bounded rather than removed: stubbed levels insert fewer
+  keys, so their trees grow more slowly inside the timed window. The depth-sensitive phases
+  (core + envelope + free_scan) total ~0.022 ms of a ~0.19 ms section, so even a 20% swing in them
+  moves F1 by ~2%, against an effect of 105%.
+
+⚠ A DECLARED CONTAMINATION THIS ARTIFACT CARRIES, AND WHAT WAS DONE ABOUT IT.
+`diff-identity` declared near-continuous cargo in a sibling worktree from 23:04:00-23:12:54Z, inside
+the `d123-f1` lock window (acquired 23:03:55Z). It covers the first F1 arms, both perturb2 arms, all
+three phases reps and part of one extra arm. The measure lock excludes other MEASURERS; it does not
+exclude builds or test suites, so holding it is not evidence of a quiet box and is never claimed as
+such here.
+  * F1 was RE-RUN clean (section 1b) because Round 3's gate rests on it.
+  * The within-arm ratios were NOT re-run, for the reason given at the end of section 2.
+  * It also supersedes my own earlier explanation of why the first warm=20k F1 arm was
+    noise-dominated: I attributed it to a load ramp; a 1577-test suite landing inside it is the
+    better explanation, and I have said so where I wrote the original.
+
+⚠ TWO RUNS IN THIS ROW PRODUCED FILES THAT LOOK LIKE RESULTS AND ARE NOT. See Amendment 8: the
+detector is the ABSENCE of the `# harness_exit=` sentinel, and `bench/d123_assemble.sh` now checks
+every arm for it before writing this artifact. A d123 file without `# harness_exit=0` at its foot
+is a truncated run and must not be quoted.

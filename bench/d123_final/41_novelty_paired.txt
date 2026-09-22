@@ -1,0 +1,55 @@
+# lock: ACQUIRED d123-nov4  load_at_acquire=3
+# acquired_utc: 2026-09-22T01:21:07Z
+# NOTE: the '# other ...' pgrep below OVER-REPORTS - it matches shells that merely mention
+#       cargo. load_at_* is the trustworthy field.
+# load_at_run_start: 3.51 2.98 3.41
+D123 serial-section attribution — MODE=novelty (Amendment 7: new-key vs fixed-key work under the lock)
+build at 6e005a1dfa4b
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+k = 8 extra upserts per fork, probe ON (PH_EXTRA is read directly; no fit).
+
+⭐ PAIRED AND ROTATED, and the first version of this mode was NEITHER — which is why
+   it was re-run. It iterated FIXED then NEW at each thread count with no rotation, so
+   NEW always ran LATER than the FIXED arm it is compared against. Load rose 3.79 ->
+   13.64 across that run, so the contrast was confounded with the load trajectory in
+   the SAME DIRECTION as the expected finding. Same instrument, different moment.
+   Here all FOUR cells run adjacently inside one rep, in an order rotated each rep, so
+   drift is common-mode within a rep and cancels in the per-rep contrast.
+
+  RAW ms per upsert, rep x cell (cell order rotated each rep):
+    rep started(utc)          T1-fix          T1-NEW         T64-fix         T64-NEW
+      0   1790040067         0.03558         0.03563         0.02040         0.03911
+      1   1790040160         0.03707         0.03518         0.01916         0.03574
+      2   1790040252         0.03235         0.03114         0.01844         0.03404
+      3   1790040348         0.03564         0.03490         0.01867         0.05808
+      4   1790040450         0.03628         0.03358         0.01994         0.03692
+
+  PER-REP, all four cells adjacent in time:
+    rep     R_fixed       R_new R_new/R_fixed
+      0        0.57x       1.10x         1.91x
+      1        0.52x       1.02x         1.97x
+      2        0.57x       1.09x         1.92x
+      3        0.52x       1.66x         3.18x
+      4        0.55x       1.10x         2.00x
+
+  R_fixed  = cost(T64) / cost(T1) for FIXED-key work   median 0.55x
+  R_new    = same for NEW-key work                      median 1.10x
+  ⭐ CONTRAST R_new/R_fixed  median 1.97x   min 1.91x   max 3.18x   reps>1.00x 5/5
+
+  CONTRAST >> 1 => novelty is the variable. Since only one thread is ever inside
+  `logical`, the counterparty cannot be another forker, so it is the concurrent
+  group-commit flush draining the pages this section keeps creating.
+  CONTRAST ~= 1 => novelty is NOT the variable; report UNATTRIBUTED per F3.
+
+  ⚠ ABSOLUTE ms/upsert is HIGHER for NEW at both thread counts because that arm
+  grows the tree by 64,000 keys against 8 (Amendment 9). That is the tree, not
+  contention, and it cancels in R_new because it is present at both thread counts.
+  Only the ratios are quoted.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# released_utc: 2026-09-22T01:29:01Z
+# load_at_run_end: 3.65 3.13 3.27

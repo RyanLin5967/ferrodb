@@ -1,0 +1,48 @@
+# lock: ACQUIRED d123-f1c2  load_at_acquire=3
+# acquired_utc: 2026-09-22T01:29:04Z
+# waited for load<=6 before starting; load now: 3.44 3.10 3.26
+# load_at_run_start: 3.44 3.10 3.26
+D123 serial-section attribution — MODE=f1 (F1 with the probe OFF, replicated, level order rotated)
+build at 6e005a1dfa4b
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+⛔ Stubbed levels are NOT a database — see MODE=stub. Every level keeps write_header
+   + stage, so >=1 page is dirty and the fsync stays real.
+THE VOID GUARD, CHECKED NOT ASSUMED: `syncs` SHOULD fall as the section gets faster —
+that is group commit batching more forks behind a shorter critical section. What must
+NOT happen is forks going undurable, so the check is CONSERVATION: syncs x f/sync must
+still equal N. A level that lost durability fails that; a level that merely batched
+better passes it. Printed per level as `syncs*f/sync` against N.
+
+  RAW forks/sec, rep x level (level order rotated each rep):
+    rep started(utc)          L0          L1          L2          L3       L3/L0
+      0   1790040544      4953.2      5701.8      7914.0      9780.2       1.97x
+      1   1790040574      5260.8      6020.8     10218.6     10014.1       1.90x
+      2   1790040599      5332.6      7670.5      7142.4     10186.0       1.91x
+      3   1790040625      4960.5      7737.3      7897.0      8832.3       1.78x
+      4   1790040650      5358.5      6824.4      7155.5     10295.4       1.92x
+      5   1790040675      5190.6      8403.1      5953.1      6886.9       1.33x
+      6   1790040705      4808.1      7595.8      8511.0     10497.9       2.18x
+      7   1790040730      5475.6      7753.7      8180.7     10526.1       1.92x
+      8   1790040755      4977.4      7612.0      8014.9      9488.9       1.91x
+
+  ⭐ PAIRED L3/L0 per rep: median 1.91x   min 1.33x   max 2.18x
+     F1 fires iff this median is within +/-10% of 1.00x.
+
+  UNPAIRED summary (kept for comparison; drift does NOT cancel here)
+  T=64, reps=9, N=8000 forks per arm
+   stub  median f/s        min        max   spread     vs L0     syncs   f/sync  syncs*f/sync
+      0      5190.6     4808.1     5475.6    12.9%     1.00x       491     16.3          8000
+      1      7612.0     5701.8     8403.1    35.5%     1.47x       332     24.1          8000
+      2      7914.0     5953.1    10218.6    53.9%     1.52x       325     24.6          8000
+      3     10014.1     6886.9    10526.1    36.3%     1.93x       251     31.9          8000
+
+F1 FIRES if L3's median is within +/-10% of L0's median: the section is NOT the ceiling.
+Compare `spread` against the L3/L0 ratio before believing either.
+
+warm-up forks per arm = 20000, N per arm = 8000
+# harness_exit=0
+# released_utc: 2026-09-22T01:33:01Z
+# load_at_run_end: 2.12 2.57 2.98
