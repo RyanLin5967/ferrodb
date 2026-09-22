@@ -787,11 +787,23 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
         println!("================================================================================");
         println!("T = {t}");
         println!("================================================================================");
+        println!("⭐ WAIT and DURABLE ARE THE DIRECT ANSWER TO 'WHAT IS THE REMAINING TIME', AND");
+        println!("   THEY BEAT THE CENSUS. Every thread's cycle is wait -> hold -> durable, so");
+        println!("   WAIT + HOLD_TOT + DURABLE = T * S_eff (D123 §2b's closure identity, checked in");
+        println!("   the `close` column). WAIT is time spent BLOCKED ACQUIRING `logical` — measured");
+        println!("   in nanoseconds by the phase clock, not inferred from a collision count, and");
+        println!("   immune to the barging blind spot that makes contended/op under-report.");
+        println!("   ⇒ at L3, WAIT >> DURABLE means the gap IS threads blocked on the lock.");
+        println!("   ⇒ at L3, DURABLE >> WAIT means the gap is the disk, and outcome 1 is dead for");
+        println!("     a reason no collision count could have shown.");
+        println!("   D123 §2b measured this at L0 ONLY (T=64: WAIT 6.84 ms > DURABLE 5.35 ms). The");
+        println!("   L1-L3 rungs have never been decomposed, which is the hole this fills.");
+        println!();
         println!("RAW — every rep, banked before any aggregation.");
         println!(
-            "  {:>3} {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>13} {:>7}",
+            "  {:>3} {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>7} {:>13} {:>7}",
             "rep", "config", "stub", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)",
-            "contended/op", "syncs"
+            "WAIT", "DURABLE", "close", "contended/op", "syncs"
         );
         let mut ct: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
         let mut uh: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
@@ -799,6 +811,8 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
         let mut se: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
         let mut ht: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
         let mut gp: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut wt: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
+        let mut du: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 4]; 3];
 
         for rep in 0..reps {
             for ci in 0..3usize {
@@ -826,20 +840,34 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
                         ));
                     }
                     let s_eff_ms = a.secs * 1000.0 / a.forks.max(1) as f64;
-                    let (hold_ms, u, gap_ms) = match a.phases {
-                        Some(p) => {
-                            let h = p.ns[probe::PH_HOLD_TOTAL] as f64 / p.forks.max(1) as f64 / 1e6;
-                            (h, h / s_eff_ms, s_eff_ms - h)
-                        }
-                        None => (f64::NAN, f64::NAN, f64::NAN),
+                    let ph = |p: &probe::Totals, i: usize| {
+                        p.ns[i] as f64 / p.forks.max(1) as f64 / 1e6
                     };
+                    let (hold_ms, u, gap_ms, wait_ms, dur_ms, close) = match a.phases {
+                        Some(p) => {
+                            let h = ph(&p, probe::PH_HOLD_TOTAL);
+                            let w = ph(&p, probe::PH_WAIT);
+                            let d = ph(&p, probe::PH_DURABLE);
+                            // D123 §2b's closure identity, on a loaded box. D123 pre-registered
+                            // +/-5% and measured -2.18% at T=64 on a quieter one; this refuses at
+                            // +/-15% and PRINTS the value at every rung so the reader sees the
+                            // drift rather than taking the gate's word for it.
+                            (h, h / s_eff_ms, s_eff_ms - h, w, d, (w + h + d) / (t as f64 * s_eff_ms))
+                        }
+                        None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+                    };
+                    // ⛔ The closure gate binds on the MEDIAN, not on a single rep, and it binds
+                    // AFTER every rep is printed. A one-rep refusal would throw away the whole
+                    // raw matrix to punish one descheduled thread on a box running at load 45,
+                    // and `commit the raw artifact before interpreting it` says not to. The gate
+                    // is not weaker for it: a systematically unaccounted loop moves the median.
                     let c = if census {
                         a.counts.contended_per_op(lk::LK_LOGICAL)
                     } else {
                         f64::NAN
                     };
                     println!(
-                        "  {:>3} {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>13.5} {:>7}",
+                        "  {:>3} {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>9.5} {:>9.5} {:>6.1}% {:>13.5} {:>7}",
                         rep,
                         name,
                         stub,
@@ -848,6 +876,9 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
                         hold_ms,
                         gap_ms,
                         100.0 * u,
+                        wait_ms,
+                        dur_ms,
+                        100.0 * close,
                         c,
                         a.syncs
                     );
@@ -858,6 +889,8 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
                     se[cfg][s].push(s_eff_ms);
                     ht[cfg][s].push(hold_ms);
                     gp[cfg][s].push(gap_ms);
+                    wt[cfg][s].push(wait_ms);
+                    du[cfg][s].push(dur_ms);
                 }
             }
         }
@@ -865,13 +898,14 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
         println!();
         println!("MEDIANS over {reps} reps:");
         println!(
-            "  {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>13}",
-            "config", "stub", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)", "contended/op"
+            "  {:>15} {:>4} {:>10} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>9} {:>13}",
+            "config", "stub", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)", "WAIT",
+            "DURABLE", "WAIT/DUR", "contended/op"
         );
         for cfg in 0..3 {
             for s in 0..4 {
                 println!(
-                    "  {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>13.5}",
+                    "  {:>15} {:>4} {:>10.1} {:>9.5} {:>9.5} {:>9.5} {:>7.1}% {:>9.5} {:>9.5} {:>9.3} {:>13.5}",
                     CFG[cfg].0,
                     s,
                     median(&tp[cfg][s]),
@@ -879,8 +913,36 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
                     median(&ht[cfg][s]),
                     median(&gp[cfg][s]),
                     100.0 * median(&uh[cfg][s]),
+                    median(&wt[cfg][s]),
+                    median(&du[cfg][s]),
+                    median(&wt[cfg][s]) / median(&du[cfg][s]),
                     median(&ct[cfg][s])
                 );
+            }
+        }
+
+        // ⛔ D123 §2b's closure identity, gated on the median of each probe-carrying rung. If the
+        // probe does not account for the loop, WAIT is not a share of anything and the whole
+        // WAIT-vs-DURABLE reading below is void. D123 pre-registered +/-5% and measured -2.18% at
+        // T=64 on a quieter box; this refuses outside +/-15% and the per-rep values are printed
+        // above so the drift is visible rather than taken on the gate's word.
+        println!();
+        println!("CLOSURE IDENTITY (D123 §2b): WAIT + HOLD_TOTAL + DURABLE vs T*S_eff, median per rung.");
+        for cfg in [0usize, 2] {
+            for s in 0..4 {
+                let w = median(&wt[cfg][s]);
+                let h = median(&ht[cfg][s]);
+                let d = median(&du[cfg][s]);
+                let c = (w + h + d) / (t as f64 * median(&se[cfg][s]));
+                println!("  {:>15} L{s}  {:.1}%", CFG[cfg].0, 100.0 * c);
+                if (c - 1.0).abs() > 0.15 {
+                    refuse(&format!(
+                        "{} L{s}: the probe accounts for only {:.1}% of T*S_eff. WAIT is then not \
+                         a share of the gap and the WAIT-vs-DURABLE reading is void.",
+                        CFG[cfg].0,
+                        100.0 * c
+                    ));
+                }
             }
         }
 
@@ -938,6 +1000,18 @@ fn mode_paired(dir: &Path, n: usize, threads: &[usize], warm: usize, reps: usize
             println!("     gap           {g0:.5} -> {g3:.5} ms   ({:.1}x UP)     [recorded 12.6x]", g3 / g0);
             println!("     forks/sec     {p0:.1} -> {p3:.1}        ({:.2}x UP)    [recorded 1.9x]  UPPER BOUND", p3 / p0);
             println!("     contended/op  {c0:.5} -> {c3:.5}      ({:.2}x)        [never recorded: THIS is the new number]", c3 / c0);
+            let w0 = median(&wt[cfg][0]);
+            let w3 = median(&wt[cfg][3]);
+            let d0 = median(&du[cfg][0]);
+            let d3 = median(&du[cfg][3]);
+            println!("     WAIT          {w0:.5} -> {w3:.5} ms   ({:.2}x)", w3 / w0);
+            println!("     DURABLE       {d0:.5} -> {d3:.5} ms   ({:.2}x)", d3 / d0);
+            println!("     WAIT/DURABLE  {:.3} -> {:.3}   <- WHAT THE REMAINING TIME IS.", w0 / d0, w3 / d3);
+            println!("                   >1 at L3: the gap is threads BLOCKED ON THE LOCK.");
+            println!("                   <1 at L3: the gap is the DISK, and no collision count");
+            println!("                             could have told you that.");
+            println!("     gap accounted (WAIT+DURABLE)/T vs gap: {:.5} vs {g3:.5} ms at L3",
+                (w3 + d3) / t as f64);
             println!();
         }
     }
