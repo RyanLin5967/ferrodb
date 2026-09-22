@@ -199,8 +199,9 @@ fn main() {
     println!("{threads} threads doing fork/write/merge cycles; L other branches sit LIVE underneath.");
     println!("PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.");
     println!();
-    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB");
-    println!("  (the four rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)");
+    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   appends   fsyncs   durable KB   park ms   us/parked");
+    println!("  (the six rightmost columns are PER PHASE — snapshotted around each L — not cumulative.)");
+    println!("  (us/parked is the per-CLAIM cost almost neat: parking is one extent claim per branch and nothing else.)");
     println!("  persistence: {}", if std::env::var("D75_PERSIST").map(|v| v=="1").unwrap_or(false) { "ON (as cli.rs:120 does)" } else { "OFF (as every 10^6 harness here does)" });
     let mut first: Option<(usize, f64)> = None;
     for &l in &lives {
@@ -212,7 +213,21 @@ fn main() {
         let (reps0, rbytes0) = ferrodb::storage::atomic_file::atomic_replace_counters();
         let (apps0, abytes0) = ferrodb::storage::atomic_file::durable_append_counters();
         let s = build(&dir);
+        // **D81 — TIME THE PARK, not only the cycle.**
+        //
+        // The measured cycle is `BEGIN AGENT SESSION` + 4 UPDATEs + `MERGE`, and exactly ONE of
+        // those events claims an extent. So the free-space map is a small share of a cycle's
+        // cost, and `bench/d81_bytes_vs_fsyncs.txt` already noticed the consequence — *"the
+        // per-cycle median is not measuring the map at these sizes at all"* — without drawing the
+        // instrument conclusion from it. Parking is the opposite: L branches, one claim each,
+        // nothing else. `us per parked branch` is therefore the per-claim cost almost neat, and
+        // it is the quantity the D79 -> D81 story is actually about.
+        //
+        // ⚠ It is still a DURATION on a shared box. It is reported next to the counters, never
+        // instead of them.
+        let park_t = Instant::now();
         park_live_branches(&s, l);
+        let park_ms = park_t.elapsed().as_secs_f64() * 1000.0;
 
         // ⚠ Refuse rather than report a number that cannot be attributed. If the parked branches
         // are not actually live, the whole axis is meaningless and a printed row would hide that.
@@ -276,9 +291,10 @@ fn main() {
         let (apps1, abytes1) = ferrodb::storage::atomic_file::durable_append_counters();
         let (reps, rbytes) = (reps1 - reps0, rbytes1 - rbytes0);
         let (apps, abytes) = (apps1 - apps0, abytes1 - abytes0);
-        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}   {reps:>9}   {apps:>7}   {:>6}   {:>10}",
+        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}   {reps:>9}   {apps:>7}   {:>6}   {:>10}   {park_ms:>7.0}   {:>9.1}",
                  med / (l as f64 / 1000.0), flat.len(),
-                 2 * reps + apps, (rbytes + abytes) / 1024);
+                 2 * reps + apps, (rbytes + abytes) / 1024,
+                 park_ms * 1000.0 / l as f64);
         if first.is_none() { first = Some((l, med)); }
         if let Some((l0, m0)) = first {
             if l != l0 {
