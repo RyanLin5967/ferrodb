@@ -150,16 +150,25 @@ pub mod scan_count {
     pub const SITE_CLASSIFY: usize = 1;
     /// `MemEffectLog::frame`'s `find` — the point read.
     pub const SITE_FRAME: usize = 2;
-    pub const SITES: usize = 3;
+    /// `MemEffectLog::frames_for`'s `filter` — the **fourth** site, and the odd one out.
+    ///
+    /// D77's list said two of these searches existed and D129 corrected that to three; the trait
+    /// `EffectLog` declares exactly two methods, and enumerating the scans from the trait rather
+    /// than by eye turns up this one as well. It is counted for the same reason: a site left out
+    /// of an instrument is a site the instrument reports as absent. It does **not** short-circuit
+    /// — `filter` visits every element — so `scanned` here is always the whole `Vec`, in both
+    /// buckets, and the hit/miss split means only "did it match anything".
+    pub const SITE_FRAMES_FOR: usize = 3;
+    pub const SITES: usize = 4;
 
     static HIT_SCANNED: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static HIT_CALLS: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static MISS_SCANNED: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static MISS_CALLS: [AtomicU64; SITES] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
     /// One search, after it finished. `scanned` is what the predicate counted.
     #[inline]
@@ -242,6 +251,9 @@ pub mod scan_count {
         }
         pub fn frame(&self) -> SiteCount {
             self.sites[SITE_FRAME]
+        }
+        pub fn frames_for(&self) -> SiteCount {
+            self.sites[SITE_FRAMES_FOR]
         }
     }
 }
@@ -463,11 +475,16 @@ impl EffectLog for MemEffectLog {
 
     fn frames_for(&self, branch: BranchId, from_seq: u64) -> Result<Vec<TxnFrame>, FerroError> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
+        let mut scanned = 0u64;
         let mut out: Vec<TxnFrame> = frames
             .iter()
-            .filter(|f| f.branch == branch && f.seq >= from_seq)
+            .filter(|f| {
+                scanned += 1;
+                f.branch == branch && f.seq >= from_seq
+            })
             .cloned()
             .collect();
+        scan_count::record(scan_count::SITE_FRAMES_FOR, !out.is_empty(), scanned);
         out.sort_by_key(|f| (f.seq, f.txn_id.0));
         Ok(out)
     }

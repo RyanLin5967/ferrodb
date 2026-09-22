@@ -296,6 +296,10 @@ fn report(label: &str, d: &Snapshot) {
     site_row("MemEffectLog::append", &d.append());
     site_row("classify_append", &d.classify());
     site_row("frame()", &d.frame());
+    // The fourth site. `grep` finds no production caller — only `tests_durable_log.rs` — so a zero
+    // here is the expected reading and it is printed rather than assumed: a site left out of the
+    // instrument is a site the instrument reports as absent.
+    site_row("frames_for() [no prod caller]", &d.frames_for());
 }
 
 // =================================================================================================
