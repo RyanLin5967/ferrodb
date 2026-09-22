@@ -387,6 +387,12 @@ struct Pool {
     /// Summed across reps. Integers, so fleet load cannot move them.
     acquisitions: u64,
     done_during_sweep: u64,
+    /// Summed wait-plus-hold across those acquisitions. ⚠ A DURATION, unlike everything else
+    /// pooled here, so it is an upper bound and is reported per acquisition, never as "the stall".
+    /// `Outcome` carried this all along and the pooling DROPPED it, which made the field dead
+    /// under CI's `-D dead_code` and made `CountingLock`'s doc — which promises it is "reported as
+    /// a total divided by `acquisitions`" — false at the same time. One defect, two faces.
+    span_ns: u64,
 }
 
 /// What one arm produced.
@@ -728,6 +734,7 @@ fn main() {
                 p.reaped += o.reaped;
                 p.acquisitions += o.acquisitions;
                 p.done_during_sweep += o.done_during_sweep;
+                p.span_ns += o.span_ns;
                 p.reps += 1;
             }
             drop(f);
@@ -751,9 +758,9 @@ fn main() {
     println!(
         "# reaped, and done_in_sw is how many client statements COMPLETED while the sweep ran.");
     println!(
-        "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>11}",
+        "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>13} {:>11}",
         "N", "arm", "K", "samples", "p50_ns", "p99_ns", "max_ns", "sweep_wall_ns", "reaped",
-        "acqs", "reap/acq", "done_in_sw"
+        "acqs", "reap/acq", "span/acq_ns", "done_in_sw"
     );
     for ((n, arm, k), p) in &pools {
         let s = Samples::of(p.waits.clone());
@@ -769,8 +776,18 @@ fn main() {
         } else {
             format!("{:.2}", p.reaped as f64 / p.acquisitions as f64)
         };
+        // `span_ns` is WAIT PLUS HOLD, divided by acquisitions -- see `CountingLock`'s docs. It is
+        // printed as a total per acquisition and NEVER as "the stall", because this wrapper sits
+        // outside the inner lock and cannot see the moment it was granted, so it is an upper bound
+        // on hold time. The doc above promised this column and the code did not print it, which
+        // made the field dead under CI's `-D dead_code` and made the doc false at the same time.
+        let span_per_acq = if p.acquisitions == 0 {
+            "-".to_string()
+        } else {
+            format!("{}", p.span_ns / p.acquisitions)
+        };
         println!(
-            "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>11}",
+            "{:>8} {:>7} {:>7} {:>9} {:>12} {:>12} {:>12} {:>14} {:>8} {:>6} {:>9} {:>13} {:>11}",
             n,
             arm,
             k,
@@ -782,6 +799,7 @@ fn main() {
             p.reaped,
             p.acquisitions,
             per_acq,
+            span_per_acq,
             p.done_during_sweep
         );
     }
