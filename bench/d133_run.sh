@@ -18,14 +18,64 @@ set -u
 WT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$WT/target/release/examples/d133_pending_len"
 
+LABEL=d133-pending-len
+SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
+LOCK_WAIT=${LOCK_WAIT:-3600}
+
+# ---- HOLD the suite lock; do not wait for a gap that never comes ---------------------------
+#
+# Waiting for the lock to be free was tried and does not converge: THREE suites took it inside
+# 35 minutes (land98a44ef 11:40, land21ae398 11:57, d127invert 12:08), and the gaps between them
+# are shorter than this sweep. D130 — the other result in this bench directory — ran its whole
+# measurement under this lock for the same reason. So this ACQUIRES it, with the same semantics
+# `tools/verify-suite.sh:135-162` uses, and a suite that starts meanwhile queues behind us
+# instead of racing us.
+#
+# `$$` is this script's pid and lives for the whole run, which is what makes the dead-holder
+# break in verify-suite.sh meaningful against us. A subshell pid would read dead immediately and
+# invite a healthy holder's lock to be broken.
+_HELD=0
+_release() { [ "$_HELD" = "1" ] || return 0; _HELD=0; rm -rf "$SUITE_LOCK"; }
+_kill_descendants() {
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_descendants "$c"; done
+    kill -9 "$p" 2>/dev/null
+}
+_abort() {
+    trap '' TERM INT                      # a second signal must not re-enter this handler
+    local c
+    for c in $(pgrep -P $$ 2>/dev/null); do _kill_descendants "$c"; done
+    _release
+    echo "REFUSED: aborted by SIG$1 after ${SECONDS}s. A sweep cut short is not a measurement." >&2
+    exit 143
+}
+
+# ⛔ **Every arm goes through this, never a bare foreground call.** Fire-checked 2026-09-22: with
+# the harness in the foreground a SIGTERM did NOT release the lock — bash does not run a trap
+# until the foreground command returns, so the lock stayed held for the remaining 55 s of a
+# `sleep 60` and the abort message read "after 60s". An arm here runs for minutes, and a stale
+# `/tmp/ferrodb-suite.lock` blocks EVERY suite on the box. `wait` is interruptible where a
+# foreground command is not; this is `tools/verify-suite.sh`'s note 7, arrived at the same way.
+run_arm() {
+    "$@" &
+    _child=$!
+    wait "$_child"
+}
+trap '_release' EXIT
+trap '_abort TERM' TERM
+trap '_abort INT' INT
+
+# Am I still the holder? Anything else means someone broke the lock and is on the box with me.
 CONTENDED=0
-# Print the suite lock's state and remember, for the whole run, whether it was ever taken.
 suite_state() {
-    if [ -d /tmp/ferrodb-suite.lock ]; then
-        CONTENDED=1
-        echo "# suite lock @ $1: TAKEN by $(cat /tmp/ferrodb-suite.lock/owner 2>&1) <- CONTAMINATED"
+    local owner pid
+    owner=$(cat "$SUITE_LOCK/owner" 2>/dev/null || echo "GONE")
+    pid=${owner%% *}
+    if [ "$pid" = "$$" ]; then
+        echo "# suite lock @ $1: HELD BY THIS RUN ($(date -u +%H:%M:%SZ), load $(uptime | sed 's/.*load averages*: *//'))"
     else
-        echo "# suite lock @ $1: free   ($(date -u +%H:%M:%SZ), load $(uptime | sed 's/.*load averages*: *//'))"
+        CONTENDED=1
+        echo "# suite lock @ $1: LOST — now '$owner' <- CONTAMINATED"
     fi
 }
 
@@ -34,14 +84,31 @@ if [ ! -d /tmp/ferrodb-measure.lock ]; then
     echo "REFUSED: /tmp/ferrodb-measure.lock is not held. A contended box returns 'no effect'." >&2
     exit 2
 fi
-if [ -d /tmp/ferrodb-suite.lock ]; then
-    echo "REFUSED: /tmp/ferrodb-suite.lock is taken by: $(cat /tmp/ferrodb-suite.lock/owner 2>&1)" >&2
-    exit 2
-fi
 if [ ! -x "$BIN" ]; then
     echo "REFUSED: $BIN does not exist. Nothing would be measured." >&2
     exit 2
 fi
+
+# Poll at 5 s, not verify-suite.sh's 15 s: at 15 s this loses the handover to a suite that is
+# also queueing, which has already cost this project four missed acquisitions in 50 minutes.
+_waited=0
+while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
+    _owner=$(cat "$SUITE_LOCK/owner" 2>/dev/null || echo "unknown")
+    _pid=${_owner%% *}
+    if [ -n "$_pid" ] && [ "$_pid" != "unknown" ] && ! kill -0 "$_pid" 2>/dev/null; then
+        echo "$LABEL: suite lock held by dead pid $_pid — breaking it" >&2
+        rm -rf "$SUITE_LOCK"; continue
+    fi
+    if [ "$_waited" -ge "$LOCK_WAIT" ]; then
+        echo "REFUSED: waited ${LOCK_WAIT}s for the suite lock held by: $_owner" >&2
+        exit 3
+    fi
+    [ "$_waited" -eq 0 ] && echo "$LABEL: queued behind $_owner" >&2
+    sleep 5; _waited=$((_waited+5))
+done
+printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
+_HELD=1
+echo "$LABEL: acquired the suite lock after ${_waited}s" >&2
 
 # ---- provenance, read from the tree and the binary, not from intent ------------------------
 echo "# D133 — pending-free queue length under a branching workload. RAW ARTIFACT."
@@ -55,6 +122,7 @@ git -C "$WT" status --porcelain | sed 's/^/#                   /'
 echo "# binary mtime      $(date -u -r "$BIN" +%Y-%m-%dT%H:%M:%SZ)"
 echo "# host              $(uname -srm)"
 echo "# measure lock      $(cat /tmp/ferrodb-measure.lock/owner 2>&1)"
+echo "# suite lock        HELD BY THIS RUN: $(cat "$SUITE_LOCK/owner" 2>&1) (queued ${_waited}s)"
 echo "# load before       $(uptime | sed 's/.*load averages*: *//')"
 echo "#"
 echo "# THE CONFIGURATION GATE, quoted from the code this harness invokes:"
@@ -73,18 +141,21 @@ echo "  fan/chain pin their children forever (lag = infinity); fanlag holds the 
 echo "  reap; fanreap reaps every child first (lag = zero); leaf is the forced negative."
 echo "=============================================================================="
 suite_state "before arm 1 persist=off"
-D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300,1000,3000 D133_PERSIST=off \
-    D133_CATALOG=mem "$BIN"
+run_arm env D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300,1000,3000 \
+    D133_PERSIST=off D133_CATALOG=mem "$BIN"
 rc1=$?
 suite_state "after arm 1 persist=off"
 echo "(arm 1 persist=off rc=$rc1)"
 echo
 suite_state "before arm 1 persist=on"
-D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300,1000 D133_PERSIST=on \
-    D133_CATALOG=mem "$BIN"
+run_arm env D133_SHAPES=fan,fanlag,leaf D133_BRANCHES=100,300,1000,3000 \
+    D133_PERSIST=on D133_CATALOG=mem "$BIN"
 rc2=$?
 suite_state "after arm 1 persist=on"
-echo "(arm 1 persist=on rc=$rc2 — every pass fsyncs the whole map, so this arm is the slow one)"
+echo "(arm 1 persist=on rc=$rc2 — every pass fsyncs the whole map, so this arm is the slow one."
+echo " Shapes trimmed to fan/fanlag/leaf: chain matched fan EXACTLY on every integer and"
+echo " fanreap matches leaf, so running them here would hold the fleet's lock to re-derive"
+echo " a duplicate. fan is the growing queue, fanlag the bounded one, leaf the fast path.)"
 echo
 
 echo "=============================================================================="
@@ -93,8 +164,8 @@ echo "must agree on the integers at a count both can reach, or one of them is th
 echo "thing being measured."
 echo "=============================================================================="
 suite_state "before arm 2"
-D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300 D133_PERSIST=off \
-    D133_CATALOG=table "$BIN"
+run_arm env D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300 \
+    D133_PERSIST=off D133_CATALOG=table "$BIN"
 rc3=$?
 suite_state "after arm 2"
 echo "(arm 2 rc=$rc3)"
@@ -106,8 +177,9 @@ echo "parked, not branches reaped, so P must scale it linearly or the model is w
 echo "=============================================================================="
 suite_state "before arm 3"
 for p in 1 4 16; do
-    D133_SHAPES=fan D133_BRANCHES=300 D133_PERSIST=off D133_CATALOG=mem D133_PAGES=$p "$BIN" \
-        | grep -E '^  (shape|fan)' | sed "s/^/  P=$p /"
+    { env D133_SHAPES=fan D133_BRANCHES=300 D133_PERSIST=off D133_CATALOG=mem D133_PAGES=$p \
+        "$BIN" | grep -E '^  (shape|fan)' | sed "s/^/  P=$p /"; } &
+    wait $!
 done
 echo
 
@@ -119,7 +191,7 @@ echo "separate a slope from a drifting box, and this project has lost four resul
 echo "to exactly that."
 echo "=============================================================================="
 suite_state "before arm 4"
-D133_SHAPES=chain D133_BRANCHES=600 D133_PERSIST=off D133_CATALOG=table "$BIN"
+run_arm env D133_SHAPES=chain D133_BRANCHES=600 D133_PERSIST=off D133_CATALOG=table "$BIN"
 rc4=$?
 suite_state "after arm 4"
 echo "(arm 4 rc=$rc4)"
@@ -132,7 +204,7 @@ if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ] || [ "$rc4" -ne 0 ];
     exit 2
 fi
 if [ "$CONTENDED" -ne 0 ]; then
-    echo "# VERDICT: THE SUITE LOCK WAS TAKEN DURING THIS RUN. The integers stand — they are"
+    echo "# VERDICT: THIS RUN LOST THE SUITE LOCK PART-WAY. The integers stand — they are"
     echo "# counts and immune to load — but DO NOT QUOTE ANY ms COLUMN from this file."
     exit 3
 fi
