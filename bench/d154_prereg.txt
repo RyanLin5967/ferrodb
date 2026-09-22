@@ -222,3 +222,31 @@ after. D154 is +6 per-target; every absolute below is that one claim evaluated a
 
 The +6 is: 6 tests in tests/d154_length_prefix_refusal.rs. The rewritten transport test is net
 zero (1 before, 1 after) and is checked BY NAME for that reason.
+
+
+AMENDMENT 4 — 2026-09-22, the base is now FIXED and the prediction is the one already registered
+=================================================================================================
+w4gen landed first, as agreed, so the row selected from the table committed at 1f6b2ae — BEFORE
+any of this data existed — is the "+w4gen" row:
+
+    base: local main 5b814b8 (merge 624edf1 + its bank), baseline 2516 per-target
+    expectation: 2516 + 6 = 2522, Go 97
+
+Both halves checked rather than taken from the landing queue's message:
+  * `git diff --stat bfcfa0e main -- src tests examples Cargo.toml` -> EMPTY, and the only
+    differing top-level dir is bench/. So w4gen's certified 2516 at bfcfa0e transfers to main.
+  * staleness RUN, not predicted: "branch b4a670e vs 5b814b8…: 0 behind, 12 ahead / COVERED".
+    Predicting it is what cost this row a cycle this morning; both of us said COVERED and the
+    guard said STALE-GREEN.
+
+⚠ origin/main is 4685d80 and RED — a reproduced 0xc0000005 on Windows, 2 of 2 on that sha. The
+base I am landing on is a LOCAL main that is 15+ commits ahead of origin and exists on this
+machine only. Recorded here because the absolute below is meaningless to anyone who fetches.
+
+    DURABLE FORM OF THIS ROW'S CLAIM:  D154 = +6 @ base 5b814b8 (local), per-target.
+    2522 is that claim evaluated at this base and nowhere else.
+
+The Windows failure does not touch this row, and that is MEASURED rather than argued from module
+names: integration_cluster_agents returned "ok. 35 passed; 0 failed" in my own complete run at
+4685d80 — the exact sha that reproduces on Windows — with 0 FAILED result lines in the whole run.
+A file-set argument is what staleness refused from us this morning, so it is not used here either.
