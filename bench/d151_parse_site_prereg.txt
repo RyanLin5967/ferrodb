@@ -92,3 +92,41 @@ head table and does fall through to `Kind::Sql`, so P4's assertion about A1 stan
 
 This amendment makes the prediction HARDER to satisfy, not easier: it converts an arm that was
 predicted to move into one that is forbidden to move.
+
+-----------------------------------------------------------------------------------------------
+AMENDMENT 2 — 2026-09-22, STILL BEFORE ANY ARM WAS RUN. Exact integers, from the RECORDED run.
+
+`bench/e6_outer_lock_count.txt` on branch `E6-outer-lock-count` (commit bf1834a, base ee24331)
+banked the BEFORE numbers already, at F=8 and T=1,4,16,64, with every acquisition attributed to
+three sites: (i) `Statement::parse_one`, (ii) `read_catalog`'s stale-snapshot refresh, (iii) the
+exclusive execute arm. Its per-fork constants are 3.000 for A2 and 4.125 for A1, flat from T=1 to
+T=64. That is the same generative rule this file derived independently, so the prediction is now
+pinned to integers instead of to a shape. D151 removes site (i) and nothing else.
+
+  F = 8. Run as: cargo run --release --features lock_census --example e6_outer_lock_count
+  (no arguments — the harness defaults to F=8 and T=1,4,16,64, which is what bf1834a recorded).
+
+    arm   T      BEFORE (banked, must reproduce)   AFTER (predicted)     DROP    per-fork after
+    A1    1                33                            17               16       2.125
+    A1    4               132                            68               64       2.125
+    A1   16               528                           272              256       2.125
+    A1   64              2112                          1088             1024       2.125
+    A2    1                24                            16                8       2.000
+    A2    4                96                            64               32       2.000
+    A2   16               384                           256              128       2.000
+    A2   64             1536                           1024              512       2.000
+    A0  all                 0                             0                0       CONTROL
+    B   all                 0                             0                0       CONTROL
+
+  A1 after = 2 x (2F) x T + T = 17T.   A2 after = 2 x FT = 16T.
+  Totals over the sweep (A1+A2, the eight cells that move): BEFORE 4845, AFTER 2805, DROP 2040.
+
+FALSIFIERS, in the order they would be believed
+  F1. A BEFORE cell that does not reproduce bf1834a's integer. Then my base is not their base and
+      nothing below it may be quoted. Reproduce theirs first.
+  F2. A0 or B non-zero in either arm.
+  F3. An AFTER cell ABOVE its predicted value: the site was not actually removed on that path.
+  F4. An AFTER cell BELOW its predicted value at T=1. There is no concurrency at T=1 for the
+      stand-down feedback of P3 to act through, so at T=1 the prediction is exact in BOTH
+      directions. At T>1 a value below the prediction is the P3 effect and must be SAID to be
+      that, not folded silently into the headline.
