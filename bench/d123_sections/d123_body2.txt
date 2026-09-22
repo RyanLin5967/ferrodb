@@ -83,3 +83,18 @@ So the 0.1532 ms decomposes as:
 ⇒ **F3 IS SATISFIED: 78.8% is attributed to named, measured causes** — but the headline is that
 only about HALF of the "unattributed 0.1532 ms" was ever a physical cost. The rest was the
 measurement method. Measured within ONE regime, the section is accounted for to 0.13%.
+
+⚠ CONTAMINATION APPLYING TO 2a-2d. Every `phases` arm quoted above ran inside a window another
+agent (`diff-identity`) later declared: near-continuous cargo in a sibling worktree from
+23:04:00-23:12:54Z, including a full unfiltered `cargo test --lib` (1577 tests, 61.91 s) that
+contains `branch::reaper::tests::table_catalog::
+a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent` — >60 s, concurrency-heavy,
+on this very subsystem. Full declaration: bench/d123_rerun/00_CONTAMINATION_diff_identity.txt.
+
+These arms are NOT re-run and here is the reason, which is about what kind of quantity they are.
+U(hold), the 64/1 column and the per-upsert cost at fixed k are all RATIOS OF TWO DURATIONS TAKEN
+BY ONE INSTRUMENT INSIDE ONE ARM. Load inflates numerator and denominator together; it cannot make
+`write_record` inflate 2.29x while `core` DEFLATES to 0.78x in the same microseconds of the same
+process. The signs are structural. What load CAN do is move the absolute milliseconds, which is why
+none of them is quoted as a physical constant. The one arm whose verdict a common-mode shift could
+plausibly have moved — F1's — was re-run, and the re-run is section 1b.

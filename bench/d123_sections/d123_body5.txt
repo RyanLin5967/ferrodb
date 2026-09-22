@@ -53,3 +53,20 @@
   keys, so their trees grow more slowly inside the timed window. The depth-sensitive phases
   (core + envelope + free_scan) total ~0.022 ms of a ~0.19 ms section, so even a 20% swing in them
   moves F1 by ~2%, against an effect of 105%.
+
+⚠ A DECLARED CONTAMINATION THIS ARTIFACT CARRIES, AND WHAT WAS DONE ABOUT IT.
+`diff-identity` declared near-continuous cargo in a sibling worktree from 23:04:00-23:12:54Z, inside
+the `d123-f1` lock window (acquired 23:03:55Z). It covers the first F1 arms, both perturb2 arms, all
+three phases reps and part of one extra arm. The measure lock excludes other MEASURERS; it does not
+exclude builds or test suites, so holding it is not evidence of a quiet box and is never claimed as
+such here.
+  * F1 was RE-RUN clean (section 1b) because Round 3's gate rests on it.
+  * The within-arm ratios were NOT re-run, for the reason given at the end of section 2.
+  * It also supersedes my own earlier explanation of why the first warm=20k F1 arm was
+    noise-dominated: I attributed it to a load ramp; a 1577-test suite landing inside it is the
+    better explanation, and I have said so where I wrote the original.
+
+⚠ TWO RUNS IN THIS ROW PRODUCED FILES THAT LOOK LIKE RESULTS AND ARE NOT. See Amendment 8: the
+detector is the ABSENCE of the `# harness_exit=` sentinel, and `bench/d123_assemble.sh` now checks
+every arm for it before writing this artifact. A d123 file without `# harness_exit=0` at its foot
+is a truncated run and must not be quoted.
