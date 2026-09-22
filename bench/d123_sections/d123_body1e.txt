@@ -13,6 +13,12 @@ correct acquire can both precede a full test suite landing on the same CPU.
                                            on this very subsystem
   d77-walls       23:59:00 - 00:03:00Z     `cargo build --examples`, `cargo test --lib` (~72 s),
                                            8 integration targets — a rebase verification
+  ⛔ MYSELF       00:31:33Z (2 cargo builds) INSIDE 50_f1_clean, which had also acquired at
+                                           load_at_acquire=13. See 50_CONTAMINATION_BY_ME.txt.
+                                           The measure lock protects a measurement from other
+                                           agents, not from its own author rebuilding the
+                                           worktree whose target/ holds the binary under test.
+                                           HOLDING THE LOCK IS NOT A LICENCE TO BUILD.
 
   arm                            ran (UTC)              intersection
   first battery F1 (both)        23:06 - 23:07Z         ENTIRELY inside diff-identity
@@ -22,8 +28,8 @@ correct acquire can both precede a full test suite landing on the same CPU.
 ⇒ **OF THE 18 PAIRED DRAWS, ONLY FIVE FALL OUTSIDE EVERY DECLARED WINDOW** — `30_f1_paired_warm20k`
 reps 4-8, at 28.2 s per rep. Those five give **median 1.97x, 4 of 5 above 1.10x**. One of them (rep
 4, 1.03x) sits inside the falsifier's band. **An earlier draft of this artifact said "17 of 18" and
-that overstates the clean evidence; the phrasing is withdrawn.** F1 is therefore re-run clean in
-`bench/d123_final/50_f1_clean.txt`, and the verdict below rests on that.
+that overstates the clean evidence; the phrasing is withdrawn.** F1 is therefore re-run in
+`bench/d123_final/51_f1_clean2.txt`, and the verdict below rests on that.
 
 ⛔ AND A DIRECTION ARGUMENT I MADE AND HAVE SINCE NARROWED. I claimed contamination biases the F1
 ratio UPWARD, because interference hurts L0 more than L3 (L0 spends ~21x longer inside the section).

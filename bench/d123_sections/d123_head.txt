@@ -11,8 +11,9 @@ This artifact is assembled by bench/d123_assemble.sh from bench/d123_sections/, 
 emit if any section still says PENDING and warns on any arm lacking a `# harness_exit=0` sentinel.
 
 ⛔ WHICH NUMBERS IN HERE ARE CLEAN. Two agents declared activity overlapping this row's measure-lock
-windows (section 1e has the ledger). The F1 verdict rests on bench/d123_final/50_f1_clean.txt, taken
-on a box the team lead deliberately quieted. Earlier F1 arms are reported, and reported as dirty.
+windows (section 1e has the ledger). The F1 verdict rests on bench/d123_final/51_f1_clean2.txt.
+Earlier F1 arms are reported, and reported as dirty — including 50_f1_clean.txt, which I
+CONTAMINATED MYSELF by running two cargo builds 2 m 50 s into it (50_CONTAMINATION_BY_ME.txt).
 
 ⚠ PROVENANCE. The first battery was run by the team lead on the rate-limit window after this agent
 hit its session limit with zero arms run (bench/D123_LEAD_RAN_THIS.md). It rebuilt a stale binary
