@@ -1054,8 +1054,19 @@ fn commit_rewrite(
             // and a key that is not in the index must not be re-inserted by a rewrite.
             if let Some(k) = key {
                 if primary.search(&k)? == Some(rid) {
-                    primary.delete(&k)?;
-                    primary.insert(k, new_rid)?;
+                    // ⛔ **D126 — this was `delete(&k)` then `insert(k, new_rid)`.** `delete` drops
+                    // the leaf write latch when it returns and `insert` re-acquires it, so the
+                    // primary key did not exist in the index between the two, and `search`
+                    // descends with no latch at all: a concurrent point lookup got "no such row"
+                    // for a row that exists and was merely being repointed by an ALTER. One
+                    // `upsert` is one page write with no such window.
+                    //
+                    // **The `search` guard above stays and is load-bearing.** `upsert` inserts a
+                    // key that is absent, which is exactly what this must not do: a deleted row
+                    // keeps its heap tombstone AND its index entry, and a key that is not in the
+                    // index must not be re-inserted by a rewrite. The guard is what decides that;
+                    // `upsert` only decides how the decided write is performed.
+                    primary.upsert(k, new_rid)?;
                 }
             }
             // Provenance is keyed by `RecordId` too (a page-local dictionary slot). Without this

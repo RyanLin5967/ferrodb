@@ -78,6 +78,21 @@ use crate::storage::page_latch::{PageLatches, PageReadGuard, PageWriteGuard};
 use std::sync::atomic::Ordering;
 use std::ops::Bound;
 
+/// Whether a leaf write adds an entry or replaces the one already there.
+///
+/// Private on purpose: it selects between [`BPlusTreeManager::insert`] and
+/// [`BPlusTreeManager::upsert`], which are the two public operations, and a third caller choosing
+/// the mode for itself would be a third replace protocol to keep correct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeafWrite {
+    /// Add the entry. An existing entry for the same key is **left in place**, which is how
+    /// `insert` has always behaved.
+    Insert,
+    /// Remove any existing entry for the key and add the new one, in one in-memory leaf image and
+    /// therefore in one page write.
+    Replace,
+}
+
 pub struct BPlusTreeManager<K, V> {
     /// The tree's current root page, **shared** with every other handle on the same tree.
     ///
@@ -169,14 +184,58 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     /// Insert one entry.
     ///
+    /// ⚠ **This does NOT replace.** Writing a key that is already present leaves TWO entries for
+    /// it and `search` returns whichever the binary search lands on. Callers rewriting a key want
+    /// [`Self::upsert`].
+    ///
     /// Fast path first: if the leaf has room, only that leaf is latched for writing and only that
     /// leaf is written. If it would split, nothing has been written yet and the whole insert is
     /// retried with write latches on the entire root-to-leaf path.
     pub fn insert(&self, key: K, value: V) -> Result<(), FerroError> {
-        if self.try_insert_without_split(&key, &value)? {
+        if self.try_write_without_split(&key, &value, LeafWrite::Insert)? {
             return Ok(());
         }
-        self.insert_splitting(key, value)
+        self.write_splitting(key, value, LeafWrite::Insert)
+    }
+
+    /// Replace `key`'s value, inserting it if absent — **without a window in which the key is
+    /// absent to a concurrent reader.** SCALE-DESIGN D126.
+    ///
+    /// # What this replaces, and why an atomic form is needed
+    ///
+    /// Every caller that rewrites a key used to open-code `delete` then `insert`, because this
+    /// type had no replace primitive. `delete` drops the leaf's write latch when it returns and
+    /// `insert` re-acquires it, so **between the two the key does not exist** — and every reader
+    /// on the point-lookup path ([`Self::search`] via `read_leaf_for`) takes no latch at all, so
+    /// it sees that gap. `TableBranchCatalog::upsert` routed the branch RECORD key through that
+    /// shape, which made an ordinary `set_root` or `renew_lease` transiently un-read a live
+    /// branch's record; `descend_optimistic`'s own comment records the same defect reached from
+    /// `execution::insert`'s key reuse. Neither bites while a global per-statement mutex excludes
+    /// reader from writer, and both bite the moment that mutex is removed, which is the whole
+    /// point of removing it.
+    ///
+    /// # Why this is atomic
+    ///
+    /// The removal and the addition are applied to the **same in-memory leaf image**, so the one
+    /// `write_page` that publishes the new value is the same `write_page` that drops the old one.
+    /// A page write is atomic to every reader: the latched path holds the page latch, and the
+    /// lock-free path reads the frame's seqlock shadow and retries on a version change
+    /// (`BufferPoolManager::read_frame_optimistic`).
+    ///
+    /// The split case is atomic for the same reason plus the existing B-link ordering. The leaf is
+    /// mutated and split entirely in memory; the new right sibling is written first and the halved
+    /// leaf — which is what publishes `next` — second. So a reader is always looking at either the
+    /// whole pre-write leaf (key present, old value) or a published pair in which the key lives in
+    /// exactly one half, and `descend_optimistic`'s right walk reaches the half it moved to.
+    ///
+    /// **It does not make a multi-key update atomic.** One key, one page write. A caller rewriting
+    /// several keys still needs its own exclusion across them — `TableBranchCatalog::logical` is
+    /// that, and stays.
+    pub fn upsert(&self, key: K, value: V) -> Result<(), FerroError> {
+        if self.try_write_without_split(&key, &value, LeafWrite::Replace)? {
+            return Ok(());
+        }
+        self.write_splitting(key, value, LeafWrite::Replace)
     }
 
     // uses sibling pointers to traverse leaves and does range scan from start -> end (inclusive)
@@ -432,13 +491,33 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         }
     }
 
-    /// The fast path. Returns `Ok(true)` if the entry was inserted, `Ok(false)` if it would have
+    /// Apply one key/value write to a leaf image **in memory**, with no page write of its own.
+    ///
+    /// This is the whole of the difference between `insert` and `upsert`, and it is deliberately
+    /// one place: under [`LeafWrite::Replace`] the old entry is removed from the same image the
+    /// new one is added to, so no caller can accidentally reintroduce a two-page-write replace.
+    fn apply_to_leaf(leaf: &mut BPlusTreeLeafPage<K, V>, key: K, value: V, mode: LeafWrite) {
+        if mode == LeafWrite::Replace {
+            // Absent is the normal case for a first write, not an error. `remove_entry` returns
+            // `KeyNotFound` for it and there is nothing else it can fail on.
+            let _ = leaf.remove_entry(&key);
+        }
+        leaf.insert_entry(key, value);
+    }
+
+    /// The fast path. Returns `Ok(true)` if the entry was written, `Ok(false)` if it would have
     /// split the leaf — in which case **nothing has been written** and the caller must retry
     /// pessimistically.
-    fn try_insert_without_split(&self, key: &K, value: &V) -> Result<bool, FerroError> {
+    ///
+    /// Under [`LeafWrite::Replace`] a same-size rewrite cannot reach the `Ok(false)` arm: no leaf
+    /// is ever left persisted in a full state (a split leaves both halves under the threshold), so
+    /// removing an entry and adding one of the same length lands on the size the leaf already had.
+    /// That is what keeps `set_root` and `renew_lease`, which rewrite a fixed-width core record,
+    /// on the single-latch path.
+    fn try_write_without_split(&self, key: &K, value: &V, mode: LeafWrite) -> Result<bool, FerroError> {
         let (page_id, _latch) = self.latch_leaf_for_write(key)?;
         let mut leaf = self.read_leaf_raw(page_id)?;
-        leaf.insert_entry(key.clone(), value.clone());
+        Self::apply_to_leaf(&mut leaf, key.clone(), value.clone(), mode);
         if leaf.is_full() {
             return Ok(false);
         }
@@ -454,7 +533,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// the decision is made. Estimating it would be a guard that silently stops excluding when the
     /// estimate is low. Splits are rare — one per leaf-full of inserts — and the common case never
     /// reaches this function at all.
-    fn insert_splitting(&self, key: K, value: V) -> Result<(), FerroError> {
+    fn write_splitting(&self, key: K, value: V, mode: LeafWrite) -> Result<(), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
             let mut guards: Vec<PageWriteGuard<'_>> = vec![self.latches().write(root)];
@@ -474,23 +553,47 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     }
                 }
             };
-            let result = self.insert_into_latched_leaf(leaf_id, &mut stack, key, value);
+            let result = self.write_into_latched_leaf(leaf_id, &mut stack, key, value, mode);
             drop(guards);
             return result;
         }
     }
 
-    /// Insert into a leaf whose whole root-to-leaf path this thread holds write latches on.
+    /// Write into a leaf whose whole root-to-leaf path this thread holds write latches on.
     ///
     /// Split ordering matters and is not the order the unlatched version used: the **new** leaf is
     /// written before the old one, because writing the old leaf is what publishes
     /// `next -> new_page_id`, and a concurrent scanner following that pointer must not land on a
     /// page that has not been written yet.
-    fn insert_into_latched_leaf(&self, leaf_id: u32, stack: &mut Vec<u32>, key: K, value: V) -> Result<(), FerroError> {
+    ///
+    /// That same ordering is what makes [`LeafWrite::Replace`] atomic here: the removal happens in
+    /// the in-memory image before the split, so the key is in `leaf` until `write_page(leaf_id)`
+    /// publishes both halves' contents, and in exactly one half afterwards. Nothing in between
+    /// removes it from a page a reader can reach.
+    fn write_into_latched_leaf(&self, leaf_id: u32, stack: &mut Vec<u32>, key: K, value: V, mode: LeafWrite) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
-        leaf.insert_entry(key, value);
+        Self::apply_to_leaf(&mut leaf, key, value, mode);
         if !leaf.is_full() {
             return self.write_page(leaf_id, leaf.serialize()?);
+        }
+        // ⛔ A full leaf holding ONE entry cannot be split into two that fit: the entry is itself
+        // larger than a page. `split` takes `mid = len / 2`, which is 0 here, so `split_off(0)`
+        // would move everything to the new page, leave THIS leaf empty, and then panic inside
+        // `serialize` — `range end index 4143 out of range for slice of length 4096` on the test
+        // below, from a `copy_from_slice` in `index_page.rs`, which names neither the key nor the
+        // cause. Refuse by name instead, before anything is written.
+        //
+        // **D126 is why this is here.** `Insert` could only reach the case on an EMPTY leaf, where
+        // it has always panicked. `Replace` reaches it on a populated one: a replacement value can
+        // grow a one-entry leaf past the page without ever making it two entries, which is a shape
+        // no `insert` can produce. The guard is written for both, and
+        // `an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf` fires it
+        // from both directions and checks that a value that DOES fit is still accepted.
+        if leaf.key_arr.len() < 2 {
+            return Err(FerroError::Io(format!(
+                "a single entry does not fit in a {PAGE_SIZE}-byte leaf page (page {leaf_id}); \
+                 splitting cannot help, and doing it anyway would leave an empty leaf"
+            )));
         }
 
         let new_page_id = self.buffer_pool.new_page()?;
@@ -965,5 +1068,84 @@ mod tests {
         let mut sorted = all.clone();
         sorted.sort();
         assert_eq!(all, sorted, "scan came back out of order");
+    }
+
+    /// **An entry larger than a page must be REFUSED, not split into an empty leaf.**
+    ///
+    /// `BPlusTreeLeafPage::split` takes `mid = len / 2`. On a leaf holding ONE entry that is
+    /// `mid = 0`, so `split_off(0)` moves everything to the new page and leaves the old leaf
+    /// EMPTY — and `serialize` on the new page then indexes past `PAGE_SIZE` and panics inside
+    /// `copy_from_slice`. Measured before the guard, on this exact test: it panicked at
+    /// `src/storage/index_page.rs:117` with
+    /// `range end index 4143 out of range for slice of length 4096`
+    /// (27 header + 12 key + 4104 value).
+    ///
+    /// **D126 is why this is written down now.** `insert` could only reach the case by inserting
+    /// an oversized entry into an EMPTY leaf; `upsert` reaches it on a POPULATED one, because a
+    /// replacement value can grow a one-entry leaf past the page without ever making it two
+    /// entries. Both arms are asserted, because the guard covers both and a guard that only ever
+    /// fires on the new path would say nothing about the old one.
+    ///
+    /// The refusal happens before anything is written, so the pre-existing value must survive —
+    /// asserted, because "refuses" and "refuses without corrupting" are different claims.
+    #[test]
+    fn an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversize.db");
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&path).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp).unwrap();
+
+        // A `Vec<u8>` entry costs 4 length bytes plus its payload, and a leaf header is 27, so one
+        // entry overflows a 4096-byte page at a payload of ~4053. 4100 is comfortably past it.
+        let huge = vec![0x5Au8; 4100];
+        let k = b"oversize".to_vec();
+        tree.insert(k.clone(), vec![1u8; 8]).expect("the small entry must fit");
+
+        // ARM 1 — UPSERT, the case D126 introduced: one entry already there, grown past the page.
+        let e = tree.upsert(k.clone(), huge.clone()).expect_err("an oversized upsert must refuse");
+        assert!(
+            e.to_string().contains("does not fit"),
+            "refused, but not by the guard that names the reason: {e}"
+        );
+        assert_eq!(
+            tree.search(&k).expect("search"),
+            Some(vec![1u8; 8]),
+            "the refusal wrote something; the previous value must survive untouched"
+        );
+
+        // ARM 2 — INSERT into an empty leaf, the case that always existed and panicked.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("oversize2.db");
+        let file2 = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&path2).unwrap();
+        let bp2 = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file2).unwrap())));
+        let empty = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp2).unwrap();
+        let e2 = empty.insert(k.clone(), huge).expect_err("an oversized insert must refuse");
+        assert!(
+            e2.to_string().contains("does not fit"),
+            "refused, but not by the guard that names the reason: {e2}"
+        );
+        assert_eq!(empty.search(&k).expect("search"), None, "nothing must have been written");
+
+        // NEGATIVE CONTROL. The guard must not refuse an entry that DOES fit, including one big
+        // enough to force a genuine split of a leaf that holds more than one entry.
+        let big_but_ok = vec![0x11u8; 2000];
+        tree.upsert(k.clone(), big_but_ok.clone()).expect("a 2000-byte value fits");
+        assert_eq!(tree.search(&k).expect("search"), Some(big_but_ok));
+        for i in 0u32..40 {
+            tree.insert(i.to_be_bytes().to_vec(), vec![0x22u8; 300])
+                .expect("ordinary inserts must still split normally");
+        }
+        for i in 0u32..40 {
+            assert_eq!(
+                tree.search(&i.to_be_bytes().to_vec()).expect("search"),
+                Some(vec![0x22u8; 300]),
+                "key {i} lost after the splits the control forced"
+            );
+        }
     }
 }

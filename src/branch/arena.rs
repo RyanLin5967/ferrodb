@@ -1571,11 +1571,18 @@ impl PageStore for ArenaPageStore {
         // An extent's owner is published BY CONSTRUCTION: `alloc_arena` is the only writer of
         // `extents` and it ends in `catalog.add_arena`, which both catalogs refuse for a branch
         // with no record. So the owner did exist. And "has no record *now*" does not mean it
-        // stopped existing: `TableBranchCatalog::upsert` is delete-then-insert with no latch held
-        // across the two, and `write_record` routes the RECORD key through it, so a concurrent
-        // `set_root` or `renew_lease` on the owner makes `get_raw` miss for a moment on a
-        // perfectly healthy branch. Resolving that to "not pinned" ran `release_page` on a page a
-        // live child may still be reading: silent data loss, not a leak.
+        // stopped existing: nothing ever deletes a record, and retirement is a state flip to
+        // `Reaped`. Resolving a failed read to "not pinned" ran `release_page` on a page a live
+        // child may still be reading: silent data loss, not a leak.
+        //
+        // ⚠ **D126 changed WHICH failures reach here, not what to do about them.** This used to
+        // say the miss was routine: `TableBranchCatalog::upsert` was delete-then-insert with no
+        // latch held across the two, and `write_record` routes the RECORD key through it, so a
+        // concurrent `set_root` or `renew_lease` on the owner made `get_raw` miss for a moment on
+        // a perfectly healthy branch. D126 gave the tree an in-place replace and closed that
+        // window (`tests/d126_atomic_upsert.rs`, and `mod d126_record_key_probe` on the RECORD
+        // key itself). What can still fail here is an I/O error or a genuinely corrupt catalog,
+        // and for both of those refusing remains the only answer that neither frees nor guesses.
         //
         // So the `?`: refusing leaves the page PARKED, which the next drain revisits, and a
         // retry succeeds. Freeing is the one outcome that cannot be retried.
