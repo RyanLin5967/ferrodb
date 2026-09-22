@@ -843,11 +843,33 @@ fn main() {
     // number of bytes per merge, then a database that has done N merges rewrites O(N) bytes on
     // every subsequent merge, whatever that merge changed. That is a real scaling problem and it
     // belongs to whoever owns the free-space map, not to chunk-vs-delta.
+    //
+    // ⛔⛔ **EVERYTHING IN THE TWO PARAGRAPHS ABOVE DESCRIBES THE PRE-D81 ARENA, AND D81 HAS
+    // LANDED.** Read them as the statement of a problem that has since been FIXED, not as a
+    // finding about the current tree. `<db>.arena` is now `[image][tail record]*`: a claim appends
+    // 45 bytes and a free 25, and `replace_atomically` fires only when the tail outgrows its share
+    // of the image. The O(N)-bytes-per-merge scaling problem this section identified — and handed
+    // to "whoever owns the free-space map" — is the wall D81 removed, measured at 530 MB -> 1.19 MB
+    // (446x) over four phases with fsyncs per claim going 2.000 -> 1.00.
+    //
+    // ⚠ **SO THIS SECTION'S SELF-CHECK IS EXPECTED TO REPORT "NOT confirmed" NOW, AND THAT IS THE
+    // CORRECT ANSWER RATHER THAN A BROKEN HARNESS.** It asserts every flat-region cycle performs
+    // EXACTLY ONE `replace_atomically`; post-D81 a cycle performs ZERO replaces and N appends until
+    // compaction, so `arena_replaces` is 0 and the `odd` branch fires. The counter is still real
+    // and still measures what it says — what changed is the system under it.
+    //
+    // ⇒ **NOT REPAIRED HERE, DELIBERATELY.** Making this section's premise true again would be
+    // editing the fixture to fit the assertion, and re-modelling `arena B` for an append-only map
+    // is a measurement decision belonging to d90's own lane, not a side effect of landing D81.
+    // The honest state is: the numbers below are still measured, and the MODEL around them is
+    // stale. Whoever next runs d90 should re-cut the model, not delete this note.
     {
         println!();
         println!("  THE ARENA FREE-SPACE MAP — a SECOND flat cost, and a different axis:");
-        println!("    `arena B` is bytes WRITTEN during the cycle, not the image's size: one");
-        println!("    `replace_atomically` rewrites the whole map, so bytes ~ replaces x image.");
+        println!("    `arena B` is bytes WRITTEN during the cycle, not the image's size. PRE-D81:");
+        println!("    one `replace_atomically` rewrote the whole map, so bytes ~ replaces x image.");
+        println!("    POST-D81 the map is append-only and a cycle may perform ZERO replaces, so");
+        println!("    that model no longer holds and (1) below is EXPECTED to read NOT confirmed.");
         println!();
         // Checked against the rows, not asserted in prose: the claim is that one whole rewrite
         // serves every r in the flat region, and a single cycle with two replaces would break it.
