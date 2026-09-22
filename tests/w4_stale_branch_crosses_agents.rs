@@ -3,24 +3,29 @@
 //!
 //! # Why this is reachable, and not a race you have to win
 //!
-//! `State.workspaces` is `BTreeMap<u64, Workspace>` — keyed by the id SLOT — while a `BranchId`
-//! is `{ id, generation }` and the catalog recycles a reaped slot (`reaper.rs:715`
-//! `release_id`, `catalog.rs:424` `fork` pops it) with the generation bumped
-//! (`catalog.rs:528`). A connection caches its `AgentSession` in `execution::session::Session`
-//! and hands `a.branch` to the runtime on every statement (`dispatch.rs:519`) — it is never
-//! re-read from the catalog.
+//! ⚠ **Read as of the PARENT commit, which is the tree these tests fail on.** `State.workspaces`
+//! **was** `BTreeMap<u64, Workspace>` — keyed by the id SLOT — while a `BranchId` is
+//! `{ id, generation }`. D158 item 1 keyed it by the whole `BranchId`, which is what makes these
+//! tests pass; everything else in this header is still true at HEAD and is what keeps them
+//! meaningful rather than vacuous.
+//!
+//! The catalog recycles a reaped slot (`reaper.rs` `release_id`, `catalog.rs` `fork` pops it)
+//! with the generation bumped, and a connection caches its `AgentSession` in
+//! `execution::session::Session` and hands `a.branch` to the runtime on every statement
+//! (`dispatch.rs`, `run_in_session`) — it is never re-read from the catalog. Both of those are
+//! unchanged, so a lookup that went by slot would still cross agents today.
 //!
 //! **There is no automatic keepalive.** A session's lease is set once at fork
-//! (`DEFAULT_LEASE_MILLIS`, `15 * 60 * 1000` at `runtime.rs:96`) and no statement path renews it.
-//! The one production `renew_lease` is `simulate.rs:431`, and it sets the lease on a candidate
-//! branch `simulate` forked two lines above it, so it cannot extend a session that has gone
+//! (`DEFAULT_LEASE_MILLIS`, `15 * 60 * 1000`) and no statement path renews it.
+//! The one production renewal is in `simulate`, and it sets the lease on a candidate branch
+//! that same expression forked, so it cannot extend a session that has gone
 //! quiet — which is the session this file is about. That is the ordinary shape of an agent run,
 //! not an edge: the lease reaper exists precisely to collect branches whose agent stopped
 //! talking. So the interleaving below needs no timing luck at all —
 //!
 //!   1. connection A opens a session on slot S, generation 0;
 //!   2. A goes quiet past its lease; the sweep reaps S, bumps the generation and releases the
-//!      slot, and `forget_branches` drops A's workspace (`lease_thread.rs:634-674`);
+//!      slot, and `forget_branches` drops A's workspace (`scan_once`);
 //!   3. connection B opens a session and `fork` pops S back off the free list at generation 1;
 //!   4. A speaks again, holding `S@g0`.
 //!
@@ -41,8 +46,9 @@
 //!   row. In a database whose thesis is agent isolation this is the most expensive answer
 //!   available.
 //! * the DESTRUCTIVE half: A's `ABANDON;` binds to `current` — its own stale `BranchId`
-//!   (`binder.rs:289`) — and `seal` removes `workspaces[&branch.id]` and unbinds `names[..]`
-//!   **before** its first catalog read. This is the hazard `forget_one_branch` (`runtime.rs:6227`)
+//!   (`Binder::bind_agent`'s `Stmt::Abandon` arm) — and `seal` removes the workspace and unbinds
+//!   the name
+//!   **before** its first catalog read. This is the hazard `forget_one_branch`
 //!   already validates the whole `BranchId` against, with a comment saying acting on a stale
 //!   answer "would then delete a LIVE agent's workspace, release its escrow and unbind its name".
 //!   Only that one write path took the argument.
@@ -151,8 +157,8 @@ impl Db {
 
 /// What the lease sweep leaves behind for one expired branch, in the order it leaves it.
 ///
-/// `reaper.rs:697-715`: `set_state(.., Reaped)` — which is the call that bumps the generation —
-/// then `release_id`, which returns the slot to the free list. `lease_thread.rs:674`:
+/// `TwoTierReaper::reap`: `set_state(.., Reaped)` — which is the call that bumps the generation
+/// — then `release_id`, which returns the slot to the free list. `scan_once` then calls
 /// `runtime.forget_branches(&reaped)`, inside the same statement-lock hold.
 fn sweep_reaps(rt: &AgentRuntime, branch: BranchId) {
     let rec = rt.branches().get(branch).expect("the branch is live before the sweep");
