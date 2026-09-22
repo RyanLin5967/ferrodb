@@ -418,10 +418,10 @@ impl CowTree {
         // releasing a page it had already finished with does not unmake it.
         let mut first_err = None;
         for page in journal.retired {
-            if let Err(e) = self.store.free_page(page, epoch) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+            if let Err(e) = self.store.free_page(page, epoch)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
             }
         }
         match first_err {

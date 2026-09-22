@@ -74,6 +74,18 @@ struct StarvingStore {
     /// where the camera goes.
     watch: Mutex<Vec<PageId>>,
     at_refusal: Mutex<Vec<(PageId, [u8; PAGE_SIZE])>>,
+    /// Reads still permitted, or `-1` for "no limit".
+    ///
+    /// ⛔ Starving the ALLOCATOR cannot reach every error path, and this is not a convenience.
+    /// Measured on this fixture: 400-byte keys give the content-defined chunker ~1.2 entries
+    /// per leaf (496 leaves for 600 keys), so `merge_right`'s merged run is ~1 KB against a
+    /// 4060-byte page and never needs cutting — 98 merges, **0 allocations**. Everything
+    /// `merge_right` does after `unlink_up` returns is therefore allocation-free, so no
+    /// allocator budget can make it fail there, and the one window where releasing a retired
+    /// page early does damage is unreachable by starving allocations alone.
+    ///
+    /// `descend` reads. Refusing the nth read walks a failure through that tail.
+    read_budget: AtomicI64,
 }
 
 impl StarvingStore {
@@ -84,7 +96,17 @@ impl StarvingStore {
             log: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),
             at_refusal: Mutex::new(Vec::new()),
+            read_budget: AtomicI64::new(-1),
         }
+    }
+
+    /// Permit exactly `n` more reads through [`PageStore::read_page`], then refuse.
+    fn allow_reads(&self, n: i64) {
+        self.read_budget.store(n, Ordering::SeqCst);
+    }
+
+    fn unlimited_reads(&self) {
+        self.read_budget.store(-1, Ordering::SeqCst);
     }
 
     /// Photograph `ids` the next time an allocation is refused.
@@ -152,6 +174,11 @@ impl PageStore for StarvingStore {
     }
 
     fn read_page(&self, page_id: PageId) -> Result<PageHandle, FerroError> {
+        if self.read_budget.load(Ordering::SeqCst) >= 0
+            && self.read_budget.fetch_sub(1, Ordering::SeqCst) <= 0
+        {
+            return Err(FerroError::Cow("starving store: read refused".into()));
+        }
         self.inner.read_page(page_id)
     }
 
@@ -970,6 +997,187 @@ fn d125_instrument_the_same_starvation_on_shadowed_pages() {
     );
 }
 
+/// The half of D125 that the row counts cannot see: **a failed operation must not hand a page
+/// back to the free space map while the tree it rolled back to still points at that page.**
+///
+/// `merge_right` calls `unlink_up` and then runs four more fallible steps — `descend`,
+/// `cow_page`, `write_leaf_chunked` and `relink_up`, the last two of which allocate. Before
+/// D125 the pages `unlink_up` retired were released as it returned, so a failure in those later
+/// steps left the tree pointing at pages the allocator was free to reissue. A row count is
+/// blind to it: the rows are still on the page, correct and readable, right up until something
+/// unrelated is written over them.
+///
+/// ⛔ This test exists because the deferred-free half was **measured to be unguarded**: with it
+/// reverted to the pre-D125 ordering, the whole `cow` suite — 168 tests — stayed green. A
+/// second mechanism with no test of its own is a mechanism nobody can change safely.
+///
+/// Two assertions, both on outcomes rather than on bookkeeping:
+///
+/// * a failed operation never *reduces* the store's live page count (it may raise it — pages it
+///   allocated before failing are deliberately leaked rather than freed, see [`WriteJournal`]);
+/// * asking the allocator for pages straight after a failure never yields one the tree can
+///   still reach.
+#[test]
+fn a_starved_delete_never_releases_a_page_the_tree_still_points_at() {
+    let f = Fixture::new();
+    let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
+    let value = vec![b'v'; 8];
+    for i in 0..600u32 {
+        root = f.insert(root, &long_key_of(i), &value).unwrap();
+    }
+
+    let mut failures = 0usize;
+    let mut failures_on_a_retiring_delete = 0usize;
+    let mut released_by_a_failure = 0usize;
+    let mut rows_lost = 0usize;
+    let mut reissued: Vec<PageId> = Vec::new();
+
+    // ⛔ The target keys are CHOSEN, not enumerated, and the choice is the whole fixture.
+    //
+    // `merge_right` is the only caller that runs fallible, allocating work AFTER `unlink_up`
+    // has retired a page, so it is the only way into the window this test guards. It fires
+    // when a delete erases a leaf's terminating content boundary -- i.e. when the deleted key
+    // was that leaf's LAST entry and others remain.
+    //
+    // Reaching it is not enough: step 3 has to ALLOCATE, which it does only when the merged
+    // run no longer fits one page. Two earlier fixtures failed here and passed while proving
+    // nothing. Deleting every third key never allocated at all (0 starved failures, caught by
+    // the premise below). Deleting all 600 descending emptied the leaves as it went, so by the
+    // time `merge_right` fired the merged run fitted in a single page: 1 starved failure, and
+    // the mutant that reverts the free deferral still passed.
+    //
+    // So: take each leaf's last key while the tree is still FULL, and give it a right
+    // neighbour to absorb. Two ~full leaves of 400-byte keys merge to roughly 7.6 KB, which
+    // must be cut, which allocates.
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    {
+        let leaves = f.leaves(root);
+        for &id in leaves.iter().take(leaves.len().saturating_sub(1)) {
+            let page = f.raw(id);
+            if let Ok(entries) = Node::new(&page).leaf_entries()
+                && entries.len() > 1
+            {
+                targets.push(entries[entries.len() - 1].0.clone());
+            }
+        }
+    }
+    assert!(targets.len() > 50, "fixture: only {} merge targets", targets.len());
+
+    for key in targets {
+        // Sweep the READ budget, not the allocation budget. Every read the delete makes is a
+        // place the operation can die; walking the cut-off point forward walks the failure
+        // through `merge_right`'s tail, which is the only stretch where `unlink_up` has
+        // already retired a page and the operation has not finished.
+        let mut failures_here = 0usize;
+        let pages_at_start = f.leaves_and_internals(root).len();
+        for reads in 0..40i64 {
+            let live_before = f.store.live_page_count().unwrap();
+            let rows_before = f.reachable(root).0;
+
+            f.store.allow_reads(reads);
+            let outcome = f.tree.delete(root, BranchId::TRUNK, f.tick(), &key);
+            f.store.unlimited_reads();
+
+            match outcome {
+                Ok(_) => break,
+                Err(_) => {
+                    failures += 1;
+                    failures_here += 1;
+
+                    // A failed operation may leak a page it allocated. It may never RELEASE
+                    // one: the tree it rolled back to still points at everything it retired.
+                    let live_after = f.store.live_page_count().unwrap();
+                    if live_after < live_before {
+                        released_by_a_failure += 1;
+                    }
+
+                    // Nor may it lose a row, which is the same journal and is asserted here
+                    // because a delete exercises `unlink_up` and `merge_right`, neither of
+                    // which the insert probe reaches.
+                    let rows_after = f.reachable(root).0;
+                    rows_lost += rows_before.difference(&rows_after).count();
+
+                    // Would the allocator now hand back a page the restored tree still uses?
+                    // `take_page` pops the arena's free list first, so a page released a
+                    // moment ago is the very next one out.
+                    let live: BTreeSet<PageId> =
+                        f.leaves_and_internals(root).into_iter().collect();
+                    for _ in 0..4 {
+                        let p = f
+                            .store
+                            .alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, f.tick())
+                            .unwrap();
+                        if live.contains(&p) {
+                            reissued.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        // Commit the delete with nothing starved, so the tree keeps moving. This is also the
+        // loudest detector in the test: with the free deferral reverted, the run dies here
+        // with the store's own `double free of page N` — the failed attempt released a page
+        // and this retry released it a second time.
+        root = match f.tree.delete(root, BranchId::TRUNK, f.tick(), &key) {
+            Ok(r) => r,
+            Err(e) => panic!(
+                "after {} starved failures on this key, the same delete with NOTHING starved \
+                 failed: {}. A failed operation left the store inconsistent — it released \
+                 pages it had retired, which the tree it rolled back to still points at",
+                failures_here, e
+            ),
+        };
+
+        // Did this key's delete actually retire pages? If it did and it also failed at least
+        // once, a failure landed on the operation shape that has something to release.
+        if failures_here > 0 && f.leaves_and_internals(root).len() < pages_at_start {
+            failures_on_a_retiring_delete += 1;
+        }
+    }
+
+    println!(
+        "D125 free-deferral: {} starved delete failures, {} of them on a delete that retires \
+         pages; {} failures reduced the store's live page count; {} rows lost; {} reissued \
+         pages were still reachable from the root",
+        failures,
+        failures_on_a_retiring_delete,
+        released_by_a_failure,
+        rows_lost,
+        reissued.len(),
+    );
+
+    // Premises. A run with no failures, or one where no failing delete was the kind that
+    // retires a page, cannot tell the deferral from its absence.
+    assert!(failures > 0, "fixture: no delete was ever starved");
+    assert!(
+        failures_on_a_retiring_delete > 0,
+        "fixture: {} starved delete failures, but not one of them was on a delete that ended up \
+         retiring a page. Nothing here could have been released early, so the run proves \
+         nothing about the free deferral",
+        failures
+    );
+
+    assert_eq!(
+        rows_lost, 0,
+        "{} rows vanished across {} failed deletes; a failed delete must leave every row where \
+         it found it",
+        rows_lost, failures
+    );
+    assert_eq!(
+        released_by_a_failure, 0,
+        "{} failed deletes reduced the store's live page count: a failed operation released \
+         pages it had retired, and the tree it rolled back to still points at them",
+        released_by_a_failure
+    );
+    assert!(
+        reissued.is_empty(),
+        "the allocator handed back {} page(s) that the tree still reaches from its root after a \
+         failed delete -- {:?}. Those pages are live data about to be overwritten",
+        reissued.len(),
+        &reissued[..reissued.len().min(8)]
+    );
+}
+
 // ================================================================================================
 // The node-level postcondition the fix establishes
 // ================================================================================================
@@ -1151,6 +1359,3 @@ fn a_partial_promotion_leaves_a_page_that_verifies() {
         promoted.len()
     );
 }
-
-
-
