@@ -18,6 +18,30 @@ was shared with another lane. This run HELD that lock for its whole measured win
 2026-09-22T09:52:06Z, released 10:03:28Z to the next waiter). So: banked = contended box, this =
 quiet box. Section 3 measures what that is worth, and the answer is not uniform across rows.
 
+⚠ EVERY LINE NUMBER BELOW IS THIS TREE'S, AND THIS TREE IS NOT MAIN. LOCATE BY SYMBOL. Each row
+below was read out of `git show main:<file>` and out of this worktree separately — none is a
+main number inferred by subtracting an offset, because THERE IS NO SINGLE OFFSET:
+
+  symbol                                        file                        main    here
+  self.drain_readers()  (in `catalog()`)        src/pgwire/mod.rs            154     159
+  writer_active.store(true, SeqCst)             src/pgwire/mod.rs            173     178
+  self.writer_active.store(false)  (Drop)       src/pgwire/mod.rs            280     288
+  "A scan that finds nothing expired..."        src/branch/lease_thread.rs    66      66
+  pub const DEFAULT_SCAN_MILLIS                 src/branch/lease_thread.rs   109     109
+  with_lock(.. resume_interrupted_reaps())      src/branch/lease_thread.rs   352     356
+  const REAP_CHUNK: usize = 1                   src/branch/lease_thread.rs   461     465
+  candidates.chunks(REAP_CHUNK)                 src/branch/lease_thread.rs   569     573
+  note_site(LeaseScan); self.catalog()          src/branch/lease_thread.rs     —     209  (added here)
+  fn parse_one                                  src/pgwire/extended.rs       201     201
+  let catalog = ctx.catalog()  (in parse_one)   src/pgwire/extended.rs       283     290
+  LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS) src/agent_sql/runtime.rs    1477    1477
+
+⇒ THE OFFSET IS ZERO ABOVE EACH INSERTION POINT AND GROWS BELOW IT, so "this tree runs N lines
+  later" is itself a bug. `lease_thread.rs` is IDENTICAL at `:66` and `:109` and drifts by 4 only
+  below the `note_site(LeaseScan)` insertion at `:209`; `mod.rs` drifts by 5 and then by 8 as more
+  instrumentation accumulates. I asserted a uniform offset once while writing this section and
+  three of the twelve rows came out wrong — the table is what the two trees actually say.
+
 ⛔ Counts only. No duration is measured or reported anywhere here.
 ⛔ Every number is through pgwire over a loopback TCP socket, the shipped `pgwire::handle` per
    connection. Nothing constructs `Session::new()` or drives `ServerContext` directly. Verified by
@@ -196,7 +220,7 @@ at `:573`. `REAP_CHUNK` is 1 (`:465`), so it is one acquisition per CANDIDATE �
 that matters is the one that does not depend on that constant: AN EMPTY CANDIDATE LIST TAKES THE
 LOCK ZERO TIMES, AT ANY CADENCE. The module says so itself at `:66` ("A scan that finds nothing
 expired now takes the lock **not at all**") and the `DEFAULT_SCAN_MILLIS` doc repeats it at
-`:105`. A branch expires `DEFAULT_LEASE_MILLIS` after it is forked — hardcoded at 15 minutes
+`:109` (same line in both trees). A branch expires `DEFAULT_LEASE_MILLIS` after it is forked — hardcoded at 15 minutes
 (`src/agent_sql/runtime.rs:1477`, `LeaseDeadline::from_now`, no SQL parameter and no environment
 override) — and no arm runs for 15 minutes.
 
