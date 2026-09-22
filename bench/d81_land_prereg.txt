@@ -177,3 +177,30 @@ RE-DERIVED AGAINST THE NEW BASE rather than assumed to carry over:
   `stringify!($modname)` is gone, and no assertion, fixture or expression
   differs. "Keep exactly one" is therefore not a judgement to be taken on trust
   — it is a diff that reduces to comments.
+
+AMENDMENT 3 — branch `d81-stale-claims`, cut BEFORE its run
+--------------------------------------------------------------------------------
+Scope note: d81-land is FINISHED and its number is banked (2500 exact at
+d3be454, land-gate.sh passed all three). This amendment is about the FOLLOW-UP
+branch `d81-stale-claims` (3a8aa33), which retracts three claims that landing
+D81 makes false — two comments in tests/integration_server_reaps.rs and an
+annotation on examples/d90_delta_vs_chunk.rs.
+
+  PRE-REGISTERED: mode=per-target passed = 2500  failed = 0  build_errors = 0
+                  go                passed = 97  failed = 0
+
+DERIVATION: 2500 (MEASURED at d3be454 — this branch's own parent, so the base is
+not a carried-forward figure from another tree) + 0.
+  git diff d3be454..3a8aa33 | grep -c '^+.*#\[test\]'  = 0
+  git diff d3be454..3a8aa33 | grep -c '^-.*#\[test\]'  = 0
+  Every changed line is a `//` comment or a `println!` string literal, shown by
+  `git diff | grep -E '^[+-][^+-]'` with comment and println lines filtered out
+  returning EMPTY.
+
+⚠ A `println!` IS CODE, WHICH IS WHY THIS GETS A RUN AT ALL. The d90 edit changes
+  four printed lines, so "comment-only" would be an overstatement and the
+  build_errors column is the term actually at risk here, not the pass count.
+
+⛔ THE EXPECTATION IS NOT THE INTERESTING OUTPUT. A miss on 2500 would mean the
+  landing's own number was wrong, not that a comment moved it. What this run is
+  for is build_errors=0 on a tree nobody has compiled.
