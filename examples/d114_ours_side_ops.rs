@@ -90,10 +90,14 @@ use ferrodb::wal::txn::TxnManager;
 /// Rows in the table. NOT the axis — held small and fixed on purpose, because the table-size
 /// question is D68/D69's and it is closed.
 const ROWS: i64 = 2000;
-/// Changed cells per merge. THIS IS WHAT THE PRE-REGISTRATION HOLDS FIXED.
+/// Changed cells per merge on the OPS axis. THIS IS WHAT THE PRE-REGISTRATION HOLDS FIXED.
 const DELTA: i64 = 4;
-/// The four row ids that carry the delta. Fixed across every arm and every point on the axis.
-const DELTA_IDS: [i64; DELTA as usize] = [11, 23, 37, 53];
+
+/// The row ids carrying the delta, for a delta of `d`. Spread so no two land in one page slot by
+/// accident; which rows they are does not matter, only that the set is the same at every point.
+fn delta_ids(d: i64) -> Vec<i64> {
+    (0..d).map(|k| 11 + k * 7).collect()
+}
 
 struct Server {
     ctx: Arc<ServerContext>,
@@ -188,7 +192,8 @@ struct Cycle {
 /// means **ops this session recorded before it merged**, and it does NOT accumulate across merges
 /// the way D86's `State::applied` does. That is a real difference from D86 and it is the reason
 /// this axis had to be driven deliberately rather than falling out of a long run.
-fn one_cycle(s: &Server, seq: u64, target_ops: i64, arm: Arm) -> Option<Cycle> {
+fn one_cycle(s: &Server, seq: u64, target_ops: i64, delta: i64, arm: Arm) -> Option<Cycle> {
+    let ids = delta_ids(delta);
     let mut sess = Session::new();
     if exec(s, &format!("BEGIN AGENT SESSION AS 'a{seq}';"), &mut sess).is_err() {
         return None;
@@ -198,11 +203,11 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, arm: Arm) -> Option<Cycle> {
     let t = Instant::now();
     match arm {
         Arm::Repeat => {
-            // `target_ops` updates round-robin over the four delta cells. The LAST write to each
-            // is what makes it a changed cell, so the delta is 4 whatever `target_ops` is.
-            let rounds = (target_ops / DELTA).max(1);
+            // `target_ops` updates round-robin over the delta cells. The LAST write to each is
+            // what makes it a changed cell, so the delta is `delta` whatever `target_ops` is.
+            let rounds = (target_ops / delta).max(1);
             for r in 0..rounds {
-                for (k, id) in DELTA_IDS.iter().enumerate() {
+                for (k, id) in ids.iter().enumerate() {
                     let v = 1_000_000 + r * 16 + k as i64;
                     if exec(s, &format!("UPDATE t SET v = {v} WHERE id = {id};"), &mut sess).is_err() {
                         return None;
@@ -217,9 +222,9 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, arm: Arm) -> Option<Cycle> {
             // is skipped by the changed-column loop, so these ops are EXAMINED by the scan and
             // never MATCHED by it — which is precisely the cost an index removes and the fold
             // does not pay.
-            let rounds = ((target_ops - DELTA) / DELTA).max(0);
+            let rounds = ((target_ops - delta) / delta).max(0);
             for r in 0..rounds {
-                for id in DELTA_IDS.iter() {
+                for id in ids.iter() {
                     let junk = 9_000_000 + r;
                     if exec(s, &format!("UPDATE t SET c = {junk} WHERE id = {id};"), &mut sess).is_err() {
                         return None;
@@ -227,7 +232,7 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, arm: Arm) -> Option<Cycle> {
                     ops_recorded += 1;
                 }
             }
-            for id in DELTA_IDS.iter() {
+            for id in ids.iter() {
                 let base_c = id * 13;
                 if exec(s, &format!("UPDATE t SET c = {base_c} WHERE id = {id};"), &mut sess).is_err() {
                     return None;
@@ -235,7 +240,7 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, arm: Arm) -> Option<Cycle> {
                 ops_recorded += 1;
             }
             // The delta itself: four cells, one op each.
-            for (k, id) in DELTA_IDS.iter().enumerate() {
+            for (k, id) in ids.iter().enumerate() {
                 let v = 2_000_000 + seq as i64 * 16 + k as i64;
                 if exec(s, &format!("UPDATE t SET v = {v} WHERE id = {id};"), &mut sess).is_err() {
                     return None;
@@ -275,6 +280,51 @@ fn med(v: &mut Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+/// **The arm the row's framing is missing: vary the DELTA at a FIXED op count.**
+///
+/// The ops axis alone cannot tell a complexity class from a constant, and here it genuinely is a
+/// constant unless the delta moves. The merge ALREADY pays O(W) once per merge without any scan:
+/// `WorkspaceSnapshot` clones `ws.frame.ops` wholesale (`runtime.rs:4043`). So the scan makes the
+/// merge O(delta x W) where it was already O(W) — at a fixed delta of 4 that is a **4x constant**,
+/// not a new class. The class only changes if `delta` grows, and `examined = delta x W` is the
+/// integer that says so directly.
+///
+/// ⚠ Read the COUNTER here, not the milliseconds. Growing the delta grows the merge's real work
+/// too — more cells to resolve, more ops applied, more rows published — so wall-clock rises in
+/// this arm whether or not the scan exists. `examined` does not have that confound.
+fn run_delta_arm(dir: &std::path::Path, deltas: &[i64], w: i64, merges: usize) {
+    println!();
+    println!("=== ARM DELTA — ops per branch held at {w}, axis = CHANGED CELLS per merge");
+    println!("    (the arm that separates a 4x CONSTANT from a complexity class; read `examined`)");
+    println!("    delta   n |   MERGE ms |  examined/merge  matched/merge | examined/(delta x ops)");
+    for &d in deltas {
+        let s = build(dir, &format!("d114_delta_{d}"));
+        let mut mg = vec![];
+        let (mut ex, mut ma, mut rec) = (0u64, 0u64, 0u64);
+        for i in 0..merges {
+            if let Some(c) = one_cycle(&s, i as u64, w, d, Arm::Churn) {
+                mg.push(c.merge_ms);
+                ex += c.examined;
+                ma += c.matched;
+                rec += c.ops_recorded;
+            }
+        }
+        if mg.is_empty() {
+            println!("  {d:>7}    0 |  NO MERGE APPLIED — not a result, and not a zero");
+            continue;
+        }
+        let n = mg.len() as u64;
+        let mm = med(&mut mg);
+        let (epm, mpm) = (ex as f64 / n as f64, ma as f64 / n as f64);
+        let recpm = rec as f64 / n as f64;
+        // If this ratio is ~1.0 the scan is EXACTLY `delta x ops` and the product is the cost.
+        println!(
+            "  {d:>7} {n:>3} | {mm:>10.3} | {epm:>15.1} {mpm:>15.1} | {:>21.3}  (ops recorded/merge = {recpm:.1})",
+            epm / (d as f64 * recpm).max(1e-9)
+        );
+    }
+}
+
 fn run_arm(dir: &std::path::Path, arm: Arm, axis: &[i64], merges: usize, label: &str, order: &str) {
     println!();
     println!("=== ARM {label} — delta held at {DELTA} changed cells, axis = ops recorded per branch");
@@ -292,7 +342,7 @@ fn run_arm(dir: &std::path::Path, arm: Arm, axis: &[i64], merges: usize, label: 
         let (mut mg, mut wr) = (vec![], vec![]);
         let (mut ex, mut ma, mut rec) = (0u64, 0u64, 0u64);
         for i in 0..merges {
-            if let Some(c) = one_cycle(&s, i as u64, w, arm) {
+            if let Some(c) = one_cycle(&s, i as u64, w, DELTA, arm) {
                 mg.push(c.merge_ms);
                 wr.push(c.writes_ms);
                 ex += c.examined;
@@ -361,6 +411,16 @@ fn main() {
     run_arm(&dir, Arm::Churn, &desc, merges, chu, "DESCENDING");
     run_arm(&dir, Arm::Repeat, &desc, merges, rep, "DESCENDING");
     run_arm(&dir, Arm::Churn, &axis, merges, chu, "ASCENDING");
+
+    // The third axis. Fixed op count, growing delta: the product `delta x ops` is what the scan
+    // actually costs, and only this arm moves the left factor.
+    let deltas: Vec<i64> = std::env::var("D114_DELTAS")
+        .unwrap_or_else(|_| "1,2,4,8,16,32".to_string())
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let fixed_w: i64 = std::env::var("D114_DELTA_OPS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    run_delta_arm(&dir, &deltas, fixed_w, merges);
 
     println!();
     println!("HOW TO READ IT:");

@@ -117,3 +117,62 @@ and carries the load average at the time the measurement lock was acquired.
   revives `merge3`.**
 * `tel::engine::compose_row`'s similar wart is **dead-code-only** (`ThreeWayMerger` has no
   production caller) and is deliberately left alone.
+
+### AMENDMENT 3 (pre-measurement, append-only): the ops axis cannot tell a constant from a class
+
+Read from source at `1bf8abe`, before measuring, and it is the single most important correction to
+the row's framing.
+
+**The merge ALREADY pays O(W) in ops-per-session before any scan exists.** `WorkspaceSnapshot`
+clones `ws.frame.ops` wholesale, once per merge (`runtime.rs:4043`, `ops: ws.frame.ops.clone()`);
+the sibling path does the same (`:3659`, `:3667`). So the `ours`-side scan does not take the merge
+from O(1) to O(W). It takes it from O(W) to **O(delta · W)** — and at the fixed delta of 4 the
+pre-registration holds, that is a **4x constant factor, not a new complexity class.**
+
+⇒ The pre-registered axis therefore comes back LINEAR whether or not the scan exists, because the
+snapshot clone is linear on its own. That is a fourth way to be fooled on this code, and it would
+have been indistinguishable from a win. The only axis that moves the left factor is the delta, so:
+
+* **`DELTA` arm** — ops per branch held FIXED, changed cells grown. `examined = delta · W` is an
+  exact integer, and the ratio `examined / (delta · ops)` is printed so the product claim can be
+  checked rather than asserted. **Read the counter, not the milliseconds:** growing the delta grows
+  the merge's genuine work too (more cells resolved, more ops applied, more rows published), so
+  wall-clock rises in this arm whether or not the scan exists.
+
+Pre-registered prediction for the fix, stated now so the after-curve has something to disagree
+with: grouping the ops by cell ONCE per merge turns `delta · W` into `W + delta`. That removes the
+delta factor and leaves the snapshot clone's O(W) untouched, so **the honest ceiling on this fix is
+a factor of `delta`, not a complexity class** — and the wall-clock win will be smaller than the
+counter ratio, because the clone stays.
+
+### AMENDMENT 4 (pre-measurement, append-only): the row overstates the blast radius
+
+The row says *"Three sites, both production merge paths"*. Checked by call graph at `1bf8abe`:
+
+| site | function | reachable from SQL? |
+|---|---|---|
+| `runtime.rs:4380` | `evaluate_merge` | **yes** — `MERGE;` → `dispatch.rs:444` → `runtime.merge` |
+| `runtime.rs:3792` | `merge_into` | no — `grep -rn 'merge_into' .` finds callers only in `tests/integration_sibling_merge.rs` |
+| `runtime.rs:3978` | `sibling_op` | no — called only from `merge_into` (`runtime.rs:3854`) |
+
+So it is **one production site, not three, and one API path, not two**: the second and third sites
+are both inside `merge_into`, which is a `pub fn` on `AgentRuntime` with no SQL surface and no
+non-test caller. That does not close the row — `:4380` is the `MERGE;` path and it is the one that
+matters — but the fix's blast radius is one reachable path plus a public API that only tests
+currently exercise. This is the same shape D110 already recorded when a brief called `merge_into`
+*"the real merge path"*.
+
+### AMENDMENT 5 (pre-measurement, append-only): a larger quadratic sits next door, on the WRITE path
+
+Noticed while confirming that an agent `UPDATE` reaches `ws.frame.ops`. `stage_all` ends each
+statement with `ws.frame.clone()` and `self.log.append(&frame)` (`runtime.rs:2924-2929`) — **the
+whole frame, cloned and re-appended once per statement.** A session issuing W statements therefore
+copies 1 + 2 + ... + W ops, which is **O(W²) on the write path**, against the merge scan's
+O(delta · W) once at the end.
+
+It is deliberate — the comment explains that re-appending replaces rather than double-counts, since
+`Add` is not idempotent — but the cost is quadratic and it is not a recorded row (`grep` of
+`SCALE-DESIGN.md` for it returns nothing). This harness times the writes phase separately, so the
+curve comes out of the same run. **Consequence for this measurement: the writes-phase column is NOT
+a machine control across points on the ops axis, only within one point.** The machine control for
+this run is the ascending/descending pair.
