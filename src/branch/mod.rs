@@ -57,8 +57,39 @@ pub trait BranchCatalog: Send + Sync {
     /// Current epoch without advancing it.
     fn current_epoch(&self) -> Epoch;
 
-    /// Create a child of `parent`. Must copy **zero data pages**.
+    /// Create a child of `parent`. Must copy **zero data pages**. Durable when it returns.
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError>;
+
+    /// Fork **without** making it durable, returning the record and a ticket for the sync that
+    /// will cover it. `None` means this store had nothing to defer and the fork is already durable.
+    ///
+    /// ⛔ **A staged fork is not a fork yet, and the caller owes it an
+    /// [`await_fork_durable`](BranchCatalog::await_fork_durable) before telling anyone it
+    /// happened.** This exists for exactly one reason: the waiting must be able to happen
+    /// *outside* whatever exclusion the caller holds, so that concurrent forkers meet inside
+    /// `CommitGroup::wait_durable` and share one disk round-trip instead of queueing for private
+    /// ones. Staging under the caller's lock and syncing after releasing it is the same split
+    /// `TableBranchCatalog::{stage, durable}` already makes internally; this lifts it one level so
+    /// a caller that holds a *wider* lock can make the same trade.
+    ///
+    /// **The default does not split, and that is the safe direction**: it forks durably through
+    /// [`fork`](BranchCatalog::fork) and reports nothing pending, so a store that has no shared
+    /// fsync to batch — every in-memory and test catalog here — is correct without overriding
+    /// anything. An implementor that overrides this owes it the same guarantee `fork` gives once
+    /// `await_fork_durable` has been called, and no guarantee at all before.
+    fn fork_staged(
+        &self,
+        parent: BranchId,
+        lease: LeaseDeadline,
+    ) -> Result<(BranchRecord, Option<u64>), FerroError> {
+        self.fork(parent, lease).map(|record| (record, None))
+    }
+
+    /// Wait until a sync covering `seq` has completed. `None` is a no-op: nothing was deferred.
+    fn await_fork_durable(&self, seq: Option<u64>) -> Result<(), FerroError> {
+        let _ = seq;
+        Ok(())
+    }
 
     /// Load a record. Returns `BranchError::Reaped` for a stale generation.
     fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError>;

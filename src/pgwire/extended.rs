@@ -33,7 +33,7 @@ use crate::binder::binder::{Binder, BoundColumn};
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::error::FerroError;
-use crate::execution::executor::{run, Outcome, try_run_read};
+use crate::execution::executor::{run_staged, Outcome, try_run_read};
 use crate::execution::session::Session;
 use crate::parser::parser::{Parser, Stmt};
 use crate::parser::scanner::{Scanner, TokenType};
@@ -384,11 +384,44 @@ impl Statement {
                             // **The catalog lock, held for exactly one statement.** See
                             // `pgwire::serve` for why this is the outermost lock and why holding
                             // it for longer would rebuild the sequential server this replaced.
+                            //
+                            // ⭐ **The fork's fsync is NOT inside it, and that is this line's
+                            // whole purpose.** `run_staged` leaves `BEGIN AGENT SESSION`'s disk
+                            // sync in `pending`; the guard is dropped first, and only then is the
+                            // sync awaited. Holding the guard across it is what made the branch
+                            // catalog's group commit inert over the wire — `f/sync` measured at
+                            // exactly 1.00 at every thread count from 1 to 128, while the same
+                            // catalog reached 17.12 in-process (`bench/d130_batch_vs_threads.txt`).
+                            // The forkers were not waiting on the disk; they were queued in front
+                            // of the commit group and never met inside it.
+                            //
+                            // ⛔ What deliberately stays INSIDE the guard is everything else the
+                            // fork does. `begin_session_as_staged`'s body is two critical sections
+                            // — the branch-catalog mutations, then the `state` block that
+                            // snapshots the PARENT's workspace — and only this guard makes them
+                            // one instant. A `MERGE`/`CHERRY PICK ... ONTO`/`seal` of the parent
+                            // landing between them produces a child whose `fork_root` addresses
+                            // the parent's arena tree while its staged rows are empty. Narrowing
+                            // this hold further is not a latency question; it is that defect.
+                            let mut pending = None;
                             let mut catalog = ctx.catalog();
-                            let o =
-                                run(stmt, &mut catalog, ctx.bp.clone(), ctx.txn.clone(), session)?;
+                            let ran = run_staged(
+                                stmt,
+                                &mut catalog,
+                                ctx.bp.clone(),
+                                ctx.txn.clone(),
+                                session,
+                                &mut pending,
+                            );
                             drop(catalog);
-                            o
+                            // Outside the guard, so concurrent forkers share one fsync. Completed
+                            // before `?` on `ran`, because `pending` is set only after the fork
+                            // has landed in the pool: dropping it on this statement's error path
+                            // would leave those pages unsynced.
+                            if let Some(d) = pending {
+                                d.complete()?;
+                            }
+                            ran?
                         }
                     }
                 };
