@@ -1,0 +1,12 @@
+# run by the LEAD; attribute-serial is rate-limited until Sep 26
+# head=8665941
+# load_at_run_start: 5.22 5.02 4.82
+D123 serial-section attribution — MODE=novelty (Amendment 7: new-key vs fixed-key work under the lock)
+build at 8665941de637
+load_at_acquire is stamped by the caller; EVERY duration below is an UPPER BOUND on a box
+measured at a 46x quiet-vs-loaded spread. Ratios of two durations from THIS process
+are the trustworthy quantities; absolute milliseconds are not.
+
+k = 8 extra upserts per fork, probe ON (PH_EXTRA is read directly; no fit).
+Per-upsert cost = PH_EXTRA / k, median of 5 reps.
+

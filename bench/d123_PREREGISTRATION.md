@@ -333,3 +333,18 @@ that skips `child_key_insert` ONLY, keeping `write_record`, then `phases` at T=6
 own cost falls when the OTHER new-key insert is removed — fewer new pages per fork for the flusher
 to drain — the mechanism is confirmed by intervention. If write_record is unchanged, the flush is
 not the counterparty and the mechanism reverts to unattributed. **Pre-registered either way.**
+
+# AMENDMENT 8 — A DETECTOR THIS ROW NEEDED AND DID NOT HAVE.
+
+Two runs in this row produced files that LOOK like results and are not: the lead's novelty attempt
+(correct banner, correct preamble, no table) and, earlier, a binary that did not contain the mode
+being asked for (would have exited 2 on "unknown mode"). Both would pass a skim.
+
+⇒ Every `run()` in this row's scripts appends `# harness_exit=$?`. **The detector is the ABSENCE of
+that line, and absence is what nobody checks.** Recorded here rather than in a commit message
+because the next reader of bench/d123_* needs it: a d123 artifact with no `# harness_exit=0` at its
+foot is a truncated run and must not be quoted.
+
+⇒ And the companion check, which established that two banked binaries never contained `mode_novelty`
+at all: **run the harness with a deliberately bad mode and read the list it admits.** The presence
+of a built binary says nothing about which arms it has.
