@@ -415,6 +415,15 @@ fn roles(arm: &str, clients: usize) -> Vec<Role> {
     }
 }
 
+/// How often a `Forker` actually forks, in rounds. 1 means every round.
+fn fork_every() -> usize {
+    std::env::var("W4_FORK_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
 /// The statements one round of a role issues, as `(prepared-name, sql)`.
 ///
 /// The name is what the extended arm keys its `Parse` cache on, so a role whose SQL is constant
@@ -426,13 +435,29 @@ fn round(role: Role, w: usize, i: usize) -> Vec<(String, String)> {
         Role::Reader => {
             vec![("read".into(), format!("SELECT id, v FROM t WHERE id = {};", i % 64))]
         }
-        Role::Forker => vec![
-            (
-                format!("fork{w}_{i}"),
-                format!("BEGIN AGENT SESSION AS 'a{w}' RUN 'r{w}_{i}';"),
-            ),
-            ("abandon".into(), "ABANDON;".into()),
-        ],
+        // `W4_FORK_EVERY=n` makes a forker fork once every n rounds and read in between, which is
+        // the OFFERED-LOAD axis: it varies the fraction of all statements that are exclusive
+        // without introducing a sleep. A sleep would make the answer depend on wall-clock
+        // latencies and therefore on what else is running on this box; a statement-count ratio
+        // does not. (The mapping from a statement-count ratio to a time duty cycle goes through
+        // the fork/read latency ratio, which is itself roughly load-invariant because both slow
+        // together — stated as the assumption it is.)
+        Role::Forker => {
+            let every = fork_every();
+            if every > 1 && i % every != 0 {
+                return vec![(
+                    "read".into(),
+                    format!("SELECT id, v FROM t WHERE id = {};", i % 64),
+                )];
+            }
+            vec![
+                (
+                    format!("fork{w}_{i}"),
+                    format!("BEGIN AGENT SESSION AS 'a{w}' RUN 'r{w}_{i}';"),
+                ),
+                ("abandon".into(), "ABANDON;".into()),
+            ]
+        }
         Role::ForkMerge => vec![
             (
                 format!("fork{w}_{i}"),
@@ -524,6 +549,12 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
     let statements = Arc::new(AtomicU64::new(0));
     let defining = Arc::new(AtomicU64::new(0));
     let want = defining_role(arm);
+    let defining_prefix: &'static str = match want {
+        Some(Role::Forker) | Some(Role::ForkMerge) => "BEGIN AGENT SESSION",
+        Some(Role::Ddl) => "CREATE TABLE",
+        Some(Role::Dml) => "UPDATE",
+        Some(Role::Reader) | None => "",
+    };
     // Twice: once after every client has warmed up (so first-statement snapshot refreshes are not
     // the measurement), and once to release them all into the measured loop together.
     let gate = Arc::new(Barrier::new(clients + 1));
@@ -569,7 +600,11 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
                     match issue(&mut c, &name, &sql) {
                         Ok(errs) => {
                             statements.fetch_add(1, Ordering::Relaxed);
-                            if Some(role) == want {
+                            // Only a statement that really is the arm's defining statement
+                            // counts: with `W4_FORK_EVERY` a Forker round may issue a read, and
+                            // counting that would let the zero-forks refusal pass on an arm that
+                            // never forked.
+                            if Some(role) == want && sql.starts_with(defining_prefix) {
                                 defining.fetch_add(1, Ordering::Relaxed);
                             }
                             if !errs.is_empty() {
@@ -643,6 +678,31 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
     }
 }
 
+/// Rounds for one arm.
+///
+/// `merge` gets its own, smaller budget and the reason is an ENGINE LIMIT, not a taste: a page's
+/// provenance dictionary holds 255 entries, and every MERGE that lands on the same page consumes
+/// one. At 400 rounds x 4 merging clients the arm ran 1600 merges into one page and the engine
+/// correctly refused with "page provenance dictionary full", which cascaded into "an agent
+/// session is already open on this connection" on every following round. That was a real refusal
+/// of a workload the engine cannot serve, not a harness bug, and the honest fix is to run the arm
+/// inside the limit rather than to widen it. `W4_MERGE_ROUNDS` overrides.
+fn rounds_for(arm: &str, rounds: usize) -> usize {
+    if arm == "merge" {
+        env_usize("W4_MERGE_ROUNDS", 40).min(rounds)
+    } else {
+        rounds
+    }
+}
+
+/// A fraction for machine-readable output: `n/a` rather than `0` when nothing was attempted.
+fn opt(f: Option<f64>) -> String {
+    match f {
+        Some(v) => format!("{v:.6}"),
+        None => "n/a".to_string(),
+    }
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -672,14 +732,18 @@ fn main() {
     println!("# W4 check 3 -- stand-downs at ServerContext::begin_read, as a fraction of attempts");
     println!("# layer: through pgwire over a loopback TCP socket; shipped `pgwire::handle` per");
     println!("#        connection; nothing drives AgentRuntime or Session directly.");
-    println!("# clients={clients} rounds={rounds} lease_scan_ms={lease_ms}");
+    println!(
+        "# clients={clients} rounds={rounds} lease_scan_ms={lease_ms} fork_every={} announcers={}",
+        fork_every(),
+        std::env::var("W4_ANNOUNCERS").unwrap_or_else(|_| "default".into())
+    );
     println!("# a COUNT, not a timing: no duration is measured and none is reported.");
     println!();
 
     let mut results = Vec::new();
     for arm in &arms {
         for proto in PROTOS {
-            let r = run_arm(arm, proto, clients, rounds, lease_ms, dir.path());
+            let r = run_arm(arm, proto, clients, rounds_for(arm, rounds), lease_ms, dir.path());
 
             if r.counts.attempts() == 0 {
                 eprintln!(
@@ -699,6 +763,36 @@ fn main() {
                     std::process::exit(5);
                 }
             }
+            // Emitted NOW, not only in the summary table below. The first full run of this
+            // harness refused in the fourth arm and took nine completed arms down with it,
+            // because every number was printed at the end. A partial result is worth keeping.
+            let c = r.counts;
+            println!(
+                "ROW arm={} proto={} sh_att={} sh_stood={} sh_frac={} dml_att={} dml_frac={} \
+                 exc_att={} exc_frac={} all_frac={} ann_parse={} ann_refr={} ann_exec={} \
+                 ann_lease={} ann_unattr={} mismatch={} gap={} stmts={} defining={}",
+                r.arm,
+                r.proto.label(),
+                c.attempts_shared_today(),
+                c.stood_down_shared_today,
+                opt(c.stand_down_fraction_shared_today()),
+                c.attempts_dml(),
+                opt(c.stand_down_fraction_dml()),
+                c.attempts_exclusive(),
+                opt(c.stand_down_fraction_exclusive()),
+                opt(c.stand_down_fraction()),
+                c.announce_parse,
+                c.announce_read_refresh,
+                c.announce_exec_exclusive,
+                c.announce_lease_scan,
+                c.announce_unattributed(),
+                c.classify_mismatch,
+                c.class_coverage_gap(),
+                r.statements,
+                r.defining_statements,
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
             results.push(r);
         }
     }
