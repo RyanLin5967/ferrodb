@@ -91,8 +91,13 @@ fn build(dir: &std::path::Path, n: usize) -> Server {
     let s = Server { ctx, bp, txn };
     let mut seed_cache = None;
     let seed_slot = std::sync::atomic::AtomicBool::new(false);
-    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut Session::new(), &mut seed_cache, &seed_slot);
-    let mut sess = Session::new();
+    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut s.ctx.session(), &mut seed_cache, &seed_slot);
+    // ⛔ D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+    // log), so every agent statement below would run on a STUB and the arena-backed runtime
+    // constructed above would be built and never touched. `agent_sql::designated` now refuses
+    // such a statement rather than measuring it.
+    let mut sess = s.ctx.session();
     for i in 1..=ROWS {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut seed_cache, &seed_slot);
     }
@@ -164,7 +169,12 @@ fn sweep_point(servers: &[Arc<Server>], shared: bool, threads: usize) -> (f64, u
         let key = (t as i64 * 97) % ROWS + 1;
         handles.push(std::thread::spawn(move || {
             let sql = format!("SELECT v FROM t WHERE id = {key};");
-            let mut sess = Session::new();
+            // ⛔ D101 — `srv.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+            // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private effect
+            // log), so every agent statement below would run on a STUB and the arena-backed runtime
+            // constructed above would be built and never touched. `agent_sql::designated` now refuses
+            // such a statement rather than measuring it.
+            let mut sess = srv.ctx.session();
             // One cache per thread, because one connection has one cache.
             let mut cache: Option<(u64, Arc<Catalog>)> = None;
             // One slot per thread, registered like a connection's.
