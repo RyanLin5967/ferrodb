@@ -467,39 +467,48 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
     // regression and an unrelated atomicity gap fail the same assertion.
 }
 
-/// ⛔ **THIS TEST FAILS TODAY, AND NOT BECAUSE OF D113.** It is `#[ignore]`d so it does not gate
-/// the suite, and left in place because deleting it would delete the finding.
+/// D125. **This test used to fail, and was `#[ignore]`d with its numbers in this comment so the
+/// finding would survive.** It gates now; the history is kept because the numbers are the
+/// evidence.
 ///
-/// Measured at `d6771d8`, both arms inserting the identical 820 keys:
+/// Measured at `d6771d8` and reproduced unchanged at `dc2a2cf`, both arms inserting the
+/// identical 820 keys:
 ///
 /// ```text
 /// rows missing -- control: 0 base,  0 gap
 ///                 starved: 28 base, 165 gap
 /// ```
 ///
-/// The control is what makes that attributable. An insert that fails on a starved allocation
-/// does not roll back: on the trunk every page is private, so `cow_page` returns the same page
-/// and the descent mutates it **in place**, leaving a leaf truncated to its first piece while the
-/// other pieces sit allocated with nothing pointing at them. The rows in those pieces are gone —
-/// and the gap figure is the alarming half, because every one of those 220 keys was *eventually*
-/// inserted by a later call that returned `Ok`, and 165 of them are still missing afterwards.
+/// The control is what makes that attributable. The alarming half is the gap figure: every one
+/// of those 220 keys was *eventually* inserted by a later call that returned `Ok`, and 165 were
+/// still missing afterwards — silent loss on the write path, not a refusal.
 ///
-/// This is the same family as D112's "free before the parent stops pointing at it": a correct
-/// happy path with a broken error path. It is out of D113's scope — D113 is the checksum — and it
-/// wants its own row, because the fix is a design choice (shadow even a private page across a
-/// split, or stage the relink) and not a patch.
+/// ⚠ **The mechanism this comment used to give was wrong, and is corrected here rather than
+/// quietly dropped.** It read: "leaving a leaf truncated to its first piece while the other
+/// pieces sit allocated with nothing pointing at them", blaming a split that fails part-way.
+/// `d125_instrument_where_a_starved_insert_loses_rows` falsified that: of 300 starved failures,
+/// the 203 refused a *leaf* page lost **zero** rows, because `write_leaf_chunked` allocates
+/// every piece before it overwrites the first. All 97 losing failures were refused an
+/// *internal* page, after the leaf split had already completed and committed. The leaf really
+/// is left truncated and the pieces really are orphaned — but by a split that **succeeded**,
+/// with the relink above it failing afterwards and nothing rolling it back.
 ///
-/// It also fails with the D113 fix reverted, so it is not a D113 discriminator either way.
+/// The premise underneath was right, and is the whole defect: on the trunk every page is
+/// private, so `cow_page` mutates in place and an operation has nothing to roll back to. The
+/// same fixture with every page shadowed loses 0 and 0 against the same refusals.
+///
+/// Same family as D112's "free before the parent stops pointing at it": a correct happy path
+/// with a broken error path. Fixed by [`WriteJournal`]; `bench/d125_starved_insert.txt`.
 #[test]
-#[ignore = "documents a real pre-existing atomicity defect; see the doc comment. Not D113."]
 fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
-    let probe_rows = |starve: bool| -> (usize, usize) {
+    let probe_rows = |starve: bool| -> (usize, usize, usize) {
         let f = Fixture::new();
         let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
         let value = vec![b'v'; 8];
         for i in 0..600u32 {
             root = f.insert(root, &long_key_of(i), &value).unwrap();
         }
+        let mut failures = 0usize;
         for j in 0..220u32 {
             let key = gap_key_of(300, j);
             if starve {
@@ -516,6 +525,7 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
                             break;
                         }
                         Err(_) => {
+                            failures += 1;
                             allowance += 1;
                             assert!(allowance < 64, "fixture: never succeeded");
                         }
@@ -530,14 +540,25 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
         let gap_lost = (0..220u32)
             .filter(|&j| f.tree.get(root, &gap_key_of(300, j)).unwrap().is_none())
             .count();
-        (base_lost, gap_lost)
+        (base_lost, gap_lost, failures)
     };
 
-    let (control_base, control_gap) = probe_rows(false);
-    let (starved_base, starved_gap) = probe_rows(true);
+    let (control_base, control_gap, control_failures) = probe_rows(false);
+    let (starved_base, starved_gap, starved_failures) = probe_rows(true);
     println!(
-        "rows missing -- control: {} base, {} gap;  starved: {} base, {} gap",
-        control_base, control_gap, starved_base, starved_gap
+        "rows missing -- control: {} base, {} gap;  starved: {} base, {} gap  \
+         ({} starved failures)",
+        control_base, control_gap, starved_base, starved_gap, starved_failures
+    );
+
+    // ⚠ The premise this test did NOT state while it was `#[ignore]`d, and the one that would
+    // let it pass for the wrong reason now that it gates: a run in which nothing was ever
+    // refused an allocation loses no rows trivially. Zero starved failures is not a pass.
+    assert_eq!(control_failures, 0, "fixture: the unstarved control was starved");
+    assert!(
+        starved_failures > 0,
+        "fixture: not one allocation was refused in the starved arm, so it is the control run \
+         twice and proves nothing"
     );
 
     // The control is the premise: plain inserts of this sequence must lose nothing, or the
@@ -576,9 +597,26 @@ fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
 ///   unreachable from the root (a fresh split piece nobody points at), or has vanished from a
 ///   page that was there before.
 ///
-/// Run it with `--ignored --nocapture`; it prints a table and asserts only its own premises.
+/// Pre-fix, at `dc2a2cf`, it printed:
+///
+/// ```text
+/// 300 starved failures, 97 of them lost rows (235 rows total).
+/// refused allocation was a leaf page in 203 failures (0 of them losing),
+///                             an internal page in  97 failures (97 losing).
+/// leaf split had already completed in 97 of the 97 losing failures.
+/// lost rows: 235 into a subtree the failing call ALLOCATED and left unreachable,
+///              0 into a PRE-EXISTING subtree it detached, 0 unaccounted for.
+/// ```
+///
+/// which is what falsified the hypothesis this row opened with — the leaf split, the stage it
+/// blamed, is the one stage that never lost a row.
+///
+/// It now **gates**, because the table it prints is exactly the postcondition
+/// [`WriteJournal`] has to establish: the same refusals still happen, and none of them loses
+/// anything. The failure count falls from 300 to 220 with the fix in and that is the fix
+/// working — a failed attempt no longer damages the tree, so the budget sweep no longer needs
+/// extra rounds to get past its own wreckage.
 #[test]
-#[ignore = "D125 instrument: prints the mechanism table, gates nothing"]
 fn d125_instrument_where_a_starved_insert_loses_rows() {
     let f = Fixture::new();
     let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
@@ -726,8 +764,30 @@ fn d125_instrument_where_a_starved_insert_loses_rows() {
         lost_elsewhere,
     );
 
+    // Premises, in the order they can go vacuous. A sweep that never starved anything proves
+    // nothing; one that starved only the leaf path proves nothing either, because the leaf path
+    // was never the broken one — 203 of the 300 pre-fix failures were refused a leaf page and
+    // all 203 were harmless. The stage that has to be reached is the internal-page refusal.
     assert!(failures > 0, "fixture: nothing was ever starved");
-    assert!(losing > 0, "fixture: nothing ever lost a row, so there is no mechanism to attribute");
+    assert!(
+        refused_internal > 0,
+        "fixture: {} starved failures, but not one of them was refused an INTERNAL page. That \
+         is the only stage that ever lost a row (97 of 97 pre-fix), so this run exercised the \
+         clean path only and proves nothing about the defect",
+        failures
+    );
+
+    // The outcome. Stated over every failure, not just the probe's end state: a row that
+    // disappears and is put back by a later insert of the same key would not show up in a
+    // final count.
+    assert_eq!(
+        (losing, lost_total),
+        (0, 0),
+        "{} starved failures lost {} rows between them. Every failure must leave the tree \
+         exactly as it found it; see `WriteJournal`",
+        losing,
+        lost_total
+    );
 }
 
 /// The second half of D125's instrument: the **same** starvation on a tree whose pages are not
@@ -740,8 +800,11 @@ fn d125_instrument_where_a_starved_insert_loses_rows() {
 ///
 /// If the trunk's losses were caused by anything other than mutating a page the old root still
 /// points at, this arm would lose rows too.
+/// It gates as well as explains. The shadow path is the arm [`WriteJournal::record`]
+/// deliberately does **not** record (`copied == true` leaves the old root's tree untouched, so
+/// there is nothing to take back), which makes it the one path whose safety rests on the store
+/// rather than on the journal. Nothing else in the suite pins it.
 #[test]
-#[ignore = "D125 instrument: prints the mechanism table, gates nothing"]
 fn d125_instrument_the_same_starvation_on_shadowed_pages() {
     let f = Fixture::new();
     let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
@@ -812,8 +875,27 @@ fn d125_instrument_the_same_starvation_on_shadowed_pages() {
     );
 
     // Premises: this arm has to reach the same failures, and it has to actually be shadowing.
+    // The second one is not decoration — the first cut of this test registered a single child
+    // before the loop, shadowed 1 insert of 220, and reproduced the trunk's 28/165 exactly
+    // while reading as a confirming result.
     assert!(failures > 0, "fixture: nothing was ever starved in the shadowed arm");
-    assert!(shadowed > 0, "fixture: no insert shadowed, so the fork did not take effect");
+    assert_eq!(
+        shadowed, 220,
+        "fixture: only {} of 220 inserts shadowed, so this is not the shadowed arm it claims \
+         to be — a shadow page is born at the current epoch and is private again on the next \
+         write, so every attempt needs its own live child",
+        shadowed
+    );
+    assert_eq!(
+        (losing, lost_total, base_lost, gap_lost),
+        (0, 0, 0, 0),
+        "a starved write on shadowed pages lost rows: {} failures lost {} rows, end state {} \
+         base and {} gap missing",
+        losing,
+        lost_total,
+        base_lost,
+        gap_lost
+    );
 }
 
 // ================================================================================================
