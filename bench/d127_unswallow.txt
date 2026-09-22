@@ -1,0 +1,293 @@
+⛔⛔ CORRECTED 2026-09-22 (SCALE-DESIGN D134) — READ THIS BEFORE ANYTHING BELOW ⛔⛔
+================================================================================
+THE MECHANISM IN THIS REPORT IS CORRECT AND LANDED. ITS JUSTIFICATION WAS BACKWARDS.
+
+This report argues in several places that a refusal is usually the BENIGN mid-rewrite race
+`TableBranchCatalog::upsert` opened — delete-then-insert with no latch across the two — and
+that only a rising, non-returning count is a leak. **That premise died with D126**, which
+landed 2.5 h before this report was written: `BPlusTreeManager::upsert` is now one in-place
+`LeafWrite::Replace` over a single page write, `TableBranchCatalog::upsert` is one line over
+it, and there is no window in which a live branch's record is absent to a reader
+(`tests/d126_atomic_upsert.rs`; `src/storage/index.rs`, `BPlusTreeManager::upsert`).
+
+⇒ THE TRUE ARGUMENT IS THE OPPOSITE: refusals are now RARE, and that is exactly why each one
+  must be reported. Every refusal reaching `ReapOutcome::Refused` is an I/O error or a
+  corrupt catalog. The alarm is the FIRST increment, not the derivative.
+⇒ As written, the prose would have trained an operator to ignore the signal this row exists
+  to raise. The shipped comments and the operator-facing string were rewritten to the
+  inverted argument before landing; this file's §2 and §5 keep the retracted wording only so
+  the retraction is visible, and both sites are marked [RETRACTED] inline.
+⇒ THE OPERATOR MESSAGE DEPENDS ON D126 BEING TRUE. "A count that does not come back down"
+  is a leak detector reading a counter, and that cannot work against a noisy baseline. D126
+  is what supplies the zero baseline it detects against — the shipped string now says so.
+⇒ THE TESTS WERE NOT TOUCHED and did not need to be: they inject `BranchError::Corrupt` via
+  `dangling_child` directly (`lease_thread/tests.rs`, `RefusesLiveChildren`), never the dead
+  upsert window, so the fixtures already test the post-D126 world.
+
+Everything below this banner is the original 2026-09-22 report, unchanged except for the two
+inline [RETRACTED] markers.
+
+D127 — D124's REFUSAL IS SWALLOWED AT THE PRIMARY REAP PATH. Make it reach a reader.
+================================================================================
+Branch:  D127-unswallow-refusal
+Base:    ac2ab26  (merge-base with main)
+Code:    7ad789b  — the last commit touching src/ tests/ examples/; what the full suite certified
+Design:  /Users/idide/wt/artie-research/SCALE-DESIGN.md, "## ⛔ D127", opened 2026-09-22
+Option taken: **2 — a three-way outcome from `reap_if_still_expired`**, the one the design
+              entry named as the one to beat. Nothing better was found; see "Why not 1 or 3".
+
+EXIT CRITERION — "a refused reap is counted and reported distinctly from 'not expired',
+with a test that fails if it is swallowed again" — HOLDS. Six mutants, six kills, below.
+
+
+1. THE DEFECT, RE-VERIFIED FROM SOURCE AT THE BASE COMMIT
+--------------------------------------------------------------------------------
+Not taken on the design entry's word. Each link re-read at ac2ab26:
+
+  L1  src/branch/types.rs `impl From<BranchError> for FerroError` — `FerroError::Branch(
+      e.to_string())`. Blanket. `Corrupt` and `NotFound` become the same variant; the
+      distinction survives only inside a string. STILL TRUE AT HEAD — deliberately not
+      touched, see §5.
+  L2  src/branch/reaper.rs `reap_if_still_expired` — `Err(FerroError::Branch(_)) => Ok(false)`
+      on BOTH arms (the `get_raw` re-read and the `reap` itself).
+  L3  src/branch/lease_thread.rs `scan_once` — `Ok(false) => {}`. Not pushed to `reaped`,
+      not counted in `failed`, never passed to `report`.
+
+⇒ D124's guard text — the sentence naming the parent, the fork epoch and the child — reached
+no log, no counter and no operator. The branch keeps its pages (so the safety property D124
+was built for holds) and becomes indistinguishable from a healthy one. Under W4 that is an
+unbounded leak with no signal.
+
+The conflation is the defect: `Ok(false)` meant BOTH "the lease moved under the sweep, this
+branch is fine" AND "the catalog would not answer, I decline to decide".
+
+
+2. THE FIX
+--------------------------------------------------------------------------------
+Line numbers are at 7ad789b. For the BEFORE side, at base ac2ab26: types.rs:359-362,
+reaper.rs:726 and :732 (`Err(FerroError::Branch(_)) => Ok(false)`, both arms),
+lease_thread.rs:575-576 (`Ok(true) => reaped.push(..)`, `Ok(false) => {}`). Each re-read
+there, not carried over from the design entry.
+
+  reaper.rs:78    `pub enum ReapOutcome { Reaped | NotExpired | Refused(FerroError) }`,
+                  `#[must_use = "a refused reap that nobody looks at is exactly the D127
+                  defect"]`. Carries the error, not a marker: the text is the only thing that
+                  separates a benign mid-rewrite miss from a genuinely corrupt CHILD entry,
+                  and a caller handed a bare count could not print it.
+                  [RETRACTED — see the banner. Post-D126 there is no benign mid-rewrite miss;
+                  the text separates an I/O error from a corrupt CHILD entry, which is why
+                  it still has to be carried.]
+  reaper.rs:782   `reap_if_still_expired` returns `ReapOutcome`, not `bool`.
+  reaper.rs:805   the `get_raw` arm  → `Ok(self.refuse(e))`
+  reaper.rs:816   the `reap` arm     → `Ok(self.refuse(e))`   ← D124's `Corrupt` arrives here
+  reaper.rs:823   `fn refuse(&self, why) -> ReapOutcome` — bumps the counter AND builds the
+                  outcome, so no caller can produce a refusal without it being counted.
+  reaper.rs:125   `TwoTierReaper::refused_reaps: AtomicU64`, read at :152.
+  lease_thread.rs:632  `Ok(ReapOutcome::Refused(why)) => refused.push((branch, why))`
+  lease_thread.rs:293  `LeaseStats::refused_branches` — per-branch refusals, summed.
+  lease_thread.rs:278  `LeaseStats::refused` RENAMED to `refused_scans` — the whole-scan
+                  refusal (no cluster time). A field called `refused` sitting next to
+                  `refused_branches` is the same conflation one level up.
+  lease_thread.rs:798  `fn refusal_report(&[(BranchId, FerroError)]) -> String`, cap 4 (:786).
+                  Free function taking the list, so the operator-facing TEXT is assertable.
+                  Count and ids first, reasons capped — the number is what says leak vs race,
+                  so it must not be what falls off a truncated line.
+  lease_thread.rs `scan_once` takes its reporter as `out: &dyn Fn(String)`. Production passes
+                  `&report`; tests pass a collector. Without this seam the only assertable
+                  half of a refusal is its counter, and a counter with no reason is most of
+                  the defect still standing.
+  cli.rs          `refused_branches > 0` added to the "print the lease stats" condition. A
+                  session that reaped nothing and refused one branch used to print nothing.
+
+WHAT DID NOT CHANGE — and this is load-bearing. `Refused` is `Ok`-shaped. The sweep absorbs
+it and goes to the next candidate, exactly as before. The absorption exists because a branch
+whose record is momentarily absent (`upsert` is delete-then-insert with no latch across the
+two, so an ordinary `set_root`/`renew_lease` makes a HEALTHY branch miss for a moment) must
+not abort the sweep. A fix that traded a silent leak for a reaper that stops on the first
+oddity would be worse than the bug. Pinned by mutant M6 below.
+  [RETRACTED — see the banner. The absorption is right and M6 still pins it, but NOT for
+  this reason: D126 closed the mid-rewrite window, so there is no healthy branch to protect
+  here. It survives on BLAST RADIUS — one branch the catalog cannot answer for must not cost
+  every other expired branch its reclamation. And absorbing is not excusing: the sweep going
+  on is precisely why the count and the reason must reach a reader.]
+
+
+3. FIRE-CHECK — six mutants, run individually against a clean committed tree
+--------------------------------------------------------------------------------
+`cargo test --lib -- d127 a_refused_reap_is_not_the_same_answer d98_a_branch_renewed
+an_unexpired_branch_survives`, one mutation at a time, restored with `git checkout HEAD --`
+between each. A detector that has not been forced to fire is not a clean result.
+
+M1  reaper.rs:816 → `Ok(ReapOutcome::NotExpired)`   (THE ORIGINAL BUG, VERBATIM)
+    KILLED 3: reaper{log,table}_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_
+    that_moved, lease_thread::d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_
+    the_sweep.
+M2  lease_thread.rs:632 → `Ok(ReapOutcome::Refused(_why)) => {}`  (the L3 swallow, restored)
+    KILLED 1: d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep.
+M3  the refusal is counted but `refusal_report(..)` replaced by a contentless string
+    KILLED 1: same test. So "printed" is pinned separately from "counted".
+M4  reaper.rs:789 → the NotExpired arm returns a refusal  (SPURIOUS FIRE, the opposite error)
+    KILLED 4: both reaper arms, d127_a_clean_sweep_reports_no_refusal_at_all, and
+    d98_a_branch_renewed_after_the_query_is_not_reaped (the large control: n - REAP_CHUNK
+    healthy branches). A signal that fires on healthy branches is noise an operator learns
+    to ignore — the defect again, one level up.
+M5  `refuse()` no longer increments `refused_reaps`
+    KILLED 2: both reaper unit-test arms.
+M6  reaper.rs:700 → `ReapOutcome::Refused(e) => return Err(e)` in `Reaper::reap_expired`
+    (i.e. the sweep stops on the first oddity — the "worse than the bug" failure)
+    KILLED 1, and only 1: d127_the_trait_sweep_counts_a_refusal_it_cannot_report.
+
+M6 is why this run added a test rather than only verifying. See §4.
+
+Anti-vacuity is inside the tests too, not only across mutants:
+ * `d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep` runs TWO expired
+   branches in ONE sweep — one armed, one healthy. The healthy one being reaped in the same
+   pass is the guard on the fix; a scan_once that refused everything fails on it.
+ * `d127_a_clean_sweep_reports_no_refusal_at_all` is the detector's own control.
+ * `d127_a_capped_refusal_report_still_states_the_true_count` asserts the cap ACTUALLY caps
+   (`!text.contains(reason-number-{n-1})`), or it would prove nothing about truncation.
+
+
+4. WHAT THIS RUN ADDED, AND WHY — the trait sweep had no pin
+--------------------------------------------------------------------------------
+The design entry asserts: "`TwoTierReaper::refused_reaps` counts at the refusal SITE so
+`Reaper::reap_expired`, which has no reporter, cannot drop one either." That claim was
+argued in a code comment and tested NOWHERE. `reap_expired` returns `Result<Vec<BranchId>>`
+— a refusal is by construction not one of the branches it reaped, and there is no room in
+the signature for one. It is precisely the call shape where the row's own defect could
+survive its own fix.
+
+Added `d127_the_trait_sweep_counts_a_refusal_it_cannot_report` (lease_thread/tests.rs):
+two expired branches, one armed with D124's exact `Corrupt`, driven through
+`Reaper::reap_expired`. Asserts `refused_reaps()` advanced by exactly 1, that `reaped ==
+[doomed]` (so the sweep went PAST the refused branch), that live pages fell, and that the
+refused branch sits in `Reaping` with every page intact.
+
+Under M6 it is the only failing test in the whole suite. That is the coverage it adds.
+
+One shape turned out to be UNEXPRESSIBLE, which strengthens the design: "move the counter
+into `scan_once`" cannot be written, because `refused_reaps` is a private field of
+`TwoTierReaper` and `lease_thread` is a sibling module, not a descendant. The counter can
+only live where the refusal is produced.
+
+
+5. WHY NOT OPTION 1 OR 3, AND WHY NO STRING MATCHING
+--------------------------------------------------------------------------------
+Option 1 (give `Corrupt` its own `FerroError` variant) is the root fix for L1, and its blast
+radius is every `From<BranchError>` site in the crate. It does not by itself fix the defect:
+with `Corrupt` separated, `reap_if_still_expired` would still answer `Ok(false)` for both
+"not expired" and "some other `Branch` error I decline to decide on", and `scan_once` would
+still match it with an empty arm. It narrows the swallow; it does not un-conflate the answer.
+NOT DONE HERE and deliberately not smuggled in — it is a separate row with a separate diff.
+
+Option 3 (count and report at the refusal site, leave the type alone) is what `refused_reaps`
+does, and it is kept as the FLOOR for callers that have no reporter. As the whole fix it is
+insufficient: `scan_once` would still be unable to tell an operator WHICH branch, because it
+would still be seeing `false`.
+
+String-matching the message to recover the variant: rejected on sight, per the brief and per
+this project's standing rule. A guard that reads wording is walked around by a reword. No
+wording is matched anywhere in this diff. The variant is recovered by changing what CARRIES
+it — the return type — not by parsing what it printed.
+
+
+6. ⛔ THE FALSIFIED PREMISE OF THIS DISPATCH — REPORTED AS THE RESULT
+--------------------------------------------------------------------------------
+The brief describes an unfixed defect and asks for the fix. **It was already fixed.** Four
+commits (28dc54a, 191512b, 63d57ae, 9e774fb, plus 7bf356c) sat on this branch when this
+worktree opened, implementing exactly option 2.
+
+The row was re-dispatched anyway, and the design entry already records WHY it happened the
+first time: "**The row was ALREADY FINISHED at 01:21 and 01:27 the same night and was
+re-dispatched at 07:0x, because it filed no `bench/` report.** ... *A real event that reaches
+no reader* — the exact sentence ... applied to the ledger rather than to the reaper. **The
+report file is the reader; a row is not closed by a commit.**"
+
+⛔ IT THEN HAPPENED A SECOND TIME, AND THE DESIGN DOC ASSERTS OTHERWISE. SCALE-DESIGN.md's
+D127 closing block says: "Evidence and the full write-up: **`bench/d127_unswallow.txt`** on
+that branch." At the moment this worktree opened, that file did not exist — `ls bench/`, 292
+files, no d127; `git log --all -- 'bench/*d127*'` empty. The doc recorded a closure whose
+stated evidence was not there, in the very row whose finding is that a real event must reach
+a reader. Writing this file is what makes that sentence true; no doc edit was needed and none
+was made.
+
+The defect D127 names — a true event that reaches nobody — has now bitten this row three
+times: once in the reaper, once in the ledger, once in the closing note that documented the
+ledger fix.
+
+
+7. VERIFICATION, AND ⛔ A SECOND FALSE CLAIM IN THE RECORD, CORRECTED BY MEASUREMENT
+--------------------------------------------------------------------------------
+`cargo check --all-targets` — clean. This is the gate the earlier commits missed: the
+`refused` → `refused_scans` rename fixed one of two uses in `examples/outer_runtime_lock.rs`
+and missed the other, E0609. Fixed on the branch at 9e774fb.
+
+  ⚠ A REVERSAL OF MY OWN, LOGGED HERE BECAUSE THIS IS WHERE I MADE IT. I first "corrected"
+  the design doc's citation of that line from `:506` to `:512`. That was WRONG: `git show
+  63d57ae:examples/outer_runtime_lock.rs` puts the broken `s.scans + s.refused + s.failed` at
+  **506**, and it reads 512 only at the tip because 9e774fb inserted six comment lines above
+  it. The original number was right for the tree that had the error; my number matched no tree
+  that ever failed to compile. Wrongly correcting a right claim is the same failure as
+  asserting a false one. Reverted, and the doc now carries both numbers with their commits.
+
+⛔ THE REASON RECORDED FOR THAT MISS IS WRONG. SCALE-DESIGN.md's D127 block says
+"**`cargo test` does not build examples**, so the branch looked green", and generalises it to
+"`cargo test` is not a build gate". MEASURED HERE, by reintroducing the exact E0609 at
+`examples/outer_runtime_lock.rs:512` and running two arms on this tree:
+
+    arm A   cargo test --lib --no-run     rc=0    the broken example is never built
+    arm B   cargo test      --no-run      rc=101  error[E0609]: no field `refused` on type
+                                                  `LeaseStats`, examples/outer_runtime_lock.rs:512
+
+A BARE `cargo test` DOES build examples and WOULD have caught this — `cargo test --help` says
+so in its first line ("Execute all unit and integration tests **and build examples** of a
+local package"), and arm B confirms it on this exact defect. What is actually true is
+narrower and sharper: **naming a target (`--lib`, `--test <name>`) turns OFF cargo's automatic
+target selection, and a target-filtered `cargo test` builds no examples.** The earlier run was
+green because it was filtered, not because `cargo test` is blind to examples.
+
+This matters beyond pedantry: the doc's version tells a reader that no `cargo test` invocation
+can be trusted as a build gate, when a bare one is exactly that. The narrower statement is
+also the actionable one — it names the flag that causes the blindness.
+⇒ SCALE-DESIGN.md corrected in place at the sentence that made the claim, per "log the
+reversal where the claim was logged".
+
+(Two pre-existing `unused variable: reaper` warnings from the `reaper_suite!` macro at
+reaper.rs:2100 are present at the BASE commit too — D127 does not touch that test.)
+
+Targeted: 8/8 green — the five D127 tests, both `a_refused_reap_is_not_the_same_answer_as_a_
+lease_that_moved` catalog arms, `d98_a_branch_renewed_after_the_query_is_not_reaped` and
+`an_unexpired_branch_survives_every_scan`.
+
+`tools/verify-impacted.sh --since ac2ab26` — rc=0, **97 of 131 targets selected** (34 skipped;
+the script names the count itself). `--since` was passed: without it a committed change selects
+ZERO targets and still reads rc=0, which is a pass-shaped nothing.
+
+FULL SUITE, taken ONCE, holding `/tmp/ferrodb-suite.lock` as `D127-unswallow`:
+
+    D127-unswallow: mode=whole rc=0 passed=2467 failed=0 build_errors=0 head=7ad789b
+    D127-unswallow: go        rc=0 passed=97   failed=0
+
+Banked in `bench/d127_certified/` (SUMMARY.txt and the log tail), because the suite's own
+output directory is a `mktemp -d` under /var/folders that a restart wipes — and because the
+two commits at the head of main right now exist precisely to re-bank verdicts that had lived
+only in a truncating SUMMARY.txt.
+
+⚠ `head=7ad789b` is a PREIMAGE, by construction: a report cannot quote a summary that names
+its own sha. **7ad789b is the commit carrying every source change in this row** — everything
+in §2 and §4. The commits after it add only `bench/` text: this paragraph, and the banked
+SUMMARY. No file under `src/`, `tests/` or `examples/` differs between 7ad789b and the tip;
+`git diff 7ad789b..HEAD -- src tests examples` is empty, which is the check that makes the
+green transferable rather than merely adjacent.
+
+
+8. FOLLOW-ONS, NOT FIXED HERE, NOT SMUGGLED IN
+--------------------------------------------------------------------------------
+a) A branch refused at the `reap` arm has already published `Live → Reaping` (`reap` sets
+   state before it consults `has_live_children`). `expired_before` is Live-only on both
+   catalogs, so that branch is refused ONCE, printed ONCE, and is then invisible to the lease
+   thread until `resume_interrupted_reaps` at the next open. Only the `get_raw` arm, which
+   leaves the branch Live, produces a per-sweep RATE. Making the sweep re-enter `Reaping`
+   records on the tick changes which branches every pass touches and needs its own row and
+   its own measurement. Asserted explicitly in the new test rather than left implicit.
+b) Option 1 (a real `FerroError::Corrupt`) remains the root fix for the blanket `From`.

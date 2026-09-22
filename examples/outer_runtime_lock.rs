@@ -498,12 +498,18 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
         )
         .expect("lease thread");
         // Wait for the one immediate scan to finish. `attempts` rises before the lock is taken and
-        // `scans`/`refused`/`failed` after the body ran, so their sum advancing is the sweep
+        // `scans`/`refused_scans`/`failed` after the body ran, so their sum advancing is the sweep
         // having completed rather than having been scheduled.
+        //
+        // **D127 renamed `refused` to `refused_scans` and this line was missed**, so the branch
+        // did not build `--all-targets` — the other use, 16 lines below, was updated. The new
+        // `refused_branches` is deliberately NOT in this sum: it is per-branch, a pass that
+        // refuses on one branch still completes and still raises `scans`, so adding it here would
+        // be a second way to say the same thing and no way to say a new one.
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             let s = lease.stats();
-            if s.scans + s.refused + s.failed > 0 {
+            if s.scans + s.refused_scans + s.failed > 0 {
                 break;
             }
             if Instant::now() > deadline {
@@ -522,7 +528,7 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
             to.duration_since(origin).as_nanos() as u64,
             stats.reaped,
             stats.scans,
-            stats.refused,
+            stats.refused_scans,
         )
     };
 
