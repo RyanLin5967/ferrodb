@@ -48,7 +48,7 @@
 use std::fs::OpenOptions;
 use std::sync::Arc;
 
-use ferrodb::agent_sql::runtime::{AgentRuntime, BranchResolver};
+use ferrodb::agent_sql::runtime::{AgentRuntime, BranchResolver, ExecCtx};
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::types::{BranchId, BranchState};
 use ferrodb::branch::BranchCatalog;
@@ -64,6 +64,17 @@ use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::recovery::recover;
 use ferrodb::wal::txn::TxnManager;
+
+/// Parse exactly one statement, for the two assertions that call the runtime directly rather than
+/// through `executor::run`.
+fn parse_one(sql: &str) -> ferrodb::parser::parser::Stmt {
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut parser = Parser::new(tokens);
+    let mut stmts = parser.parse();
+    assert!(parser.errors.is_empty(), "{sql}: {:?}", parser.errors);
+    assert_eq!(stmts.len(), 1, "expected one statement: {sql}");
+    stmts.remove(0)
+}
 
 /// One database, several connections — the same shape `integration_capability_envelope.rs` uses.
 struct Db {
@@ -220,6 +231,41 @@ fn a_reaped_sessions_select_must_not_read_the_new_occupants_staged_row() {
          1, yet A's SELECT on {stale} was answered: qty = {:?}. `workspaces` is keyed by the id \
          slot alone, so A was handed agent-b's workspace. 999 is agent-b's staged, unmerged row.",
         answer.as_ref().ok()
+    );
+
+    // **The two lookups that statement makes, asserted SEPARATELY — and that is the point.**
+    //
+    // A `SELECT` in a session reaches `workspaces` twice: `visible_rows_where` for the staged-row
+    // overlay, and `record_read` to retain the read. The assertion above needs BOTH to be keyed
+    // correctly to fail, so on its own it cannot tell which one is carrying the property — blind
+    // one of them and the other still refuses the statement, and the test stays green over a live
+    // leak. That is the instrument's problem, not the code's, so each site gets its own witness.
+
+    // `visible_rows_where` alone: `reader: None` skips `record_read` entirely, so the overlay is
+    // the only workspace lookup left. The value matters here, not just the refusal — the base
+    // table says 20 and agent-b's workspace says 999.
+    let stmt = parse_one("SELECT qty FROM inventory WHERE id = 1;");
+    let runtime = db.runtime.clone();
+    let overlay = {
+        let ctx = ExecCtx { catalog: &mut db.catalog, bp: db.bp.clone(), txn: db.txn.clone() };
+        runtime.select(&ctx.read(), stale, &stmt, None)
+    };
+    let base_only: Vec<Vec<Value>> = vec![vec![Value::Integer(20)]];
+    assert_eq!(
+        overlay.as_ref().ok(),
+        Some(&base_only),
+        "the staged-row overlay for the reaped {stale} must be agent-b's business alone; reading \
+         it through the dead handle returned {overlay:?}, and 999 is agent-b's unmerged row"
+    );
+
+    // `blind_writes` is a third, independent lookup on the same map and the shortest statement
+    // that needs a workspace at all. `w4_sweep_slot_recycle.rs` recorded it as the one-line
+    // demonstration of this defect while it was open.
+    let blind = db.runtime.blind_writes(stale);
+    assert!(
+        blind.is_err(),
+        "blind_writes({stale}) must refuse a branch the catalog no longer has; it answered about \
+         slot {slot}'s new occupant instead: {blind:?}"
     );
 }
 
