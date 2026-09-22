@@ -1184,15 +1184,30 @@ impl Fleet {
     }
 
     /// Drive until every node has applied through `round`.
+    ///
+    /// **Reports its ITERATION COUNT, not only its outcome — and that is the point.** A duration
+    /// alone cannot tell "converging slowly" from "not converging": 100 000 turns at 3 ms each and
+    /// 300 turns at 1 s each are the same six minutes. Pairing the timer with an integer taken
+    /// inside the loop is what separates a right SHAPE from a wrong MAGNITUDE.
+    ///
+    /// Written for the Windows `STATUS_ACCESS_VIOLATION` in this file, which is **2 of 2 on
+    /// `4685d80`** and whose logs carry **no `panicked at`** — so no bound was reached and the
+    /// process died PART WAY THROUGH one of these loops. This line is what says where.
     fn settle_to(&self, round: Round) {
-        for _ in 0..20_000 {
+        let t0 = std::time::Instant::now();
+        for turn in 0..20_000u32 {
             if self.ledgers.iter().all(|l| lock(l).last_applied() >= round) {
+                eprintln!(
+                    "LOOPCOUNT settle_to round={round} turns={turn} bound=20000 ms={}",
+                    t0.elapsed().as_millis()
+                );
                 return;
             }
             self.pump_all();
         }
         panic!(
-            "round {round} did not reach every node; applied = {:?}",
+            "round {round} did not reach every node after 20000 turns in {} ms; applied = {:?}",
+            t0.elapsed().as_millis(),
             self.ledgers.iter().map(|l| lock(l).last_applied()).collect::<Vec<_>>()
         );
     }
@@ -1210,16 +1225,26 @@ impl Fleet {
     /// this test asserts — the log holds only forks and merges, at one proposal each — says nothing
     /// about leadership being continuous, so that dependency was incidental. Making it explicit
     /// removes the flake without weakening a single assertion.
+    ///
+    /// **Reports its ITERATION COUNT on both exits.** See `settle_to` for why: the bound here is a
+    /// turn count, not a deadline, so "six minutes" is ambiguous between a slow `pump()` and a
+    /// non-converging election until an integer says which.
     fn hold_leader(&self, want: usize) {
         let l = NodeId(want as u32 + 1);
-        for _ in 0..100_000 {
+        let t0 = std::time::Instant::now();
+        for turn in 0..100_000u32 {
             self.pump_all();
             if self.reps.iter().all(|r| r.leader() == Some(l)) {
+                eprintln!(
+                    "LOOPCOUNT hold_leader want={want} turns={turn} bound=100000 ms={}",
+                    t0.elapsed().as_millis()
+                );
                 return;
             }
         }
         panic!(
-            "node {want} never regained the leadership; leaders = {:?}",
+            "node {want} never regained the leadership after 100000 turns in {} ms; leaders = {:?}",
+            t0.elapsed().as_millis(),
             self.reps.iter().map(|r| r.leader()).collect::<Vec<_>>()
         );
     }
