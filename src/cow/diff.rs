@@ -43,9 +43,23 @@
 //! free. Counted here, 16k rows, four changed:
 //!
 //! ```text
-//! diff + PageIdentity  :   18 reads        <- exact, no precompute
-//! diff + SubtreeHash   :  748 reads  + 1085 to stamp = 1833, for the same answer
+//!                         diff-time   precompute     total
+//! diff + PageIdentity  :     18            0           18     <- exact, nothing to precompute
+//! diff + SubtreeHash   :     36         1450         1486     <- 1450 stamps BOTH roots
+//! CowTree::diff, O(N)  :   2188            -         2188     <- walks both roots
 //! ```
+//!
+//! The digest's 1486 **beats** the 2188 O(N) path, and quoting that would flatter it. It is the
+//! wrong comparator: nothing in this store would reach for `CowTree::diff` to answer an in-lineage
+//! question when [`PageIdentity`] is right there, exact and free. Against **18**, the digest costs
+//! **83x** for a byte-identical answer.
+//!
+//! ⚠ Two superseded figures, written down so neither is restored. (1) An earlier cut added a
+//! diff-time count to a ONE-root stamp (1085) and reported `1833 against 2188` as a win; the
+//! control walks both roots, so the stamp must too — corrected by `71d13f0`. (2) The diff-time
+//! count was **748** until `439793c` settled `a == b` ahead of the identity provider: in-lineage
+//! the two roots share nearly every page, so those comparisons stopped costing two header reads
+//! each and 748 collapsed to 36. Neither number moves the verdict, and the second only widens it.
 //!
 //! **So in-lineage the digest does not pay, at any N, and nothing here should use it.** That is
 //! not news and it is not the whole question, because it is not the case the digest was built for.
@@ -901,24 +915,28 @@ fn decode_payload(h: &PageHandle, pid: PageId, enclosing: &Span) -> Result<Paylo
 /// "O(1)" is the provider's cost, and the memoising providers here spend one page fetch and a
 /// header parse in it, to check that the row they are about to answer from still describes the
 /// page ([`PageVersion`]). That buys the difference between a stale row *missing* and a stale row
-/// *lying*, and it is not free: **a skip stopped being a zero-read event.** Comparisons, not
-/// decodes, are what a skipping diff does most of, so the bill lands on exactly the operation the
-/// module optimises. Counted on the 16k-row, 1085-node tree of
+/// *lying*, and it is not free: **a skip decided by the provider stopped being a zero-read
+/// event.** Counted on the 16k-row, 1085-node tree of
 /// `warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path`, four rows
 /// changed:
 ///
 /// ```text
 /// diff + PageIdentity  :   18 page reads   (no memo, so nothing to validate)
-/// diff + SubtreeHash   :  748 page reads   (~2 per comparison, on top of the same 18 decodes)
+/// diff + SubtreeHash   :   36 page reads   (the same 18 decodes, plus the validated comparisons)
 /// CowTree::diff, O(N)  : 2188 page reads
 /// ```
 ///
 /// Both still decode 18 payloads — `visited` does not move, and `examples/d91_diff_curve.rs`
-/// records the same `new_visited` for both providers at every N. It is the *fetches* that grow,
-/// bounded by the comparison count O(delta · m · log_m N) rather than by N: the validated hash
-/// provider still reads fewer pages than the tree has nodes, and under half what the path it
-/// replaces reads. [`PageIdentity`] holds no memo, has nothing to validate, and is unaffected —
-/// which is another reason it is the provider to prefer inside ferrodb.
+/// records the same `new_visited` for both providers at every N.
+///
+/// ⚠ That row read **748** before `439793c`, and the sentence above it used to say a skip had
+/// stopped being a zero-read event *at all*. Both were too broad. The pairs that dominate a small
+/// in-lineage diff are the ones where both sides are the **same page id**, and those are settled
+/// by the descent without asking any provider — so they cost nothing, then and now. What the
+/// validation actually charges for is the narrow case of two *different* page ids whose digests
+/// agree, which is rare in-lineage and is the whole story cross-lineage. Bounded by the comparison
+/// count O(delta · m · log_m N) rather than by N either way. [`PageIdentity`] holds no memo, has
+/// nothing to validate, and is unaffected — another reason it is the provider to prefer here.
 ///
 /// A pair that is the **same page id** costs nothing either, from any provider: `id_of` is a pure
 /// function of the page id, so the descent settles that case itself and never asks. In a
@@ -2505,9 +2523,15 @@ mod tests {
         // reads than the tree has nodes means it is not enumerating, and fewer than the control
         // means it still beats the path it replaces.
         assert!(
-            hash_diff_reads < nodes && hash_diff_reads < control_reads,
-            "validating the memo on every comparison ({hash_diff_reads}) has pushed the skipping \
-             diff into enumerating: {nodes} nodes, and the O(N) path costs {control_reads}"
+            hash_diff_reads < diff_reads * 4,
+            "the validated provider cost {hash_diff_reads} reads against {diff_reads} for the \
+             provider that validates nothing. Validation is supposed to be bounded by the \
+             comparisons the descent actually asks about — a pair that is the SAME page id is \
+             settled without asking, and in-lineage that is nearly every pair. A multiple this \
+             large means the descent started consulting the provider on shared pages again \
+             (that regression measured {} reads here before 439793c), or that validation stopped \
+             riding on a page the caller already had.",
+            748
         );
         assert!(
             warm_reads > control_reads,
