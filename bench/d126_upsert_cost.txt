@@ -1,0 +1,51 @@
+# D126 -- cost of the atomic upsert against the delete+insert it replaces.
+# binary: target/release/examples/d126_upsert_cost  (cargo build --release --example d126_upsert_cost)
+# commit: d8218c548523f38eebb89b692f9fd76acabf896b
+# host: Darwin 25.6.0 arm64   date: 2026-09-22T05:23:06Z
+# measure lock HELD for both replicates: 'ACQUIRED d126-cost load_at_acquire=15'.
+# ⚠ load_at_acquire=15 -- the box was NOT quiet (13-agent fleet). Every us/op below is an
+#   UPPER BOUND. The ratio is what is being claimed, it is taken from ONE run of ONE binary
+#   with the arm order rotated as a Latin square, and the search CONTROL moved only 1.21-1.25x
+#   across rounds while the two write arms differ by 1.86-1.92x.
+
+=== REPLICATE 1 ===
+D126 -- atomic upsert vs delete+insert. 40000 keys resident, 20000 iters/arm, 6 rounds, arm order rotated each round.
+
+  round  order     del+ins us/op    upsert us/op     search us/op
+      0  [0, 1, 2]       23.8183         12.9771          6.9125
+      1  [1, 2, 0]       25.8295         13.5691          7.8294
+      2  [2, 0, 1]       25.6190         12.9970          7.7498
+      3  [0, 1, 2]       23.9829         12.5450          6.5332
+      4  [1, 2, 0]       24.3025         12.6213          7.1066
+      5  [2, 0, 1]       23.7748         13.1936          8.1456
+
+  median  delete+insert   24.1427 us/op
+  median  upsert          12.9870 us/op
+  median  search           7.4282 us/op   <- CONTROL, unaffected by either arm
+  upsert / (delete+insert) = 0.538x
+  upsert - search          = 5.5589 us  (the write half of one descent)
+  search hits              = 120000   (0 here would mean the control measured nothing)
+  CONTROL spread across rounds = 1.25x
+  If that spread is large, the box drifted during the run and the ratio above is a
+  ratio of two different machines. Re-run on a quiet box before quoting it.
+
+=== REPLICATE 2 (same binary, same lock hold, back to back) ===
+D126 -- atomic upsert vs delete+insert. 40000 keys resident, 20000 iters/arm, 6 rounds, arm order rotated each round.
+
+  round  order     del+ins us/op    upsert us/op     search us/op
+      0  [0, 1, 2]       22.0226         11.9701          6.5737
+      1  [1, 2, 0]       24.0787         12.9907          7.5890
+      2  [2, 0, 1]       24.4504         12.9664          7.3269
+      3  [0, 1, 2]       24.8233         12.6559          7.2713
+      4  [1, 2, 0]       25.3630         13.4258          7.9689
+      5  [2, 0, 1]       24.6621         12.5050          7.6859
+
+  median  delete+insert   24.5562 us/op
+  median  upsert          12.8112 us/op
+  median  search           7.4580 us/op   <- CONTROL, unaffected by either arm
+  upsert / (delete+insert) = 0.522x
+  upsert - search          = 5.3532 us  (the write half of one descent)
+  search hits              = 120000   (0 here would mean the control measured nothing)
+  CONTROL spread across rounds = 1.21x
+  If that spread is large, the box drifted during the run and the ratio above is a
+  ratio of two different machines. Re-run on a quiet box before quoting it.
