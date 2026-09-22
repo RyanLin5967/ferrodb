@@ -726,6 +726,16 @@ fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
          was still working lost its branch, and the generation makes that unrecoverable.",
         stats.reaped
     );
+    // **D127 control, on the largest population of NOT-EXPIRED answers this suite has.** Every
+    // one of the `n - REAP_CHUNK` survivors takes `reap_if_still_expired`'s "the lease moved"
+    // path. If that path were counted as a refusal, the new signal would arrive already
+    // saturated with healthy branches and an operator would learn to ignore it.
+    assert_eq!(
+        stats.refused_branches, 0,
+        "{} branches whose lease was renewed under the sweep were counted as refusals; stats: \
+         {stats:?}",
+        n - REAP_CHUNK
+    );
     let survivors = all
         .iter()
         .filter(|b| f.h.catalog.get_raw(b.id).map(|r| r.state) == Ok(BranchState::Live))
@@ -735,5 +745,324 @@ fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
         n - REAP_CHUNK,
         "expected the {} renewed branches to survive, found {survivors}",
         n - REAP_CHUNK
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// RULE 4 — D127: a refusal about one branch must reach a reader.
+// -------------------------------------------------------------------------------------------
+
+/// Stands in for D124's refusal text. Deliberately not a substring of anything else this module
+/// prints, so "the reason travelled" is a test about the reason and not about the word "refused"
+/// appearing twice.
+const CORRUPT_MARKER: &str = "CHILD entry (parent 7, fork epoch 11) names branch 4242";
+
+/// Makes `has_live_children` refuse for one parent, and delegates everything else untouched.
+///
+/// **This is the exact shape D124 produces.** `TableBranchCatalog::child_liveness` answers
+/// `Err(dangling_child(..))` — a `BranchError::Corrupt` naming the parent, the fork epoch and the
+/// child — when a CHILD entry names a record it cannot read, and `has_live_children` is what
+/// `Reaper::reap` consults on its way to choosing the fast or the slow path. Injecting it rather
+/// than corrupting a catalog is the point: the arm under test catches an `Err` from that call, so
+/// what matters is the error, not how a catalog came to produce it. Reproducing the real
+/// corruption would test `TableBranchCatalog`'s key layout instead.
+struct RefusesLiveChildren {
+    inner: Arc<dyn BranchCatalog>,
+    /// `u64::MAX` means nothing is armed; no real id reaches it, ids are minted from 0 up.
+    armed: AtomicU64,
+}
+
+impl RefusesLiveChildren {
+    fn new(inner: Arc<dyn BranchCatalog>) -> Arc<RefusesLiveChildren> {
+        Arc::new(RefusesLiveChildren { inner, armed: AtomicU64::new(u64::MAX) })
+    }
+    fn arm(&self, parent_id: u64) {
+        self.armed.store(parent_id, Ordering::SeqCst);
+    }
+}
+
+impl BranchCatalog for RefusesLiveChildren {
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        if parent_id == self.armed.load(Ordering::SeqCst) {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "{CORRUPT_MARKER}, which has no record right now"
+            ))
+            .into());
+        }
+        self.inner.has_live_children(parent_id)
+    }
+
+    fn next_epoch(&self) -> crate::branch::types::Epoch {
+        self.inner.next_epoch()
+    }
+    fn current_epoch(&self) -> crate::branch::types::Epoch {
+        self.inner.current_epoch()
+    }
+    fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        self.inner.fork(p, l)
+    }
+    fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> {
+        self.inner.get(b)
+    }
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        self.inner.get_raw(id)
+    }
+    fn reparent(
+        &self,
+        b: BranchId,
+        p: BranchId,
+        e: crate::branch::types::Epoch,
+        r: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(b, p, e, r)
+    }
+    fn restrict_envelope(
+        &self,
+        b: BranchId,
+        env: crate::branch::record::CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(b, env)
+    }
+    fn set_state(
+        &self,
+        b: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        self.inner.set_state(b, expect, to)
+    }
+    fn set_root(&self, b: BranchId, r: PageId) -> Result<(), FerroError> {
+        self.inner.set_root(b, r)
+    }
+    fn expired_before(
+        &self,
+        now_millis: u64,
+    ) -> Result<Vec<crate::branch::record::CoreRecord>, FerroError> {
+        self.inner.expired_before(now_millis)
+    }
+    fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        self.inner.in_state(s)
+    }
+    fn scan(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan()
+    }
+    fn max_live_child(&self, p: u64) -> Result<Option<crate::branch::types::Epoch>, FerroError> {
+        self.inner.max_live_child(p)
+    }
+    fn live_child_in_epoch_range(
+        &self,
+        p: u64,
+        lo: crate::branch::types::Epoch,
+        hi: crate::branch::types::Epoch,
+    ) -> Result<bool, FerroError> {
+        self.inner.live_child_in_epoch_range(p, lo, hi)
+    }
+    fn live_count(&self) -> usize {
+        self.inner.live_count()
+    }
+    fn release_id(&self, id: u64) {
+        self.inner.release_id(id)
+    }
+    fn attach_child(
+        &self,
+        p: u64,
+        e: crate::branch::types::Epoch,
+        c: u64,
+    ) -> Result<(), FerroError> {
+        self.inner.attach_child(p, e, c)
+    }
+    fn detach_child(&self, p: u64, e: crate::branch::types::Epoch) -> Result<bool, FerroError> {
+        self.inner.detach_child(p, e)
+    }
+    fn add_arena(&self, b: BranchId, a: crate::branch::types::ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(b, a)
+    }
+    fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+        self.inner.renew_lease(b, l)
+    }
+    fn envelope_of(
+        &self,
+        b: BranchId,
+    ) -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+        self.inner.envelope_of(b)
+    }
+    fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+        self.inner.charge_row_writes(b, n)
+    }
+}
+
+/// Collects what a scan would have printed, so "did a reader see it?" is a question a test can
+/// ask. This is the reason `scan_once` takes its reporter as a parameter.
+#[derive(Default)]
+struct Printed(Mutex<Vec<String>>);
+
+impl Printed {
+    fn push(&self, m: String) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).push(m);
+    }
+    fn text(&self) -> String {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).join("\n")
+    }
+}
+
+/// **D127 — the whole chain, end to end: D124's `Corrupt` must reach a counter and a reader.**
+///
+/// Before this row: `From<BranchError> for FerroError` flattened `Corrupt` into
+/// `FerroError::Branch(String)`; `reap_if_still_expired` mapped that to `Ok(false)`; `scan_once`
+/// matched `Ok(false)` with `{}`. So the sentence naming the parent, the fork epoch and the child
+/// reached no log, no counter and no operator, and a branch that could never be reaped looked
+/// exactly like a healthy one.
+///
+/// **Two expired branches, one armed, in ONE sweep**, because every interesting claim is
+/// comparative:
+///   * the armed branch is counted in `refused_branches`, **not** in `reaped` and **not** in
+///     `failed` — a refusal is not a reap and is not a sweep that stopped;
+///   * the other branch is reaped **in the same pass**, which is the guard on the fix itself: the
+///     absorption exists so one odd branch does not kill the sweep, and a fix that traded a
+///     silent leak for a reaper that stops on the first oddity would be worse than the bug
+///     (SCALE-DESIGN D127, "keep what the swallow is for");
+///   * the printed text names the refused branch **and carries the catalog's own reason**, which
+///     is the only thing that can tell a benign mid-rewrite race from a corrupt CHILD entry.
+///
+/// The reaped branch is the anti-vacuity control throughout: a `scan_once` that refused
+/// everything, or that printed a refusal line unconditionally, fails on it.
+#[test]
+fn d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep() {
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&refusing) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+
+    let doomed = branch_with_pages(&f, EXPIRED, 3);
+    let corrupt = branch_with_pages(&f, EXPIRED, 3);
+    let with_both = f.h.store.live_page_count().unwrap();
+    refusing.arm(corrupt.id);
+
+    let counters = Counters::default();
+    let printed = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| printed.push(m));
+    let stats = counters.snapshot();
+    let text = printed.text();
+
+    // 1. COUNTED, and counted as itself.
+    assert_eq!(
+        stats.refused_branches, 1,
+        "the refusal was not counted. `Ok(false)` used to mean both \"the lease moved\" and \
+         \"the catalog would not answer\", and `scan_once` matched it with an empty arm: under W4 \
+         that is an unbounded leak with no signal at all. Stats: {stats:?}"
+    );
+    assert_eq!(stats.reaped, 1, "exactly one of the two branches was reapable; stats: {stats:?}");
+    assert_eq!(
+        stats.failed, 0,
+        "a refusal was reported as a FAILED sweep. It is not one: nothing was freed, the other \
+         expired branch was still reclaimed, and treating it as a failure would make the reaper \
+         stop on the first oddity — strictly worse than the bug this row fixes."
+    );
+    assert_eq!(stats.scans, 1, "the sweep must have completed; stats: {stats:?}");
+
+    // 2. THE SWEEP CONTINUED. This is what the absorption is for, and the reason the fix is a
+    //    richer outcome rather than propagating the error.
+    assert_eq!(
+        state_of(&f, doomed),
+        BranchState::Reaped,
+        "a refusal on one branch stopped the other expired branch from being reaped"
+    );
+    assert!(
+        f.h.store.live_page_count().unwrap() < with_both,
+        "the healthy branch's pages did not come back, so the refusal aborted the reclamation"
+    );
+
+    // 3. PRINTED, naming the branch AND carrying the catalog's own reason. A count alone cannot
+    //    tell the benign mid-rewrite race from a genuinely corrupt CHILD entry.
+    assert!(
+        text.contains(&corrupt.to_string()),
+        "the refusal reached a reader without naming the branch it was about:\n{text}"
+    );
+    assert!(
+        text.contains(CORRUPT_MARKER),
+        "the refusal reached a reader without the reason the catalog gave. That reason is the \
+         whole output of D124's guard — it names the parent, the fork epoch and the child — and \
+         dropping it leaves an operator a number with nothing to act on:\n{text}"
+    );
+
+    // 4. ANTI-VACUITY. A reaped branch must NOT be described as refused, or the new signal is
+    //    noise an operator learns to ignore — which is this defect again, one level up.
+    assert!(
+        !text.contains("REFUSED to decide on 2"),
+        "the healthy branch was reported as a refusal too:\n{text}"
+    );
+    assert!(
+        text.contains("reaped 1 expired branch"),
+        "the successful reap stopped being reported:\n{text}"
+    );
+}
+
+/// **D127, the other direction: a scan that refuses nothing must say nothing about refusals.**
+///
+/// A detector that fires on a clean run is not a detector. Same fixture, nothing armed, and it is
+/// the control that makes every assertion in the test above mean something: without it, a
+/// `scan_once` that counted and printed a refusal unconditionally would pass them all.
+#[test]
+fn d127_a_clean_sweep_reports_no_refusal_at_all() {
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&refusing) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+
+    let doomed = branch_with_pages(&f, EXPIRED, 3);
+    // Nothing armed. Also present: a branch whose lease has NOT expired, so the pass has
+    // something to leave alone as well as something to reap — the `NotExpired` answer must not
+    // land in `refused_branches` either.
+    let kept = branch_with_pages(&f, FAR_FUTURE, 3);
+
+    let counters = Counters::default();
+    let printed = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| printed.push(m));
+    let stats = counters.snapshot();
+    let text = printed.text();
+
+    assert_eq!(stats.refused_branches, 0, "a clean sweep counted a refusal: {stats:?}");
+    assert_eq!(stats.reaped, 1, "the expired branch was not reaped: {stats:?}");
+    assert!(!text.contains("REFUSED"), "a clean sweep printed a refusal:\n{text}");
+    assert_eq!(state_of(&f, doomed), BranchState::Reaped);
+    assert_eq!(state_of(&f, kept), BranchState::Live, "a live lease was reaped");
+}
+
+/// **D127 — the report is bounded, and the bound never eats the count.**
+///
+/// The reasons are paragraphs (D124's is six lines), so an uncapped list on a database with a
+/// thousand refusals would be a log nobody reads — the same failure as a log nobody writes. What
+/// must survive truncation is the number and the ids, because the number is what says whether
+/// this is the benign mid-rewrite race or a leak.
+#[test]
+fn d127_a_capped_refusal_report_still_states_the_true_count() {
+    let n = REFUSAL_DETAIL_CAP + 3;
+    let refused: Vec<(BranchId, FerroError)> = (0..n)
+        .map(|i| {
+            (
+                BranchId::new(100 + i as u64, 0),
+                FerroError::Branch(format!("reason-number-{i}")),
+            )
+        })
+        .collect();
+    let text = refusal_report(&refused);
+
+    assert!(
+        text.contains(&format!("REFUSED to decide on {n} expired branch(es)")),
+        "the exact count must survive the cap:\n{text}"
+    );
+    for (b, _) in &refused {
+        assert!(text.contains(&b.to_string()), "branch {b} was not named at all:\n{text}");
+    }
+    assert!(text.contains("reason-number-0"), "the first reasons must be spelled out:\n{text}");
+    assert!(
+        text.contains(&format!("and {} more refusal(s)", n - REFUSAL_DETAIL_CAP)),
+        "a truncated report must say how much it truncated:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("reason-number-{}", n - 1)),
+        "the cap did not actually cap anything, so this test proves nothing about it:\n{text}"
     );
 }

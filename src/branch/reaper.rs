@@ -2167,6 +2167,103 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // D127 — the three answers must be three answers.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D127.** `reap_if_still_expired` used to return a `bool`, and `false` was both *"the
+    /// lease moved, leave it alone"* and *"the catalog would not answer, I decline to decide"*.
+    /// This walks all three outcomes in one body so that each is the other two's control: a
+    /// mutant that answers `Refused` for everything fails on the first two arms, and the mutant
+    /// that shipped — `NotExpired` for a refusal — fails on the last two.
+    ///
+    /// The refusal counter is read before and after **every** arm, not only the refusing ones.
+    /// Without that, a counter that incremented unconditionally would satisfy every assertion
+    /// about the refusing arms and say nothing at all.
+    #[test]
+    fn a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved() {
+        let (h, reaper) = setup();
+
+        // ARM 1 — healthy and expired. Reaped, and nothing is refused.
+        let doomed = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        write_pages(&h, doomed, 2);
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(doomed, far_future()).unwrap(),
+                ReapOutcome::Reaped
+            ),
+            "an expired branch with a readable record must be REAPED"
+        );
+        assert_eq!(reaper.refused_reaps(), before, "a successful reap was counted as a refusal");
+
+        // ARM 2 — the lease moved under the sweep. Not expired, and STILL not a refusal: this is
+        // the arm whose answer a refusal used to be indistinguishable from.
+        let kept = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap().branch_id;
+        write_pages(&h, kept, 2);
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(kept, LeaseDeadline::now_millis()).unwrap(),
+                ReapOutcome::NotExpired
+            ),
+            "a branch whose lease has not expired must answer NOT EXPIRED"
+        );
+        assert_eq!(
+            reaper.refused_reaps(),
+            before,
+            "a healthy branch with a live lease was counted as a refusal; that turns the new \
+             signal into noise an operator learns to ignore, which is the defect again"
+        );
+        assert_eq!(
+            h.catalog.get_raw(kept.id).unwrap().state,
+            BranchState::Live,
+            "a NOT EXPIRED answer must not have touched the branch"
+        );
+
+        // ARM 3 — the record cannot be read at all (`get_raw`'s `Branch` arm). This is the
+        // momentary miss `TableBranchCatalog::upsert` opens on a healthy branch, reached here
+        // through an id that was never minted, which produces the same `FerroError::Branch`.
+        let before = reaper.refused_reaps();
+        let outcome = reaper.reap_if_still_expired(BranchId::new(9_999_999, 0), far_future());
+        let why = match outcome.unwrap() {
+            ReapOutcome::Refused(e) => e,
+            other => panic!(
+                "a branch whose record could not be read answered {other:?}. Rounded to \
+                 NOT EXPIRED it is indistinguishable from a healthy branch, which is how D124's \
+                 refusal reached no reader at all."
+            ),
+        };
+        assert!(
+            matches!(why, FerroError::Branch(_)),
+            "the refusal must carry the catalog's own error, or there is nothing to report: {why}"
+        );
+        assert_eq!(reaper.refused_reaps(), before + 1, "the refusal was not counted");
+
+        // ARM 4 — the record reads fine but `reap` itself refuses (`reap`'s `Branch` arm). This
+        // is the site D124's `Corrupt` arrives at from `has_live_children`; a stale generation is
+        // the same arm reached without a corrupt catalog.
+        let live = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        write_pages(&h, live, 2);
+        let stale = live.bump();
+        assert_eq!(stale.id, live.id, "fixture: bump must keep the slot and move the generation");
+        let before = reaper.refused_reaps();
+        assert!(
+            matches!(
+                reaper.reap_if_still_expired(stale, far_future()).unwrap(),
+                ReapOutcome::Refused(_)
+            ),
+            "a reap the catalog refused answered something other than REFUSED"
+        );
+        assert_eq!(reaper.refused_reaps(), before + 1, "the refusal was not counted");
+        assert_eq!(
+            h.catalog.get_raw(live.id).unwrap().state,
+            BranchState::Live,
+            "a refusal must free nothing: refusing is the safe direction precisely because it \
+             leaves the branch exactly as it was"
+        );
+    }
+
             }
         };
     }
