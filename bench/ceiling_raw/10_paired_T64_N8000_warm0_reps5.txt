@@ -1,0 +1,153 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=paired. THE COUNT AND THE UTILISATION, MEASURED TOGETHER.
+
+⚠ LAYER: `TableBranchCatalog` driven directly — the layer the recorded 21x/1.9x pair
+  was measured at, NOT what any shipped front-end does. See MODE=pgwire.
+
+  THREE INSTRUMENT CONFIGURATIONS PER RUNG, because a paired reading is worthless if
+  either instrument is moving the other's number:
+    A  census ON,  probe ON   THE DELIVERABLE: contended/op and U(hold), one loop.
+    B  census ON,  probe OFF  does the phase clock move the COUNT?
+    C  census OFF, probe ON   does the try_lock census move UTILISATION? With the
+                              census off, acquire_unwrap short-circuits to a plain
+                              lock().unwrap(), so C is byte-identical to D123's own
+                              instrument and is also the REPRODUCTION ARM for the
+                              recorded 96.1% -> 8.5% collapse.
+
+  U(hold) is a ratio of two durations taken by ONE instrument inside ONE run, which is
+  the kind D123 §(F4) argues survives a loaded box. ms columns are UPPER BOUNDS.
+  ⛔ contended/op UNDER-reports blocking under barging — see MODE=model's BARGE row.
+# paired_start: 2026-09-22T07:18:12Z  load_at_acquire=s: 37.59 32.08 22.53
+# build at 8f03fe0fd4be +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+# reps=5 N=8000 warm=0; configuration order AND rung order both rotate per rep
+
+RECORDED, for comparison only — bench/d123_serial_attribution.txt §3b, warm=0, T=64,
+a DIFFERENT process on a DIFFERENT night. Reproducing it is configuration C's job.
+   stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)
+      0     4788.6   0.20883   0.20079   0.00804    96.1%
+      3     9019.1   0.11088   0.00941   0.10147     8.5%
+
+================================================================================
+T = 64
+================================================================================
+RAW — every rep, banked before any aggregation.
+  rep          config stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)  contended/op   syncs
+    0  A census+probe    0     2822.6   0.35428   0.28307   0.07121    79.9%       0.97450     472
+    0  A census+probe    1     6957.4   0.14373   0.08440   0.05933    58.7%       0.95063     259
+    0  A census+probe    2     7156.1   0.13974   0.08794   0.05180    62.9%       0.94450     259
+    0  A census+probe    3     6350.7   0.15746   0.01311   0.14436     8.3%       0.84475     251
+    0   B census only    0     2999.9   0.33335       NaN       NaN     NaN%       0.97025     522
+    0   B census only    1     4536.6   0.22043       NaN       NaN     NaN%       0.94425     313
+    0   B census only    2     4936.1   0.20259       NaN       NaN     NaN%       0.94537     281
+    0   B census only    3     5448.0   0.18355       NaN       NaN     NaN%       0.82550     264
+    0    C probe only    0     2322.5   0.43058   0.38162   0.04896    88.6%           NaN     486
+    0    C probe only    1     1793.6   0.55755   0.38176   0.17579    68.5%           NaN     258
+    0    C probe only    2     2628.2   0.38049   0.19224   0.18824    50.5%           NaN     259
+    0    C probe only    3     2830.1   0.35335   0.01344   0.33991     3.8%           NaN     252
+    1   B census only    1     1384.7   0.72217       NaN       NaN     NaN%       0.96688     258
+    1   B census only    2     1470.9   0.67986       NaN       NaN     NaN%       0.96637     256
+    1   B census only    3     2926.6   0.34170       NaN       NaN     NaN%       0.90275     250
+    1   B census only    0      901.4   1.10944       NaN       NaN     NaN%       0.99087     399
+    1    C probe only    1     2858.3   0.34986   0.19903   0.15083    56.9%           NaN     256
+    1    C probe only    2     2965.4   0.33722   0.17041   0.16682    50.5%           NaN     257
+    1    C probe only    3     4362.3   0.22924   0.01200   0.21724     5.2%           NaN     250
+    1    C probe only    0     2006.3   0.49843   0.45084   0.04759    90.5%           NaN     333
+    1  A census+probe    1     3630.3   0.27546   0.13265   0.14281    48.2%       0.95650     255
+    1  A census+probe    2     3504.4   0.28535   0.11885   0.16651    41.6%       0.95325     257
+    1  A census+probe    3     4183.2   0.23905   0.01282   0.22623     5.4%       0.89950     250
+    1  A census+probe    0     2557.1   0.39107   0.35037   0.04070    89.6%       0.98638     334
+    2    C probe only    2     4344.4   0.23018   0.09720   0.13298    42.2%           NaN     256
+    2    C probe only    3     4396.0   0.22748   0.01191   0.21557     5.2%           NaN     250
+    2    C probe only    0     2013.8   0.49659   0.44301   0.05358    89.2%           NaN     408
+    2    C probe only    1     3439.0   0.29078   0.12588   0.16490    43.3%           NaN     255
+    2  A census+probe    2     3523.1   0.28384   0.11690   0.16694    41.2%       0.95388     256
+    2  A census+probe    3     3848.3   0.25985   0.01122   0.24863     4.3%       0.90787     250
+    2  A census+probe    0     2965.4   0.33723   0.29889   0.03834    88.6%       0.98525     321
+    2  A census+probe    1     4282.6   0.23350   0.09700   0.13650    41.5%       0.95100     251
+    2   B census only    2     4402.7   0.22713       NaN       NaN     NaN%       0.94737     255
+    2   B census only    3     4700.9   0.21272       NaN       NaN     NaN%       0.90400     250
+    2   B census only    0     2899.7   0.34486       NaN       NaN     NaN%       0.98462     331
+    2   B census only    1     3976.2   0.25150       NaN       NaN     NaN%       0.95537     251
+    3  A census+probe    3     4291.4   0.23303   0.01282   0.22021     5.5%       0.88900     250
+    3  A census+probe    0     3053.2   0.32753   0.28592   0.04161    87.3%       0.98587     333
+    3  A census+probe    1     3875.9   0.25800   0.10983   0.14817    42.6%       0.95175     255
+    3  A census+probe    2     4078.2   0.24520   0.10032   0.14488    40.9%       0.94675     254
+    3   B census only    3     4233.3   0.23622       NaN       NaN     NaN%       0.89638     250
+    3   B census only    0     2998.5   0.33350       NaN       NaN     NaN%       0.98575     330
+    3   B census only    1     3326.9   0.30058       NaN       NaN     NaN%       0.94788     253
+    3   B census only    2     3531.2   0.28319       NaN       NaN     NaN%       0.94625     253
+    3    C probe only    3     3000.7   0.33326   0.01223   0.32103     3.7%           NaN     250
+    3    C probe only    0     2968.3   0.33690   0.29983   0.03707    89.0%           NaN     328
+    3    C probe only    1     4274.3   0.23396   0.09239   0.14157    39.5%           NaN     253
+    3    C probe only    2     3996.3   0.25023   0.10152   0.14871    40.6%           NaN     255
+    4   B census only    0     3173.2   0.31514       NaN       NaN     NaN%       0.98250     328
+    4   B census only    1     4471.6   0.22364       NaN       NaN     NaN%       0.94888     254
+    4   B census only    2     4578.2   0.21842       NaN       NaN     NaN%       0.94950     254
+    4   B census only    3     4469.9   0.22372       NaN       NaN     NaN%       0.86962     250
+    4    C probe only    0     3107.0   0.32186   0.28447   0.03739    88.4%           NaN     342
+    4    C probe only    1     3836.5   0.26066   0.10548   0.15518    40.5%           NaN     254
+    4    C probe only    2     3825.0   0.26144   0.10597   0.15547    40.5%           NaN     252
+    4    C probe only    3     3950.2   0.25315   0.01238   0.24077     4.9%           NaN     250
+    4  A census+probe    0     2867.7   0.34871   0.30540   0.04331    87.6%       0.98638     323
+    4  A census+probe    1     3910.6   0.25571   0.10600   0.14971    41.5%       0.95513     258
+    4  A census+probe    2     4820.3   0.20746   0.09051   0.11694    43.6%       0.95225     251
+    4  A census+probe    3     4997.6   0.20010   0.01266   0.18744     6.3%       0.91650     250
+
+MEDIANS over 5 reps:
+           config stub  forks/sec     S_eff  HOLD_TOT       gap  U(hold)  contended/op
+   A census+probe    0     2867.7   0.34871   0.29889   0.04161    87.6%       0.98587
+   A census+probe    1     3910.6   0.25571   0.10600   0.14281    42.6%       0.95175
+   A census+probe    2     4078.2   0.24520   0.10032   0.14488    41.6%       0.95225
+   A census+probe    3     4291.4   0.23303   0.01282   0.22021     5.5%       0.89950
+    B census only    0     2998.5   0.33350       NaN       NaN     NaN%       0.98462
+    B census only    1     3976.2   0.25150       NaN       NaN     NaN%       0.94888
+    B census only    2     4402.7   0.22713       NaN       NaN     NaN%       0.94737
+    B census only    3     4469.9   0.22372       NaN       NaN     NaN%       0.89638
+     C probe only    0     2322.5   0.43058   0.38162   0.04759    89.0%           NaN
+     C probe only    1     3439.0   0.29078   0.12588   0.15518    43.3%           NaN
+     C probe only    2     3825.0   0.26144   0.10597   0.15547    42.2%           NaN
+     C probe only    3     3950.2   0.25315   0.01223   0.24077     4.9%           NaN
+
+CROSS-CONTROLS — a paired reading is licensed only if neither instrument moves
+the other's number. Bar: within 25% at every rung.
+  L0  contended/op  A(probe ON) 0.98587  vs  B(probe OFF) 0.98462   ratio 1.001
+  L1  contended/op  A(probe ON) 0.95175  vs  B(probe OFF) 0.94888   ratio 1.003
+  L2  contended/op  A(probe ON) 0.95225  vs  B(probe OFF) 0.94737   ratio 1.005
+  L3  contended/op  A(probe ON) 0.89950  vs  B(probe OFF) 0.89638   ratio 1.003
+  L0  U(hold)       A(census ON) 87.6%  vs  C(census OFF) 89.0%   ratio 0.984
+  L1  U(hold)       A(census ON) 42.6%  vs  C(census OFF) 43.3%   ratio 0.983
+  L2  U(hold)       A(census ON) 41.6%  vs  C(census OFF) 42.2%   ratio 0.986
+  L3  U(hold)       A(census ON) 5.5%  vs  C(census OFF) 4.9%   ratio 1.124
+
+⭐ L0 -> L3 AT T=64, CONFIGURATION A (census+probe, THE DELIVERABLE):
+     HOLD_TOT      0.29889 -> 0.01282 ms   (23.3x DOWN)   [recorded 21x]
+     U(hold)       87.6% -> 5.5%          (15.9x DOWN)   [recorded 11.3x, 96.1->8.5]
+     gap           0.04161 -> 0.22021 ms   (5.3x UP)     [recorded 12.6x]
+     forks/sec     2867.7 -> 4291.4        (1.50x UP)    [recorded 1.9x]  UPPER BOUND
+     contended/op  0.98587 -> 0.89950      (0.91x)        [never recorded: THIS is the new number]
+
+⭐ L0 -> L3 AT T=64, CONFIGURATION C (probe only, D123's own instrument):
+     HOLD_TOT      0.38162 -> 0.01223 ms   (31.2x DOWN)   [recorded 21x]
+     U(hold)       89.0% -> 4.9%          (18.2x DOWN)   [recorded 11.3x, 96.1->8.5]
+     gap           0.04759 -> 0.24077 ms   (5.1x UP)     [recorded 12.6x]
+     forks/sec     2322.5 -> 3950.2        (1.70x UP)    [recorded 1.9x]  UPPER BOUND
+     contended/op  NaN -> NaN      (NaNx)        [never recorded: THIS is the new number]
+
+⭐ HOW TO READ IT — Amendment 2, pre-registered. No fourth outcome is permitted.
+   contended/op RISES as the section shortens ⇒ the gap is park/unpark handoff.
+   it does NOT rise                           ⇒ the remaining time is not threads
+                                                blocking on each other, and
+                                                pre-registered OUTCOME 1 IS DEAD.
+   the counts cannot discriminate             ⇒ a result about the INSTRUMENT, which
+                                                Amendment 2 permits and requires to
+                                                be labelled as one.
+
+⛔ AND THE COMPARATOR IS MODE=model's OPERATING-POINT REFERENCE (b), NOT ZERO. A pure
+   mutex driven at each recorded rung's own arrival process already reads a high
+   contended/op at BOTH ends. 'Still contended at L3' is only evidence for outcome 1
+   if it is HIGHER than what a mutex with no handoff floor reads at that same
+   operating point.
+# end: 2026-09-22T07:20:44Z  load_at_acquire=s: 26.44 33.59 25.06

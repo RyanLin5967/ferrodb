@@ -1,0 +1,42 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=direct. THE L0→L3 KEY-COUNT LADDER, AS A CONTENTION COUNT.
+
+⚠ LAYER: `TableBranchCatalog` driven directly (open_sidecar + cat.fork), holding
+  `logical` and NOTHING ELSE. This is the layer `examples/fork_concurrency.rs` drives
+  and the layer the recorded 21x/1.9x/12.6x pair was measured at. It is NOT what any
+  shipped front-end does — see MODE=pgwire. (E.6; INVENTION-TRIGGER Amendment 1.)
+
+⛔ Stubbed levels are NOT a database. L1 writes no child record; L2 leaks retired
+   slots; L3 also drops the envelope (capability escape) and the parent's live-child
+   entry (GC hole). Every level KEEPS write_header + stage so >=1 page is dirty and
+   the fsync stays real — `syncs` is the check that this held.
+
+   contended/op  = acquisitions of `logical` whose try_lock() failed, per fork.
+                   UPPER bound on blocking (holder may release in the window), so a
+                   LOW value is the STRONG direction. See src/branch/lockcount.rs.
+   acq/op        = acquisitions of `logical` per fork. Free, and it bounds the answer.
+   forks/sec     = UPPER BOUND ONLY. Box not quiet; stamped below. Counts are the evidence.
+# direct_start: 2026-09-22T07:31:48Z  load_at_acquire=s: 33.89 30.78 27.26
+
+  threads  stub     forks       ops   contended/op     acq/op  cont.frac    syncs   f/sync
+       64     0      8000      8000        0.98900     1.0000      98.9%      336     23.8
+       64     1      8000      8000        0.96650     1.0000      96.7%      256     31.2
+       64     2      8000      8000        0.96013     1.0000      96.0%      256     31.2
+       64     3      8000      8000        0.90938     1.0000      90.9%      250     32.0
+    L0→L3 at T=64:  contended/op 0.98900 → 0.90938  (0.92x)   [forks/sec 2479 → 2325, 0.94x, UPPER BOUND]
+
+  CROSS-CHECK — the same rung counted BOTH ways. Thread-local accumulation is used
+  above; the pgwire arm must use process-wide atomics because the library owns its
+  connection threads. If the two modes disagree, one of them is losing counts.
+    T=64 L0  thread-local 0.98650   global-atomic 0.98762   ratio 1.0011
+    (acq/op 1.0000 vs 1.0000; ops 8000 vs 8000)
+
+⭐ THE DISCRIMINATOR (INVENTION-TRIGGER Amendment 2, pre-registered):
+   contention per op RISES as the section shortens  ⇒ the gap is park/unpark handoff.
+   it does NOT rise                                 ⇒ the remaining time is not threads
+                                                      blocking on each other, and
+                                                      pre-registered OUTCOME 1 IS DEAD.
+# end: 2026-09-22T07:32:14Z  load_at_acquire=s: 24.91 28.89 26.69
