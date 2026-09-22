@@ -453,20 +453,23 @@ impl TableBranchCatalog {
         self.upsert(keys::header(), v)
     }
 
-    /// Replace a key's value.
+    /// Replace a key's value, **atomically** — the key is never absent to a concurrent reader.
     ///
-    /// **`BPlusTreeManager::insert` does not replace** — `insert_entry` always inserts, so writing
-    /// an existing key a second time leaves TWO entries and `search` returns whichever the binary
-    /// search lands on. For a catalog that would mean a branch with two records that disagree,
-    /// chosen nondeterministically. Delete-then-insert is the only upsert the storage layer offers.
+    /// `BPlusTreeManager::insert` still does not replace: `insert_entry` always inserts, so
+    /// writing an existing key through it a second time leaves TWO entries and `search` returns
+    /// whichever the binary search lands on. For a catalog that would mean a branch with two
+    /// records that disagree, chosen nondeterministically.
+    ///
+    /// ⛔ This used to be `tree.delete` then `tree.insert`, with **nothing held across the two**.
+    /// `delete` drops the leaf write latch on return and `insert` re-acquires it, so the key did
+    /// not exist for the length of a tree descent on **every ordinary rewrite** — and `core`,
+    /// `get_raw`, `has_live_children`, `max_live_child` and `live_child_in_epoch_range` all read
+    /// it with no lock at all (`logical` is writers-only). D124 is pre-positioned against exactly
+    /// that state on the page paths, and its comments described it as impossible; it was not.
+    /// [`BPlusTreeManager::upsert`] closes the window at the layer that owns the latch.
+    /// SCALE-DESIGN D126; probe in `tests/d126_atomic_upsert.rs` and `mod d126_record_key_probe`.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
-        match self.tree.delete(&key) {
-            Ok(()) => {}
-            // Absent is the normal case for a first write, not an error.
-            Err(FerroError::KeyNotFound) => {}
-            Err(e) => return Err(e),
-        }
-        self.tree.insert(key, value)
+        self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
@@ -1360,6 +1363,169 @@ impl BranchCatalog for TableBranchCatalog {
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)
+    }
+}
+
+#[cfg(test)]
+mod d126_record_key_probe {
+    //! **D126 at the key that matters: the branch RECORD key must never be transiently absent.**
+    //!
+    //! `tests/d126_atomic_upsert.rs` proves the tree primitive. This proves the catalog uses it,
+    //! on the exact key D124's page guards read, and it lives here rather than in `tests/` for one
+    //! reason: the CONTROL has to reproduce the old `upsert` on the real RECORD key, which means
+    //! reaching `self.tree` — private, and deliberately so.
+    //!
+    //! Three arms, in this order, because the later ones are only admissible after the first:
+    //!
+    //! 1. **CONTROL — `tree.delete` then `tree.insert` on `keys::record(id)`.** Exactly what
+    //!    `upsert` was. It MUST make `get_raw` miss, or the probe cannot see the defect and the
+    //!    two zeros below are worthless.
+    //! 2. **TREATMENT — `cat.upsert(keys::record(id), ..)`.** Same key, same readers, same write
+    //!    count, one call in place of two. Must be zero, with at least a comparable number of
+    //!    reads behind that zero.
+    //! 3. **REALISM — `set_root` in a loop.** The actual hot-path caller, fsync and all. Zero.
+    //!
+    //! The reader is `get_raw`, which is what `arena::free_page` and
+    //! `reaper::drain_pending_seeded` call, and it takes no lock: `logical` is writers-only.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    const READERS: usize = 3;
+
+    fn fresh(tag: &str) -> (Arc<TableBranchCatalog>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d126-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{tag}.branchcat"));
+        let _ = std::fs::remove_file(&path);
+        (Arc::new(TableBranchCatalog::open_sidecar(&path, 1).expect("open")), path)
+    }
+
+    #[derive(Debug, Default)]
+    struct Arm {
+        misses: u64,
+        reads: u64,
+    }
+
+    /// Spin `READERS` threads on `get_raw(id)` while the caller rewrites that branch's record.
+    fn probe<W: FnOnce()>(cat: &Arc<TableBranchCatalog>, id: u64, write: W) -> Arm {
+        let stop = Arc::new(AtomicBool::new(false));
+        let misses = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..READERS {
+            let (c, stop, misses, reads) =
+                (Arc::clone(cat), Arc::clone(&stop), Arc::clone(&misses), Arc::clone(&reads));
+            hs.push(std::thread::spawn(move || {
+                let (mut m, mut r) = (0u64, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    // `core`, not `get_raw`: `get_raw` hydrates, which adds an arena range_scan
+                    // between the record read and the answer and would let a miss be masked by
+                    // timing rather than by correctness. The record read is the thing on trial.
+                    if c.core(id).expect("core read").is_none() {
+                        m += 1;
+                    }
+                    r += 1;
+                }
+                misses.fetch_add(m, Ordering::Relaxed);
+                reads.fetch_add(r, Ordering::Relaxed);
+            }));
+        }
+        // Let the readers get going before the rewrites start; otherwise a fast writer can finish
+        // inside thread spawn and the arm reports a zero it never earned. The `reads > 0` assert
+        // at each call site is what actually enforces this.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write();
+        stop.store(true, Ordering::Relaxed);
+        for h in hs {
+            h.join().expect("reader");
+        }
+        Arm { misses: misses.load(Ordering::Relaxed), reads: reads.load(Ordering::Relaxed) }
+    }
+
+    /// Rewrites per arm. Arms 1 and 2 are raw key writes; arm 3 pays an fsync each, so it gets a
+    /// smaller count and its own `reads` assertion rather than a shared one.
+    const RAW_WRITES: usize = 4_000;
+    const SET_ROOT_WRITES: usize = 300;
+
+    #[test]
+    fn the_record_key_is_never_absent_while_it_is_rewritten() {
+        let lease = LeaseDeadline(u64::MAX);
+
+        // ---- 1. CONTROL: the delete-then-insert `upsert` used to be. It must fire. ----
+        let (c1, _p1) = fresh("control");
+        let child = c1.fork(BranchId::TRUNK, lease).expect("fork");
+        let id = child.branch_id.id;
+        let bytes = child.serialize_core();
+        let c1w = Arc::clone(&c1);
+        let control = probe(&c1, id, move || {
+            for _ in 0..RAW_WRITES {
+                match c1w.tree.delete(&keys::record(id)) {
+                    Ok(()) | Err(FerroError::KeyNotFound) => {}
+                    Err(e) => panic!("control delete: {e:?}"),
+                }
+                c1w.tree.insert(keys::record(id), bytes.clone()).expect("control insert");
+            }
+        });
+        println!("D126 catalog CONTROL  (delete+insert): misses={} reads={}", control.misses, control.reads);
+        assert!(control.reads > 0, "the control's readers never ran");
+        assert!(
+            control.misses > 0,
+            "THE PROBE IS NOT DISCRIMINATING. delete-then-insert on the RECORD key leaves it \
+             absent between the two calls by construction, and {READERS} readers over \
+             {RAW_WRITES} rewrites saw it {} times in {} reads. The zeros below mean nothing \
+             until this fires.",
+            control.misses,
+            control.reads
+        );
+
+        // ---- 2. TREATMENT: the same rewrite through the catalog's own `upsert`. ----
+        let (c2, _p2) = fresh("treatment");
+        let child2 = c2.fork(BranchId::TRUNK, lease).expect("fork");
+        let id2 = child2.branch_id.id;
+        let bytes2 = child2.serialize_core();
+        let c2w = Arc::clone(&c2);
+        let treatment = probe(&c2, id2, move || {
+            for _ in 0..RAW_WRITES {
+                c2w.upsert(keys::record(id2), bytes2.clone()).expect("upsert");
+            }
+        });
+        println!("D126 catalog TREATMENT (upsert)      : misses={} reads={}", treatment.misses, treatment.reads);
+        assert_eq!(
+            treatment.misses, 0,
+            "the RECORD key was absent {} times in {} reads while `upsert` rewrote it",
+            treatment.misses, treatment.reads
+        );
+        assert!(
+            treatment.reads >= control.reads / 4,
+            "the treatment arm's readers did only {} reads against the control's {}; its zero is \
+             not comparable to the control's positive count",
+            treatment.reads,
+            control.reads
+        );
+
+        // ---- 3. REALISM: the hot-path caller, whole. ----
+        let (c3, _p3) = fresh("set_root");
+        let child3 = c3.fork(BranchId::TRUNK, lease).expect("fork");
+        let bid = child3.branch_id;
+        let c3w = Arc::clone(&c3);
+        let real = probe(&c3, bid.id, move || {
+            for i in 0..SET_ROOT_WRITES {
+                c3w.set_root(bid, 900_000 + i as u32).expect("set_root");
+            }
+        });
+        println!("D126 catalog set_root                : misses={} reads={}", real.misses, real.reads);
+        assert!(real.reads > 0, "the set_root arm's readers never ran");
+        assert_eq!(
+            real.misses, 0,
+            "`set_root` un-read a live branch's record {} times in {} reads",
+            real.misses, real.reads
+        );
+        // The rewrites actually landed, so the zero is not the zero of a writer that did nothing.
+        assert_eq!(
+            c3.get_raw(bid.id).expect("record").root_page_id,
+            900_000 + (SET_ROOT_WRITES - 1) as u32,
+            "set_root did not write what the arm counted"
+        );
     }
 }
 
