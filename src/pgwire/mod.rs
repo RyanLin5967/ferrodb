@@ -215,11 +215,20 @@ impl ServerContext {
     /// `DEFAULT_LEASE_MILLIS` (15 min) after fork and no arm runs that long. Its real axis is
     /// **expired branches per tick**, and it is still unmeasured.
     ///
-    /// ⇒ **What governs the stand-down rate is the offered EXCLUSIVE rate, and it is measured**
-    /// (`bench/w4_check3_rederived.txt`): on the extended query protocol — what real drivers use —
-    /// it runs from **1.07% at one fork per 200 statements to 95% at one per one**. It is also a
-    /// FIXED POINT, because a stood-down read falls back and therefore announces, so the rate and
-    /// the announcer set drive each other. **Quote a rate only with the fork rate it was taken at.**
+    /// ⇒ **What governs the stand-down rate is the offered EXCLUSIVE rate, and it is measured:**
+    /// on the extended query protocol — what real drivers use — it runs from **1.07% at one fork
+    /// per 200 statements to 95% at one per one**. It is also a FIXED POINT, because a stood-down
+    /// read falls back and therefore announces, so the rate and the announcer set drive each
+    /// other. **Quote a rate only with the fork rate it was taken at.**
+    ///
+    /// ⚠ **PROVENANCE, stated precisely because an earlier version of this comment got it wrong.**
+    /// The evidence is `bench/w4_check3_rederived.txt`, which is **NOT ON `main`** — it lives on
+    /// branch `w4-check3-rederive` at `cef94dc` and has not landed. This comment previously cited
+    /// it as a bare path, so a reader on `main` would `ls bench/` and find nothing, unable to tell
+    /// whether it was deleted or never produced. **A citation must name a tree it can be found
+    /// in.** ⚠ That artifact also cites `extended.rs:290`/`:387`; on `main` those sites are
+    /// `:283`/`:357` — the branch carries measurement instrumentation, so **line numbers are not
+    /// comparable across the two trees** and only the symbols are.
     pub fn begin_read<'a>(
         &self,
         slot: &'a std::sync::atomic::AtomicBool,
