@@ -153,14 +153,26 @@ fn main() {
     println!("  ratio of two different machines. Re-run on a quiet box before quoting it.");
 
     // The key must hold exactly one entry after all of this -- a replace that left duplicates
-    // would be cheap and wrong, and ms/op cannot tell the difference.
-    for k in &targets {
-        let n = tree
-            .range_scan(Bound::Included(k.clone()), Bound::Included(k.clone()))
-            .unwrap()
-            .filter(|e| matches!(e, Ok((kk, _)) if kk == k))
-            .count();
-        assert_eq!(n, 1, "target key ended with {n} entries; a replace must leave exactly one");
+    // would be cheap and wrong, and us/op cannot tell the difference.
+    //
+    // ⚠ The scan is UNBOUNDED, and that is not laziness. A `range_scan` seeded at the key itself
+    // cannot count duplicates: its lower bound lands via `BPlusTreeLeafPage::binary_search`, and
+    // `slice::binary_search` over an array containing duplicates returns *an* index of a match
+    // rather than the first, so a scan seeded that way can begin AFTER a duplicate and report 1
+    // where there are 2 -- a detector that fails in the direction that looks like success. The
+    // same mistake is called out in `tests/d126_atomic_upsert.rs::occurrences`, and this file had
+    // it too. One full pass over {PREPOP} keys, once, at the end of the run.
+    let mut counts = vec![0usize; targets.len()];
+    for e in tree.range_scan(Bound::Unbounded, Bound::Unbounded).unwrap() {
+        let (kk, _) = e.unwrap();
+        for (i, k) in targets.iter().enumerate() {
+            if &kk == k {
+                counts[i] += 1;
+            }
+        }
+    }
+    for (i, n) in counts.iter().enumerate() {
+        assert_eq!(*n, 1, "target {i} ended with {n} entries; a replace must leave exactly one");
     }
     assert!(hits > 0, "the search control never found the key");
 }

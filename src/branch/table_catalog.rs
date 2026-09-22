@@ -1534,6 +1534,87 @@ mod d126_record_key_probe {
             "set_root did not write what the arm counted"
         );
     }
+
+    /// The other hot-path rewrite, read through the method D124's page guards actually call —
+    /// and with a **NEIGHBOUR record that is never rewritten**, read on the same schedule by the
+    /// same threads.
+    ///
+    /// Two things the arms above do not say, which this one does:
+    ///
+    /// * `renew_lease` is the second hot-path caller named in SCALE-DESIGN and reaches `upsert`
+    ///   through `write_record` exactly as `set_root` does. Covered by argument is not covered.
+    /// * The reader here is `get_raw`, which is what `arena::free_page` and
+    ///   `reaper::drain_pending_seeded` call. `core` (above) is the tighter instrument; `get_raw`
+    ///   is the one whose answer the page paths act on, and it hydrates — so a zero from `core`
+    ///   does not by itself say the callers are safe.
+    /// * The neighbour is the negative control **inside the treatment arm**. It shares a leaf with
+    ///   the target, so every page write the rewriter performs passes straight over it. If the
+    ///   lockless reader were unsound in some way that had nothing to do with delete-then-insert —
+    ///   a torn snapshot, a descent that loses a page mid-write — the neighbour would miss too.
+    ///   It must not, and the target's zero is only worth something alongside it.
+    ///
+    /// Measured before the fix with the same shape (`bench/d126_probe_before.txt`): 472 misses on
+    /// the target through `get_raw`, 0 on the neighbour.
+    #[test]
+    fn renew_lease_never_un_reads_the_record_and_the_neighbour_never_moves() {
+        let lease = LeaseDeadline(u64::MAX);
+        let (cat, _p) = fresh("renew");
+        let target = cat.fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+        let neighbour = cat.fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+        cat.get_raw(target.id).expect("target readable before the probe");
+        cat.get_raw(neighbour.id).expect("neighbour readable before the probe");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let target_miss = Arc::new(AtomicU64::new(0));
+        let neighbour_miss = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..READERS {
+            let (c, stop, tm, nm, reads) = (
+                Arc::clone(&cat),
+                Arc::clone(&stop),
+                Arc::clone(&target_miss),
+                Arc::clone(&neighbour_miss),
+                Arc::clone(&reads),
+            );
+            hs.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if c.get_raw(target.id).is_err() {
+                        tm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if c.get_raw(neighbour.id).is_err() {
+                        nm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reads.fetch_add(2, Ordering::Relaxed);
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 0..SET_ROOT_WRITES {
+            cat.renew_lease(target, LeaseDeadline(u64::MAX - i as u64)).expect("renew_lease");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in hs {
+            h.join().expect("reader");
+        }
+        let (tm, nm, r) = (
+            target_miss.load(Ordering::Relaxed),
+            neighbour_miss.load(Ordering::Relaxed),
+            reads.load(Ordering::Relaxed),
+        );
+        println!("D126 catalog renew_lease/get_raw     : target_miss={tm} neighbour_miss={nm} reads={r}");
+        assert!(r > 0, "the readers never ran; this arm proves nothing");
+        assert_eq!(
+            nm, 0,
+            "the NEVER-REWRITTEN neighbour record went missing {nm} times in {r} reads. That is \
+             not the D126 window — nothing rewrites it — so it is an unsound reader or an \
+             unsound page write, and it would invalidate the target's zero."
+        );
+        assert_eq!(
+            tm, 0,
+            "`renew_lease` made `get_raw` miss a live branch's record {tm} times in {r} reads"
+        );
+    }
 }
 
 #[cfg(test)]
