@@ -176,12 +176,42 @@ times: once in the reaper, once in the ledger, once in the closing note that doc
 ledger fix.
 
 
-7. VERIFICATION
+7. VERIFICATION, AND ⛔ A SECOND FALSE CLAIM IN THE RECORD, CORRECTED BY MEASUREMENT
 --------------------------------------------------------------------------------
 `cargo check --all-targets` — clean. This is the gate the earlier commits missed: the
 `refused` → `refused_scans` rename fixed one of two uses in `examples/outer_runtime_lock.rs`
-and missed the other (E0609), and **`cargo test` does not build examples**, so the branch
-read green while not compiling. Fixed on the branch at 9e774fb; re-verified here.
+and missed the other, E0609. Fixed on the branch at 9e774fb.
+
+  ⚠ A REVERSAL OF MY OWN, LOGGED HERE BECAUSE THIS IS WHERE I MADE IT. I first "corrected"
+  the design doc's citation of that line from `:506` to `:512`. That was WRONG: `git show
+  63d57ae:examples/outer_runtime_lock.rs` puts the broken `s.scans + s.refused + s.failed` at
+  **506**, and it reads 512 only at the tip because 9e774fb inserted six comment lines above
+  it. The original number was right for the tree that had the error; my number matched no tree
+  that ever failed to compile. Wrongly correcting a right claim is the same failure as
+  asserting a false one. Reverted, and the doc now carries both numbers with their commits.
+
+⛔ THE REASON RECORDED FOR THAT MISS IS WRONG. SCALE-DESIGN.md's D127 block says
+"**`cargo test` does not build examples**, so the branch looked green", and generalises it to
+"`cargo test` is not a build gate". MEASURED HERE, by reintroducing the exact E0609 at
+`examples/outer_runtime_lock.rs:512` and running two arms on this tree:
+
+    arm A   cargo test --lib --no-run     rc=0    the broken example is never built
+    arm B   cargo test      --no-run      rc=101  error[E0609]: no field `refused` on type
+                                                  `LeaseStats`, examples/outer_runtime_lock.rs:512
+
+A BARE `cargo test` DOES build examples and WOULD have caught this — `cargo test --help` says
+so in its first line ("Execute all unit and integration tests **and build examples** of a
+local package"), and arm B confirms it on this exact defect. What is actually true is
+narrower and sharper: **naming a target (`--lib`, `--test <name>`) turns OFF cargo's automatic
+target selection, and a target-filtered `cargo test` builds no examples.** The earlier run was
+green because it was filtered, not because `cargo test` is blind to examples.
+
+This matters beyond pedantry: the doc's version tells a reader that no `cargo test` invocation
+can be trusted as a build gate, when a bare one is exactly that. The narrower statement is
+also the actionable one — it names the flag that causes the blindness.
+⇒ SCALE-DESIGN.md corrected in place at the sentence that made the claim, per "log the
+reversal where the claim was logged".
+
 (Two pre-existing `unused variable: reaper` warnings from the `reaper_suite!` macro at
 reaper.rs:2100 are present at the BASE commit too — D127 does not touch that test.)
 
