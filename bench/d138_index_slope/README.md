@@ -187,3 +187,25 @@ Per file: `src/tel/log.rs` 5 → 7, `src/tel/tests_durable_log.rs` 24 → 25. Al
 
 ⇒ **Expected, revised: per-target 2479 passed, 0 failed. Go 97 passed, 0 failed.**
 Amendment 1's 2478 is superseded by this line and is left above unedited.
+
+### AMENDMENT 3 — re-derived at the commit that actually ships (append-only)
+
+`d138_new_raw.txt` measured `dfe2c70`. Three review-pass commits followed it, so that artifact
+named a tree that was no longer the one landing. Only one of those commits touched production
+code at all — `Frames::push`, `debug_assert!` + `HashMap::insert` → an `Entry` match — and `push`
+walks no frames in either version, so the measured quantity could not have moved. **That is an
+argument, and a re-run is a measurement, so the re-run was done.**
+
+`d138_ship_raw.txt` is the same instrument (harness `git diff` → 0 lines; `scan_count` module
+diffed identical) over **`66e726c`, the commit that lands**. Result, checked mechanically rather
+than eyeballed — the extracted PARK tables diff **empty**:
+
+    scan/hit 0.0 and scan/miss 0.0 at all 8 rows
+    shadow/hit 125.5 -> 1875.5, shadow/miss 124.5 -> 1874.5, slope 1
+    index-vs-scan disagreements: 0 over 6000 appends
+    classify_append: 0.0 scanned over 1000 calls
+    replay at open of a 1000-frame file: 0 elements walked (was 499500)
+
+⇒ **The verdict at the top of this file holds for the shipping tree, not only for `dfe2c70`.**
+`reduce_slope.py` still reads `d138_new_raw.txt`; `d138_ship_raw.txt` is the re-derivation beside
+it, kept so the record shows the re-run happened rather than asserting it was unnecessary.
