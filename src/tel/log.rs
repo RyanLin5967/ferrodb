@@ -124,29 +124,93 @@ use crate::wal::log::{
     write_str,
 };
 
+/// The frames, and the position index that answers `(branch, txn_id)` without walking them.
+///
+/// **This is D86's shape, copied rather than invented** — `State::push_applied` /
+/// `State::applied_at_cell` in `agent_sql/runtime.rs` pair an append-only `Vec` with a `HashMap`
+/// holding **positions into it**, never a second copy of the data. Both halves live behind the one
+/// mutex and are written by [`Frames::push`] alone, which is what keeps them from diverging: a
+/// second door is how an index acquires a stale entry.
+///
+/// ⛔ **THE POSITIONS ARE STABLE ONLY BECAUSE NOTHING EVER REMOVES OR REORDERS `frames`, AND THAT
+/// FACT IS LOAD-BEARING.** The only two mutations of the `Vec` in this file are [`Frames::push`]
+/// and the in-place `extend` in `MemEffectLog::append`, which grows a frame *at the position it
+/// already occupies*. There is no `sort`, `reverse`, `swap`, `remove`, `retain`, `drain`,
+/// `truncate`, `clear`, `pop` or `insert` on it anywhere — `frames_for` sorts the **copy** it is
+/// about to return, never the stored `Vec`.
+///
+/// ⇒ **If anything ever prunes, compacts or reorders this log, every position stored here is
+/// invalidated and this index must be rebuilt in the same operation — or replaced by a
+/// key → frame map that holds no positions at all.** That is not a style note. A prune that
+/// leaves this map alone hands `append` a position pointing at some *other* transaction's frame,
+/// and one transaction's ops are then extended onto another's: silent, unauditable, and exactly
+/// the class of corruption `classify` exists to refuse. D129's finding that nothing prunes the log
+/// is what makes the cheap index legal; the day that stops being true, this stops being correct.
+#[derive(Default)]
+struct Frames {
+    /// Every frame ever appended, in append order. Append-only, by the contract above.
+    frames: Vec<TxnFrame>,
+    /// Where in `frames` each key's single frame lives. One entry per element of `frames`, because
+    /// `(branch, txn_id)` is what makes a frame unique here — `append` refuses to store a second
+    /// frame under a key it already holds, it extends the first.
+    by_key: HashMap<(BranchId, TxnId), usize>,
+}
+
+impl Frames {
+    /// The only way a frame enters — one door, so the `Vec` and the index cannot disagree.
+    ///
+    /// The caller must have just found the key absent. That is true of the single call site, and
+    /// the `debug_assert` is here so a second one added later fails in the test suite rather than
+    /// silently orphaning the displaced frame's position.
+    fn push(&mut self, frame: TxnFrame) {
+        let at = self.frames.len();
+        debug_assert!(
+            !self.by_key.contains_key(&(frame.branch, frame.txn_id)),
+            "pushing a key the log already holds would orphan the frame at its old position"
+        );
+        self.by_key.insert((frame.branch, frame.txn_id), at);
+        self.frames.push(frame);
+    }
+
+    /// The position of one key's frame, in O(1). Replaces the front-to-back `position`/`find`
+    /// scan that all three of this file's keyed lookups used to pay.
+    fn position(&self, branch: BranchId, txn: TxnId) -> Option<usize> {
+        self.by_key.get(&(branch, txn)).copied()
+    }
+}
+
 /// An `EffectLog` held in memory. Durable enough for a branch that never outlives the process,
 /// which — given non-cooperative lease reaping — is the common case for an agent task.
 ///
 /// It is also [`DurableEffectLog`]'s index, which is why it is not merely a stand-in: every guard
 /// it enforces applies there unchanged, and there is one implementation of the re-append rule
 /// rather than two.
+///
+/// # D138 — the keyed lookups are O(1), not O(frames ever appended)
+///
+/// `append`, `frame` and `classify_append` all search `frames` for the **same** key, and until
+/// D138 each did it with a front-to-back scan of every frame the process had ever appended.
+/// D137 measured the consequence on a parked workload — one live, unfinished branch added exactly
+/// one element to every subsequent scan, forever, at an integer slope of 1 across all 8 sampled
+/// rows — which is the axis the 10⁶-branch objective moves along. All three now go through
+/// [`Frames::position`]. See [`Frames`] for the precondition that makes storing positions legal.
 #[derive(Default)]
 pub struct MemEffectLog {
-    frames: Mutex<Vec<TxnFrame>>,
+    frames: Mutex<Frames>,
 }
 
 impl MemEffectLog {
     pub fn new() -> Self {
-        MemEffectLog { frames: Mutex::new(Vec::new()) }
+        MemEffectLog { frames: Mutex::new(Frames::default()) }
     }
 
     /// Every frame ever appended, in append order.
     pub fn all(&self) -> Vec<TxnFrame> {
-        self.frames.lock().expect("effect log mutex poisoned").clone()
+        self.frames.lock().expect("effect log mutex poisoned").frames.clone()
     }
 
     pub fn len(&self) -> usize {
-        self.frames.lock().expect("effect log mutex poisoned").len()
+        self.frames.lock().expect("effect log mutex poisoned").frames.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -155,12 +219,8 @@ impl MemEffectLog {
 
     /// The frame for one transaction on one branch, if it was ever appended.
     pub fn frame(&self, branch: BranchId, txn: TxnId) -> Option<TxnFrame> {
-        self.frames
-            .lock()
-            .expect("effect log mutex poisoned")
-            .iter()
-            .find(|f| f.branch == branch && f.txn_id == txn)
-            .cloned()
+        let frames = self.frames.lock().expect("effect log mutex poisoned");
+        frames.position(branch, txn).map(|i| frames.frames[i].clone())
     }
 
     /// Classify `frame` against what is stored **without changing anything**.
@@ -173,9 +233,9 @@ impl MemEffectLog {
     /// whether the append is legal at all, and a refused append must not reach the file.
     fn classify_append(&self, frame: &TxnFrame) -> Result<Option<Reappend>, FerroError> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
-        match frames.iter().find(|f| f.branch == frame.branch && f.txn_id == frame.txn_id) {
+        match frames.position(frame.branch, frame.txn_id) {
             None => Ok(None),
-            Some(existing) => classify(existing, frame).map(Some),
+            Some(i) => classify(&frames.frames[i], frame).map(Some),
         }
     }
 }
@@ -294,11 +354,10 @@ fn classify(old: &TxnFrame, new: &TxnFrame) -> Result<Reappend, FerroError> {
 impl EffectLog for MemEffectLog {
     fn append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
         let mut frames = self.frames.lock().expect("effect log mutex poisoned");
-        if let Some(i) = frames
-            .iter()
-            .position(|f| f.branch == frame.branch && f.txn_id == frame.txn_id)
-        {
-            match classify(&frames[i], frame)? {
+        // D138: an O(1) index read where this used to walk every frame ever appended. The two
+        // arms below are unchanged — what changed is only how `i` is found.
+        if let Some(i) = frames.position(frame.branch, frame.txn_id) {
+            match classify(&frames.frames[i], frame)? {
                 Reappend::Retry => return Ok(()),
                 // The open frame grew. **Extended rather than replaced**, and the difference is
                 // not performance (though it is also that: replacing cloned the whole frame on
@@ -311,7 +370,9 @@ impl EffectLog for MemEffectLog {
                 // accepted. Extending here makes the two stores hold the identical frame for
                 // every input rather than for the inputs a producer happens to send.
                 Reappend::Grew { ops, guards, claims } => {
-                    let stored = &mut frames[i];
+                    // Grown **at the position it already occupies**, which is the half of the
+                    // append-only contract that lets [`Frames`] store positions at all.
+                    let stored = &mut frames.frames[i];
                     stored.ops.extend_from_slice(&frame.ops[ops..]);
                     stored.guards.extend_from_slice(&frame.guards[guards..]);
                     stored.claims.extend_from_slice(&frame.claims[claims..]);
@@ -323,9 +384,33 @@ impl EffectLog for MemEffectLog {
         Ok(())
     }
 
+    /// Every frame on one branch from `from_seq`, in `(seq, txn_id)` order.
+    ///
+    /// # ⛔ Deliberately NOT served by D138's index, and it is not an oversight
+    ///
+    /// This is the one search in this file that is **not** keyed by `(branch, txn_id)`: it selects
+    /// on `branch` alone, filters on `seq`, and returns every match. D138's map is keyed by the
+    /// pair and can only answer "where is this one frame", so it cannot serve this at all — a
+    /// branch-keyed `HashMap<BranchId, Vec<usize>>` would be a *second* index, which is the reflex
+    /// `RuntimeCherryLog`'s contract rules out (`agent_sql/runtime.rs`) and which nothing here has
+    /// measured a need for.
+    ///
+    /// ⚠ **CORRECTION to D138's own text, which reads "a fourth, `frames_for()`, has no production
+    /// caller".** It has two: `SurfaceMerger::diff` (`tel/engine.rs`) and
+    /// `RuntimeMerger::diff` (`agent_sql/merge_engine.rs`), both outside `#[cfg(test)]`. The
+    /// D129 harness observed zero calls because its axes never merge, not because the callers do
+    /// not exist — an absence in one workload read as an absence in the code. What is true is the
+    /// weaker, sufficient statement: **this scan is on the MERGE/diff path, not the append write
+    /// path**, so it is not on the axis D137's slope-1 law measures and D138 is not about it.
+    /// Pricing it needs a merging workload, which D136's 255-entry per-page provenance cap
+    /// currently blocks.
+    ///
+    /// Note `out` is a fresh `Vec`: the sort below touches the copy being returned, never the
+    /// stored frames, so it does not disturb any position [`Frames::by_key`] holds.
     fn frames_for(&self, branch: BranchId, from_seq: u64) -> Result<Vec<TxnFrame>, FerroError> {
         let frames = self.frames.lock().expect("effect log mutex poisoned");
         let mut out: Vec<TxnFrame> = frames
+            .frames
             .iter()
             .filter(|f| f.branch == branch && f.seq >= from_seq)
             .cloned()
@@ -1535,6 +1620,47 @@ impl EffectLog for DurableEffectLog {
     }
 }
 
+#[cfg(test)]
+impl MemEffectLog {
+    /// Assert D138's index and the `Vec` agree **per key, in both directions**.
+    ///
+    /// ⛔ **Deliberately not a count.** `by_key.len() == frames.len()` is satisfied by the exact
+    /// pair of errors a broken maintenance path produces together — one entry left pointing at the
+    /// wrong frame, one entry never written — because they are +0 and −0 to the same total. So the
+    /// two directions are walked separately and neither can absorb the other's failure:
+    ///
+    ///   * every map entry points at a frame that really carries that key — catches stale, wrong
+    ///     and out-of-range positions;
+    ///   * every frame is reachable from the map at exactly its own position — catches missing
+    ///     entries and off-by-one positions.
+    ///
+    /// Together those are a bijection, asserted element by element and named in the failure.
+    fn assert_index_agrees(&self, ctx: &str) {
+        let g = self.frames.lock().expect("effect log mutex poisoned");
+        for (key, &at) in &g.by_key {
+            let f = g.frames.get(at).unwrap_or_else(|| {
+                panic!(
+                    "{ctx}: the index sends {key:?} to position {at}, past the end of {} frames",
+                    g.frames.len()
+                )
+            });
+            assert_eq!(
+                (f.branch, f.txn_id),
+                *key,
+                "{ctx}: the index sends {key:?} to position {at}, which holds another key"
+            );
+        }
+        for (i, f) in g.frames.iter().enumerate() {
+            let key = (f.branch, f.txn_id);
+            assert_eq!(
+                g.by_key.get(&key),
+                Some(&i),
+                "{ctx}: frame {i} carries {key:?} and the index does not send that key to {i}"
+            );
+        }
+    }
+}
+
 // The house style in `src/tel/` is an inline `#[cfg(test)] mod tests` per file, and the file below
 // deviates from it for the reason every Phase F lane did: it is large enough that keeping it beside
 // a 700-line implementation would bury both. `#[path]` on a module that is not inside an inline
@@ -1657,5 +1783,138 @@ mod tests {
         assert_eq!(back.guards.len(), 1);
         assert_eq!(back.guards[0].violated_predicate(), "qty >= 0");
         assert_eq!(back.ops.len(), 1);
+    }
+
+    /// `decrement`, plus `extra` further ops on distinct cells. The first op is byte-identical to
+    /// what `decrement(txn, branch, seq, n)` builds, so this **extends** that frame rather than
+    /// contradicting it.
+    fn grown(txn: u64, branch: u64, seq: u64, n: i64, extra: u64) -> TxnFrame {
+        let mut f = decrement(txn, branch, seq, n);
+        for k in 0..extra {
+            f.push_op(Op::new(
+                TableId(1),
+                RowId(2 + k),
+                Some(ColId(2)),
+                OpKind::Add(Delta::Int(-1)),
+            ));
+        }
+        f
+    }
+
+    /// D138 — the position index and the frame `Vec` hold the same thing, asserted **per key**
+    /// through every path that touches either of them.
+    ///
+    /// The workload is built to move positions around under the index rather than to be large:
+    /// keys are interleaved across branches so append order is not grouped, a scattered subset is
+    /// grown **in place** afterwards (the one mutation that writes to the `Vec` without pushing),
+    /// identical retries are replayed (which must change nothing), one re-append is **refused**
+    /// (which must not leave a half-written entry behind), and only then are further new keys
+    /// appended — so an index that mis-records a position during the middle phase is caught by the
+    /// frames that come after it.
+    ///
+    /// The expected positions come from `order`, which this test builds itself from its own
+    /// append sequence. They are never read back out of the log: a test whose expected value is
+    /// whatever the subject says is a test of nothing.
+    #[test]
+    fn the_position_index_and_the_frames_agree_per_key() {
+        let log = MemEffectLog::new();
+
+        // Phase 1 — 24 distinct keys, interleaved so that consecutive positions differ in branch.
+        let mut order: Vec<(BranchId, TxnId)> = Vec::new();
+        for txn in 1u64..=4 {
+            for branch in 1u64..=6 {
+                log.append(&decrement(txn, branch, 0, 1)).unwrap();
+                order.push((BranchId::new(branch, 0), TxnId(txn)));
+            }
+        }
+        log.assert_index_agrees("after 24 interleaved new keys");
+
+        // Phase 2 — grow a scattered subset IN PLACE. Nothing may move, and nothing may be added.
+        let grew: [(u64, u64); 4] = [(1, 3), (3, 1), (4, 6), (2, 2)];
+        for (txn, branch) in grew {
+            log.append(&grown(txn, branch, 0, 1, 2)).unwrap();
+        }
+        log.assert_index_agrees("after four in-place grows");
+
+        // What is stored for a key now: the grown frame for the four above, the original for the
+        // rest. The test tracks this itself rather than asking the log what it holds.
+        let stored = |branch: BranchId, txn: TxnId| -> TxnFrame {
+            if grew.contains(&(txn.0, branch.id)) {
+                grown(txn.0, branch.id, 0, 1, 2)
+            } else {
+                decrement(txn.0, branch.id, 0, 1)
+            }
+        };
+
+        // Phase 3 — byte-identical retries, over both a grown key and un-grown ones.
+        // `Reappend::Retry` stores nothing.
+        for (txn, branch) in [(1u64, 1u64), (4, 6), (2, 5)] {
+            log.append(&stored(BranchId::new(branch, 0), TxnId(txn))).unwrap();
+        }
+        log.assert_index_agrees("after identical retries");
+
+        // Phase 4 — a re-append that CONTRADICTS what is stored. It must be refused, and a
+        // refusal must not touch the index: an entry written before the classify would point at a
+        // frame that was never stored.
+        let err = log.append(&decrement(2, 2, 0, 99)).unwrap_err();
+        assert!(
+            format!("{err}").contains("does not extend"),
+            "expected the contradiction refusal, got: {err}"
+        );
+        log.assert_index_agrees("after a refused re-append");
+
+        // Phase 5 — more new keys, after all of the above.
+        for branch in 1u64..=6 {
+            log.append(&decrement(9, branch, 0, 1)).unwrap();
+            order.push((BranchId::new(branch, 0), TxnId(9)));
+        }
+        log.assert_index_agrees("after new keys following the grows");
+
+        // The index agrees with the order THIS TEST recorded, key by key — not with an order read
+        // back out of the log.
+        {
+            let g = log.frames.lock().unwrap();
+            for (want_at, key) in order.iter().enumerate() {
+                assert_eq!(
+                    g.by_key.get(key),
+                    Some(&want_at),
+                    "{key:?} was the {want_at}th distinct key appended; the index disagrees"
+                );
+                assert_eq!(
+                    (g.frames[want_at].branch, g.frames[want_at].txn_id),
+                    *key,
+                    "position {want_at} does not hold the {want_at}th key appended"
+                );
+            }
+            assert!(
+                g.by_key.get(&(BranchId::new(1, 0), TxnId(777))).is_none(),
+                "the index holds a key that was never appended"
+            );
+        }
+
+        // And the three production lookups that now read the index return the right frame for
+        // EVERY key — per key, so a lookup that works for one and not another cannot hide.
+        for (i, (branch, txn)) in order.iter().enumerate() {
+            let got = log
+                .frame(*branch, *txn)
+                .unwrap_or_else(|| panic!("frame() lost {branch:?}/{txn:?} at position {i}"));
+            assert_eq!((got.branch, got.txn_id), (*branch, *txn));
+            // `classify_append` reads the same index: a frame identical to what is stored is a
+            // `Retry`, and `Retry` is only reachable when the key was FOUND. `None` here would
+            // mean the index reported the key absent.
+            assert!(
+                matches!(log.classify_append(&stored(*branch, *txn)), Ok(Some(Reappend::Retry))),
+                "classify_append did not find {branch:?}/{txn:?} through the index (position {i})"
+            );
+        }
+        assert!(
+            log.frame(BranchId::new(1, 0), TxnId(777)).is_none(),
+            "frame() invented a frame for a key that was never appended"
+        );
+        // A different GENERATION of the same branch id is a different key, and must not collide.
+        assert!(
+            log.frame(BranchId::new(1, 1), TxnId(1)).is_none(),
+            "the index ignored the branch generation"
+        );
     }
 }

@@ -1558,3 +1558,72 @@ fn the_log_opens_on_a_real_file_and_recovers_from_it() {
     assert_eq!(std::fs::metadata(&tel).unwrap().len(), clean);
     assert_eq!(log.frame(b(1), TxnId(7)).unwrap().ops.len(), 2);
 }
+
+/// **D138 — the position index is rebuilt correctly by REPLAY, not only by live appends.**
+///
+/// `DurableEffectLog::open` reconstructs its `MemEffectLog` by feeding every record back through
+/// `mem.append`, and replay is the one caller that drives both index paths — a `FrameOpen` pushes
+/// a new key, a `FrameExtend` grows a frame at the position the earlier open put it — in a
+/// different order from the live workload that wrote the file. An index maintained correctly in
+/// one and not the other passes every in-memory test and still hands the restarted store a
+/// position pointing at another transaction's frame.
+///
+/// Membership is asserted **per key in both directions** by `assert_index_agrees`; the
+/// `frame()`-per-key loop below is the behavioural half, so a correct-looking index that no lookup
+/// actually reads cannot pass this.
+#[test]
+fn the_position_index_survives_a_replay_intact() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+
+    // Interleaved across branches, with growth landing on frames that are NOT at the tail — so a
+    // replay that extended "the last frame" rather than "the frame at this key's position" is
+    // caught.
+    let mut order: Vec<(BranchId, TxnId)> = Vec::new();
+    {
+        let log = open_on(&fabric).unwrap();
+        for txn in 1u64..=3 {
+            for branch in 1u64..=4 {
+                log.append(&decrement(txn, branch, 0, 1, 1)).unwrap();
+                order.push((b(branch), TxnId(txn)));
+            }
+        }
+        // Grow three frames that are already buried under later ones.
+        for (txn, branch) in [(1u64, 2u64), (2, 4), (1, 1)] {
+            log.append(&grown(txn, branch, 0, &[(1, 1), (5, 2)])).unwrap();
+        }
+        log.append(&kitchen_sink(7, 9)).unwrap();
+        order.push((b(9), TxnId(7)));
+        log.mem.assert_index_agrees("before the restart");
+    }
+
+    let log = DurableEffectLog::with_storage(TEL, fabric.restart().open(TEL)).unwrap();
+    assert_eq!(log.recovery().frames, 13, "the frames were not all replayed");
+    assert_eq!(log.recovery().extensions, 3, "the three growths did not replay as extensions");
+
+    log.mem.assert_index_agrees("after the replay");
+
+    // The index must send each key to the position this test's own append order put it in — and
+    // the grown frames must still be at their original positions, not moved to the tail.
+    {
+        let g = log.mem.frames.lock().unwrap();
+        for (want_at, key) in order.iter().enumerate() {
+            assert_eq!(
+                g.by_key.get(key),
+                Some(&want_at),
+                "after replay, {key:?} was the {want_at}th key opened and the index disagrees"
+            );
+        }
+    }
+
+    // Behavioural half: every key is reachable through the lookup that reads the index, and a key
+    // that was never written is not.
+    for (branch, txn) in &order {
+        let got = log
+            .frame(*branch, *txn)
+            .unwrap_or_else(|| panic!("frame() lost {branch:?}/{txn:?} across the replay"));
+        assert_eq!((got.branch, got.txn_id), (*branch, *txn));
+    }
+    assert_eq!(log.frame(b(2), TxnId(1)).unwrap().ops.len(), 2, "a grown frame lost its tail");
+    assert_eq!(log.frame(b(3), TxnId(1)).unwrap().ops.len(), 1, "an ungrown frame gained ops");
+    assert!(log.frame(b(1), TxnId(999)).is_none(), "the replayed index invented a key");
+}
