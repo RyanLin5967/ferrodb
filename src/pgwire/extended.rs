@@ -299,10 +299,14 @@ impl Statement {
         // what `Catalog::epoch` tracks, so a snapshot that is current for the epoch is current for
         // this. `read_catalog` takes the exclusive lock only on first use and after a schema
         // change; `ctx.catalog()` took it for EVERY `Kind::Sql`, including the ones `try_run_read`
-        // then ran on the shared path, so a plain `SELECT 1` announced a writer and drained every
-        // reader at parse time. Measured at 1,604 of 6,369 announcements (~25%) in the deciding
-        // arm — and this is NOT a W4 rescue: it moves a system already pinned against its ceiling
-        // at high fork rates, and is worth several times as much one decade of fork rate away.
+        // then ran on the shared path — so a pure reader such as `SELECT c FROM t` announced a
+        // writer and drained every other connection's in-flight read, at PARSE time, before it ran
+        // on the shared path and took nothing. ⚠ Not `SELECT 1`, which the enclosing `if let` above
+        // has already answered as a liveness probe: `bench/d151_e6_before.txt`'s A0 control counts
+        // ZERO for it, before this change as much as after. Measured at 1,604 of 6,369
+        // announcements (~25%) in the deciding arm — and this is NOT a W4 rescue: it moves a system
+        // already pinned against its ceiling at high fork rates, and is worth several times as much
+        // one decade of fork rate away.
         let catalog = ctx.read_catalog(catalog_cache);
         let param_oids = params::infer_types(&stmt, nparams, declared, catalog);
         let fields =
