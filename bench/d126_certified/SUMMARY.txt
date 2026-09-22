@@ -1,0 +1,42 @@
+# CERTIFICATION EVIDENCE — D126's landing green at head=8d2b673
+
+Banked 2026-09-22 by the THIRD dispatch of D126. This verdict certified the code that D126
+landed, and it existed ONLY in $VERIFY_OUT/SUMMARY.txt — which verify-suite.sh writes with a
+TRUNCATING redirect to a fixed path, here under target/, which is gitignored. The next run into
+that directory destroys it. Main's commits bb443c4 and ac2ab26 exist because exactly that happened
+to D124's and D101's verdicts; this is the same loss, banked before it could happen a third time.
+
+⚠ Distinct LABELS do not protect SUMMARY.txt — only a distinct VERIFY_OUT directory does.
+
+## The harness's own lines, verbatim
+```
+d126-8d2b673: mode=whole rc=0 passed=2474 failed=0 build_errors=0 head=8d2b673 log=/Users/idide/wt/ferrodb-wf_e78d06ad-550-2/target/verify-out-d126-r2/suite-d126-8d2b673.log
+d126-8d2b673: go rc=0 passed=97 failed=0 log=/Users/idide/wt/ferrodb-wf_e78d06ad-550-2/target/verify-out-d126-r2/suite-d126-8d2b673.go.log
+```
+
+## Provenance
+- suite-d126-8d2b673.log  242894 bytes  sha256=7f06a6747b59b257e9fecdebdcc1e7f4acca5fa421a7a086e3d645149a4bc93e
+- suite-d126-8d2b673.go.log  17285 bytes  sha256=2df126b030e96a25c753439a9e0da79f1f14d5257829aadf6131fb77a9c0670e
+- prepush-d126-8d2b673.log — the CI-parity checks (`-D dead_code`, the FFI gate, the Windows
+  cfg arms), run at the same tip. PREPUSH_EXIT=0. D126 REMOVES caller sites, which is precisely
+  the shape prepush exists to catch and that a green suite structurally cannot see: `cargo test`
+  compiles with `cfg(test)`, where a test module can keep an otherwise-orphaned item alive.
+
+## What it certifies
+head=8d2b673 — the D126 branch tip AFTER merging main's D125 / D101 / D110 / D114 work in, i.e.
+the exact tree that main's merge commit 2bc80fd landed. certify-head.sh confirmed suite head ==
+landing commit; staleness.sh reported COVERED; prepush.sh OK.
+
+## An earlier green on this same branch — SUPERSEDED, recorded so it is not re-quoted
+head=34549e4: mode=whole rc=0 passed=2468 failed=0 build_errors=0, go rc=0 passed=97 failed=0.
+
+That tip did NOT contain main's D125 merge, which touches `src/branch/arena.rs` — the one file
+D126 also edits. It was certified, and then main moved underneath it before it could land. **It
+is superseded by 8d2b673 and must not be cited as D126's certification.** The count difference,
+2468 -> 2474, is D125's tests arriving; nothing of D126's moved between the two runs.
+
+⚠ The reason this section exists at all is the failure mode certify-head.sh was written for,
+arriving from the other side: that guard catches a suite whose BRANCH moved after the run, and
+this was a suite whose BASE moved after the run. Both produce a green that names a tree nobody
+ended up shipping. `staleness.sh` is the half that answers the base question, and it has to be
+re-asked at land time, not once at the start.
