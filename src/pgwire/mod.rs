@@ -120,6 +120,30 @@ pub struct ServerContext {
 static CATALOG_ACQUISITIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// ⛔ CEILING MEASUREMENT SCAFFOLD — must never merge. See `src/branch/lockcount.rs`.
+///
+/// Acquisitions of [`ServerContext::catalog`] whose `try_lock()` failed: the lock was held by
+/// another connection at that instant, so the uninstrumented `lock()` would have gone on to wait.
+/// E.6 counted only HOW MANY times the outer mutex is taken; this counts how many of those
+/// COLLIDED, which is the quantity the 1.9×-ceiling question turns on.
+#[cfg(feature = "lock_census")]
+static CATALOG_CONTENDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Contended acquisitions of [`ServerContext::catalog`], or `None` when the census was not
+/// compiled in. Same `Option` discipline and same reason as [`catalog_acquisitions`]: a build that
+/// was not measuring must not be readable as a lock that was never contended.
+pub fn catalog_contended() -> Option<u64> {
+    #[cfg(feature = "lock_census")]
+    {
+        Some(CATALOG_CONTENDED.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "lock_census"))]
+    {
+        None
+    }
+}
+
 /// Exclusive acquisitions of [`ServerContext::catalog`] in this process, or `None` when the
 /// census was not compiled in (`--features lock_census`).
 ///
@@ -178,6 +202,25 @@ impl ServerContext {
     /// statement. The data behind the lock is the on-disk catalog, which is reloadable, so the
     /// surviving connections are better served by continuing.
     pub fn catalog(&self) -> CatalogGuard<'_> {
+        // ⛔ CEILING SCAFFOLD, census builds only. `try_lock` first so a COLLIDING acquisition is
+        // distinguishable from a free one. This is not an extra mechanism on the acquire path:
+        // `Mutex::lock` already begins with this same uncontended compare-exchange and only parks
+        // after it fails, so `WouldBlock` is exactly the condition under which the uninstrumented
+        // path would have gone on to wait. Failure is an UPPER bound (the holder may release in
+        // the window); success is exact. See `src/branch/lockcount.rs`.
+        #[cfg(feature = "lock_census")]
+        let inner = match self.catalog.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                CATALOG_CONTENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match self.catalog.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        #[cfg(not(feature = "lock_census"))]
         let inner = match self.catalog.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),

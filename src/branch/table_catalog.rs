@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use crate::branch::group_commit::CommitGroup;
 /// ⛔ D123 MEASUREMENT SCAFFOLD — must never merge. See `src/branch/d123_probe.rs`.
 use crate::branch::d123_probe as probe;
+/// ⛔ CEILING MEASUREMENT SCAFFOLD — must never merge. See `src/branch/lockcount.rs`.
+use crate::branch::lockcount;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
@@ -808,7 +810,7 @@ impl TableBranchCatalog {
     /// from reaching for a whole-record write instead of naming the field it means.
     #[cfg(test)]
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let old = self.core(record.branch_id.id)?;
         self.write_record(record, old.as_ref())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
@@ -852,7 +854,7 @@ impl BranchCatalog for TableBranchCatalog {
             // ⛔ SCAFFOLD: named `g` rather than `_g` so the unlock can be bracketed explicitly.
             // Rust drops in reverse declaration order, so a guard declared first unlocks LAST —
             // after the local records are freed. See `d123_probe::PH_DROPS`.
-            let g = self.logical.lock().unwrap();
+            let g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
             probe::record(probe::PH_WAIT, t_wait);
             let t_hold = probe::mark();
 
@@ -989,6 +991,9 @@ impl BranchCatalog for TableBranchCatalog {
         self.durable(seq)?;
         probe::record(probe::PH_DURABLE, t_dur);
         probe::bump_fork();
+        // ⛔ CEILING SCAFFOLD. Counted by the SAME instrument that counts the acquisitions, so
+        // `contended per operation` is one instrument's ratio and not two bookkeepings divided.
+        lockcount::bump_op();
         Ok(child)
     }
 
@@ -1009,7 +1014,7 @@ impl BranchCatalog for TableBranchCatalog {
         // no new lock-order edge. The whole read-modify-write is inside it: what this writes back
         // is a record read microseconds ago under the same lock, not the snapshot its caller took
         // before copying up to 256 MiB of pages.
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         core.check_readable(branch)?;
         let depth = self
@@ -1047,7 +1052,7 @@ impl BranchCatalog for TableBranchCatalog {
         // without touching the record. The narrowing is compared against what is IN FORCE under
         // the lock, not against a snapshot the caller read — two restrictions racing now leave the
         // narrower one standing instead of whichever wrote last.
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         core.check_readable(branch)?;
         if let Some(current) = self.envelope_bytes(branch.id)? {
@@ -1067,7 +1072,7 @@ impl BranchCatalog for TableBranchCatalog {
         expect: BranchState,
         to: BranchState,
     ) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
         // second half of every reap, and `check_readable` refuses `Reaping` outright.
@@ -1112,7 +1117,7 @@ impl BranchCatalog for TableBranchCatalog {
     }
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         // HYDRATED, not core. `core` returns a record whose `arenas` is empty, and `write_record`
         // makes the arena span match the record it is given - so writing back a core record
         // DELETES every arena the branch owns. The page store records an arena by appending to
@@ -1303,7 +1308,7 @@ impl BranchCatalog for TableBranchCatalog {
         if id == 0 {
             return;
         }
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         // Refuse while the slot still has live children - that set decides the fate of pages
         // parked under this branch's name. Errors are swallowed to match the inherent method's
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
@@ -1330,7 +1335,7 @@ impl BranchCatalog for TableBranchCatalog {
         fork_epoch: Epoch,
         child_id: u64,
     ) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         // **D124 — refuse to CREATE an entry that can never resolve.** The value written here is
         // a child branch id, and both resolvers (`child_liveness`, `live_child_at`) later ask
         // that child's own record whether the entry is a pin. An entry naming a branch that was
@@ -1358,7 +1363,7 @@ impl BranchCatalog for TableBranchCatalog {
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1387,7 +1392,7 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // The generation check is the same story: `get_mut`-by-id alone let a STALE handle whose
         // slot had been recycled attach an arena to the slot's new occupant.
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         core.check_readable(branch)?;
         self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
@@ -1399,7 +1404,7 @@ impl BranchCatalog for TableBranchCatalog {
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
         // back would delete the branch's.
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
@@ -1427,7 +1432,7 @@ impl BranchCatalog for TableBranchCatalog {
         // Under the logical lock so the read-modify-write cannot lose a concurrent charge, and so
         // it cannot discard a `set_root` or `renew_lease` that landed in the window: only the
         // envelope key is written back, never a whole stale record.
-        let _g = self.logical.lock().unwrap();
+        let _g = lockcount::acquire_unwrap(&self.logical, lockcount::LK_LOGICAL);
         let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         rec.check_readable(branch)?;
         let mut env = self.envelope_bytes(branch.id)?.ok_or_else(|| {
