@@ -83,6 +83,7 @@ use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::tel::frame::TxnFrame;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::tel::guard::{ArithOp, CmpOp, Guard, GuardExpr};
 use crate::tel::ids::{ColId, RowId, TableId, TxnId};
 use crate::tel::merge::{ConflictKind, ConflictReport, MergeOutcome, MergePolicy};
@@ -93,6 +94,82 @@ use crate::wal::txn::{ReadView, TxnManager};
 /// Default lease on an agent branch. Leases are non-cooperative: expiry does not require the
 /// client to call anything (DESIGN.md exit criterion 8).
 pub const DEFAULT_LEASE_MILLIS: u64 = 15 * 60 * 1000;
+
+/// **D114 instrument — how many ops the `ours`-side cell scan TOUCHED, and how many it KEPT.**
+///
+/// A wall-clock number on this box is an upper bound that moves with the build fleet; these are
+/// integers, and an integer does not move when the machine is loaded. That is the whole reason
+/// they exist, and it is the same reason `wal::log::FSYNC_CALLS` exists.
+///
+/// The pair is what separates the two mechanisms that both look linear from the outside:
+///
+/// * `EXAMINED` counts every op the filter looked at — `snapshot.ops.len()` per changed cell,
+///   because `filter().map().collect()` has no early exit. This is the cost an INDEX removes.
+/// * `MATCHED` counts the ops that survived, which `compose_ops` must then fold. This is the
+///   cost an index does NOT remove, because the fold still has to see them.
+///
+/// If `EXAMINED` grows and `MATCHED` does not, the scan is the defect. If both grow together,
+/// indexing divides by the cell count and changes no complexity class — which is exactly the
+/// trap D86's attempt 1 fell into, and it reported it rather than shipping it.
+///
+/// ⚠ Counted per CELL, not per op: one relaxed add per changed cell (four per merge in these
+/// harnesses) against a scan of thousands, so the instrument cannot create the slope it measures.
+/// A per-op `fetch_add` would have been ~10x the cost of the comparison it wraps.
+pub static OURS_SCAN_EXAMINED: AtomicU64 = AtomicU64::new(0);
+pub static OURS_SCAN_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `(examined, matched)` since process start. Read twice and subtract to scope it to a phase.
+pub fn ours_scan_counters() -> (u64, u64) {
+    (
+        OURS_SCAN_EXAMINED.load(AtomicOrdering::Relaxed),
+        OURS_SCAN_MATCHED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
+/// cell, in the order it wrote them, for `compose_ops` to fold.
+///
+/// # ⛔ D114 — yes, this is a full scan per changed cell. MEASURED, and it is NOT the cost.
+///
+/// If you are here because you noticed that the caller computes `theirs` on the very next line via
+/// `concurrent_op` — which **D86 indexed** down to a `partition_point` — and that this side was
+/// left linear: that reading is correct, and it has already been measured. Do not index it.
+///
+/// The scan is exactly `delta x ops`, confirmed to a ratio of **1.000** by a counter. It is also
+/// invisible: driving `examined` up **128.5x** moved merge latency 0.93x-1.20x, and a
+/// configuration walking **32x more ops** merges FASTER than one walking fewer with a bigger
+/// delta. **Merge cost tracks the DELTA, not this op log.** The curve, both directions, 15/15
+/// merges applied, is `bench/d114_ours_side_scan.md` with raw runs in `bench/d114_before.txt`.
+///
+/// Two reasons indexing it would be a mistake rather than merely useless. First, `evaluate_merge`
+/// already clones this whole Vec once per merge (`ops: ws.frame.ops.clone()`), so the merge is
+/// O(ops) regardless and the scan only adds a factor of the delta — never a complexity class.
+/// Second, it would be the THIRD wrong mechanism proposed for a slope on this exact code (D68,
+/// D69-REOPEN, D114); the first two were also read correctly off the source and also wrong.
+///
+/// ⚠ If you are looking for a real quadratic on this path, it is in `stage_all`, which clones the
+/// whole frame once **per statement** — measured at exponent 1.95, and 200x larger than this.
+///
+/// One function rather than the three identical iterator chains that were here before
+/// (`evaluate_merge`, `merge_into`, `sibling_op`) — they differed only in which `Vec<Op>` they
+/// read, and a defect in a scan repeated three times is a defect that gets fixed twice. The
+/// counting is why it is worth a call: `examined` has to be taken from the iterator that actually
+/// walks the ops, not computed as `ops.len()` from outside, or the instrument is an assertion
+/// about the code rather than a reading of it.
+fn ours_ops_on_cell(ops: &[Op], tbl: TableId, row: RowId, col: ColId) -> Vec<OpKind> {
+    let mut examined = 0u64;
+    let kinds: Vec<OpKind> = ops
+        .iter()
+        .filter(|o| {
+            examined += 1;
+            o.tbl == tbl && o.row == row && o.col == Some(col)
+        })
+        .map(|o| o.kind.clone())
+        .collect();
+    OURS_SCAN_EXAMINED.fetch_add(examined, AtomicOrdering::Relaxed);
+    OURS_SCAN_MATCHED.fetch_add(kinds.len() as u64, AtomicOrdering::Relaxed);
+    kinds
+}
 
 /// Everything the runtime needs to reach the shared tables, with the catalog EXCLUSIVELY.
 ///
@@ -3789,14 +3866,8 @@ impl AgentRuntime {
                                 continue;
                             }
                             let col = ColId(idx as u32);
-                            let ours = compose_ops(
-                                &src.ops
-                                    .iter()
-                                    .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
-                                    .map(|o| o.kind.clone())
-                                    .collect::<Vec<_>>(),
-                            )
-                            .unwrap_or(OpKind::Assign(v[idx].clone()));
+                            let ours = compose_ops(&ours_ops_on_cell(&src.ops, tbl, row, col))
+                                .unwrap_or(OpKind::Assign(v[idx].clone()));
                             // The SIBLING's op for the same cell, which is what makes this a
                             // three-way merge rather than a replay. `concurrent_op` cannot answer
                             // here: it reads `state.applied`, the log of what has been PUBLISHED,
@@ -3975,12 +4046,7 @@ impl AgentRuntime {
         base: &[Value],
         idx: usize,
     ) -> Option<OpKind> {
-        let ops: Vec<OpKind> = tgt
-            .ops
-            .iter()
-            .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
-            .map(|o| o.kind.clone())
-            .collect();
+        let ops: Vec<OpKind> = ours_ops_on_cell(&tgt.ops, tbl, row, col);
         if !ops.is_empty() {
             return compose_ops(&ops).ok();
         }
@@ -4377,15 +4443,8 @@ impl AgentRuntime {
                             continue;
                         }
                         let col = ColId(idx as u32);
-                        let ours = compose_ops(
-                            &snapshot
-                                .ops
-                                .iter()
-                                .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
-                                .map(|o| o.kind.clone())
-                                .collect::<Vec<_>>(),
-                        )
-                        .unwrap_or(OpKind::Assign(v[idx].clone()));
+                        let ours = compose_ops(&ours_ops_on_cell(&snapshot.ops, tbl, row, col))
+                            .unwrap_or(OpKind::Assign(v[idx].clone()));
                         let theirs = self.concurrent_op(tbl, row, col, snapshot.fork_seq, &now, b, idx);
                         let cell = CellMerge {
                             tbl,
