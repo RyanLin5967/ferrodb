@@ -360,6 +360,54 @@ fn model_cell_barrier(t: usize, hold: u64) -> ModelCell {
     }
 }
 
+/// ⛔ THE OPERATING-POINT REFERENCE, REBUILT FROM **THIS** RUN'S OWN NUMBERS.
+///
+/// `mode_model`'s reference (b) is parameterised by `bench/d123_serial_attribution.txt` §3b —
+/// a different process on a different night. Comparing this session's L3 count against a model
+/// built from THAT operating point is the same two-instruments-two-moments error the whole
+/// re-run exists to avoid, and it is the weakest joint in the argument.
+///
+/// So: hand this the hold and cycle measured by `mode_paired` in THIS session, and it reports
+/// what a bare `Mutex` with no handoff floor, no tree and no fsync reads at that exact arrival
+/// process. `hold_ms` is HOLD_TOTAL per fork; `cycle_ms` is `T * S_eff`, the per-thread cycle.
+/// The outside interval is a SLEEP, so a thread between acquisitions leaves the runnable set as
+/// it does inside `durable()`'s fsync — a spin would oversubscribe a ~12-core box 5x and inflate
+/// every reading.
+fn mode_opref(hold_ms: f64, cycle_ms: f64, t: usize) {
+    println!("CEILING — MODE=opref. A PURE MUTEX AT AN OPERATING POINT YOU SUPPLY.");
+    println!("LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock.");
+    println!("⚠ Feed it THIS session's measured hold and cycle, not a recorded one.");
+    stamp("opref_start");
+    let spins_per_sec = calibrate_spin();
+    println!("  spin calibration: {spins_per_sec:.3e} spins/sec single-threaded");
+    println!("  asked for: T={t}  hold={hold_ms} ms  cycle={cycle_ms} ms  (offered rho = {:.5})",
+        hold_ms / cycle_ms * t as f64);
+    println!();
+    println!("  {:>18} {:>4} {:>9} {:>14} {:>8} {:>14} {:>10} {:>9} {:>7}",
+        "cell", "T", "hold", "outside", "ops", "contended/op", "acq/op", "queue_max", "U_ach");
+    let hold = (hold_ms / 1000.0 * spins_per_sec).round() as u64;
+    let out = std::time::Duration::from_secs_f64(((cycle_ms - hold_ms).max(0.0)) / 1000.0);
+    let c = model_cell_ex(t, 200, hold, 0, Some(out));
+    let u = (c.ops as f64) * (hold_ms / 1000.0) / c.secs;
+    println!(
+        "  {:>18} {:>4} {:>9} {:>14} {:>8} {:>14.5} {:>10.4} {:>9} {:>6.1}%",
+        format!("{hold_ms:.5}ms"),
+        t,
+        hold,
+        format!("sleep {:.3}ms", cycle_ms - hold_ms),
+        c.ops,
+        c.contended_per_op,
+        c.acq_per_op,
+        c.queue_max,
+        100.0 * u
+    );
+    println!("  queue_mean {:.2}", c.queue_mean);
+    println!();
+    println!("⚠ U_ach is the utilisation this model ACHIEVED, not the one asked for. If it is far");
+    println!("  below the real rung's U(hold), the arrival processes are not comparable and the");
+    println!("  contended/op below is not the right reference. Say so rather than using it.");
+}
+
 fn mode_model() {
     println!("CEILING — MODE=model. THE FIRE-CHECK, and the shape a PURE mutex produces.");
     println!("LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock. This cell exists");
@@ -1497,6 +1545,16 @@ fn main() {
     println!();
     match mode.as_str() {
         "model" => mode_model(),
+        "opref" => {
+            let hold_ms: f64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let cycle_ms: f64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            if !(hold_ms > 0.0 && cycle_ms > hold_ms) {
+                refuse("opref needs <hold_ms> <cycle_ms> with 0 < hold < cycle");
+            }
+            // T from slot 4, NOT from `threads` (slot 3), which this mode uses for cycle_ms.
+            let tt: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(64);
+            mode_opref(hold_ms, cycle_ms, tt);
+        }
         "direct" => mode_direct(&dir, n, &threads, warm),
         "paired" => mode_paired(&dir, n, &threads, warm, reps),
         "pgwire" => mode_pgwire(&dir, n, &threads, max_stub.min(3)),
