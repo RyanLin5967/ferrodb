@@ -134,7 +134,7 @@ CROSS-CHECK licensing the process-wide atomic mode the pgwire arm must use
 `TableBranchCatalog` layer, beneath the outer statement mutex that serialises forks in
 production.** `open_sidecar` + `cat.fork` directly, holding `logical` and nothing else. This is
 what `examples/fork_concurrency.rs` drives and what D123 measured. It is NOT what any shipped
-front-end does — section 5 is that.
+front-end does — section 6 is that.
 
 Raw: bench/ceiling_raw/12_paired_T64_N8000_warm0_reps5_WAITDUR.txt.
 T=64, N=8000, warm=0 (the recorded table's own shape), 5 reps, medians, configuration order AND
@@ -175,7 +175,7 @@ probe-carrying rungs. The probe accounts for the whole loop, so WAIT is a real s
 The brief's warning case was "if your utilisation does NOT collapse, that is a finding about the
 recorded number". It does collapse. But the three headline multipliers do not all survive.
 
-  quantity                recorded (quiet box)   measured here (load 24-45)   reproduced?
+  quantity                recorded (d123 §3b)    measured here (load 25-38)   reproduced?
   throughput L0->L3              1.9x            1.90x  (config C)            ✅ EXACTLY
                                                  1.73x  (config A)
   U(hold) collapse        96.1% -> 8.5% (11.3x)  90.7% -> 3.7% (24.7x)        ✅ IN KIND,
@@ -183,7 +183,7 @@ recorded number". It does collapse. But the three headline multipliers do not al
   HOLD_TOT fall                  21x             41.5x (A) / 40.7x (C)        ❌ 2x LARGER
   gap rise                      12.6x            6.0x (A) / 5.1x (C)          ❌ 2x SMALLER
 
-⇒ **The QUALITATIVE claim is robust and reproduces on a different box at 3-5x the load: HOLD
+⇒ **The QUALITATIVE claim is robust and reproduces on the SAME box at 3-5x the load: HOLD
 collapses by more than an order of magnitude, utilisation collapses with it, and throughput moves
 about 1.9x. The specific multipliers 21x and 12.6x DO NOT REPRODUCE, and they move in OPPOSITE
 directions.** That is what a duration ratio does on a box with a measured 46x quiet-vs-loaded
