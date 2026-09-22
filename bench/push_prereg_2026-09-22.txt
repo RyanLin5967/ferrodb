@@ -96,3 +96,37 @@ FALSIFIER IS DISCHARGED FOR UBUNTU.
   ⇒ A Windows run with NO LOOPCOUNT line is therefore interpretable as "it died before a
   loop completed", CONDITIONAL on Windows reaching those tests at all -- which the log
   itself shows, since the tests run in a named target.
+
+[2026-09-22T21:15Z] THE RUN RESOLVED. **OUTCOME 4: ALL THREE PLATFORMS PASS.**
+  Run 35782161642 on 68e24de: windows-latest SUCCESS, ubuntu-latest SUCCESS, macos-latest SUCCESS.
+
+  ⛔ PER THE READING FIXED ABOVE, BEFORE THE RUN EXISTED, THIS IS "INFORMATIVE ABOUT THE
+  AV'S RATE ONLY." It is NOT evidence the access violation is fixed, NOT evidence any row
+  landed tonight fixed it, and NOT evidence av-loop-counters perturbed it away. An
+  intermittent passes most of the time; that is what makes it an intermittent. The known
+  rate is 2 crashes in 3 attempts on 4685d80 and 0 in 3 on b17ec58 -- a green run here is
+  one more draw, and one draw does not move p=0.20.
+
+  ⭐ WHAT IS GENUINELY NEW, AND IT IS THE POINT OF HOLDING THE PUSH: THE INSTRUMENT FIRES
+  ON WINDOWS. 16 LOOPCOUNT lines in the windows job (106930057108), sanity-checked against
+  146 'test result:' lines in the same log so a zero could not be a failed fetch.
+
+      platform   loop exits   max turns   max ms     bounds
+      macOS           16           3         10      20000 / 100000
+      ubuntu          16           0-2       0-3     20000 / 100000
+      windows         16           4         29      20000 / 100000
+
+  READING, and it is deliberately narrow because this run did NOT crash:
+   - Turn counts are IDENTICAL in shape across all three platforms and sit four orders of
+     magnitude below the bounds. The election converges in <=4 pumps everywhere.
+   - Windows is ~3x macOS in WALL CLOCK at the SAME turn count (29ms vs 10ms). That is a
+     per-iteration cost difference, which is the direction the pre-registered reading
+     assigns to the SOCKET LAYER -- but 29ms is not 'huge', so this is a WEAK signal and
+     must not be quoted as a diagnosis.
+   - ⛔ THESE ARE HEALTHY-RUN NUMBERS. They diagnose nothing about the AV. What they
+     establish is a WINDOWS BASELINE, so that the next run which DOES crash is readable:
+     turns near the bound would mean the election, turns small with ms huge would mean the
+     socket layer, and no LOOPCOUNT line at all would mean it died before either loop.
+
+  ⇒ The instrument's falsifier is now discharged on ALL THREE platforms, not just ubuntu.
+    The direct-stderr write is not platform-conditional anywhere.
