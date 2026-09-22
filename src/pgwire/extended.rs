@@ -172,9 +172,14 @@ struct Portal {
 
 impl Statement {
     /// Parse one statement for the extended protocol.
+    ///
+    /// `conn` is here for one reason: [`Connection::catalog_cache`]. Parsing needs the schema —
+    /// parameter types and the result description — and reads it from this connection's cached
+    /// SNAPSHOT rather than from the exclusive catalog. See [`Statement::parse_one`].
     pub fn parse(
         sql: &str,
         declared: &[i32],
+        conn: &mut Connection,
         ctx: &ServerContext,
     ) -> Result<Statement, (&'static str, String)> {
         let trimmed = sql.trim();
@@ -195,12 +200,23 @@ impl Statement {
                 "cannot insert multiple commands into a prepared statement".into(),
             ));
         }
-        Self::parse_one(parts.first().map(|s| s.as_str()).unwrap_or(trimmed), declared, ctx)
+        // Only `catalog_cache` is borrowed, so nothing else on the connection is held across the
+        // parse — the same disjoint-fields idiom `execute` uses below.
+        let Connection { catalog_cache, .. } = &mut *conn;
+        Self::parse_one(
+            parts.first().map(|s| s.as_str()).unwrap_or(trimmed),
+            declared,
+            catalog_cache,
+            ctx,
+        )
     }
 
+    /// `catalog_cache` is this connection's snapshot slot, threaded in rather than reached through
+    /// `&mut Connection`, because that is all of the connection parsing touches.
     fn parse_one(
         sql: &str,
         declared: &[i32],
+        catalog_cache: &mut Option<(u64, Arc<Catalog>)>,
         ctx: &ServerContext,
     ) -> Result<Statement, (&'static str, String)> {
         // `begin transaction` / `start transaction` / `end` / `abort` are the same three statements
@@ -278,24 +294,38 @@ impl Statement {
         }
         let stmt = stmts.remove(0);
         let verb = command_tag_verb(&stmt);
-        // The catalog is needed for both halves of the answer — what the parameters are and what
-        // the columns are — and both are read under one acquisition.
-        let catalog = ctx.catalog();
-        let param_oids = params::infer_types(&stmt, nparams, declared, &catalog);
+        // **D151 — the shared snapshot, not the exclusive catalog.** Both halves of the answer —
+        // what the parameters are and what the columns are — are SCHEMA, and the schema is exactly
+        // what `Catalog::epoch` tracks, so a snapshot that is current for the epoch is current for
+        // this. `read_catalog` takes the exclusive lock only on first use and after a schema
+        // change; `ctx.catalog()` took it for EVERY `Kind::Sql`, including the ones `try_run_read`
+        // then ran on the shared path — so a pure reader such as `SELECT c FROM t` announced a
+        // writer and drained every other connection's in-flight read, at PARSE time, before it ran
+        // on the shared path and took nothing. ⚠ Not `SELECT 1`, which the enclosing `if let` above
+        // has already answered as a liveness probe: `bench/d151_e6_before.txt`'s A0 control counts
+        // ZERO for it, before this change as much as after. Measured at 1,604 of 6,369
+        // announcements (~25%) in the deciding arm — and this is NOT a W4 rescue: it moves a system
+        // already pinned against its ceiling at high fork rates, and is worth several times as much
+        // one decade of fork rate away.
+        let catalog = ctx.read_catalog(catalog_cache);
+        let param_oids = params::infer_types(&stmt, nparams, declared, catalog);
         let fields =
-            describe_stmt(&stmt, &catalog).map_err(|e| (sqlstate_of(&e), format!("{e}{hint}")))?;
+            describe_stmt(&stmt, catalog).map_err(|e| (sqlstate_of(&e), format!("{e}{hint}")))?;
         Ok(Statement { sql: sql.to_string(), kind: Kind::Sql { stmt, verb }, param_oids, fields })
     }
 
     /// Parse a simple-query string, which may carry several statements.
     pub fn parse_batch(
         sql: &str,
-        _conn: &mut Connection,
+        conn: &mut Connection,
         ctx: &ServerContext,
     ) -> Result<Vec<Statement>, FerroError> {
         let mut out = Vec::new();
+        // Borrowed once for the whole batch: the cache is refreshed at most once per epoch, so a
+        // ten-statement simple query pays the same as a one-statement one.
+        let Connection { catalog_cache, .. } = &mut *conn;
         for part in split_statements(sql) {
-            match Statement::parse_one(&part, &[], ctx) {
+            match Statement::parse_one(&part, &[], catalog_cache, ctx) {
                 Ok(s) => out.push(s),
                 // A simple query has no `ParameterDescription` to carry a SQLSTATE, so the code is
                 // folded back into the error the caller reports.
@@ -731,7 +761,7 @@ fn parse_message(body: &[u8], conn: &mut Connection, ctx: &ServerContext) -> Out
             format!("prepared statement \"{name}\" already exists"),
         );
     }
-    match Statement::parse(&sql, &declared, ctx) {
+    match Statement::parse(&sql, &declared, conn, ctx) {
         Ok(stmt) => {
             conn.statements.insert(name, Arc::new(stmt));
             Output::one(Message::ParseComplete)

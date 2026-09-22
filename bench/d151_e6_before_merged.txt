@@ -1,0 +1,48 @@
+E.6 -- acquisitions of ServerContext::catalog() during a concurrent-fork workload,
+driven THROUGH PGWIRE against the same workload driven DIRECTLY.
+Recorded 2026-09-22T11:20:30-0400. Counts only; this file quotes no durations, and an integer count is
+load-immune, so this run did not need a quiet box or the fleet measure-lock.
+
+LAYERS AND THEIR PRODUCTION LOCKS
+  A1/A2/A0  the shipped pgwire server over a real TCP socket, forks issued as SQL.
+            Production locks: ServerContext::catalog() OUTERMOST, one per statement,
+            then AgentRuntime's Mutex<State>, then TableBranchCatalog's `logical`.
+  B         TableBranchCatalog directly, as examples/fork_concurrency.rs does
+            (:26, :32, :101). Production locks at this layer: `logical` ONLY --
+            no statement mutex, because no shipped front-end reaches fork this way.
+
+forks/thread F = 8. Total forks = F x T, so the totals RISE with T and the
+acquisition column can be read against the statement rate directly.
+
+instrument self-check: one explicit ctx.catalog() moved the census by exactly 1. OK
+
+  arm                          T   forks   acquisitions   forks/acquisition
+  A1 pgwire, persistent conn   1       8             33               0.242
+  A1 pgwire, persistent conn   4      32            132               0.242
+  A1 pgwire, persistent conn  16     128            528               0.242
+  A1 pgwire, persistent conn  64     512           2112               0.242
+  A2 pgwire, conn per fork     1       8             24               0.333
+  A2 pgwire, conn per fork     4      32             96               0.333
+  A2 pgwire, conn per fork    16     128            384               0.333
+  A2 pgwire, conn per fork    64     512           1536               0.333
+  A0 CONTROL, SELECT 1         1   --                 0                  --
+  A0 CONTROL, SELECT 1         4   --                 0                  --
+  A0 CONTROL, SELECT 1        16   --                 0                  --
+  A0 CONTROL, SELECT 1        64   --                 0                  --
+  B  direct, no ServerContext   1       8              0   n/a (no acquisitions)
+  B  direct, no ServerContext   4      32              0   n/a (no acquisitions)
+  B  direct, no ServerContext  16     128              0   n/a (no acquisitions)
+  B  direct, no ServerContext  64     512              0   n/a (no acquisitions)
+
+READING IT
+  A0 is the per-connection/per-statement FLOOR: acquisitions a client pays for
+  connecting and running a trivial statement, with no fork in it at all. A2 minus
+  A0 at the same T is what the fork statement itself costs in acquisitions.
+    T=  1: A2 24 - A0 0 = 24 acquisitions attributable to the fork statement, over 8 forks
+    T=  4: A2 96 - A0 0 = 96 acquisitions attributable to the fork statement, over 32 forks
+    T= 16: A2 384 - A0 0 = 384 acquisitions attributable to the fork statement, over 128 forks
+    T= 64: A2 1536 - A0 0 = 1536 acquisitions attributable to the fork statement, over 512 forks
+
+  arm B took 0 acquisitions in total across every T, while arms A1+A2 took
+  4845 in the SAME PROCESS against the SAME counter. That pairing is what makes
+  B's zero a measurement rather than a silent instrument.
