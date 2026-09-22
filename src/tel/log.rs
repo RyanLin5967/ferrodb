@@ -125,6 +125,133 @@ use crate::wal::log::{
     write_str,
 };
 
+/// D148 — where the time in `DurableEffectLog::append` actually goes.
+///
+/// D137's slope-1 law was measured on [`MemEffectLog`], because the pgwire front-end forces that
+/// store. `src/cli/cli.rs` ships [`DurableEffectLog`], whose `append` also does an `encode`, a
+/// `pwrite` and a **`sync_data` per statement**. D115 measured that append at 4.057 ms with
+/// ≥97.6% in encode+write+sync — but its ≤2.4% "comparisons" counter is `extends()`, which
+/// compares ops WITHIN one frame, not the `position()` scan ACROSS frames that D138 removes.
+/// So nothing yet says what share the frame scan holds on the durable path, and on this system
+/// structural wins have been swamped by durable I/O three times in one day (D133, D81, and the
+/// case that raised this).
+///
+/// ⚠ **This is wall-clock, unlike `scan_count`, and it is therefore the weaker instrument.**
+/// Two things make it usable on a loaded box:
+///   * every phase is timed INSIDE one `append`, so all phases share the same load and the
+///     **share** is far more robust than any absolute figure;
+///   * every timer is paired with a **counter that must be non-zero**, so a phase that did not
+///     run is distinguishable from one that was fast — and the phases are summed and compared to
+///     an independently measured TOTAL, so the table has to close.
+pub mod phase {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub const LOOKUP_CLASSIFY: usize = 0;
+    pub const ENCODE: usize = 1;
+    pub const PWRITE: usize = 2;
+    pub const SYNC: usize = 3;
+    pub const LOOKUP_APPEND: usize = 4;
+    /// The whole of `DurableEffectLog::append`, timed independently so the parts must add up.
+    pub const TOTAL: usize = 5;
+    pub const PHASES: usize = 6;
+
+    pub const NAMES: [&str; PHASES] =
+        ["lookup(classify)", "encode", "pwrite", "sync_data", "lookup(append)", "TOTAL"];
+
+    static NANOS: [AtomicU64; PHASES] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+    static CALLS: [AtomicU64; PHASES] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+    /// The phase's own natural unit: frames examined, bytes encoded, bytes written, fsyncs.
+    static UNITS: [AtomicU64; PHASES] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+
+    /// Time `f`, attribute it to `which`, and record `units` of that phase's own work.
+    #[inline]
+    pub(super) fn timed<T>(which: usize, units: u64, f: impl FnOnce() -> T) -> T {
+        let t0 = Instant::now();
+        let out = f();
+        let dt = t0.elapsed().as_nanos() as u64;
+        NANOS[which].fetch_add(dt, Ordering::Relaxed);
+        CALLS[which].fetch_add(1, Ordering::Relaxed);
+        UNITS[which].fetch_add(units, Ordering::Relaxed);
+        out
+    }
+
+    /// Attribute an already-measured span, for a phase whose unit count is only known afterwards.
+    #[inline]
+    pub(super) fn record(which: usize, nanos: u64, units: u64) {
+        NANOS[which].fetch_add(nanos, Ordering::Relaxed);
+        CALLS[which].fetch_add(1, Ordering::Relaxed);
+        UNITS[which].fetch_add(units, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct PhaseCount {
+        pub nanos: u64,
+        pub calls: u64,
+        pub units: u64,
+    }
+
+    impl PhaseCount {
+        /// ns per call, or `None` when the phase never ran — a zero here must read as "did not
+        /// happen", never as "was free".
+        pub fn per_call(&self) -> Option<f64> {
+            (self.calls > 0).then(|| self.nanos as f64 / self.calls as f64)
+        }
+    }
+
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Snapshot {
+        pub p: [PhaseCount; PHASES],
+    }
+
+    pub fn snapshot() -> Snapshot {
+        let mut out = Snapshot::default();
+        for i in 0..PHASES {
+            out.p[i] = PhaseCount {
+                nanos: NANOS[i].load(Ordering::Relaxed),
+                calls: CALLS[i].load(Ordering::Relaxed),
+                units: UNITS[i].load(Ordering::Relaxed),
+            };
+        }
+        out
+    }
+
+    impl Snapshot {
+        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+            let mut out = Snapshot::default();
+            for i in 0..PHASES {
+                out.p[i] = PhaseCount {
+                    nanos: self.p[i].nanos.saturating_sub(earlier.p[i].nanos),
+                    calls: self.p[i].calls.saturating_sub(earlier.p[i].calls),
+                    units: self.p[i].units.saturating_sub(earlier.p[i].units),
+                };
+            }
+            out
+        }
+        /// The two lookups together — what D138 removes.
+        pub fn lookup_nanos(&self) -> u64 {
+            self.p[LOOKUP_CLASSIFY].nanos + self.p[LOOKUP_APPEND].nanos
+        }
+        /// Encode + pwrite + sync — what D115 called ≥97.6%.
+        pub fn io_nanos(&self) -> u64 {
+            self.p[ENCODE].nanos + self.p[PWRITE].nanos + self.p[SYNC].nanos
+        }
+        /// TOTAL minus the parts. Must be small, and is PRINTED rather than absorbed.
+        pub fn residual_nanos(&self) -> i64 {
+            self.p[TOTAL].nanos as i64 - (self.lookup_nanos() + self.io_nanos()) as i64
+        }
+    }
+}
+
 /// The frames, and the position index that answers `(branch, txn_id)` without walking them.
 ///
 /// **This is D86's shape, copied rather than invented** — `State::push_applied` /
@@ -1573,7 +1700,14 @@ impl DurableEffectLog {
     }
 
     fn write_record(file: &dyn Storage, rec: &[u8], at: u64) -> Result<(), FerroError> {
+        let tw = std::time::Instant::now();
         pwrite_all(file, rec, at)?;
+        phase::record(phase::PWRITE, tw.elapsed().as_nanos() as u64, rec.len() as u64);
+        let ts = std::time::Instant::now();
+        let r = file.sync_data().map_err(|e| FerroError::Io(e.to_string()));
+        phase::record(phase::SYNC, ts.elapsed().as_nanos() as u64, 1);
+        return r;
+        #[allow(unreachable_code)]
         // Synchronous on every append, deliberately. The whole claim of this store is that a frame
         // survives the process that captured it; a buffered write that has not reached the disk
         // survives a clean exit and nothing else, and the difference is invisible until the crash
@@ -1628,7 +1762,20 @@ impl EffectLog for DurableEffectLog {
         // the index and the file both untouched. `provenance::durable` had to mutate first because
         // its guards live inside the mutation; this store's do not, and the difference is what lets
         // the order below be the safe one.
-        let body = match self.mem.classify_append(frame)? {
+        // D148 instrumentation. `t_total` brackets the whole append so the parts must add up to
+        // something independently measured, rather than to their own sum.
+        let t_total = std::time::Instant::now();
+        let t0 = std::time::Instant::now();
+        let classified = self.mem.classify_append(frame)?;
+        // ⛔ `elapsed` FIRST. `mem.len()` takes the same mutex, and reading it before stopping the
+        // clock charged a lock acquisition to the lookup phase — inflating exactly the term D138
+        // shrinks, i.e. biasing the answer in the direction that flatters this row.
+        let dt_classify = t0.elapsed().as_nanos() as u64;
+        let log_len = self.mem.len() as u64;
+        phase::record(phase::LOOKUP_CLASSIFY, dt_classify, log_len);
+
+        let t1 = std::time::Instant::now();
+        let body = match classified {
             None => encode_open(frame)?,
             // A retry. There is no new tail, so there is nothing to write — which is stronger than
             // writing a second copy and collapsing it on read: the file simply never holds one.
@@ -1638,6 +1785,7 @@ impl EffectLog for DurableEffectLog {
             }
         };
         let rec = frame_record(&body)?;
+        phase::record(phase::ENCODE, t1.elapsed().as_nanos() as u64, rec.len() as u64);
 
         // **The record lands first, and only then does the index accept it.**
         //
@@ -1654,8 +1802,12 @@ impl EffectLog for DurableEffectLog {
         // this node.
         let at = inner.end;
         Self::write_record(&*inner.file, &rec, at)?;
+        let t3 = std::time::Instant::now();
         self.mem.append(frame)?;
+        let dt_append = t3.elapsed().as_nanos() as u64;
+        phase::record(phase::LOOKUP_APPEND, dt_append, log_len);
         inner.end = at + rec.len() as u64;
+        phase::record(phase::TOTAL, t_total.elapsed().as_nanos() as u64, 1);
         Ok(())
     }
 
