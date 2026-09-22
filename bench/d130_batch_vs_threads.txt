@@ -444,3 +444,64 @@ of it. No throughput figure from this sweep is quoted anywhere above.
 - **`FERRODB_PARENT_ARENAS=0`**, so the direct harness cannot see D7's arena scan. That
   keeps `S` at its smallest and `C = D/S` at its largest, which is the direction that
   favours the hypothesis under test — the batch saturates anyway.
+
+================================================================================
+8. ⭐ THE LOAD-BEARING PREMISE — STATED AS ONE SENTENCE, AND RE-CHECKED AT MAIN'S
+   CURRENT HEAD RATHER THAN AT THIS BRANCH'S BASE.
+================================================================================
+
+Three sibling lanes came back NOT LANDABLE on the same day for a false premise rather
+than a wrong number — one of them because a premise true when written was falsified by a
+merge 2.5 hours later. Everything above rests on one premise of exactly that kind, so it
+is written here to be checked rather than assumed.
+
+⭐ **THE PREMISE.** `CommitGroup::wait_durable` (`src/branch/group_commit.rs`) is
+single-stage commit-when-ready: the leader sets `syncing`, reads `let target =
+st.requested;` while still holding the state lock and before it calls `sync()`, and
+applies no size cap and no accumulation delay — so one fsync covers exactly the tickets
+that existed at the instant it began, and a ticket handed out during a sync waits a whole
+further round.
+
+That is what makes `throughput = min(1/S, T/D)` and the `f/sync ≈ T/2` race prediction
+mean anything at all. If it is false, every number above is computed on top of a fiction.
+
+**CHECKED 2026-09-22T11:45Z against `main` at `98a44ef`** — not against `2bc80fd`, which
+is where this branch was cut and which main has since moved past several times:
+
+    git rev-parse 2bc80fd:src/branch/group_commit.rs  -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+    git rev-parse 98a44ef:src/branch/group_commit.rs  -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+    git rev-parse main:src/branch/group_commit.rs     -> 81b8b5dfcf8b0a5c94849c7ea4d185a7620a8275
+
+⇒ **Byte-identical.** `src/branch/table_catalog.rs`, which holds the only production call
+sites, is likewise unchanged across that span (`git diff --stat 2bc80fd..main --` on both
+files is empty). The premise is TRUE AT HEAD, and the measurement was taken on the same
+blob production runs.
+
+**The symbols, not line numbers** — line numbers drift, and correcting a right one with a
+wrong one has already cost this project once:
+
+  - `src/branch/group_commit.rs` :: `CommitGroup::wait_durable` — reads `target` under the
+    state lock, immediately after setting `syncing` and immediately before `drop(st)`.
+  - `src/branch/group_commit.rs` :: `CommitGroup::ticket` — the only way `requested` moves.
+  - `src/branch/table_catalog.rs` :: `TableBranchCatalog::stage` — the ONLY production
+    caller of `ticket()`; takes it after `publish_root()`, under the logical lock.
+  - `src/branch/table_catalog.rs` :: `TableBranchCatalog::durable` — the ONLY production
+    caller of `wait_durable`; supplies `flush_all` + `disk_manager.sync()` as the fsync.
+
+⇒ Enumerated from the callers, not assumed: at `main` there are exactly **four** callers
+  of `ticket()` — three of them in this file's own `#[cfg(test)]` module — and exactly
+  **one** caller of `wait_durable` outside the module. There is no second commit path for
+  the premise to be false on.
+
+⛔ **ONE PRECISION, SO NOBODY "CORRECTS" THIS PREMISE WRONGLY LATER.** The phrase "no
+timer" is right about batching and wrong as a literal reading of the file: `wait_durable`
+contains `wait_timeout(st, Duration::from_millis(50))`. That is a FOLLOWER's bounded park,
+present so a lost wakeup cannot hang a writer for the life of the process, and the file
+says so in as many words. It is **not** a leader delaying its flush to collect more
+tickets — which is precisely what PostgreSQL's `commit_delay` is, and precisely what this
+code does not have. A reader who greps `Duration::` here will find it; the premise
+survives, and the distinction is the whole difference between single-stage and staged
+group commit.
+
+⇒ ✅ THE PREMISE HELD. Had it not, that would have been the result and the tables above
+  would have been withdrawn rather than reported.
