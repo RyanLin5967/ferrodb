@@ -891,6 +891,21 @@ mod tests {
     //! runs each case twice, and a divergence between the two implementations fails the build
     //! instead of waiting for someone to write a bespoke probe for it.
 
+    /// Runs the whole reaper suite against both catalogs.
+    ///
+    /// ⚠ **ONE `#[test]` WRITTEN IN HERE BECOMES *TWO* TESTS AT RUNTIME**, because this macro is
+    /// instantiated twice below (`log_catalog`, `table_catalog`) and both run in the SAME process,
+    /// in parallel. Nothing else in this file says so, and that single property has produced two
+    /// unrelated defects (SCALE-DESIGN D139):
+    ///
+    /// * **A fixture race.** Any temp path keyed only on `std::process::id()` is IDENTICAL in both
+    ///   instances, so one clobbers the other's file. Give every fixture path a per-instantiation
+    ///   discriminator — `module_path!()` — or a per-thread one. Two sites had it wrong and one
+    ///   (the `d128-site3-blocker` path) already had it right, which is why the fix is a SWEEP of
+    ///   this file and not a patch of whichever test happened to fail.
+    /// * **A test-count surprise.** A pre-registered suite total derived by counting `#[test]` in a
+    ///   diff UNDERCOUNTS: a test added in here contributes 2. Counting 5 added tests and predicting
+    ///   +5 cost a landing an unexplained +1.
     macro_rules! reaper_suite {
         ($modname:ident, $table:expr) => {
             mod $modname {
@@ -1091,7 +1106,19 @@ mod tests {
     fn a_fast_path_reap_reaches_the_durable_map_not_just_memory() {
         let (h, reaper) = setup();
         let path = std::env::temp_dir()
-            .join(format!("ferro-reap-ckpt-{}.bin", std::process::id()));
+            .join(format!(
+                // **D139: `module_path!()` is load-bearing, not decoration.**
+                // This test lives inside `reaper_suite!`, which is instantiated TWICE
+                // (`log_catalog`, `table_catalog`). Keyed on the pid alone, BOTH
+                // instances computed this same path and raced: one `remove_file`d the
+                // checkpoint the other had just written, and the fixture guard below
+                // fired with "nothing was ever checkpointed". Intermittent, because it
+                // needs an unlucky interleaving -- it survived thousands of green runs
+                // and surfaced only under fleet load.
+                "ferro-reap-ckpt-{}-{}.bin",
+                module_path!().replace("::", "_"),
+                std::process::id()
+            ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
@@ -1167,7 +1194,19 @@ mod tests {
     fn a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map() {
         let (h, reaper) = setup();
         let path = std::env::temp_dir()
-            .join(format!("ferro-slow-reap-ckpt-{}.bin", std::process::id()));
+            .join(format!(
+                // **D139: `module_path!()` is load-bearing, not decoration.**
+                // This test lives inside `reaper_suite!`, which is instantiated TWICE
+                // (`log_catalog`, `table_catalog`). Keyed on the pid alone, BOTH
+                // instances computed this same path and raced: one `remove_file`d the
+                // checkpoint the other had just written, and the fixture guard below
+                // fired with "nothing was ever checkpointed". Intermittent, because it
+                // needs an unlucky interleaving -- it survived thousands of green runs
+                // and surfaced only under fleet load.
+                "ferro-slow-reap-ckpt-{}-{}.bin",
+                module_path!().replace("::", "_"),
+                std::process::id()
+            ));
         let _ = std::fs::remove_file(&path);
         h.store.checkpoint_to(path.clone());
 
