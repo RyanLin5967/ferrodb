@@ -1,0 +1,31 @@
+PRE-REGISTERED 2026-09-22, BEFORE the run, for main at d93d23b5416e5946659347813f4ac85e22111c24
+
+  expected: per-target rc=0 passed=2482 failed=0 ; go rc=0 passed=97
+
+  DERIVATION (every term checked, not recalled):
+    2476  main @ 98a44ef, banked at bench/land98a44ef_certified/
+      +0  D130 merge      -- bench/ + examples/d130_pgwire_batch.rs, which carries ZERO #[test]
+      +0  d85-rederive    -- bench/ only, confirmed by path
+      +0  D136 merge      -- +1 trait method and 2 impls, examples/d136_prov_dict_curve.rs
+                             carries ZERO #[test]
+      +0  21ae398/29ad1f5/7fdafb6 -- doc comment, bench artifact, citation repair
+      +6  D127 merge      -- 5 source #[test] added (names read from the diff, not counted),
+                             but ONE of them sits inside macro_rules! reaper_suite, which is
+                             instantiated TWICE, so it contributes 2 runtime tests: 4 + 2 = 6
+      +0  d93d23b         -- D139 fixture paths + a macro doc comment; no assertion, no test
+    = 2482
+
+  ⛔ A COUNT THAT MOVES IN EITHER DIRECTION FALSIFIES THIS AND MUST BE EXPLAINED BEFORE
+     PUSHING, NOT AFTERWARDS. The 2476->2475 fixture race and the 2481->2482 macro
+     double-count were BOTH caught this way, in opposite directions, on the same day.
+
+  ⚠ WATCH FOR: branch::reaper::tests::{log_catalog,table_catalog}::
+     a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map
+     If it fails, D139's fix is NOT the explanation (its fire-check did not fire) and the
+     hunt is open -- see SCALE-DESIGN D139.
+
+  AMENDMENT 1, 2026-09-22, still BEFORE any run: head moved d93d23b -> b2991c6.
+    The delta is b2991c6, which REMOVES a false claim I had committed inside the D139 fix
+    ("Nothing else in this file says so" -- reaper.rs:890-891 already documents the doubling).
+    Comment-only, no assertion, no test. EXPECTATION UNCHANGED AT 2482.
+    The original 2481->2482 derivation above is left standing rather than edited.

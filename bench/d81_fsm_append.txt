@@ -1,0 +1,206 @@
+D81 — `<db>.arena` IS APPEND-ONLY IN PLACE. THE O(N²) BYTES ARE GONE AND THE FSYNCS ARE HALVED.
+⛔ AND THE STATED EXIT CRITERION COULD NOT BE EVALUATED, BECAUSE THE *BEFORE* ARM DOES NOT RISE.
+
+Branch `D81-fsm-append`. Raw data, committed before this file was written:
+  bench/d81_curve_raw.txt   four arms,  one lock hold, 2026-09-22T03:23Z  (superseded, kept)
+  bench/d81_curve_raw2.txt  eight arms, one lock hold, 2026-09-22T03:42Z  (the result)
+
+=== WHAT WAS BUILT =====================================================================
+
+`<db>.arena` is now `[image][tail record]*`. `alloc_arena` appends a 45-byte claim record and
+fsyncs it; `free_arena` appends a 25-byte free record and fsyncs it. `replace_atomically` is
+untouched and becomes the compaction path, firing when the tail passes `max(image/2, 4 KiB)`.
+
+**The image format did NOT change.** Every `<db>.arena` on disk still opens, `key_order_in_image`
+and `two_stores_in_the_same_state_checkpoint_byte_identical_images` are untouched, and no
+`STATE_VERSION` bump was needed — a structural walker (`ArenaPageStore::image_len`) finds the
+image/tail boundary instead. That was a deliberate trade: this file's own D85 note prices a version
+bump at *"migrate every `<db>.arena` on disk"*, and the walker costs one allocation-free pass at
+open time. It is pinned against `state_bytes` by a test whose fixture fills every variable-length
+section, because a section left empty has its stride multiplied by zero and a wrong stride vanishes.
+
+Two things were not obvious before writing it:
+
+  * **The tail is an ORDERED log, so durable order must equal in-memory order.** `free_arena`
+    returning range X and `alloc_arena` immediately re-claiming it, written down backwards, replays
+    to X both on the free list *and* live in `extents` — two owners for one page range, and nothing
+    about the file looks wrong. Full-image checkpoints could not have this bug, because each one
+    publishes a coherent snapshot and the last writer wins. A new outermost persist mutex is held
+    across the state mutation and the append on both paths.
+  * **A full image made everything durable as a side effect, and a record does not.** `next_free`
+    and the per-extent `recycled` list need no guard — `load_state` already clears `current` and
+    D85 already marks every restored extent fill-unknown, *per extent* rather than per age of
+    image, so an older image means more extents get that treatment, not weaker treatment. The
+    **pending-free log** does need one, because nothing refuses to trust it and a lost entry is a
+    page `drain_pending` never revisits. A version counter forces a rewrite when it has moved.
+
+=== ⛔ DEAD OPTION 2 — THE CIRCULARITY CHECK THE DESIGN DEMANDED FIRST ==================
+
+Recorded in full in `artie-research/SCALE-DESIGN.md` at commit 91c631c. In short, and read out of
+the code at 52e1137 rather than recalled:
+
+**The circularity does not bite, and the direction is the opposite of the guess.** `recover(&txn)`
+is `cli/cli.rs:65`; `ArenaPageStore` is not constructed until `cli/cli.rs:100`. WAL replay reads
+`{db}.wal` by LSN through `WalManager::read_record` — its own file, not a page — with no arena
+floor registered and no arena store in existence. WAL replay does not need arena state to start.
+
+**Option 2 is NO-GO anyway, on RETENTION.** `TxnManager::checkpoint` → `WalManager::truncate` is
+`file.set_len(HEADER_SIZE)` plus a `base_lsn` advance (`wal/log.rs:759-762`): it physically
+discards every record. The WAL keeps a record until the next checkpoint; an extent claim must stay
+durable for the life of the extent. Putting the claim in the WAL erases it at the next checkpoint
+while the extent is still live, and the next open re-issues the range — exactly the aliasing that
+killed option A. Second, independent blocker: `base_page` would have nowhere to live, since
+`reopen_from_checkpoint` deliberately takes it from the image and not from a caller.
+
+=== THE INTEGERS. LOAD CANNOT MOVE THESE, AND THEY ARE THE RESULT ======================
+
+Per phase (one phase = L parked branches + 120 measured merges = L + 120 extent claims). Identical
+in both rounds, as counters over a deterministic workload must be.
+
+  BEFORE (a7b8c50 — instrument only, no arena change)
+    L      claims   replaces  appends   fsyncs   durable KB   B/claim   fsyncs/claim
+      500     620        620        0     1240         9077    14,992          2.000
+     1000    1120       1120        0     2240        29523    26,992          2.000
+     2000    2120       2120        0     4240       105571    50,993          2.000
+     4000    4120       4120        0     8240       398292    98,993          2.000
+
+  AFTER (0f596da)
+    L      claims   replaces  appends   fsyncs   durable KB   B/claim   fsyncs/claim
+      500     620          5      615      625           74       122          1.008
+     1000    1120          7     1113     1127          176       161          1.006
+     2000    2120          8     2112     2128          294       142          1.004
+     4000    4120         10     4110     4130          671       167          1.002
+
+**FSYNCS PER CLAIM: exactly 2.000 → 1.00, at every L.** A `replace_atomically` is four operations
+and two fsyncs (write temporary, `sync_file`, rename, `sync_dir`); an append is two operations and
+one, because it changes no directory entry and so has nothing for `sync_dir` to do.
+
+**BYTES PER CLAIM: LINEAR IN L → FLAT.** The BEFORE column fits `24·L + 3000` bytes with **no
+residual over four points** (15000 / 27000 / 51000 / 99000 predicted against 14992 / 26992 / 50993
+/ 98993 measured). That is D79's 48 B-per-live-branch law arriving through a different counter —
+24 rather than 48 because the image averages half its final size across a phase — so this run
+**reproduces the prior finding rather than disagreeing with it**. The `map bytes` column agrees
+too: 197,849 B at L=4000 against D79's 195,929, and the difference is exactly 1,920 = 40 × 48,
+which is the 40 extra branches this run's 120 merges create over D79's 80.
+
+The AFTER column is 122 / 161 / 142 / 167 B — a 1.37x spread across an 8x range in L, and
+non-monotone, i.e. flat plus noise.
+
+  total durable bytes over the four phases:  530 MB  →  1.19 MB    (446x)
+  at L = 4000 alone:                      398,292 KB →   671 KB    (593x)
+
+⚠ **Projection to 10^6 is ARITHMETIC, not data.** BEFORE: `sum(48i) = 24N²` = 24 TB, which is D79's
+figure. AFTER: the compaction rule gives an amortised `45 + 48L/(24L/45) = 135` B per claim,
+independent of L — corroborated to ~20% by the measured 167 B/claim at L=4000, which is an
+independent counter and not a rearrangement of the same division — so ~135 MB, and ~10^6 fsyncs
+where there were 2×10^6.
+
+=== ⛔ THE EXIT CRITERION AS STATED COULD NOT BE EVALUATED ==============================
+
+The criterion was: ON/OFF median-ms-per-cycle is *1.88 / 1.48 / 2.39 / 3.29 at L = 500 / 1000 /
+2000 / 4000, RISING*, and D81 is done when it stops rising.
+
+**It does not rise in the BEFORE arm on this box, so the criterion cannot discriminate.** Mean of
+two rounds, `median ms/cycle`:
+
+    L          500     1000     2000     4000
+    BEFORE/OFF  83.7    224.0    175.9    166.6
+    BEFORE/ON  181.4    167.0    176.5    101.7
+    ON/OFF      2.17     0.75     1.00     0.61      ⛔ not rising — and not 1.88/1.48/2.39/3.29
+    AFTER/OFF   96.4    185.1     99.0     75.0
+    AFTER/ON   114.1    110.0    172.3    151.3
+    ON/OFF      1.18     0.59     1.74     2.02      ⛔ noise, in the other direction
+
+This is not a new surprise and it should not be presented as one. `bench/d81_bytes_vs_fsyncs.txt`
+had already failed to reproduce D79's direction on the same code — *"the two runs disagree in
+DIRECTION, which is the honest statement that the per-cycle median is not measuring the map at
+these sizes at all"*. This run makes it unarguable: in the first four-arm pass
+(`bench/d81_curve_raw.txt`) the two **OFF controls — the arm the change cannot affect — disagreed
+by up to 2.4x**, which by this project's own rule voids the comparison outright.
+
+**The instrument is the reason, and it is diagnosable rather than mysterious.** A measured cycle is
+`BEGIN AGENT SESSION` + 4 UPDATEs + `MERGE` and claims exactly ONE extent, so the free-space map is
+a small share of what the median times. The instrument was therefore extended — identically on both
+sides, from one commit cherry-picked onto both branches — to time the **park** phase, which is L
+branches, one claim each, and nothing else.
+
+=== THE SAME QUESTION, ON AN INSTRUMENT THAT CAN SEE IT =================================
+
+`us per parked branch`, both rounds shown because the spread is the point:
+
+    L                 500     1000     2000     4000
+    BEFORE/OFF  R1    11574    12670    15924    15807
+                R2    10646    26375    13999    23619
+                mean  11110    19522    14962    19713
+    BEFORE/ON   R1    44194    41749    42177    27725
+                R2    19491    25669    20315    27703
+                mean  31842    33709    31246    27714
+                ON/OFF 2.87     1.73     2.09     1.41
+    AFTER/OFF   R1     9282    16774    27898    18257
+                R2    12155    11020    11346    13874
+                mean  10718    13897    19622    16065
+    AFTER/ON    R1    14918    15593    17775    17454
+                R2    19959    14743    17172    15769
+                mean  17438    15168    17473    16612
+                ON/OFF 1.63     1.09     0.89     1.03
+
+⇒ **AFTER, persistence is close to free: ON/OFF is 1.63 / 1.09 / 0.89 / 1.03 — flat, and
+indistinguishable from 1.** BEFORE it is 2.87 / 1.73 / 2.09 / 1.41, above 1 at every point.
+Comparing the two ON arms directly, the per-claim cost falls from 31.8 / 33.7 / 31.2 / 27.7 ms to
+17.4 / 15.2 / 17.5 / 16.6 ms.
+
+⚠ **AND THE BEFORE ARM STILL DOES NOT RISE HERE EITHER** (2.87 → 1.41). So the honest verdict on
+the exit criterion is: **the AFTER ratio is flat in L, which is what the criterion asks for, but
+the criterion was not able to fail** — the rising 1.88 → 3.29 it is defined against did not
+reproduce on this box at L ≤ 4000, on either instrument. The load-immune columns above are what
+this row should be judged on.
+
+⚠ Round 1 and round 2 disagree by up to 2.3x on the same cell (BEFORE/ON at L=500: 44194 vs 19491),
+which is why every duration here is a mean of two and why none of them is quoted to better than its
+leading digit. `load_at_acquire` was 8 for the first pass and 3 for the second.
+
+=== METHOD, AND WHAT MAKES THE TWO HALVES COMPARABLE ====================================
+
+* **One `measure-lock.sh` hold for all eight arms**, so no cell is separated from another by a
+  window in which the fleet did something different. A sidecar touched the lock's owner file while
+  — and only while — the run's pid was alive, because the lock reclaims an owner older than 45
+  minutes on the assumption it is dead, and eight arms take longer than that.
+* **Two binaries, one instrument.** `git diff a7b8c50:examples/d75_live_branch_scaling.rs
+  0f596da:examples/d75_live_branch_scaling.rs` is **empty**; the only difference between them is
+  `src/branch/arena.rs`. Both were rebuilt from clean committed trees, so each table above is
+  headed by the binary's own `build_provenance()` naming its commit — the first pair were built
+  from dirty trees and were rebuilt for exactly this reason.
+* **Round 2 runs the four arms in reverse**, so every cell sits at a different point in the window.
+  ⚠ It does NOT reverse the L axis *inside* an arm — that is the harness's own loop — so L and
+  position-within-arm remain confounded. Named, not solved.
+
+=== UNIT-LEVEL EVIDENCE, AND THE MUTATIONS THAT PROVE IT IS EVIDENCE ====================
+
+14 new tests in `src/branch/arena.rs`, 3 in `src/storage/atomic_file.rs`. Each of the arena ones
+asserts a non-empty tail or `appends > 0` *before* it asserts anything else, so a suite that never
+entered the append path fails instead of passing quietly. Two carry explicit controls: the
+corruption test checks that the same damage in the LAST record still opens (or the refusal is
+blanket, not a rule), and the pending guard is made to fire and then shown not to fire.
+
+**Five mutations applied to 53a6b66, each reverted after measuring:**
+
+  mutation                                             caught by
+  pending-log guard → `false`                          parking_a_page_forces_the_next_claim… (+1)
+  `image_bytes == 0` guard → `false`                   10 tests, incl. a_reopened_store_rewrites…
+  mid-tail corruption refusal → unreachable            a_bad_record_with_records_behind_it…
+  `image_len` extent stride 28 → 24                    6 tests, incl. the walker pin
+  claim replay's free-list removal deleted             a_free_and_an_immediate_reclaim_of_one_range…
+
+A sixth was found by the suite rather than planted: leaving `live_pages` out of the claim record
+made a restart report 0 live pages after 7 allocations, which is why the record carries it as an
+absolute while `reserved_pages` is carried as a delta.
+
+=== WHAT THIS DOES NOT SAY =============================================================
+
+⛔ It does not say the persistence penalty is gone at 10^6. Everything above L=4000 is arithmetic.
+⛔ It does not say the cycle-median curve improved. On this box that number is noise in both arms.
+⛔ It does not close the reap-heavy case by measurement. `free_arena` now appends too, so the shape
+   is right, but the d75 workload builds its runtime without a reaper, so no `free_arena` fired in
+   any arm above. The free record is covered by unit tests only.
+⛔ It says nothing about a cluster. Every arm is single-node; an authority change deliberately
+   forces a full rewrite and no measurement here exercises that path.

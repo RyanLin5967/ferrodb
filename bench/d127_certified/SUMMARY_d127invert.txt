@@ -6,8 +6,20 @@ CERTIFICATION — d127-invert (the D134 prose inversion), 2026-09-22
 
 suite head=  3b0bee5   (branch d127-invert)
 mode=        per-target
-  ⚠ MODE IS PART OF THE NUMBER. `whole` = `per-target` + 2 doctests, so this 2482
+  ⚠ MODE IS PART OF THE NUMBER. `whole` = `per-target` + 2 DOCTESTS, so this 2482
     is NOT comparable term-for-term with the superseded 2467 in SUMMARY.txt.
+  ⛔ THIS LINE WAS "CORRECTED" TO +1 ON 2026-09-22 AND THAT WAS WRONG. REVERTED.
+    The original +2 is right. THREE of us independently made the same mistake:
+    we grepped for `Doc-tests`, saw "running 1 test", and stopped. That reads the
+    FIRST doctest block only. A `compile_fail` doctest is compiled and reported
+    SEPARATELY, so the section has TWO blocks and TWO `test result` lines:
+        src/cow/diff.rs - cow::diff::MemoIdentity (line 443) ... ok
+        src/cow/diff.rs - cow::diff::MemoIdentity (line 483) - compile fail ... ok
+    ⇒ COUNTING `Doc-tests` SECTIONS IS NOT COUNTING DOCTESTS.
+    ⇒ With +2 the open discrepancy CLOSES: 2482 + 8 = 2490, + 2 doctests = 2492,
+      which is exactly D141's measured whole-mode total. Nothing was missing.
+    ⚠ Wrongly correcting a right claim is the same failure as asserting a false
+      one. The reversal is logged here, where the wrong edit was made.
 
 pre-registered: 2482, in bench/d127_invert_prereg.txt as AMENDMENT 1, cut
   2026-09-22T12:11:43Z while the run was still in flight and no verdict existed

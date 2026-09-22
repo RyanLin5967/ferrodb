@@ -67,6 +67,25 @@ pub enum FerroError {
     /// Deliberately loud in `Display`. Every other error here describes something a caller did; this one
     /// describes damage, and it must not read like a syntax complaint.
     Corruption(String),
+    /// A value the on-disk encoding's length fields cannot express — refused on the way in, before
+    /// it becomes durable.
+    ///
+    /// **The same variant, for the same reason, as `consensus::log::LogError::Unrepresentable`**,
+    /// whose doc comment states the argument in full: this is *arithmetic*, not policy, so it is
+    /// not a flavour of `NotEnoughSpace` (a page-size limit) or of `Constraint` (whether data is
+    /// valid). A name longer than its `u8` or `u16` length prefix is written with a **truncated
+    /// prefix followed by its full bytes**, which desynchronises every reader from that point on —
+    /// and nothing downstream can catch it, because everything downstream checks the bytes against
+    /// a checksum of exactly the bytes intended. Refusing at the encoder is the only point at which
+    /// the caller still has somewhere to put the error.
+    ///
+    /// `what` is a `String` and not `LogError`'s `&'static str` because the catalog encoder runs
+    /// over the WHOLE catalog at once: "column name" alone does not say which table, and the
+    /// operator's next action is to rename a specific object.
+    ///
+    /// Introduced by D141, which found `catalog::catalog_page` doing exactly this at eight sites
+    /// while three sibling encoders already carried comments about the hazard.
+    Unrepresentable { what: String, len: usize, limit: usize },
     /// A publication refused to let something out of the database, or its declaration is not usable
     /// — see `replication::publication`.
     ///
@@ -92,6 +111,13 @@ impl Display for FerroError {
             FerroError::Eval(e) => write!(f, "evaluation error: {}", e),
             FerroError::Internal(e) => write!(f, "internal error (this is a bug in ferrodb): {}", e),
             FerroError::Corruption(e) => write!(f, "DATA CORRUPTION: {}", e),
+            // Names the limit as well as the length: "too long" without a number leaves the caller
+            // guessing at what would fit, and the two limits here differ by a factor of 256.
+            FerroError::Unrepresentable { what, len, limit } => write!(
+                f,
+                "{what} is {len} bytes, which the on-disk length field cannot express (limit \
+                 {limit}); refused rather than written truncated"
+            ),
             FerroError::Publication(e) => write!(f, "publication refused: {}", e),
             FerroError::Io(e) => write!(f, "io error: {}", e),
             FerroError::NotEnoughSpace => write!(f, "not enough space in page"),

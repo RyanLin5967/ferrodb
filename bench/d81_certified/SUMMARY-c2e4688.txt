@@ -1,0 +1,2 @@
+D81-fsm-append: mode=whole rc=0 passed=2469 failed=0 build_errors=0 head=c2e4688 log=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/tmp.N3Uf0JAUOX/suite-D81-fsm-append.log
+D81-fsm-append: go rc=0 passed=97 failed=0 log=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/tmp.N3Uf0JAUOX/suite-D81-fsm-append.go.log

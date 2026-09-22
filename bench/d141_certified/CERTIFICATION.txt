@@ -1,0 +1,116 @@
+CERTIFICATION — D141, merged into main as 6084883 on 2026-09-22.  NOT PUSHED (see below).
+
+suite head=            28783ab
+merge commit=          6084883
+second parent=         28783ab           <- VERIFIED by git rev-parse, not asserted
+base before merge=     6167bfd
+
+CODE IDENTITY: `git diff 28783ab 6084883 -- src tests examples Cargo.toml` is EMPTY.
+  The code that was tested and the code that landed are the same code. This is the check,
+  not a claim — D126's bank asserted an equality that was false by 506 lines.
+
+⛔ NOT PUSHED TO origin/main. My own operating instructions forbid pushing to the default
+  branch, so the merge is local and the push is the team lead's. `origin/main` is 6167bfd.
+
+RESULT, verbatim from the runner's own stdout
+---------------------------------------------
+d141merged: mode=whole rc=0 passed=2492 failed=0 build_errors=0 head=28783ab
+d141merged: go rc=0 passed=97 failed=0
+RUNNER_EXIT=0
+
+GATE — tools/land-gate.sh, all three, staleness asked LAST
+----------------------------------------------------------
+certify-head  OK — the verdict names 28783ab
+staleness     COVERED-NO-CODE — base moved 1 commit (6167bfd), bench/ only, no code
+prepush       OK — FFI sweep, cargo build --examples, cargo check --all-targets,
+                   and the x86_64-pc-windows-msvc check, all under CI's RUSTFLAGS
+land-gate: OK — "the evidence is about the tree that will ship"
+
+PRE-REGISTRATION (bench/d141_prereg.txt, amended append-only before the run)
+----------------------------------------------------------------------------
+1. rc=0, failed=0, build_errors=0 ................................... HIT
+2. Go 97 passed / 0 failed .......................................... HIT
+3. all EIGHT new tests present BY NAME, each "... ok" ............... HIT (grepped, not inferred)
+4. total == main's count + 8 ........................................ HIT — 2482 + 8 + 2 = 2492
+
+⛔ CORRECTION, 2026-09-22, logged where the wrong claim was logged
+------------------------------------------------------------------
+THE PARAGRAPH THAT WAS HERE SAID THE TOTAL WAS "ONE TEST ADRIFT AND I COULD NOT CLOSE IT",
+AND IT ALSO "CORRECTED" THE PROJECT'S `whole = per-target + 2 doctests` RULE TO +1.
+BOTH WERE WRONG. The arithmetic closes exactly:
+
+     main's certified per-target at b2991c6                     2482
+     plus D141's 8, counted BY NAME in the log                  + 8
+     plus doctests                                              + 2
+                                                                ----
+     this run's whole-mode total                                2492   ✓ EXACT
+
+THERE ARE **TWO** DOCTESTS, not one. The second is a `compile_fail` doctest, and rustdoc runs it
+as a SEPARATE `running 1 test` block with its OWN `test result` line:
+
+     test src/cow/diff.rs - cow::diff::MemoIdentity (line 443) ... ok
+     test result: ok. 1 passed; ...
+     test src/cow/diff.rs - cow::diff::MemoIdentity (line 483) - compile fail ... ok
+     test result: ok. 1 passed; ...
+
+⇒ `whole = per-target + 2 doctests` WAS CORRECT ALL ALONG, as d127's bank said. Three of us
+  independently "corrected" it to +1 in the same hour and one of those edits reached d127's bank
+  before being reverted. **Wrongly correcting a right claim is the same failure as asserting a
+  false one**, and this file carried the false version — hence this band rather than a quiet edit.
+
+⚠ HOW ALL THREE OF US GOT IT WRONG, because the method is the reusable part:
+  we each grepped `Doc-tests` with a few lines of trailing context, saw `running 1 test`, and
+  stopped. That reads the FIRST doctest block only. **Counting `Doc-tests` SECTIONS is not
+  counting doctests** — there is one section and two blocks. A surprisingly small result is a
+  fact about the SCOPE of the detector before it is a fact about the world; the fix is to print
+  the section to end-of-file, which is how it was finally seen.
+
+⭐ AND WHAT ACTUALLY CLOSED IT WAS NOT THE TOTAL. It was diffing the two runs PER TARGET:
+
+     src/lib.rs                      per-target 1632   whole 1636   <- D141's 4 unit tests
+     tests/d141_long_identifier.rs   per-target    -   whole    4   <- D141's 4 new-target tests
+
+  No shared target differed except by D141's own additions. That eliminated the entire "a test is
+  hiding somewhere" class and left only the unattributed lines, which were the second doctest.
+  ⇒ **An aggregate disagreement is best attacked per-component. A total tells you a gap exists
+  and never where it is.**
+
+THE ELIMINATIONS BELOW STILL STAND and are what narrowed it to a single unattributed pass:
+     * a bin target per-target's glob misses — src/main.rs IS run by whole mode, and has
+       0 tests, so it contributes nothing.
+     * a test target declared outside tests/*.rs — Cargo.toml declares none; 133 tests/*.rs
+       files and exactly 133 "Running tests/" lines in the log.
+     * D141 adding 9 rather than 8 — `git diff main...HEAD -- src tests` adds 8
+       `#[test]` and removes 0, and all 8 are present by name at runtime.
+     * a partial or truncated run — the sum of every "test result: ok. N passed" line is
+       exactly 2492, so the run is internally self-consistent.
+
+A whole-mode run at b2991c6 was pre-registered and QUEUED to settle this; it was cancelled
+before it ever acquired the suite lock, so it cost no machine time. Its pre-registration is kept
+at /Users/idide/wt/artie-research/verify-out/d141-basecheck-PREREG.txt — including outcome A,
+which predicted 2484 on the assumption of ONE doctest and would have been wrong for that reason.
+
+⚠ WHAT THIS GREEN DOES NOT LICENSE
+-----------------------------------
+
+1. The fire-check proves each guard FIRES and that the boundary still round-trips. It says
+   nothing about identifier limits ABOVE the catalog layer — there are none in src/.
+
+2. `Catalog::persist` returns through `?` without unpinning the catalog page it fetched, so
+   every refusal leaks one pin. PRE-EXISTING on every error path there; D141 made it reachable
+   from SQL for the first time. Bounded, not fixed: 300 consecutive refusals leave the database
+   working, asserted by many_refused_statements_leave_the_database_working.
+
+3. `wal::log::write_str` (src/wal/log.rs:211) still writes `s.len() as u16` UNCHECKED, and its
+   doc comment one line above claims the opposite: "so a name containing anything at all cannot
+   desync the reader." Out of D141's scope, scoped and handed over as its own row. tel/log.rs
+   and consensus/log.rs are NOT affected — each already wraps it in a checked put_str.
+
+EVIDENCE
+--------
+bench/d141_firecheck.txt   all 8 guards reverted to their raw cast one at a time; 8 KILLED,
+                           0 survivors, unmutated baseline PASS first
+bench/d141_mutate.py       the harness that produced it
+bench/d141_prereg.txt      pre-registration + append-only amendment
+SUMMARY.txt, runner.log    this run, as the runner wrote them
+full logs                  /Users/idide/wt/artie-research/verify-out/d141merged/

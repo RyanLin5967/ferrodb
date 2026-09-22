@@ -1,0 +1,13 @@
+BASELINE (unmutated): rc=0 PASS
+guard 1 (table count): KILLED — range end index 4097 out of range for slice of length 4096
+guard 2 (table name): KILLED — guard 2 (table name): DID NOT FIRE — serialize produced a page it cannot encode
+guard 3 (column count): KILLED — range end index 4097 out of range for slice of length 4096
+guard 4 (column name): KILLED — guard 4 (column name): DID NOT FIRE — serialize produced a page it cannot encode
+guard 5 (index count): KILLED — guard 5 (index count): DID NOT FIRE — serialize produced a page it cannot encode
+guard 6 (indexed-column name): KILLED — guard 6 (indexed-column name): DID NOT FIRE — serialize produced a page it cannot encode
+guard 7 (full-text index count): KILLED — guard 7 (full-text index count): DID NOT FIRE — serialize produced a page it cannot encode
+guard 8 (full-text indexed-column name): KILLED — guard 8 (full-text indexed-column name): DID NOT FIRE — serialize produced a page it cannot encode
+
+RESULT: all 8 guards KILLED by catalog_page::tests::every_length_prefix_refuses_the_first_value_it_cannot_express
+HARNESS_EXIT=0
+DONE
