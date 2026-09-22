@@ -1467,16 +1467,6 @@ mod d126_record_key_probe {
             }
         });
         println!("D126 catalog CONTROL  (delete+insert): misses={} reads={}", control.misses, control.reads);
-        assert!(control.reads > 0, "the control's readers never ran");
-        assert!(
-            control.misses > 0,
-            "THE PROBE IS NOT DISCRIMINATING. delete-then-insert on the RECORD key leaves it \
-             absent between the two calls by construction, and {READERS} readers over \
-             {RAW_WRITES} rewrites saw it {} times in {} reads. The zeros below mean nothing \
-             until this fires.",
-            control.misses,
-            control.reads
-        );
 
         // ---- 2. TREATMENT: the same rewrite through the catalog's own `upsert`. ----
         let (c2, _p2) = fresh("treatment");
@@ -1490,18 +1480,6 @@ mod d126_record_key_probe {
             }
         });
         println!("D126 catalog TREATMENT (upsert)      : misses={} reads={}", treatment.misses, treatment.reads);
-        assert_eq!(
-            treatment.misses, 0,
-            "the RECORD key was absent {} times in {} reads while `upsert` rewrote it",
-            treatment.misses, treatment.reads
-        );
-        assert!(
-            treatment.reads >= control.reads / 4,
-            "the treatment arm's readers did only {} reads against the control's {}; its zero is \
-             not comparable to the control's positive count",
-            treatment.reads,
-            control.reads
-        );
 
         // ---- 3. REALISM: the hot-path caller, whole. ----
         let (c3, _p3) = fresh("set_root");
@@ -1514,6 +1492,35 @@ mod d126_record_key_probe {
             }
         });
         println!("D126 catalog set_root                : misses={} reads={}", real.misses, real.reads);
+
+        // ---- Every arm has REPORTED before any assertion fires. ----
+        //
+        // Deliberate: the first cut asserted arm by arm, and the before-the-fix run therefore
+        // died on arm 2 and never printed arm 3 at all. The number that shows `set_root` -- the
+        // hot-path caller, the one that makes this more than a storage-layer curiosity -- was
+        // the one the ordering threw away. A probe should not hide its own evidence.
+        assert!(control.reads > 0, "the control's readers never ran");
+        assert!(
+            control.misses > 0,
+            "THE PROBE IS NOT DISCRIMINATING. delete-then-insert on the RECORD key leaves it \
+             absent between the two calls by construction, and {READERS} readers over \
+             {RAW_WRITES} rewrites saw it {} times in {} reads. The zeros below mean nothing \
+             until this fires.",
+            control.misses,
+            control.reads
+        );
+        assert_eq!(
+            treatment.misses, 0,
+            "the RECORD key was absent {} times in {} reads while `upsert` rewrote it",
+            treatment.misses, treatment.reads
+        );
+        assert!(
+            treatment.reads >= control.reads / 4,
+            "the treatment arm's readers did only {} reads against the control's {}; its zero is \
+             not comparable to the control's positive count",
+            treatment.reads,
+            control.reads
+        );
         assert!(real.reads > 0, "the set_root arm's readers never ran");
         assert_eq!(
             real.misses, 0,
