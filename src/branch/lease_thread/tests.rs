@@ -303,7 +303,12 @@ fn an_unexpired_branch_survives_every_scan() {
     wait_for("at least four scans to complete", || lease.stats().scans >= 4);
     let stats = lease.stop();
     assert_eq!(stats.reaped, 0, "a live lease was reaped");
-    assert_eq!(stats.refused, 0, "a standalone node always knows the time");
+    assert_eq!(stats.refused_scans, 0, "a standalone node always knows the time");
+    assert_eq!(
+        stats.refused_branches, 0,
+        "a healthy branch with a live lease must be reported as NOT EXPIRED, never as a branch \
+         the reaper declined to decide about (D127)"
+    );
     assert_eq!(stats.failed, 0, "a healthy scan must not be erroring");
     assert_eq!(state_of(&f, kept), BranchState::Live);
     assert_eq!(f.h.store.live_page_count().unwrap(), pages);
@@ -558,7 +563,7 @@ fn d88_the_orphan_sweep_does_not_run_inside_the_statement_lock() {
     let counters = Counters::default();
     let before_total = f.reaper.sweep_visits();
 
-    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters, &report);
 
     let inside = gate.visits_inside.load(Ordering::SeqCst);
     let total = f.reaper.sweep_visits() - before_total;
@@ -649,7 +654,7 @@ fn d98_one_acquisition_never_reaps_more_than_a_chunk() {
 
     let gate = ChunkGate::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
     let counters = Counters::default();
-    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters, &report);
 
     let stats = counters.snapshot();
     assert_eq!(
@@ -711,7 +716,7 @@ fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
     }
 
     let counters = Counters::default();
-    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters, &report);
 
     let stats = counters.snapshot();
     assert_eq!(

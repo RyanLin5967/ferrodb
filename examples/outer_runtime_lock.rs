@@ -522,7 +522,7 @@ fn run_arm(f: &Fixture, arm: Arm, clients: usize, probe_us: u64, warmup: Duratio
             to.duration_since(origin).as_nanos() as u64,
             stats.reaped,
             stats.scans,
-            stats.refused,
+            stats.refused_scans,
         )
     };
 

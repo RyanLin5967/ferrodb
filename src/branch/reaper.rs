@@ -48,6 +48,48 @@ const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
 /// always collects rather than waiting out an interval measured from the epoch.
 const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 
+/// What one branch's turn in a lease sweep actually did.
+///
+/// # D127 — this was a `bool`, and `false` meant two unrelated things
+///
+/// [`TwoTierReaper::reap_if_still_expired`] answered `Ok(false)` both for *"the lease was renewed
+/// between the candidate query and here, so there is nothing to do"* — routine, expected, and
+/// correctly silent — and for *"the catalog would not answer, so this reaper declined to decide"*.
+/// The second is D124's guard firing: a refusal carrying text that names the parent, the fork
+/// epoch and the child whose record could not be read. Collapsed into the first, that text reached
+/// **no log, no counter and no operator**, and the branch it names becomes one that can never be
+/// reaped while looking exactly like a healthy one — an unbounded leak with no signal.
+///
+/// The conflation IS the defect, which is why the fix is the return type and not a match arm
+/// somewhere downstream. Recovering the distinction from the message string was the alternative
+/// and is rejected on sight: `From<BranchError> for FerroError` flattens every variant into
+/// `Branch(String)`, so a discriminator built on the wording is walked around by a reword.
+///
+/// # What did NOT change: a refusal still lets the sweep continue
+///
+/// That is what the swallow is *for*. A branch whose record is momentarily absent — `upsert` is
+/// delete-then-insert and holds no latch across the two, so an ordinary `set_root` or
+/// `renew_lease` removes the RECORD key for a moment on a perfectly healthy branch — must not
+/// abort the sweep, and a reaper that stopped on the first oddity would be strictly worse than the
+/// bug this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the
+/// caller records it and moves to the next candidate. Only a non-`Branch` error still aborts.
+#[derive(Debug)]
+#[must_use = "a refused reap that nobody looks at is exactly the D127 defect"]
+pub enum ReapOutcome {
+    /// The branch was reaped and its pages are back.
+    Reaped,
+    /// Its lease is no longer expired: the deadline moved between the candidate query and the
+    /// re-read inside the lock. Routine, and deliberately reported nowhere — the branch is
+    /// healthy and there is nothing for an operator to do.
+    NotExpired,
+    /// **The reaper declined to decide, and this is why.** Nothing was freed, so nothing is lost;
+    /// the branch keeps its pages and the next sweep asks again. Carrying the error rather than a
+    /// bare marker is the whole point: the text is the only thing that can tell a benign
+    /// mid-rewrite race apart from a genuinely corrupt CHILD entry, and a caller that only got a
+    /// count could not print it.
+    Refused(FerroError),
+}
+
 pub struct TwoTierReaper {
     catalog: Arc<dyn BranchCatalog>,
     store: Arc<ArenaPageStore>,
@@ -73,6 +115,14 @@ pub struct TwoTierReaper {
     /// until the next open. A non-zero reading here after a clean close is that producer saying so
     /// out loud, instead of a 60-second full scan quietly hiding it.
     open_sweep_freed: AtomicU64,
+    /// **D127.** Branch reaps this reaper declined to decide. See [`ReapOutcome::Refused`].
+    ///
+    /// Counted at the one site that produces a refusal rather than at each caller, because there
+    /// is more than one call shape — `lease_thread::scan_once` runs the halves of a sweep itself,
+    /// `Reaper::reap_expired` runs them back to back — and a counter each caller had to remember
+    /// to bump is a counter the next caller forgets. `scan_once` additionally *reports* the text;
+    /// this is the floor that makes a refusal impossible to drop entirely, whoever asked for it.
+    refused_reaps: AtomicU64,
 }
 
 impl TwoTierReaper {
@@ -85,12 +135,22 @@ impl TwoTierReaper {
             sweep_visits: AtomicU64::new(0),
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
+            refused_reaps: AtomicU64::new(0),
         }
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
     pub fn open_sweep_freed(&self) -> u64 {
         self.open_sweep_freed.load(Ordering::Relaxed)
+    }
+
+    /// **D127.** Reaps this reaper refused to decide, over its whole life.
+    ///
+    /// Not the same question as `LeaseStats::refused_branches`, which counts what the background
+    /// lease thread saw: this counts every caller's refusals, including `Reaper::reap_expired`'s,
+    /// which has no reporter of its own.
+    pub fn refused_reaps(&self) -> u64 {
+        self.refused_reaps.load(Ordering::Relaxed)
     }
 
     /// Arenas currently recorded as needing a narrowed sweep. Test/diagnostic read.
@@ -624,8 +684,20 @@ impl Reaper for TwoTierReaper {
         let candidates = self.expired_candidates(now_millis)?;
         let mut reaped = Vec::with_capacity(candidates.len());
         for rec in candidates {
-            if self.reap_if_still_expired(rec.branch_id(), now_millis)? {
-                reaped.push(rec.branch_id());
+            match self.reap_if_still_expired(rec.branch_id(), now_millis)? {
+                ReapOutcome::Reaped => reaped.push(rec.branch_id()),
+                ReapOutcome::NotExpired => {}
+                // **D127.** This shape hands back only the list of branches it reaped, and a
+                // refusal is by definition not one of them — there is nowhere in the signature to
+                // put it, and widening the signature would change every caller of a trait method
+                // that no production path uses (`scan_once` calls the two halves itself, so that
+                // it can bound how long it holds the statement lock).
+                //
+                // The refusal is therefore not lost and not reported here either: it is counted on
+                // the reaper by `reap_if_still_expired` itself, readable through
+                // `TwoTierReaper::refused_reaps`. That is deliberate rather than an oversight, and
+                // it is why the counter lives at the refusal site and not in the caller.
+                ReapOutcome::Refused(_) => {}
             }
         }
 
@@ -685,8 +757,8 @@ impl TwoTierReaper {
         Ok(candidates)
     }
 
-    /// Reap `branch`, but only if its lease is **still** expired at `now_millis`. Returns whether
-    /// it reaped.
+    /// Reap `branch`, but only if its lease is **still** expired at `now_millis`. Returns which of
+    /// the three things in [`ReapOutcome`] happened.
     ///
     /// # The re-check is not belt and braces; it is the guarantee the lock used to give
     ///
@@ -711,9 +783,11 @@ impl TwoTierReaper {
         &self,
         branch: BranchId,
         now_millis: u64,
-    ) -> Result<bool, FerroError> {
+    ) -> Result<ReapOutcome, FerroError> {
         match self.catalog.get_raw(branch.id) {
-            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
+            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => {
+                return Ok(ReapOutcome::NotExpired)
+            }
             Ok(_) => {}
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
@@ -723,15 +797,32 @@ impl TwoTierReaper {
             // likewise turns a refusal into "did not reap" rather than aborting the sweep —
             // deliberately left alone, because propagating it would turn a benign already-reaped
             // race into a failed sweep for a whole pre-existing class of errors.
-            Err(FerroError::Branch(_)) => return Ok(false),
+            //
+            // **D127 — it is no longer the same ANSWER as "not expired", though.** Both still
+            // decline to reap and both still let the sweep go on; what changed is that the caller
+            // can now tell them apart, so the refusal can be counted and printed instead of being
+            // rounded off into a healthy branch's routine reprieve.
+            Err(e @ FerroError::Branch(_)) => return Ok(self.refuse(e)),
             Err(e) => return Err(e),
         }
         match self.reap(branch) {
-            Ok(_) => Ok(true),
-            // A branch already reaped as a side effect of this same scan is not an error.
-            Err(FerroError::Branch(_)) => Ok(false),
+            Ok(_) => Ok(ReapOutcome::Reaped),
+            // A branch already reaped as a side effect of this same scan is not an error — and
+            // neither is D124's `Corrupt`, which arrives here from `has_live_children` when a
+            // CHILD entry names a record that cannot be read. **D127: this is the site whose
+            // silence the row exists to fix.** The refusal is still absorbed, because a corrupt
+            // entry on one branch must not stop the other expired branches from being reclaimed;
+            // it is now absorbed *with its reason attached*.
+            Err(e @ FerroError::Branch(_)) => Ok(self.refuse(e)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Count a refusal and hand it back as an outcome, so that no caller can produce one without
+    /// it being counted. See [`TwoTierReaper::refused_reaps`].
+    fn refuse(&self, why: FerroError) -> ReapOutcome {
+        self.refused_reaps.fetch_add(1, Ordering::Relaxed);
+        ReapOutcome::Refused(why)
     }
 }
 
