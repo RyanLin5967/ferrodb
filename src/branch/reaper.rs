@@ -414,10 +414,17 @@ impl TwoTierReaper {
                     // This owner WAS published: the extent it names was created by `alloc_arena`,
                     // which ends in `catalog.add_arena`, and every catalog refuses that for a
                     // branch with no record. And a record that is missing *right now* has not
-                    // stopped existing — `TableBranchCatalog::upsert` is delete-then-insert with
-                    // no latch held across the two calls, and `write_record` routes the RECORD
-                    // key through it, so a concurrent `set_root` or `renew_lease` on the owner
-                    // makes this read miss on a perfectly healthy branch.
+                    // stopped existing: nothing ever deletes a record, and retirement is a state
+                    // flip to `Reaped`.
+                    //
+                    // ⚠ **D126 changed WHICH failures reach here, not what to do about them.**
+                    // This used to say the miss was routine: `TableBranchCatalog::upsert` was
+                    // delete-then-insert with no latch held across the two calls, so a concurrent
+                    // `set_root` or `renew_lease` on the owner made this read miss on a perfectly
+                    // healthy branch. D126 gave the tree an in-place replace and closed that
+                    // window (`tests/d126_atomic_upsert.rs`). An I/O error or a corrupt catalog
+                    // still reaches this arm, and for both of those refusing remains the only
+                    // answer that neither frees nor guesses.
                     //
                     // Answering "not pinned" to that hands back a page the interval rule had
                     // deliberately parked for a live child. Refusing keeps the entry in the

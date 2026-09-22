@@ -521,13 +521,23 @@ impl TableBranchCatalog {
     /// `write_record` for a branch whose keys are **provably new**, which on the fork path means a
     /// freshly minted id.
     ///
-    /// `upsert` is delete-then-insert, because `BPlusTreeManager::insert` does not replace. For a
-    /// key that cannot exist, the delete is a **guaranteed miss: a full B+tree descent whose only
-    /// possible outcome is `KeyNotFound`**. Measured on the child key, same key space and same run:
-    /// `upsert` 0.02280 ms against `tree.insert` 0.01003 ms, so **the wasted delete is 56% of an
-    /// upsert** (`bench/serial_section_profile.txt`). This also skips the arena-span `range_scan`
-    /// that `write_record` performs to reconcile arenas, which for a brand-new child can only ever
-    /// find an empty span.
+    /// ⛔ **D126 RETIRED MOST OF THIS METHOD'S ORIGINAL JUSTIFICATION. Stated rather than left to
+    /// be discovered, because the retired half is the half that carried a number.**
+    ///
+    /// The argument was: `upsert` is delete-then-insert, so for a key that cannot exist the delete
+    /// is a guaranteed miss — a full B+tree descent whose only possible outcome is `KeyNotFound`.
+    /// Measured on the child key, same key space and same run, `upsert` 0.02280 ms against
+    /// `tree.insert` 0.01003 ms, so the wasted delete was 56% of an upsert
+    /// (`bench/serial_section_profile.txt`). **`upsert` is no longer delete-then-insert.** It is
+    /// one descent and one page write, the same shape as `insert`, and the delete it used to pay
+    /// for does not happen: `bench/d126_upsert_cost.txt` measures the replacement at 0.52-0.54x
+    /// the pair, which is that wasted descent going away.
+    ///
+    /// ⇒ What is left of the justification is the part that never depended on the delete: this
+    /// skips the arena-span `range_scan` that `write_record` performs to reconcile arenas, which
+    /// for a brand-new child can only ever find an empty span. **That saving is UNMEASURED** — the
+    /// only number this method ever had was the one D126 removed — so anyone pricing `fork`'s
+    /// serial section should re-take it rather than reusing 56% of anything.
     ///
     /// SAFETY OF "PROVABLY NEW", checked rather than assumed: no path anywhere deletes a `RECORD`
     /// key -- the only operations on `keys::record` are insert, search and upsert -- so a reaped
@@ -564,6 +574,18 @@ impl TableBranchCatalog {
     /// [`CoreRecord`]: the only things ever read from it are the state and deadline index keys, and
     /// typing it that way means a caller can pass the cheap read it already has without the
     /// signature implying the expensive one would be safer.
+    ///
+    /// ⚠ **D126 made the RECORD key's rewrite atomic. It did NOT make this method atomic, and the
+    /// difference is worth stating so the guarantee is not over-read.** The state and deadline
+    /// index keys are not rewritten in place, they MOVE: `remove_if_present(old)` below, then
+    /// `upsert(new)` a few lines later. Between those two a branch is in NEITHER state span and
+    /// neither deadline span, and `live_count`, `in_state` and `expired_before` scan exactly those
+    /// spans without the `logical` lock. No per-key primitive can close that window — the two keys
+    /// are different keys, in general on different pages — so it needs multi-key exclusion or an
+    /// ordering argument, and it is a separate row. The direction it fails in is benign for the
+    /// reaper (`expired_before` missing an entry means "not expired yet", and
+    /// `reap_if_still_expired` re-reads the record anyway), which is why it is noted here rather
+    /// than treated as the same defect.
     fn write_record(
         &self,
         rec: &BranchRecord,
@@ -639,28 +661,34 @@ impl TableBranchCatalog {
     /// as the one-entry answer its other callers want, now written in terms of this.
     /// A CHILD entry whose value names a branch with **no record**. Refused, never resolved.
     ///
-    /// ⛔ **A missing record cannot mean "the child is gone" — but it does NOT mean "impossible"
-    /// either, and an earlier version of this comment said exactly that and was WRONG.**
+    /// ⛔ **A missing record cannot mean "the child is gone."** Nothing ever leaves a record
+    /// deleted: retirement is a state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled
+    /// slot, and `keys::record` is only ever inserted, searched and upserted — the same fact
+    /// `write_record_new`'s "provably new" argument rests on.
     ///
-    /// The DURABLE form of the claim holds: nothing ever leaves a record deleted. Retirement is a
-    /// state FLIP to `Reaped`, the id-reuse path OVERWRITES the recycled slot, and `keys::record`
-    /// is only ever inserted, searched and upserted — the same fact `write_record_new`'s
-    /// "provably new" argument rests on.
+    /// # What D126 changed here, and what it did not
     ///
-    /// The TRANSIENT form does not hold. `BPlusTreeManager` has no replace primitive (see
-    /// `upsert`, which says so), so `upsert` is DELETE-THEN-INSERT; `delete` drops its leaf write
-    /// latch when it returns and `insert` re-acquires, and `write_record` routes the RECORD key
-    /// straight through it. So during any `set_root`, `renew_lease`, `set_state`, `reparent`,
-    /// `restrict_envelope` or `put` — two of those are hot-path writes — the key is briefly
-    /// ABSENT. Every reader here is lockless: `logical` is writers-only. **A reader can therefore
-    /// see "no record" for a perfectly healthy, live branch.**
+    /// An earlier version of this comment called the state impossible. It was not, and the reason
+    /// was `upsert`: with no replace primitive on the tree it was DELETE-THEN-INSERT, `delete`
+    /// dropped its leaf write latch on return and `insert` re-acquired, and `write_record` routed
+    /// the RECORD key through the pair. Every `set_root`, `renew_lease`, `set_state`, `reparent`,
+    /// `restrict_envelope` and `put` — two of them hot-path writes — left the key briefly ABSENT,
+    /// and every reader here is lockless because `logical` is writers-only. **A reader could see
+    /// "no record" for a perfectly healthy, live branch.**
     ///
-    /// That is not a reason to resolve it; it is the reason refusing is right. A reader cannot
-    /// distinguish "mid-rewrite" from "never published", and freeing on that ambiguity destroys a
-    /// live branch's pages. Refusing costs a spurious error on a healthy database; resolving
-    /// costs the data. **SCALE-DESIGN D126 closes the window** by giving the tree a real replace,
-    /// after which this really is unreachable — that is a storage-layer change and deliberately
-    /// not part of D124.
+    /// **D126 closed that window** ([`crate::storage::index::BPlusTreeManager::upsert`]). Measured
+    /// on the RECORD key itself in `mod d126_record_key_probe`: the delete-then-insert control
+    /// misses 18,515 times in 156,409 lockless reads, the same rewrite through `upsert` misses 0
+    /// in 140,113, and a 300-iteration `set_root` loop misses 0 in 9,401,816.
+    ///
+    /// ⇒ This arm is no longer reachable from an ordinary write. It is still refused, for a
+    /// different reason than before: what remains is a branch that was never published — which
+    /// `attach_child` and `add_arena` refuse to create, so it means an older database or a bug —
+    /// or genuine corruption. Freeing is irreversible and refusing is retryable, so guessing the
+    /// destructive direction is wrong whichever of the two it is.
+    ///
+    /// ⚠ **That makes this `Corrupt` a REAL signal rather than an expected artefact of a hot-path
+    /// write — which makes D127, the reaper swallowing it, matter more rather than less.**
     ///
     /// **D124 — both resolvers used to answer "not a pin" here, which is the DESTRUCTIVE
     /// direction.** The parent then reads as childless, `reap_expired` frees its pages, and a
@@ -676,13 +704,14 @@ impl TableBranchCatalog {
             _ => format!("malformed CHILD key {key:02x?}"),
         };
         BranchError::Corrupt(format!(
-            "CHILD entry ({which}) names branch {child_id}, which has no record right now. That \
-             is either a branch that was never published, or — far more likely on a healthy \
-             database — one whose record is mid-rewrite: upsert is delete-then-insert and holds \
-             no latch across the two, so set_root/renew_lease/set_state briefly remove the key. \
-             A reader cannot tell those apart, so this refuses instead of resolving it to \"not \
-             a live child\", which would let the parent's pages be freed underneath a branch \
-             that may still be reading them. Retry is safe; see D124/D126."
+            "CHILD entry ({which}) names branch {child_id}, which has no record. Nothing ever \
+             deletes a record — retirement is a state flip to Reaped — and since D126 there is \
+             no rewrite window either: upsert replaces a value under one hold of the leaf latch, \
+             so an ordinary set_root/renew_lease/set_state no longer makes the key momentarily \
+             absent. What is left is a branch that was never published, or a corrupt entry. This \
+             refuses instead of resolving it to \"not a live child\", which would let the \
+             parent's pages be freed underneath a branch that may still be reading them. \
+             Refusing leaks at worst and is retryable; see D124/D126."
         ))
         .into()
     }
@@ -701,9 +730,10 @@ impl TableBranchCatalog {
             Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
-            // `dangling_child` has the reason: the state is NOT impossible — a concurrent
-            // `set_root` on this very child removes its RECORD key for the length of an upsert —
-            // and a reader that cannot tell "mid-rewrite" from "never existed" must not free.
+            // `dangling_child` has the reason. It used to be "a concurrent `set_root` on this
+            // very child removes its RECORD key for the length of an upsert"; D126 closed that
+            // window, and the arm stays because what is left — never published, or corrupt — is
+            // still not something to resolve in the direction that FREES pages.
             None => return Err(Self::dangling_child(key, child_id)),
         })
     }
@@ -1258,10 +1288,10 @@ impl BranchCatalog for TableBranchCatalog {
         // can create one; `fork` writes the record before the child key under this same lock, so
         // it cannot create one either.
         //
-        // ⚠ This removes the PERMANENT form and not the transient one. A record can also be
-        // missing for the length of an `upsert` on a perfectly healthy branch, which this check
-        // cannot prevent and the resolvers therefore still have to refuse — see `dangling_child`,
-        // and D126 for the fix that removes the window itself.
+        // ⚠ This removes the PERMANENT form. The transient one — a record missing for the length
+        // of an `upsert` on a perfectly healthy branch — was never preventable here, and is now
+        // gone at its source: D126 made `upsert` an in-place replace under one latch hold. The
+        // resolvers still refuse a dangling entry, for the residual reasons in `dangling_child`.
         //
         // One extra point lookup, and it is free where it matters: `migrate_from` is the only
         // production caller (D63 deleted `collapse`) and it already writes every record before it
@@ -1727,7 +1757,11 @@ mod serial_section_profile {
         let t_publish = timed(N, || {
             cat.publish_root().unwrap();
         });
-        // One upsert on its own, to price the delete-then-insert that `write_record` does 3x.
+        // One upsert on its own, for scale against the 3 that `write_record` performs.
+        // ⚠ Since D126 this is an in-place replace, not the delete-then-insert it was when this
+        // profile was first taken, so the 0.01344 ms in `bench/serial_section_profile.txt` is a
+        // PRE-D126 number. `bench/d126_upsert_cost.txt` prices the change at 0.52-0.54x; re-run
+        // this profiler before quoting its upsert row again.
         let t_upsert = timed(N, || {
             cat.upsert(keys::state(child.state.as_u8(), child.branch_id.id), Vec::new()).unwrap();
         });
