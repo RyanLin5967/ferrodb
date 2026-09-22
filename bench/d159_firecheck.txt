@@ -1,0 +1,79 @@
+D159 FIRE-CHECK — does `tests/d159_fork_sync_is_deferred.rs` actually detect the defect it names?
+=================================================================================================
+worktree: /Users/idide/wt/ferrodb-agent-ad99f2a878b6869a3   branch: w4-statement-fork-lock
+tree at mutation time: clean (git status --porcelain = 0 lines), HEAD 7aabdb6
+recorded: 2026-09-22
+instrument: `cargo test --test d159_fork_sync_is_deferred` (debug). No timing is read from this
+            harness; every assertion is on `TableBranchCatalog::syncs_issued()`, an integer.
+
+WHY THIS FILE EXISTS
+--------------------
+A green test that has never been shown to fail is not evidence. The claim these tests carry is that
+`BEGIN AGENT SESSION`'s fsync is issuable OUTSIDE the caller's lock and that two forks staged before
+either completes SHARE one fsync. If the tests would pass with the split removed, they assert
+nothing about the split.
+
+THE MUTANT — the pre-D159 shape, restored in one place
+-------------------------------------------------------
+`src/branch/table_catalog.rs`, at the end of `TableBranchCatalog::fork_staged`, the returned
+ticket replaced by an immediate sync:
+
+      // FIRE-CHECK MUTANT -- the pre-D159 shape: sync inside, defer nothing.
+      self.durable(seq)?;
+      Ok((child, None))
+
+That is exactly what `fork` did before the split: the disk round-trip happens while the caller still
+holds whatever lock it holds, and nothing is handed back to defer.
+
+RESULT — 2 of 4 failed, and they are the 2 that carry the claim
+----------------------------------------------------------------
+    test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+
+  a_staged_fork_has_not_synced_yet_and_completing_it_syncs_once   FAILED
+    assertion `left == right` failed: staging a fork must not issue the branch catalog's fsync. [...]
+      left: 1
+     right: 0
+
+  two_forks_staged_before_either_completes_share_one_fsync        FAILED
+    assertion `left == right` failed: neither staged fork may have synced: if the first one did,
+    tickets cannot accumulate and there is nothing for a leader to batch
+      left: 2
+     right: 0
+
+⭐ **The second mutant reading is the whole point: 2 forks produced 2 syncs.** `f/sync` = 1.00 —
+which is precisely the number D130 measured over the wire at every thread count from 1 to 128
+(`bench/d130_batch_vs_threads.txt`). So the mutant does not merely fail the test; it reproduces the
+banked wire-level defect on a deterministic in-process fixture, which is what makes the test a
+detector for THAT defect rather than for some nearby one.
+
+AND THE TWO THAT PASSED UNDER THE MUTANT ARE SUPPOSED TO
+---------------------------------------------------------
+  the_durable_spelling_still_syncs_before_it_returns        ok  (under mutant AND unmutated)
+  the_unsplit_default_forks_durably_and_defers_nothing     ok  (under mutant AND unmutated)
+
+Both are about durability being PRESERVED, not deferred, so a mutant that syncs eagerly cannot break
+them. A fire-check where every test fails would mean the tests are coupled and only one thing is
+really being asserted; these two staying green is the evidence that the suite discriminates.
+
+RESTORED AND RE-VERIFIED
+------------------------
+`git checkout HEAD -- src/branch/table_catalog.rs`; `git status --porcelain` = 0 lines; re-run:
+
+    running 4 tests
+    test the_unsplit_default_forks_durably_and_defers_nothing ... ok
+    test the_durable_spelling_still_syncs_before_it_returns ... ok
+    test a_staged_fork_has_not_synced_yet_and_completing_it_syncs_once ... ok
+    test two_forks_staged_before_either_completes_share_one_fsync ... ok
+    test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+STATED BLIND SPOTS
+------------------
+* This proves the MECHANISM batches. It does not prove any CLIENT sees a batch — that needs the wire
+  measurement, and D159 amendment 4 predicts, in advance, that `f/sync` stays near 1.00 on
+  `examples/d130_pgwire_batch.rs` because that harness gives every fork a unique run id and so pays
+  `prov_store.intern`'s own ungrouped fsync per fork, under `state`, inside the catalog guard.
+* One mutant, at one site. It does not exercise the A/B-atomicity argument (SCALE-DESIGN D159
+  amendment 1), which is a claim about what stays INSIDE the guard and is not expressible as a sync
+  count.
+* Debug build. `ForkDurability`'s `Drop` assertion is a `debug_assert!` and is compiled out of
+  release, so the "staged and never awaited" guard is a test-time guard, not a production one.
