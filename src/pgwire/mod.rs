@@ -194,7 +194,32 @@ impl ServerContext {
     /// pages a writer is freeing.
     ///
     /// Standing down is not a failure: the caller falls back to the exclusive path, which blocks
-    /// on the mutex and is correct. It happens only while DDL is actually in flight.
+    /// on the mutex and is correct.
+    ///
+    /// ⛔ **This used to end "It happens only while DDL is actually in flight." That is FALSE, and
+    /// it is false by construction rather than by degree.** The announcer set is exhaustively
+    /// enumerable and none of it is DDL-gated: `ServerContext::drain_readers` is the only writer
+    /// of `writer_active`, [`ServerContext::catalog`] is its only caller, and `catalog()` has
+    /// exactly four callers in `src/` — `branch::lease_thread`'s `RuntimeLock` impl,
+    /// `pgwire::extended::Statement::parse_one`, the exclusive execution path, and
+    /// [`ServerContext::read_catalog`]'s snapshot refresh. **`parse_one` takes it unconditionally
+    /// for every `Kind::Sql`**, so a plain `SELECT 1` on the simple query protocol announces a
+    /// writer and drains every reader at parse time.
+    ///
+    /// ⚠ **And do NOT replace that sentence with "the lease thread announces every
+    /// `DEFAULT_SCAN_MILLIS`", which is the correction a previous pass tried and which is also
+    /// false.** `scan_once` computes its candidates OUTSIDE the lock and takes it once per
+    /// *reaped branch* (`REAP_CHUNK`), so a scan that finds nothing expired takes it **zero**
+    /// times — `lease_thread`'s own module doc says exactly that. Measured, the lease thread
+    /// announced zero times in every arm ever run, because a branch expires
+    /// `DEFAULT_LEASE_MILLIS` (15 min) after fork and no arm runs that long. Its real axis is
+    /// **expired branches per tick**, and it is still unmeasured.
+    ///
+    /// ⇒ **What governs the stand-down rate is the offered EXCLUSIVE rate, and it is measured**
+    /// (`bench/w4_check3_rederived.txt`): on the extended query protocol — what real drivers use —
+    /// it runs from **1.07% at one fork per 200 statements to 95% at one per one**. It is also a
+    /// FIXED POINT, because a stood-down read falls back and therefore announces, so the rate and
+    /// the announcer set drive each other. **Quote a rate only with the fork rate it was taken at.**
     pub fn begin_read<'a>(
         &self,
         slot: &'a std::sync::atomic::AtomicBool,
