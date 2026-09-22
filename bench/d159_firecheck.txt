@@ -117,6 +117,54 @@ is asserted under it, so the profile that serves pgwire is the profile the guara
 
 Restored: `git checkout HEAD -- src/agent_sql/session.rs`; `git status --porcelain` = 0 lines.
 
+
+=================================================================================================
+FIRE-CHECK 3 — ⭐ EVERY SYNC-COUNTER TEST PASSES WHILE THE DATA IS GONE
+=================================================================================================
+HEAD a0bcbbc. The "a staged fork cannot be lost" argument does NOT rest on the per-seq ticket
+accounting this design is written in terms of. It rests on something coarser: `durable(seq)` calls
+`BufferPoolManager::flush_all`, which **takes no seq** and writes every dirty page. So any later
+sync on the catalog flushes a fork that was staged and never awaited.
+
+From inside `durable()` that reads like dead work — the method HAS a `seq`, so why flush pages no
+ticket asked for? This fire-check answers that.
+
+THE MUTANT — the plausible "optimisation", one line
+    self.commit_group.wait_durable(seq, || {
+        // self.pool.flush_all()?;        <- removed
+        self.pool.disk_manager.sync()
+    })
+
+RESULT
+    test the_unsplit_default_forks_durably_and_defers_nothing              ... ok
+    test the_durable_spelling_still_syncs_before_it_returns                ... ok
+    test dropping_a_staged_fork_without_completing_it_still_syncs_and_...  ... ok
+    test a_staged_fork_has_not_synced_yet_and_completing_it_syncs_once     ... ok
+    test two_forks_staged_before_either_completes_share_one_fsync          ... ok
+    test a_later_sync_makes_an_earlier_staged_fork_durable                 ... FAILED
+    test completing_a_staged_fork_does_not_touch_the_fallback_counter      ... ok
+    test result: FAILED. 6 passed; 1 failed
+
+⛔ **READ THE PASSING COLUMN, NOT THE FAILING ONE.** Six of seven pass — including
+`two_forks_staged_before_either_completes_share_one_fsync`, which is the headline evidence for this
+whole row, and `dropping_..._still_syncs_and_is_counted`, which is the safety net's own proof.
+**Under this mutant the branch catalog loses every staged fork, and both of those still read green,
+because `CommitGroup` reports the fork durable while its pages were never written.**
+
+⇒ ⭐ **A SYNC COUNT IS NOT A FACT ABOUT THE DISK.** Every assertion in this file except one is on
+`syncs_issued()`, an in-process counter, and a counter cannot see an unwritten page. The only test
+that catches this asserts against the FILE — it reopens `{db}.branchcat` with `open_sidecar` and
+demands the record back. That is the difference between instrumenting the mechanism and checking
+the outcome, and it is the reason this test was added rather than trusting the five that were
+already green.
+
+⚠ Consequence for anyone editing `durable()`: narrowing `flush_all` to a seq-scoped flush converts
+a non-hazard into a real one, and the suite would have told you it was fine. The warning is on
+`durable()` itself, where the edit would be made, not only here.
+
+Restored: `git checkout HEAD -- src/branch/table_catalog.rs`; `git status --porcelain` = 0 lines;
+re-run: `test result: ok. 7 passed; 0 failed`.
+
 STATED BLIND SPOTS
 ------------------
 * This proves the MECHANISM batches. It does not prove any CLIENT sees a batch — that needs the wire
