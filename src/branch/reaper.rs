@@ -67,12 +67,23 @@ const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 ///
 /// # What did NOT change: a refusal still lets the sweep continue
 ///
-/// That is what the swallow is *for*. A branch whose record is momentarily absent — `upsert` is
-/// delete-then-insert and holds no latch across the two, so an ordinary `set_root` or
-/// `renew_lease` removes the RECORD key for a moment on a perfectly healthy branch — must not
-/// abort the sweep, and a reaper that stopped on the first oddity would be strictly worse than the
-/// bug this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the
-/// caller records it and moves to the next candidate. Only a non-`Branch` error still aborts.
+/// That is what the swallow is *for* — **but not for the reason this row first gave.** The
+/// original argument was that a healthy branch's record goes missing for a moment: `upsert` was
+/// delete-then-insert holding no latch across the two, so an ordinary `set_root` or `renew_lease`
+/// removed the RECORD key briefly on a perfectly live branch, and a sweep must not abort on that.
+/// **D126 closed that window** — the tree now has an in-place replace and
+/// `TableBranchCatalog::upsert` is one line over it (`tests/d126_atomic_upsert.rs`) — so nothing
+/// benign reaches [`Self::Refused`] any more.
+///
+/// The swallow survives on the argument that was underneath it all along: **blast radius.** One
+/// branch the catalog cannot answer for must not cost every *other* expired branch its
+/// reclamation, and a reaper that stopped on the first oddity would be strictly worse than the bug
+/// this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the caller
+/// records it and moves to the next candidate. Only a non-`Branch` error still aborts.
+///
+/// ⚠ **Absorbing is not excusing.** Now that every refusal is an I/O error or a corrupt catalog,
+/// the sweep continuing is exactly why the count and the reason have to reach a reader — the
+/// absorption is what makes the branch look healthy, and D127 is what stops it doing so silently.
 #[derive(Debug)]
 #[must_use = "a refused reap that nobody looks at is exactly the D127 defect"]
 pub enum ReapOutcome {
@@ -83,10 +94,12 @@ pub enum ReapOutcome {
     /// healthy and there is nothing for an operator to do.
     NotExpired,
     /// **The reaper declined to decide, and this is why.** Nothing was freed, so nothing is lost;
-    /// the branch keeps its pages and the next sweep asks again. Carrying the error rather than a
-    /// bare marker is the whole point: the text is the only thing that can tell a benign
-    /// mid-rewrite race apart from a genuinely corrupt CHILD entry, and a caller that only got a
-    /// count could not print it.
+    /// the branch keeps its pages and the next sweep asks again — but since D126 there is no
+    /// benign producer left, so a retry that keeps refusing is the normal case, not the odd one.
+    /// Carrying the error rather than a bare marker is the whole point: every refusal is an I/O
+    /// error or a corrupt catalog, and the text is the only thing that says WHICH — a failing disk
+    /// and a dangling CHILD entry need different people — so a caller handed only a count has a
+    /// number it cannot act on.
     Refused(FerroError),
 }
 
@@ -825,9 +838,14 @@ impl TwoTierReaper {
             Ok(_) => {}
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
-            // from the read, including the momentary miss `TableBranchCatalog::upsert` opens on a
-            // healthy branch. Declining to reap on one is the safe direction: it frees nothing,
-            // and the next sweep asks again. Same class as the `Branch` error below, which
+            // from the read. ⚠ This used to add "including the momentary miss
+            // `TableBranchCatalog::upsert` opens on a healthy branch" — **D126 closed that
+            // window** (`tests/d126_atomic_upsert.rs`; the same correction is spelled out on the
+            // `get_raw` match in `drain_pending_seeded`), so an I/O error or a corrupt catalog is
+            // all that is left to arrive here. Declining to reap on one is still the safe
+            // direction: it frees
+            // nothing, and the next sweep asks again. Same class as the `Branch` error below,
+            // which
             // likewise turns a refusal into "did not reap" rather than aborting the sweep —
             // deliberately left alone, because propagating it would turn a benign already-reaped
             // race into a failed sweep for a whole pre-existing class of errors.
@@ -2315,9 +2333,10 @@ mod tests {
             "a NOT EXPIRED answer must not have touched the branch"
         );
 
-        // ARM 3 — the record cannot be read at all (`get_raw`'s `Branch` arm). This is the
-        // momentary miss `TableBranchCatalog::upsert` opens on a healthy branch, reached here
-        // through an id that was never minted, which produces the same `FerroError::Branch`.
+        // ARM 3 — the record cannot be read at all (`get_raw`'s `Branch` arm). Post-D126 the only
+        // producers of this are an I/O error and a corrupt catalog; it is reached here through an
+        // id that was never minted, which produces the same `FerroError::Branch` without needing
+        // either. What is under test is the arm, not how a catalog came to trip it.
         let before = reaper.refused_reaps();
         let outcome = reaper.reap_if_still_expired(BranchId::new(9_999_999, 0), far_future());
         let why = match outcome.unwrap() {

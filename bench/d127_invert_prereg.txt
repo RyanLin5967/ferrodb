@@ -1,0 +1,45 @@
+D127 PROSE INVERSION (SCALE-DESIGN D134) — PRE-REGISTERED SUITE COUNT
+================================================================================
+Written BEFORE the first run of the suite on this branch. Amendments append-only.
+
+Branch:      d127-invert  (from D127-unswallow-refusal @ 01fc53b, main merged twice)
+Base at reg: main = 29ad1f5
+What changed on this branch vs D127-unswallow-refusal: COMMENTS, DOC COMMENTS AND ONE
+  OPERATOR-FACING STRING ONLY. No code, no test logic, no assertion. `git diff` confirms.
+
+PRE-REGISTERED EXPECTATION
+--------------------------------------------------------------------------------
+  mode=per-target   passed = 2481   failed = 0   build_errors = 0
+  go                passed = 97     failed = 0
+
+DERIVATION — every term has a named instrument, none is recalled.
+  a) main @ 98a44ef, mode=per-target, passed=2476.
+     Instrument: bench/land98a44ef_certified/SUMMARY.txt, verbatim from the runner's stdout.
+  b) main advanced 98a44ef -> 29ad1f5 by two commits, 21ae398 and 29ad1f5.
+     `git diff e62746c..main -- src/ tests/ | grep -c '^[+-].*#\[test\]'` = 0.
+     21ae398 is a 20/4-line comment edit in src/branch/table_catalog.rs; 29ad1f5 adds only
+     bench/w4_root_cell.txt. So (a) carries forward unchanged: 2476.
+  c) D127 adds 5 tests and removes none.
+     `git diff ac2ab26..D127-unswallow-refusal -- src/ tests/ | grep -c '^+.*#\[test\]'` = 5,
+     the `-` count is 0. Named:
+       d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep
+       d127_a_clean_sweep_reports_no_refusal_at_all
+       d127_a_capped_refusal_report_still_states_the_true_count
+       d127_the_trait_sweep_counts_a_refusal_it_cannot_report
+       a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved
+  d) This branch's own edits add and remove zero tests.
+  ⇒ 2476 + 5 = 2481, mode=per-target.
+
+⚠ MODE IS PART OF THE NUMBER. D127's own bank reads `mode=whole passed=2467`, and `whole`
+  = `per-target` + 2 doctests, so it is NOT comparable to 2476 term for term and is not used
+  above. The only two numbers combined here are both per-target-derived.
+
+⚠ THE PROXY IS `#[test]` ATTRIBUTES, not a collection. It would miss a test added behind a
+  macro or a cfg this grep does not see, and would overcount an `#[ignore]`. Both would show
+  up as a miss against 2481 and are to be reported as such, not absorbed.
+
+WHAT A MISS MEANS
+  passed != 2481  -> the count is wrong or the branch is; report the delta and find the name.
+                     Do NOT adjust this file to match the result.
+  failed > 0      -> report verbatim. This branch touched no test logic, so any failure is a
+                     real interaction with the 48 main commits merged in, not a prose edit.

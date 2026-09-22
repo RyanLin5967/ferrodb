@@ -924,7 +924,9 @@ impl Printed {
 ///     silent leak for a reaper that stops on the first oddity would be worse than the bug
 ///     (SCALE-DESIGN D127, "keep what the swallow is for");
 ///   * the printed text names the refused branch **and carries the catalog's own reason**, which
-///     is the only thing that can tell a benign mid-rewrite race from a corrupt CHILD entry.
+///     is the only thing that says which fault it was. Post-D126 a refusal is an I/O error or a
+///     corrupt catalog — never a healthy branch caught mid-rewrite — and those two need different
+///     people, so a bare count is a number an operator cannot act on.
 ///
 /// The reaped branch is the anti-vacuity control throughout: a `scan_once` that refused
 /// everything, or that printed a refusal line unconditionally, fails on it.
@@ -975,7 +977,8 @@ fn d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep() {
     );
 
     // 3. PRINTED, naming the branch AND carrying the catalog's own reason. A count alone cannot
-    //    tell the benign mid-rewrite race from a genuinely corrupt CHILD entry.
+    //    say which fault it was, and post-D126 every refusal is a real fault: an I/O error or a
+    //    corrupt CHILD entry.
     assert!(
         text.contains(&corrupt.to_string()),
         "the refusal reached a reader without naming the branch it was about:\n{text}"
@@ -1080,8 +1083,8 @@ fn d127_a_clean_sweep_reports_no_refusal_at_all() {
 ///
 /// The reasons are paragraphs (D124's is six lines), so an uncapped list on a database with a
 /// thousand refusals would be a log nobody reads — the same failure as a log nobody writes. What
-/// must survive truncation is the number and the ids, because the number is what says whether
-/// this is the benign mid-rewrite race or a leak.
+/// must survive truncation is the number and the ids: post-D126 the expected count is zero, so
+/// the number is what says an operator has to act at all, and the ids are what they act on.
 #[test]
 fn d127_a_capped_refusal_report_still_states_the_true_count() {
     let n = REFUSAL_DETAIL_CAP + 3;

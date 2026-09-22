@@ -1,3 +1,32 @@
+⛔⛔ CORRECTED 2026-09-22 (SCALE-DESIGN D134) — READ THIS BEFORE ANYTHING BELOW ⛔⛔
+================================================================================
+THE MECHANISM IN THIS REPORT IS CORRECT AND LANDED. ITS JUSTIFICATION WAS BACKWARDS.
+
+This report argues in several places that a refusal is usually the BENIGN mid-rewrite race
+`TableBranchCatalog::upsert` opened — delete-then-insert with no latch across the two — and
+that only a rising, non-returning count is a leak. **That premise died with D126**, which
+landed 2.5 h before this report was written: `BPlusTreeManager::upsert` is now one in-place
+`LeafWrite::Replace` over a single page write, `TableBranchCatalog::upsert` is one line over
+it, and there is no window in which a live branch's record is absent to a reader
+(`tests/d126_atomic_upsert.rs`; `src/storage/index.rs`, `BPlusTreeManager::upsert`).
+
+⇒ THE TRUE ARGUMENT IS THE OPPOSITE: refusals are now RARE, and that is exactly why each one
+  must be reported. Every refusal reaching `ReapOutcome::Refused` is an I/O error or a
+  corrupt catalog. The alarm is the FIRST increment, not the derivative.
+⇒ As written, the prose would have trained an operator to ignore the signal this row exists
+  to raise. The shipped comments and the operator-facing string were rewritten to the
+  inverted argument before landing; this file's §2 and §5 keep the retracted wording only so
+  the retraction is visible, and both sites are marked [RETRACTED] inline.
+⇒ THE OPERATOR MESSAGE DEPENDS ON D126 BEING TRUE. "A count that does not come back down"
+  is a leak detector reading a counter, and that cannot work against a noisy baseline. D126
+  is what supplies the zero baseline it detects against — the shipped string now says so.
+⇒ THE TESTS WERE NOT TOUCHED and did not need to be: they inject `BranchError::Corrupt` via
+  `dangling_child` directly (`lease_thread/tests.rs`, `RefusesLiveChildren`), never the dead
+  upsert window, so the fixtures already test the post-D126 world.
+
+Everything below this banner is the original 2026-09-22 report, unchanged except for the two
+inline [RETRACTED] markers.
+
 D127 — D124's REFUSAL IS SWALLOWED AT THE PRIMARY REAP PATH. Make it reach a reader.
 ================================================================================
 Branch:  D127-unswallow-refusal
@@ -45,6 +74,9 @@ there, not carried over from the design entry.
                   defect"]`. Carries the error, not a marker: the text is the only thing that
                   separates a benign mid-rewrite miss from a genuinely corrupt CHILD entry,
                   and a caller handed a bare count could not print it.
+                  [RETRACTED — see the banner. Post-D126 there is no benign mid-rewrite miss;
+                  the text separates an I/O error from a corrupt CHILD entry, which is why
+                  it still has to be carried.]
   reaper.rs:782   `reap_if_still_expired` returns `ReapOutcome`, not `bool`.
   reaper.rs:805   the `get_raw` arm  → `Ok(self.refuse(e))`
   reaper.rs:816   the `reap` arm     → `Ok(self.refuse(e))`   ← D124's `Corrupt` arrives here
@@ -73,6 +105,11 @@ whose record is momentarily absent (`upsert` is delete-then-insert with no latch
 two, so an ordinary `set_root`/`renew_lease` makes a HEALTHY branch miss for a moment) must
 not abort the sweep. A fix that traded a silent leak for a reaper that stops on the first
 oddity would be worse than the bug. Pinned by mutant M6 below.
+  [RETRACTED — see the banner. The absorption is right and M6 still pins it, but NOT for
+  this reason: D126 closed the mid-rewrite window, so there is no healthy branch to protect
+  here. It survives on BLAST RADIUS — one branch the catalog cannot answer for must not cost
+  every other expired branch its reclamation. And absorbing is not excusing: the sweep going
+  on is precisely why the count and the reason must reach a reader.]
 
 
 3. FIRE-CHECK — six mutants, run individually against a clean committed tree

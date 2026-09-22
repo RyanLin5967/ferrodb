@@ -284,12 +284,25 @@ pub struct LeaseStats {
     /// reclaimed). Each one keeps its pages and is retried on the next scan, and each one is
     /// printed with its reason — see `refusal_report`.
     ///
-    /// **A steady trickle is the benign race** `TableBranchCatalog::upsert` opens: delete-then-
-    /// insert with no latch across the two, so a concurrent `set_root` or `renew_lease` makes a
-    /// healthy branch's record miss for a moment. **A number that climbs and never comes back is
-    /// not**: it is a branch that can no longer be reaped, i.e. pages that never return. That is
-    /// the difference this counter exists to make visible, and before D127 neither case reached
-    /// any reader at all.
+    /// **On a healthy database this reads ZERO, and every increment is worth acting on.**
+    ///
+    /// D127 first argued the opposite — that a steady trickle was the benign race
+    /// `TableBranchCatalog::upsert` opened, delete-then-insert with no latch across the two, so a
+    /// concurrent `set_root` or `renew_lease` un-read a healthy branch's record for a moment, and
+    /// only a number that climbed and never came back was a leak. **That premise is dead.** D126
+    /// gave the tree an in-place replace — `BPlusTreeManager::upsert` is one `LeafWrite::Replace`
+    /// over a single page write — and `TableBranchCatalog::upsert` is one
+    /// line over it, so there is no window in which a live branch's record is absent to a reader
+    /// (`tests/d126_atomic_upsert.rs`; `TwoTierReaper::reap_if_still_expired` says the same at its
+    /// `get_raw` arm).
+    ///
+    /// What still reaches this counter is an **I/O error or a corrupt catalog**, and neither is
+    /// routine. So the alarm is the FIRST increment, not the derivative: an operator told to wait
+    /// for a rising trend would be waiting out the signal itself. A number that does not come back
+    /// down is the worse reading — a branch that can no longer be reaped, pages that never return
+    /// — but it is worse than an already-actionable one, not the threshold for acting.
+    ///
+    /// Before D127 neither case reached any reader at all, which is what the row fixes.
     pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
@@ -793,8 +806,9 @@ const REFUSAL_DETAIL_CAP: usize = 4;
 /// branch from a report that says "something happened".
 ///
 /// The count is always exact and always first; only the reasons are capped. That ordering is
-/// deliberate — the number is what says whether this is the benign mid-rewrite race or a leak, and
-/// it must not be the thing that falls off the end of a truncated line.
+/// deliberate — since D126 closed the last window in which a healthy branch could be refused, the
+/// expected count is zero, so the number is what says an operator has to act **at all**. It must
+/// not be the thing that falls off the end of a truncated line.
 fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
     let ids: Vec<BranchId> = refused.iter().map(|(b, _)| *b).collect();
     let mut msg = format!(
@@ -804,8 +818,11 @@ fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
          for these. A refusal raised before the reap began leaves the branch Live and the next \
          scan asks again; one raised after it began leaves the record Reaping, which the next \
          scan cannot see (expired_before is Live-only) and which resume_interrupted_reaps \
-         re-enters at the next open. A count that does not come back down is a branch that can no \
-         longer be reaped: pages that never return.",
+         re-enters at the next open. ACT ON THE FIRST ONE: since D126 made the catalog's record \
+         rewrite atomic, a healthy database refuses nothing here, so the expected count is ZERO \
+         and anything above it is an I/O error or a corrupt catalog. That zero baseline is also \
+         what makes the trend readable at all — against it, a count that does not come back down \
+         is a branch that can no longer be reaped: pages that never return.",
         refused.len(),
         join_ids(&ids)
     );
