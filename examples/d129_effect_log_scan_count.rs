@@ -313,9 +313,9 @@ fn fire_checks(dir: &std::path::Path) -> bool {
     println!("=== FIRE-CHECK — force the counter to fire, and separate the buckets ===");
     println!();
 
-    // (1) MISS-ONLY. Each session writes exactly once, so every append is the first append under a
-    // key that is not present. Nothing here can produce a hit on `append`.
-    {
+    // (1) MISS-ONLY. Each session writes exactly once under a `(branch, txn_id)` that has never
+    // been appended, so every session must contribute at least one miss.
+    let miss_arm = {
         let s = build(dir, "fc_miss");
         let before = scan_count::snapshot();
         for k in 0..n {
@@ -323,22 +323,22 @@ fn fire_checks(dir: &std::path::Path) -> bool {
         }
         let d = scan_count::snapshot().since(&before);
         report(&format!("(1) MISS-ONLY  — {n} sessions x 1 write"), &d);
+        println!("      log length after: {} frames", s.log.len());
         let a = d.append();
-        let pass = a.miss_calls >= n as u64 && a.hit_calls * 4 < a.miss_calls;
+        let pass = a.miss_calls >= n as u64;
         println!(
-            "      => {} : miss_calls {} vs hit_calls {} (want misses >= {n} and dominant)",
+            "      => {} : miss_calls {} (want >= {n}, one per new key)",
             if pass { "PASS" } else { "FAIL" },
-            a.miss_calls,
-            a.hit_calls
+            a.miss_calls
         );
         ok &= pass;
-        println!("      log length after: {}", s.log.len());
-    }
+        a
+    };
     println!();
 
     // (2) HIT-HEAVY. ONE session, many writes. `stage_all` re-appends the open frame once per
     // statement, so after the first append every one of these finds its key.
-    {
+    let hit_arm = {
         let s = build(dir, "fc_hit");
         let before = scan_count::snapshot();
         one_session(&s, 0, n, false).unwrap_or_else(|e| panic!("hit-heavy session: {e}"));
@@ -351,6 +351,31 @@ fn fire_checks(dir: &std::path::Path) -> bool {
             if pass { "PASS" } else { "FAIL" },
             a.hit_calls,
             a.miss_calls
+        );
+        ok &= pass;
+        a
+    };
+    println!();
+
+    // ⭐ THE SEPARATION, stated ACROSS the two arms rather than within either.
+    //
+    // A within-arm ratio would be the wrong test: if `BEGIN AGENT SESSION` itself appends a frame,
+    // arm (1) produces a hit per session as well as a miss per session, and a "misses dominate"
+    // gate would fail for a reason that has nothing to do with the counter being right. What
+    // distinguishes the two workloads is **misses per session** — arm (1) opens `n` keys and arm
+    // (2) opens one — and a counter that could not tell them apart would not be an instrument.
+    {
+        let per_session_1 = miss_arm.miss_calls as f64 / n as f64;
+        let per_session_2 = hit_arm.miss_calls as f64;
+        let pass = miss_arm.miss_calls >= 10 * hit_arm.miss_calls.max(1);
+        println!(
+            "  (1)v(2) SEPARATION: misses/session {per_session_1:.2} (n sessions) vs \
+             {per_session_2:.2} (1 session)  => {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        println!(
+            "      the buckets are not one number: arm(1) {} miss / {} hit, arm(2) {} miss / {} hit",
+            miss_arm.miss_calls, miss_arm.hit_calls, hit_arm.miss_calls, hit_arm.hit_calls
         );
         ok &= pass;
     }
@@ -448,6 +473,76 @@ fn axis(dir: &std::path::Path, tag: &str, what: &str, merge: bool, blocks: usize
     true
 }
 
+// =================================================================================================
+// ADDENDUM — the DURABLE store, which is NOT what pgwire builds
+// =================================================================================================
+
+/// ⚠ **This arm is NOT through pgwire, and saying so is the point.**
+///
+/// `examples/pgserver.rs` hands the runtime a `MemEffectLog`, so the axis above — which is the
+/// pgwire measurement the row asked for — can only ever exercise `MemEffectLog::append`.
+/// `src/cli/cli.rs` hands it `DurableEffectLog::default_for_database`. That is a different store
+/// with the same index inside it, and it reaches the counted sites **twice per append**:
+/// `classify_append` decides what bytes are new, and `MemEffectLog::append` then accepts the frame.
+///
+/// It also replays the whole file at `open`, one `mem.append` per record, and every one of those
+/// pays a scan of everything replayed so far. D115's agent asserted that consequence in prose; this
+/// measures it. The store is driven directly here because there is no wire path to it.
+fn durable_addendum(dir: &std::path::Path) -> bool {
+    use ferrodb::branch::types::{BranchId, CommitHash};
+    use ferrodb::tel::{Delta, DurableEffectLog, Op, OpKind, TxnFrame};
+    use ferrodb::tel::{ColId, RowId, TableId, TxnId};
+
+    let k = env_usize("D129_DURABLE_FRAMES", 1000) as u64;
+    let path = dir.join("durable.tel");
+    let _ = std::fs::remove_file(&path);
+
+    println!("=== ADDENDUM: DurableEffectLog — the store `src/cli/cli.rs` ships (NOT pgwire's) ===");
+    println!("    {k} frames, each a distinct (branch, txn_id), appended then replayed at open.");
+
+    let frame = |i: u64| {
+        let mut f = TxnFrame::new(TxnId(i), BranchId::new(i, 0), CommitHash::ZERO, 0, 1);
+        f.push_op(Op::new(TableId(1), RowId(i), Some(ColId(2)), OpKind::Add(Delta::Int(-1))));
+        f
+    };
+
+    let before = scan_count::snapshot();
+    {
+        let log = DurableEffectLog::open(&path).expect("open durable log");
+        for i in 0..k {
+            log.append(&frame(i)).expect("append");
+        }
+    }
+    let d = scan_count::snapshot().since(&before);
+    report(&format!("APPEND phase — {k} appends of distinct keys"), &d);
+    println!(
+        "      appends {} -> counted calls: {} on append + {} on classify_append = {} scans for {k} logical appends",
+        k,
+        d.append().calls(),
+        d.classify().calls(),
+        d.append().calls() + d.classify().calls()
+    );
+    println!("      total elements walked in this phase: {}", d.append().scanned() + d.classify().scanned());
+
+    let before = scan_count::snapshot();
+    let reopened = DurableEffectLog::open(&path).expect("reopen durable log");
+    let d = scan_count::snapshot().since(&before);
+    report(&format!("REPLAY at open — reading a file of {k} frames back"), &d);
+    println!("      frames recovered: {}", reopened.len());
+    let walked = d.append().scanned() + d.classify().scanned();
+    println!("      elements walked to open a {k}-frame file: {walked}");
+    // K(K-1)/2 is what one scan per record over a log that grows by one each time costs.
+    let quadratic = (k * k.saturating_sub(1)) / 2;
+    println!("      K(K-1)/2 for K={k} is {quadratic} — the shape a per-record scan would give");
+    let ok = reopened.len() as u64 == k && walked > 0;
+    if !ok {
+        println!("⛔ the durable addendum did not replay what it wrote, or counted nothing.");
+    }
+    println!();
+    let _ = std::fs::remove_file(&path);
+    ok
+}
+
 fn main() {
     println!("D129 — scanned elements per effect-log append, bucketed HIT / MISS.");
     println!("{}", ferrodb::build_provenance());
@@ -477,8 +572,10 @@ fn main() {
     // walked — which is the whole case for option (2) PRUNE over option (1) INDEX.
     let b = axis(&dir, "churn", "CHURN — every session MERGEs, so every branch is FINISHED", true, blocks, block);
 
+    let c = durable_addendum(&dir);
+
     let _ = std::fs::remove_dir_all(&dir);
-    if !(a && b) {
+    if !(a && b && c) {
         std::process::exit(1);
     }
 }
