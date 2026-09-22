@@ -274,6 +274,25 @@ impl CowStore {
         Ok(released)
     }
 
+    /// Has the store been told to free `page_id` — either released onto an extent's free list,
+    /// or parked in the pending-free log awaiting reclamation?
+    ///
+    /// Two properties this deliberately has, both learned the hard way in D125:
+    ///
+    /// * **Per-page, not net.** `live_page_count` is `next_free - free_pages.len()` summed over
+    ///   extents. `CowTree`'s journal leaks pages a failed operation allocated while it must
+    ///   never release one it retired, and those move a net figure in opposite directions — so
+    ///   one leak cancels one release and the total reports nothing while the defect happens.
+    /// * **Both destinations.** `free_page` releases immediately only when the interval rule
+    ///   says the page is reclaimable, and parks it in `pending` otherwise. A shadow of a page
+    ///   the writer owns always takes the `pending` branch, so a predicate that looked only at
+    ///   free lists would be blind on exactly the path where D125's review found the hole.
+    pub fn is_page_freed(&self, page_id: PageId) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.extents.values().any(|st| st.free_pages.contains(&page_id))
+            || inner.pending.iter().any(|pf| pf.page_id == page_id)
+    }
+
     pub fn pending_free_len(&self) -> usize {
         self.inner.lock().unwrap().pending.len()
     }
@@ -439,6 +458,7 @@ impl PageStore for CowStore {
                 page_id,
                 previous_page_id: page_id,
                 copied: false,
+                retire_previous: false,
                 handle,
             });
         }
@@ -457,14 +477,20 @@ impl PageStore for CowStore {
 
         // A branch may only free pages it owns. If this page belongs to an ancestor, that
         // ancestor's root still points at it; the child simply stops referencing it.
-        if owned_by_writer {
-            self.free_page(page_id, epoch)?;
-        }
-
+        //
+        // ⛔ D125: REPORTED, NOT DONE HERE. This used to be `self.free_page(page_id, epoch)?`,
+        // and it is the one place a caller that can roll back cannot tolerate. `CowTree`
+        // restores a failed operation to the old root, which still points at `page_id` — so a
+        // free taken here was taken for an operation that never happened, parking a live page
+        // for reclamation. The caller frees it at its own commit point instead. Pinned by
+        // `a_failed_write_on_shadowed_pages_frees_nothing_the_tree_still_points_at`; restoring
+        // the free here fails it with 69 live pages already handed to `free_page`.
+        // See `CowPage::retire_previous`.
         Ok(CowPage {
             page_id: new_id,
             previous_page_id: page_id,
             copied: true,
+            retire_previous: owned_by_writer,
             handle: new_handle,
         })
     }

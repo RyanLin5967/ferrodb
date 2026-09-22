@@ -1453,6 +1453,54 @@ mod tests {
     use std::fs::OpenOptions;
     use std::sync::Arc;
 
+    /// ⛔ **`unpin_page`'s `is_dirty` may only ever SET the flag. `false` must be a no-op.**
+    ///
+    /// `release_pin_if_labelled` writes `if is_dirty { dirty_flag.store(true) }`. The obvious
+    /// tidy-up is `dirty_flag.store(is_dirty, ...)`: one line shorter, no branch, and it matches
+    /// the plain reading of the parameter name. It is also silent data loss, and nothing stated
+    /// that until this test.
+    ///
+    /// Why it matters beyond style: a page can be pinned more than once, and the holders do not
+    /// agree about dirtiness. `CowTree`'s write journal (D125) takes a second pin on every page
+    /// it may have to roll back, purely to read bytes, so that handle drops with
+    /// `is_dirty == false` while the real writer's handle has set the flag. Under the "tidy"
+    /// version the journal's unpin CLEARS the writer's flag and the committed page is never
+    /// flushed — a write that returned `Ok`, reported no error, and is not on disk.
+    ///
+    /// That is D125's own defect shape arriving through the buffer pool instead of the tree, so
+    /// it is pinned here, where the edit that breaks it would be made, rather than three layers
+    /// away in a caller nobody would think to re-run.
+    #[test]
+    fn unpinning_without_the_dirty_flag_never_clears_it() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-bp-dirtykeep-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file =
+            OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+
+        let page_id = bp.new_page().unwrap();
+        let frame_i = bp.fetch_page(page_id).unwrap();
+
+        // The writer marks it dirty and lets go.
+        bp.unpin_page(page_id, true);
+        assert!(
+            bp.frames[frame_i].read().unwrap().dirty_flag.load(Ordering::Relaxed),
+            "fixture: the page must be dirty before the second unpin, or this proves nothing"
+        );
+
+        // A second holder that only read the page lets go. It must not undo the first.
+        bp.unpin_page(page_id, false);
+        assert!(
+            bp.frames[frame_i].read().unwrap().dirty_flag.load(Ordering::Relaxed),
+            "unpin_page(.., false) CLEARED the dirty flag a previous holder had set. Every \
+             write still in this frame will be dropped on eviction instead of written back"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A pool over a real file, with an arena floor registered so `deallocate` will refuse.
     ///
     /// `tag` must be unique per test. These run as threads in one binary, so a filename keyed
