@@ -118,6 +118,18 @@ exactly four callers in all of `src/`:
     src/pgwire/mod.rs:239            `read_catalog` refreshing a stale snapshot
 None is DDL-gated. So `begin_read`'s doc — "It happens only while DDL is actually in flight" — is
 false by construction, and the file contradicts itself forty lines apart. Unchanged verdict.
+
+⚠ PRECISELY WHICH STATEMENTS PAY THE PARSE ACQUISITION, because "every statement" is too strong
+and the exceptions are easy to miscount. `parse_one` begins at `extended.rs:201` and the
+acquisition is at `:290`. FOUR paths return before it: the txn-control error at `:212`,
+`Kind::Session` for SET/SHOW/RESET at `:224` (and its `$`-parameter error at `:218`), `Kind::Empty`
+at `:266`, and the multi-statement error at `:273`. Everything that becomes `Kind::Sql` acquires —
+a plain `SELECT 1` included, which is the point.
+⇒ And the closure of 2a settles, without any reading, that NO measured statement took the
+  `Kind::Session` path: a `Kind::Session` statement never reaches `begin_read`, yet in every arm
+  `sh_att + dml_att + exc_att` equals `stmts` exactly (agent/simple: 1600 + 0 + 3200 = 4800). So
+  `BEGIN AGENT SESSION` and `ABANDON` are `Kind::Sql` despite their names, and the announcer
+  accounting is not quietly missing a class of statement.
 (That enumeration is also why `ann_unattr=0` is meaningful: the four `Site` tags are exhaustive
 over the call graph, not merely observed to be zero.)
 
