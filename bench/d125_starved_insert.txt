@@ -1,0 +1,350 @@
+D125 — a starved insert returns Ok and loses committed rows
+===========================================================
+
+Branch `D125-starved-insert`, worktree /Users/idide/wt/ferrodb-D125-starved-insert,
+cut from `dc2a2cf`. Probe: `cow::tests_compact_refusal::
+a_starved_insert_loses_no_row_that_the_unstarved_control_keeps` (written by the D113 agent,
+`#[ignore]`d there, NOT deleted).
+
+Every number below is an integer count taken inside the test process. None of them is a
+duration, so none of them depends on how busy the box was.
+
+
+1. REPRODUCED, unchanged
+------------------------
+
+At `dc2a2cf`, `cargo test --lib a_starved_insert_loses_no_row -- --ignored --nocapture`:
+
+    rows missing -- control: 0 base, 0 gap;  starved: 28 base, 165 gap
+
+Identical to the figure handed over. The control losing zero **in the same run** is what makes
+the starved arm attributable; both arms insert the same 820 keys.
+
+
+2. THE REPORTER'S MECHANISM IS WRONG, AND THE INSTRUMENT SAYS SO
+----------------------------------------------------------------
+
+The hypothesis handed over, explicitly labelled a guess, was:
+
+    on the trunk every page is private, so `cow_page` mutates in place, and a split failing
+    part-way leaves the leaf truncated to its first piece with the remainder orphaned.
+
+Instrumented by `d125_instrument_where_a_starved_insert_loses_rows`, which attributes every
+failure without a hook in production code: the starving store logs the `PageType` of each
+allocation it serves or refuses, and `alloc_for(BTreeLeaf)` is reached only from
+`write_leaf_chunked` while `alloc_for(BTreeInternal)` is reached only from `internal_relink`
+or the new-root tail of `relink_up`. Measured over the probe's own sequence:
+
+    300 starved failures, 97 of them lost rows (235 rows total).
+    refused allocation was a leaf page in 203 failures (0 of them losing),
+                                an internal page in  97 failures (97 of them losing).
+    leaf split had already completed in 97 of the 97 losing failures.
+    lost rows by where they went: 235 into a subtree the failing call ALLOCATED and left
+                                      unreachable,
+                                    0 into a PRE-EXISTING subtree the failing call detached,
+                                    0 unaccounted for by either.
+
+⇒ **The stage the hypothesis blamed is the one stage that is correct.** All 203 failures
+refused *inside* the leaf split lost **zero** rows: `write_leaf_chunked` allocates every piece
+before it overwrites the first, exactly as its own comment claims ("Allocate before
+overwriting, so a failure to allocate leaves the leaf exactly as it was rather than truncated
+to its first piece"). Nothing fails part-way there.
+
+⇒ **The loss is one level up.** The leaf split *succeeds and commits* — the original leaf is
+truncated to piece 0 and the remaining pieces are written into fresh pages — and then
+`relink_up`/`internal_relink` is refused its allocation, so those pieces are never linked in.
+Nothing rolls the leaf back, because on the trunk every page is private and was mutated in
+place. The hypothesis had the right family (orphaned pieces, no rollback) and the wrong
+location.
+
+The hypothesis's *premise* — "on the trunk every page is private, so `cow_page` mutates in
+place" — is the part that is correct, and it is the whole mechanism.
+
+
+3. THE ARM THAT PINS IT
+------------------------
+
+`d125_instrument_the_same_starvation_on_shadowed_pages` runs the identical fixture — same 600
++ 220 keys, same budget sweep, same refusals — with a live child branch registered immediately
+before every attempt. That makes `CowStore::privacy` refuse, so `cow_page` shadows the page
+instead of handing it back for in-place mutation. Nothing else changes.
+
+    D125 shadowed arm: 220 starved failures, 0 of them lost rows (0 rows);
+    end state: 0 of 600 base and 0 of 220 gap rows missing;
+    220 of 220 inserts moved the root (i.e. actually shadowed).
+
+⇒ Same starvation, same failures, **zero** rows lost. The defect is in-place mutation, not the
+splits and not the allocator.
+
+⚠ The first cut of this arm registered ONE child before the loop and reported 28 base / 165
+gap — an apparently perfect reproduction of the trunk's loss. It was wrong as a control: a
+shadow page is born at the *current* epoch and is therefore private again on the next write,
+so only 1 of 220 inserts actually shadowed. The premise assertion now in the test
+(`shadowed > 0`, and the printed count) is what caught it. A control that silently stops being
+a control reads exactly like a confirming result.
+
+
+4. THE FIX
+-----------
+
+`CowTree` gains a per-operation `WriteJournal` (`src/cow/btree.rs`) with two halves:
+
+* **Undo.** Every page `PageStore::cow_page` hands back for in-place mutation
+  (`copied == false`) is recorded once, with the bytes it held at that moment, behind a second
+  pin so the restore can neither be defeated by eviction nor be refused by `read_page`'s
+  checksum gate. Any error restores all of them, so the operation is all-or-nothing. `copied ==
+  true` is deliberately not recorded: a shadow leaves the tree the old root describes untouched.
+* **Deferred frees.** Pages the operation retires are freed only once it commits.
+  `unlink_up` already kept its own frees to the end for D112's reason; that was sound inside
+  `unlink_up` and not enough outside it, because `merge_right` calls `unlink_up` and then runs
+  three more fallible steps. Rolling back to a tree that points at already-released pages would
+  trade lost rows for reissued pages, which is worse than the defect. Both halves now live in
+  one place, `CowTree::finish`, so they cannot drift apart.
+
+Pages the operation *allocated* are deliberately NOT freed on rollback. Once the tree is
+restored nothing references them, so they are a leak inside the branch's own arena, recovered
+by `free_arena` — and `free_page` on an error path is precisely what D112 was. A leak is
+recoverable; a page reissued while something still points at it is not.
+
+This covers `insert`, `delete` and `merge_right` from the same mechanism, not just the insert
+the probe exercises.
+
+On the success path the change is observationally identical: `finish` runs before the entry
+point returns, so `live_page_count` after a `delete` is what it always was. That is also why no
+pre-existing test can see the deferred-free half — it is tested explicitly rather than assumed.
+
+
+5. AFTER THE FIX
+-----------------
+
+All counts from the test process; `cargo test --lib`, worktree
+/Users/idide/wt/ferrodb-D125-starved-insert.
+
+The probe, no longer `#[ignore]`d:
+
+    rows missing -- control: 0 base, 0 gap;  starved: 0 base, 0 gap  (220 starved failures)
+
+The instrument, now a gate:
+
+    D125 instrument: 220 starved failures, 0 of them lost rows (0 rows total).
+    refused allocation was a leaf page in 184 failures (0 of them losing),
+                                an internal page in  36 failures (0 losing).
+    lost rows by where they went: 0 / 0 / 0.
+
+  The failure count falls from 300 to 220 because a failed attempt no longer damages the tree,
+  so the budget sweep no longer needs extra rounds to climb past its own wreckage. 220 is one
+  failure per probe key, which is the fixture's design. **36 internal-page refusals still
+  happen** — the stage that lost 97 of 97 pre-fix is still being reached and now loses nothing,
+  so the green is not vacuous.
+
+The shadowed control:
+
+    D125 shadowed arm: 220 starved failures, 0 of them lost rows (0 rows);
+    end state: 0 of 600 base and 0 of 220 gap rows missing;
+    220 of 220 inserts moved the root.
+
+D113's end-to-end falsifier, adapted (see section 7):
+
+    starved failures: 220 (220 rewrote page bytes, 32 left a page compacted in place)
+
+The free-deferral guard:
+
+    D125 free-deferral: 2368 starved delete failures, 96 of them on a delete that retires
+    pages; 0 failures reduced the store's live page count; 0 rows lost; 0 reissued pages were
+    still reachable from the root
+
+`cargo test --lib cow`: **169 passed, 0 failed, 0 ignored** (D113's own record was 163 passed
+plus 1 ignored, and the 1 ignored was this probe).
+`cargo clippy --lib --all-targets`: 0 errors; the only warning on a file this row touched is a
+pre-existing `type_complexity` on `ScanCursor::entry_at`, which this row did not write.
+
+
+5b. THE FULL SUITE
+-------------------
+
+    VERIFY_MODE=per-target VERIFY_OUT=$HOME/wt/artie-research/verify-out \
+      timeout 5400 ./tools/verify-suite.sh d125-417e273
+
+    d125-417e273: mode=per-target rc=0 passed=2453 failed=0 build_errors=0 head=417e273
+    d125-417e273: go rc=0 passed=97 failed=0
+
+Baseline `dc2a2cf` is `rc=0 passed=2449`, independently confirmed from the nearest recorded
+earlier run (`suite-land22-52e1137.log`: passed=2449, ignored=4).
+
+**2453 was pre-registered before the run, not read off afterwards**: 2449 + 3 new gating tests
++ 1 probe moved from ignored to passing. It matched exactly, and `ignored` fell from 4 to 3.
+
+
+6. FIRE-CHECKS — every guard was forced to fire
+------------------------------------------------
+
+A detector that has never fired is not a clean result.
+
+**M1, `WriteJournal::rollback` made a no-op.** Three tests go red, and the instrument prints
+the pre-fix figures exactly:
+
+    left: (97, 235)   right: (0, 0)
+    failures: a_starved_allocation_never_leaves_an_unverifiable_page
+              a_starved_insert_loses_no_row_that_the_unstarved_control_keeps
+              d125_instrument_where_a_starved_insert_loses_rows
+
+**M2, the deferred frees reverted to the pre-D125 ordering (frees back inside `unlink_up`).**
+⛔ **The whole `cow` suite stayed green — 168 passed, 0 failed.** The second half of the fix
+was completely unguarded, which is why `a_starved_delete_never_releases_a_page_the_tree_still_
+points_at` now exists. With that test present, the same mutant dies on the store's own
+detector:
+
+    called `Result::unwrap()` on an `Err` value: Branch("arena error: double free of page 298")
+
+  i.e. the failed delete released a page and the retry released it a second time.
+
+
+7. THREE THINGS THAT WERE NOT IN THE BRIEF
+-------------------------------------------
+
+**a. D113's end-to-end falsifier was about to go quietly vacuous, and this row caused it.**
+`a_starved_allocation_never_leaves_an_unverifiable_page` inspects the tree AFTER a failed
+insert. D125's rollback puts every page back before that call returns, so it reported
+`220 starved failures (0 rewrote page bytes, 0 left a page compacted in place)` and failed its
+own premise assertion. Relaxing the premise would have left it green, still asserting, and
+blind to the defect it exists for. Instead the starving store now photographs the watched pages
+**at the instant it refuses** — the moment the D113 defect exists — and the test reads the
+photograph. It also now asserts D125's stronger property, byte-for-byte identity once the call
+has returned. Both on every failure. The premise is live again: 220 of 220 failures rewrote
+page bytes mid-operation, 32 left a page compacted in place.
+
+**b. `merge_right` never allocates, so allocator starvation cannot reach its error tail.**
+Measured, after two fixtures passed while proving nothing:
+
+    terminators: 98 deletes, 0 allocations total, leaves 496 -> 400
+     descending: 600 deletes, 1 allocation  total, leaves 496 -> 1
+      ascending: 600 deletes, 1 allocation  total, leaves 496 -> 1
+
+  400-byte keys give the content-defined chunker ~1.2 entries per leaf (496 leaves for 600
+  keys), so a merged pair is ~1 KB against a 4060-byte page and never needs cutting. This is
+  the same shape as D113's own "`leaf_put`'s exposure is real in the code but not reachable
+  through `CowTree::insert`". The free-deferral window is therefore reachable only by failing
+  something other than an allocation, and the starving store gained a read budget for it.
+
+**c. `cow_page`'s shadow path never immediately releases the page it shadows** — reasoned, not
+measured, and flagged as such. `cow_page` frees the old page only when `owned_by_writer`, and a
+page in the writer's own arena was necessarily born after the writer forked, so `privacy`
+returning false forces `reclaimable` false on the same live-children array and `free_page`
+takes its `pending` branch rather than `release_page`. The immediate-release branch is
+unreachable from `cow_page`. If that ever stops holding, a rollback would restore a tree
+pointing at a page already back in the free space map, and the deferred-free half of the
+journal does not cover it — the free happens inside the store, below `CowTree`.
+
+⛔ **(c) WAS THE RIGHT OBSERVATION AND THE WRONG CONCLUSION. See section 8 — it is a real
+defect, and "it only goes to `pending`" is not a defence.**
+
+
+8. THE ADVERSARIAL REVIEW ROUND — one blocker and five test defects
+--------------------------------------------------------------------
+
+A fresh-context review of the diff. Every finding below was verified against the code before
+being acted on, and every fix is fire-checked.
+
+**FINDING 1 — BLOCKER, and section 7(c) above is where I talked myself past it.**
+`cow_page` frees the shadowed source when the writing branch owns it (`store.rs`, and
+`ArenaPageStore` in `branch/arena.rs`, **which is what the CLI ships**). `WriteJournal::record`
+returned early on exactly that case. So the free was neither journaled nor undone, and after a
+rollback the restored old root still pointed at a page the store had parked for reclamation.
+
+My own doc comment named the error precisely while getting it wrong: *"a shadow leaves the tree
+the old root describes untouched, so there is nothing to take back."* **True of the page's
+contents, false of its allocation.** The undo list is contents-shaped; this hazard is
+allocation-shaped. Skipping on `copied` was the right instinct applied to the wrong axis.
+
+Section 7(c) reasoned that the page lands in `pending` rather than on a free list and concluded
+it was harmless. The first half is correct — and irrelevant. A pending free is a *deferred*
+release of a page the restored tree still references; when the pinning child is reaped,
+`drain_pending_free` releases it under a live pointer. **A hazard that needs one more event to
+fire is still a hazard, and "reasoned, not measured" was the flag I wrote on it myself.**
+
+Fixed by making both stores **report** rather than free: `CowPage::retire_previous`, with
+`CowTree::shadow` putting `previous_page_id` on the journal so it is freed at commit — the same
+rule `unlink_up`'s retires already follow, one layer further down. This is D112's lesson and
+D125's own deferred-free lesson arriving a third time.
+
+**Why no test caught it, which is worth more than the bug.** Every test that inspects free
+bookkeeping runs on the **trunk with no children**, where `privacy` is always true, `cow_page`
+returns `copied == false`, and the shadow-path free never executes. The one test that does
+exercise the shadow path counted **rows**. Neither covers the intersection, so "free the
+shadowed source unconditionally" survived the whole suite. The new test
+`a_failed_write_on_shadowed_pages_frees_nothing_the_tree_still_points_at` sits exactly there.
+
+  Fire-check — restore the inline free and it fails:
+
+    69 page(s) reachable from the root had been handed to free_page by an operation that
+    then FAILED -- [155, 308, 315, 322, 329, 330, 329, 340]
+
+  The other 8 tests in the module passed under that mutant, confirming the coverage gap.
+
+Note the predicate this needed: `CowStore::is_page_freed` asks about the **pending-free log as
+well as the free lists**, because a shadow of an owned page always takes the `pending` branch. A
+check that looked only at free lists would have been blind on exactly this path.
+
+**FINDING 2 — `finish` returned `Err` after the operation had committed.** That contradicts the
+contract the rest of the function establishes and that the new delete guard asserts: an `Err`
+from a write means nothing happened. Handing back `Err` once the tree had already moved tells
+the caller to discard a live root — losing every row the operation wrote, which is this row's
+own defect re-introduced on the success path. Now returns `Ok(new_root)`, with a `debug_assert`
+so a failed release is still loud where tests run: every way `free_page` can fail there is a bug.
+
+**FINDING 3 — the delete guard wrote `Ok(_) => break`,** discarding the successful attempt's new
+root. On the trunk the root id usually does not move, so it looked harmless until an `unlink_up`
+cascade moved it — after which every `leaves_and_internals(root)` was reading a tree that no
+longer existed and under-reporting what was live.
+
+**FINDING 4 — its non-vacuity premise paired two different attempts.** "This delete failed" and
+"this delete retired a page" are about the failing and the succeeding attempt respectively, so
+the counter was satisfiable by a run where every failure happened at `reads == 0`, before
+`unlink_up` retired anything. Replaced with a depth measure: the deepest failure on a
+page-retiring delete, which must clear 8. Measured **27**, against a 3-4 read opening descent.
+The honest statement is in the test: an assertion cannot observe that window from outside, so
+the fire-check is the proof and the premise is a floor.
+
+**FINDING 5 — the release check was a NET page count.** `live_pages()` is
+`next_free - free_pages.len()`, and this journal deliberately *leaks* pages a failed operation
+allocated while it must never *release* one it retired. Those move a net figure in opposite
+directions, so one leak cancels one release and the detector reports nothing while the defect
+happens. Now per-page via `is_page_freed`.
+
+**FINDING 6 — the reissue probe disarmed the louder detector.** `release_page` reports
+`double free of page N` only while the page is still on `free_pages`; the probe allocated 4
+pages after every failure and popped exactly those entries off, eating the evidence the
+double-free panic depends on. Two detectors for one fact where one consumes the other — the
+probe is gone, and the per-page check answers the same question without touching the free list.
+
+**AND ONE THING THE REVIEW FOUND IN ITS "NOTHING HERE" SECTION, which was the most valuable
+item in it.** The journal takes a second buffer-pool pin per recorded page and drops it with
+`dirty == false`, while the real writer's handle drops dirty. That is safe **only** because
+`release_pin_if_labelled` is `if is_dirty { store(true) }` — set-only. The obvious tidy-up,
+`store(is_dirty, ..)`, is one line shorter, removes a branch, matches the plain reading of the
+parameter name, and **silently stops committed pages ever reaching disk.** So D125 was correct
+because of a buffer-pool property it did not state, own or test. Now pinned by
+`unpinning_without_the_dirty_flag_never_clears_it`, in the buffer pool — where that edit would
+be made, not three layers away in a caller nobody would re-run. Fire-checked: the tidy-up fails it.
+
+**Review answers that were clean**, recorded so the absence is legible: no write guard reachable
+from `insert`/`delete` bypasses `shadow()` (enumerated from the type — `NodeMut::new` needs
+`&mut Frame`, so `PageHandle::write()` is the complete gate, and all 13 sites in `btree.rs` are
+either a `shadow()` handle or a page that operation allocated); the extra pins cannot exhaust or
+deadlock the pool (bounded by `2*MAX_DESCENT + 2 = 130` against 1024 frames, ~6 in practice,
+resolved by `try_pin_resident` with no eviction or fault); rollback cannot restore a
+mid-operation image for any page reachable from the restored root; and the deferred frees
+neither leak nor double-free on the success path.
+
+
+9. FIRE-CHECK SUMMARY — all four mutants die
+---------------------------------------------
+
+Run against the final code, `cargo test --lib cow::tests_compact_refusal` unless noted.
+
+| mutant | result |
+|---|---|
+| `WriteJournal::rollback` made a no-op | 4 tests fail, 5 pass |
+| frees moved back inside `unlink_up` | delete guard fails: `double free of page 17`, named by the test's own message |
+| `cow_page` frees the source inline again | shadow-path test fails: 69 live pages already freed; other 8 pass |
+| `unpin_page` stores `is_dirty` instead of only setting | buffer-pool test fails |
