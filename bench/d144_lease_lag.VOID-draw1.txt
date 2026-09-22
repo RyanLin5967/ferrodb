@@ -1,0 +1,101 @@
+################################################################################################
+# VOID -- DRAW 1 OF D144. **DISCARDED BY THE AUTHOR, NOT BY A FAILURE. DO NOT QUOTE ANY ROW.**
+#
+# Kept because a void run recorded as void costs nothing and a silently deleted one teaches
+# nobody. Two independent defects, BOTH self-inflicted:
+#
+# 1. **IT RAN THE WRONG BINARY.** This run queued 380 s behind `land-d93d23b` and acquired the
+#    suite lock at 12:59:41Z. Believing it still queued, I rebuilt
+#    `target/release/examples/d144_lease_lag` FOUR times between 13:00 and 13:03 while it was
+#    executing. A running process keeps its mapped image, so it ran the PRE-CALIBRATION build --
+#    visible in this file's own table header, which lacks the `S run/cal` and `S spread` columns
+#    the current harness prints. The artifact convicts itself, which is the only reason this was
+#    caught.
+#
+# 2. **I RAN THREE HARNESSES ALONGSIDE IT.** A quiet-box smoke, a load smoke, and TWO fire-checks
+#    at S=20 ms whose entire purpose was to create a pathological sweep cadence -- all concurrent
+#    with a measurement whose x-axis is a ratio of two durations.
+#
+# ⇒ The standing rule is "never write into a tree while a run against it is in flight", and the
+#   reason it says *write*, not *git*, is exactly this: `cargo build` is a write. Queued is NOT
+#   idle; a run that is waiting for a lock will start without telling you.
+#
+# ⚠ WHAT SURVIVES: nothing from this file. The separately-run smokes DO stand -- they were
+#   standalone invocations with their own output, not rows of this artifact, and the load smoke
+#   (realised S 1001-1010 ms at nominal 1000 under load 7.7-10.1) is what discharged the
+#   timer-under-load hazard.
+################################################################################################
+d144-lease-lag: queued behind 93177 land-d93d23b 2026-09-22T12:48:44Z
+d144-lease-lag: acquired the suite lock after 380s
+# D144 — the lag the LEASE produces. RAW ARTIFACT.
+#
+# run at            2026-09-22T12:59:41Z UTC
+# worktree          /Users/idide/wt/ferrodb-d133-pending-len
+# branch            d133-pending-len
+# head              74266ea15e289cd63fcb78c8f84eb01d021781df
+# tree state        1 modified/untracked path(s)
+#                   ?? bench/d144_lease_lag.txt
+# binary mtime      2026-09-22T12:52:03Z
+# host              Darwin 25.6.0 arm64
+# measure lock      61248 d133-pending-len 2026-09-22T11:52:09Z
+# suite lock        HELD BY THIS RUN: 20012 d144-lease-lag 2026-09-22T12:59:41Z (queued 380s)
+#
+# ⛔ THE SCAN INTERVAL THIS RUN USED IS **3000 ms**, NOT THE SHIPPED 30 s.
+#    Δ is swept against $SCAN_MS, never against 30 s. The knob is the shipped one:
+#     109:pub const DEFAULT_SCAN_MILLIS: u64 = 30_000;
+#     112:pub const SCAN_INTERVAL_ENV: &str = "FERRODB_LEASE_SCAN_MILLIS";
+#    and the harness reads it through the server's own scan_interval_from_env():
+#     pub fn scan_interval_from_env() -> Result<Duration, FerroError> {
+#         match std::env::var(SCAN_INTERVAL_ENV) {
+#             Err(_) => Ok(Duration::from_millis(DEFAULT_SCAN_MILLIS)),
+#             Ok(v) => parse_scan_interval(&v),
+#         }
+#     }
+#
+# ⛔ THE LEASE IS COMPRESSED. The shipped constant has no environment override:
+#     96:pub const DEFAULT_LEASE_MILLIS: u64 = 15 * 60 * 1000;
+#     1477:            .fork(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
+#    The window under test is exactly Δ and does not contain L, so a compressed L rescales
+#    WHEN the window opens and not HOW WIDE it is. The CONTROL arm varies L at fixed Δ and
+#    must not move; the run REFUSES if it does.
+#
+==============================================================================
+ARM 1 — Δ swept ACROSS the scan interval S=3000 ms, below and above.
+==============================================================================
+# suite lock @ before arm 1: HELD BY THIS RUN (12:59:41Z, load 6.69 6.94 5.81)
+D144 — the lag the LEASE produces, swept across the scan interval.
+
+  scan interval S  3000 ms   (from scan_interval_from_env(), i.e. FERRODB_LEASE_SCAN_MILLIS or the 30000 ms default)
+  lease L          20000 ms  (COMPRESSED from DEFAULT_LEASE_MILLIS = 900000 ms, which has no env override;
+                   L does not enter the window, which is exactly Δ — the `lease` control arm tests that claim)
+  pairs per point  60, parent forks spread across exactly one S so the sweep phase is uniform
+  pages per parent 4, written BEFORE the child forks so the child can see them
+  reaping          the REAL LeaseThread on a real clock. No faked time, no direct reap() call.
+
+  P1 = D144 as written: a STEP — 0 parked below S, all parked above.
+  P2 = refinement:      a KNEE — parked fraction = min(Δ/S, 1), so a RAMP below S.
+
+      Δ ms lease ms        Δ/S    parked       P1       P2     peak pending      realised Δ   scans a/s/r/f/reaped  incsum
+lease: reaped 42 expired branch(es) with no client cooperation (b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b28@g0, b26@g0, b24@g0, b22@g0, b20@g0, b18@g0, b16@g0, b14@g0, b12@g0, b10@g0, b8@g0, b6@g0, b4@g0, b2@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b29@g0, b27@g0, b25@g0, b23@g0, b21@g0, b19@g0, b17@g0, b15@g0, b13@g0, b11@g0, b9@g0, b7@g0, b5@g0, b3@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 78 expired branch(es) with no client cooperation (b120@g0, b118@g0, b116@g0, b114@g0, b112@g0, b110@g0, b108@g0, b106@g0, b104@g0, b102@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b119@g0, b117@g0, b115@g0, b113@g0, b111@g0, b109@g0, b107@g0, b105@g0, b103@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0); 0 workspace(s) forgotten
+         0    20000      0.000         0        0        0                0            0..1          12/12/0/0/120       0
+lease: reaped 32 expired branch(es) with no client cooperation (b31@g0, b29@g0, b27@g0, b25@g0, b23@g0, b21@g0, b19@g0, b17@g0, b15@g0, b13@g0, b11@g0, b32@g0, b30@g0, b28@g0, b26@g0, b24@g0, b22@g0, b20@g0, b18@g0, b16@g0, b14@g0, b12@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 88 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b109@g0, b107@g0, b105@g0, b103@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b110@g0, b108@g0, b106@g0, b104@g0, b102@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0); 0 workspace(s) forgotten
+       500    20000      0.167        10        0       10               40        496..504          12/12/0/0/120      10
+lease: reaped 24 expired branch(es) with no client cooperation (b23@g0, b21@g0, b24@g0, b22@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 96 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b99@g0, b97@g0, b95@g0, b93@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b29@g0, b27@g0, b25@g0, b100@g0, b98@g0, b96@g0, b94@g0, b92@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b28@g0, b26@g0); 0 workspace(s) forgotten
+      1000    20000      0.333        20        0       20               80       995..1003          12/12/0/0/120      20
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 91 expired branch(es) with no client cooperation (b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b89@g0, b87@g0, b85@g0, b83@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b39@g0, b37@g0, b35@g0, b33@g0, b31@g0, b90@g0, b88@g0, b86@g0, b84@g0, b82@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b38@g0, b36@g0, b34@g0, b32@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 8 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0); 0 workspace(s) forgotten
+      1500    20000      0.500        21        0       30               84      1497..1504          13/13/0/0/120      48
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 81 expired branch(es) with no client cooperation (b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0, b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b79@g0, b77@g0, b75@g0, b73@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b49@g0, b47@g0, b45@g0, b43@g0, b41@g0, b80@g0, b78@g0, b76@g0, b74@g0, b72@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b48@g0, b46@g0, b44@g0, b42@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 18 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0); 0 workspace(s) forgotten
+      2000    20000      0.667        21        0       40               84      1997..2004          13/13/0/0/120      47
+lease: reaped 21 expired branch(es) with no client cooperation (b21@g0, b20@g0, b19@g0, b18@g0, b17@g0, b16@g0, b15@g0, b14@g0, b13@g0, b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+lease: reaped 71 expired branch(es) with no client cooperation (b92@g0, b91@g0, b90@g0, b89@g0, b88@g0, b87@g0, b86@g0, b85@g0, b84@g0, b83@g0, b82@g0, b81@g0, b80@g0, b79@g0, b78@g0, b77@g0, b76@g0, b75@g0, b74@g0, b73@g0, b72@g0, b71@g0, b69@g0, b67@g0, b65@g0, b63@g0, b61@g0, b59@g0, b57@g0, b55@g0, b53@g0, b51@g0, b70@g0, b68@g0, b66@g0, b64@g0, b62@g0, b60@g0, b58@g0, b56@g0, b54@g0, b52@g0, b50@g0, b49@g0, b48@g0, b47@g0, b46@g0, b45@g0, b44@g0, b43@g0, b42@g0, b41@g0, b40@g0, b39@g0, b38@g0, b37@g0, b36@g0, b35@g0, b34@g0, b33@g0, b32@g0, b31@g0, b30@g0, b29@g0, b28@g0, b27@g0, b26@g0, b25@g0, b24@g0, b23@g0, b22@g0); 0 workspace(s) forgotten
+lease: reaped 28 expired branch(es) with no client cooperation (b120@g0, b119@g0, b118@g0, b117@g0, b116@g0, b115@g0, b114@g0, b113@g0, b112@g0, b111@g0, b110@g0, b109@g0, b108@g0, b107@g0, b106@g0, b105@g0, b104@g0, b103@g0, b102@g0, b101@g0, b100@g0, b99@g0, b98@g0, b97@g0, b96@g0, b95@g0, b94@g0, b93@g0); 0 workspace(s) forgotten
+      2500    20000      0.833        28        0       50              112      2496..2504          13/13/0/0/120      47
+bench/d144_run.sh: line 23: 61067 Killed: 9               "$@"
+REFUSED: aborted by SIGTERM after 620s. A sweep cut short is not a measurement.
