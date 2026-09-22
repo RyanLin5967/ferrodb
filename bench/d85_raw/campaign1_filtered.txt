@@ -1,0 +1,112 @@
+D85 re-derivation campaign
+worktree: /Users/idide/wt/ferrodb-d85-rederive
+HEAD: 2bc80fda496333cb126fa8870f05678b879b90f1
+started: 2026-09-22T10:03:38Z
+
+==============================================================================
+### M0-baseline  (rc=0, 12s)
+    removes:  nothing - HEAD as it stands
+    predicted: all green
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... ok
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.12s
+
+==============================================================================
+### M1-no-seed  (rc=101, 4s)
+    removes:  load_state no longer marks restored extents suspect (disables the WHOLE fix)
+    predicted: end-to-end FAILS = the hazard is real
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... FAILED
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... FAILED
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... FAILED
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... FAILED
+    thread 'branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent' (258599243) panicked at src/branch/arena.rs:3333:9:
+    extent_is_empty() answered from an UNPROBED restored extent's next_free, which the image can understate — that is the number that freed a live child's pages in D85
+    D85: arena ArenaId(4)  pages before checkpoint=0  after more writes=3  after restore=0  extent_is_empty=true
+    thread 'branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says' (258599253) panicked at src/branch/arena.rs:3437:9:
+    REGRESSION: an extent holding 3 written page(s) reports extent_is_empty()=true after a crash. That is D85 — retire_arenas_by_rule then parks none of a live child's pages and the orphan sweep frees the extent.
+    thread 'branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free' (258599286) panicked at src/branch/reaper.rs:2177:5:
+    D85 IS DATA LOSS: the extent holding 3 page(s) a LIVE CHILD can read was freed after a crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked nothing and `extent_is_empty` then reported it collectable
+    thread 'branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free' (258599297) panicked at src/branch/reaper.rs:2178:5:
+    D85 IS DATA LOSS: the extent holding 3 page(s) a LIVE CHILD can read was freed after a crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked nothing and `extent_is_empty` then reported it collectable
+    test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.12s
+    error: test failed, to rerun pass `--lib`
+
+==============================================================================
+### M2-probe-recovers-nothing  (rc=101, 3s)
+    removes:  resolve_fill clears the suspicion but recovers no pages
+    predicted: end-to-end FAILS (row: 'only neutering resolve_fill failed it')
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... FAILED
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... FAILED
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... FAILED
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... FAILED
+    D85: arena ArenaId(4)  pages before checkpoint=0  after more writes=3  after restore=0  extent_is_empty=false
+    D85 probe: recovered 0 page(s) (wanted 3); arena_owner=Some(BranchId { id: 1, generation: 0 })
+    thread 'branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says' (258600457) panicked at src/branch/arena.rs:3456:9:
+    D87 falsifier2: truth=3 probed-from-zero=0
+    thread 'branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written' (258600459) panicked at src/branch/arena.rs:3303:9:
+    assertion `left == right` failed: probing from zero under-reports (0 of 3); a rebuilt extent would look emptier than it is, which is exactly D85's data loss arriving by another door
+    thread 'branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free' (258600461) panicked at src/branch/reaper.rs:2177:5:
+    D85 IS DATA LOSS: the extent holding 3 page(s) a LIVE CHILD can read was freed after a crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked nothing and `extent_is_empty` then reported it collectable
+    thread 'branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free' (258600462) panicked at src/branch/reaper.rs:2178:5:
+    D85 IS DATA LOSS: the extent holding 3 page(s) a LIVE CHILD can read was freed after a crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked nothing and `extent_is_empty` then reported it collectable
+    test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.12s
+    error: test failed, to rerun pass `--lib`
+
+==============================================================================
+### M3-no-refusal  (rc=101, 3s)
+    removes:  extent_is_empty no longer refuses an unprobed extent
+    predicted: end-to-end GREEN (masked); the direct guard test must FAIL
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... FAILED
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... FAILED
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    thread 'branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent' (258601748) panicked at src/branch/arena.rs:3330:9:
+    extent_is_empty() answered from an UNPROBED restored extent's next_free, which the image can understate — that is the number that freed a live child's pages in D85
+    D85: arena ArenaId(4)  pages before checkpoint=0  after more writes=3  after restore=0  extent_is_empty=true
+    thread 'branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says' (258601749) panicked at src/branch/arena.rs:3434:9:
+    REGRESSION: an extent holding 3 written page(s) reports extent_is_empty()=true after a crash. That is D85 — retire_arenas_by_rule then parks none of a live child's pages and the orphan sweep frees the extent.
+    test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.11s
+    error: test failed, to rerun pass `--lib`
+
+==============================================================================
+### M4-no-retire-probe  (rc=0, 3s)
+    removes:  retire_arenas_by_rule no longer probes before enumerating pages
+    predicted: end-to-end GREEN (masked by extent_is_collectable probing first)
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... ok
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.11s
+
+==============================================================================
+### M5-no-collectable-probe  (rc=0, 4s)
+    removes:  extent_is_collectable no longer probes before asking extent_is_empty
+    predicted: unknown - is anything left that catches this?
+==============================================================================
+    test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+    test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... ok
+    test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+    test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+    test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 0.12s
+
+finished: 2026-09-22T10:04:08Z
+CAMPAIGN_COMPLETE

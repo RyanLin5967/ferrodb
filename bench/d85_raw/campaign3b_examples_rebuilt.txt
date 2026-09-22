@@ -1,0 +1,255 @@
+D85 final pass
+worktree: /Users/idide/wt/ferrodb-d85-rederive
+HEAD: 2bc80fda496333cb126fa8870f05678b879b90f1
+acquired the suite lock after 1146s at 2026-09-22T10:49:37Z
+
+=== ARM 0: build examples (the staleness guard refuses a stale binary) ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+warning: variable does not need to be mutable
+  --> examples/d51_sharedword_probe.rs:77:17
+   |
+77 |             let mut one = |s: &Shared| match arm {
+   |                 ----^^^
+   |                 |
+   |                 help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Barrier`
+  --> examples/d68_merge_is_o_table.rs:50:22
+   |
+50 | use std::sync::{Arc, Barrier};
+   |                      ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 1 warning (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.37s
+--- rc=0 after 4s ---
+
+=== ARM A2: baseline, the two restoring integration targets ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.30s
+     Running tests/integration_cluster_grants.rs (target/debug/deps/integration_cluster_grants-67065c5a27dc5eca)
+
+running 35 tests
+test a_member_with_no_lease_tick_refuses_to_answer_what_time_it_is ... ok
+test a_node_with_no_cluster_configured_grants_itself_everything ... ok
+test a_standalone_node_reaps_on_its_own_clock_exactly_as_before ... ok
+test a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases ... ok
+test a_lease_tick_never_moves_the_clusters_clock_backwards ... ok
+test a_node_with_no_cluster_configured_still_begins_transactions ... ok
+test a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out ... ok
+test a_replicated_tick_and_not_the_wall_clock_decides_a_reap ... ok
+test a_member_with_no_extent_grant_refuses_to_allocate_an_arena ... ok
+test a_recycled_extent_start_from_a_previous_authority_is_not_handed_out_again ... ok
+test a_redelivered_grant_does_not_hand_out_the_same_extent_twice ... ok
+test a_granted_extent_is_filled_without_any_further_consensus ... ok
+test a_member_begins_transactions_from_its_granted_range_and_no_further ... ok
+test a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued ... ok
+test a_replicated_checkpoint_command_is_what_truncates_on_a_member ... ok
+test a_standalone_node_refuses_a_lease_tick ... ok
+test a_standalone_node_refuses_a_grant_it_was_never_supposed_to_get ... ok
+test a_member_with_no_txn_grant_refuses_to_begin_a_transaction ... ok
+test a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter ... ok
+test a_grant_addressed_to_another_node_is_refused_by_this_one ... ok
+test a_standalone_node_still_checkpoints_on_its_own_commit_counter ... ok
+test an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name ... ok
+test a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join ... ok
+test the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote ... ok
+test an_authority_change_is_noticed_by_the_counters_and_not_merely_survived ... ok
+test recovery_raises_the_transaction_watermark_without_inventing_a_grant ... ok
+test an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards ... ok
+test the_reaper_trait_is_the_path_under_test ... ok
+test two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live ... ok
+test is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick ... ok
+test the_infallible_lease_clock_aborts_rather_than_inventing_a_time - should panic ... ok
+test space_a_node_self_granted_while_standalone_is_revoked_when_it_joins ... ok
+test the_three_appliers_take_exactly_the_frozen_commands_shape ... ok
+test two_nodes_with_disjoint_grants_never_hand_out_the_same_physical_page ... ok
+test two_nodes_with_disjoint_grants_never_issue_the_same_transaction_id ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
+
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-2fe130781ef8f38a)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... ok
+test a_healthy_database_resumes_nothing_on_startup ... ok
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... ok
+test a_live_lease_survives_a_server_that_scans_continuously ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+
+--- rc=0 after 8s ---
+
+(W4 applied: retire-side probe removed)
+
+=== ARM 0b: rebuild examples AFTER the mutation (it made src/ newer again) ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+warning: unused import: `Barrier`
+  --> examples/d68_merge_is_o_table.rs:50:22
+   |
+50 | use std::sync::{Arc, Barrier};
+   |                      ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 1 warning (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+warning: variable does not need to be mutable
+  --> examples/d51_sharedword_probe.rs:77:17
+   |
+77 |             let mut one = |s: &Shared| match arm {
+   |                 ----^^^
+   |                 |
+   |                 help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.99s
+--- rc=0 after 3s ---
+
+=== ARM B2: W4, the two restoring integration targets ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+     Running tests/integration_cluster_grants.rs (target/debug/deps/integration_cluster_grants-67065c5a27dc5eca)
+
+running 35 tests
+test a_node_with_no_cluster_configured_still_begins_transactions ... ok
+test a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases ... ok
+test a_node_with_no_cluster_configured_grants_itself_everything ... ok
+test a_lease_tick_never_moves_the_clusters_clock_backwards ... ok
+test a_member_with_no_lease_tick_refuses_to_answer_what_time_it_is ... ok
+test a_redelivered_grant_does_not_hand_out_the_same_extent_twice ... ok
+test a_replicated_tick_and_not_the_wall_clock_decides_a_reap ... ok
+test a_recycled_extent_start_from_a_previous_authority_is_not_handed_out_again ... ok
+test a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join ... ok
+test a_member_with_no_extent_grant_refuses_to_allocate_an_arena ... ok
+test a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued ... ok
+test a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter ... ok
+test a_member_with_no_txn_grant_refuses_to_begin_a_transaction ... ok
+test a_member_begins_transactions_from_its_granted_range_and_no_further ... ok
+test a_replicated_checkpoint_command_is_what_truncates_on_a_member ... ok
+test a_grant_addressed_to_another_node_is_refused_by_this_one ... ok
+test a_standalone_node_reaps_on_its_own_clock_exactly_as_before ... ok
+test a_standalone_node_refuses_a_lease_tick ... ok
+test a_standalone_node_refuses_a_grant_it_was_never_supposed_to_get ... ok
+test a_standalone_node_still_checkpoints_on_its_own_commit_counter ... ok
+test is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick ... ok
+test a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out ... ok
+test an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name ... ok
+test a_granted_extent_is_filled_without_any_further_consensus ... ok
+test an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards ... ok
+test the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote ... ok
+test space_a_node_self_granted_while_standalone_is_revoked_when_it_joins ... ok
+test the_reaper_trait_is_the_path_under_test ... ok
+test two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live ... ok
+test the_infallible_lease_clock_aborts_rather_than_inventing_a_time - should panic ... ok
+test an_authority_change_is_noticed_by_the_counters_and_not_merely_survived ... ok
+test the_three_appliers_take_exactly_the_frozen_commands_shape ... ok
+test recovery_raises_the_transaction_watermark_without_inventing_a_grant ... ok
+test two_nodes_with_disjoint_grants_never_hand_out_the_same_physical_page ... ok
+test two_nodes_with_disjoint_grants_never_issue_the_same_transaction_id ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.69s
+
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-2fe130781ef8f38a)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... ok
+test a_healthy_database_resumes_nothing_on_startup ... ok
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... ok
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... ok
+test a_live_lease_survives_a_server_that_scans_continuously ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.18s
+
+--- rc=0 after 9s ---
+arm 7 patch applied
+
+=== ARM 7: why the probe reports fewer pages than were written ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d85-rederive)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2177 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2177 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2178 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2103:17
+     |
+2103 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2178 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.18s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 1 test
+test branch::arena::tests::d85_diag_why_the_probe_reports_fewer_pages_than_were_written ... D85 arm7: image next_free=1 recycled=[8]
+D85 arm7: wrote after the image [8, 9, 10] (of which REUSED a recycled id: [8])
+D85 arm7: restored next_free=1 -> after probe 3
+D85 arm7: recycled after restore=[8]  allocated_pages=[9, 10]
+D85 arm7: ** page 8 holds data written after the image and is listed FREE after restore (next_free=3). `fill_unknown` corrects next_free only; the restored `recycled` list carries the same staleness.
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1628 filtered out; finished in 0.02s
+
+--- rc=0 after 5s ---
+
+tree clean at end: YES
+FINAL_COMPLETE
