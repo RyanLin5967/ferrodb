@@ -172,3 +172,86 @@ fn an_untagged_acquirer_shows_up_as_unattributed() {
          is supposed to catch an acquirer nobody counted cannot fire"
     );
 }
+
+/// **The `LeaseScan` tag fires — and knowing that is what makes `ann_lease=0` readable.**
+///
+/// Every row of the W4 check 3 main run reports `ann_lease=0`, and a zero from a detector that
+/// has never been made to fire says nothing at all. It is worth separating two claims that the
+/// bare zero collapses:
+///
+/// * *the tag works* — asserted here, by calling the reaper's own `RuntimeLock` seam and watching
+///   `announce_lease_scan` move by exactly one;
+/// * *the reaper announced nothing during an arm* — which is TRUE but is true BY CONSTRUCTION and
+///   therefore measures nothing. `LeaseScan` is tagged in `impl RuntimeLock for ServerContext`,
+///   which the lease thread reaches only from `scan_once`'s per-candidate reap loop —
+///   `expired_candidates` is computed OUTSIDE the lock and an empty candidate list takes the lock
+///   zero times, at any scan interval. A branch expires `DEFAULT_LEASE_MILLIS` after it is
+///   forked, hardcoded at 15 minutes (`src/agent_sql/runtime.rs`, `LeaseDeadline::from_now`), and
+///   no arm runs for 15 minutes.
+///
+/// ⇒ So `W4_LEASE_MS` moves the scan CADENCE and cannot make the reaper announce; only an EXPIRED
+/// BRANCH can. A fire-check that lowers the interval and expects `ann_lease` to become non-zero
+/// tests the wrong knob. The reaper's contribution to the announcer set is UNMEASURED by that
+/// harness, and this test is the boundary of what is known: the tag is live, the population is
+/// empty.
+#[cfg(feature = "w4-standdown-count")]
+#[test]
+fn the_lease_scan_tag_fires_when_the_reaper_takes_the_statement_lock() {
+    use ferrodb::branch::lease_thread::RuntimeLock;
+
+    let _g = gate();
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx(&dir, "leasescan.db");
+
+    let before = standdown::counts().expect("instrumented");
+    let mut ran = false;
+    let mut body = || ran = true;
+    // The exact seam the lease thread uses; nothing here is a stand-in for it.
+    RuntimeLock::with_runtime_lock(&*c, &mut body);
+    let after = standdown::counts().expect("instrumented");
+
+    assert!(ran, "with_runtime_lock returned without running its body");
+    assert_eq!(
+        after.announce_lease_scan - before.announce_lease_scan,
+        1,
+        "the reaper took the statement lock and `announce_lease_scan` did not move, so every \
+         `ann_lease=0` in the main run is a dead counter rather than an absent announcer"
+    );
+    assert_eq!(
+        after.announce_total - before.announce_total,
+        1,
+        "the reaper's acquisition did not reach `announce_total`"
+    );
+    assert_eq!(
+        after.announce_unattributed() - before.announce_unattributed(),
+        0,
+        "the reaper's acquisition was tagged, so it must NOT also count as unattributed"
+    );
+}
+
+/// The does-not-fire-spuriously half of the test above: an acquisition that is NOT the reaper's
+/// must leave `announce_lease_scan` alone. Without this the test above passes for a counter that
+/// increments on every acquisition and merely happens to be named after the reaper.
+#[cfg(feature = "w4-standdown-count")]
+#[test]
+fn the_lease_scan_tag_does_not_fire_for_an_ordinary_acquirer() {
+    let _g = gate();
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx(&dir, "leasescan_neg.db");
+
+    let before = standdown::counts().expect("instrumented");
+    drop(c.catalog());
+    let after = standdown::counts().expect("instrumented");
+
+    assert_eq!(
+        after.announce_total - before.announce_total,
+        1,
+        "the acquisition did not reach the total counter"
+    );
+    assert_eq!(
+        after.announce_lease_scan - before.announce_lease_scan,
+        0,
+        "an acquisition with no reaper behind it moved the LeaseScan tag, so that column does not \
+         mean what its name says and a reaper-caused stand-down could not be told from any other"
+    );
+}

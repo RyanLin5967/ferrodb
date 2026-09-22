@@ -199,6 +199,57 @@ impl Client {
         self.drain_to_ready()
     }
 
+    /// Extended framing with the `Parse` sent and ACKNOWLEDGED in its own round trip, before
+    /// `Bind`/`Execute`/`Sync` go out.
+    ///
+    /// **This exists to split one axis off another, and it is not a driver model.** `ext_reparse`
+    /// was built to test whether `simple`'s low stand-down rate comes from the client holding the
+    /// exclusive catalog for its own `Parse` immediately before its own `begin_read`. It
+    /// re-parses like `simple` does, and it landed BETWEEN `simple` and `extended` rather than on
+    /// `simple` — so that explanation is at best partial and a second mechanism is unaccounted
+    /// for. The obvious candidate is not WHETHER the client re-parsed but HOW LONG AGO: in
+    /// `simple` the server drops the parse guard and reaches `begin_read` a few hundred
+    /// nanoseconds later inside one function, while in `ext_reparse` it must first decode a
+    /// pipelined `Bind` and `Execute` from the socket buffer.
+    ///
+    /// This row holds the re-parse constant and stretches that gap to a full network round trip.
+    /// If the gap is the residual mechanism, this must land on or past `extended`; if it lands on
+    /// `ext_reparse`, the gap is not what separates those two rows and the residual is elsewhere.
+    fn extended_split(&mut self, name: &str, sql: &str) -> std::io::Result<Vec<String>> {
+        let mut errors = Vec::new();
+        if !self.prepared.contains(name) {
+            let mut body = name.as_bytes().to_vec();
+            body.push(0);
+            body.extend_from_slice(sql.as_bytes());
+            body.push(0);
+            body.extend_from_slice(&0i16.to_be_bytes()); // no parameter type hints
+            let mut out = Client::msg(b'P', &body);
+            // `Sync` rather than `Flush`, so the reply is a `ReadyForQuery` and `drain_to_ready`
+            // is the same reader every other path here uses. Nothing opens a transaction in this
+            // harness, so ending the implicit one costs nothing.
+            out.extend_from_slice(&Client::msg(b'S', &[]));
+            self.w.write_all(&out)?;
+            self.w.flush()?;
+            errors.extend(self.drain_to_ready()?);
+            self.prepared.insert(name.to_string());
+        }
+        let mut bind = vec![0u8]; // unnamed portal
+        bind.extend_from_slice(name.as_bytes());
+        bind.push(0);
+        for n in [0i16, 0, 0] {
+            bind.extend_from_slice(&n.to_be_bytes());
+        }
+        let mut out = Client::msg(b'B', &bind);
+        let mut exec = vec![0u8]; // unnamed portal
+        exec.extend_from_slice(&0i32.to_be_bytes()); // unlimited rows
+        out.extend_from_slice(&Client::msg(b'E', &exec));
+        out.extend_from_slice(&Client::msg(b'S', &[]));
+        self.w.write_all(&out)?;
+        self.w.flush()?;
+        errors.extend(self.drain_to_ready()?);
+        Ok(errors)
+    }
+
     /// Read backend messages until `ReadyForQuery`, returning every error text seen.
     fn drain_to_ready(&mut self) -> std::io::Result<Vec<String>> {
         let mut errors = Vec::new();
@@ -353,6 +404,11 @@ enum Proto {
     /// comes from that self-release and not from something else in the simple-query code path,
     /// this row must track `simple`; if it tracks `extended`, that explanation is wrong.
     ExtendedReparse,
+    /// `ext_reparse` with the `Parse` acknowledged in its own round trip before `Bind`/`Execute`
+    /// go out. Re-parses exactly as `simple` and `ext_reparse` do; the ONLY thing it changes is
+    /// how long after the client's own catalog release its `begin_read` arrives. See
+    /// [`Client::extended_split`] for why that axis has to be split off separately.
+    ExtendedSplit,
 }
 
 impl Proto {
@@ -361,11 +417,18 @@ impl Proto {
             Proto::Simple => "simple",
             Proto::Extended => "extended",
             Proto::ExtendedReparse => "ext_reparse",
+            Proto::ExtendedSplit => "ext_split",
         }
     }
 }
 
+/// The DEFAULT rows, unchanged: adding `ext_split` here would silently make every existing run
+/// a different experiment from the one whose numbers are on record.
 const PROTOS: [Proto; 3] = [Proto::Simple, Proto::Extended, Proto::ExtendedReparse];
+
+/// Every row `W4_PROTOS` can name. `ext_split` is opt-in for that reason.
+const ALL_PROTOS: [Proto; 4] =
+    [Proto::Simple, Proto::Extended, Proto::ExtendedReparse, Proto::ExtendedSplit];
 
 /// Which protocol rows to run. `W4_PROTOS=extended` restricts a sweep to the row that answers the
 /// question — real drivers cache prepared statements — instead of paying 3x for rows whose
@@ -376,7 +439,7 @@ fn protos() -> Vec<Proto> {
         Ok(v) => {
             let want: Vec<&str> = v.split(',').map(|s| s.trim()).collect();
             let chosen: Vec<Proto> =
-                PROTOS.iter().copied().filter(|p| want.contains(&p.label())).collect();
+                ALL_PROTOS.iter().copied().filter(|p| want.contains(&p.label())).collect();
             if chosen.is_empty() {
                 eprintln!(
                     "REFUSED: W4_PROTOS={v:?} selects no known protocol. A run that collected \
@@ -606,6 +669,10 @@ fn run_arm(arm: &str, proto: Proto, clients: usize, rounds: usize, lease_ms: u64
                 Proto::ExtendedReparse => {
                     seq += 1;
                     c.extended(&format!("{name}__{seq}"), sql)
+                }
+                Proto::ExtendedSplit => {
+                    seq += 1;
+                    c.extended_split(&format!("{name}__{seq}"), sql)
                 }
             };
 
