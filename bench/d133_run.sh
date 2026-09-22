@@ -69,16 +69,18 @@ echo "#"
 # ---- the sweep -----------------------------------------------------------------------------
 echo "=============================================================================="
 echo "ARM 1 — the branch-count curve, in-memory catalog, both persist settings."
+echo "  fan/chain pin their children forever (lag = infinity); fanlag holds the lag at ONE"
+echo "  reap; fanreap reaps every child first (lag = zero); leaf is the forced negative."
 echo "=============================================================================="
 suite_state "before arm 1 persist=off"
-D133_SHAPES=fan,chain,leaf D133_BRANCHES=100,300,1000,3000 D133_PERSIST=off \
+D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300,1000,3000 D133_PERSIST=off \
     D133_CATALOG=mem "$BIN"
 rc1=$?
 suite_state "after arm 1 persist=off"
 echo "(arm 1 persist=off rc=$rc1)"
 echo
 suite_state "before arm 1 persist=on"
-D133_SHAPES=fan,chain,leaf D133_BRANCHES=100,300,1000,3000 D133_PERSIST=on \
+D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300,1000 D133_PERSIST=on \
     D133_CATALOG=mem "$BIN"
 rc2=$?
 suite_state "after arm 1 persist=on"
@@ -91,7 +93,7 @@ echo "must agree on the integers at a count both can reach, or one of them is th
 echo "thing being measured."
 echo "=============================================================================="
 suite_state "before arm 2"
-D133_SHAPES=fan,chain,leaf D133_BRANCHES=100,300 D133_PERSIST=off \
+D133_SHAPES=fan,chain,fanreap,fanlag,leaf D133_BRANCHES=100,300 D133_PERSIST=off \
     D133_CATALOG=table "$BIN"
 rc3=$?
 suite_state "after arm 2"

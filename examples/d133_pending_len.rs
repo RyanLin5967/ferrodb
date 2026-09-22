@@ -57,6 +57,24 @@
 //!           `drain_passes` and `drain_entry_visits` must all read ZERO. A counter that is never
 //!           zero is not measuring what its name says.
 //!
+//! ⚠ **`fan` and `chain` pin their children FOREVER, by construction.** That makes them a worst
+//! case, not a steady state, and a worst case shipped without its boundary condition is a scope
+//! artifact. Two more shapes find the boundary, and their expectations are written down here
+//! BEFORE the run rather than read off it:
+//!
+//!   `fanreap` The same fan, but the children are expired too and the sweep reaps them FIRST —
+//!             which is the order `expired_candidates` actually produces (`lease_thread.rs:564`,
+//!             deepest first, and the reaper's own comment says reaping a child is what lets its
+//!             parent take the fast path). Every parent is then a childless leaf when its turn
+//!             comes. **Prediction: peak = 0, passes = 0, visits = 0** — nothing is parked at all.
+//!   `fanlag`  Each child outlives its parent by exactly ONE reap: p1, c1, p2, c2, … Reaping p_i
+//!             parks P pages; reaping c_i is what un-pins them. **Prediction, with V the victim
+//!             count printed: peak = P, passes = V, visits = P*V** — a queue that is CONSTANT in
+//!             the branch count and walked a linear number of times.
+//!
+//! So the axis that matters is not the branch count but **how long a child outlives its parent**,
+//! and these three shapes are lag = infinity, lag = one reap, and lag = zero.
+//!
 //! Refuses rather than reporting: zero branches, zero rows, a `fan`/`chain` row that parked
 //! nothing (the fixture missed the code under test), or a `leaf` row that parked anything.
 //!
@@ -159,6 +177,34 @@ fn pad(rig: &Rig, shape: &str, n: usize, pages: u32) -> Vec<BranchId> {
             all.reverse();
             all
         }
+        // The same fan, but the children expire too and are reaped FIRST — deepest-first, which
+        // is the order the lease thread's own candidate list arrives in. Every parent is a
+        // childless leaf by the time its turn comes, so the slow path never runs.
+        "fanreap" => {
+            let mut parents = Vec::with_capacity(n);
+            let mut children = Vec::with_capacity(n);
+            for _ in 0..n {
+                let p = rig.cat.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                write_pages(rig, p.branch_id, pages);
+                children.push(rig.cat.fork(p.branch_id, LeaseDeadline(0)).unwrap().branch_id);
+                parents.push(p.branch_id);
+            }
+            children.extend(parents); // children first
+            children
+        }
+        // Each child outlives its parent by exactly one reap. This is the lag the queue's length
+        // is actually a function of, held at one instead of at infinity.
+        "fanlag" => {
+            let mut victims = Vec::with_capacity(2 * n);
+            for _ in 0..n {
+                let p = rig.cat.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                write_pages(rig, p.branch_id, pages);
+                let c = rig.cat.fork(p.branch_id, LeaseDeadline(0)).unwrap();
+                victims.push(p.branch_id);
+                victims.push(c.branch_id);
+            }
+            victims
+        }
         // The forced negative: childless leaves park nothing, so every counter must stay at zero.
         "leaf" => (0..n)
             .map(|_| {
@@ -172,7 +218,7 @@ fn pad(rig: &Rig, shape: &str, n: usize, pages: u32) -> Vec<BranchId> {
 }
 
 fn main() {
-    let shapes = list("D133_SHAPES", "fan,chain,leaf");
+    let shapes = list("D133_SHAPES", "fan,chain,fanreap,fanlag,leaf");
     let counts: Vec<usize> =
         list("D133_BRANCHES", "100,300,1000,3000").iter().filter_map(|s| s.parse().ok()).collect();
     let persists = list("D133_PERSIST", "off,on");
@@ -265,6 +311,29 @@ fn main() {
                                 "leaf N={n} parked {peak} entries and walked {visits}: a childless \
                                  leaf has no live child, so the counters are measuring something \
                                  other than the pinned-page path"
+                            ));
+                        }
+                    }
+                    // Not a prediction being tested but a contract: a parent reaped after its own
+                    // child IS a childless leaf, and the fast path parks nothing. A non-zero here
+                    // means the deepest-first ordering does not buy what the reaper says it buys.
+                    "fanreap" => {
+                        if peak != 0 {
+                            refusals.push(format!(
+                                "fanreap N={n} parked {peak} entries although every child was \
+                                 reaped before its parent — the fast path did not engage"
+                            ));
+                        }
+                    }
+                    // `fanlag` asserts nothing here on purpose: whether the queue DRAINS when the
+                    // pinning child dies is the question this shape exists to answer, and a
+                    // harness that refuses unless it drains has assumed the answer. The prediction
+                    // (peak = P, passes = V, visits = P*V) is checked by bench/d133_check.py.
+                    "fanlag" => {
+                        if visits == 0 {
+                            refusals.push(format!(
+                                "fanlag N={n} walked zero pending entries — the fixture never \
+                                 reached the drain at all"
                             ));
                         }
                     }

@@ -28,7 +28,7 @@ import re
 import sys
 
 ROW = re.compile(
-    r"^\s*(?:P=(?P<p>\d+)\s+)?(?P<shape>fan|chain|leaf)\s+(?P<persist>on|off)\s+"
+    r"^\s*(?:P=(?P<p>\d+)\s+)?(?P<shape>fan|chain|fanreap|fanlag|leaf)\s+(?P<persist>on|off)\s+"
     r"(?P<n>\d+)\s+(?P<pend_end>\d+)\s+(?P<peak>\d+)\s+(?P<passes>\d+)\s+(?P<visits>\d+)\s+"
     r"(?P<ms>[\d.]+)\s+(?P<per>[\d.]+)\s*$"
 )
@@ -54,19 +54,28 @@ def main() -> int:
         shapes.add(shape)
         n = int(m.group("n"))
         pages = int(m.group("p")) if m.group("p") else default_pages
-        # The control: a childless leaf has no live child, so nothing can be parked and nothing
-        # can be walked. Expected values here are 0 by the same rule 1, with P effectively 0.
-        p = 0 if shape == "leaf" else pages
-        want_peak = p * n
-        want_passes = n if p else 0
-        want_visits = p * n * (n + 1) // 2
+        # `n` is the VICTIM count the harness printed, which is what every form below is in.
+        if shape in ("leaf", "fanreap"):
+            # `leaf` has no child at all; `fanreap` reaps every child BEFORE its parent, so each
+            # parent is a childless leaf by its turn. Both take the fast path and park nothing.
+            want = (0, 0, 0)
+        elif shape == "fanlag":
+            # A child that outlives its parent by exactly one reap. Reaping p_i parks P; reaping
+            # c_i releases them, so the queue returns to empty and never accumulates. Each of the
+            # V reaps makes one pass over the P entries standing at that moment.
+            want = (pages, n, pages * n)
+        else:
+            # `fan`/`chain`: the child never dies, so the i-th reap adds P and releases nothing,
+            # and its single pass walks everything parked so far.
+            want = (pages * n, n, pages * n * (n + 1) // 2)
         got = (int(m.group("peak")), int(m.group("passes")), int(m.group("visits")))
-        want = (want_peak, want_passes, want_visits)
         if got != want:
-            bad.append(f"{shape:<5} persist={m.group('persist'):<3} N={n:<5} P={pages}: "
+            bad.append(f"{shape:<7} persist={m.group('persist'):<3} V={n:<5} P={pages}: "
                        f"got peak/passes/visits {got}, closed form says {want}")
-        if int(m.group("pend_end")) != int(m.group("peak")):
-            bad.append(f"{shape:<5} persist={m.group('persist'):<3} N={n:<5}: pend_end "
+        # Only where the premise holds: fan/chain keep their children alive for the whole run, so
+        # a queue that shrank would falsify the model. fanlag is EXPECTED to end drained.
+        if shape in ("fan", "chain") and int(m.group("pend_end")) != int(m.group("peak")):
+            bad.append(f"{shape:<7} persist={m.group('persist'):<3} V={n:<5}: pend_end "
                        f"{m.group('pend_end')} != peak {m.group('peak')} — the queue DID drain, "
                        f"which the 'children stay live' premise says it cannot")
 
@@ -95,8 +104,9 @@ def main() -> int:
         for b in bad:
             print(f"  - {b}", file=sys.stderr)
         return 1
-    print(f"OK — all {rows} rows (shapes: {', '.join(sorted(shapes))}) match the closed form "
-          f"pend=P*N, passes=N, visits=P*N*(N+1)/2 EXACTLY, and no row's queue ever drained.")
+    print(f"OK — all {rows} rows (shapes: {', '.join(sorted(shapes))}) match their closed forms "
+          f"EXACTLY: fan/chain pend=P*V passes=V visits=P*V*(V+1)/2; fanlag pend=P passes=V "
+          f"visits=P*V; fanreap/leaf all zero.")
     return 0
 
 
