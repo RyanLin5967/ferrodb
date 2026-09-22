@@ -131,6 +131,34 @@ impl Catalog {
         self.roots.retain(|(t, _), _| live.contains(t));
     }
 
+    /// Discard every shared cell and re-seed it from the durable records.
+    ///
+    /// # Why [`Catalog::sync_root_cells`] cannot be used for this
+    ///
+    /// `sync_root_cells` **creates missing cells and never overwrites an existing one**, and that
+    /// asymmetry is deliberate: a live handle may have split past the value on the catalog page,
+    /// so clobbering the cell would hand the next reader a root that has already moved. It is
+    /// therefore powerless in the one situation where the record is RIGHT and the cell is WRONG.
+    ///
+    /// `wal::recovery::rebuild_indexes` is exactly that situation. It frees every index tree and
+    /// builds a fresh one, writing the new root into the `TableEntry`; the cells were seeded by
+    /// `Catalog::open` from the *pre-crash* roots, and `sync_root_cells` leaves them there. Every
+    /// cell then points into a tree that was just freed, and `plan::open_table` takes the
+    /// `Some(cell)` arm in preference to the record — so the rebuild is correct on disk and
+    /// invisible to every statement that follows it.
+    ///
+    /// # ⛔ Precondition: no handle may exist
+    ///
+    /// Dropping a cell while another handle holds a clone of the `Arc` is precisely the D53
+    /// defect: the next `open_table` mints a *fresh* cell, two handles hold independent root
+    /// pointers, and the root-split retry in `read_leaf_for` compares a private value against
+    /// itself. This is safe only on a single-threaded bootstrap path, before any connection has
+    /// opened a table — which is the only place it is called.
+    pub fn reseed_root_cells(&mut self) {
+        self.roots.clear();
+        self.sync_root_cells();
+    }
+
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
         // E67: this was `FerroError::KeyNotFound`, so creating a table that already exists answered
         // `error: key wasn't found` - a storage-layer message, for a name collision, telling the

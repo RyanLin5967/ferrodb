@@ -5,9 +5,9 @@ use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
 use crate::wal::log::WalManager;
-use crate::wal::recovery::{rebuild_indexes, recover};
+use crate::wal::recovery::open_recovered;
 use crate::wal::txn::TxnManager;
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::TableBranchCatalog;
@@ -62,16 +62,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
-    let recovered = recover(&txn)?;
-    let mut catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
-    } else {
-        Catalog::create(bp.clone())?
-    };
-    if recovered {
-        rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
-    }
+    let mut catalog = open_recovered(&bp, &txn, existed, FIRST_CATALOG_PAGE_ID)?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`

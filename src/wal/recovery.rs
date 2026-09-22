@@ -272,7 +272,55 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
         }
     }
+    // **The records above are the only copy that moved.** Every loop in this function writes the
+    // fresh root into the `TableEntry`, and the SHARED cells (`Catalog::roots`, D53) still hold the
+    // roots `Catalog::open` seeded from the catalog page before any of this ran — i.e. the trees
+    // `free_tree` has just released. `plan::open_table` prefers the cell to the record, so without
+    // this the rebuild is correct on disk and *invisible*: every statement after recovery descends
+    // a freed tree, and whether that answers wrongly or merely differently depends on which pages
+    // the allocator handed back to `create`.
+    //
+    // `reseed_root_cells` rather than `sync_root_cells`, and the difference is the whole bug:
+    // `sync_root_cells` never overwrites an existing cell, so it cannot repair one.
+    catalog.reseed_root_cells();
     catalog.persist()
+}
+
+/// Open the catalog for a database, recovering it first if the WAL says it needs it.
+///
+/// **The single bootstrap, because there used to be two and they disagreed.** `src/cli/cli.rs`
+/// ran `recover` → `Catalog::open` → `rebuild_indexes` → `checkpoint`; `examples/pgserver.rs` —
+/// the shipped server, and the path every pgwire measurement is taken on — ran `recover` and
+/// **discarded its return value**, so it never rebuilt an index. Index structure is not WAL-logged
+/// at all (see `rebuild_indexes`: the heap is authoritative after redo/undo and every tree is
+/// reconstructed here), so on that path a crash left the trees in whatever partially-flushed state
+/// the crash produced, against a heap the redo pass had moved on. `rebuild_indexes` was never
+/// present in `pgserver.rs` — it is an omission from the wire-protocol commit that introduced it,
+/// not a removal — and `tests/sim_durability.rs` models the *cli* sequence by name, so no test
+/// covered the server's actual bootstrap.
+///
+/// Taking the sequence away from both callers is the point: a second copy is how they diverged.
+pub fn open_recovered(
+    bp: &Arc<BufferPoolManager>,
+    txn: &TxnManager,
+    existed: bool,
+    first_catalog_page_id: u32,
+) -> Result<Catalog, FerroError> {
+    // Before `Catalog::open`: redo/undo repairs the heap that `rebuild_indexes` then reads.
+    let recovered = recover(txn)?;
+    let mut catalog = if existed {
+        Catalog::open(Arc::clone(bp), first_catalog_page_id)?
+    } else {
+        Catalog::create(Arc::clone(bp))?
+    };
+    if recovered {
+        rebuild_indexes(&mut catalog, bp)?;
+        // The rebuilt trees and the catalog page are on disk now, so the log that produced them
+        // has nothing left to say. Without this the next open replays the same records and rebuilds
+        // every tree again.
+        txn.checkpoint()?;
+    }
+    Ok(catalog)
 }
 
 #[cfg(test)]
@@ -403,5 +451,85 @@ use super::*;
         let entry = catalog.get_table("t").unwrap();
         let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
         assert!(tree.search(&Value::Integer(1)).unwrap().is_some());
+    }
+
+    /// A crash rebuild must leave the SHARED root cells pointing at the trees it just built.
+    ///
+    /// `rebuild_indexes` frees every index tree and writes a fresh root into the `TableEntry`. The
+    /// shared cells (D53, `Catalog::roots`) were seeded by `Catalog::open` from the **pre-crash**
+    /// roots, and `sync_root_cells` cannot repair them — it creates missing cells and never
+    /// overwrites an existing one. Without `Catalog::reseed_root_cells` the rebuild is therefore
+    /// correct on disk and invisible to every statement after it, because `plan::open_table` and
+    /// the point-lookup path in `optimizer.rs` both prefer the cell to the record.
+    ///
+    /// **Why the test above does not catch this**, which is the reason this one exists:
+    /// `sql_crash_recover_rebuild_query` asserts through `entry.primary_index_root` — the record,
+    /// not the cell — and its `SELECT name FROM t;` is an unqualified scan that reads the heap. Both
+    /// halves sit above the cell and cannot see it hold a freed page.
+    ///
+    /// **TWO tables and 400 rows each, not one small table**, and that is load-bearing: `free_tree`
+    /// returns the old pages to the allocator and `create` can hand the very same page straight
+    /// back, so a single-page tree can rebuild to an identical root id and hide the defect. A
+    /// multi-level tree's final root is a page allocated late in the refill, and the second table
+    /// starts from an allocator the first has already churned.
+    #[test]
+    fn crash_rebuild_reseeds_the_shared_root_cells() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let exec = |sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>| -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
+            let mut session = Session::new();
+            run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut session).unwrap()
+        };
+
+        const ROWS: i64 = 400;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            let mut catalog = Catalog::create(bp.clone()).unwrap();
+            for t in ["t", "u"] {
+                exec(&format!("CREATE TABLE {t} (id INTEGER NOT NULL, name VARCHAR(16));"), &mut catalog, &bp, &txn);
+                for i in 0..ROWS {
+                    exec(&format!("INSERT INTO {t} VALUES ({i}, 'r{i}');"), &mut catalog, &bp, &txn);
+                }
+            }
+            // No checkpoint and no clean close: the WAL still holds records, so the reopen below
+            // takes the recovery path rather than trusting the catalog page.
+        }
+
+        let (bp, _wal, txn) = setup(dir.path());
+        let mut catalog = open_recovered(&bp, &txn, true, 1).unwrap(); // FIRST_CATALOG_PAGE_ID
+
+        // The structural law, and the one that fails first: the two places a root is written down
+        // must name the same page. Read from the system on both sides — neither number is written
+        // into this test.
+        for t in ["t", "u"] {
+            let record = catalog.get_table(t).unwrap().primary_index_root;
+            let cell = catalog
+                .root_cell(t, None)
+                .expect("Catalog::open seeds a cell for every table it loads")
+                .load(Ordering::SeqCst);
+            assert_eq!(
+                cell, record,
+                "table '{t}': the shared root cell still names page {cell}, the tree \
+                 `rebuild_indexes` freed; the rebuilt tree is at page {record}"
+            );
+        }
+
+        // The user-visible consequence: an indexed point lookup is the path that reads the cell.
+        for t in ["t", "u"] {
+            let probe = ROWS - 1;
+            match exec(&format!("SELECT name FROM {t} WHERE id = {probe};"), &mut catalog, &bp, &txn) {
+                Outcome::Rows(rows) => assert_eq!(
+                    rows.len(), 1,
+                    "table '{t}': point lookup of id={probe} after crash recovery"
+                ),
+                _ => panic!("table '{t}': expected rows"),
+            }
+        }
     }
 }

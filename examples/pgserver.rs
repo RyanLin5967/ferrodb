@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::TableBranchCatalog;
@@ -22,7 +21,7 @@ use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
+use ferrodb::wal::recovery::open_recovered;
 use ferrodb::wal::txn::TxnManager;
 
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
@@ -63,12 +62,10 @@ fn main() {
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
-    recover(&txn).unwrap();
-    let catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
-    } else {
-        Catalog::create(bp.clone()).unwrap()
-    };
+    // The SAME bootstrap the CLI uses. This used to be `recover(&txn).unwrap();` with the return
+    // value dropped, so the shipped server recovered the heap and never rebuilt an index — see
+    // `open_recovered`.
+    let catalog = open_recovered(&bp, &txn, existed, FIRST_CATALOG_PAGE_ID).unwrap();
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
     // Readiness, not a guess: the test reads this line rather than sleeping.
