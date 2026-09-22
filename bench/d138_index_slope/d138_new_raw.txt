@@ -1,0 +1,90 @@
+### provenance of this run
+worktree: /Users/idide/wt/ferrodb-d138-effectlog-index
+branch:   d138-measure-new
+head:     7087f74 D138 measurement arm NEW: the same instrument over the INDEXED code
+code under test: dfe2c70, INDEXED (D138)
+instrument: d129 harness + scan_count, v2 -- byte-identical to the OLD arm
+dirty:    2 file(s)
+started:  2026-09-22T12:28:03Z
+host load: 3.54 5.13 6.00
+suite lock: NOT taken -- COUNT harness; scan lengths do not move with machine load.
+
+D129 — scanned elements per effect-log append, bucketed HIT / MISS.
+at dfe2c706f872 +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+Driven over a real TCP socket against `pgwire::serve` in this process.
+⛔ COUNTS ONLY. No timing is reported and none was taken — SCALE-DESIGN.md D129.
+
+=== FIRE-CHECK — force the counter to fire, and separate the buckets ===
+
+  (0) INSTRUMENT LIVE — a site that still scans linearly, in this same binary
+      frames_for over 64 frames: calls 1 scanned 64 returned 64  (want 1 / 64 / 64)  => PASS
+      ⇒ a zero at any OTHER site below is that site's, not this counter's.
+
+  (1) MISS-ONLY  — 200 sessions x 1 write
+    MemEffectLog::append       calls     200  (      0 hit /     200 miss)   scanned/hit          -  scanned/miss        0.0
+    classify_append            calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frame()                    calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frames_for() [no prod caller] calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+      log length after: 200 frames
+      => PASS : miss_calls 200 (want >= 200, one per new key)
+
+  (2) HIT-HEAVY  — 1 session x 200 writes
+    MemEffectLog::append       calls     200  (    199 hit /       1 miss)   scanned/hit        0.0  scanned/miss        0.0
+    classify_append            calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frame()                    calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frames_for() [no prod caller] calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+      => PASS : hit_calls 199 vs miss_calls 1 (want hits dominant)
+
+  (1)v(2) SEPARATION: misses/session 1.00 (n sessions) vs 1.00 (1 session)  => PASS
+      the buckets are not one number: arm(1) 200 miss / 0 hit, arm(2) 1 miss / 199 hit
+
+  (3) NO AGENT SESSION — 200 plain UPDATEs on trunk
+    MemEffectLog::append       calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    classify_append            calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frame()                    calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frames_for() [no prod caller] calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+      => PASS : append calls 0 (want 0 — a non-agent write appends no frame)
+
+Axis: 8 blocks of 250 sessions, 3 writes per session.
+
+=== AXIS: PARK — sessions begin, write, and never end (live branches) ===
+     sessions   log_len     hits   misses     scan/hit    scan/miss   shadow/hit  shadow/miss      scanned
+            0       250      500      250        0.0        0.0      125.5      124.5            0
+          250       500      500      250        0.0        0.0      375.5      374.5            0
+          500       750      500      250        0.0        0.0      625.5      624.5            0
+          750      1000      500      250        0.0        0.0      875.5      874.5            0
+         1000      1250      500      250        0.0        0.0     1125.5     1124.5            0
+         1250      1500      500      250        0.0        0.0     1375.5     1374.5            0
+         1500      1750      500      250        0.0        0.0     1625.5     1624.5            0
+         1750      2000      500      250        0.0        0.0     1875.5     1874.5            0
+    final log length: 2000 frames, never pruned
+    growth over the axis: scan/hit 0.0 -> 0.0 (0.0x),  scan/miss 0.0 -> 0.0 (0.0x)
+    shadow growth (the scan D138 REMOVED, still measured): scan/hit 125.5 -> 1875.5, scan/miss 124.5 -> 1874.5 over 6000 calls
+    index-vs-scan disagreements over this axis: 0  => PASS (the index answered what the log holds, every time)
+
+=== AXIS: CHURN — every session MERGEs, so every branch is FINISHED ===
+     sessions   log_len     hits   misses     scan/hit    scan/miss   shadow/hit  shadow/miss      scanned
+            0       250      500      250        0.0        0.0      125.5      124.5            0
+⛔ session 495 failed: provenance error: page provenance dictionary full (255 entries); refusing to widen the per-version slot
+=== ADDENDUM: DurableEffectLog — the store `src/cli/cli.rs` ships (NOT pgwire's) ===
+    1000 frames, each a distinct (branch, txn_id), appended then replayed at open.
+  APPEND phase — 1000 appends of distinct keys
+    MemEffectLog::append       calls    1000  (      0 hit /    1000 miss)   scanned/hit          -  scanned/miss        0.0
+    classify_append            calls    1000  (      0 hit /    1000 miss)   scanned/hit          -  scanned/miss        0.0
+    frame()                    calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frames_for() [no prod caller] calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+      appends 1000 -> counted calls: 1000 on append + 1000 on classify_append = 2000 scans for 1000 logical appends
+      total elements walked in this phase: 0
+  REPLAY at open — reading a file of 1000 frames back
+    MemEffectLog::append       calls    1000  (      0 hit /    1000 miss)   scanned/hit          -  scanned/miss        0.0
+    classify_append            calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frame()                    calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+    frames_for() [no prod caller] calls       0  (      0 hit /       0 miss)   scanned/hit          -  scanned/miss          -
+      frames recovered: 1000
+      elements walked to open a 1000-frame file: 0
+      K(K-1)/2 for K=1000 is 499500 — the shape a per-record scan would give
+⛔ the durable addendum did not replay what it wrote, or counted nothing.
+
+
+### harness exit code: 1
+### finished: 2026-09-22T12:29:40Z
