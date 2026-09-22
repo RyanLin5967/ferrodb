@@ -16,7 +16,15 @@ BIN=./target/release/examples/w4_standdown_count
 [ -x "$BIN" ] || { echo "no $BIN -- build with --features w4-standdown-count" >&2; exit 1; }
 mkdir -p "$OUT"
 rc=0
-for arm in readonly agent agent_dml merge ddl; do
+# The binary is re-checked before EVERY arm, not once at the top. In the first full pass another
+# process on this box reclaimed disk by deleting this worktree's entire `target/` directory
+# midway through, and the three remaining arms then failed one by one with a message from
+# `timeout` rather than from anything that knew what the run was for.
+for arm in ${W4_RUN_ARMS:-readonly agent agent_dml merge ddl}; do
+    [ -x "$BIN" ] || {
+        echo "REFUSED: $BIN vanished before arm $arm -- another process removed target/" >&2
+        exit 1
+    }
     echo "== arm $arm =="
     W4_CLIENTS=8 W4_ROUNDS=400 W4_ARMS="$arm" \
         timeout 900 "$BIN" > "$OUT/arm_$arm.txt" 2> "$OUT/arm_$arm.err" || {

@@ -367,6 +367,28 @@ impl Proto {
 
 const PROTOS: [Proto; 3] = [Proto::Simple, Proto::Extended, Proto::ExtendedReparse];
 
+/// Which protocol rows to run. `W4_PROTOS=extended` restricts a sweep to the row that answers the
+/// question — real drivers cache prepared statements — instead of paying 3x for rows whose
+/// mechanism section 5 of the artifact has already settled.
+fn protos() -> Vec<Proto> {
+    match std::env::var("W4_PROTOS") {
+        Err(_) => PROTOS.to_vec(),
+        Ok(v) => {
+            let want: Vec<&str> = v.split(',').map(|s| s.trim()).collect();
+            let chosen: Vec<Proto> =
+                PROTOS.iter().copied().filter(|p| want.contains(&p.label())).collect();
+            if chosen.is_empty() {
+                eprintln!(
+                    "REFUSED: W4_PROTOS={v:?} selects no known protocol. A run that collected \
+                     nothing has not passed."
+                );
+                std::process::exit(8);
+            }
+            chosen
+        }
+    }
+}
+
 /// How an arm splits `clients` threads between roles. The reader half is what a stand-down
 /// actually costs under W4; the rest is the announcer population.
 fn roles(arm: &str, clients: usize) -> Vec<Role> {
@@ -742,7 +764,7 @@ fn main() {
 
     let mut results = Vec::new();
     for arm in &arms {
-        for proto in PROTOS {
+        for proto in protos() {
             let r = run_arm(arm, proto, clients, rounds_for(arm, rounds), lease_ms, dir.path());
 
             if r.counts.attempts() == 0 {
