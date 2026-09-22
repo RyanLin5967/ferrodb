@@ -53,13 +53,13 @@ PROP = [
     ("Clr / recursive redo", "src/wal/log.rs",
      '                redo.serialize(buffer)?;\n'),
     ("provenance / agent_id", "src/provenance/durable.rs",
-     '        write_str(&mut body, &run.agent_id, "an agent id")?;\n'),
+     '        write_str(&mut tail, &run.agent_id, "an agent id")?;\n'),
     ("provenance / run_id", "src/provenance/durable.rs",
-     '        write_str(&mut body, &run.run_id, "a run id")?;\n'),
+     '        write_str(&mut tail, &run.run_id, "a run id")?;\n'),
     ("provenance / model", "src/provenance/durable.rs",
-     '        write_str(&mut body, &run.model, "a model name")?;\n'),
+     '        write_str(&mut tail, &run.model, "a model name")?;\n'),
     ("provenance / model_version", "src/provenance/durable.rs",
-     '        write_str(&mut body, &run.model_version, "a model version")?;\n'),
+     '        write_str(&mut tail, &run.model_version, "a model version")?;\n'),
 ]
 for label, f, call in PROP:
     indent = call[: len(call) - len(call.lstrip())]

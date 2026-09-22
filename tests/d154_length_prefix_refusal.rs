@@ -196,3 +196,82 @@ fn the_largest_value_each_prefix_can_express_still_encodes() {
 
     assert!(encoded_at_least_one, "the table was empty, so this test asserted nothing");
 }
+
+// ---- the four sites the sweep found UNCOVERED ------------------------------------------------
+//
+// bench/d154_firecheck.txt's first run: 13 killed, 4 SURVIVED, and the survivors were exactly
+// `provenance::durable`'s four `write_str` calls. The guard was fine; the INSTRUMENT could not
+// reach them, because everything above drives `RecKind::serialize` and these live behind
+// `DurableProvenanceStore::intern`. A sweep scoped to what it already covers returns a clean sheet
+// that means nothing, so the sweep kept them as survivors and this closes them.
+
+use ferrodb::provenance::{DurableProvenanceStore, ProvenanceStore};
+
+fn store_at(dir: &std::path::Path) -> DurableProvenanceStore {
+    DurableProvenanceStore::open(dir.join("p.prov")).expect("a fresh store must open")
+}
+
+fn entity(agent: &str, run_id: &str, model: &str, version: &str) -> RunEntity {
+    RunEntity::new(
+        ProvId(1),
+        agent,
+        run_id,
+        model,
+        version,
+        [0u8; 32],
+        1_700_000_000_000,
+        BranchId::new(4, 0),
+    )
+}
+
+/// Each of the durable provenance store's four `write_str` sites refuses what it cannot encode —
+/// **and a refused run does not linger in the store's own view of itself.**
+///
+/// The second half is the law, not decoration. `intern` interns into memory and *then* encodes, so
+/// a refusal returns early with the run already in `self.mem` but never in the file. It would be
+/// reported by `run_count`/`runs` and would vanish on the next `open`: the store answering for a
+/// run that is not durable.
+#[test]
+fn the_durable_provenance_store_refuses_a_run_it_cannot_encode() {
+    let long = "x".repeat(TOO_LONG);
+    let cases = [
+        ("agent_id", entity(&long, "r", "m", "v")),
+        ("run_id", entity("a", &long, "m", "v")),
+        ("model", entity("a", "r", &long, "v")),
+        ("model_version", entity("a", "r", "m", &long)),
+    ];
+
+    for (field, run) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(dir.path());
+        let before = store.run_count();
+
+        match store.intern(&run) {
+            Err(FerroError::Unrepresentable { len, limit, .. }) => {
+                assert_eq!(len, TOO_LONG, "{field}: wrong length in the refusal");
+                assert_eq!(limit, MAXIMAL, "{field}: wrong limit in the refusal");
+            }
+            Err(other) => panic!("{field}: expected Unrepresentable, got {other:?}"),
+            Ok(_) => panic!(
+                "{field}: DID NOT FIRE — a {TOO_LONG}-byte value was written behind a u16 prefix \
+                 into a durable provenance record"
+            ),
+        }
+
+        assert_eq!(
+            store.run_count(),
+            before,
+            "{field}: the run was REFUSED but is still in the store's in-memory view. It is not in \
+             the file, so `runs()` reports a run that disappears on the next open"
+        );
+    }
+
+    // Anti-vacuity: an ordinary run still interns, and at the exact limit too.
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_at(dir.path());
+    store.intern(&entity("agent", "run", "model", "v1")).expect("an ordinary run must intern");
+    store
+        .intern(&entity(&"y".repeat(MAXIMAL), "run2", "model", "v1"))
+        .expect("an agent id AT the limit must intern, or the guard refuses what it can express");
+    assert_eq!(store.run_count(), 2, "both runs must be in the store");
+}
