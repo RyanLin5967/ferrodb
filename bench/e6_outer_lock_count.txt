@@ -1,0 +1,320 @@
+E.6 -- DOES EVERY W-B SCALING NUMBER MEASURE A LAYER PRODUCTION NEVER REACHES UNMEDIATED?
+=========================================================================================
+
+Base commit: ee24331
+branch:      E6-outer-lock-count   (created as E6-outer-lock-count-2 and renamed after
+             certification; a rename moves no sha, so the certification below still holds)
+head:        ed598e4 -- THE COMMIT THE TABLE BELOW WAS MEASURED AT. It carries the Cargo
+             feature, the counter in `ServerContext::catalog()` and the harness. This file is
+             committed on top of it and changes nothing the harness runs.
+Question:    count acquisitions of `ServerContext::catalog()` during a concurrent-fork workload
+             driven THROUGH PGWIRE, against the same workload driven DIRECTLY.
+Instrument:  a process-global AtomicU64 incremented inside `ServerContext::catalog()` itself,
+             compiled in only under `--features lock_census` (off by default), read as a delta
+             per arm. `catalog_acquisitions()` returns Option<u64>; None means "not
+             instrumented", which is a different fact from zero, and the harness exits 1 on it.
+Kind:        A COUNT, NOT A TIMING. An integer is load-immune, so this run needed neither a
+             quiet box nor the fleet measure-lock. NO DURATION APPEARS ANYWHERE IN THIS FILE.
+
+
+PRE-REGISTERED OUTCOMES -- written before the first run, verbatim as handed down
+--------------------------------------------------------------------------------
+
+1. ARM A's acquisitions track the statement rate (~1 per fork, rising with T)
+   => the outer mutex mediates every production fork; ARM B measures a path production never
+   takes; every `logical` item is optimising underneath it. This is the expected result.
+
+2. ARM A's acquisitions do NOT track
+   => an exemption exists in code I did not read -- FIND IT AND NAME IT, because that would mean
+   E.6 is wrong and the W-B work is sound as scoped.
+
+3. ARM A cannot be built (no usable in-process pgwire client path)
+   => say so plainly and report what blocks it. Do NOT substitute a proxy for arm A and present
+   it as arm A.
+
+
+WHICH FIRED
+-----------
+OUTCOME 1, and not marginally.
+
+ARM A's acquisitions are EXACTLY LINEAR in T, with a constant per-fork cost at every thread
+count in the sweep:
+
+    A2 (one connection per fork):  24/8 = 96/32 = 384/128 = 1536/512 = 3.000 acquisitions/fork
+    A1 (persistent connection):    33/8 = 132/32 = 528/128 = 2112/512 = 4.125 acquisitions/fork
+
+Not "roughly one or more per fork, rising with T" -- three per fork, and the ratio column does
+not move by a thousandth from T=1 to T=64. ARM B took ZERO at every T, in the same process,
+against the same static, with a pgwire server built and listening beside it.
+
+EVERY ACQUISITION IS ATTRIBUTED. This is the part that makes the result checkable rather than
+merely plausible: the measured totals are not "consistent with" mediation, they are reproduced
+exactly by counting the three sites the pre-registration named, with nothing left over.
+
+  The three sites, confirmed in source (this tree, commit ed598e4):
+    (i)   src/pgwire/extended.rs:283  `Statement::parse_one` -- one acquisition to infer
+          parameter types and describe result columns. The SIMPLE query path reaches it too:
+          `run_simple` -> `Statement::parse_batch` -> `parse_one`.
+    (ii)  src/pgwire/mod.rs:257       inside `ServerContext::read_catalog`, refreshing a STALE
+          per-connection snapshot. Fires once per connection here and no more -- `ctx.epoch`
+          is the SQL catalog's epoch, which a branch fork does not move.
+    (iii) src/pgwire/extended.rs:357  the exclusive execute arm, taken when `try_run_read`
+          answers `None`. `BEGIN AGENT SESSION` and `ABANDON` are not reads, so it always does.
+
+  A2 -- one connection, one statement each:   (i) + (ii) + (iii) = 3 per fork.
+        T=1   8 conns x 3 =   24   measured   24
+        T=4  32 conns x 3 =   96   measured   96
+        T=16 128 conns x 3 =  384  measured  384
+        T=64 512 conns x 3 = 1536  measured 1536
+
+  A1 -- one connection per thread, 8 x (BEGIN + ABANDON) on it. Two statements per fork, each
+        paying (i) + (iii); (ii) is paid ONCE for the connection because the fork does not move
+        the SQL catalog epoch:  16 statements x 2 + 1 = 33 per connection.
+        T=1   1 x 33 =   33   measured   33
+        T=4   4 x 33 =  132   measured  132
+        T=16 16 x 33 =  528   measured  528
+        T=64 64 x 33 = 2112   measured 2112
+
+  Residual in all eight cells: zero.
+
+⚠ ONE CORRECTION TO THE HARNESS'S OWN PROSE, recorded here rather than left to ride.
+
+  The harness prints "A0 is the per-connection/per-statement FLOOR: acquisitions a client pays
+  for connecting and running a trivial statement". A0 measured 0 at every T, and the reason is
+  NOT the shared read path, which is what the arm table's "the statement is a read, so it may
+  take the shared read path instead" invites a reader to assume.
+
+  `SELECT 1` never reaches the engine at all. `Statement::parse_one` tries
+  `crate::pgwire::session::parse` FIRST and returns `Kind::Session` before the acquisition at
+  extended.rs:283; `session::parse` routes a leading SELECT to `parse_probe`, and
+  src/pgwire/session.rs:473-479 answers a bare integer literal as a liveness probe
+  ("`SELECT 1` -- the oldest connection-liveness check there is"). `Statement::execute` then
+  dispatches `Kind::Session(cmd)` to `run_session`, which does not touch the catalog either.
+
+  So A0=0 is a true and useful control for the ONE thing E.6 needs it for -- it proves that
+  opening 512 connections and completing a statement on each costs ZERO acquisitions, which is
+  why the whole of A2 is attributable to the fork statement and its parse. It is NOT a floor
+  for "a trivial statement that reaches the query engine": no such statement was run. A read
+  that does reach the engine pays (i) at parse even when `try_run_read` then serves it without
+  (iii). The conclusion is unaffected -- A2 - A0 = A2 either way -- but the label was wider
+  than the measurement, and the measurement is the smaller of the two.
+
+
+WHAT WAS ESTABLISHED FROM SOURCE BEFORE THE RUN (confirmed, not re-derived)
+---------------------------------------------------------------------------
+- src/pgwire/mod.rs, `serve`'s lock-ordering note: the catalog mutex is taken OUTERMOST, for the
+  duration of a single statement, and "Nothing beneath it ever takes it back".
+- `ServerContext::catalog()` is a real `Mutex::lock` (plus an unconditional reader drain).
+- examples/fork_concurrency.rs constructs a `TableBranchCatalog` directly (:26, :32) and calls
+  `cat.fork(BranchId::TRUNK, lease)` at :101. It holds no statement mutex and builds no
+  `ServerContext`.
+- The pgwire fork statement is `BEGIN AGENT SESSION AS '<agent>' RUN '<run>';`. It reaches
+  `TableBranchCatalog::fork` through `AgentRuntime::begin_session_as`
+  (src/agent_sql/runtime.rs, `self.branches.fork(parent, ...)`) -- the SAME `fork` arm B calls.
+- src/agent_sql/dispatch.rs refuses a second `BEGIN AGENT SESSION` on a connection that already
+  has one open, and `ABANDON` clears `session.agent`. That is why arm A1 alternates the two and
+  arm A2 uses one connection per fork.
+- Three distinct sites inside the pgwire path can take the counted lock for one statement:
+  `Statement::parse_one` (describe/param-infer), `ServerContext::read_catalog` (refreshing a
+  stale per-connection snapshot), and `Statement::execute`'s exclusive arm. The census counts
+  acquisitions, not statements, so a ratio below 1 fork per acquisition is expected and is
+  itself evidence of mediation, not against it.
+  [CONFIRMED BY THE RUN. All three fire, and they are the whole of both A arms -- see the
+   attribution above. The ratio came out at 0.333 for A2 and 0.242 for A1, both below 1.]
+
+
+ARMS -- LAYER AND PRODUCTION LOCKS (the standing requirement E.6 promoted to a gate)
+-------------------------------------------------------------------------------------
+A1  layer: the shipped pgwire server, real TCP socket, one client connection per thread,
+           forks issued as SQL (`BEGIN AGENT SESSION` / `ABANDON` per fork).
+    production locks at this layer: ServerContext::catalog() OUTERMOST, one per statement
+           -> AgentRuntime's Mutex<State> -> TableBranchCatalog's `logical`.
+A2  layer: the same server, one connection per fork, a single `BEGIN AGENT SESSION` on each.
+    production locks: identical to A1.
+A0  layer: the same server, same client shape as A2, `SELECT 1;` in place of the fork.
+    THE CONTROL. Establishes the per-connection/per-statement acquisition floor, so the fork
+    statement's own contribution is A2 - A0 rather than the whole of A2.
+    [SEE THE CORRECTION ABOVE for what this control does and does not establish.]
+B   layer: `TableBranchCatalog` directly, as examples/fork_concurrency.rs does today.
+    production locks at this layer: `logical` ONLY -- no statement mutex, because no shipped
+    front-end reaches `fork` this way. The configuration that does is an embedded
+    `AgentRuntime` caller, which is real and is what that harness actually models.
+
+Arms A build the branch catalog with `default_for_database` (the pgserver.rs shape); arm B uses
+`open_sidecar` (the fork_concurrency.rs shape). Same type, same `fork`. Stated rather than
+smoothed over, and not the difference the result turns on: arm B cannot reach the counted lock
+under either constructor.
+
+NO LeaseThread runs in any arm. In production the lease scan takes this same outermost mutex
+once per interval, so leaving it out makes every A count a LOWER BOUND on what production takes
+-- the safe direction for the claim under test.
+
+
+FORCING THE DETECTOR TO FIRE (a zero is not a result until the counter is shown to be live)
+---------------------------------------------------------------------------------------------
+1. A self-check asserts one explicit `ctx.catalog()` moves the census by exactly 1; the harness
+   exits 1 otherwise.  [FIRED AND PASSED -- first line of the table output below.]
+2. Arms A and B run in the SAME PROCESS against the SAME static. A's non-zero is the proof the
+   instrument was live at the moment B read zero.  [A1+A2 = 4845 against B's 0.]
+3. A pgwire server is built and listening while arm B runs. B reads zero because nothing
+   connects to it, not because there is nothing to count.
+4. The fork total is cross-checked against the branch identities the SERVER reported (arm A) and
+   the distinct branch ids the catalog minted (arm B); a disagreement with the loop counter
+   exits 1. No arm's headline number comes from this harness's own bookkeeping alone.
+   [The server-side witness is the `branch_name` column of `session_started_columns()`
+    (src/agent_sql/dispatch.rs), formatted `b_{id}` at src/agent_sql/runtime.rs:1541. It is a
+    sound witness in this rig because ids are not recycled here: `AgentRuntime::with_storage`
+    builds with `reaper: None`, and the reaper-less `seal` sets state to `Reaped` without
+    calling `release_id`, so no FREE_ID slot is ever published for `fork` to recycle. Had ids
+    recycled, the cross-check would have REFUSED rather than under-counted.]
+
+
+TABLE
+-----
+E.6 -- acquisitions of ServerContext::catalog() during a concurrent-fork workload,
+driven THROUGH PGWIRE against the same workload driven DIRECTLY.
+Recorded 2026-09-21T23:21:34-0400. Counts only; this file quotes no durations, and an integer count is
+load-immune, so this run did not need a quiet box or the fleet measure-lock.
+
+LAYERS AND THEIR PRODUCTION LOCKS
+  A1/A2/A0  the shipped pgwire server over a real TCP socket, forks issued as SQL.
+            Production locks: ServerContext::catalog() OUTERMOST, one per statement,
+            then AgentRuntime's Mutex<State>, then TableBranchCatalog's `logical`.
+  B         TableBranchCatalog directly, as examples/fork_concurrency.rs does
+            (:26, :32, :101). Production locks at this layer: `logical` ONLY --
+            no statement mutex, because no shipped front-end reaches fork this way.
+
+forks/thread F = 8. Total forks = F x T, so the totals RISE with T and the
+acquisition column can be read against the statement rate directly.
+
+instrument self-check: one explicit ctx.catalog() moved the census by exactly 1. OK
+
+  arm                          T   forks   acquisitions   forks/acquisition
+  A1 pgwire, persistent conn   1       8             33               0.242
+  A1 pgwire, persistent conn   4      32            132               0.242
+  A1 pgwire, persistent conn  16     128            528               0.242
+  A1 pgwire, persistent conn  64     512           2112               0.242
+  A2 pgwire, conn per fork     1       8             24               0.333
+  A2 pgwire, conn per fork     4      32             96               0.333
+  A2 pgwire, conn per fork    16     128            384               0.333
+  A2 pgwire, conn per fork    64     512           1536               0.333
+  A0 CONTROL, SELECT 1         1   --                 0                  --
+  A0 CONTROL, SELECT 1         4   --                 0                  --
+  A0 CONTROL, SELECT 1        16   --                 0                  --
+  A0 CONTROL, SELECT 1        64   --                 0                  --
+  B  direct, no ServerContext   1       8              0   n/a (no acquisitions)
+  B  direct, no ServerContext   4      32              0   n/a (no acquisitions)
+  B  direct, no ServerContext  16     128              0   n/a (no acquisitions)
+  B  direct, no ServerContext  64     512              0   n/a (no acquisitions)
+
+READING IT
+  A0 is the per-connection/per-statement FLOOR: acquisitions a client pays for
+  connecting and running a trivial statement, with no fork in it at all. A2 minus
+  A0 at the same T is what the fork statement itself costs in acquisitions.
+    T=  1: A2 24 - A0 0 = 24 acquisitions attributable to the fork statement, over 8 forks
+    T=  4: A2 96 - A0 0 = 96 acquisitions attributable to the fork statement, over 32 forks
+    T= 16: A2 384 - A0 0 = 384 acquisitions attributable to the fork statement, over 128 forks
+    T= 64: A2 1536 - A0 0 = 1536 acquisitions attributable to the fork statement, over 512 forks
+
+  arm B took 0 acquisitions in total across every T, while arms A1+A2 took
+  4845 in the SAME PROCESS against the SAME counter. That pairing is what makes
+  B's zero a measurement rather than a silent instrument.
+
+[end of harness stdout, verbatim. The cargo `Compiling`/`Finished`/`Running` lines that preceded
+ it on the terminal are omitted on purpose: they carry a build duration, and no duration belongs
+ in this file. Command:
+   cargo run --release --features lock_census --example e6_outer_lock_count
+ run from /Users/idide/wt/ferrodb-E6-outer-lock-count-2 at commit ed598e4, F=8 and T=1,4,16,64
+ left at their defaults. Exit status 0.]
+
+
+SUITE
+-----
+
+PROVENANCE OF THE 2449 BASELINE -- raised as UNBACKED, and it is in fact BACKED. Recorded here
+because the next reader will grep this file for why the number is trusted, and because the
+negative that raised the doubt was correct on its own terms and should not be read as sloppy.
+
+  THE DOUBT, as raised: `passed=2449` appeared in no file in the ferrodb working tree, and
+  `ee24331` appeared in no file either; the highest recorded count among the eleven
+  `bench/<row>_certified/` directories was `passed=2139 head=91270f9` in `bench/d60_certified/`.
+  That search was of a working tree and explicitly did not cover git history.
+
+  WHY IT CAME BACK EMPTY, AND WHY THAT IS NOT A CONTRADICTION. The evidence was banked at
+  commit 8b18fa2, `bank the 2449 certification evidence: it lived only in a volatile VERIFY_OUT
+  dir`, which adds `bench/land22_certified/{SUMMARY.txt,suite-land22-52e1137.log,.go.log}`.
+  8b18fa2 is on `main` but is NOT AN ANCESTOR OF ee24331 -- it landed after this row's base. So
+  a search of the tree at or below ee24331 structurally could not see it, and the scope limit
+  the negative stated for itself is exactly the gap the result fell through. `git log --all
+  --oneline -S2449` finds it; `git grep 2449 ee24331 -- bench tools` does not, and both are
+  right.
+
+  WHAT IT SAYS, verbatim from bench/land22_certified/SUMMARY.txt at 8b18fa2:
+    land22-52e1137: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=52e1137
+    land22-52e1137: go rc=0 passed=97 failed=0
+
+  THAT GREEN NAMES 52e1137, NOT ee24331, and its own text says so, adding that every later push
+  is bench-only and code-identical -- then instructs the reader to re-run the diff rather than
+  trust the sentence. Re-run here, not trusted:
+    git diff --stat 52e1137..ee24331 -- src examples tests tools Cargo.toml Cargo.lock cdc-consumer
+    -> EMPTY. ee24331 is code-identical to the commit the 2449 certifies.
+    git diff --stat 52e1137..ed598e4 -- <same paths>
+    -> exactly Cargo.toml (+7), examples/e6_outer_lock_count.rs (+636), src/pgwire/mod.rs (+41).
+       Nothing else in the code differs between the certified baseline and this row's head.
+
+  SO THE BASELINE IS CORROBORATED TWICE, BY TWO INDEPENDENT RUNS ON DIFFERENT COMMITS: 2449 at
+  52e1137 (banked) and 2449 at ed598e4 (below), with the Go suite at 97 in both. No second
+  baseline run was needed and none was made. The d60_certified 2139 is a real earlier
+  calibration point and is not in conflict -- it is an older head (91270f9), and the suite has
+  grown since.
+
+Baseline at ee24331: rc=0 passed=2449 failed=0
+This tree, DEFAULT FEATURES (lock_census off -- default features are what ships):
+  rc=0 passed=2449 failed=0 build_errors=0     -- IDENTICAL TO THE BASELINE COUNT.
+  Go suite (cdc-consumer): rc=0 passed=97 failed=0
+
+  Exact command, run from /Users/idide/wt/ferrodb-E6-outer-lock-count-2:
+    VERIFY_OUT=/Users/idide/wt/logs/e6-verify VERIFY_MODE=per-target \
+      ./tools/verify-suite.sh E6-ed598e4
+
+  Verbatim summary, as persisted to /Users/idide/wt/logs/e6-verify/SUMMARY.txt:
+    E6-ed598e4: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=ed598e4 log=/Users/idide/wt/logs/e6-verify/suite-E6-ed598e4.log
+    E6-ed598e4: go rc=0 passed=97 failed=0 log=/Users/idide/wt/logs/e6-verify/suite-E6-ed598e4.go.log
+
+  Certified:
+    ./tools/certify-head.sh /Users/idide/wt/logs/e6-verify ed598e4
+    certify-head: OK -- suite head=ed598e4 == landing ed598e4
+
+  EVIDENCE BANKED IN THE REPO, for the same reason 8b18fa2 banked land22's: a $VERIFY_OUT dir
+  is volatile and the next suite overwrites it. See `bench/e6_outer_lock_count_certified/`,
+  holding SUMMARY.txt and both raw logs.
+
+  Staleness, run before quoting the count (this row edits src/pgwire/mod.rs, which every
+  example links against, and this repo has had a stale-artifact run fail 53 tests):
+    ./tools/staleness.sh /Users/idide/wt/ferrodb-E6-outer-lock-count-2
+    -> "0 behind, 259 ahead"  COVERED  (rc=0)
+  verify-suite.sh also rebuilds examples itself before measuring and refuses if that build
+  fails, so the rebuild is part of the measurement rather than something the caller remembered.
+
+  WHICH COMMIT THAT GREEN CERTIFIES, stated rather than implied. ed598e4 is the commit carrying
+  the Cargo feature, the counter in `ServerContext::catalog()` and the harness -- everything the
+  suite can compile or execute. This file is committed on top of it and is inert text: nothing
+  under tests/ enumerates bench/, and the one test that reads the directory
+  (`integration_readme_commands.rs`) opens a single named file, `bench/branch_scaling.txt`. So
+  the green is not re-run for a text-only delta, per certify-head.sh's own note that a
+  comment-only delta is refused rather than waved through -- the honest form is to say which
+  commit the suite named, which is what this block does.
+
+  ALSO RECORDED, because it happened and a reader should not have to discover it: this file was
+  briefly written into bench/ while the suite was still running and was moved back out. The
+  suite's own tree-moved guard compares HEAD and the dirty-file count before and after; both
+  read clean at the end (dirty=0, head unchanged), and no target reads bench/ as a directory.
+  Neither the tracked tree nor any compiled artifact differed at any point during the run.
+
+  MACHINE STATE, for a reader deciding how much to trust this. The box was NOT quiet -- it never
+  is here. That is why E.6 was specified as a COUNT: the fleet cannot change how many times a
+  lock was taken. `bench/d98_outer_runtime_lock.txt` settled the same point for the same lock
+  ("Integers. Fleet load does not change how many times a lock was taken. THE CLAIM RESTS ON
+  THESE"), so this run deliberately did not take `~/wt/logs/measure-lock.sh`. For the record, a
+  measurer (d81-fsm) acquired that lock at 2026-09-22T03:23:47Z, after the counts above had
+  already been collected.

@@ -1,0 +1,40 @@
+# CERTIFICATION EVIDENCE — E.6, banked 2026-09-22
+
+Banked for the same reason 8b18fa2 banked land22's: a $VERIFY_OUT directory is volatile and the
+next suite overwrites it. A verdict that exists only there is not evidence.
+
+## The harness's own SUMMARY.txt lines, verbatim
+```
+E6-ed598e4: mode=per-target rc=0 passed=2449 failed=0 build_errors=0 head=ed598e4 log=/Users/idide/wt/logs/e6-verify/suite-E6-ed598e4.log
+E6-ed598e4: go rc=0 passed=97 failed=0 log=/Users/idide/wt/logs/e6-verify/suite-E6-ed598e4.go.log
+```
+
+## What this certifies
+head=ed598e4, on branch E6-outer-lock-count (created as E6-outer-lock-count-2 and renamed
+after certification; a rename moves no sha). That commit carries the whole of E.6's code:
+the off-by-default `lock_census` Cargo feature, the cfg-gated counter and accessor in
+`src/pgwire/mod.rs`, and `examples/e6_outer_lock_count.rs`. Run with DEFAULT FEATURES —
+`lock_census` OFF — because default features are what ships.
+
+    VERIFY_OUT=/Users/idide/wt/logs/e6-verify VERIFY_MODE=per-target \
+      ./tools/verify-suite.sh E6-ed598e4
+
+`tools/certify-head.sh /Users/idide/wt/logs/e6-verify ed598e4` returned
+`OK — suite head=ed598e4 == landing ed598e4`. `tools/staleness.sh` returned COVERED.
+Not pushed and not merged.
+
+⚠ The bench artifact `bench/e6_outer_lock_count.txt` and this directory are committed ON TOP
+of ed598e4 and are inert text. Nothing under tests/ enumerates bench/; the one test that reads
+the directory (`integration_readme_commands.rs`) opens a single named file,
+`bench/branch_scaling.txt`. Re-run that check rather than trusting this sentence.
+
+## Relation to the 2449 baseline
+This run independently reproduces the count banked at 8b18fa2 for head=52e1137
+(`bench/land22_certified/SUMMARY.txt`: rc=0 passed=2449 failed=0, go passed=97).
+`git diff 52e1137..ee24331 -- src examples tests tools Cargo.toml Cargo.lock cdc-consumer` is
+empty, so that green covers this row's base as code; the only code difference between it and
+ed598e4 is E.6's own three files. Two runs, two commits, same 2449 and same Go 97.
+
+## Provenance of the log files
+- suite-E6-ed598e4.log     263728 bytes  sha256=b09d5fc09dc44c42cf5b4c46ebd162ec15983cd484dc5a646850e3dbde736ccf
+- suite-E6-ed598e4.go.log   17285 bytes  sha256=f5354337240b1731b6697ecf028fef636b0cb3e83f5206e2955dc459886cc3d7
