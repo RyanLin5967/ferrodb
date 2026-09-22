@@ -90,8 +90,15 @@ use ferrodb::wal::txn::TxnManager;
 /// Rows in the table. NOT the axis — held small and fixed on purpose, because the table-size
 /// question is D68/D69's and it is closed.
 const ROWS: i64 = 2000;
-/// Changed cells per merge on the OPS axis. THIS IS WHAT THE PRE-REGISTRATION HOLDS FIXED.
-const DELTA: i64 = 4;
+/// Changed cells per merge on the OPS axis. THIS IS WHAT THE PRE-REGISTRATION HOLDS FIXED — at 4,
+/// the value D86's harness used. `D114_DELTA` overrides it so the ops axis can be re-walked at a
+/// LARGE fixed delta, which is the decisive control: the scan costs `delta x ops`, so if it is
+/// ever the merge's cost it is there, at the biggest delta and the biggest op count together.
+static DELTA_V: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    std::env::var("D114_DELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+});
+#[allow(non_snake_case)]
+fn DELTA() -> i64 { *DELTA_V }
 
 /// The row ids carrying the delta, for a delta of `d`. Spread so no two land in one page slot by
 /// accident; which rows they are does not matter, only that the set is the same at every point.
@@ -195,7 +202,14 @@ struct Cycle {
 fn one_cycle(s: &Server, seq: u64, target_ops: i64, delta: i64, arm: Arm) -> Option<Cycle> {
     let ids = delta_ids(delta);
     let mut sess = Session::new();
-    if exec(s, &format!("BEGIN AGENT SESSION AS 'a{seq}';"), &mut sess).is_err() {
+    // ⛔ ONE agent name for every cycle, not `a{seq}`. The provenance slot is declared per branch
+    // and REFUSES to be redeclared under a different agent name: `a1` on the slot `a0` declared
+    // errors with "provenance slot prov1 is already declared as agent=a0". A per-cycle name made
+    // every merge after the first fail, and because the harness only counted merges that applied,
+    // it printed n=1 rather than an error — a broken instrument wearing a result's clothes. D68's
+    // harness reuses `a{tid}` for exactly this reason.
+    if let Err(e) = exec(s, "BEGIN AGENT SESSION AS 'a0';", &mut sess) {
+        if std::env::var("D114_DEBUG").is_ok() { eprintln!("  [seq {seq}] BEGIN failed: {e}"); }
         return None;
     }
 
@@ -208,7 +222,10 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, delta: i64, arm: Arm) -> Opt
             let rounds = (target_ops / delta).max(1);
             for r in 0..rounds {
                 for (k, id) in ids.iter().enumerate() {
-                    let v = 1_000_000 + r * 16 + k as i64;
+                    // ⚠ MUST depend on `seq`. Without it cycle 2 writes the values cycle 1 already
+                    // published, the changed-column loop skips every cell, the delta is ZERO and
+                    // the merge applies nothing — a second way to get n=1 that looks like the first.
+                    let v = 1_000_000 + seq as i64 * 4096 + r * 16 + k as i64;
                     if exec(s, &format!("UPDATE t SET v = {v} WHERE id = {id};"), &mut sess).is_err() {
                         return None;
                     }
@@ -258,8 +275,15 @@ fn one_cycle(s: &Server, seq: u64, target_ops: i64, delta: i64, arm: Arm) -> Opt
     // `Outcome::Table` counts zero forever; and a QUARANTINED merge returns Ok without doing the
     // work being timed.
     let applied = match exec(s, "MERGE;", &mut sess) {
-        Ok(Outcome::Agent(AgentOutput::Merge(report))) => report.applied_to_target,
-        _ => false,
+        Ok(Outcome::Agent(AgentOutput::Merge(report))) => {
+            if !report.applied_to_target && std::env::var("D114_DEBUG").is_ok() {
+                eprintln!("  [seq {seq}] merge did NOT apply: outcome={:?} rows={}",
+                          report.outcome, report.rows.len());
+            }
+            report.applied_to_target
+        }
+        Ok(_) => { if std::env::var("D114_DEBUG").is_ok() { eprintln!("  [seq {seq}] MERGE returned a NON-merge outcome"); } false }
+        Err(e) => { if std::env::var("D114_DEBUG").is_ok() { eprintln!("  [seq {seq}] MERGE errored: {e}"); } false }
     };
     let merge_ms = t.elapsed().as_secs_f64() * 1000.0;
     let (e1, m1) = ours_scan_counters();
@@ -314,6 +338,9 @@ fn run_delta_arm(dir: &std::path::Path, deltas: &[i64], w: i64, merges: usize) {
             continue;
         }
         let n = mg.len() as u64;
+        if (n as usize) < merges {
+            println!("  ⛔ delta {d}: only {n} of {merges} merges APPLIED — this row is NOT a measurement");
+        }
         let mm = med(&mut mg);
         let (epm, mpm) = (ex as f64 / n as f64, ma as f64 / n as f64);
         let recpm = rec as f64 / n as f64;
@@ -327,7 +354,7 @@ fn run_delta_arm(dir: &std::path::Path, deltas: &[i64], w: i64, merges: usize) {
 
 fn run_arm(dir: &std::path::Path, arm: Arm, axis: &[i64], merges: usize, label: &str, order: &str) {
     println!();
-    println!("=== ARM {label} — delta held at {DELTA} changed cells, axis = ops recorded per branch");
+    println!("=== ARM {label} — delta held at {} changed cells, axis = ops recorded per branch", DELTA());
     println!("    (axis walked {order}; one FRESH server per point — see `run_arm` for why)");
     println!("   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms");
     let mut base: Option<(i64, f64, f64)> = None;
@@ -342,7 +369,7 @@ fn run_arm(dir: &std::path::Path, arm: Arm, axis: &[i64], merges: usize, label: 
         let (mut mg, mut wr) = (vec![], vec![]);
         let (mut ex, mut ma, mut rec) = (0u64, 0u64, 0u64);
         for i in 0..merges {
-            if let Some(c) = one_cycle(&s, i as u64, w, DELTA, arm) {
+            if let Some(c) = one_cycle(&s, i as u64, w, DELTA(), arm) {
                 mg.push(c.merge_ms);
                 wr.push(c.writes_ms);
                 ex += c.examined;
@@ -357,6 +384,13 @@ fn run_arm(dir: &std::path::Path, arm: Arm, axis: &[i64], merges: usize, label: 
             continue;
         }
         let n = mg.len() as u64;
+        // ⛔ A PARTIAL n IS NOT A SMALLER SAMPLE, IT IS A BROKEN ARM. The first run of this harness
+        // silently reported n=1 out of 15 because every merge after the first was refused, and a
+        // lone sample printed in the same column as a median reads exactly like a result. Say it
+        // on the row itself; the reader cannot be trusted to cross-check a count they did not ask for.
+        if (n as usize) < merges {
+            println!("  ⛔ {w:>5}: only {n} of {merges} merges APPLIED — this row is NOT a measurement");
+        }
         let (mm, mw) = (med(&mut mg), med(&mut wr));
         let (epm, mpm) = (ex as f64 / n as f64, ma as f64 / n as f64);
         println!(
@@ -389,7 +423,7 @@ fn main() {
         .collect();
     let merges: usize = std::env::var("D114_MERGES").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
 
-    println!("D114 — merge cost against OPS RECORDED PER BRANCH, at FIXED changed cells ({DELTA}).");
+    println!("D114 — merge cost against OPS RECORDED PER BRANCH, at FIXED changed cells ({}).", DELTA());
     println!("PRE-REGISTERED: FLAT in ops/branch => the ours-side-scan reading is WRONG, row closes.");
     println!("                LINEAR at fixed delta => the row is real.");
     println!();

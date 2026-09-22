@@ -1,0 +1,81 @@
+=== D114 DECISIVE CONTROL, RE-RUN ON A QUIET BOX.
+=== The first attempt (bench/d114_before_delta32.txt, mtime 20:52) took ~56s of chunk-dedup's
+=== 'cargo test --lib' at 20:47. Re-run rather than caveated, because it is the decisive control.
+=== delta FIXED at 32, ops axis to 8192, so examined reaches 262k ops walked per merge.
+=== lock D114-rerun, load_at_acquire=3. started 2026-09-22T01:33:52Z, load 3.65 2.95 3.10
+D114 — merge cost against OPS RECORDED PER BRANCH, at FIXED changed cells (32).
+PRE-REGISTERED: FLAT in ops/branch => the ours-side-scan reading is WRONG, row closes.
+                LINEAR at fixed delta => the row is real.
+
+The counters are the finding; the milliseconds are an UPPER BOUND on a shared box.
+  examined/merge  = ops the ours-side scan WALKED   -> an index removes these
+  matched/merge   = ops compose_ops must FOLD       -> an index does NOT remove these
+
+table rows = 2000 (fixed; the table axis is D68/D69's and is closed), merges/point = 10
+
+=== ARM REPEAT (ops land ON the delta cells: scan AND fold grow) — delta held at 32 changed cells, axis = ops recorded per branch
+    (axis walked ASCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+       32  10 |     10.734 |          1024.0            32.0 |             0.450    (ops actually recorded/merge = 32.0)
+      128  10 |      9.815 |          4096.0           128.0 |             2.056    (ops actually recorded/merge = 128.0)
+          ^ 4x ops -> 0.91x MERGE ms,  4.00x examined
+      512  10 |      8.877 |         16384.0           512.0 |            11.990    (ops actually recorded/merge = 512.0)
+          ^ 16x ops -> 0.83x MERGE ms,  16.00x examined
+     2048  10 |      8.945 |         65536.0          2048.0 |           150.952    (ops actually recorded/merge = 2048.0)
+          ^ 64x ops -> 0.83x MERGE ms,  64.00x examined
+     8192  10 |     11.096 |        262144.0          8192.0 |          2247.207    (ops actually recorded/merge = 8192.0)
+          ^ 256x ops -> 1.03x MERGE ms,  256.00x examined
+
+=== ARM CHURN  (ops land OFF the delta cells: only the scan grows) — delta held at 32 changed cells, axis = ops recorded per branch
+    (axis walked DESCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+     8192  10 |     10.777 |        263168.0            32.0 |          2284.295    (ops actually recorded/merge = 8224.0)
+     2048  10 |      8.903 |         66560.0            32.0 |           157.004    (ops actually recorded/merge = 2080.0)
+          ^ 0x ops -> 0.83x MERGE ms,  0.25x examined
+      512  10 |      8.677 |         17408.0            32.0 |            14.525    (ops actually recorded/merge = 544.0)
+          ^ 0x ops -> 0.81x MERGE ms,  0.07x examined
+      128  10 |      8.020 |          5120.0            32.0 |             2.056    (ops actually recorded/merge = 160.0)
+          ^ 0x ops -> 0.74x MERGE ms,  0.02x examined
+       32  10 |      9.814 |          2048.0            32.0 |             0.813    (ops actually recorded/merge = 64.0)
+          ^ 0x ops -> 0.91x MERGE ms,  0.01x examined
+
+=== ARM REPEAT (ops land ON the delta cells: scan AND fold grow) — delta held at 32 changed cells, axis = ops recorded per branch
+    (axis walked DESCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+     8192  10 |     10.037 |        262144.0          8192.0 |          2261.580    (ops actually recorded/merge = 8192.0)
+     2048  10 |      9.034 |         65536.0          2048.0 |           152.959    (ops actually recorded/merge = 2048.0)
+          ^ 0x ops -> 0.90x MERGE ms,  0.25x examined
+      512  10 |      8.243 |         16384.0           512.0 |            11.980    (ops actually recorded/merge = 512.0)
+          ^ 0x ops -> 0.82x MERGE ms,  0.06x examined
+      128  10 |      9.738 |          4096.0           128.0 |             1.938    (ops actually recorded/merge = 128.0)
+          ^ 0x ops -> 0.97x MERGE ms,  0.02x examined
+       32  10 |      8.802 |          1024.0            32.0 |             0.321    (ops actually recorded/merge = 32.0)
+          ^ 0x ops -> 0.88x MERGE ms,  0.00x examined
+
+=== ARM CHURN  (ops land OFF the delta cells: only the scan grows) — delta held at 32 changed cells, axis = ops recorded per branch
+    (axis walked ASCENDING; one FRESH server per point — see `run_arm` for why)
+   ops/br   n |   MERGE ms |  examined/merge  matched/merge | CONTROL writes ms
+       32  10 |      8.384 |          2048.0            32.0 |             0.679    (ops actually recorded/merge = 64.0)
+      128  10 |      8.050 |          5120.0            32.0 |             1.963    (ops actually recorded/merge = 160.0)
+          ^ 4x ops -> 0.96x MERGE ms,  2.50x examined
+      512  10 |      8.568 |         17408.0            32.0 |            13.487    (ops actually recorded/merge = 544.0)
+          ^ 16x ops -> 1.02x MERGE ms,  8.50x examined
+     2048  10 |     12.547 |         66560.0            32.0 |           156.478    (ops actually recorded/merge = 2080.0)
+          ^ 64x ops -> 1.50x MERGE ms,  32.50x examined
+     8192  10 |     12.885 |        263168.0            32.0 |          2325.838    (ops actually recorded/merge = 8224.0)
+          ^ 256x ops -> 1.54x MERGE ms,  128.50x examined
+
+=== ARM DELTA — ops per branch held at 8192, axis = CHANGED CELLS per merge
+    (the arm that separates a 4x CONSTANT from a complexity class; read `examined`)
+    delta   n |   MERGE ms |  examined/merge  matched/merge | examined/(delta x ops)
+        1  10 |      6.178 |          8193.0             1.0 |                 1.000  (ops recorded/merge = 8193.0)
+        4  10 |      6.411 |         32784.0             4.0 |                 1.000  (ops recorded/merge = 8196.0)
+       32  10 |     11.416 |        263168.0            32.0 |                 1.000  (ops recorded/merge = 8224.0)
+
+HOW TO READ IT:
+  Each arm appears TWICE, ascending and descending. If the two passes disagree on
+  the SHAPE, the machine moved and neither pass is a result.
+  REPEAT linear + CHURN flat  -> the slope is the FOLD. An index would NOT fix it.
+  REPEAT linear + CHURN linear-> the SCAN is real; D86's index is the right fix.
+  both flat                   -> the pre-registered falsifier FIRES. Close the row.
+=== finished 2026-09-22T01:39:21Z, load 2.26 2.77 2.98
