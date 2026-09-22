@@ -2,7 +2,7 @@ D127 — D124's REFUSAL IS SWALLOWED AT THE PRIMARY REAP PATH. Make it reach a r
 ================================================================================
 Branch:  D127-unswallow-refusal
 Base:    ac2ab26  (merge-base with main)
-Head:    59e1a8f  at the time of writing
+Code:    7ad789b  — the last commit touching src/ tests/ examples/; what the full suite certified
 Design:  /Users/idide/wt/artie-research/SCALE-DESIGN.md, "## ⛔ D127", opened 2026-09-22
 Option taken: **2 — a three-way outcome from `reap_if_still_expired`**, the one the design
               entry named as the one to beat. Nothing better was found; see "Why not 1 or 3".
@@ -35,7 +35,10 @@ branch is fine" AND "the catalog would not answer, I decline to decide".
 
 2. THE FIX
 --------------------------------------------------------------------------------
-Line numbers are at HEAD 59e1a8f.
+Line numbers are at 7ad789b. For the BEFORE side, at base ac2ab26: types.rs:359-362,
+reaper.rs:726 and :732 (`Err(FerroError::Branch(_)) => Ok(false)`, both arms),
+lease_thread.rs:575-576 (`Ok(true) => reaped.push(..)`, `Ok(false) => {}`). Each re-read
+there, not carried over from the design entry.
 
   reaper.rs:78    `pub enum ReapOutcome { Reaped | NotExpired | Refused(FerroError) }`,
                   `#[must_use = "a refused reap that nobody looks at is exactly the D127
@@ -219,7 +222,26 @@ Targeted: 8/8 green — the five D127 tests, both `a_refused_reap_is_not_the_sam
 lease_that_moved` catalog arms, `d98_a_branch_renewed_after_the_query_is_not_reaped` and
 `an_unexpired_branch_survives_every_scan`.
 
-Suite results are appended below by the run that produced them.
+`tools/verify-impacted.sh --since ac2ab26` — rc=0, **97 of 131 targets selected** (34 skipped;
+the script names the count itself). `--since` was passed: without it a committed change selects
+ZERO targets and still reads rc=0, which is a pass-shaped nothing.
+
+FULL SUITE, taken ONCE, holding `/tmp/ferrodb-suite.lock` as `D127-unswallow`:
+
+    D127-unswallow: mode=whole rc=0 passed=2467 failed=0 build_errors=0 head=7ad789b
+    D127-unswallow: go        rc=0 passed=97   failed=0
+
+Banked in `bench/d127_certified/` (SUMMARY.txt and the log tail), because the suite's own
+output directory is a `mktemp -d` under /var/folders that a restart wipes — and because the
+two commits at the head of main right now exist precisely to re-bank verdicts that had lived
+only in a truncating SUMMARY.txt.
+
+⚠ `head=7ad789b` is a PREIMAGE, by construction: a report cannot quote a summary that names
+its own sha. **7ad789b is the commit carrying every source change in this row** — everything
+in §2 and §4. The commits after it add only `bench/` text: this paragraph, and the banked
+SUMMARY. No file under `src/`, `tests/` or `examples/` differs between 7ad789b and the tip;
+`git diff 7ad789b..HEAD -- src tests examples` is empty, which is the check that makes the
+green transferable rather than merely adjacent.
 
 
 8. FOLLOW-ONS, NOT FIXED HERE, NOT SMUGGLED IN
