@@ -10,8 +10,17 @@ W=/Users/idide/wt/ferrodb-D123-serial-attribution
 BIN=$W/target/release/examples/d123_serial_attribution
 OUT=$W/bench/d123_final; mkdir -p "$OUT"
 arm () {  # arm <tag> <file> <mode> <N> <threads> <warm> <reps> <timeout>
-  ~/wt/logs/measure-lock.sh acquire "$1" > "$OUT/${2%.txt}_lock.txt" 2>&1
-  grep -q ACQUIRED "$OUT/${2%.txt}_lock.txt" || { echo "NO LOCK for $2 - DO NOT REPORT A NUMBER"; return 1; }
+  # ⛔ RE-QUEUE RATHER THAN GIVE UP. measure-lock.sh refuses after 240 x 15 s = 60 min, and a
+  # legitimate holder (a full per-target suite over 27 commits) can exceed that. Giving up there
+  # would lose the arm silently while the box was merely busy, which is indistinguishable in the
+  # log from the arm never having been wanted. Three attempts = 3 h of patience, then refuse loudly.
+  local try=0
+  while [ $try -lt 3 ]; do
+    ~/wt/logs/measure-lock.sh acquire "$1" > "$OUT/${2%.txt}_lock.txt" 2>&1
+    grep -q ACQUIRED "$OUT/${2%.txt}_lock.txt" && break
+    try=$((try+1)); echo "[$(date +%T)] acquire attempt $try for $2 timed out; re-queuing"
+  done
+  grep -q ACQUIRED "$OUT/${2%.txt}_lock.txt" || { echo "NO LOCK for $2 after 3 attempts - DO NOT REPORT A NUMBER"; return 1; }
   ( echo "# lock: $(cat "$OUT/${2%.txt}_lock.txt")"
     echo "# acquired_utc: $(date -u +%FT%TZ)"
     echo "# other cargo/rustc/suite at acquire:"
