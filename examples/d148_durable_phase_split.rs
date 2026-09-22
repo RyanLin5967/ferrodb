@@ -241,22 +241,42 @@ fn main() {
         ifirst.1, ifirst.0, ilast.1, ilast.0
     );
     println!();
-    if rows.len() >= 2 && (last.0 - first.0).abs() > 0.0 {
-        let a = (last.1 - first.1) / (last.0 - first.0);
-        let b = first.1 - a * first.0;
+    if rows.len() >= 3 {
+        // ⛔ LEAST SQUARES over every row, not an endpoint fit. The box is shared, one row came
+        // back visibly noisy, and an endpoint fit hands that single row the whole slope. Both
+        // fits are printed so the disagreement between them IS the error bar.
+        let n = rows.len() as f64;
+        let mx = rows.iter().map(|r| r.0).sum::<f64>() / n;
+        let my = rows.iter().map(|r| r.1).sum::<f64>() / n;
+        let sxy: f64 = rows.iter().map(|r| (r.0 - mx) * (r.1 - my)).sum();
+        let sxx: f64 = rows.iter().map(|r| (r.0 - mx) * (r.0 - mx)).sum();
+        let a_ls = sxy / sxx;
+        let b_ls = my - a_ls * mx;
+        let a_ep = (last.1 - first.1) / (last.0 - first.0);
         let io_mean = rows.iter().map(|r| r.2).sum::<f64>() / rows.len() as f64;
         let total_mean = idx_rows.iter().map(|r| r.2).sum::<f64>() / idx_rows.len() as f64;
-        println!("    SCAN fit over the axis: {a:.4} ns per frame in the log, intercept {b:.0} ns");
+        println!("    SCAN slope, least squares over all {} rows: {a_ls:.4} ns per frame per append", rows.len());
+        println!("    SCAN slope, endpoints only:                 {a_ep:.4} ns per frame per append");
         println!("    encode+pwrite+sync_data mean: {io_mean:.0} ns/append — CONSTANT in log length");
         println!("    whole append mean (indexed arm): {total_mean:.0} ns");
-        if a > 1e-12 {
-            let cross = (total_mean - b) / a;
-            println!();
-            println!("    ⭐ CROSSOVER: the scan equals the WHOLE durable append at ~{cross:.0} frames.");
-            println!("       Below that the fsync dominates and D138 is a small fix.");
-            println!("       Above it the scan dominates and D138 is the whole cost.");
-            println!("       The 10^6-branch objective is {:.0}x past that crossover.", 1e6 / cross.max(1.0));
+        println!();
+        println!("    ⭐ EXTRAPOLATED to the objective's own axis (a fit over 250..2000 frames,");
+        println!("       stated as an extrapolation, NOT a measurement at that size):");
+        for (label, a) in [("least squares", a_ls), ("endpoints", a_ep)] {
+            let at_1e6 = a * 1e6 + b_ls;
+            println!(
+                "       {label:>14}: scan at 10^6 frames = {:.2} ms/append vs {:.2} ms of I/O  => {:.1}% of the append",
+                at_1e6 / 1e6,
+                io_mean / 1e6,
+                100.0 * at_1e6 / (at_1e6 + io_mean)
+            );
         }
+        if a_ls > 1e-12 {
+            let cross = (io_mean - b_ls) / a_ls;
+            println!("    ⇒ the scan EQUALS encode+pwrite+sync at ~{cross:.0} frames (least-squares fit).");
+        }
+        println!("    ⚠ At 10^6 the frame Vec is ~100 MB, so per-element cost would RISE with cache");
+        println!("      misses. The extrapolation is therefore conservative, not optimistic.");
     }
     println!();
     println!("    appends measured: {total_appends}, final log length {} frames", log.len());
