@@ -375,9 +375,54 @@ is not authority to take the lock. Counts were run instead; they are what the ex
 criterion needs.
 
 ================================================================================
-10. CERTIFICATION AND THE STATE THIS BRANCH IS HANDED OVER IN
+10. CERTIFICATION — THE THING THAT WAS ACTUALLY MISSING, AND IS NOW DONE
 ================================================================================
 
-Filled in by the banking commit that follows, which names the sha the suite
-certified. A body cannot quote a summary naming its own sha.
+**D126 IS LANDED.** main = `2bc80fd` "Merge D126-atomic-upsert: a rewritten
+catalog key is never momentarily absent", which contains `8d2b673`.
+
+Evidence in `bench/d126_certified/` (SUMMARY.txt, both suite logs with sha256s,
+the prepush log). The verdict:
+
+    d126-8d2b673: mode=whole rc=0 passed=2474 failed=0 build_errors=0 head=8d2b673
+    d126-8d2b673: go rc=0 passed=97 failed=0
+
+All four gates, at that tip: verify-suite rc=0 · certify-head OK (suite head ==
+landing commit) · staleness COVERED · prepush OK. prepush matters here more than
+usual and is the one a green suite cannot stand in for: D126 REMOVES caller
+sites, and `cargo test` compiles with `cfg(test)`, where a test module keeps an
+otherwise-orphaned item alive under CI's `-D dead_code`.
+
+⚠ **THE FIRST CERTIFICATION WAS THROWN AWAY, AND WHY IS THE USEFUL PART.**
+The suite was run and certified green at `34549e4` (2468 passed). While it ran,
+main moved from `ac2ab26` to `4e0bcc1` — D125 landed, touching
+`src/branch/arena.rs`, which is one of the files D126 edits. So the certified
+tree was no longer the tree that would ship. The run was discarded, main merged
+in, and the whole suite re-taken at `8d2b673` (2474 passed; the +6 is D125's
+tests, not anything of D126's).
+
+⇒ `certify-head.sh` catches a suite whose BRANCH moved after the run. This was a
+suite whose BASE moved after the run, and no guard in the repo catches that —
+`staleness.sh` asks the base question, but only when someone asks it, and asking
+it once at the start is not enough. **Both produce a green that names a tree
+nobody ships.** Recorded in `bench/d126_certified/SUMMARY.txt` next to the
+superseded verdict, so the 2468 is never re-quoted as D126's number.
+
+WHAT THE THIRD DISPATCH ADDED, in full, so it is not mistaken for a re-run:
+  1. The certification above — the reason the branch could not land, and the
+     reason the row kept reading as open. Sections 7 and 8.
+  2. An independent re-run of every probe arm in a fresh context, controls
+     firing at 53.4% / 54.2% / 13.7%. Section 8, raw logs in `bench/d126_reverify/`.
+  3. An adversarial read of the primitive that found no defect but two claims
+     worth checking rather than assuming — `remove_entry`'s discarded Result, and
+     whether `latch_leaf_for_write` can hand Replace a leaf that does not hold the
+     key (it cannot, and `insert` already depended on that). Section 9.
+  4. `tests/integration_index_debt.rs` — TWO stale claims that D126 itself
+     created, in the module doc and in the body: both said the key-reuse workload
+     calls `primary_index.delete`, and after D126 `grep -rn 'primary_index\.delete'
+     src/` matches only a comment. Corrected in the strict direction: the test's
+     conclusion is now reached by a SHORTER argument ("SQL cannot reach a primary
+     index removal" rather than "every removal is half of a pair"), and neither
+     the workload nor the assertion was touched. Commit `8d2b673`.
+  5. This section.
 
