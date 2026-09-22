@@ -10,10 +10,18 @@
 //! logically modified: the rows were all still there and still correct, and reading them returned
 //! "refusing to return a torn page".
 //!
-//! Each test below states its premises as assertions. A fixture that stops reproducing the setup —
-//! an allocation that does not actually starve, a compaction that moves no bytes — fails as a
-//! fixture failure rather than passing vacuously, which is how the first version of this probe
-//! quietly proved nothing.
+//! **Which caller an ordinary workload actually reaches.** `internal_relink`'s — its level is
+//! still byte-balanced, so internal nodes pack to capacity and refuse. `leaf_put`'s does not: a
+//! leaf refuses only above 3046 of its 4060 bytes, and the D89 chunker targets 507, so that is a
+//! ~6x tail run. Measured over builds of 2000-8000 keys at three value sizes, leaf occupancy
+//! averaged 496-507 and peaked at 2268, and **no** leaf in any build could have refused even a
+//! maximum-size entry. The leaf path is pinned at the node level below rather than end to end.
+//!
+//! Each test states its premises as assertions. A fixture that stops reproducing the setup — an
+//! allocation that does not starve, a compaction that moves no bytes, a sweep that never reaches
+//! a refusal — fails as a fixture failure rather than passing vacuously. That is not
+//! hypothetical: the first end-to-end fixture here scattered its probe inserts and recorded 493
+//! starved failures without reaching the refusal path once, and passed.
 
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -401,7 +409,7 @@ fn a_starved_allocation_never_leaves_an_unverifiable_page() {
 /// the identical insert sequence run with the budget never armed is the control, and only the
 /// difference between the two arms is attributable to the starvation.
 #[test]
-fn an_aborted_insert_is_not_atomic_and_the_control_says_the_abort_is_why() {
+fn a_starved_insert_loses_no_row_that_the_unstarved_control_keeps() {
     let probe_rows = |starve: bool| -> (usize, usize) {
         let f = Fixture::new();
         let mut root = f.tree.create(BranchId::TRUNK, f.tick()).unwrap();
@@ -581,10 +589,14 @@ fn a_refused_replace_leaves_a_page_that_verifies() {
 /// `internal_relink`'s partial-promotion path, in shape: place separators until one is refused,
 /// then look at the page the way the code does when it drops the guard.
 ///
-/// This is the case that makes the node-level postcondition load-bearing rather than incidental.
-/// The separators that *did* land mutated the page and nothing stamped after them; what makes the
-/// page valid at the break is that the loop's only exit is a refusal, and a refusal compacts —
-/// and compaction now stamps. That is why the fix belongs in `compact` and not at the call site.
+/// This is the case that makes the node-level postcondition load-bearing rather than incidental,
+/// and it is why this probe and the two above are **not** one bug. Here the separators that did
+/// land mutated the page and nothing stamped after them — a different cause from a compaction on
+/// the refusal path. The two share a fix only because the loop's single exit is a refusal, and a
+/// refusal now restamps, which covers the earlier successful placements as a side effect.
+///
+/// That is a structural argument, not a coincidence, and it is the reason there is no second
+/// `stamp_checksum` at the call site: one authority, in `restamp_after_refusal`.
 #[test]
 fn a_partial_promotion_leaves_a_page_that_verifies() {
     let mut page = [0u8; PAGE_SIZE];
