@@ -1,0 +1,157 @@
+D181 PRE-REGISTRATION — expected counter values, derived from SOURCE, before the run
+====================================================================================
+
+Written and committed BEFORE the tests below were executed. Every number here comes from reading
+src/optimizer/cost_model.rs, src/optimizer/optimizer.rs and src/execution/sec_index_scan.rs and
+doing the arithmetic by hand. None of it is copied from a run. Amendments append only, at the
+bottom, dated and labelled.
+
+Requested by the team lead: "PRE-REGISTER the expected counter values from the source BEFORE
+running — not from what the run prints."
+
+Tree: branch d179-sec-index, parent of the commit that adds this file. Base 727a8ec.
+
+
+CONSTANTS (src/optimizer/cost_model.rs)
+---------------------------------------
+  DEFAULT_SEQ_PAGE_COST      1.0
+  DEFAULT_RANDOM_PAGE_COST   4.0
+  DEFAULT_CPU_TUPLE_COST     0.01
+  DEFAULT_RANGE_SELECTIVITY  0.25
+  DEFAULT_TABLE_ROWS         1000
+  DEFAULT_DISTINCT           100
+  DEFAULT_INDEX_FANOUT       100.0
+  DEFAULT_ENTRIES_PER_LEAF   100.0
+
+FORMULAE (cost_model.rs::cost)
+------------------------------
+  IndexScan:  rows   = max(base.rows * bound_selectivity(col, lower, upper), 1.0)
+              height = tree_height(BASE.rows)      <- base.rows, not rows
+              leaves = max(ceil(rows / 100), 1)
+              cost   = height*4 + leaves*1 + rows*4   (+ rows*4 again when column != 0)
+  Filter:     cost   = child.cost + child.stats.rows * 0.01
+  SeqScan:    cost   = table_pages * 1.0 + rows * 0.01     (table_pages >= 1 always)
+  tree_height(r) = 1.0 if r <= 1 else max(ceil(ln r / ln 100), 1.0)
+  apply_unique_key_fact: columns[0].distinct = row count, statistics or not (D56)
+
+
+(a) `v > 3990 AND id = 399`  — tests/d178_dml_index_counters.rs section 4, UNTOUCHED
+-----------------------------------------------------------------------------------
+Fixture: t(id INTEGER NOT NULL, v INTEGER, label VARCHAR(16)), 400 rows, v = id*10,
+         CREATE INDEX ix ON t (v), **no ANALYZE**.
+
+No statistics, so base_stats falls back: rows = 1000, every column distinct = 100, min/max = None;
+then columns[0].distinct = 1000 by the unique-key fact.
+
+  candidate `id = 399`   IndexScan{col 0, [399, 399]}
+      sel  = 1/1000                     (lo == hi arm)
+      rows = max(1000 * 0.001, 1.0)     = 1.0
+      cost = 2*4 + 1*1 + 1*4            = 13.0       (column 0: no second random-page term)
+      + Filter(v > 3990)  + 1 * 0.01    = 13.01
+
+  candidate `v > 3990`   IndexScan{col 1, (3990, inf)}
+      sel  = 0.25                       (min/max are None -> DEFAULT_RANGE_SELECTIVITY)
+      rows = max(1000 * 0.25, 1.0)      = 250.0
+      cost = 2*4 + 3*1 + 250*4 + 250*4  = 2011.0
+      + Filter(id = 399)  + 250 * 0.01  = 2013.5
+
+  incumbent              Filter{SeqScan}
+      cost = P + 1000*0.01 + 1000*0.01  = P + 20  >= 21      (P = table_pages >= 1)
+
+  CHEAPEST = 13.01, the PRIMARY KEY point lookup.
+
+  ==> PRE-REGISTERED: heap tuples pulled sequentially = 0, via `id = 399`. Index scans >= 1.
+      13.01 < 2013.5 and 13.01 < 21 are STRICT, so this outcome does not depend on tie-breaking
+      and does not depend on which conjunct was typed first.
+
+  (Before D181's fix, with D179 in: `position` took `v > 3990`, 2013.5 lost to the sequential
+   scan, and the statement read all 400 rows. That is the 400-vs-0 failure this row was found by.)
+
+
+(b) ORDER SWAP — tests/d181_conjunct_order_independence.rs
+----------------------------------------------------------
+Fixture: t(id INTEGER NOT NULL, sel INTEGER, broad INTEGER, pad VARCHAR(16)), n = 1000,
+         sel = id, broad = id % 2, CREATE INDEX on BOTH sel and broad, ANALYZE t.
+
+  Statistics: rows 1000; columns[1] sel  distinct 1000, min 0, max 999
+                         columns[2] broad distinct 2,    min 0, max 1
+
+  Predicate A: `sel = 501 AND broad = 1`      (cheaper conjunct typed FIRST)
+  Predicate B: `broad = 1 AND sel = 501`      (cheaper conjunct typed SECOND)
+
+  candidate SEL    IndexScan{col 1, [501, 501]}
+      sel  = 1/1000, rows = 1.0
+      cost = 2*4 + 1*1 + 1*4 + 1*4      = 17.0      (column != 0: BOTH random-page terms)
+      + Filter(broad = 1) + 1 * 0.01    = 17.01
+
+  candidate BROAD  IndexScan{col 2, [1, 1]}
+      sel  = 1/2,    rows = 500.0
+      cost = 2*4 + 5*1 + 500*4 + 500*4  = 4013.0
+      + Filter(sel = 501) + 500 * 0.01  = 4018.0
+
+  incumbent        Filter{SeqScan}       = P + 20  >= 21
+
+  CHEAPEST = 17.01, candidate SEL, in BOTH typing orders. Strict on both sides
+  (17.01 < 4018.0 and 17.01 < 21), so this test does NOT rest on tie-breaking.
+
+  Counters for that plan, derived from the scanner walk in
+  optimizer::secondary_scan_start + execution::sec_index_scan::next:
+
+      secondary_scan_start(Included(501))            = Included((501, Null))
+      range_scan((501,Null), Unbounded) -> binary_search lands on (501, 501),
+        because Null sorts below every pk and sel = id makes the entry (501, 501)
+      next() #1  yields (501,501)   examined = 1   not past, not before   -> RETURNS the row
+      next() #2  yields (502,502)   examined = 2   502 > upper 501        -> None
+      Drop       INDEX_SCANS += 1, INDEX_SCAN_ENTRIES += 2
+      no SeqScan is constructed                     SEQ_SCANS += 0, SEQ_SCAN_TUPLES += 0
+
+  ==> PRE-REGISTERED, IDENTICAL FOR BOTH TYPING ORDERS:
+          seq_scans      = 0
+          seq_tuples     = 0
+          index_scans    = 1
+          index_entries  = 2
+          rows returned  = 1
+
+      The entries count is 2 and not 1 because the scan must READ the first entry past the upper
+      bound in order to learn that it is past it. That entry is counted where the tree yielded it.
+
+  ==> PRE-REGISTERED FIRE-CHECK (same fixture, `pad = 'zz'`, no index on pad):
+          seq_tuples = 1000, index_scans = 0, rows returned = 0.
+
+  ==> PRE-REGISTERED FAILS-BEFORE: with `position` (pre-D181), order B takes the BROAD conjunct,
+      4018.0 loses to the sequential scan, and order B reports seq_tuples = 1000 / index_scans = 0
+      while order A reports 0 / 1. The two orders disagree. That disagreement is the defect.
+
+
+(c) EXACT COST TIE — tests/d181_tie_break.rs
+--------------------------------------------
+Fixture: t(id INTEGER NOT NULL, a INTEGER, b INTEGER, pad VARCHAR(16)), n = 1000,
+         a = id AND b = id (IDENTICAL data), CREATE INDEX on both, ANALYZE t.
+
+  a and b hold identical values, so ANALYZE gives them identical ColumnStats
+  (distinct 1000, min 0, max 999, nulls 0). `cost` reads nothing else about a column, and both
+  are column != 0, so the two candidates evaluate the SAME formula on the SAME inputs:
+
+      candidate A  IndexScan{col 1, [5,5]}  rows 1.0  cost 17.0  + Filter(b = 5)  = 17.01
+      candidate B  IndexScan{col 2, [5,5]}  rows 1.0  cost 17.0  + Filter(a = 5)  = 17.01
+
+  These are bitwise-equal f64: an EXACT tie, and both beat the incumbent (>= 21).
+
+  Tie-break key (optimizer::candidate_key) = (column, bound_key(lower), bound_key(upper)).
+  A's key is (1, ..) and B's is (2, ..), so A < B.
+
+  ==> PRE-REGISTERED: BOTH typing orders — `a = 5 AND b = 5` and `b = 5 AND a = 5` — choose
+      COLUMN 1, i.e. EXPLAIN contains "Index scan on t (col 1,".
+
+  ==> PRE-REGISTERED FAILS-BEFORE: with a strict `<` and no tie-break key, the first-typed
+      candidate wins the tie, so `a = 5 AND b = 5` chooses col 1 and `b = 5 AND a = 5` chooses
+      col 2. Typing order still decides. That is the residual the team lead flagged.
+
+
+WHAT WOULD FALSIFY THE FIX
+--------------------------
+  * (b) reporting different counters for the two typing orders.
+  * (c) reporting different columns for the two typing orders.
+  * the fire-check in (b) reporting anything other than 1000 sequential tuples — the counter would
+    then be unable to show the bad case, and every zero above would be vacuous.
+  * any arm returning the wrong number of rows. An arm that stopped answering is not a faster arm.
