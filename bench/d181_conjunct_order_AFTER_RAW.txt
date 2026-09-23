@@ -1,3 +1,37 @@
+==============================================================================
+PROVENANCE -- AFTER -- D179 and D181 both applied, tie-break included
+==============================================================================
+commit        : c790fdb00ef874962514411335dbbb8ab41684c1
+branch        : (detached HEAD -- no branch)
+dirty files   : 0   (excluding this artifact; 0 means the binary IS this commit)
+note          : d179-sec-index at e39c93b plus the bench runner; build_index_scan costs EVERY usable conjunct and takes the cheapest, ties broken on candidate_key
+binary        : /Users/idide/wt/ferrodb-d179-sec-index/target/release/examples/d181_conjunct_order
+binary mtime  : 2026-09-23T12:12:45Z
+built with    : cargo build --release --example d181_conjunct_order
+rustc         : rustc 1.97.1 (8bab26f4f 2026-07-14)
+command       : /Users/idide/wt/ferrodb-d179-sec-index/target/release/examples/d181_conjunct_order
+env           : none. The harness reads no environment variable; sizes are SIZES in its
+                source and the fixture is built in-process in a fresh tempdir per arm.
+run at        : 2026-09-23T16:12:45Z
+host          : Darwin 25.6.0 arm64
+load at start : 21.68 19.22 14.88
+suite lock    : free at start -- this script refuses to run otherwise (VERIFY_IGNORE_LOCK=0)
+
+LOAD IMMUNITY. Every number below is an INTEGER COUNT -- heap tuples pulled and index
+entries walked -- not a duration. The same plan examines the same rows on a quiet box and
+a loaded one, so the load line above is recorded for completeness and is NOT a caveat.
+Two of this project's timing runs have been voided by a shared machine
+(bench/d101_rerun_VOID_disk_emergency.txt, rc=137). This measurement has no such failure
+mode, which is why the row was specified in counts rather than durations.
+
+REPRODUCE:
+  git checkout c790fdb00ef874962514411335dbbb8ab41684c1
+  bench/d181_run.sh <out> 'AFTER -- D179 and D181 both applied, tie-break included' 'd179-sec-index at e39c93b plus the bench runner; build_index_scan costs EVERY usable conjunct and takes the cheapest, ties broken on candidate_key'
+
+EXPECTED VALUES were pre-registered in bench/d181_prereg.txt, committed before the first
+run of this harness. Amendments to that file are append-only.
+==============================================================================
+
 D181 — conjunct order vs index selection
 rows examined = seq tuples pulled + index entries walked
 
