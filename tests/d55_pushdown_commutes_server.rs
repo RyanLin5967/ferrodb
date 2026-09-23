@@ -18,6 +18,14 @@
 //! `pushdown_agrees_with_filter_afterwards_on_every_overlay_case` red with
 //! "this agent statement is running on an AgentRuntime that no ServerContext designated".
 //!
+//! ⚠ **Same scope limit as the arena test, and for the same reason** — stated there in full:
+//! `visible_rows_where` folds in the in-memory workspace map on every backend and never reads the
+//! page store, so the six case assertions below cannot diverge from the map-backed ones. Measured:
+//! with `stage_all`'s mirror block disabled the six cases here still passed and only the
+//! page-growth guard fired. What this file adds over the arena test is the WIRING — sessions from
+//! `ServerContext::session()`, the catalog borrowed per statement through `ServerContext::catalog()`,
+//! two sessions sharing one runtime, and the designation guard live throughout.
+//!
 //! The six cases, unchanged from the sibling file:
 //!
 //! * base passes, staged version FAILS   → row must be ABSENT (staged wins, and it fails)

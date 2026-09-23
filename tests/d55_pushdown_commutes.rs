@@ -34,6 +34,30 @@
 //! assertions are spelled out twice so that a change made to satisfy one backend cannot silently
 //! move the other backend's expectation with it.
 //!
+//! # ⚠ What the arena test does and does NOT prove — measured, not argued
+//!
+//! **`visible_rows_where` never reads the page store.** It filters the base scan and then folds in
+//! `state.workspaces[branch].rows`, which is the same in-memory map on both backends; `self.storage`
+//! appears nowhere on that path (`src/agent_sql/runtime.rs` — the only uses are `storage()`,
+//! `rows()`, `live_page_count` and `stage_all`'s mirror block). So the six case assertions
+//! **cannot** diverge between the two backends, and a green arena run is not independent
+//! confirmation that pushdown commutes "on disk" — the overlay it reads is not on disk.
+//!
+//! That was fire-checked rather than reasoned at: with `stage_all`'s mirror block disabled
+//! (`if false && self.storage.is_some()`), so that nothing whatsoever reached the arena, all six
+//! arena case assertions still PASSED. The one assertion that fired was the page-growth guard.
+//!
+//! What the arena test therefore does buy, which the map-backed test cannot:
+//!
+//! 1. Every staged write really executes `put_row` / `delete_row`, arena page allocation and a
+//!    `set_root` through the branch catalog — under the catalog lock, beside a live agent session.
+//!    A panic, an error or a deadlock in any of that fails here and nowhere else in this file.
+//! 2. The page-growth guard pins that the mirror ran at all, so the test cannot silently decay
+//!    into a second copy of the map-backed one.
+//! 3. It is the regression barrier for the change that would make backend divergence possible:
+//!    the day `visible_rows_where` starts answering from the tree, these six cases are already
+//!    written and already pointed at it.
+//!
 //! ⚠ **No `ServerContext` is built in this binary, and that is load-bearing.** `ServerContext::new`
 //! designates its runtime process-wide (`src/agent_sql/designated.rs`), after which any agent
 //! statement on a *different* runtime is refused — which is every statement of the map-backed test
