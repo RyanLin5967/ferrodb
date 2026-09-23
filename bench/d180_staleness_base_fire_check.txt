@@ -103,3 +103,14 @@ OTHER CALLERS OF staleness.sh, checked BEFORE the change
     verify-suite}.sh comments, and src/ and tests/ doc comments -- is PROSE about the script or
     about an unrelated in-engine "staleness" concept. No other executable call site exists.
   * No hook, settings.json, or cron entry invokes it.
+
+================================================================================================
+F. NO-COLLATERAL CHECK -- is the EXPLICIT-argument path (the one land-gate.sh:86 uses) unchanged?
+   Pre-fix script and fixed script, same explicit args, outputs diffed byte-for-byte.
+================================================================================================
+  base=agent-isolation head=d180-fixture-behind   IDENTICAL output, both rc=0  -> COVERED
+  base=main            head=d180-fixture-behind   IDENTICAL output, both rc=1  -> STALE-GREEN
+  base=main            head=d180-staleness-base   IDENTICAL output, both rc=0  -> COVERED
+   => The change is confined to the value used when $2 is ABSENT. land-gate.sh always supplies $2,
+      so its behaviour is not merely argued to be unchanged -- it is measured identical, including
+      on the STALE-GREEN path. This is why land-gate.sh needed no edit.
