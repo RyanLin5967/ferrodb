@@ -1219,14 +1219,18 @@ impl ArenaPageStore {
         if let Err(e) =
             self.persist_delta_locked(&mut persist, Self::TAIL_PAGES_PARKED, &payload, None)
         {
+            // Nothing reached the file. Put the marks back — and the record that was going to
+            // describe the parked entries did not land either, so they are in exactly the state
+            // `abandon_park` exists for.
             self.state.lock().unwrap().recycled_dirty.extend(dirty);
-            return Err(e);
+            drop(persist);
+            return self.abandon_park(&parked, e);
         }
         Ok(released)
     }
 
-    /// Give up on a `retire_arenas_by_rule` that failed part way, without leaving the entries it
-    /// already parked invisible.
+    /// Give up on a `retire_arenas_by_rule` that did not get its record written, without leaving
+    /// the entries it already parked invisible.
     ///
     /// **They are in memory and in no record**, and the pushes themselves do not bump
     /// [`Self::pending_version`] precisely because the record at the end of the loop describes
@@ -1235,8 +1239,12 @@ impl ArenaPageStore {
     /// append behind a file that does not list them, and a crash before the next compaction leaks
     /// every one. Marking the log dirty makes the next persist a full rewrite instead.
     ///
-    /// The recycled lists need no equivalent: `release_page` marks its arena in
-    /// [`StoreState::recycled_dirty`] as it goes, and nothing here takes that set.
+    /// Both ways out of that method come here: an error inside the decision loop, and a failure to
+    /// append at the end. The second is the easier one to miss, because by then the payload has
+    /// been built and it *looks* finished.
+    ///
+    /// The recycled lists need no equivalent from the loop: `release_page` marks its arena in
+    /// [`StoreState::recycled_dirty`] as it goes, and the loop never takes that set.
     fn abandon_park<T>(&self, parked: &[PendingFree], e: FerroError) -> Result<T, FerroError> {
         if !parked.is_empty() {
             self.pending_version.fetch_add(1, Ordering::SeqCst);
@@ -2038,6 +2046,17 @@ impl ArenaPageStore {
                     // which happens whenever a concurrent drain cut its record between this
                     // caller's in-memory push and its append. Without the test, the log comes back
                     // with the same page twice and `pending_len` disagrees with a full rewrite.
+                    //
+                    // The FIRST entry for a key wins, and that is the one that MATCHES MEMORY
+                    // rather than the one that is safest in isolation. A page parked twice — a
+                    // resumed reap re-entering a `Reaping` branch is the reachable way — carries
+                    // the same `birth_epoch` and owner, so only `free_epoch` can differ, and a
+                    // narrower `[birth, free)` pins FEWER children, i.e. releases more readily.
+                    // That is not a reason to prefer it; the reason is that `drain_pending`
+                    // decides on whichever entry it meets FIRST in `st.pending`, which is the
+                    // earlier park, which is also the first to reach the log. Keeping the later
+                    // one instead would make a restarted database release a page on a different
+                    // rule than the running one does.
                     let mut seen: std::collections::HashSet<(PageId, ArenaId)> =
                         st.pending.iter().map(|p| (p.page_id, p.arena_id)).collect();
                     for e in parked {
