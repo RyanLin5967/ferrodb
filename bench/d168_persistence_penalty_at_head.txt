@@ -1,0 +1,68 @@
+D168 — THE PERSISTENCE PENALTY RE-DERIVED AT HEAD. The N-growth is GONE; a flat ~1.4x remains.
+Pre-registration: bench/d168_prereg.txt, committed a79fde2 BEFORE the first measurement.
+
+[HERE] 2026-09-23  examples/branch_curve_writes (UNMODIFIED) at 160a154, release, 4 threads,
+0.5 GB budget, checkpoints 500,1000,2000,4000. Measure lock HELD. 33 GiB free, no cargo running.
+Counterbalanced arm order: block 1 = OFF,ON · block 2 = ON,OFF.
+
+=== WHY THIS RUN ===================================================================
+
+D80 (artifact 697eb89, 2026-09-20) measured this same axis and found **4.32x at N=500** with the
+penalty GROWING in N: "1.88x at L=500 to 3.29x at L=4,000, because the image rewritten on each new
+branch is 48 bytes longer than the last one."
+
+**D81 (53a6b66, 2026-09-21 — ONE DAY LATER) deleted the mechanism D80 measured**: a claim now
+appends a 45-byte tail record instead of re-serialising the whole 48*L-byte image. D80's headline
+has been stale ever since and was never re-derived. This run re-derives it.
+
+=== RESULT =========================================================================
+
+     N   OFF mean   ON mean   ratio     b1     b2    pre-D81
+   500      172.0     126.7    1.36    1.59   1.13     1.88x
+  1000      202.9     115.3    1.76    1.89   1.64       -
+  2000      169.6     121.3    1.40    1.61   1.18       -
+  4000      156.4     115.1    1.36    1.45   1.24     3.29x
+  (forks/sec, mean of the two counterbalanced blocks)
+
+  ratio across N=500 -> 4000 : 1.36 -> 1.36   (change 1.00x)
+  pre-D81, same range        : 1.88 -> 3.29   (change 1.75x)
+  max ratio falls at N=1000, NOT at the largest N ⇒ no monotone growth.
+
+⇒ ✅ **OUTCOME 1 OF THE PRE-REGISTRATION. D81 CONFIRMED IN THE HEADLINE HARNESS.** The registered
+claim was about the SHAPE — "the ON/OFF ratio must be FLAT in N" — and it is flat.
+
+⇒ **What remains is a flat ~1.4x, and that is NOT a failure.** D81 claimed to remove the N^2
+BYTES, not the per-claim fsync. A constant-factor durability cost that does not grow with branch
+count is the expected residue, and it is reported here as the honest cost of shipping with the map
+persisted (which `cli.rs` does and this harness does not).
+
+=== THE DISCRIMINATING-POWER CHECK — why "flat" is not just noise ===================
+
+The OFF arm is noisy: within-arm spread between blocks reaches **1.45x** (ON reaches 1.23x), which
+is the same order as the effect. A flat curve read off a noisy instrument can be a non-result, so
+the question is not "is the noise smaller than the effect" but **"would the alternative hypothesis
+have produced a visibly different number?"**
+
+  If the pre-D81 growth were still present, ON at N=4000 would read 156.4 / 3.29 = **47.5** f/s.
+  Measured ON at N=4000: **115.1** (blocks 127.1 and 103.1).
+
+47.5 sits far outside both blocks. **The instrument can discriminate, and it excludes the pre-D81
+shape.** The LEVEL (~1.4x) is soft and is quoted as approximate; the SHAPE is the robust claim, and
+the SHAPE is what was pre-registered.
+
+=== CONTROL — held =================================================================
+
+`len B/branch` is the load-independent column and is **identical across all four arms**:
+4104 / 4100 / 4098 / 4097 at N = 500 / 1000 / 2000 / 4000, OFF and ON alike. The two arms ran the
+same workload; the timing difference is the map's durability and nothing else. (D80's own control
+was the same column at 4104 both ways.)
+
+=== WHAT THIS DOES NOT SAY =========================================================
+
+- ⛔ Not a 10^6 result. The measured range is 500-4,000. It says the GROWTH that would have made
+  10^6 impossible is absent over that range; it does not measure 10^6.
+- ⛔ Not an absolute throughput claim. Shared box, and the OFF arm drifted 1.45x between blocks.
+- ⛔ Says nothing about the reap path. D81 deliberately left the three full-rewrite sites whole
+  (arena.rs, comment at the TAIL_ARENA_CLAIMED site), and its own stated risk — "a workload that
+  reaps as often as it forks pays a full rewrite per reap and only half of this row's benefit" —
+  is UNMEASURED here. That is the open successor to this row.
