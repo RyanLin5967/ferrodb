@@ -3817,6 +3817,22 @@ mod tests {
     /// are 0 because the pages are parked rather than freed, so 0/3 extents are empty and
     /// `sweep_touched_extents` never reaches `free_arena`.
     ///
+    /// ⚠ **THAT DECOMPOSITION IS THIS FIXTURE'S SHAPE, NOT THE INTERIOR PATH'S.** The cost is
+    /// `2n` in all three shapes an interior branch can have, by THREE different second-rewrite
+    /// sources — measured, with the stages summed against the real reap each time, in
+    /// `super::d183_adversary::d183adv_mech_the_second_rewrite_takes_three_different_routes`:
+    ///
+    /// | shape | real | retire | drain | sweep |
+    /// |---|---|---|---|---|
+    /// | PARKED (this fixture) | (2, 0) | (1,0) | `put_pending` (1,0) | (0,0), 0/3 extents empty |
+    /// | RELEASABLE (child forked first) | (2, 2) | (1,0) | (0,0), `put_pending` never runs | (1,2), the bump forces the first free |
+    /// | MIXED (child forked partway) | (2, 1) | (1,0) | `put_pending` (1,0) | (0,1), `put_pending` resynced, so it appends |
+    ///
+    /// **Consequence for validating a fix, and it is a trap:** removing any ONE of the three
+    /// sources makes every shape read `2n -> n`, so the headline improvement is identical
+    /// whichever shape you validate on while two routes are still there. A fix has to be
+    /// measured on all three, and MIXED is the one a real workload produces.
+    ///
     /// **A REPLACEMENT MUST MEASURE THROUGH `Reaper::reap`.** Pre-registering from the source
     /// is not enough on its own — this band did that and still got the magnitude wrong, because
     /// the pre-registration was made about a function the fixture did not call.
@@ -5425,5 +5441,151 @@ mod d183_adversary {
         );
         assert_eq!(real, (2, 0), "one interior reap is not 2 full rewrites and 0 appends");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **2n IS ROUTE-INVARIANT, AND THE ROUTE IS NOT.** The interior arm costs two full rewrites
+    /// per branch in all three page shapes an interior branch can have -- and gets there three
+    /// different ways. This matters for validating a fix: **a fix that removes one of the three
+    /// second-rewrite sources makes every shape read `2n -> n`, so the headline improvement is
+    /// identical whichever arm you validate on, while the other routes are still there.**
+    ///
+    /// I had asserted the RELEASABLE arm's decomposition from arithmetic that closed (2 rewrites
+    /// + 2 appends over 3 arenas) rather than from the steps. This measures the steps.
+    ///
+    ///   * PARKED (pages born before the child): `retire` rewrite + `put_pending` rewrite; no
+    ///     extent is empty so the sweep frees nothing. **(2, 0)**
+    ///   * RELEASABLE (pages born after the child): `retire` rewrite; the drain finds the log
+    ///     EMPTY so `put_pending` never runs -- but `take_pending` bumped `pending_version`
+    ///     anyway, so the first extent the sweep frees is forced into a rewrite and the rest
+    ///     append. **(2, 2)**
+    ///   * MIXED (both): `retire` rewrite + `put_pending` rewrite, and because `put_pending`
+    ///     RESYNCED `durable_pending_version` the sweep's frees append rather than rewrite.
+    ///     **(2, k)**
+    #[test]
+    fn d183adv_mech_the_second_rewrite_takes_three_different_routes() {
+        /// `shape`: 0 = parked, 1 = releasable, 2 = mixed.
+        fn one(shape: u8) -> (Harness, std::path::PathBuf, BranchId, Vec<ArenaId>) {
+            let (h, path) = armed("route", shape as usize);
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            match shape {
+                0 => {
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                    }
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                }
+                1 => {
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                    let birth = h.catalog.next_epoch();
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+                    }
+                }
+                _ => {
+                    for _ in 0..2 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                    }
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                    let birth = h.catalog.next_epoch();
+                    for _ in 0..2 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+                    }
+                }
+            }
+            assert!(h.catalog.has_live_children(b.branch_id.id).unwrap());
+            let arenas: Vec<ArenaId> =
+                h.catalog.get_raw(b.branch_id.id).unwrap().arenas.iter().copied().collect();
+            (h, path, b.branch_id, arenas)
+        }
+
+        for (shape, label) in [(0u8, "PARKED    "), (1, "RELEASABLE"), (2, "MIXED     ")] {
+            // (i) The real reaper, end to end.
+            let (h, path, id, arenas) = one(shape);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            reaper.reap(id).unwrap();
+            let (r1, a1) = h.store.persist_counters();
+            let real = (r1 - r0, a1 - a0);
+            // What the sweep actually did to the extents, asked of the store, not inferred.
+            let still_owned =
+                arenas.iter().filter(|a| h.store.arena_owner(**a).is_some()).count();
+            let _ = std::fs::remove_file(&path);
+
+            // (ii) The same branch, stage by stage.
+            let (h, path, id, arenas) = one(shape);
+            let rec = h.catalog.get_raw(id.id).unwrap();
+            let ep = h.catalog.next_epoch();
+
+            let (s0, t0) = h.store.persist_counters();
+            let released = h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+            let (s1, t1) = h.store.persist_counters();
+            let retire = (s1 - s0, t1 - t0);
+            let parked_now = h.store.pending_len();
+            let empty_after_retire =
+                arenas.iter().filter(|a| h.store.extent_is_empty(**a)).count();
+
+            // The drain, spelled exactly as `drain_pending_seeded` spells it.
+            let taken = h.store.take_pending();
+            let put_ran = !taken.is_empty();
+            if put_ran {
+                h.store.put_pending(taken).unwrap();
+            }
+            let (s2, t2) = h.store.persist_counters();
+            let drain = (s2 - s1, t2 - t1);
+
+            // The sweep: `free_arena` for every extent that is now empty.
+            let mut swept = 0usize;
+            for a in arenas.iter().copied() {
+                if h.store.extent_is_empty(a) {
+                    h.store.free_arena(a).unwrap();
+                    swept += 1;
+                }
+            }
+            let (s3, t3) = h.store.persist_counters();
+            let sweep = (s3 - s2, t3 - t2);
+            let summed = (retire.0 + drain.0 + sweep.0, retire.1 + drain.1 + sweep.1);
+
+            println!(
+                "ROUTE {label} real={real:?} | retire={retire:?} released={released} parked={parked_now}                  empty_after_retire={empty_after_retire}/{} | put_pending_ran={put_ran} drain={drain:?}                  | sweep={sweep:?} freed={swept} | SUM={summed:?} | still_owned_after_real_reap={still_owned}",
+                arenas.len()
+            );
+
+            assert_eq!(summed, real, "{label}: stages do not sum to the real reap");
+            assert_eq!(real.0, 2, "{label}: the interior cost is not 2 full rewrites");
+            assert_eq!(retire, (1, 0), "{label}: retire_arenas_by_rule is not one rewrite");
+            match shape {
+                0 => {
+                    assert!(put_ran, "PARKED: the drain had nothing to put back");
+                    assert_eq!(drain, (1, 0), "PARKED: put_pending is not the second rewrite");
+                    assert_eq!(sweep, (0, 0), "PARKED: the sweep freed something");
+                    assert_eq!(swept, 0, "PARKED: an extent was empty");
+                }
+                1 => {
+                    assert!(!put_ran, "RELEASABLE: put_pending ran, so the drain was not empty");
+                    assert_eq!(parked_now, 0, "RELEASABLE: retire parked pages");
+                    assert_eq!(
+                        empty_after_retire,
+                        arenas.len(),
+                        "RELEASABLE: not every extent emptied, so the sweep cannot be the route"
+                    );
+                    // THE CLAIM UNDER CHECK: the second rewrite is the bump-forced first free.
+                    assert_eq!(
+                        sweep,
+                        (1, arenas.len() as u64 - 1),
+                        "RELEASABLE: the sweep is not one forced rewrite then appends"
+                    );
+                    assert_eq!(swept, arenas.len(), "RELEASABLE: the sweep did not free every extent");
+                    assert_eq!(still_owned, 0, "RELEASABLE: the real reap left extents owned");
+                }
+                _ => {
+                    assert!(put_ran, "MIXED: the drain had nothing to put back");
+                    assert_eq!(drain, (1, 0), "MIXED: put_pending is not the second rewrite");
+                    // put_pending resynced durable_pending_version, so the sweep APPENDS.
+                    assert_eq!(sweep.0, 0, "MIXED: the sweep paid a rewrite after put_pending");
+                    assert!(swept > 0, "MIXED: no extent emptied, so this is just the parked shape");
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
