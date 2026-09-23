@@ -1,0 +1,68 @@
+FIRE-CHECK — does `reusing_a_recycled_page_reaches_the_durable_map` detect the defect it names?
+================================================================================================
+worktree: /Users/idide/wt/ferrodb-d183-reap-delta   branch: d183-recycled-pop (cut from main 0e20c72)
+tree at mutation time: clean (git status --porcelain = 0 lines), HEAD 97b4564
+recorded: 2026-09-23
+instrument: `cargo test --lib branch::arena::tests::reusing_a_recycled_page` (debug). No timings.
+            Assertions are on two integers (`persist_counters`) and on a byte string
+            (`state_bytes`, CRC32-terminated).
+
+WHY THIS FILE EXISTS
+--------------------
+The claim is that a recycled page handed out again reaches the durable free-space map. The failure
+it prevents is a restored extent answering `extent_is_empty` while holding live pages, which frees
+that page range back to the allocator. A green test that has never been made to fail asserts
+nothing about that, and this test was written from the defect rather than after it.
+
+⛔ THE MUTANT THAT MATTERS IS M1b, NOT M1
+------------------------------------------
+The test asserts two things: that the persist after a reuse is a REWRITE (the mechanism), and that
+a store restored from image+tail is byte-identical to one restored from a full image (the
+outcome). M1 fails on the first. That is not enough evidence: a test that only pins the mechanism
+passes whenever the mechanism is present, whatever the mechanism achieves — it reads command
+shape, not resulting state. So M1b runs the same mutant with the counter assertion RELAXED, which
+leaves only the byte comparison able to fail. It fails, and its message names the consequence.
+
+THE MUTANTS
+-----------
+M1   the guard in `persist_delta_locked` removed (`|| self.recycled_reissued.load(..)`), so the
+     flag is still set and never consulted.
+M1b  M1, plus the counter assertion relaxed to the defective value, so ONLY the byte comparison
+     can fail.
+M2   the `store(true)` at the pop in `alloc_in_arena` removed, so the flag is never set. A
+     different injection point with the same observable — both halves of the mechanism are
+     load-bearing.
+
+RESULTS — against HEAD 97b4564, each mutant applied to a clean tree and reverted after
+----------------------------------------------------------------------------------------
+M1   FAILED:
+       the claim after a recycled-page reuse APPENDED (0 rewrites, 1 appends) instead of
+       rewriting the image
+       left: (0, 1)   right: (1, 0)
+     test result: FAILED. 0 passed; 1 failed
+
+M1b  FAILED, on the byte comparison, which is the result this file exists to record:
+       the durable map still lists the reused page as recycled: a restored extent would answer
+       `extent_is_empty` while holding a live page
+     test result: FAILED. 0 passed; 1 failed
+     ⇒ the test detects the divergent durable STATE, not merely the absence of the guard.
+
+M2   FAILED:
+       the claim after a recycled-page reuse APPENDED (0 rewrites, 1 appends) instead of
+       rewriting the image
+     test result: FAILED. 0 passed; 1 failed
+
+A FIXTURE TRAP THAT ALREADY COST A WRONG READING
+--------------------------------------------------
+The first version of this test used `alloc_for` for the trailing persist. `alloc_for` claims the
+extent (which persists) and THEN allocates a page into it, advancing `next_free` with nothing
+after it to write that down — so the byte comparison failed on THAT field, an ordinary unpersisted
+`next_free` which D85 owns and this test is not about. Measured: it did, and it read as a failure
+of the fix while the fix was working. The test uses `arena_for`, which persists with no mutation
+after it. Recorded because the wrong reading was convincing.
+
+NOT CLAIMED HERE
+----------------
+No concurrent case is fire-checked. The flag is set under the `state` lock the pop is already
+taken under, and cleared before the image is serialised so that a pop landing in between sets it
+again — that argument is in the code at both sites and is not reproduced by a test.
