@@ -453,6 +453,14 @@ pub struct ArenaPageStore {
 ///     first persist rewrites the image, which drops the torn bytes. So a good record can never
 ///     end up sitting behind a bad one, which is the one arrangement the reader cannot recover
 ///     from (it must stop at the first bad record, and would then silently discard the good one).
+/// **D183.** What a `take_pending` handed out, so the matching `put_pending` can describe the
+/// drain by difference instead of by restating the whole log. See [`PersistState::drain_mark`].
+struct DrainMark {
+    rewrites: u64,
+    base_version: u64,
+    taken: Vec<(PageId, ArenaId)>,
+}
+
 struct PersistState {
     /// Bytes of the image THIS process last wrote to `checkpoint_path`, or 0 for "none".
     image_bytes: u64,
@@ -481,6 +489,31 @@ struct PersistState {
     /// serialises, so a push racing the write is recorded as still-dirty and costs one extra
     /// rewrite — never a missed one.
     durable_pending_version: u64,
+    /// **D183.** Proof that the durable pending-free log is still the one `take_pending` handed
+    /// out, so `put_pending` may describe the drain by what it REMOVED instead of restating the
+    /// whole log.
+    ///
+    /// `rewrites` and `durable_pending_version` as they stood at the take, plus the KEYS the take
+    /// handed out. Between the take and the put, exactly two things can make the durable log stop
+    /// being the pre-take log: a full image rewrite (which publishes the drained, empty log) and
+    /// another record that carries the log. The first moves `rewrites`; the second moves
+    /// `durable_pending_version`. Both unchanged means the file still lists precisely
+    /// `DrainMark::taken`.
+    ///
+    /// ⛔ **The keys are carried because `put_pending`'s contract is "the log is now exactly
+    /// this", NOT "I released what I dropped".** An earlier draft derived the removals from
+    /// `release_page` instead, on the reasoning that `drain_pending_seeded` releases every entry
+    /// it drops. It does — but `put_pending` is public and
+    /// `putting_the_pending_log_back_reaches_the_durable_map` calls it with a subset and no
+    /// releases at all, which that draft turned into a durable log with four entries where a full
+    /// rewrite gives two. The removals are therefore computed from what the drain TOOK against
+    /// what it PUT BACK, which needs no assumption about any other method.
+    ///
+    /// `None` means "do not try", and every ambiguous case resolves to it: a second drain
+    /// overlapping this one, a take whose log was not level with memory to begin with, a log
+    /// larger than [`ArenaPageStore::DRAIN_MARK_CAP`], a map loaded from elsewhere. The absolute
+    /// record is always correct, so the fallback costs bytes and never correctness.
+    drain_mark: Option<DrainMark>,
     /// Full-image rewrites and tail appends this store has performed.
     ///
     /// Per-STORE, where `storage::atomic_file`'s counters are per-process. Both exist and neither
@@ -595,6 +628,7 @@ impl ArenaPageStore {
                 tail_bytes: 0,
                 image_epoch: crate::cluster::epoch(),
                 durable_pending_version: 0,
+                drain_mark: None,
                 rewrites: 0,
                 appends: 0,
             }),
@@ -973,11 +1007,35 @@ impl ArenaPageStore {
         //
         // The guard stays exactly as strong: every drain that removes an entry still bumps, and
         // `put_pending`'s record is what discharges it afterwards.
+        //
+        // **`persist` is taken FIRST and only for this**, per the outermost rule in
+        // [`PersistState`]. It is here so the mark below is cut from the same instant as the take:
+        // read afterwards, a rewrite landing in between would be invisible to it and the drain
+        // record would describe a log the file no longer holds.
+        let mut persist = self.persist.lock().unwrap();
         let mut st = self.state.lock().unwrap();
+        // BEFORE the bump. The mark is only usable if the durable log was level with memory at
+        // this instant — otherwise the file is already missing an entry (an unrecorded
+        // `park_or_release`, say) and removing from it would leave it missing.
+        let version = self.pending_version.load(Ordering::SeqCst);
+        let level = persist.durable_pending_version == version;
         let taken = std::mem::take(&mut st.pending);
         if !taken.is_empty() {
             self.pending_version.fetch_add(1, Ordering::SeqCst);
         }
+        // A second drain overlapping this one poisons the mark: two takes cannot both be "the
+        // log the file still holds", and `put_pending` has no way to tell whose entries it has.
+        let overlapping = persist.drain_mark.is_some();
+        persist.drain_mark =
+            if taken.is_empty() || !level || overlapping || taken.len() > Self::DRAIN_MARK_CAP {
+                None
+            } else {
+                Some(DrainMark {
+                    rewrites: persist.rewrites,
+                    base_version: version,
+                    taken: taken.iter().map(|p| (p.page_id, p.arena_id)).collect(),
+                })
+            };
         taken
     }
 
@@ -997,32 +1055,78 @@ impl ArenaPageStore {
         // record that REPLACES the log has to be written in the order the log actually changed,
         // or a `TAIL_PAGES_PARKED` cut by a concurrent reap lands on the wrong side of it.
         let mut persist = self.persist.lock().unwrap();
-        let (payload, dirty, version) = {
+        // ⭐ **Which record, and it is the difference between linear and quadratic.**
+        //
+        // The absolute one restates the WHOLE log, and the log is also in the image, so once it
+        // has grown past roughly a third of the map every such record exceeds `compact_threshold`
+        // and each drain costs a full rewrite again. Measured through the real reaper before this
+        // branch existed: interior reaps settled at **0.58 rewrites per branch over 8…128
+        // branches** — a better constant than the 2.0 they started at, and the same Θ(N²) class.
+        //
+        // The drain record instead names only what LEFT the log, which is what actually changed.
+        // It is usable exactly when the durable log is still the one `take_pending` handed out;
+        // [`PersistState::drain_mark`] is that proof, and every ambiguous case resolves to the
+        // absolute record, which is always correct.
+        let mark = persist.drain_mark.take();
+        let (payload, dirty, covered, kind) = {
             let mut st = self.state.lock().unwrap();
             st.pending.extend(entries);
             let dirty = std::mem::take(&mut st.recycled_dirty);
             // Read under the SAME lock as the log this encodes. See `persist_delta_locked`'s
             // `pending_covered`: a version read outside would vouch for a push the record misses.
             let version = self.pending_version.load(Ordering::SeqCst);
+
+            // Nothing may have moved the durable log since the take: a full image rewrite
+            // publishes the drained log (moves `rewrites`), and any other record that carries the
+            // log moves `durable_pending_version`. `removed` is then the difference between what
+            // the drain TOOK and what it PUT BACK — no assumption about who released what.
+            //
+            // A caller that puts back a key the take did not hand out is describing a log this
+            // record cannot reach by removal alone, so that falls back too.
+            let plan = mark.as_ref().filter(|m| {
+                m.rewrites == persist.rewrites && m.base_version == persist.durable_pending_version
+            });
+            let removed: Option<Vec<(PageId, ArenaId)>> = plan.and_then(|m| {
+                let kept: std::collections::HashSet<(PageId, ArenaId)> =
+                    st.pending.iter().map(|p| (p.page_id, p.arena_id)).collect();
+                let held: std::collections::HashSet<(PageId, ArenaId)> =
+                    m.taken.iter().copied().collect();
+                if kept.iter().any(|k| !held.contains(k)) {
+                    return None;
+                }
+                Some(m.taken.iter().copied().filter(|k| !kept.contains(k)).collect())
+            });
+
             let mut p = Vec::new();
             p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-            p.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
-            for e in st.pending.iter() {
-                Self::encode_pending_entry(&mut p, e);
-            }
+            let kind = match &removed {
+                Some(rm) => {
+                    p.extend_from_slice(&(rm.len() as u32).to_be_bytes());
+                    for (page, arena) in rm {
+                        p.extend_from_slice(&page.to_be_bytes());
+                        p.extend_from_slice(&arena.0.to_be_bytes());
+                    }
+                    Self::TAIL_PENDING_DRAINED
+                }
+                None => {
+                    p.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
+                    for e in st.pending.iter() {
+                        Self::encode_pending_entry(&mut p, e);
+                    }
+                    Self::TAIL_PENDING_REPLACED
+                }
+            };
             Self::encode_arena_sections(&mut p, &st, &dirty);
-            (p, dirty, version)
+            // The drain record discharges exactly the take's own bump and nothing else, so it
+            // vouches for `base + 1`. Anything that bumped alongside it stays undescribed and the
+            // next persist rewrites, which is the same conservative direction as everywhere else.
+            let covered = match (&removed, &mark) {
+                (Some(_), Some(m)) => m.base_version + 1,
+                _ => version,
+            };
+            (p, dirty, covered, kind)
         };
-        // ⚠ **This record is O(pending log), so it amortises WEAKLY where the others amortise
-        // strongly.** The log is also in the image, so a log that has grown past roughly a third
-        // of the map makes every such record exceed `compact_threshold` and the call degenerates
-        // to the full rewrite it replaces — never worse than that, and strictly better below it.
-        // Stated here rather than discovered: closing it needs the drain to name what it
-        // RELEASED, which `put_pending`'s signature does not carry, and
-        // `putting_the_pending_log_back_reaches_the_durable_map` pins that signature.
-        if let Err(e) =
-            self.persist_delta_locked(&mut persist, Self::TAIL_PENDING_REPLACED, &payload, Some(version))
-        {
+        if let Err(e) = self.persist_delta_locked(&mut persist, kind, &payload, Some(covered)) {
             // Nothing reached the file, so the arenas this record named are still owed one.
             // Re-marking rather than assuming: an arena dirtied again while the append was in
             // flight is already back in the set and `extend` leaves it there.
@@ -1590,9 +1694,14 @@ impl ArenaPageStore {
     /// image once per interior branch.
     const TAIL_PAGES_PARKED: u8 = 3;
     /// **D183.** The pending-free log was REPLACED wholesale, and the arenas the drain released
-    /// into have new recycled lists. `put_pending`'s record, and the closing half of
-    /// `take_pending`'s read-modify-write.
+    /// into have new recycled lists. `put_pending`'s record when it cannot prove the durable log
+    /// is still the one the drain took — always correct, and O(the whole log).
     const TAIL_PENDING_REPLACED: u8 = 4;
+    /// **D183.** A drain removed exactly these entries from the pending-free log.
+    /// `put_pending`'s record when [`PersistState::drain_mark`] proves the durable log is the one
+    /// `take_pending` handed out — **O(released) rather than O(the whole log)**, which is what
+    /// keeps a run of interior reaps linear in bytes instead of quadratic.
+    const TAIL_PENDING_DRAINED: u8 = 5;
     /// Kinds this build understands. An allowlist for the same reason `READABLE_STATE_VERSIONS`
     /// is one.
     const KNOWN_TAIL_KINDS: &'static [u8] = &[
@@ -1600,7 +1709,15 @@ impl ArenaPageStore {
         Self::TAIL_EXTENT_FREED,
         Self::TAIL_PAGES_PARKED,
         Self::TAIL_PENDING_REPLACED,
+        Self::TAIL_PENDING_DRAINED,
     ];
+
+    /// Largest pending-free log for which a drain will be tracked key by key.
+    ///
+    /// Past it [`PersistState::drain_mark`] is not taken at all and `put_pending` writes the
+    /// absolute record, so the transient 8 bytes per entry this costs is bounded by a constant
+    /// and not by a workload. A bound rather than a warning.
+    const DRAIN_MARK_CAP: usize = 1 << 16;
 
     /// Below this the tail may grow freely however small the image is.
     ///
@@ -2113,6 +2230,28 @@ impl ArenaPageStore {
                     let mut st = self.state.lock().unwrap();
                     log.retain(|p| st.extents.contains_key(&p.arena_id));
                     st.pending = log;
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — the small half of `put_pending`.** Everything the drain reclaimed left the
+            // log; everything else in it is untouched, which is why this record does not have to
+            // name the survivors.
+            Self::TAIL_PENDING_DRAINED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut removed = std::collections::HashSet::new();
+                for _ in 0..n {
+                    let page = c.u32()?;
+                    let arena = ArenaId(c.u32()?);
+                    removed.insert((page, arena));
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // Idempotent, and independent of what else is in the log: removing a key that
+                    // is not there is the identity. That is what lets this record sit on either
+                    // side of a `TAIL_EXTENT_FREED` or a `TAIL_PAGES_PARKED` for the same pages.
+                    st.pending.retain(|p| !removed.contains(&(p.page_id, p.arena_id)));
                     Self::apply_arena_sections(&mut c, &mut st)?;
                 }
                 self.live_pages.store(live, Ordering::SeqCst);
