@@ -81,9 +81,100 @@
 //!   ratio, and `f/sync` with a zero denominator is not a small batch, it is no measurement.
 //! - Any SQL error from any statement. A refused `BEGIN AGENT SESSION` is a fork that did not
 //!   happen, and counting the arm around it reports a mediated path as an unmediated one.
+//! - A cell whose run ids do not have the shape the mode asked for: `distinct` refuses unless the
+//!   count of DISTINCT ids equals the forks, `shared` refuses unless there is exactly ONE distinct
+//!   id, it is the pinned one, and it was echoed back once per statement. Neither is a weakening of
+//!   the other — `shared` cannot use a distinct count as its witness by construction, so it counts
+//!   echoes instead, and it additionally pins the value. See `run_ids` and `RunIdMode`.
 //!
 //! Every refusal exits non-zero, so a run that could not see its subject cannot be read as a run
 //! that saw nothing wrong.
+//!
+//! # S5 — THE RUN-ID ARM. `D130_RUN_ID=distinct|shared`
+//!
+//! ⭐ **PRE-REGISTERED 2026-09-23, BEFORE A SINGLE CELL OF THIS ARM HAD BEEN RUN.** Nothing below
+//! was written with a number in front of it; the smoke run that proved the knob does not disturb
+//! the default arm was a 12-fork proof pass and is labelled as such in `bench/d130_run_id_arm.txt`.
+//!
+//! The `⚠ What this does NOT license` bullet above *names* a second serialiser and then does not
+//! test it. This knob tests it. Today every fork this harness issues carries a run id unique across
+//! the whole cell, so `prov_store.intern` appends and fsyncs **once per fork** — and it does that
+//! while holding `AgentRuntime`'s `state` mutex (`runtime.rs`, `begin_session_as_staged`: `state`
+//! is locked, then `intern` is called under it), inside the statement-wide catalog guard pgwire
+//! holds. A global mutex held across a disk round trip admits one forker at a time, which is
+//! exactly the shape that would make group commit's ×17.3 invisible to a client.
+//!
+//! * **`distinct` (the DEFAULT, and today's behaviour, unchanged.)** Every fork carries
+//!   `(a<thread>, r<thread>_<iter>)`. `MemProvenanceStore::intern` keys on `(agent_id, run_id)`
+//!   (`src/provenance/store.rs`, `let key = (run.agent_id.clone(), run.run_id.clone())`), so that
+//!   key is new every time and `DurableProvenanceStore::intern` runs its append + fsync.
+//! * **`shared`.** Every fork in every thread carries the one tuple `(a0, r0_0)` — byte for byte
+//!   the statement thread 0 issues on its first iteration in `distinct` mode. The first fork of the
+//!   cell interns; every fork after it takes the repeat path in `DurableProvenanceStore::intern`
+//!   (`let before = self.mem.run_count(); … if self.mem.run_count() == before { return Ok(id); }`),
+//!   which returns the existing `ProvId` and never reaches `append_locked`. **That fsync is gone
+//!   for all but one fork of the entire cell.**
+//!
+//! **Both halves of the key are pinned, because both halves ARE the key.** Sharing only the run id
+//! would leave `(a<thread>, r0_0)` distinct per thread and so one intern per thread — 128 of them
+//! at T=128, concentrated at the start of the cell, which is precisely the high-T end where the
+//! reading has to be trusted. The knob is named for the run id and documented as what it is: the
+//! provenance *actor tuple*.
+//!
+//! ## The discriminator, in the column this file actually prints
+//!
+//! `f/sync` is **forks ÷ syncs**. The banked pgwire run reads P = 1.00 at every T — one catalog
+//! fsync per fork, no batch at all.
+//!
+//!   **A.** `shared`'s `f/sync` RISES above 1.00 and keeps rising with T while `distinct` stays
+//!          ≈1.00 ⇒ `intern`'s fsync under `state` **was** the binding serialiser. Group commit's
+//!          batch was invisible to clients because no two forks could be inside `wait_durable` at
+//!          once, and D159's split was correct but bottled behind a term it did not touch.
+//!   **B.** BOTH arms stay ≈1.00 at every T ⇒ `intern` is **NOT** the binding term. A third
+//!          serialiser bounds the pgwire fork path and this arm has now excluded the named
+//!          suspect. **That is an equally real result and is not a failed run** — it retires the
+//!          only mechanism the file header currently offers, which is worth more than confirming
+//!          it.
+//!   **C.** `shared` rises but flattens at some batch `B` < T ⇒ `intern` was *a* serialiser and
+//!          something else bounds the batch at `B`. Outcome 2 of the ladder at the top of this
+//!          file, one layer in.
+//!
+//! ⚠ **The dispatch brief for this arm phrased the prediction as "the SHARED arm's `f/sync` must
+//! FALL below 1.00 as T rises".** That is outcome A with the ratio inverted — *syncs per fork*
+//! falls below 1.00 exactly when *forks per sync* rises above it — and this file prints forks÷syncs,
+//! so A above is written in the column that exists. Recorded rather than silently corrected,
+//! because which direction was pre-registered is the entire content of a pre-registration.
+//!
+//! ## Why `shared` cannot be refused by the store, and what happens if that ever changes
+//!
+//! `RunEntity::same_actor` counts `parent_branch`, so a repeat whose parent differs is refused
+//! rather than reused. Every fork here forks from trunk — `BEGIN AGENT SESSION` binds
+//! `parent: current.unwrap_or(BranchId::TRUNK)` and this harness never has a session open when it
+//! issues one (arm P connects fresh; arm S `ABANDON`s first) — so the tuple is constant and the
+//! repeat is a lookup. If that stops being true the store returns an error, the server returns an
+//! `ErrorResponse`, and `refuse_on_error` exits non-zero. **The failure mode is loud, not a quietly
+//! wrong ratio**, which is the only reason it is acceptable to depend on that fact at all.
+//!
+//! ## What this arm is NOT
+//!
+//! * **Arm D cannot respond to the knob — but its rows still move, and the invariant is
+//!   SYSTEMATIC, not per-cell.** The positive control calls `TableBranchCatalog::fork` directly,
+//!   never builds a `RunEntity` and never reads the environment, so no code path carries the knob
+//!   into it. ⚠ **An earlier draft of this very paragraph said its rows "must read the same in both
+//!   modes". That is false, and the smoke pass caught it before this arm had any evidence in it.**
+//!   Arm D is itself a batch race — exhibiting one is the reason it exists — so its sync count is
+//!   stochastic at a fixed `T`. Measured on the default knob alone, at the smoke ladder `f=4,
+//!   T=2`, 30 consecutive reps of this binary on 2026-09-23: **25 reps read 8 syncs (f/sync 1.00),
+//!   4 read 7 (1.14), 1 read 6 (1.33)**. A single `shared` cell reading 7 therefore sits inside the
+//!   DEFAULT arm's own distribution and is not evidence of anything.
+//!   ⇒ The check is that arm D shows no **trend** across modes — reproducible across reps, moving
+//!   with `T`. Reading one differing arm-D cell as a leak is reading this harness's noise as a
+//!   finding, and reading arm D's agreement in a single pair of runs as proof of no leak is the
+//!   same error pointed the other way.
+//! * **A `shared` cell is not a database anyone would run.** One run id for every fork is a
+//!   provenance store with one entity in it and attribution that answers nothing. It is a
+//!   term-removal control. The only thing it licenses is the comparison against `distinct` at the
+//!   same `T`, in the same process, on the same counter.
 
 use std::collections::BTreeSet;
 use std::io::{BufReader, Read, Write};
@@ -272,11 +363,18 @@ fn branch_names(reply: &Reply) -> Vec<String> {
 
 /// The run ids a reply echoed back, as the SERVER recorded them.
 ///
-/// Every `BEGIN AGENT SESSION` in this harness carries a run id unique across the whole cell
-/// (`r<thread>_<iteration>`), and a `SessionStarted` row exists only for a statement that
-/// succeeded. So the count of DISTINCT run ids in the replies is a server-side statement that this
-/// many distinct fork statements ran — and unlike the branch name it cannot be deflated by slot
+/// A `SessionStarted` row exists only for a statement that succeeded, so every id this returns is
+/// the server saying a fork happened — and unlike the branch name it cannot be deflated by slot
 /// recycling, because the catalog never invents a run id.
+///
+/// ⚠ **Which statistic of these ids is the witness depends on [`RunIdMode`], and the parser does
+/// not.** In `distinct` mode each `BEGIN AGENT SESSION` carries `r<thread>_<iteration>`, unique
+/// across the whole cell, and the witness is the count of DISTINCT ids. In `shared` mode every
+/// statement carries the one pinned id, so a distinct count is 1 by construction and carries no
+/// information; the witness there is the number of ECHOES plus the requirement that the single
+/// distinct value is the pinned one. The pinned id is deliberately spelled in the same
+/// `r<digits>_<digits>` shape, so this filter is identical in both modes rather than being a second
+/// parser that could drift from the first.
 fn run_ids(reply: &Reply) -> Vec<String> {
     reply
         .texts
@@ -359,6 +457,64 @@ fn rig(root: &Path, tag: &str) -> Rig {
         let _ = serve(listener, ctx);
     });
     Rig { branches, addr, _dir: dir }
+}
+
+// ---------------------------------------------------------------------------------------------
+// the run-id knob
+// ---------------------------------------------------------------------------------------------
+
+/// The pinned actor tuple for [`RunIdMode::Shared`].
+///
+/// Chosen to be exactly what thread 0 iteration 0 issues in `Distinct` mode, so the two modes are
+/// the same statement at `T=1, f=1` and differ only in how the tuple varies after that.
+const SHARED_AGENT: &str = "a0";
+const SHARED_RUN: &str = "r0_0";
+
+/// Which provenance actor tuple each fork carries — the S5 arm. See the `D130_RUN_ID` section of
+/// this file's header for the pre-registration; this type only implements it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunIdMode {
+    /// `(a<thread>, r<thread>_<iter>)` — a key the store has never seen, so every fork pays
+    /// `intern`'s append and fsync. Today's behaviour and the default.
+    Distinct,
+    /// `(a0, r0_0)` for every fork of every thread, so `intern` is a lookup after the first.
+    Shared,
+}
+
+impl RunIdMode {
+    /// `D130_RUN_ID`, or `Distinct`.
+    ///
+    /// ⛔ An unrecognised value REFUSES rather than falling back to the default. A typo that
+    /// silently produced the default arm would bank a `distinct` table under a `shared` label,
+    /// which is the one failure this knob can cause that a reader cannot see.
+    fn from_env() -> RunIdMode {
+        match std::env::var("D130_RUN_ID").ok().as_deref() {
+            None | Some("") | Some("distinct") => RunIdMode::Distinct,
+            Some("shared") => RunIdMode::Shared,
+            Some(other) => {
+                eprintln!(
+                    "d130: REFUSING. D130_RUN_ID={other:?} is neither `distinct` nor `shared`. \
+                     Defaulting a mode knob would bank one arm's table under the other's name."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            RunIdMode::Distinct => "distinct",
+            RunIdMode::Shared => "shared",
+        }
+    }
+
+    /// The `(agent, run)` tuple thread `th` carries on iteration `i`.
+    fn identity(self, th: usize, i: usize) -> (String, String) {
+        match self {
+            RunIdMode::Distinct => (format!("a{th}"), format!("r{th}_{i}")),
+            RunIdMode::Shared => (SHARED_AGENT.to_string(), SHARED_RUN.to_string()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -462,8 +618,8 @@ fn refuse_on_error(r: &Reply, what: &str) {
 }
 
 /// Run one cell: `t` client threads, `f` forks each, on a freshly built server.
-fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
-    let rig = rig(root, &format!("{}-t{t}", arm.tag()));
+fn run_cell(arm: Arm, mode: RunIdMode, t: usize, f: usize, root: &Path) -> Cell {
+    let rig = rig(root, &format!("{}-{}-t{t}", arm.tag(), mode.tag()));
 
     // Snapshot AFTER the rig is built. `Catalog::create`, the arena and the runtime's construction
     // are fixture cost; charging their syncs to the clients would inflate `f/sync`'s denominator
@@ -472,6 +628,10 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
 
     let mut reported: BTreeSet<String> = BTreeSet::new();
     let mut runs: BTreeSet<String> = BTreeSet::new();
+    // Echoes, not distinct values. In `Shared` mode the distinct set collapses to one entry by
+    // construction, so the count that still carries information is how many times the server sent
+    // a run id back — once per `SessionStarted`, i.e. once per fork that actually happened.
+    let mut run_hits = 0usize;
     let mut named = 0usize;
     let mut asked = 0usize;
     let addr = rig.addr;
@@ -488,7 +648,8 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
                     Arm::PerFork => None,
                 };
                 for i in 0..f {
-                    let sql = format!("BEGIN AGENT SESSION AS 'a{th}' RUN 'r{th}_{i}';");
+                    let (agent, run) = mode.identity(th, i);
+                    let sql = format!("BEGIN AGENT SESSION AS '{agent}' RUN '{run}';");
                     match arm {
                         Arm::PerFork => {
                             let mut c = Client::connect(addr).expect("connect");
@@ -524,6 +685,7 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
         for h in hs {
             let (n, r, nm, a) = h.join().expect("client thread");
             reported.extend(n);
+            run_hits += r.len();
             runs.extend(r);
             named += nm;
             asked += a;
@@ -551,15 +713,47 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
         );
         std::process::exit(1);
     }
-    if runs.len() != asked {
-        eprintln!(
-            "d130: REFUSING. {} at T={t}: asked for {asked} forks but the server echoed {} distinct \
-             run ids. The fork total cannot be taken from this harness's own counter when the two \
-             witnesses disagree.",
-            arm.label(),
-            runs.len()
-        );
-        std::process::exit(1);
+    // ⚠ The run-id witness is the ONE check the S5 knob changes, and it is split rather than
+    // loosened: `Shared` cannot use a distinct count, because pinning the tuple is the whole point
+    // of the arm and would make that count 1 at every T. It pays for the statistic it gives up by
+    // ALSO pinning the value — `Distinct` never checks WHAT the ids were, only how many were
+    // distinct, so the shared branch below is the strictly stronger of the two, not a weakening.
+    match mode {
+        RunIdMode::Distinct => {
+            if runs.len() != asked {
+                eprintln!(
+                    "d130: REFUSING. {} at T={t}: asked for {asked} forks but the server echoed {} \
+                     distinct run ids. The fork total cannot be taken from this harness's own \
+                     counter when the two witnesses disagree.",
+                    arm.label(),
+                    runs.len()
+                );
+                std::process::exit(1);
+            }
+        }
+        RunIdMode::Shared => {
+            if runs.len() != 1 || runs.iter().next().map(String::as_str) != Some(SHARED_RUN) {
+                eprintln!(
+                    "d130: REFUSING. {} at T={t}: D130_RUN_ID=shared pins every fork to run id \
+                     `{SHARED_RUN}`, but the server echoed {} distinct ids: {:?}. If the ids are \
+                     not the pinned one, `prov_store.intern` was not taking the repeat path and \
+                     this arm removed nothing.",
+                    arm.label(),
+                    runs.len(),
+                    runs
+                );
+                std::process::exit(1);
+            }
+            if run_hits != asked {
+                eprintln!(
+                    "d130: REFUSING. {} at T={t}: asked for {asked} forks but the server echoed a \
+                     run id {run_hits} times. In shared mode the echo count is the witness that a \
+                     statement ran, and it disagrees with this harness's own counter.",
+                    arm.label()
+                );
+                std::process::exit(1);
+            }
+        }
     }
     if arm == Arm::PerFork && reported.len() != asked {
         eprintln!(
@@ -581,9 +775,17 @@ fn run_cell(arm: Arm, t: usize, f: usize, root: &Path) -> Cell {
         std::process::exit(1);
     }
 
-    // `runs.len()`, not `reported.len()`: the run ids are the witness that survives slot recycling,
-    // and in arm S the distinct branch names are FEWER than the forks by construction.
-    Cell { forks: runs.len(), syncs: after - before }
+    // The run ids, not `reported.len()`: they are the witness that survives slot recycling, and in
+    // arm S the distinct branch names are FEWER than the forks by construction. Which *statistic*
+    // of them is the count differs by mode for the reason given at the refusal above — and in
+    // `Distinct` the two are provably the same number, since `runs.len() == asked` was just
+    // enforced and `run_hits >= runs.len()`. The match is kept anyway so the default arm's fork
+    // total comes from the expression it has always come from.
+    let forks = match mode {
+        RunIdMode::Distinct => runs.len(),
+        RunIdMode::Shared => run_hits,
+    };
+    Cell { forks, syncs: after - before }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -643,6 +845,7 @@ fn main() {
         eprintln!("d130: REFUSING. an empty thread list or zero forks per thread collects nothing.");
         std::process::exit(1);
     }
+    let mode = RunIdMode::from_env();
 
     let root = std::env::temp_dir().join(format!("ferrodb-d130-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
@@ -665,13 +868,42 @@ fn main() {
     println!("   a rate from this harness would be a fact about the socket. The counts are the");
     println!("   evidence.");
     println!();
+    match mode {
+        RunIdMode::Distinct => {
+            println!("RUN-ID MODE: distinct  (D130_RUN_ID unset or `distinct` — the default arm)");
+            println!("  Every fork carries `(a<thread>, r<thread>_<iter>)`, a key the provenance");
+            println!("  store has never seen, so `prov_store.intern` appends and fsyncs once per");
+            println!("  fork while holding `AgentRuntime`'s `state`. That serialiser is PRESENT in");
+            println!("  every row below. Run with D130_RUN_ID=shared for the arm that removes it.");
+        }
+        RunIdMode::Shared => {
+            println!("RUN-ID MODE: shared  (D130_RUN_ID=shared — THE S5 TERM-REMOVAL ARM)");
+            println!("  Every fork in every thread carries the one tuple `({SHARED_AGENT}, {SHARED_RUN})`, so");
+            println!("  `prov_store.intern` takes its repeat path after the first fork of the cell");
+            println!("  and its fsync under `state` is GONE. ⛔ Not a configuration anyone would");
+            println!("  run: one run id for the whole cell is attribution that answers nothing.");
+            println!("  These rows mean only what they mean against `distinct` at the same T.");
+            println!("  Arm D builds no RunEntity and cannot respond to the knob — but it IS a batch");
+            println!("  race, so one differing D cell is this harness's noise, not a leak. Only a");
+            println!("  reproducible TREND across modes invalidates a run; header has the spread.");
+        }
+    }
+    println!("  The arm is pre-registered in this file's header, written before any cell was run.");
+    println!();
     println!("# start: {}  load: {}", stamp(), loadavg());
     println!();
 
     self_check(&root);
     println!();
 
-    println!("  arm                                threads    forks    syncs    f/sync   f/sync÷T");
+    // The mode is repeated on the column header, not just in the banner above, so a row lifted out
+    // of this table into a note still carries the arm it came from. It is header text: no cell,
+    // no count and no ratio below depends on it.
+    println!(
+        "  arm                                threads    forks    syncs    f/sync   f/sync÷T   \
+         [run-id: {}]",
+        mode.tag()
+    );
     let row = |label: &str, t: usize, c: &Cell| {
         let per = c.forks as f64 / c.syncs as f64;
         println!(
@@ -681,7 +913,7 @@ fn main() {
     };
     for arm in [Arm::PerFork, Arm::Persistent] {
         for &t in &threads {
-            row(arm.label(), t, &run_cell(arm, t, f, &root));
+            row(arm.label(), t, &run_cell(arm, mode, t, f, &root));
         }
         println!();
     }
@@ -695,6 +927,7 @@ fn main() {
     println!("   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact");
     println!("   about pgwire and every cell in this run is a fact about this harness.");
 
+    println!("# run-id mode: {}", mode.tag());
     println!("# end: {}  load: {}", stamp(), loadavg());
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -30,7 +30,24 @@ PHASES=${PHASES:-direct pgwire}
 APPEND=${APPEND:-0}
 DIRECT_N=${DIRECT_N:-8000}
 PGWIRE_F=${PGWIRE_F:-40}
+# S5 — the run-id arm. `distinct` is today's behaviour and the pre-registered default; `shared`
+# pins the provenance actor tuple so `prov_store.intern` is a lookup after the first fork and its
+# fsync under `AgentRuntime`'s `state` disappears. Only the pgwire harness reads it — the direct
+# harness builds no `RunEntity` — so PHASES=direct is unaffected and the direct rows of a `shared`
+# run are comparable to a `distinct` run's. The pre-registration is in the harness header.
+D130_RUN_ID=${D130_RUN_ID:-distinct}
 LABEL="d130-$(git rev-parse --short HEAD 2>/dev/null || echo nohead)"
+
+# Validated HERE, above the lock, deliberately. A typo that only surfaced inside the binary would
+# have spent a fifteen-minute hold on a shared lock to learn it, and three other lanes queue on it.
+case "$D130_RUN_ID" in
+    distinct | shared) ;;
+    *)
+        echo "$LABEL: REFUSING — D130_RUN_ID=$D130_RUN_ID is neither 'distinct' nor 'shared'." >&2
+        exit 2
+        ;;
+esac
+export D130_RUN_ID
 
 SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 LOCK_WAIT=${LOCK_WAIT:-5400}
@@ -88,6 +105,7 @@ run_bounded() {
     echo "Run by bench/d130_run.sh under $SUITE_LOCK, so no other suite's fsyncs move D."
     echo "tree: $(git rev-parse HEAD 2>/dev/null)  worktree: $(pwd)"
     echo "host: $(uname -srm)  started: $(date -u +%FT%TZ)"
+    echo "run-id mode: $D130_RUN_ID  (pgwire phase only; pre-registered in examples/d130_pgwire_batch.rs)"
     echo
 } >> "$OUT"
 
@@ -157,7 +175,15 @@ case " $PHASES " in *" pgwire "*)
 {
     echo
     echo "================================================================================"
-    echo "MODE=pgwire — examples/d130_pgwire_batch.rs."
+    echo "MODE=pgwire — examples/d130_pgwire_batch.rs.  RUN-ID: $D130_RUN_ID"
+    echo
+    echo "  D130_RUN_ID=distinct (default) — every fork interns a NEW provenance run and pays"
+    echo "  prov_store.intern's append+fsync under AgentRuntime's state mutex, inside pgwire's"
+    echo "  statement-wide catalog guard. D130_RUN_ID=shared pins the actor tuple so every fork"
+    echo "  after the first takes intern's repeat path and that fsync is gone — the S5 arm, whose"
+    echo "  pre-registration and outcome table live in the harness header. Arm D builds no"
+    echo "  RunEntity and cannot respond to the knob, but it is itself a batch race: one differing"
+    echo "  D cell across modes is noise, and only a reproducible trend invalidates a run."
     echo "================================================================================"
 } >> "$OUT"
 
