@@ -294,6 +294,27 @@ pub fn d170_reset_overlay_counters() {
     }
 }
 
+/// D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Cost of `stage_all`'s per-statement
+/// `ws.frame.clone()` (`runtime.rs`), paired with the `ops.len()` it copied.
+pub static D172_DROP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_APPEND_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_CLONE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_CLONE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_OPS_LEN_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_OPS_LEN_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (total clone ns, clone calls, total append ns, max ops.len())
+pub fn d172_clone_counters() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (D172_CLONE_NS.load(Relaxed), D172_CLONE_CALLS.load(Relaxed),
+     D172_APPEND_NS.load(Relaxed), D172_OPS_LEN_MAX.load(Relaxed), D172_DROP_NS.load(Relaxed))
+}
+
+pub fn d172_reset_clone_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [&D172_CLONE_NS, &D172_CLONE_CALLS, &D172_APPEND_NS, &D172_DROP_NS, &D172_OPS_LEN_SUM, &D172_OPS_LEN_MAX] { c.store(0, Relaxed); }
+}
+
 fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u64> {
     let pk_type = pk_type?;
     let mut conjuncts = Vec::new();
@@ -3114,12 +3135,38 @@ impl AgentRuntime {
                 }
                 mirrored.push((item.row, item.after));
             }
-            ws.frame.clone()
+            // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Times THIS clone alone and pairs it
+            // with the integer `ops.len()` at the same moment, so the timer never travels without
+            // its counter.
+            {
+                let n = ws.frame.ops.len() as u64;
+                let t0 = std::time::Instant::now();
+                let f = ws.frame.clone();
+                D172_CLONE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                D172_CLONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                D172_OPS_LEN_SUM.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                D172_OPS_LEN_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                f
+            }
         };
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
         // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
         // statement, which is also why the frame is cloned after every row is folded in.
-        self.log.append(&frame)?;
+        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The second Theta(S) site: classify's
+        // frame_eq + extends compare op-by-op over the stored frame.
+        {
+            let t0 = std::time::Instant::now();
+            let r = self.log.append(&frame);
+            D172_APPEND_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            r?
+        };
+        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The third Theta(S) site: dropping the
+        // clone deallocates S `Op`s and their witnesses, outside both timers above.
+        {
+            let t0 = std::time::Instant::now();
+            drop(frame);
+            D172_DROP_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
         // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the

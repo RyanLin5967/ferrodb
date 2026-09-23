@@ -127,3 +127,69 @@ B2. THE CONFIRMATION ARM, registered before running it. **A PHASE TIMER, NOT A R
 
     FALSIFIER: if `ops.len()` does not itself grow ~1 per statement in this workload, the axis is
     not what I think and the fit is meaningless — so `ops.len()` is REPORTED, never assumed.
+
+B3. 2026-09-23. OUTCOME B2b FIRED: the clone is A term, not THE term. Measured, arm B, arena,
+    pushdown, W=100 fixed, ops.len() REPORTED not assumed (it reads S+200 throughout, i.e. exactly
+    1 op per statement, so the falsifier in B2 passes):
+
+        S      us/stmt   clone us   ops.len   clone%
+      100        67.00       7.39       300     11.0
+      400        88.33      16.35       600     18.5
+     1600       176.17      51.20      1800     29.1
+     6400       541.37     202.83      6600     37.5
+    12800       914.92     370.76     13000     40.5
+
+    The clone is LINEAR in ops.len() at a very stable ~28 ns per op copied (24.6 / 27.3 / 28.4 /
+    30.7 / 28.5), and contributes 28.6 of the 66.8 ns/statement total slope = **43%**.
+    ⇒ B1's site is CONFIRMED as a real Theta(S) per-statement term. It is NOT the whole term.
+
+    ⛔ 57% IS UNATTRIBUTED, AND AN UNATTRIBUTED MAJORITY IS NOT A RESULT -- a phase table must
+    close. Registering the next site BEFORE measuring it.
+
+    THE SECOND SITE, again located by READING: `self.log.append(&frame)` immediately after the
+    clone. `MemEffectLog::append` -> `classify(&frames.frames[i], frame)` (`src/tel/log.rs:368`),
+    which runs `frame_eq(old, new)` and then `extends(old, new)` -- BOTH op-by-op over the stored
+    frame via `op_eq` (`log.rs:300`, comparing tbl/row/col/witness/kind). **That is a second
+    Theta(S) pass per statement**, on top of the Theta(S) copy.
+    `log.rs:284-286` states the cause in its own words: *"because `stage_all` re-appends the open
+    frame once per statement"*. One design decision, two Theta(S) costs.
+
+    ⚠ D138 DOES NOT COVER THIS AND MUST NOT BE READ AS COVERING IT. Its arms report
+    `classify_append calls 0` -- classify was never exercised in that measurement -- and its scan
+    counter is on the INDEX lookup (`frames_for`), not on classify's prefix comparison.
+
+    PREDICTIONS:
+      B3a. append_ns rises linearly with ops.len() and clone% + append% accounts for ~all of the
+           slope -> the phase table CLOSES and the term is fully attributed to the re-append design.
+      B3b. clone% + append% still leaves a large gap -> a third site exists; report the gap as a
+           gap and do NOT distribute it across the two known ones.
+      B3c. append_ns flat -> classify is not the second term; the reading is wrong.
+
+B4. 2026-09-23. OUTCOME B3b FIRED: the table does NOT close. Measured (arm B, arena, pushdown,
+    W=100, load 3):
+
+        S      us/stmt   clone us  append us   clone%  append%   SUM%
+      100        64.75       7.11       2.67     11.0      4.1    15.1
+      400        89.58      16.51       6.47     18.4      7.2    25.7
+     1600       165.04      48.90      20.44     29.6     12.4    42.0
+     6400       539.75     202.54      84.33     37.5     15.6    53.1
+    12800       947.04     383.22     162.28     40.5     17.1    57.6
+
+    As SLOPES over S=100..12800: total 69.5 ns/stmt; clone 29.6 (43%); append 12.6 (18%).
+    ⇒ BOTH sites CONFIRMED Theta(S) and linear. Together they are 61% of the slope.
+    ⇒ **~27 ns/stmt (39%) IS UNATTRIBUTED. Reported as a gap, and NOT distributed across the two
+    known sites**, per B3b.
+
+    THE THIRD SITE, registered before measuring: **the cloned frame's DROP.** `stage_all` clones
+    an O(S) `TxnFrame`, passes `&frame` to `append`, and the clone then falls out of scope.
+    Dropping a `Vec<Op>` of length S deallocates S `Op`s, each carrying an `Option<Value>`
+    witness -- Theta(S), and it sits OUTSIDE both existing timers.
+    ⚠ This is a KNOWN pattern in this project's own notes ("a phase table must close -- an
+    unattributed 40% was the clone's DROP"), which is a reason to TEST it, not to assume it.
+
+    PREDICTIONS:
+      B4a. drop_ns is Theta(S) and clone+append+drop accounts for ~the whole slope -> the table
+           CLOSES; the whole per-statement term is the cost of materialising, comparing and
+           discarding a cumulative frame once per statement.
+      B4b. drop_ns small, gap persists -> a fourth site; report the gap again and STOP rather than
+           keep guessing. Two registered misses is the limit for this row.

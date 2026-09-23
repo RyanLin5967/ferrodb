@@ -12,7 +12,8 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrodb::agent_sql::runtime::{d170_overlay_counters, d170_reset_overlay_counters, AgentRuntime};
+use ferrodb::agent_sql::runtime::{d170_overlay_counters, d170_reset_overlay_counters,
+    d172_clone_counters, d172_reset_clone_counters, AgentRuntime};
 use ferrodb::agent_sql::AgentOutput;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
@@ -107,7 +108,7 @@ impl StubDb {
 }
 
 /// One stub cell, same shape as `cell`: pre-load untimed to (w, s), then time TIMED statements.
-fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
+fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64, f64, u64, f64, f64) {
     let mut db = StubDb::new();
     let mut base = Session::new();
     db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut base);
@@ -123,6 +124,7 @@ fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
         assert_eq!(affected(&out), Some(1), "STUB preload no-op at w={w} s={s} i={i}");
     }
     d170_reset_overlay_counters();
+    d172_reset_clone_counters();
     let mut samples = Vec::with_capacity(TIMED);
     for i in 0..TIMED {
         let k = key(i, w, rows);
@@ -132,7 +134,11 @@ fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
         assert_eq!(affected(&out), Some(1), "STUB timed no-op at w={w} s={s} i={i}");
     }
     let (pf, wu, wn, mu, mo) = d170_overlay_counters();
-    (median(&mut samples), pf, wu, wn, mu, mo)
+    let (cns, ccalls, ans, omax, dns) = d172_clone_counters();
+    let clone_us = if ccalls == 0 { 0.0 } else { cns as f64 / ccalls as f64 / 1000.0 };
+    let append_us = if ccalls == 0 { 0.0 } else { ans as f64 / ccalls as f64 / 1000.0 };
+    let drop_us = if ccalls == 0 { 0.0 } else { dns as f64 / ccalls as f64 / 1000.0 };
+    (median(&mut samples), pf, wu, wn, mu, mo, clone_us, omax, append_us, drop_us)
 }
 
 fn affected(o: &Outcome) -> Option<usize> {
@@ -158,7 +164,7 @@ const TIMED: usize = 200;
 
 /// Run one cell: pre-load to (w distinct keys, s statements) untimed, then time TIMED statements
 /// on keys already staged. Returns (median ms, probe_fired, walk_unprob, max_unprob, max_overlay).
-fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
+fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64, f64, u64, f64, f64) {
     let mut db = Db::new(rows);
     let mut base = db.ctx.session();
     db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut base);
@@ -181,6 +187,7 @@ fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
 
     // TIMED WINDOW. Keys already staged, so the overlay does not grow while timing.
     d170_reset_overlay_counters();
+    d172_reset_clone_counters();
     let mut samples = Vec::with_capacity(TIMED);
     for i in 0..TIMED {
         let k = key(i, w, rows);
@@ -190,7 +197,11 @@ fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
         assert_eq!(affected(&out), Some(1), "timed no-op at w={w} s={s} i={i}");
     }
     let (pf, wu, wn, mu, mo) = d170_overlay_counters();
-    (median(&mut samples), pf, wu, wn, mu, mo)
+    let (cns, ccalls, ans, omax, dns) = d172_clone_counters();
+    let clone_us = if ccalls == 0 { 0.0 } else { cns as f64 / ccalls as f64 / 1000.0 };
+    let append_us = if ccalls == 0 { 0.0 } else { ans as f64 / ccalls as f64 / 1000.0 };
+    let drop_us = if ccalls == 0 { 0.0 } else { dns as f64 / ccalls as f64 / 1000.0 };
+    (median(&mut samples), pf, wu, wn, mu, mo, clone_us, omax, append_us, drop_us)
 }
 
 fn main() {
@@ -214,7 +225,7 @@ fn main() {
         "C" => format!("S FIXED at {s_fixed}, W swept -- statement count constant"),
         _ => "unknown".to_string(),
     });
-    println!("\n      axis        W        S   median ms   us/stmt   probe   wlknopk   walk_unprob   max_unprob   max_overlay");
+    println!("\n      axis        W        S   us/stmt   clone us  append us    drop us   ops.len   clone%  append%   drop%   SUM%   probe");
     let mut first: Option<f64> = None;
     for &x in &axis {
         let (w, s) = match arm.as_str() {
@@ -225,7 +236,8 @@ fn main() {
         };
         assert!((w as i64) <= rows, "w={w} exceeds table rows={rows}: the overlay would SATURATE");
         let stub = std::env::var("D171_STUB").is_ok();
-        let (med, pf, wu, wn, mu, mo) = if stub { stub_cell(rows, w, s) } else { cell(rows, w, s) };
+        let (med, pf, wu, wn, mu, mo, clone_us, opsmax, append_us, drop_us) =
+            if stub { stub_cell(rows, w, s) } else { cell(rows, w, s) };
 
         // Controls, enforced before the number is printed.
         //
@@ -247,8 +259,12 @@ fn main() {
         assert_eq!(mu, 0, "unprobeable_rows non-zero at w={w} s={s}: cell VOID");
         assert_eq!(mo, w as u64, "max_overlay_len={mo} != intended W={w}: the overlay SATURATED, cell VOID");
 
-        println!("  {x:>8} {w:>8} {s:>8}   {med:>9.4}   {:>7.2}   {pf:>5}   {wn:>6}   {wu:>11}   {mu:>10}   {mo:>11}",
-                 med * 1000.0);
+        let us = med * 1000.0;
+        let (cp, ap, dp) = if us > 0.0 {
+            (clone_us / us * 100.0, append_us / us * 100.0, drop_us / us * 100.0)
+        } else { (0.0, 0.0, 0.0) };
+        println!("  {x:>8} {w:>8} {s:>8}   {us:>7.2}   {clone_us:>8.2}   {append_us:>8.2}   {drop_us:>8.2}   {opsmax:>7}   {cp:>6.1}   {ap:>6.1}   {dp:>5.1}   {:>4.1}   {pf:>5}",
+                 cp + ap + dp);
         if first.is_none() { first = Some(med); }
         if let Some(m0) = first {
             if x != axis[0] {
