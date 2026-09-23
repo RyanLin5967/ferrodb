@@ -1,0 +1,267 @@
+D183 RE-VERIFY — RAW EXTRACT, run 1 (tree 4b1ab2d), no interpretation. Interpretation: artie-research frontier/lane_d183_reverify.md
+instrument: cargo test --lib (WHOLE lib target) per mutant; runner /Users/idide/wt/logs/d183-reverify/run_mutants.sh; mutant applier /Users/idide/wt/logs/d183-reverify/mutate.py; full logs in /Users/idide/wt/logs/d183-reverify
+
+== baseline: cargo test --lib branch::arena
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 1607 filtered out; finished in 48.50s
+== baseline: cargo test --lib -- --list  (tests listed)
+1675
+== baseline: cargo test --lib
+test result: ok. 1673 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 92.92s
+== baseline: cargo test --lib d183adv_a -- --nocapture --test-threads=1
+   --> src/catalog/catalog_page.rs:800:13
+    --> src/branch/reaper.rs:2264:17
+    --> src/branch/reaper.rs:2264:17
+    --> src/branch/reaper.rs:2264:17
+    --> src/branch/reaper.rs:2264:17
+test branch::arena::d183_adversary::d183adv_a1_the_predicate_is_what_the_fixture_assumes ... A1 interior=false: has_live_children = false for all 8 branches, 24 arenas total (3 per branch)
+A1 interior=true: has_live_children = true for all 8 branches, 24 arenas total (3 per branch)
+test branch::arena::d183_adversary::d183adv_a1_what_the_real_reaper_costs ... A1 REAL `Reaper::reap` -- (full rewrites, delta appends, pages freed)
+  LEAF      8: rewrites=  0 appends= 24 pages_freed= 32
+  LEAF     16: rewrites=  0 appends= 48 pages_freed= 64
+  INTERIOR  8: rewrites=  0 appends= 16 pages_freed=  0
+  INTERIOR 16: rewrites=  1 appends= 31 pages_freed=  0
+  rewrite slope over 8 more branches: LEAF=0, INTERIOR=1
+test branch::arena::d183_adversary::d183adv_a2_the_interior_zero_appends_is_unfalsifiable ... A2 INTERIOR, 32 branches x 64 pages (8x the pages, 4x the branches of the original): rewrites=5 appends=27
+test branch::arena::d183_adversary::d183adv_a2_the_leaf_zero_is_only_a_small_n_zero ... A2 LEAF arm, hand-rolled exactly as the test under attack does it:
+  branches=   8: rewrites=   0 appends=  24
+  branches=  16: rewrites=   0 appends=  48
+  branches=  64: rewrites=   1 appends= 191
+  branches= 256: rewrites=   2 appends= 766
+  -> the leaf arm's rewrite counter FIRES at branches=64
+test branch::arena::d183_adversary::d183adv_a3_the_leaf_arm_is_counted_per_arena ... A3 LEAF appends against branches x pages
+  pages/branch= 1 branches= 8: arenas=  8 rewrites=0 appends=8
+  pages/branch= 1 branches=16: arenas= 16 rewrites=0 appends=16
+  pages/branch= 4 branches= 8: arenas= 24 rewrites=0 appends=24
+  pages/branch= 4 branches=16: arenas= 48 rewrites=0 appends=48
+  pages/branch=16 branches= 8: arenas= 40 rewrites=0 appends=40
+  pages/branch=16 branches=16: arenas= 80 rewrites=1 appends=79
+test branch::arena::d183_adversary::d183adv_a3_the_slope_is_per_branch_not_per_arena_or_page ... A3 INTERIOR rewrites against branches x pages (arenas read from the records)
+  pages/branch= 0: b=8 rewrites=1 arenas=0 | b=16 rewrites=1 arenas=0 | b=24 rewrites=1 arenas=0
+  pages/branch= 1: b=8 rewrites=0 arenas=8 | b=16 rewrites=0 arenas=16 | b=24 rewrites=0 arenas=24
+  pages/branch= 4: b=8 rewrites=0 arenas=24 | b=16 rewrites=1 arenas=48 | b=24 rewrites=1 arenas=72
+  pages/branch=16: b=8 rewrites=1 arenas=40 | b=16 rewrites=3 arenas=80 | b=24 rewrites=3 arenas=120
+test branch::arena::d183_adversary::d183adv_a4_flipping_only_the_predicate_flips_the_cost ... A4b same shape, only the predicate differs, through the REAL reaper:
+test branch::arena::d183_adversary::d183adv_a4_live_children_with_nothing_parked_still_pays ... A4a live children, all pages RELEASABLE: released=32 parked_after=0 rewrites=0 appends=8
+test branch::arena::d183_adversary::d183adv_a5_the_interior_cost_is_no_longer_a_class ... A5 INTERIOR cost against branches, through the REAL reaper:
+  branches=   8: rewrites=   0 appends=  16  rewrites/branch=0.000  records/branch=2.000
+  branches=  16: rewrites=   1 appends=  31  rewrites/branch=0.062  records/branch=2.000
+  branches=  32: rewrites=   1 appends=  63  rewrites/branch=0.031  records/branch=2.000
+  branches=  64: rewrites=   2 appends= 126  rewrites/branch=0.031  records/branch=2.000
+  branches= 128: rewrites=   3 appends= 253  rewrites/branch=0.023  records/branch=2.000
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 48.28s
+
+== progress.txt (verbatim)
+LOCK ACQUIRED 27534 d183-reverify 2026-09-23T21:43:19Z
+head=4b1ab2d12c7cc09e300bd38615996490c3ab5e6d blob=d4b7ae51be5f13ea0715e724d52953eb0518d355
+base_branch_arena rc=0
+base_lib_list rc=0
+base_lib rc=0
+base_a1_a5 rc=0
+M1: applied
+M1 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=719f78a152935c5a3309481b9938a998bb84d941 sha256_post=baf83862c6eb84262c65f318d3dc6d73fdf9f5b7259d95ff2947232367aebd44
+M1 rc=101 compiled=1 result=[test result: FAILED. 1669 passed; 4 failed; 2 ignored; 0 measured; 0 filtered out; finished in 89.20s]
+M3: applied
+M3 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=5f24b1e3aed7346bf6b3c90a0492f80c8f4c5b9c sha256_post=f7467ecf2e12d8da0f0c7573b3f4860292b76912142bc07cd81892455c6a7465
+M3 rc=101 compiled=1 result=[test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 107.07s]
+M4: applied
+M4 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=97de09733be9a311025d4bdefbfe80d7b8a744ac sha256_post=2c02bf9db0d159f27ad7b1bcc7d94e7173d107020b6e2c2f6b15b615566d0eb0
+M4 rc=101 compiled=1 result=[test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.37s]
+M5: applied
+M5 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=2627434cdf9650751bd96e87e296c8907618ee2c sha256_post=c37cd5126f1613e392879597d2d623e2ea6b4baa1cb7f24e9b062f2824158aae
+M5 rc=101 compiled=1 result=[test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.65s]
+M6: applied
+M6 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=5439ddc253bfcc20fd0cf1da3486737e015b3573 sha256_post=4ede3927dd4b5dada521b8fbb2e6f46002656a115720a4113b6d56c1b3d65861
+M6 rc=101 compiled=1 result=[test result: FAILED. 1672 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 89.58s]
+M7: applied
+M7 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=5fc7156d5b83b073e631410a796f1bdedbe2d314 sha256_post=ebe783f928e87afd5bbde61098672be8f0dbb1bc73e3b4325967967e7fbcd9f3
+M7 rc=101 compiled=1 result=[test result: FAILED. 1670 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 91.06s]
+M8: applied
+M8 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=0ca52cbbf9930005b46c6dd23dedbc3405cd8be8 sha256_post=c50ca1c673c3d828220ee5ac944fc9b5521910d3ecc2da7d68feb60c82c31eeb
+M8 rc=0 compiled=1 result=[test result: ok. 1673 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 94.22s]
+M9: applied
+M9 pre_blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 post_blob=d106cf122d89450f866051b16397bd0ad8bb3a02 sha256_post=b1cdf1d6690fcfe329f23def50db7c258a0817ee378d66b45481fff8822590b2
+M9 rc=0 compiled=1 result=[test result: ok. 1673 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 90.84s]
+restored blob=d4b7ae51be5f13ea0715e724d52953eb0518d355 status=[]
+DONE 2026-09-23T22:00:07Z
+
+== mut_M1
+-- diff
+-            p.extend_from_slice(&(parked.len() as u32).to_be_bytes());
+-            for e in &parked {
++            let parked_m = &parked[..parked.len().saturating_sub(1)];
++            p.extend_from_slice(&(parked_m.len() as u32).to_be_bytes());
++            for e in parked_m {
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1669 passed; 4 failed; 2 ignored; 0 measured; 0 filtered out; finished in 89.20s
+-- failed tests
+test branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite ... FAILED
+test branch::arena::tests::parking_pages_by_the_interval_rule_reaches_the_durable_map ... FAILED
+test branch::reaper::tests::log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map ... FAILED
+test branch::reaper::tests::table_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map ... FAILED
+-- panics
+thread 'branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite' (314946786) panicked at src/branch/arena.rs:4707:13:
+assertion `left == right` failed: after the interior reap: the replayed pending-free log has 2 entries where a full rewrite gives 3
+  left: 2
+ right: 3
+
+thread 'branch::arena::tests::parking_pages_by_the_interval_rule_reaches_the_durable_map' (314946909) panicked at src/branch/arena.rs:4457:9:
+assertion `left == right` failed: the pending-free log never reached the durable map, so a restart releases pages a live child can still see
+  left: 3
+ right: 4
+
+thread 'branch::reaper::tests::log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map' (314947910) panicked at src/branch/reaper.rs:2436:5:
+assertion `left == right` failed: the pending-free log a restart needs did not reach the durable map
+  left: 3
+ right: 4
+
+thread 'branch::reaper::tests::table_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map' (314948077) panicked at src/branch/reaper.rs:2437:5:
+assertion `left == right` failed: the pending-free log a restart needs did not reach the durable map
+  left: 3
+ right: 4
+
+
+== mut_M3
+-- diff
+-            let rec = st.recycled.get(&a).unwrap_or(&empty);
++            let _rec_real = st.recycled.get(&a).unwrap_or(&empty); let rec = &empty;
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 107.07s
+-- failed tests
+test branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record ... FAILED
+test branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite ... FAILED
+-- panics
+thread 'branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record' (314980825) panicked at src/branch/arena.rs:4835:13:
+assertion `left == right` failed: rewrite: the fallback did not reproduce a full rewrite
+  left: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 177, 1, 126, 167]
+ right: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 79, 20, 118, 200]
+
+thread 'branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite' (314981249) panicked at src/branch/arena.rs:4714:13:
+assertion `left == right` failed: after the interior reap: a store restored from image+tail is not byte-identical to one restored from a full image of the same state — the D183 delta does not reproduce what it replaced
+  left: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 117, 206, 38, 185]
+ right: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 248, 39, 15, 56]
+
+
+== mut_M4
+-- diff
+-                    st.recycled_dirty.insert(arena);
++                    /* M4 */
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.37s
+-- failed tests
+test branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record ... FAILED
+test branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite ... FAILED
+-- panics
+thread 'branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record' (315031610) panicked at src/branch/arena.rs:4835:13:
+assertion `left == right` failed: rewrite: the fallback did not reproduce a full rewrite
+  left: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 177, 1, 126, 167]
+ right: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 79, 20, 118, 200]
+
+thread 'branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite' (315032049) panicked at src/branch/arena.rs:4714:13:
+assertion `left == right` failed: after the drain put the log back: a store restored from image+tail is not byte-identical to one restored from a full image of the same state — the D183 delta does not reproduce what it replaced
+  left: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 117, 65, 10, 186]
+ right: [3, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 78, 157, 216, 145]
+
+
+== mut_M5
+-- diff
+-                    p.extend_from_slice(&(rm.len() as u32).to_be_bytes());
+-                    for (page, arena) in rm {
++                    p.extend_from_slice(&(rm.len().saturating_sub(1) as u32).to_be_bytes());
++                    for (page, arena) in &rm[..rm.len().saturating_sub(1)] {
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1671 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.65s
+-- failed tests
+test branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite ... FAILED
+test branch::arena::tests::putting_the_pending_log_back_reaches_the_durable_map ... FAILED
+-- panics
+thread 'branch::arena::tests::an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite' (315075466) panicked at src/branch/arena.rs:4706:13:
+assertion `left == right` failed: after the drain put the log back: the replayed pending-free log has 3 entries where a full rewrite gives 2
+  left: 3
+ right: 2
+
+thread 'branch::arena::tests::putting_the_pending_log_back_reaches_the_durable_map' (315076133) panicked at src/branch/arena.rs:4879:9:
+assertion `left == right` failed: the durable pending-free log still lists entries the drain resolved, so a restart would park released pages all over again
+  left: 3
+ right: 2
+
+
+== mut_M6
+-- diff
+-            let plan = mark.as_ref().filter(|m| {
+-                m.rewrites == persist.rewrites && m.base_version == persist.durable_pending_version
+-            });
++            let plan = mark.as_ref();
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1672 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 89.58s
+-- failed tests
+test branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record ... FAILED
+-- panics
+thread 'branch::arena::tests::a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record' (315111078) panicked at src/branch/arena.rs:4819:13:
+rewrite: the difference record was written although its proof was invalidated ([5])
+
+
+== mut_M7
+-- diff
+-        if !taken.is_empty() {
++        {
+-- compile
+   1 error: test failed, to rerun pass `--lib`
+   2 warning: unused variable: `reaper`
+-- result
+test result: FAILED. 1670 passed; 3 failed; 2 ignored; 0 measured; 0 filtered out; finished in 91.06s
+-- failed tests
+test branch::arena::d183_adversary::d183adv_mech_an_empty_take_pending_no_longer_forces_a_rewrite ... FAILED
+test branch::arena::d183_adversary::d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending ... FAILED
+test branch::arena::d183_adversary::d183adv_a1_what_the_real_reaper_costs ... FAILED
+-- panics
+thread 'branch::arena::d183_adversary::d183adv_mech_an_empty_take_pending_no_longer_forces_a_rewrite' (315148767) panicked at src/branch/arena.rs:6367:9:
+assertion `left == right` failed: an empty drain still forces the following free into a full image rewrite — the fourth D183 site is back (it read (1, 1) at 630afaa)
+  left: (1, 1)
+ right: (0, 2)
+
+thread 'branch::arena::d183_adversary::d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending' (315148768) panicked at src/branch/arena.rs:6452:9:
+assertion `left == right` failed: full image rewrites survive on the interior path: parked=0, releasable=8 (both were 16 at 630afaa)
+  left: (0, 8)
+ right: (0, 0)
+
+thread 'branch::arena::d183_adversary::d183adv_a1_what_the_real_reaper_costs' (315148755) panicked at src/branch/arena.rs:5941:9:
+assertion `left == right` failed: the leaf arm still pays full image rewrites: 8->7, 16->15
+  left: (7, 15, 8)
+ right: (0, 0, 0)
+
+
+== mut_M8
+-- diff
++        drop(persist);
++        let mut persist = self.persist.lock().unwrap();
+-- compile
+   2 warning: unused variable: `reaper`
+-- result
+test result: ok. 1673 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 94.22s
+-- failed tests
+-- panics
+
+== mut_M9
+-- diff
+-            self.pending_version.fetch_add(1, Ordering::SeqCst);
+-- compile
+   2 warning: unused variable: `reaper`
+-- result
+test result: ok. 1673 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 90.84s
+-- failed tests
+-- panics
