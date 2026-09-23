@@ -81,8 +81,21 @@ _release_lock() {
     _HELD_LOCK=0
     rm -rf "$SUITE_LOCK"
 }
+# A signal must take the children with it, BEFORE the lock is released. Every child runs under
+# `run_bounded`'s backgrounded `timeout`, and GNU timeout makes itself a process-group leader, so
+# exiting this script alone orphans a harness that keeps issuing fsyncs for up to an hour against a
+# lock that is already free for the next suite. Same shape, copied verbatim, as `_kill_descendants`
+# and note 7(b) in tools/verify-suite.sh. Fire-checked 2026-09-23 (lane s5-guard): without it, the
+# stopped descendants of a TERMed run survive it.
+_kill_descendants() {
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_descendants "$c"; done
+    kill -9 "$p" 2>/dev/null
+}
 _abort() {
     trap '' TERM INT
+    local c
+    for c in $(pgrep -P $$ 2>/dev/null); do _kill_descendants "$c"; done
     _release_lock
     echo "$LABEL: REFUSING — aborted by SIG$1 after ${SECONDS}s. A sweep cut short is not a count." >&2
     exit 143
@@ -114,6 +127,14 @@ while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
 done
 printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
 _HELD_LOCK=1
+# The pgwire harness REFUSES unless /tmp/ferrodb-suite.lock is held by one of its ANCESTORS (see
+# `refuse_unless_inside_the_suite_lock` in examples/d130_pgwire_batch.rs). This script qualifies
+# because it wrote its own `$$` into the owner file above and runs the harness as a descendant,
+# under `timeout`. Nothing is exported to claim that: the harness reads the process table, so the
+# claim cannot be made by anyone who merely read the lock. SUITE_LOCK is exported so the harness
+# ALSO checks the path this script took; it cannot replace the machine-wide lock, so a redirected
+# SUITE_LOCK runs no harness unless the real lock is held by an ancestor as well.
+export SUITE_LOCK
 echo "$LABEL: holding the suite lock as pid $$ (waited ${_waited}s)" >&2
 
 run_bounded() {
