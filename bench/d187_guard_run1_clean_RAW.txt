@@ -1,0 +1,43 @@
+# label: run1 clean at 7cc4fbb
+# lock acquired: 12975 d187-guard 2026-09-23T21:42:04Z
+# head: 7cc4fbb95375885fef90977ee3e7b15ed2783be0  dirty: 0
+# shasum sec_index_scan.rs: 6a043252a4e772f3af9ac15c3a7b33ba6941be5d
+# shasum index_scan.rs:     d5f9e17f6939ea246016f11a25387362a7e4b9e8
+# rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+# cmd: cargo test --test d187_null_skip_is_counted -- --nocapture ; then -- --list
+# start: 2026-09-23T21:42:04Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d187-null-index-scan)
+warning: unused import: `ferrodb::catalog::column::Value`
+  --> tests/d187_null_skip_is_counted.rs:87:5
+   |
+87 | use ferrodb::catalog::column::Value;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "d187_null_skip_is_counted") generated 1 warning (run `cargo fix --test "d187_null_skip_is_counted" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.20s
+     Running tests/d187_null_skip_is_counted.rs (target/debug/deps/d187_null_skip_is_counted-659ecc0f80e7daf6)
+
+running 1 test
+test an_index_entry_the_null_skip_drops_is_still_counted_as_pulled ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.47s
+
+# test rc=0  end: 2026-09-23T21:42:26Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d187-null-index-scan)
+warning: unused import: `ferrodb::catalog::column::Value`
+  --> tests/d187_null_skip_is_counted.rs:87:5
+   |
+87 | use ferrodb::catalog::column::Value;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "d187_null_skip_is_counted") generated 1 warning (run `cargo fix --test "d187_null_skip_is_counted" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.79s
+     Running tests/d187_null_skip_is_counted.rs (target/debug/deps/d187_null_skip_is_counted-659ecc0f80e7daf6)
+an_index_entry_the_null_skip_drops_is_still_counted_as_pulled: test
+
+1 test, 0 benchmarks
+# list rc=0

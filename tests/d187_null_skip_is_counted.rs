@@ -84,7 +84,6 @@ use std::sync::Arc;
 use ferrodb::binder::binder::Binder;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::index_scan::index_scan_counters;
 use ferrodb::execution::seq_scan::seq_scan_counters;
@@ -235,6 +234,9 @@ fn an_index_entry_the_null_skip_drops_is_still_counted_as_pulled() {
         sec.entries, sec.rows, sec.index_scans, sec.seq_tuples, sec.plan.trim(),
         pk.entries, pk.rows, pk.index_scans, pk.seq_tuples, pk.plan.trim(),
     );
+    // Printed on a PASS too (visible with `--nocapture`), so a green run leaves the measured
+    // integers in its log rather than only the fact that they matched.
+    println!("d187_null_skip_is_counted measured:{seen}");
 
     // ---- 1. The plan is the scan under test, and it starts ON the NULL prefix. ------------------
     assert!(
