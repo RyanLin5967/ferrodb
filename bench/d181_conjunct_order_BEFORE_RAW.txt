@@ -1,0 +1,78 @@
+D181 — conjunct order vs index selection
+rows examined = seq tuples pulled + index entries walked
+
+================ ANALYZE: no ================
+arm                 n  examined seq_tuples  seq_scans  idx_entries idx_scans   rows
+FIRE              400       400        400          1            0         0      0
+CONTROL_SEL       400       400        400          1            0         0      1
+SEL_FIRST         400       400        400          1            0         0      1
+BROAD_FIRST       400       400        400          1            0         0      1
+  -> n=400: SEL_FIRST examined 400, BROAD_FIRST examined 400 (delta 0, ratio 1.0x)
+
+FIRE              800       800        800          1            0         0      0
+CONTROL_SEL       800       800        800          1            0         0      1
+SEL_FIRST         800       800        800          1            0         0      1
+BROAD_FIRST       800       800        800          1            0         0      1
+  -> n=800: SEL_FIRST examined 800, BROAD_FIRST examined 800 (delta 0, ratio 1.0x)
+
+FIRE             1600      1600       1600          1            0         0      0
+CONTROL_SEL      1600      1600       1600          1            0         0      1
+SEL_FIRST        1600      1600       1600          1            0         0      1
+BROAD_FIRST      1600      1600       1600          1            0         0      1
+  -> n=1600: SEL_FIRST examined 1600, BROAD_FIRST examined 1600 (delta 0, ratio 1.0x)
+
+  plans at n=1600:
+    FIRE: SELECT id FROM t WHERE pad = 'zz';
+      Projection [#0] (rows=10 cost=33.10)
+        Filter (#3 = 'zz') (rows=10 cost=33.00)
+          Sequential scan on t (rows=1000 cost=23.00)
+    CONTROL_SEL: SELECT id FROM t WHERE sel = 801;
+      Projection [#0] (rows=10 cost=33.10)
+        Filter (#1 = 801) (rows=10 cost=33.00)
+          Sequential scan on t (rows=1000 cost=23.00)
+    SEL_FIRST: SELECT id FROM t WHERE sel = 801 AND broad = 1;
+      Projection [#0] (rows=1 cost=33.01)
+        Filter (#1 = 801 AND #2 = 1) (rows=1 cost=33.00)
+          Sequential scan on t (rows=1000 cost=23.00)
+    BROAD_FIRST: SELECT id FROM t WHERE broad = 1 AND sel = 801;
+      Projection [#0] (rows=1 cost=33.01)
+        Filter (#2 = 1 AND #1 = 801) (rows=1 cost=33.00)
+          Sequential scan on t (rows=1000 cost=23.00)
+
+================ ANALYZE: yes ================
+arm                 n  examined seq_tuples  seq_scans  idx_entries idx_scans   rows
+FIRE              400       400        400          1            0         0      0
+CONTROL_SEL       400       400        400          1            0         0      1
+SEL_FIRST         400       400        400          1            0         0      1
+BROAD_FIRST       400       400        400          1            0         0      1
+  -> n=400: SEL_FIRST examined 400, BROAD_FIRST examined 400 (delta 0, ratio 1.0x)
+
+FIRE              800       800        800          1            0         0      0
+CONTROL_SEL       800         2          0          0            2         1      1
+SEL_FIRST         800         2          0          0            2         1      1
+BROAD_FIRST       800       800        800          1            0         0      1
+  -> n=800: SEL_FIRST examined 2, BROAD_FIRST examined 800 (delta 798, ratio 400.0x)
+
+FIRE             1600      1600       1600          1            0         0      0
+CONTROL_SEL      1600         2          0          0            2         1      1
+SEL_FIRST        1600         2          0          0            2         1      1
+BROAD_FIRST      1600      1600       1600          1            0         0      1
+  -> n=1600: SEL_FIRST examined 2, BROAD_FIRST examined 1600 (delta 1598, ratio 800.0x)
+
+  plans at n=1600:
+    FIRE: SELECT id FROM t WHERE pad = 'zz';
+      Projection [#0] (rows=1600 cost=69.00)
+        Filter (#3 = 'zz') (rows=1600 cost=53.00)
+          Sequential scan on t (rows=1600 cost=37.00)
+    CONTROL_SEL: SELECT id FROM t WHERE sel = 801;
+      Projection [#0] (rows=1 cost=17.01)
+        Index scan on t (col 1, [801, 801]) (rows=1 cost=17.00)
+    SEL_FIRST: SELECT id FROM t WHERE sel = 801 AND broad = 1;
+      Projection [#0] (rows=1 cost=17.02)
+        Filter (#2 = 1) (rows=1 cost=17.01)
+          Index scan on t (col 1, [801, 801]) (rows=1 cost=17.00)
+    BROAD_FIRST: SELECT id FROM t WHERE broad = 1 AND sel = 801;
+      Projection [#0] (rows=1 cost=53.01)
+        Filter (#2 = 1 AND #1 = 801) (rows=1 cost=53.00)
+          Sequential scan on t (rows=1600 cost=37.00)
+
