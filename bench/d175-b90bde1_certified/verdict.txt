@@ -1,0 +1,2 @@
+d55arena-b90bde1: mode=per-target rc=0 passed=2531 failed=0 build_errors=0 head=b90bde1 log=/Users/idide/wt/artie-research/verify-out/suite-d55arena-b90bde1.log
+d55arena-b90bde1: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/suite-d55arena-b90bde1.go.log
