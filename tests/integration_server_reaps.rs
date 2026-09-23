@@ -37,6 +37,17 @@
 //! the sentence describing HOW was false, and a header that mis-names the mechanism is how the
 //! next reader concludes these assertions are stale when they are not.
 //!
+//! ⚠ **D183 — and until D183 the sentence above was still false for HALF the events it covers.**
+//! "the whole image is rewritten only when the tail outgrows its share" was true of the claim and
+//! the free and of nothing else: the slow-path retire and the pending-free drain both ended in
+//! `persist_full_locked`, which never consults the threshold, so they rewrote the whole image
+//! EVERY time — one per interior branch reaped, counted by
+//! `branch::arena::tests::d183_an_interior_reap_...`. They append now too
+//! (`TAIL_PAGES_PARKED`, `TAIL_PENDING_REPLACED`), so the sentence is finally true of all four
+//! events. Again the property is untouched: a record still reaches the device, fsynced, at each
+//! one. Recorded here because this header is where the next reader checks what the file's numbers
+//! rest on, and it is the second time this paragraph described a mechanism it did not have.
+//!
 //! * `reserved_page_count` is exact whenever the map is read, because it only ever changes at an
 //!   extent event, which is the moment the map is made durable.
 //! * `live_page_count` counts individual pages, and those are handed out **between** extent events.
