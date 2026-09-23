@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::{FullTextHandle, IndexHandle}, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
+use crate::{binder::binder::{Binder, BoundColumn, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, index_handle::{FullTextHandle, IndexHandle}, insert::Insert, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, planner::logical_plan::LogicalPlan, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -32,7 +32,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 }
                 None => None
             };
-            let scan = build_scan(entry, bound_where, bp, view.clone())?;
+            let scan = build_scan(entry, bound_where, catalog, bp, view.clone())?;
             let delete = Delete {author: None, table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
             return Ok(Plan::Write(Box::new(delete)))
         }
@@ -72,7 +72,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 Some(w) => Some(binder.bind_expr(w, &scope)?),
                 None => None
             };
-            let child = build_scan(entry, bound_where, bp.clone(), view.clone())?;
+            let child = build_scan(entry, bound_where, catalog, bp.clone(), view.clone())?;
             let mut tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
             tt_heap.set_transaction(txn, txn_id);
             let update = Update {author: None, table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, fulltext_indexes: fulltext, view: view.clone(), tt_heap};
@@ -134,17 +134,68 @@ fn open_table(entry: &TableEntry, catalog: &Catalog, bp: Arc<BufferPoolManager>,
     Ok((heap, tree, handles, fulltext))
 }
 
-fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPoolManager>, view: Arc<ReadView>) -> Result<Box<dyn Executor>, FerroError> {
-    let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
-    let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
-    let scanner = heap.scan();
-    let mut node: Box<dyn Executor> = Box::new(SeqScan {
-        scanner, schema: entry.schema.clone(), tt_heap, view
-    });
-    if let Some(pred) = predicate {
-        node = Box::new(Filter { child: node, predicate: pred})
-    }
-    Ok(node)
+/// The row source an `UPDATE` or a `DELETE` reads — planned by **the same optimizer `SELECT` uses**.
+///
+/// # D178 — this function used to be a second planning path, and it could not reach an index
+///
+/// It opened the heap, built a `SeqScan`, and wrapped it in a `Filter` when there was a predicate.
+/// It never consulted an index. Its only two callers are the `Stmt::Update` and `Stmt::Delete` arms
+/// above, and `optimize` — which holds the index-selection rewrite — was reached only by
+/// `Stmt::Select`. So **`SELECT` could get an `IndexScan` and `UPDATE`/`DELETE` structurally could
+/// not**, whatever indexes a table carried and whoever had run `ANALYZE`.
+///
+/// Measured before and after on the same harness (`examples/d178_dml_index.rs`, raws in
+/// `bench/d178_run1_BEFORE_RAW.txt` and `bench/d178_run3_AFTER_RAW.txt`), in tuples the heap
+/// yielded for four `UPDATE t SET v = ? WHERE id = ?` statements:
+///
+/// ```text
+///     rows in t        500     1000     2000     4000
+///     before          2000     4000     8000    16000      <- delta * n, exactly
+///     after               ...see the raw...               <- flat in n
+/// ```
+///
+/// D176 measured the same `delta * n` arriving at `MERGE;` through publish, which issues one
+/// `UPDATE` per changed row — so this gap is what made a merge O(delta x table).
+///
+/// # Why it delegates rather than learning to pick an index itself
+///
+/// Calling `predicate_to_bounds` + `has_index` from here would have been a much smaller diff and is
+/// **rejected by the design entry (D178, option 2)**: it is a second planning path needing its own
+/// cost model, and it would silently diverge from the plan `SELECT` chooses for the identical
+/// predicate. Delegating means there is exactly ONE planning path, so a future improvement to index
+/// selection reaches `UPDATE` and `DELETE` for free, and a future BUG in it is at least consistent.
+///
+/// The three steps below are the same three `Stmt::Select` takes at the top of this file, minus the
+/// `Binder` — DML binds its own predicate against a single-table scope first, and the column indices
+/// that produces are positions in that table's schema, which is exactly what a single-relation
+/// `Scan` means. `alias` is `None` because a DML statement has no `FROM t AS x` to carry.
+///
+/// # Why the substitution is safe for the executors above
+///
+/// `Executor::next` is one uniform method returning `(RecordId, Vec<Value>)`, and `SeqScan`,
+/// `IndexScan` and `SecondaryIndexScan` all yield the row's heap `RecordId` with its columns in
+/// schema order — the primary tree is `upsert`ed whenever a row moves (`execution::update`), so the
+/// rid an index hands back is the rid the heap scan would have. And **both `Update::execute` and
+/// `Delete::execute` drain this child completely before they write anything**, so replacing a heap
+/// scan with an index scan cannot produce the Halloween problem: no tree is mutated while the
+/// scanner over it is still live. `Update` additionally refuses to assign to column 0, so a scan
+/// driven by the primary index can never have its own key rewritten underneath it.
+fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, catalog: &Catalog, bp: Arc<BufferPoolManager>, view: Arc<ReadView>) -> Result<Box<dyn Executor>, FerroError> {
+    let scan = LogicalPlan::Scan {
+        table: entry.name.clone(),
+        alias: None,
+        output: entry.schema.columns.iter().map(|c| BoundColumn {
+            qualifier: entry.name.clone(),
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+        }).collect(),
+    };
+    let logical = match predicate {
+        Some(pred) => LogicalPlan::Filter { input: Box::new(scan), predicate: pred },
+        None => scan,
+    };
+    lower(optimize(pushdown(logical), catalog)?, catalog, bp, view)
 }
 
 fn single_table_scope(catalog: &Catalog, table: &str) -> Result<Scope, FerroError> {

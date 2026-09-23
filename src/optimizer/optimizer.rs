@@ -43,7 +43,7 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
             let tt_heap = HeapFileManager::open(entry.time_travel_root, bp);
-            Ok(Box::new(SeqScan { scanner: heap.scan(), schema: entry.schema.clone(), tt_heap, view}))
+            Ok(Box::new(SeqScan::new(heap.scan(), entry.schema.clone(), view, tt_heap)))
         }
         PhysicalPlan::Projection { input, exprs, .. } => {
             let child = lower(*input, catalog, bp, view)?;
@@ -81,11 +81,8 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                 None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
             };
 
-            let scan_lower = match lower {
-                Bound::Excluded(_) => return Err(FerroError::Bind("lower bound sec index isn't supported".into())),
-                Bound::Included(v) => Bound::Included((v, Value::Null)),
-                Bound::Unbounded => Bound::Unbounded
-            };
+            let scan_lower = secondary_scan_lower(&lower)
+                .ok_or_else(|| FerroError::Bind("lower bound sec index isn't supported".into()))?;
             let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
             Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper, tt_heap, view, col_index: column}))
         }
@@ -124,11 +121,72 @@ pub fn build_join(left: PhysicalPlan, right: PhysicalPlan, on: BoundExpr, join_t
     }
 }
 
+/// The secondary tree's lower bound for a `(value, pk)` key — or `None` when this bound **cannot
+/// be expressed at all** against that key shape.
+///
+/// A secondary index is keyed on `(value, pk)`, so `Bound::Included(v)` becomes `(v, Value::Null)`:
+/// `Null` sorts below every pk, so that is exactly the first key whose value is `v`. A *strictly
+/// excluded* `v` has no such spelling — it would have to start just past the LAST key with value
+/// `v`, and there is no maximum pk to write down. Hence `None` rather than an approximation: the
+/// nearest expressible bound is `Included`, which would silently return the rows `> v` was asked to
+/// exclude.
+///
+/// # D178 — this is the SINGLE authority, and that is the point
+///
+/// This predicate had one consumer: `lower`, which refused and returned an error. `build_index_scan`
+/// did not consult it, so the optimizer could **choose a plan that could not then be built**, and on
+/// the SELECT path that is a live, reachable defect rather than a latent one. Measured at `fe40276`
+/// + D176's counters, in `bench/d178_run1_BEFORE_RAW.txt`, on a 1,000-row table with an index on
+/// `v` and `ANALYZE` run:
+///
+/// ```text
+///   SELECT id FROM h WHERE v > 9980 ;  ERROR: binding error: lower bound sec index isn't supported
+///   SELECT id FROM h WHERE v > 9900 ;  OK, 9 rows
+/// ```
+///
+/// Same table, same index, same predicate shape — the only difference is that the higher cutoff
+/// estimates few enough rows for the index side to win the cost comparison, at which point the
+/// engine refuses a query it answers correctly one row-estimate lower. A user sees a statement
+/// start failing because their data grew.
+///
+/// So `build_index_scan` now asks this question BEFORE proposing an `IndexScan`, through
+/// [`index_scan_lowerable`], and falls through to the sequential scan it was already costing
+/// against. Both callers read this one function; neither carries its own copy of the rule, so they
+/// cannot drift apart. `lower`'s refusal STAYS — a hand-built `PhysicalPlan` can still name an
+/// unbuildable scan, and `plan::tests::test_index_scan_secondary_rejects_strict_lower` pins that.
+///
+/// ⚠ What this does NOT do is make `secondary > v` use the index. That needs a real fix in
+/// `SecondaryIndexScan` — start at `Included((v, Null))` and skip the `sec == v` run, the mirror of
+/// the `sec_upper` check it already carries — and that is a separate row, not this one. Until then
+/// the honest outcome is a correct sequential scan instead of an error.
+fn secondary_scan_lower(lower: &Bound<Value>) -> Option<Bound<(Value, Value)>> {
+    match lower {
+        Bound::Included(v) => Some(Bound::Included((v.clone(), Value::Null))),
+        Bound::Unbounded => Some(Bound::Unbounded),
+        Bound::Excluded(_) => None,
+    }
+}
+
+/// Can [`lower`] actually build an `IndexScan` on `column` with this lower bound?
+///
+/// Column 0 is the primary tree, keyed on the value alone, so every bound is expressible there.
+/// Everything else is a `(value, pk)` secondary tree and defers to [`secondary_scan_lower`].
+fn index_scan_lowerable(column: usize, lower: &Bound<Value>) -> bool {
+    column == 0 || secondary_scan_lower(lower).is_some()
+}
+
 fn build_index_scan(table: &str, predicate: &BoundExpr, catalog: &Catalog) -> Option<PhysicalPlan> {
     let mut conjuncts = Vec::new();
     let entry = catalog.get_table(table)?;
     split_and(predicate.clone(), &mut conjuncts);
-    let chosen = conjuncts.iter().position(|c| predicate_to_bounds(c).is_some_and(|(col, _, _)| has_index(entry, col)))?;
+    // D178 — an index on the column is necessary but NOT sufficient: the bound has to be one
+    // `lower` can express against that tree's key. A conjunct that fails this is passed over and
+    // the next indexed one is considered, so `sec > v AND id = 7` still reaches the primary index
+    // instead of falling all the way back to a sequential scan.
+    let chosen = conjuncts.iter().position(|c| {
+        predicate_to_bounds(c)
+            .is_some_and(|(col, lo, _)| has_index(entry, col) && index_scan_lowerable(col, &lo))
+    })?;
     let index_conjunct = conjuncts.remove(chosen);
     let (column, lower, upper) = predicate_to_bounds(&index_conjunct)?;
     let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };

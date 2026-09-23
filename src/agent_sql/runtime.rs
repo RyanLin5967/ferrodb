@@ -126,6 +126,61 @@ pub fn ours_scan_counters() -> (u64, u64) {
     )
 }
 
+/// **How many table rows a merge actually reads — D176.** Same rationale as `OURS_SCAN_*` above,
+/// aimed at a different question: whether merge cost is O(table) or O(delta).
+///
+/// # Why this is a counter and not a stopwatch
+///
+/// The duration form of this experiment (`examples/d68_merge_is_o_table.rs`) has been VOIDED
+/// TWICE — once for timing an in-memory stub, once by a disk emergency mid-sweep. An integer is
+/// not a wall-clock number and does not move when the box is loaded, which is the same reason
+/// `wal::log::FSYNC_CALLS` and the pair above exist.
+///
+/// # Why `scan_rows_observed` could not answer it
+///
+/// `RunActivity::scan_rows_observed` (`:1042`) looks like this counter and is not. It is a
+/// per-workspace field derived in `run_activity` by summing `rows_observed` over the
+/// `ReadSet::Predicate` entries a SESSION recorded in `state.captures`. A merge's internal scans
+/// call `scan_table_where` directly and record nothing into `captures`, so that field is
+/// structurally blind to them — it reads zero for a merge that scanned a million rows.
+///
+/// # ⚠ Counted PER SCAN, not per row
+///
+/// One relaxed add of `out.len()` per `scan_table_where` call, against a scan of thousands — so
+/// the instrument cannot create the slope it measures. `CALLS` is kept beside `ROWS` because the
+/// two separate a merge doing one big scan from one doing many small lookups, and those are
+/// different complexity classes that produce the same total.
+///
+/// ⛔ **`ROWS` is rows RETURNED, which is NOT rows read by the engine.** A point lookup with the
+/// predicate pushed down returns one row; if the planner declines the index and falls back to a
+/// sequential scan, the engine reads the whole table while this counter reports 1. Read it
+/// together with `execution::seq_scan::SEQ_SCAN_TUPLES`, which counts what the heap actually
+/// yielded. Flat here plus growing there is an O(table) merge behind a blind instrument.
+pub static SCAN_TABLE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_TABLE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// Of the tuples `SEQ_SCAN_TUPLES` counts, the ones pulled by a tree THIS function built.
+///
+/// The attribution counter. A merge runs two loops that each issue one statement per changed row —
+/// the point lookups here, and the publish path's `PendingWrite::into_stmt` UPDATEs — so a global
+/// count of `delta` sequential scans does not say which loop produced them. This one does, because
+/// it is incremented only from inside `scan_table_where`'s own drain. `SEQ_SCAN_TUPLES` minus this
+/// is the work done by every OTHER scan in the window.
+pub static SCAN_TABLE_SEQ_TUPLES: AtomicU64 = AtomicU64::new(0);
+
+/// `(calls, rows_returned)` since process start. Read twice and subtract to scope it to a phase.
+pub fn scan_table_counters() -> (u64, u64) {
+    (
+        SCAN_TABLE_CALLS.load(AtomicOrdering::Relaxed),
+        SCAN_TABLE_ROWS.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// Tuples sequentially scanned by trees `scan_table_where` itself built. See the static above.
+pub fn scan_table_seq_tuples() -> u64 {
+    SCAN_TABLE_SEQ_TUPLES.load(AtomicOrdering::Relaxed)
+}
+
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///
@@ -6730,10 +6785,28 @@ pub fn scan_table_where(
     };
     match plan(stmt, ctx.catalog, ctx.bp.clone(), None, view)? {
         Plan::Read(mut root) => {
+            // D176 ATTRIBUTION — bracket THIS call's own executor tree.
+            //
+            // Process-global seq-scan and index-scan counts cannot say which of a merge's two
+            // per-delta statement loops is scanning: `evaluate_merge`'s point lookups here, and
+            // the publish path's `PendingWrite -> UPDATE`. Both issue `delta` statements, so a
+            // window showing `delta` sequential scans and `delta` index scans is consistent with
+            // either one doing the scanning. Reading the seq-scan counter either side of this
+            // call's OWN drain resolves it by construction instead of by inference.
+            //
+            // `drop(root)` is explicit and load-bearing: `SeqScan` flushes its tally in `Drop`, so
+            // the closing read must happen after the tree is gone or it sees nothing.
+            let seq_before = crate::execution::seq_scan::seq_scan_counters().1;
             let mut out = Vec::new();
             while let Some(next) = root.next() {
                 out.push(next?.1);
             }
+            drop(root);
+            let seq_here = crate::execution::seq_scan::seq_scan_counters().1 - seq_before;
+            // D176 — one relaxed add per SCAN, never per row. See `SCAN_TABLE_ROWS`.
+            SCAN_TABLE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            SCAN_TABLE_ROWS.fetch_add(out.len() as u64, AtomicOrdering::Relaxed);
+            SCAN_TABLE_SEQ_TUPLES.fetch_add(seq_here, AtomicOrdering::Relaxed);
             Ok(out)
         }
         Plan::Write(_) => Err(FerroError::Bind("expected a read plan".into())),
