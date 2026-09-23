@@ -12,12 +12,24 @@ figure is a number from the overlay, not from the engine.
 The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
 path. They are simply not a measurement of the path this file's headline names.
 Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
-Harnesses corrected: commit fc443c4.  ⛔ THE RE-RUN HAS NOT HAPPENED. It was attempted and VOIDED — disk hit 0G mid-sweep and
+Harnesses corrected: commit fc443c4.  ✅ **THE RE-RUN HAS NOW HAPPENED FOR THIS HARNESS — D170,
+2026-09-23.** ⚠ Scoped deliberately: **D170 re-ran ONLY the d71 harness.** The same sentence is
+still TRUE and is deliberately LEFT STANDING in the nine other files carrying this banner
+(`d55_*`, `d56_*`, `d67_*`, `d68_*`) — their re-runs are still owed. Bulk-fixing this line across
+all eleven would have falsified nine true statements.
+The EARLIER attempt was VOIDED — disk hit 0G mid-sweep and
 every target/ on the box was deleted; eleven of its blocks exited rc=127 while the runner
 printed 'ALL FIVE COMPLETE' over them. That record is kept at
 `bench/d101_rerun_VOID_disk_emergency.txt`. There is NO `bench/d101_rerun.txt` and this
 line used to cite one, which read as provenance for a run that does not exist.
-⇒ Everything above marked "plausibly survives" REMAINS A HYPOTHESIS, not a finding.
+⇒ ✅ **THIS FILE'S AFTER ARM IS NO LONGER A HYPOTHESIS — IT WAS RIGHT, AND IT WAS RIGHT BEFORE I
+RE-MEASURED IT.** Its `AFTER 0.013 → 0.016, ratio 1.23` (with 1.00 and 1.27 in sibling arms) was
+banked **2026-09-20** and is reproduced on the SHIPPED ARENA path by D170: post-fix **0.99x /
+0.97x** arena, **0.98x / 0.29x** stub. The class holds in both configurations; the stub cost a
+**~4x CONSTANT** in the absolutes only (16,000 rows, fix in: stub 0.0117 ms vs arena 0.0509 ms).
+⛔ The surviving O(table) term is the **BASE SCAN** `scan_table_where(table, alias, None, ctx)`,
+NOT the overlay walk — the overlay is O(1) here via the probe, measured.
+⇒ Evidence: `bench/d170_d71_rerun_RAW.txt`, `frontier/d170_adversary.md`.
 ⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
 ===============================================================================================
 
