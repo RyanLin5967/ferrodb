@@ -212,6 +212,24 @@ pub fn predicate_to_bounds(pred: &BoundExpr) -> Option<(usize, Bound<Value>, Bou
         (BoundExpr::Literal(v), BoundExpr::Column(c)) => (*c, flip(*operator)?, v.clone()),
         _ => return None
     };
+    // D187 — a NULL literal is not a bound, and must not become one.
+    //
+    // Every comparison against NULL is UNKNOWN, so the predicate matches NO row. Turning it into a
+    // bound makes the scan answer a RANGE instead, and the worst shape is not the obvious one:
+    // `v >= NULL` became `(Included(Null), Unbounded)`, and since `Null` sorts below every literal
+    // (`column.rs`'s `type_rank`) that scan starts at the FIRST entry and has no upper bound — it
+    // returns the WHOLE TABLE for a predicate that matches nothing. `v = NULL` is the same defect
+    // one step smaller: `(Included(Null), Included(Null))` returns every NULL-valued row.
+    //
+    // `check_comparable` in the binder lets a NULL literal through deliberately, on the stated
+    // grounds that "three-valued logic handles it in `compare`". That is true of the `Filter` path
+    // and false of this one — an index bound never reaches `compare`. This is the other exit from
+    // that hazard, and closing it here rather than in the scans is what makes it independent of
+    // whether a scan is bounded: `build_index_scan` simply declines the index and falls back to the
+    // sequential scan, whose `Filter` evaluates `compare` and correctly answers nothing.
+    if matches!(val, Value::Null) {
+        return None;
+    }
     let (lower, upper) = match op {
         TokenType::Equal => (Bound::Included(val.clone()), Bound::Included(val)),
         TokenType::Less => (Bound::Unbounded, Bound::Excluded(val)),

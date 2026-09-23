@@ -59,6 +59,14 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let schema = entry.schema.clone();
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
             let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
+            // D187 — does this scan compare anything against a bound? If it does, an entry whose
+            // indexed value is NULL is not in the answer, because that comparison is UNKNOWN and an
+            // UNKNOWN row is excluded. If it does not, there is nothing to be UNKNOWN about and the
+            // NULL entries belong. Computed here, before either bound is moved into the scanner,
+            // and handed to whichever scan is built — the rule is one sentence and both scans get
+            // the same one. See `IndexScan::skip_nulls`.
+            let skip_nulls =
+                !matches!(lower, Bound::Unbounded) || !matches!(upper, Bound::Unbounded);
             if column == 0 {
                 // SHARED root cell (D53). The point-lookup path every indexed read takes was
                 // missed when D53 wired plan::open_table: a private cell here means an index scan
@@ -68,7 +76,7 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                     None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp),
                 };
                 let scanner = tree.range_scan(lower, upper)?;
-                return Ok(Box::new(IndexScan{heap, scanner, schema, tt_heap, view}))
+                return Ok(Box::new(IndexScan{heap, scanner, schema, tt_heap, view, skip_nulls}))
             } 
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
@@ -84,7 +92,7 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let scan_lower = secondary_scan_lower(&lower)
                 .ok_or_else(|| FerroError::Bind("lower bound sec index isn't supported".into()))?;
             let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
-            Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper, tt_heap, view, col_index: column}))
+            Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper, tt_heap, view, col_index: column, skip_nulls}))
         }
         PhysicalPlan::HashJoin { left, right, on, join_type, left_keys, right_keys, right_width } => {
             let left_exec = lower(*left, catalog, bp.clone(), view.clone())?;

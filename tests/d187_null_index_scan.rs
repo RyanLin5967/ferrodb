@@ -350,15 +350,58 @@ fn fully_unbounded_scan_keeps_nulls() {
 // END TO END — the reported shape, through real SQL, with the plan asserted first
 // ---------------------------------------------------------------------------------------------
 
-/// 500 NULL rows plus one `v = 1` row: `v < 5` must answer 1, and answered 501 before the fix.
+/// A table the cost model will actually choose the INDEX for. Both dimensions are load-bearing.
 ///
-/// The `explain_plan` assertion is load-bearing. Below a few thousand rows the cost model prefers a
-/// filtered sequential scan, whose `Filter` rejects NULLs correctly — so without this assertion a
-/// GREEN here would mean "the index was never used", not "the index is right".
-#[test]
-fn sql_range_predicate_answers_one_row() {
-    let mut d = seeded(500, 0);
+/// The first attempt at this seeded 500 NULLs plus a single `v = 1` and got a sequential scan:
+///
+/// ```text
+///   Filter (#1 < 5) (rows=125 cost=15.02)
+///     Sequential scan on t (rows=501 cost=10.01)
+/// ```
+///
+/// Two independent reasons, both visible in `cost_model.rs`:
+///
+/// 1. **`analyze` computes min/max over NON-NULL values only** — NULLs are counted into `nulls` and
+///    never pushed into `per_col`. With one non-NULL row, `min == max`, and `bound_selectivity`
+///    bails to `DEFAULT_RANGE_SELECTIVITY = 0.25`. That is the `rows=125` above: 501 * 0.25. So the
+///    `v` values must SPREAD, or the estimate cannot be selective no matter how big the table is.
+/// 2. **A sequential scan is genuinely cheaper on a small table**, and correctly so. The table must
+///    be big enough that `table_pages + rows * CPU_TUPLE_COST` exceeds the index's
+///    `height * RANDOM_PAGE_COST + leaf_pages + rows * RANDOM_PAGE_COST * 2`.
+///
+/// 500 NULLs + one `v = 1` + 2500 rows spread to `v = 7597` satisfies both, and lands the reported
+/// numbers exactly: **501 rows returned where 1 is correct.**
+fn seeded_wide() -> Db {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER, v INTEGER, w INTEGER);");
+    d.sql("CREATE INDEX iv ON t (v);");
+    let mut id = 1;
+    for _ in 0..500 {
+        d.sql(&format!("INSERT INTO t VALUES ({id}, NULL, 1);"));
+        id += 1;
+    }
+    d.sql(&format!("INSERT INTO t VALUES ({id}, 1, 1);"));
+    id += 1;
+    for k in 0..2500 {
+        d.sql(&format!("INSERT INTO t VALUES ({id}, {}, 1);", 100 + 3 * k));
+        id += 1;
+    }
     d.sql("ANALYZE t;");
+    d
+}
+
+/// The reported defect, end to end, through real SQL on a plan that really is an index scan.
+///
+/// One fixture, because building it is 3001 statements and all four questions are about the same
+/// table. The `explain_plan` assertion on the first is load-bearing: below a few thousand rows the
+/// cost model prefers a filtered sequential scan whose `Filter` rejects NULLs correctly, so a GREEN
+/// without it would mean "the index was never used", not "the index is right". That is not
+/// hypothetical — it is what the first version of this test actually did.
+#[test]
+fn sql_index_path_answers_correctly() {
+    let mut d = seeded_wide();
+
+    // 1. The reported shape. 501 before the fix, 1 after.
     let plan = d.explain("SELECT id FROM t WHERE v < 5;");
     assert!(
         plan.contains("Index scan"),
@@ -369,38 +412,34 @@ fn sql_range_predicate_answers_one_row() {
         1,
         "only the v=1 row satisfies v < 5; the 500 NULL rows are UNKNOWN. plan:\n{plan}"
     );
-}
 
-/// The user-facing guarantee behind `null_bound_literal_is_not_turned_into_bounds`.
-///
-/// Every comparison against a NULL literal is UNKNOWN for every row, so each of these answers
-/// nothing. Whether the index or a sequential scan is chosen must not change that — which is the
-/// whole point, so this one deliberately does NOT assert a plan.
-#[test]
-fn sql_null_literal_predicates_answer_nothing() {
-    let mut d = seeded(500, 0);
-    d.sql("ANALYZE t;");
+    // 2. The same, with a residual Filter above the scan. `w = 1` holds for every row, so it
+    //    changes no answer — it is here to prove the fix does not depend on a Filter being there.
+    assert_eq!(
+        d.select_rows("SELECT id FROM t WHERE w = 1 AND v < 5;"),
+        1,
+        "w = 1 holds for every row, so this is `v < 5` and answers 1. plan:\n{}",
+        d.explain("SELECT id FROM t WHERE w = 1 AND v < 5;")
+    );
+
+    // 3. The inclusive upper bound, which reaches the other arm of the same test.
+    assert_eq!(
+        d.select_rows("SELECT id FROM t WHERE v <= 4;"),
+        1,
+        "only the v=1 row satisfies v <= 4. plan:\n{}",
+        d.explain("SELECT id FROM t WHERE v <= 4;")
+    );
+
+    // 4. The NULL-literal defect, end to end. `v = NULL` takes `bound_selectivity`'s `lo == hi`
+    //    branch (`1/distinct`), which is selective enough that the INDEX wins here too — so before
+    //    the fix this returns all 500 NULL rows where SQL answers none.
     for pred in ["v = NULL", "v >= NULL", "v > NULL", "v <= NULL", "v < NULL"] {
         let sql = format!("SELECT id FROM t WHERE {pred};");
         assert_eq!(
             d.select_rows(&sql),
             0,
-            "`{pred}` is UNKNOWN for all 501 rows and must answer nothing. plan:\n{}",
+            "`{pred}` is UNKNOWN for all 3001 rows and must answer nothing. plan:\n{}",
             d.explain(&sql)
         );
     }
-}
-
-/// The two-conjunct shape. `w = 1` is true for every row, so it changes no answer — it exists to
-/// put a residual `Filter` above the scan and prove the fix does not depend on one being there.
-#[test]
-fn sql_two_conjunct_shape_answers_one_row() {
-    let mut d = seeded(500, 0);
-    d.sql("ANALYZE t;");
-    let plan = d.explain("SELECT id FROM t WHERE w = 1 AND v < 5;");
-    assert_eq!(
-        d.select_rows("SELECT id FROM t WHERE w = 1 AND v < 5;"),
-        1,
-        "w = 1 holds for every row, so this is `v < 5` and answers 1. plan:\n{plan}"
-    );
 }
