@@ -1885,6 +1885,31 @@ fn d173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed() {
     // is the whole of exit item (3), and it is asserted before anything else so a failure says
     // which answer the cluster gave.
     seam.release();
+
+    // ⭐ THE MECHANISM, MEASURED RATHER THAN INFERRED. `Node::propose` drains inline, so the
+    // `Append` carrying the merge entry was written to the peers' sockets BEFORE `propose`
+    // returned — before the lease died, and before anything could be voted on. TCP delivers it
+    // ahead of every later message, so the peers append it on their very FIRST poll, which is also
+    // what refreshes their election timers. One poll each, and read their tails: if the entry only
+    // reached them via some later election traffic, this probe shows tails that have not moved.
+    for r in &fleet.reps {
+        r.pump().expect("a node's driver failed");
+    }
+    let tails_after_one_poll: Vec<Round> =
+        fleet.reps.iter().map(|r| r.with_node(|n| n.last_round())).collect();
+    loopcount(format_args!(
+        "D173 first-poll-after-release: tails={tails_after_one_poll:?} (at deposition {:?}) \
+         leaders={:?}",
+        at.tails,
+        fleet.reps.iter().map(|r| r.leader()).collect::<Vec<_>>()
+    ));
+    assert!(
+        tails_after_one_poll.iter().filter(|t| **t >= at.round).count() >= 2,
+        "the entry did not reach a quorum on the peers' first poll after the deposition: tails \
+         {tails_after_one_poll:?}. Then its survival below is owed to something other than the \
+         socket backlog and this comment is wrong"
+    );
+
     let survive = std::time::Instant::now() + Duration::from_millis(4000);
     while std::time::Instant::now() < survive {
         fleet.pump_all();

@@ -1,0 +1,40 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d173-adversary-2)
+warning: fields `tails` and `leaders` are never read
+    --> tests/integration_cluster_agents.rs:1674:5
+     |
+1667 | struct AtDeposition {
+     |        ------------ fields in this struct
+...
+1674 |     tails: Vec<Round>,
+     |     ^^^^^
+1675 |     /// Who each node believed led.
+1676 |     leaders: Vec<Option<NodeId>>,
+     |     ^^^^^^^
+     |
+     = note: `AtDeposition` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_cluster_agents") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.61s
+     Running tests/integration_cluster_agents.rs (target/debug/deps/integration_cluster_agents-3b12af37878b8d8b)
+
+running 1 test
+test d173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed ... LOOPCOUNT hold_leader site=d173/pre-fork want=0 turns=0 bound=100000 ms=4
+LOOPCOUNT settle_to round=2 turns=3 bound=20000 ms=14
+LOOPCOUNT hold_leader site=d173/pre-merge want=0 turns=0 bound=100000 ms=4
+D173 attempt1 took ms=143252 result=Err("merge error: round 3, the merge of n1/b1 was not applied within 100000 turns of the consensus driver. Refusing rather than blocking a client for ever; nothing was published")
+D173 at-deposition AtDeposition { round: 3, own_committed: 2, own_applied: 2, tails: [3, 2, 2], leaders: [None, Some(NodeId(1)), Some(NodeId(1))] }
+
+thread 'd173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed' (291149192) panicked at tests/integration_cluster_agents.rs:1862:5:
+the caller must see the transient-by-contract error, not something else: merge error: round 3, the merge of n1/b1 was not applied within 100000 turns of the consensus driver. Refusing rather than blocking a client for ever; nothing was published
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    d173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 143.96s
+
+error: test failed, to rerun pass `--test integration_cluster_agents`
