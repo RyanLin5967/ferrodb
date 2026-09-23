@@ -62,6 +62,12 @@ struct Acks {
     retained: u64,
 }
 
+/// Tracks how far each replica has acknowledged, and how far ANY replica ever did.
+///
+/// ⚠ `#[derive(Default)]` restored here after D184's adversary found it had been orphaned onto
+/// the private `Acks` when that struct was inserted between the derive and this type — an
+/// unintended PUBLIC API removal that compiled clean because nothing in-tree calls it.
+#[derive(Default)]
 pub struct AckTracker {
     acks: Mutex<Acks>,
     changed: Condvar,
@@ -79,7 +85,22 @@ impl AckTracker {
     /// has already acted on, and a durability promise that can be withdrawn after the fact is not
     /// a promise. Going backwards is legitimate for the *replica* — it is how a resume works — but
     /// it must not un-commit anything here.
-    pub fn record(&self, peer: &str, lsn: u64) {
+    /// ⛔ **`frontier` IS IN THIS SIGNATURE SO A CALLER CANNOT RECORD AN UNSATISFIABLE ACK.**
+    /// Added after D184's adversary poisoned `retained` to `u64::MAX` through
+    /// `repl_primary.rs:144`, which records `from_lsn` straight off the wire, and
+    /// `Replication::read_from` (`mod.rs:303`) which answers a position ABOVE the frontier with
+    /// `UpToDate` rather than a refusal. One `Hello { from_lsn: u64::MAX }` disabled synchronous
+    /// commit for the life of the process.
+    ///
+    /// ⚠ **A clamp HERE and not at the call site**, because a call-site clamp is a guard on a
+    /// private copy: it protects that one caller and not the next one written.
+    ///
+    /// ⚠ **D184 made this WORSE, which is why the two ship together.** Before D184 the poison was
+    /// transient — `forget` dropped the entry when the peer disconnected. `retained` has no
+    /// `forget`, no reconnect path and no decay, so one bad frame became permanent.
+    pub fn record(&self, peer: &str, lsn: u64, frontier: u64) {
+        // Unrepresentable, not documented: the primary cannot have shipped what it never had.
+        let lsn = lsn.min(frontier);
         let mut acks = self.acks.lock().unwrap();
         let slot = acks.peers.entry(peer.to_string()).or_insert(0);
         if lsn > *slot {
@@ -139,8 +160,8 @@ impl AckTracker {
             let now = Instant::now();
             if now >= deadline {
                 return Err(FerroError::Wal(format!(
-                    "synchronous commit was not acknowledged: waited for lsn {lsn} but the furthest \
-                     replica is at {best} ({} replica(s) connected). The commit is durable on the \
+                    "synchronous commit was not acknowledged: waited for lsn {lsn}; the furthest \
+                     acknowledgement from any replica is {best} ({} replica(s) connected now). The commit is durable on the \
                      PRIMARY and is not confirmed on any replica, so this transaction has only \
                      asynchronous durability. Nothing was rolled back.",
                     acks.peers.len()
@@ -165,11 +186,11 @@ mod tests {
 
         // Below the target must NOT release it, or the test would pass against a `wait_for` that
         // returns on any ack at all.
-        t.record("replica-1", 499);
+        t.record("replica-1", 499, u64::MAX);
         std::thread::sleep(Duration::from_millis(20));
         assert!(!h.is_finished(), "the waiter was released by an ack below its target");
 
-        t.record("replica-1", 500);
+        t.record("replica-1", 500, u64::MAX);
         assert!(h.join().unwrap().is_ok(), "an ack at the target did not release the waiter");
     }
 
@@ -177,7 +198,7 @@ mod tests {
     #[test]
     fn a_target_already_acked_does_not_wait() {
         let t = AckTracker::new();
-        t.record("r", 900);
+        t.record("r", 900, u64::MAX);
         let start = Instant::now();
         assert!(t.wait_for(800, Duration::from_secs(5)).is_ok());
         assert!(start.elapsed() < Duration::from_millis(500), "it waited despite already being acked");
@@ -200,8 +221,8 @@ mod tests {
     #[test]
     fn an_ack_never_goes_backwards() {
         let t = AckTracker::new();
-        t.record("r", 1000);
-        t.record("r", 10); // e.g. restarted from an older base backup
+        t.record("r", 1000, u64::MAX);
+        t.record("r", 10, u64::MAX); // e.g. restarted from an older base backup
         assert_eq!(t.max_acked(), 1000, "a replica retracted an ack the primary may have acted on");
         assert!(t.wait_for(1000, Duration::from_millis(50)).is_ok());
     }
@@ -210,8 +231,8 @@ mod tests {
     #[test]
     fn the_furthest_replica_satisfies_the_wait() {
         let t = AckTracker::new();
-        t.record("slow", 10);
-        t.record("fast", 2000);
+        t.record("slow", 10, u64::MAX);
+        t.record("fast", 2000, u64::MAX);
         assert_eq!(t.max_acked(), 2000);
         assert!(t.wait_for(1500, Duration::from_millis(50)).is_ok());
         assert_eq!(t.peer_count(), 2);
@@ -237,7 +258,7 @@ mod tests {
     #[test]
     fn an_ack_survives_the_replica_disconnecting() {
         let t = AckTracker::new();
-        t.record("r", 1000);
+        t.record("r", 1000, u64::MAX);
         assert_eq!(t.max_acked(), 1000, "fixture: the ack was never recorded");
 
         t.forget("r");
@@ -268,7 +289,7 @@ mod tests {
     #[test]
     fn a_replica_that_reconnects_inside_the_deadline_still_satisfies_the_commit() {
         let t = Arc::new(AckTracker::new());
-        t.record("only", 5);
+        t.record("only", 5, u64::MAX);
         let t2 = Arc::clone(&t);
         let h = std::thread::spawn(move || t2.wait_for(100, Duration::from_secs(10)));
 
@@ -279,7 +300,7 @@ mod tests {
         assert!(!h.is_finished(), "the commit gave up while its replica was merely absent");
 
         // ...and comes back, having caught up. The commit must be honoured, not abandoned.
-        t.record("only", 100);
+        t.record("only", 100, u64::MAX);
         assert!(
             h.join().unwrap().is_ok(),
             "a replica reconnected and acked inside the deadline, and the commit still failed"
@@ -322,7 +343,7 @@ mod tests {
         const FRONTIER: u64 = 54_737;
 
         let t = AckTracker::new();
-        t.record("ahead", u64::MAX);
+        t.record("ahead", u64::MAX, FRONTIER);
         t.forget("ahead");
 
         assert_eq!(t.peer_count(), 0, "fixture: no replica is connected");
@@ -372,7 +393,7 @@ mod tests {
             // Let the waiter park inside `wait_timeout` and release the mutex, so this models the
             // primary's main thread already waiting when the replica's last ack arrives.
             std::thread::sleep(Duration::from_millis(5));
-            t.record("r", 1000);
+            t.record("r", 1000, u64::MAX);
             t.forget("r");
             if !waiter.join().unwrap() {
                 lost += 1;
@@ -407,6 +428,6 @@ mod tests {
     /// `Condvar: Default`), move that doc line back with it, and uncomment the body here.
     #[test]
     fn acktracker_still_implements_default() {
-        // let _t: AckTracker = Default::default();
+        let _t: AckTracker = Default::default();
     }
 }
