@@ -1,0 +1,330 @@
+=== RUN   TestAnyDuplicationOrReplayConvergesToTheSameState
+--- PASS: TestAnyDuplicationOrReplayConvergesToTheSameState (0.30s)
+=== RUN   TestAStaleEventLaterInTheFeedIsFilteredByTheCursor
+--- PASS: TestAStaleEventLaterInTheFeedIsFilteredByTheCursor (0.01s)
+=== RUN   TestTheSQLOrderingGuardRejectsAStaleWriteOnItsOwn
+--- PASS: TestTheSQLOrderingGuardRejectsAStaleWriteOnItsOwn (0.00s)
+=== RUN   TestValidateRefusesAnEmptyFeed
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestValidateRefusesAnEmptyFeed (0.00s)
+=== RUN   TestValidateRefusesAFeedThatIsMissingItsFinalNewline
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestValidateRefusesAFeedThatIsMissingItsFinalNewline (0.00s)
+=== RUN   TestSinkRefusesAnEmptyFeed
+applied 1, skipped 0 re-delivered
+APPLIED 1 SKIPPED 0 CURSOR 21 TABLE t
+--- PASS: TestSinkRefusesAnEmptyFeed (0.00s)
+=== RUN   TestDuckSinkRefusesWithoutAKeyColumn
+--- PASS: TestDuckSinkRefusesWithoutAKeyColumn (0.01s)
+=== RUN   TestDiffRefusesAMalformedSourceDump
+MATCH 1 row(s) from 1 event(s)
+--- PASS: TestDiffRefusesAMalformedSourceDump (0.00s)
+=== RUN   TestEveryRowOfOneCommitLands
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 103 TABLE t
+applied 1, skipped 3 re-delivered
+APPLIED 1 SKIPPED 3 CURSOR 2 TABLE t
+--- PASS: TestEveryRowOfOneCommitLands (0.00s)
+=== RUN   TestTheLaterRecordInOneCommitWinsForTheSameKey
+applied 3, skipped 0 re-delivered
+APPLIED 3 SKIPPED 0 CURSOR 103 TABLE t
+--- PASS: TestTheLaterRecordInOneCommitWinsForTheSameKey (0.00s)
+=== RUN   TestEveryRowOfASnapshotLands
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 9 TABLE t
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 9 TABLE t
+--- PASS: TestEveryRowOfASnapshotLands (0.00s)
+=== RUN   TestI20RegressionInferredDestinationThenDeclaredCreateTable
+applied 1, skipped 0 re-delivered
+APPLIED 1 SKIPPED 0 CURSOR 11 TABLE inv
+    i20_regression_test.go:43: destination shape after the inference path: [[id TEXT] [qty TEXT]]
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestI20RegressionInferredDestinationThenDeclaredCreateTable (0.00s)
+=== RUN   TestI20RegressionInferredCatchUpOverADeclaredDestination
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 11 TABLE inv
+applied 1, skipped 0 re-delivered
+APPLIED 1 SKIPPED 0 CURSOR 31 TABLE inv
+    i20_regression_test.go:87: rows: [[1 10 <nil>] [2 20 new]]
+--- PASS: TestI20RegressionInferredCatchUpOverADeclaredDestination (0.00s)
+=== RUN   TestI20RegressionTwoTablesDifferentKeys
+=== RUN   TestI20RegressionTwoTablesDifferentKeys/sqlite
+    i20_regression_test.go:115: sqlite: refused a second table whose key is not the flag: apply INSERT to orders: SQL logic error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint (1)
+=== RUN   TestI20RegressionTwoTablesDifferentKeys/duckdb
+    i20_regression_test.go:115: duckdb: refused a second table whose key is not the flag: table orders has no key column "id"; the ordering guard needs one
+--- PASS: TestI20RegressionTwoTablesDifferentKeys (0.02s)
+    --- PASS: TestI20RegressionTwoTablesDifferentKeys/sqlite (0.00s)
+    --- PASS: TestI20RegressionTwoTablesDifferentKeys/duckdb (0.02s)
+=== RUN   TestI20RegressionKeyForOnAPrimaryKeylessDestination
+    i20_regression_test.go:145: keyFor on a PK-less destination: "id" (flag is "id")
+--- PASS: TestI20RegressionKeyForOnAPrimaryKeylessDestination (0.00s)
+=== RUN   TestI20RegressionKeyCacheAcrossDropAndRecreate
+applied 8, skipped 0 re-delivered
+APPLIED 8 SKIPPED 0 CURSOR 71 TABLE inv
+    i20_regression_test.go:183: after drop+recreate: [[1 6]]
+--- PASS: TestI20RegressionKeyCacheAcrossDropAndRecreate (0.01s)
+=== RUN   TestI20RegressionReplayOfAnOriginalDeclarationAfterARetype
+applied 3, skipped 0 re-delivered
+APPLIED 3 SKIPPED 0 CURSOR 21 TABLE inv
+applied 1, skipped 2 re-delivered
+APPLIED 1 SKIPPED 2 CURSOR 2 TABLE inv
+--- PASS: TestI20RegressionReplayOfAnOriginalDeclarationAfterARetype (0.00s)
+=== RUN   TestI20RegressionTypeCheckAgainstAHandBuiltDestination
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 11 TABLE inv
+--- PASS: TestI20RegressionTypeCheckAgainstAHandBuiltDestination (0.00s)
+=== RUN   TestSameNumberAcceptsAFloatThatSurvivedItsRoundTrip
+--- PASS: TestSameNumberAcceptsAFloatThatSurvivedItsRoundTrip (0.00s)
+=== RUN   TestSameNumberStillCatchesDigitsNoDoubleCanHold
+--- PASS: TestSameNumberStillCatchesDigitsNoDoubleCanHold (0.00s)
+=== RUN   TestExactFloatIsExactForSubnormals
+--- PASS: TestExactFloatIsExactForSubnormals (0.00s)
+=== RUN   TestExactFloatRoundTripsToTheSameDouble
+--- PASS: TestExactFloatRoundTripsToTheSameDouble (0.00s)
+=== RUN   TestConsumerRefusesADeniedColumnTheProducerLetThrough
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerRefusesADeniedColumnTheProducerLetThrough (0.00s)
+=== RUN   TestConsumerChecksTheBeforeImageToo
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerChecksTheBeforeImageToo (0.00s)
+=== RUN   TestConsumerRefusesAnUndecidedTable
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerRefusesAnUndecidedTable (0.00s)
+=== RUN   TestConsumerRefusesASchemaEventDeclaringADeniedColumn
+OK 1
+WRITERS attributed=0 unattributed=0
+--- PASS: TestConsumerRefusesASchemaEventDeclaringADeniedColumn (0.00s)
+=== RUN   TestConsumerRefusesAShapeNarrowerThanItsOwnPolicy
+OK 1
+WRITERS attributed=0 unattributed=0
+--- PASS: TestConsumerRefusesAShapeNarrowerThanItsOwnPolicy (0.00s)
+=== RUN   TestADropIsNotJudgedByTheShapeCheck
+OK 1
+WRITERS attributed=0 unattributed=0
+--- PASS: TestADropIsNotJudgedByTheShapeCheck (0.00s)
+=== RUN   TestWithNoPublicationNothingIsRefused
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestWithNoPublicationNothingIsRefused (0.00s)
+=== RUN   TestUsePublicationRefusesAFileItCannotRead
+--- PASS: TestUsePublicationRefusesAFileItCannotRead (0.00s)
+=== RUN   TestParsePublicationRefusesEveryMalformedShape
+--- PASS: TestParsePublicationRefusesEveryMalformedShape (0.00s)
+=== RUN   TestTheSinkRefusesADeniedColumnBeforeLandingIt
+applied 1, skipped 0 re-delivered
+APPLIED 1 SKIPPED 0 CURSOR 21 TABLE customers
+--- PASS: TestTheSinkRefusesADeniedColumnBeforeLandingIt (0.00s)
+=== RUN   TestPrecisionRefusesADeniedColumnRatherThanPrintingIt
+FIELD 1 id number 1
+FIELD 1 name string ada
+FIELD 1 id number 1
+FIELD 1 name string ada
+SUMMARY strings=1 numbers=1 lossy=0
+FIELD 1 id number 1
+FIELD 1 name string ada
+FIELD 1 ssn string 000-11-2222
+SUMMARY strings=2 numbers=1 lossy=0
+--- PASS: TestPrecisionRefusesADeniedColumnRatherThanPrintingIt (0.00s)
+=== RUN   TestPrecisionRefusesAnUndecidedTable
+--- PASS: TestPrecisionRefusesAnUndecidedTable (0.00s)
+=== RUN   TestConsumerChecksADropsBeforeImage
+OK 1
+WRITERS attributed=0 unattributed=0
+--- PASS: TestConsumerChecksADropsBeforeImage (0.00s)
+=== RUN   TestConsumerRefusesDuplicateKeysInOneObject
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerRefusesDuplicateKeysInOneObject (0.00s)
+=== RUN   TestConsumerRefusesKeysOutsideTheEnvelope
+OK 1
+WRITERS attributed=0 unattributed=0
+--- PASS: TestConsumerRefusesKeysOutsideTheEnvelope (0.00s)
+=== RUN   TestConsumerRefusesANonScalarRowValue
+OK 1
+WRITERS attributed=0 unattributed=1
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerRefusesANonScalarRowValue (0.00s)
+=== RUN   TestConsumerRefusesAnEventForAnExcludedTable
+OK 1
+WRITERS attributed=0 unattributed=1
+--- PASS: TestConsumerRefusesAnEventForAnExcludedTable (0.00s)
+=== RUN   TestParsePublicationHandlesExclusions
+--- PASS: TestParsePublicationHandlesExclusions (0.00s)
+=== RUN   TestAnAttributedEventSurvivesAPublication
+--- PASS: TestAnAttributedEventSurvivesAPublication (0.00s)
+=== RUN   TestAnUnknownTopLevelKeyIsStillRefused
+--- PASS: TestAnUnknownTopLevelKeyIsStillRefused (0.00s)
+=== RUN   TestBothSinksLandTheSameWriterColumnNames
+--- PASS: TestBothSinksLandTheSameWriterColumnNames (0.00s)
+=== RUN   TestRetractWorksAgainstADuckDBDestination
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=quarantine engine=duckdb
+ROW id=1 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=3 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=4 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=5 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=6 prov_id=0 agent=<none> model_version=<unattributed> retracted=0 deleted=0
+SCANNED 6 table=inv engine=duckdb
+--- PASS: TestRetractWorksAgainstADuckDBDestination (0.04s)
+=== RUN   TestRetractInDeleteModeAgainstDuckDB
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=delete engine=duckdb
+--- PASS: TestRetractInDeleteModeAgainstDuckDB (0.04s)
+=== RUN   TestRetractAndScanRefuseAnUnknownEngine
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=quarantine engine=sqlite
+--- PASS: TestRetractAndScanRefuseAnUnknownEngine (0.01s)
+=== RUN   TestAnOlderDuckDBDestinationIsUpgradedInPlace
+RETRACTED 3 OF 7 table=inv model_version=2026-07 mode=quarantine engine=duckdb
+--- PASS: TestAnOlderDuckDBDestinationIsUpgradedInPlace (0.05s)
+=== RUN   TestRetractTouchesExactlyOneModelVersionsRows
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=quarantine engine=sqlite
+--- PASS: TestRetractTouchesExactlyOneModelVersionsRows (0.01s)
+=== RUN   TestRetractInDeleteModeAlsoTombstones
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=delete engine=sqlite
+--- PASS: TestRetractInDeleteModeAlsoTombstones (0.01s)
+=== RUN   TestARetractionThatMatchesNothingIsRefused
+RETRACTED 2 OF 6 table=inv model_version=2026-05 mode=quarantine engine=sqlite
+--- PASS: TestARetractionThatMatchesNothingIsRefused (0.01s)
+=== RUN   TestAnEmptyModelVersionIsRefused
+--- PASS: TestAnEmptyModelVersionIsRefused (0.01s)
+=== RUN   TestADestinationWithNoAttributionIsRefusedRatherThanRetractingNothing
+--- PASS: TestADestinationWithNoAttributionIsRefusedRatherThanRetractingNothing (0.00s)
+=== RUN   TestARetractionSurvivesAReplayButNotAFreshWrite
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=quarantine engine=sqlite
+--- PASS: TestARetractionSurvivesAReplayButNotAFreshWrite (0.01s)
+=== RUN   TestScanReportsEveryRowsWriterAndMark
+RETRACTED 3 OF 6 table=inv model_version=2026-07 mode=quarantine engine=sqlite
+ROW id=1 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=3 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=4 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=5 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+ROW id=6 prov_id=0 agent=<none> model_version=<unattributed> retracted=0 deleted=0
+SCANNED 6 table=inv engine=sqlite
+--- PASS: TestScanReportsEveryRowsWriterAndMark (0.01s)
+=== RUN   TestAWriterObjectWithAnUnknownKeyIsRefused
+--- PASS: TestAWriterObjectWithAnUnknownKeyIsRefused (0.00s)
+=== RUN   TestAMalformedWriterIsRefused
+--- PASS: TestAMalformedWriterIsRefused (0.00s)
+=== RUN   TestScanRefusesAnEmptyTable
+ROW id=1 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=0 deleted=0
+ROW id=3 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=4 prov_id=2 agent=restock-agent model_version=2026-07 retracted=0 deleted=0
+ROW id=5 prov_id=2 agent=restock-agent model_version=2026-07 retracted=0 deleted=0
+ROW id=6 prov_id=0 agent=<none> model_version=<unattributed> retracted=0 deleted=0
+SCANNED 6 table=inv engine=sqlite
+--- PASS: TestScanRefusesAnEmptyTable (0.01s)
+=== RUN   TestWellFormedColumnLevelEventsAreAccepted
+--- PASS: TestWellFormedColumnLevelEventsAreAccepted (0.00s)
+=== RUN   TestColumnLevelEventsAreCrossCheckedAgainstTheirOwnShape
+--- PASS: TestColumnLevelEventsAreCrossCheckedAgainstTheirOwnShape (0.00s)
+=== RUN   TestColumnLevelChangesAreNewsNotDeclarations
+--- PASS: TestColumnLevelChangesAreNewsNotDeclarations (0.00s)
+=== RUN   TestTableFoldSurvivesAColumnLevelChange
+--- PASS: TestTableFoldSurvivesAColumnLevelChange (0.00s)
+=== RUN   TestTheFoldMovesRenamedValuesInRowsItAlreadyHolds
+--- PASS: TestTheFoldMovesRenamedValuesInRowsItAlreadyHolds (0.00s)
+=== RUN   TestTheFoldReEncodesAColumnThatBecameStringTyped
+--- PASS: TestTheFoldReEncodesAColumnThatBecameStringTyped (0.00s)
+=== RUN   TestTheSqliteSinkAddsAColumnMidStreamAndKeepsLandingRows
+applied 5, skipped 0 re-delivered
+APPLIED 5 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestTheSqliteSinkAddsAColumnMidStreamAndKeepsLandingRows (0.01s)
+=== RUN   TestReplayingAFeedWithASchemaChangeIsANoOp
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 31 TABLE inv
+applied 1, skipped 3 re-delivered
+APPLIED 1 SKIPPED 3 CURSOR 2 TABLE inv
+--- PASS: TestReplayingAFeedWithASchemaChangeIsANoOp (0.01s)
+=== RUN   TestTheSqliteSinkRenamesRatherThanRebuilding
+applied 3, skipped 0 re-delivered
+APPLIED 3 SKIPPED 0 CURSOR 21 TABLE inv
+--- PASS: TestTheSqliteSinkRenamesRatherThanRebuilding (0.01s)
+=== RUN   TestTheSqliteSinkRebuildsForARetypeAndKeepsTheRows
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestTheSqliteSinkRebuildsForARetypeAndKeepsTheRows (0.01s)
+=== RUN   TestASinkThatNeverSawTheCreateStillGetsTheShape
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestASinkThatNeverSawTheCreateStillGetsTheShape (0.01s)
+=== RUN   TestASinkThatMissedTheAlterCatchesUpFromTheReDeclaration
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 11 TABLE inv
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 51 TABLE inv
+--- PASS: TestASinkThatMissedTheAlterCatchesUpFromTheReDeclaration (0.01s)
+=== RUN   TestTheCatchUpRefusesAnythingThatIsNotAPrefix
+--- PASS: TestTheCatchUpRefusesAnythingThatIsNotAPrefix (0.00s)
+=== RUN   TestTheFeedLandsInDuckdbAcrossAMissedAlter
+--- PASS: TestTheFeedLandsInDuckdbAcrossAMissedAlter (0.02s)
+=== RUN   TestTheSqliteCatchUpRefusesARetypeInTheDeclaration
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 11 TABLE inv
+--- PASS: TestTheSqliteCatchUpRefusesARetypeInTheDeclaration (0.00s)
+=== RUN   TestTheSqliteCatchUpComparesTypesAndNotOnlyNames
+--- PASS: TestTheSqliteCatchUpComparesTypesAndNotOnlyNames (0.00s)
+=== RUN   TestTheSqliteSinkFollowsARenameOfTheKeyColumn
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestTheSqliteSinkFollowsARenameOfTheKeyColumn (0.00s)
+=== RUN   TestTheDuckSinkFollowsARenameOfTheKeyColumn
+applied 4, skipped 0 re-delivered
+APPLIED 4 SKIPPED 0 CURSOR 31 TABLE inv
+--- PASS: TestTheDuckSinkFollowsARenameOfTheKeyColumn (0.03s)
+=== RUN   TestARenameTruncatedAwayStallsTheSinkButNamesTheCause
+applied 2, skipped 0 re-delivered
+APPLIED 2 SKIPPED 0 CURSOR 11 TABLE inv
+--- PASS: TestARenameTruncatedAwayStallsTheSinkButNamesTheCause (0.00s)
+=== RUN   TestDuckTypeMapping
+--- PASS: TestDuckTypeMapping (0.00s)
+=== RUN   TestWideTypesLandExactlyInDuckDB
+--- PASS: TestWideTypesLandExactlyInDuckDB (0.01s)
+=== RUN   TestDuckTypeOfInfersFromTheValue
+--- PASS: TestDuckTypeOfInfersFromTheValue (0.00s)
+=== RUN   TestEnsureDuckTableRefusesATypeOutsideTheAllowlist
+--- PASS: TestEnsureDuckTableRefusesATypeOutsideTheAllowlist (0.01s)
+=== RUN   TestEnsureDuckTableRefusesATableWithoutTheKey
+--- PASS: TestEnsureDuckTableRefusesATableWithoutTheKey (0.01s)
+=== RUN   TestApplyRejectsAStaleEventAndAcceptsANewerOne
+--- PASS: TestApplyRejectsAStaleEventAndAcceptsANewerOne (0.02s)
+=== RUN   TestDeleteIsSoftAndRejectsAStaleResurrection
+--- PASS: TestDeleteIsSoftAndRejectsAStaleResurrection (0.03s)
+=== RUN   TestColumnsComeFromTheCatalogNotFromGuessing
+--- PASS: TestColumnsComeFromTheCatalogNotFromGuessing (0.03s)
+=== RUN   TestApplyRefusesARowWithNoKeyColumn
+--- PASS: TestApplyRefusesARowWithNoKeyColumn (0.01s)
+=== RUN   TestOpenDestinationRefusesAnUnknownEngine
+--- PASS: TestOpenDestinationRefusesAnUnknownEngine (0.01s)
+=== RUN   TestALaterCreateTableThatDisagreesIsRefused
+--- PASS: TestALaterCreateTableThatDisagreesIsRefused (0.02s)
+=== RUN   TestARepeatedIdenticalCreateTableIsStillANoOp
+--- PASS: TestARepeatedIdenticalCreateTableIsStillANoOp (0.01s)
+=== RUN   TestAHostileTypeInACreateTableEventCannotReachTheDDL
+--- PASS: TestAHostileTypeInACreateTableEventCannotReachTheDDL (0.01s)
+=== RUN   TestRenderCellMatchesItsRecordedCLIExpectations
+--- PASS: TestRenderCellMatchesItsRecordedCLIExpectations (0.00s)
+=== RUN   TestRenderCellAgreesWithTheRealDuckdbCLI
+--- PASS: TestRenderCellAgreesWithTheRealDuckdbCLI (0.11s)
+=== RUN   TestQuoteIdentDoublesEmbeddedQuotes
+--- PASS: TestQuoteIdentDoublesEmbeddedQuotes (0.00s)
+=== RUN   TestSQLTypeMapping
+--- PASS: TestSQLTypeMapping (0.00s)
+=== RUN   TestDecodeLineRejectsMalformedEnvelopes
+--- PASS: TestDecodeLineRejectsMalformedEnvelopes (0.00s)
+=== RUN   TestReadIsExemptFromTheResumePointRule
+--- PASS: TestReadIsExemptFromTheResumePointRule (0.00s)
+=== RUN   TestTableApplyFoldsOpsCorrectly
+--- PASS: TestTableApplyFoldsOpsCorrectly (0.00s)
+=== RUN   TestApplyRefusesARowWithNoKey
+--- PASS: TestApplyRefusesARowWithNoKey (0.00s)
+PASS
+ok  	github.com/RyanLin5967/ferrodb/cdc-consumer	1.416s
