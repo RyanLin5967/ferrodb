@@ -27,3 +27,21 @@ THE THREE GATES, run not predicted (tools/land-gate.sh, 2026-09-23 11:01Z):
   (`visible_rows_where` folds the in-memory BTreeMap; `self.storage` is not on that path), proven
   by disabling `stage_all`'s mirror block and watching all six still pass. The page-growth guard
   is what stops the arena test decaying into a second copy of the map-backed one.
+
+## ✅ OUTCOME, appended 2026-09-23 11:27Z once CI run 35852275502 completed
+
+    ubuntu-latest: success   macos-latest: success   windows-latest: success
+
+⇒ The two new tests pass on ALL THREE PLATFORMS, which is the first cross-platform confirmation of
+this work and the reason the certification push was HELD until the run finished.
+
+⭐⭐ **AND THE SAME RUN IS D173'S THIRD SAMPLE, WHICH PASSED.** That settles a question the first two
+samples could not: **D173 is INTERMITTENT, 2 failures in 3**, not deterministic.
+
+    3e71a2b  windows FAILED   round 8 merges n3/b2, which is Merged { at: 5 }
+    742e6f9  windows FAILED   round 9 merges n1/b3, which is Merged { at: 7 }
+    b90bde1  windows PASSED
+
+⚠ Consequence for the base-colour note above: main was RED at 742e6f9 when this branch landed, and
+**main is GREEN now**. The red was real, was D173, and was unrelated to this branch — the record
+above stands as written and is not retracted; this is the later fact, not a correction of it.
