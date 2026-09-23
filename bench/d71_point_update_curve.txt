@@ -41,12 +41,23 @@ me to D167 and to a retracted "O(staged rows)" claim. Read `scan_table_where`, n
 The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
 path. They are simply not a measurement of the path this file's headline names.
 Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
-Harnesses corrected: commit fc443c4.  ⛔ THE RE-RUN HAS NOT HAPPENED. It was attempted and VOIDED — disk hit 0G mid-sweep and
+Harnesses corrected: commit fc443c4.  ✅ **THE RE-RUN HAS NOW HAPPENED — D170, 2026-09-23.**
+⚠ This sentence read "⛔ THE RE-RUN HAS NOT HAPPENED" until 2026-09-23, and was left standing for an
+hour AFTER the banner above was added — a file contradicting itself six lines apart. A reader
+landing here concludes the re-run is still owed and re-does it. Caught by the D170 adversary, not
+by me: I corrected the header and left the body, which is the same failure class as the overlay
+misattribution this banner fixes.
+The EARLIER attempt was VOIDED — disk hit 0G mid-sweep and
 every target/ on the box was deleted; eleven of its blocks exited rc=127 while the runner
 printed 'ALL FIVE COMPLETE' over them. That record is kept at
 `bench/d101_rerun_VOID_disk_emergency.txt`. There is NO `bench/d101_rerun.txt` and this
 line used to cite one, which read as provenance for a run that does not exist.
-⇒ Everything above marked "plausibly survives" REMAINS A HYPOTHESIS, not a finding.
+⇒ ✅ **Everything above marked "plausibly survives" is now CONFIRMED AS TO THE COMPLEXITY CLASS
+and REFUTED AS TO THE MECHANISM.** The class holds in BOTH configurations — 2x2 in one binary,
+pre-fix stub **15.54x / 15.71x** vs arena **12.53x / 12.79x**; post-fix stub **0.98x / 0.29x** vs
+arena **0.99x / 0.97x** — and the stub cost a **~4x CONSTANT** in the absolutes, not a class.
+⛔ The surviving O(table) term is the **BASE SCAN**, not the overlay walk: see the correction above.
+⇒ Evidence: `bench/d170_d71_rerun_RAW.txt`, `frontier/d170_adversary.md`.
 ⛔⛔ END D101 CORRECTION — everything below is the original file, unedited except where marked.
 ===============================================================================================
 
