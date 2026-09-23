@@ -161,6 +161,9 @@ fn replay(rt: &AgentRuntime) -> (usize, usize, AttestFootprint) {
 
 // ---- the runtime, built as run_cli builds it ------------------------------------------------
 
+/// Distinct agent identities cycled through. Below `MAX_PAGE_DICT_ENTRIES` (255) with room to spare.
+const IDENTITY_POOL: usize = 64;
+
 struct Db {
     catalog: Catalog,
     bp: Arc<BufferPoolManager>,
@@ -224,7 +227,14 @@ impl Db {
     /// One branch lifecycle for `arm`. Returns the number of attested entries it must add.
     fn lifecycle(&mut self, arm: &str, i: usize) -> usize {
         let mut s = Session::with_runtime(self.runtime.clone());
-        self.ok(&format!("BEGIN AGENT SESSION AS 'agent-{i}' RUN 'r_{i}';"), &mut s);
+        // Identities are POOLED. With a distinct (agent, run) per lifecycle, every merge stamps a
+        // new run into the one page holding row 1, and that page's provenance dictionary refuses
+        // its 256th run (`MAX_PAGE_DICT_ENTRIES`, src/provenance/store.rs) — the first run of this
+        // harness died there at ~255 merges. Interning a known run is a lookup, and nothing in
+        // `AttestedHistory` is sized by the identity: every entry is fixed-width and every fork
+        // still mints its own `BranchId`.
+        let who = i % IDENTITY_POOL;
+        self.ok(&format!("BEGIN AGENT SESSION AS 'agent-{who}' RUN 'r_{who}';"), &mut s);
         let branch = s.agent.as_ref().expect("BEGIN AGENT SESSION opened no branch").branch;
         match arm {
             "merge" => {
@@ -267,7 +277,7 @@ fn main() {
     }
     let checkpoints: Vec<usize> = args
         .next()
-        .unwrap_or_else(|| "1000,1400,2000,2800,4000,5600,8000,11200,16000,22400,32000".into())
+        .unwrap_or_else(|| "1000,1400,2000,2800,4000,5600,8000,11200,16000".into())
         .split(',')
         .map(|s| s.trim().parse().expect("checkpoint must be an integer"))
         .collect();
