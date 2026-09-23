@@ -91,10 +91,69 @@ LABEL=${1:-verify}
 #      (observed the same night: an orphaned `--test integration_cdc_feed` outlived its parent and
 #      had to be killed by hand). `run_bounded` therefore backgrounds each child and `wait`s,
 #      because `wait` IS interruptible by a trap while a foreground builtin is not.
+#
+# ── 8. A RELEASE MUST PROVE THE LOCK IS STILL THIS RUN'S. ─────────────────────────────────────
+#
+# FIRED LIVE 2026-09-23 and deleted a RUNNING suite's lock. The release used to read
+#
+#     [ "${_HELD_LOCK:-0}" = "1" ] || return 0;  _HELD_LOCK=0;  rm -rf "$SUITE_LOCK"
+#
+# which tests a flag meaning "I acquired A lock once" and never asks whether the directory on disk
+# is still THE lock it acquired. From the fleet log that day:
+#
+#     16:14:26Z   run A acquires the lock and writes its pid to $SUITE_LOCK/owner
+#     ~16:29      a third agent removes the lock directory by hand
+#     16:30:07Z   run B legitimately mkdir's a NEW lock and records ITS OWN pid
+#     later       run A exits. Its EXIT trap sees _HELD_LOCK=1 and rm -rf's *run B's* lock.
+#
+# Run B then ran unprotected for 110 more targets with two lanes queued to acquire — the five-way
+# starvation of note 6, re-armed by the guard that exists to prevent it. Note 7 above fixed a
+# release that fired when it should NOT have; this is a release firing at the right TIME against
+# the WRONG OBJECT, and a boolean structurally cannot tell those apart.
+#
+# So the release re-reads $SUITE_LOCK/owner and removes ONLY on a pid match against the pid this
+# run recorded when it created the directory. Every other reading — no directory, no owner file,
+# an unreadable or unparseable one, or a different pid — is a REFUSAL, and it warns loudly on
+# stderr naming exactly what it found. Both halves matter:
+#
+#   * FAIL CLOSED. Never `rm` a lock this run cannot identify as its own. Refusing strands
+#     nothing, because the ACQUIRE path below already breaks a lock whose recorded pid is dead —
+#     which is precisely the state a refusal here can leave behind.
+#   * THE WARNING IS THE DELIVERABLE AS MUCH AS THE REFUSAL. "My lock was taken" is otherwise
+#     completely invisible: the run that loses its lock never notices, and the run that gets its
+#     lock deleted never notices either. On 2026-09-23 that invisibility cost an hour of
+#     confusion before anyone looked at the timestamps.
 _HELD_LOCK=0
+_LOCK_OWNER_PID=          # the pid written into $SUITE_LOCK/owner when THIS run created it
+# LOCK-RELEASE-OWNERSHIP-CHECKED (D188) — see tools/verify-suite-selftest.sh part 4.
 _release_lock() {
     [ "${_HELD_LOCK:-0}" = "1" ] || return 0
     _HELD_LOCK=0
+    local _o _p
+    if [ ! -d "$SUITE_LOCK" ]; then
+        echo "$LABEL: WARNING — this run held $SUITE_LOCK as pid $_LOCK_OWNER_PID, and it is" >&2
+        echo "  ALREADY GONE at release. Something removed this run's lock while it was running," >&2
+        echo "  so any suite that acquired after that removal shared the machine with this one." >&2
+        return 0
+    fi
+    _o=$(cat "$SUITE_LOCK/owner" 2>/dev/null) || _o=
+    _p=${_o%% *}
+    case "$_p" in
+        '' | *[!0-9]*)
+            echo "$LABEL: REFUSING to release — $SUITE_LOCK/owner is missing or unparseable" >&2
+            echo "  (read: '$_o'). This run held the lock as pid $_LOCK_OWNER_PID. Leaving the" >&2
+            echo "  directory in place: a lock this run cannot identify as its own is not its to" >&2
+            echo "  remove, and the acquire path breaks a lock whose pid is dead." >&2
+            return 0 ;;
+    esac
+    if [ "$_p" != "$_LOCK_OWNER_PID" ]; then
+        echo "$LABEL: REFUSING to release — $SUITE_LOCK is now owned by pid $_p, not by this run" >&2
+        echo "  (pid $_LOCK_OWNER_PID). Owner line: '$_o'." >&2
+        echo "  The lock this run acquired was removed by something else and re-created by another" >&2
+        echo "  run, which has therefore been running UNPROTECTED alongside this one. Leaving the" >&2
+        echo "  new owner's lock intact; treat BOTH runs' timings as contended. See note 8." >&2
+        return 0
+    fi
     rm -rf "$SUITE_LOCK"
 }
 _kill_descendants() {
@@ -157,6 +216,9 @@ if [ "${VERIFY_NOLOCK:-0}" != "1" ]; then
         sleep 15; _waited=$((_waited+15))
     done
     printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
+    # Record the pid we just wrote, so the release can compare against what it claimed rather than
+    # against a flag. `$$` is this script's own pid and is stable in traps and subshells alike.
+    _LOCK_OWNER_PID=$$
     _HELD_LOCK=1
     [ "$_waited" -gt 0 ] && echo "$LABEL: acquired the suite lock after ${_waited}s" >&2
 fi
