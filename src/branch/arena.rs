@@ -1953,6 +1953,35 @@ impl ArenaPageStore {
         (g.rewrites, g.appends)
     }
 
+    /// **D183.** The record kinds actually present in the tail of `path`, in file order.
+    ///
+    /// **Ask the artifact, not the code that wrote it.** `persist_counters` says how many records
+    /// were appended and says nothing about WHICH, so a test whose site silently fell back to a
+    /// different record — `TAIL_PENDING_REPLACED` where `TAIL_PENDING_DRAINED` was the point —
+    /// reads exactly like one where it did not. This parses the file the same way `replay_tail`
+    /// does and returns what is there.
+    ///
+    /// Stops at the first torn or unparseable frame, like the replayer; it is an instrument for
+    /// tests, so it reports what it can see rather than refusing.
+    #[cfg(test)]
+    pub(crate) fn tail_kinds(path: &std::path::Path) -> Vec<u8> {
+        let Ok(buf) = std::fs::read(path) else { return Vec::new() };
+        let Ok(n) = Self::image_len(&buf) else { return Vec::new() };
+        let mut kinds = Vec::new();
+        let mut at = n;
+        while at + 9 <= buf.len() {
+            let kind = buf[at];
+            if kind == 0 {
+                break;
+            }
+            let len = u32::from_be_bytes(buf[at + 1..at + 5].try_into().unwrap()) as usize;
+            let Some(total) = len.checked_add(9).filter(|t| at + *t <= buf.len()) else { break };
+            kinds.push(kind);
+            at += total;
+        }
+        kinds
+    }
+
     /// How many bytes of `buf` the IMAGE occupies, including its trailing CRC32.
     ///
     /// # Why this exists instead of a length field in the header
@@ -4478,11 +4507,21 @@ mod tests {
     /// full rewrite while naming different pages; `state_bytes` carries every field of every entry
     /// plus every recycled id, under a CRC32.
     ///
-    /// ⚠ **Anti-vacuity is the point of the counter assertion.** If either site quietly fell back
-    /// to `persist_full_locked`, the restore would of course match a full rewrite — and the test
-    /// would prove nothing at all. So it pins that the two calls produced TWO APPENDS AND NO
-    /// REWRITE first, and only then compares. Same for the fixture: it asserts the reap both
-    /// parked and released pages, because a log with nothing in it round-trips trivially.
+    /// ⛔⛔ **IT COMPARES AFTER *EACH* RECORD, AND THAT IS NOT THOROUGHNESS — IT IS THE ONLY WAY
+    /// THE FIRST RECORD IS TESTED AT ALL.** An end-only version of this test was **fire-checked
+    /// and PASSED with `TAIL_PAGES_PARKED` dropping a parked entry**: the drain's record restates
+    /// the log afterwards, so a downstream record that re-states the same state masks every mutant
+    /// of the one in front of it. The parked record is therefore compared while it is still the
+    /// last word on the log, before the drain runs.
+    ///
+    /// ⚠ **Anti-vacuity, at each stage, and in two forms.** A site that quietly fell back to
+    /// `persist_full_locked` would of course match a full rewrite, so each stage pins that it
+    /// APPENDED and did not rewrite — and, because a count cannot say WHICH record was appended,
+    /// each stage also reads the kind back out of the file with [`ArenaPageStore::tail_kinds`].
+    /// `TAIL_PENDING_REPLACED` is the always-correct fallback for the drain, so without that
+    /// second check this test would pass while never exercising the difference record at all.
+    /// Same for the fixture: it asserts the reap both parked and released pages, because a log
+    /// with nothing in it round-trips trivially.
     ///
     /// The crash this stands in for is the one `arena.rs`'s own note names: a kill after
     /// `mark_reaped`, whose branch record no longer points at the arenas, so the parked entries and
@@ -4514,53 +4553,88 @@ mod tests {
             h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(9)).unwrap();
         }
 
+        // `image + tail` must serialise to exactly what a full rewrite of the live state would.
+        let same_as_a_full_rewrite = |stage: &str| {
+            // The full rewrite, taken at a path that is NOT the armed one so the tail accounting
+            // this test is measuring is left alone.
+            h.store.checkpoint(&control).unwrap();
+            let from_tail = h.fresh_store();
+            assert!(from_tail.restore(&armed).unwrap(), "{stage}: the armed path holds nothing");
+            let from_image = h.fresh_store();
+            assert!(from_image.restore(&control).unwrap());
+            assert_eq!(
+                from_tail.pending_len(),
+                from_image.pending_len(),
+                "{stage}: the replayed pending-free log has {} entries where a full rewrite gives \
+                 {}",
+                from_tail.pending_len(),
+                from_image.pending_len()
+            );
+            assert_eq!(
+                from_tail.state_bytes(),
+                from_image.state_bytes(),
+                "{stage}: a store restored from image+tail is not byte-identical to one restored \
+                 from a full image of the same state — the D183 delta does not reproduce what it \
+                 replaced"
+            );
+        };
+
+        // ── STAGE 1: the reap slow path alone. `TAIL_PAGES_PARKED` is the last word on the log
+        // here, so this is the only place its pending half can be observed at all.
         let (r0, a0) = h.store.persist_counters();
         let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
         let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
         assert!(released > 0, "fixture: nothing was released, so no recycled list changed");
         let parked = h.store.pending_len();
         assert!(parked > 0, "fixture: nothing was parked, so the pending log never changed");
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the interior reap did not APPEND: rewrites +{}, appends +{}. A fallback to the full \
+             rewrite would make the comparison below vacuously true",
+            r1 - r0,
+            a1 - a0
+        );
+        // **Ask the FILE which record it wrote.** The counter says one append happened; it cannot
+        // say which kind, and a restore that matches a full rewrite passes just as well when the
+        // wrong record produced it.
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PAGES_PARKED),
+            "stage 1 wrote {:?}, not a parked record",
+            ArenaPageStore::tail_kinds(&armed)
+        );
+        same_as_a_full_rewrite("after the interior reap");
 
-        // The drain's read-modify-write, spelled exactly as `reaper::drain_pending_seeded` spells
-        // it: take the whole log, hand one page back, put the survivors. This is what reaches
-        // `TAIL_PENDING_REPLACED`.
+        // ── STAGE 2: the drain's read-modify-write on top, spelled exactly as
+        // `reaper::drain_pending_seeded` spells it — take the whole log, hand one page back, put
+        // the survivors. This is what reaches `TAIL_PENDING_DRAINED`.
         let taken = h.store.take_pending();
         assert_eq!(taken.len(), parked, "fixture: the take did not see the parked entries");
         h.store.release_page(taken[0].page_id, taken[0].arena_id);
         h.store.put_pending(taken[1..].to_vec()).unwrap();
-
-        let (r1, a1) = h.store.persist_counters();
+        let (r2, a2) = h.store.persist_counters();
         assert_eq!(
-            (r1 - r0, a1 - a0),
-            (0, 2),
-            "the two reclamation sites did not APPEND: rewrites +{}, appends +{}. A fallback to \
-             the full rewrite would make the comparison below vacuously true",
-            r1 - r0,
-            a1 - a0
-        );
-
-        // What a full rewrite of this same live state would have produced, taken at a path that
-        // is NOT the armed one so the tail accounting is untouched.
-        h.store.checkpoint(&control).unwrap();
-
-        let from_tail = h.fresh_store();
-        assert!(from_tail.restore(&armed).unwrap(), "fixture: the armed path holds nothing");
-        let from_image = h.fresh_store();
-        assert!(from_image.restore(&control).unwrap());
-
-        assert_eq!(
-            from_tail.pending_len(),
-            from_image.pending_len(),
-            "the replayed pending-free log has {} entries where a full rewrite gives {}",
-            from_tail.pending_len(),
-            from_image.pending_len()
+            (r2 - r1, a2 - a1),
+            (0, 1),
+            "putting the log back did not APPEND: rewrites +{}, appends +{}",
+            r2 - r1,
+            a2 - a1
         );
         assert_eq!(
-            from_tail.state_bytes(),
-            from_image.state_bytes(),
-            "a store restored from image+tail is not byte-identical to one restored from a full \
-             image of the same state: the D183 deltas do not reproduce what they replaced"
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+            "stage 2 wrote {:?}; the DIFFERENCE record is the one this row added and the absolute \
+             fallback would hide every defect in it",
+            ArenaPageStore::tail_kinds(&armed)
         );
+        assert!(
+            h.store.pending_len() < parked,
+            "fixture: the drain put back everything it took, so the drain record describes no \
+             change at all"
+        );
+        same_as_a_full_rewrite("after the drain put the log back");
 
         let _ = std::fs::remove_file(&armed);
         let _ = std::fs::remove_file(&control);
