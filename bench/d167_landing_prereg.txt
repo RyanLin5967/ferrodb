@@ -1,0 +1,27 @@
+PRE-REGISTRATION — landing D167, written BEFORE the suite runs
+===============================================================
+base fixed at: 0de43e7   (main; origin/main == main, 0 unpushed)
+EXPECTATION:   +0 @ 0de43e7, absolute 2529 per-target.
+
+DERIVATION, so the claim is checkable rather than trusted:
+  git diff --name-only 0de43e7 d167-demoted-overlay-cost
+    -> bench/d167_prereg.txt
+       bench/d167_demoted_overlay_curve.txt
+       examples/d56_plan_curve.rs
+  NO file under tests/ is touched, so the test count cannot move. The example gains one
+  env-var knob (D56_DEMOTE) and one conditional UPDATE; it adds no #[test].
+
+⚠ MODE: 2529 is per-target. `whole` would read 2531 (+2 doctests). Comparing across modes
+  manufactures a phantom delta.
+⚠ The absolute 2529 is DERIVED from main's last bank, not independently pre-registered here.
+  The +0 is the pre-registered quantity. Stated against my own favour.
+
+WHY THIS NEEDS THE FULL SUITE AT ALL, given it is "just an example":
+  prepush builds examples under CI RUSTFLAGS, so a broken example is a red CI job. And
+  `cargo does not see cfg(test) modules` — editing an example does not rebuild integration
+  tests that spawn it, which is exactly how this project once failed 53 tests on a fresh tree.
+
+WHAT WOULD FALSIFY IT
+  Any count other than 2529 per-target. LOWER is a regression or a starved run and must be
+  re-run, never reported as a count. HIGHER means the derivation above is wrong and the
+  derivation must be redone rather than the number accepted.

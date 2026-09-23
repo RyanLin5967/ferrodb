@@ -1,0 +1,57 @@
+PRE-REGISTRATION — D167: what does the DEMOTED overlay state cost?
+==================================================================
+Cut 2026-09-22T21:40Z, BEFORE the first run. Amendments append-only below the line.
+
+THE GAP THIS CLOSES, stated by the adversary against its own finding:
+  "A documented, correctness-motivated, permanent per-subtree cost cliff whose COST HALF
+   has never been measured." No test and no bench asserts anything about the demoted state.
+
+⛔ WHAT THIS IS NOT. `unprobeable_rows` being monotone, inherited and never decremented is
+  DOCUMENTED INTENT (runtime.rs:340-344) and deliberately TESTED (d57_overlay_probe.rs:346).
+  This measures the COST of that correct decision. It is not a bug report.
+
+THE INSTRUMENT
+  examples/d56_plan_curve.rs + a new D56_DEMOTE=1 knob. One PK-moving UPDATE
+  (`UPDATE t SET id = rows+1000000 WHERE id = 1`) makes unprobeable_rows non-zero, so
+  visible_rows_where WALKS instead of probing (runtime.rs:2172 gates on `== 0`).
+  The moved key is OUTSIDE the table and is NOT the key under test, so the read still comes
+  from the base table and the two arms differ in EXACTLY ONE THING: whether the probe is on.
+
+  Why the PK door and not the variant door: both reach the same counter, but
+  `git grep -nE "VALUES \([0-9]+\.[0-9]"` finds the variant door ONLY inside d57's own tests,
+  while the PK move is the plausible one -- trunk REFUSES it (value_fits, reached only through
+  Tuple::serialize) so an agent must reach for a branch, and the branch path
+  (paged_rows::encode_row) takes &[Value] and never sees the schema.
+
+  Measured as a CURVE over D56_STAGED (= W, the overlay size) at fixed rows=5000, because a
+  single before/after ratio cannot separate a complexity class from a constant, and this box
+  is never quiet. The SHAPE is the result.
+
+THE PREDICTION, FIXED BEFORE THE RUN
+  control  (D56_DEMOTE=0): the read takes the probe -- one `staged.get` -- so throughput is
+                           ~FLAT across W.
+  demoted  (D56_DEMOTE=1): the probe is disabled, so visible_rows_where walks the whole table
+                           prefix of the overlay -- O(W) per read -- so throughput falls ~1/W.
+  => The discriminator is the SLOPE of the demoted arm against a flat control, not any ratio.
+
+⛔ FALSIFIERS -- each says the INSTRUMENT failed, not that the cost is zero
+  1. DEMOTED ARM ALSO FLAT  => either the demoting UPDATE did not fire, or the walk is not on
+     the measured path. A flat demoted arm is NOT evidence the cliff is free. Check the UPDATE
+     succeeded and that the two arms differ AT ALL at some W before reading any slope.
+  2. CONTROL ARM FALLS WITH W => the probe is not firing even in the control, the arms are not
+     distinguishable, and the comparison is void. (`a moved control means two bases`.)
+  3. ARMS IDENTICAL AT EVERY W => the demotion never happened. This is the most likely failure
+     and it looks exactly like "no effect".
+
+POSITIVE CONTROL, REQUIRED BEFORE ANY SLOPE IS READ
+  The two arms MUST differ at the largest W. If they do not, stop and fix the harness.
+  A detector that has not been forced to fire is not a clean result.
+
+WHAT A CONFIRMED RESULT WOULD AND WOULD NOT LICENSE
+  ✅ "The demoted state costs O(W) per read where the probeable state costs O(1), measured."
+  ⛔ NOT "this is a bug" -- see above.
+  ⛔ NOT any absolute stmt/s figure as a property of ferrodb; this box is contended and the
+     numbers are a SHAPE, exactly as d56's own header says.
+
+AMENDMENTS
+  (none yet)
