@@ -118,3 +118,34 @@ A2. Table size set to 16,000 rows rather than 20,000. The requirement is only th
     larger than the largest W (12,800) so the overlay cannot saturate; 16,000 satisfies it, is the
     largest size D170 used, and cuts ~25% off the per-cell build. `max_overlay_len == W` is
     asserted in every cell regardless, so saturation cannot pass silently whatever the table size.
+
+A3. 2026-09-23, after passes 1 and before any stub measurement. ⛔ MY RESULT CONTRADICTS A CLOSED
+    ROW, AND THE RULE IS TO REPRODUCE THEIRS FIRST.
+
+    `bench/d71_point_update_curve.txt`, section "A SECOND WALL I PROPOSED AND THEN KILLED BY
+    MEASURING IT", swept updates-in-session at a fixed 4,000-row table and concluded:
+      "64x the session size costs 1.45x per update. THE HYPOTHESIS IS DEAD. ... There is no
+       session-size wall and no quadratic term."
+    Arm B here holds the overlay FIXED and sweeps statements, and measures 61.71 -> 953.92 us over
+    128x, ~70 ns per statement. Those disagree.
+
+    ⚠ BEFORE CLAIMING A WALL I MUST ASSUME MY NUMBER IS WRONG AND REPRODUCE THEIRS. Their sweep
+    ran on the STUB configuration (`Session::new()`, `storage: None`) -- the same D101 defect that
+    D170 was about -- so the reproduction is arm B RUN ON THE STUB.
+
+    REGISTERED ARM D (post-hoc and labelled as such, NOT a pre-registered confirmation):
+      arm B's design, `D171_STUB=1`, no `ServerContext` constructed anywhere in the process so
+      `designated::check` permits it.
+
+    PREDICTIONS:
+      D1. STUB FLAT, ARENA RISES -> the per-statement term lives in or below the storage layer,
+          and `d71_point_update_curve.txt`'s "no session-size wall" is CORRECT FOR THE STUB and
+          FALSE FOR THE SHIPPED PATH. That is the same shape as D170: a stub result that does not
+          transfer. It would NARROW the mechanism to the storage layer WITHOUT naming a structure,
+          which is as far as this row is licensed to go.
+      D2. STUB ALSO RISES -> their measurement and mine disagree on the SAME configuration, and
+          NOTHING may be concluded until that is resolved. My number is then the suspect one.
+      D3. BOTH FLAT -> arm B is an artifact of my own instrument; withdraw it.
+
+    ⛔ Whatever D returns, this row STILL MAY NOT NAME A STRUCTURE. "In or below the storage
+    layer" is a narrowing, not a mechanism. `frame.push_op` remains a CANDIDATE NOT CHECKED.
