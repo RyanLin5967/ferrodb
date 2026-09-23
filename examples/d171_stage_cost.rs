@@ -107,7 +107,7 @@ impl StubDb {
 }
 
 /// One stub cell, same shape as `cell`: pre-load untimed to (w, s), then time TIMED statements.
-fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64) {
+fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
     let mut db = StubDb::new();
     let mut base = Session::new();
     db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut base);
@@ -131,8 +131,8 @@ fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64) {
         samples.push(t.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(affected(&out), Some(1), "STUB timed no-op at w={w} s={s} i={i}");
     }
-    let (pf, wu, _wn, mu, mo) = d170_overlay_counters();
-    (median(&mut samples), pf, wu, mu, mo)
+    let (pf, wu, wn, mu, mo) = d170_overlay_counters();
+    (median(&mut samples), pf, wu, wn, mu, mo)
 }
 
 fn affected(o: &Outcome) -> Option<usize> {
@@ -158,7 +158,7 @@ const TIMED: usize = 200;
 
 /// Run one cell: pre-load to (w distinct keys, s statements) untimed, then time TIMED statements
 /// on keys already staged. Returns (median ms, probe_fired, walk_unprob, max_unprob, max_overlay).
-fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64) {
+fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64, u64) {
     let mut db = Db::new(rows);
     let mut base = db.ctx.session();
     db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut base);
@@ -189,8 +189,8 @@ fn cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64) {
         samples.push(t.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(affected(&out), Some(1), "timed no-op at w={w} s={s} i={i}");
     }
-    let (pf, wu, _wn, mu, mo) = d170_overlay_counters();
-    (median(&mut samples), pf, wu, mu, mo)
+    let (pf, wu, wn, mu, mo) = d170_overlay_counters();
+    (median(&mut samples), pf, wu, wn, mu, mo)
 }
 
 fn main() {
@@ -214,7 +214,7 @@ fn main() {
         "C" => format!("S FIXED at {s_fixed}, W swept -- statement count constant"),
         _ => "unknown".to_string(),
     });
-    println!("\n      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay");
+    println!("\n      axis        W        S   median ms   us/stmt   probe   wlknopk   walk_unprob   max_unprob   max_overlay");
     let mut first: Option<f64> = None;
     for &x in &axis {
         let (w, s) = match arm.as_str() {
@@ -225,15 +225,29 @@ fn main() {
         };
         assert!((w as i64) <= rows, "w={w} exceeds table rows={rows}: the overlay would SATURATE");
         let stub = std::env::var("D171_STUB").is_ok();
-        let (med, pf, wu, mu, mo) = if stub { stub_cell(rows, w, s) } else { cell(rows, w, s) };
+        let (med, pf, wu, wn, mu, mo) = if stub { stub_cell(rows, w, s) } else { cell(rows, w, s) };
 
         // Controls, enforced before the number is printed.
-        assert_eq!(pf, TIMED as u64, "probe did not fire on every timed statement (w={w} s={s}): {pf}/{TIMED}");
+        //
+        // ⚠ The EXPECTED ARM depends on the configuration, and the first version of this got it
+        // wrong: under `D170_NOPUSHDOWN=1` the predicate is not pushed, so `bound` is `None`, so
+        // `overlay_probe_key` cannot fire and the no-pk-conjunct walk is taken BY CONSTRUCTION.
+        // Requiring `probe == 200` there refused three correct cells. It refused rather than
+        // printing a number, which is the right direction to fail, but it was the wrong gate.
+        // What must hold in BOTH configurations is that this is NOT D167's demoted regime.
+        let nopush = std::env::var("D170_NOPUSHDOWN").map(|v| v == "1").unwrap_or(false);
+        if nopush {
+            assert_eq!(wn, TIMED as u64,
+                "NOPUSHDOWN: expected the no-pk-conjunct walk on every timed statement (w={w} s={s}): {wn}/{TIMED}");
+            assert_eq!(pf, 0, "NOPUSHDOWN: the probe fired {pf} times, so the predicate WAS pushed (w={w} s={s})");
+        } else {
+            assert_eq!(pf, TIMED as u64, "probe did not fire on every timed statement (w={w} s={s}): {pf}/{TIMED}");
+        }
         assert_eq!(wu, 0, "walk_unprobeable non-zero at w={w} s={s}: this is D167's demoted regime, cell VOID");
         assert_eq!(mu, 0, "unprobeable_rows non-zero at w={w} s={s}: cell VOID");
         assert_eq!(mo, w as u64, "max_overlay_len={mo} != intended W={w}: the overlay SATURATED, cell VOID");
 
-        println!("  {x:>8} {w:>8} {s:>8}   {med:>9.4}   {:>7.2}   {pf:>5}   {wu:>11}   {mu:>10}   {mo:>11}",
+        println!("  {x:>8} {w:>8} {s:>8}   {med:>9.4}   {:>7.2}   {pf:>5}   {wn:>6}   {wu:>11}   {mu:>10}   {mo:>11}",
                  med * 1000.0);
         if first.is_none() { first = Some(med); }
         if let Some(m0) = first {

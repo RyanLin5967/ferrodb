@@ -1,0 +1,88 @@
+ACQUIRED d171e2  load_at_acquire=3
+host: Darwin arm64  started: 2026-09-23T07:57:17Z
+load: 3.67 4.08 4.71
+tree: c097eab228e1452109d595a5d93ef75760668541
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d170-adversary)
+    Finished `release` profile [optimized] target(s) in 8.73s
+
+=== E1 STUB + NOPUSHDOWN + arm A (W=S) — THEIR SWEEP, REPRODUCED — load 4.01 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1 +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM A: W = S, both swept (reproduces D170's axis)
+
+      axis        W        S   median ms   us/stmt   probe   wlknopk   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.5220    521.96       0      200             0            0            50
+       100      100      100      0.5472    547.17       0      200             0            0           100
+           ^ 2.0x the axis, 1.05x the time
+       200      200      200      0.5563    556.33       0      200             0            0           200
+           ^ 4.0x the axis, 1.07x the time
+       400      400      400      0.6172    617.25       0      200             0            0           400
+           ^ 8.0x the axis, 1.18x the time
+       800      800      800      0.6170    617.04       0      200             0            0           800
+           ^ 16.0x the axis, 1.18x the time
+      1600     1600     1600      0.6823    682.33       0      200             0            0          1600
+           ^ 32.0x the axis, 1.31x the time
+      3200     3200     3200      0.8596    859.63       0      200             0            0          3200
+           ^ 64.0x the axis, 1.65x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== E2 STUB + NOPUSHDOWN + arm B (W=50 fixed) — S alone — load 2.46 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1 +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   wlknopk   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.5211    521.12       0      200             0            0            50
+       100       50      100      0.5133    513.33       0      200             0            0            50
+           ^ 2.0x the axis, 0.99x the time
+       200       50      200      0.5318    531.83       0      200             0            0            50
+           ^ 4.0x the axis, 1.02x the time
+       400       50      400      0.5440    543.96       0      200             0            0            50
+           ^ 8.0x the axis, 1.04x the time
+       800       50      800      0.5830    582.96       0      200             0            0            50
+           ^ 16.0x the axis, 1.12x the time
+      1600       50     1600      0.6485    648.54       0      200             0            0            50
+           ^ 32.0x the axis, 1.24x the time
+      3200       50     3200      0.7201    720.08       0      200             0            0            50
+           ^ 64.0x the axis, 1.38x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== E5 ARENA + NOPUSHDOWN + arm B (W=50 fixed) — S alone — load 3.27 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1 +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = ARENA (ArenaPageStore + ServerContext) — the shipped path
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   wlknopk   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.6462    646.21       0      200             0            0            50
+       100       50      100      0.6102    610.25       0      200             0            0            50
+           ^ 2.0x the axis, 0.94x the time
+       200       50      200      0.6171    617.08       0      200             0            0            50
+           ^ 4.0x the axis, 0.95x the time
+       400       50      400      0.6382    638.21       0      200             0            0            50
+           ^ 8.0x the axis, 0.99x the time
+       800       50      800      0.6562    656.21       0      200             0            0            50
+           ^ 16.0x the axis, 1.02x the time
+      1600       50     1600      0.6670    667.04       0      200             0            0            50
+           ^ 32.0x the axis, 1.03x the time
+      3200       50     3200      0.7914    791.37       0      200             0            0            50
+           ^ 64.0x the axis, 1.22x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+finished: 2026-09-23T08:02:03Z  load: 3.90 3.71 4.32
+RELEASED d171e2
+D171E2_COMPLETE

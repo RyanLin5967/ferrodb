@@ -1,0 +1,142 @@
+ACQUIRED d171e  load_at_acquire=7
+host: Darwin arm64  started: 2026-09-23T07:50:55Z
+load: 7.65 5.59 5.40
+tree: c097eab228e1452109d595a5d93ef75760668541  branch d170-adversary
+
+REPRODUCING bench/d71_point_update_curve.txt's 'A SECOND WALL I PROPOSED AND THEN KILLED
+BY MEASURING IT': fixed 4000-row table, N updates in session, N = 50..3200. Its numbers:
+   50 -> 0.708 ms   100 -> 0.695   200 -> 0.717   400 -> 0.765
+  800 -> 0.762      1600 -> 0.790  3200 -> 1.027   => it read 1.45x and concluded
+  'THE HYPOTHESIS IS DEAD ... no session-size wall and no quadratic term.'
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d170-adversary)
+    Finished `release` profile [optimized] target(s) in 9.66s
+
+=== E1 STUB  + NOPUSHDOWN + arm A (W=S) — THEIR SWEEP, REPRODUCED — load 7.55 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM A: W = S, both swept (reproduces D170's axis)
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+
+thread 'main' (287883161) panicked at examples/d171_stage_cost.rs:231:9:
+assertion `left == right` failed: probe did not fire on every timed statement (w=50 s=50): 0/200
+  left: 0
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+rc=101
+
+=== E2 STUB  + NOPUSHDOWN + arm B (W=50 fixed) — S alone — load 6.91 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+
+thread 'main' (287885539) panicked at examples/d171_stage_cost.rs:231:9:
+assertion `left == right` failed: probe did not fire on every timed statement (w=50 s=50): 0/200
+  left: 0
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+rc=101
+
+=== E3 STUB  + pushdown   + arm A (W=S) — load 6.23 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM A: W = S, both swept (reproduces D170's axis)
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.0174     17.37     200             0            0            50
+       100      100      100      0.0211     21.08     200             0            0           100
+           ^ 2.0x the axis, 1.21x the time
+       200      200      200      0.0284     28.42     200             0            0           200
+           ^ 4.0x the axis, 1.64x the time
+       400      400      400      0.0405     40.54     200             0            0           400
+           ^ 8.0x the axis, 2.33x the time
+       800      800      800      0.0663     66.33     200             0            0           800
+           ^ 16.0x the axis, 3.82x the time
+      1600     1600     1600      0.1321    132.08     200             0            0          1600
+           ^ 32.0x the axis, 7.60x the time
+      3200     3200     3200      0.2319    231.92     200             0            0          3200
+           ^ 64.0x the axis, 13.35x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== E4 STUB  + pushdown   + arm B (W=50 fixed) — S alone — load 4.17 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.0210     20.96     200             0            0            50
+       100       50      100      0.0207     20.67     200             0            0            50
+           ^ 2.0x the axis, 0.99x the time
+       200       50      200      0.0281     28.08     200             0            0            50
+           ^ 4.0x the axis, 1.34x the time
+       400       50      400      0.0402     40.21     200             0            0            50
+           ^ 8.0x the axis, 1.92x the time
+       800       50      800      0.0693     69.33     200             0            0            50
+           ^ 16.0x the axis, 3.31x the time
+      1600       50     1600      0.1177    117.67     200             0            0            50
+           ^ 32.0x the axis, 5.61x the time
+      3200       50     3200      0.2243    224.29     200             0            0            50
+           ^ 64.0x the axis, 10.70x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== E5 ARENA + NOPUSHDOWN + arm B (W=50 fixed) — S alone — load 3.61 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = ARENA (ArenaPageStore + ServerContext) — the shipped path
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+
+thread 'main' (287934527) panicked at examples/d171_stage_cost.rs:231:9:
+assertion `left == right` failed: probe did not fire on every timed statement (w=50 s=50): 0/200
+  left: 0
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+rc=101
+
+=== E6 ARENA + pushdown   + arm B (W=50 fixed) — S alone — load 3.39 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at c097eab228e1
+table rows = 4000, timed window = 200 statements on already-staged keys
+config = ARENA (ArenaPageStore + ServerContext) — the shipped path
+ARM B: W FIXED at 50, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+        50       50       50      0.0588     58.79     200             0            0            50
+       100       50      100      0.0615     61.50     200             0            0            50
+           ^ 2.0x the axis, 1.05x the time
+       200       50      200      0.0689     68.87     200             0            0            50
+           ^ 4.0x the axis, 1.17x the time
+       400       50      400      0.0840     84.00     200             0            0            50
+           ^ 8.0x the axis, 1.43x the time
+       800       50      800      0.1185    118.46     200             0            0            50
+           ^ 16.0x the axis, 2.01x the time
+      1600       50     1600      0.1612    161.21     200             0            0            50
+           ^ 32.0x the axis, 2.74x the time
+      3200       50     3200      0.2902    290.21     200             0            0            50
+           ^ 64.0x the axis, 4.94x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+finished: 2026-09-23T07:56:10Z  load: 3.55 4.21 4.81
+RELEASED d171e
+D171E_COMPLETE

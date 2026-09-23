@@ -1,0 +1,140 @@
+ACQUIRED d171  load_at_acquire=6
+host: Darwin arm64  started: 2026-09-23T07:20:51Z
+load: 6.14 6.85 8.41
+tree: 690bb758c566926251420b851118943d29eac15e  branch d170-adversary
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d170-adversary)
+    Finished `release` profile [optimized] target(s) in 9.31s
+
+######## PASS 1 (A,B,C) ########
+
+=== ARM A — pass 1 — load 7.49 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM A: W = S, both swept (reproduces D170's axis)
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100      100      0.0621     62.13     200             0            0           100
+       400      400      400      0.0797     79.71     200             0            0           400
+           ^ 4.0x the axis, 1.28x the time
+      1600     1600     1600      0.1700    170.04     200             0            0          1600
+           ^ 16.0x the axis, 2.74x the time
+      6400     6400     6400      0.5165    516.54     200             0            0          6400
+           ^ 64.0x the axis, 8.31x the time
+     12800    12800    12800      0.9874    987.42     200             0            0         12800
+           ^ 128.0x the axis, 15.89x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== ARM B — pass 1 — load 5.50 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM B: W FIXED at 100, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100      100      0.0617     61.71     200             0            0           100
+       400      100      400      0.0813     81.33     200             0            0           100
+           ^ 4.0x the axis, 1.32x the time
+      1600      100     1600      0.1655    165.46     200             0            0           100
+           ^ 16.0x the axis, 2.68x the time
+      6400      100     6400      0.6184    618.38     200             0            0           100
+           ^ 64.0x the axis, 10.02x the time
+     12800      100    12800      0.9539    953.92     200             0            0           100
+           ^ 128.0x the axis, 15.46x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== ARM C — pass 1 — load 5.46 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM C: S FIXED at 12800, W swept -- statement count constant
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100    12800      1.0150   1014.96     200             0            0           100
+       400      400    12800      0.9345    934.50     200             0            0           400
+           ^ 4.0x the axis, 0.92x the time
+      1600     1600    12800      1.0324   1032.42     200             0            0          1600
+           ^ 16.0x the axis, 1.02x the time
+      6400     6400    12800      0.9407    940.67     200             0            0          6400
+           ^ 64.0x the axis, 0.93x the time
+     12800    12800    12800      0.9988    998.75     200             0            0         12800
+           ^ 128.0x the axis, 0.98x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+######## PASS 2 (C,B,A) ########
+
+=== ARM C — pass 2 — load 4.49 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM C: S FIXED at 12800, W swept -- statement count constant
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100    12800      0.9533    953.29     200             0            0           100
+       400      400    12800      0.9650    964.96     200             0            0           400
+           ^ 4.0x the axis, 1.01x the time
+      1600     1600    12800      0.9186    918.58     200             0            0          1600
+           ^ 16.0x the axis, 0.96x the time
+      6400     6400    12800      0.9127    912.71     200             0            0          6400
+           ^ 64.0x the axis, 0.96x the time
+     12800    12800    12800      0.9958    995.79     200             0            0         12800
+           ^ 128.0x the axis, 1.04x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== ARM B — pass 2 — load 3.80 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM B: W FIXED at 100, S swept -- overlay never grows
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100      100      0.0646     64.62     200             0            0           100
+       400      100      400      0.0795     79.50     200             0            0           100
+           ^ 4.0x the axis, 1.23x the time
+      1600      100     1600      0.1592    159.21     200             0            0           100
+           ^ 16.0x the axis, 2.46x the time
+      6400      100     6400      0.4958    495.83     200             0            0           100
+           ^ 64.0x the axis, 7.67x the time
+     12800      100    12800      0.9390    938.96     200             0            0           100
+           ^ 128.0x the axis, 14.53x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+=== ARM A — pass 2 — load 3.79 ===
+D171 — separate W (staged rows) from S (statements). Prereg: bench/d171_prereg.txt
+at 690bb758c566
+table rows = 16000, timed window = 200 statements on already-staged keys
+ARM A: W = S, both swept (reproduces D170's axis)
+
+      axis        W        S   median ms   us/stmt   probe   walk_unprob   max_unprob   max_overlay
+       100      100      100      0.0606     60.63     200             0            0           100
+       400      400      400      0.0779     77.92     200             0            0           400
+           ^ 4.0x the axis, 1.29x the time
+      1600     1600     1600      0.1585    158.54     200             0            0          1600
+           ^ 16.0x the axis, 2.62x the time
+      6400     6400     6400      0.5023    502.29     200             0            0          6400
+           ^ 64.0x the axis, 8.29x the time
+     12800    12800    12800      0.9669    966.92     200             0            0         12800
+           ^ 128.0x the axis, 15.95x the time
+
+All cells: probe fired on every timed statement, unprobeable_rows 0, overlay == W,
+every statement changed exactly 1 row, negative control 0.
+rc=0
+
+finished: 2026-09-23T07:48:55Z  load: 3.33 3.60 4.74
+RELEASED d171
+D171_COMPLETE
