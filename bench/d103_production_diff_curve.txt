@@ -24,6 +24,12 @@ alone would have been undone by the next run. The generator, its module doc, and
 sentence in src/cow/btree.rs, src/agent_sql/runtime.rs (DiffCost, page_changeset_with_cost) and
 tests/integration_production_diff_wiring.rs are corrected in the same D193 commit that adds this
 block. The file name is historical; renaming it would break its citations.
+RE-RUN, 2026-09-23T22:00Z: the corrected generator, built at 180618a047ba (clean stamp), run from
+a scratch cwd so this file was not overwritten. Output banked verbatim at
+bench/d193_label/d103_rerun_at_180618a.txt. It emits the corrected title, Subject and verdict, and
+all 40 integers of its table (5 rows x 8 columns) are IDENTICAL to the table below (mechanical
+diff of the rows; negative control: one altered integer makes the diff fire). So the numbers
+below are current for 180618a, not only for the run that banked them.
 ⛔⛔ END D193 CORRECTION — everything below is the original file, unedited.
 ===============================================================================================
 
