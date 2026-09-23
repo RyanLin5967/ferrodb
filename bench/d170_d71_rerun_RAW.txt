@@ -1,3 +1,44 @@
+⛔⛔ VERDICT 2026-09-23: **DESTROYED BY ITS ADVERSARY** (`frontier/d170_adversary.md`).
+READ THIS BEFORE ANY NUMBER BELOW. The data are sound; the framing I was building on them was
+wrong TWICE, and the headline result was already on disk before I measured it.
+
+1. ⛔ **THE CAUSAL CLAIM IS FALSE.** This is NOT a stub-vs-arena comparison. It is a
+   BEFORE-FIX vs AFTER-FIX comparison with the fix confounded in. `e6958d6` ("D71 FIX: push the
+   predicate through the agent WRITE paths") landed **2026-09-20 14:14:44**, ONE HOUR after the
+   stub run's instrument commit, and is an ancestor of HEAD.
+
+2. ⛔ **THE ADVERSARY ISOLATED IT BY MEASUREMENT, NOT ARGUMENT.** Restoring only that call site
+   (`D170_NOPUSHDOWN=1`), same binary, ARENA path:
+
+       HEAD, pushdown ON        1.27x / 0.76x   ms/1000 FALLS
+       NOPUSHDOWN (pre-fix)    11.78x / 14.55x  ms/1000 FLAT ~0.14-0.16
+       stub run's headline      12.91x          ms/1000 FLAT ~0.17
+
+   Pre-fix ARENA mean **13.17** brackets the stub's **12.91**. ⇒ **The stub defect moved D71's
+   headline by approximately nothing.** The 2x2: across a row (no fix -> fix) 13-15x -> ~1x; down
+   a column (stub -> arena) 12.91 -> 13.17 and 1.17 -> 1.02, i.e. NOTHING.
+
+3. ⛔⛔ **AND THE RESULT WAS ALREADY BANKED THREE DAYS EARLIER — A RULE ZERO FAILURE OF MINE.**
+   `bench/d71_pushdown_fix.txt` already holds the AFTER arm as FLAT: `AFTER 0.013 -> 0.016,
+   ratio 1.23` (with 1.00 and 1.27 in sibling arms, mean 1.17), committed 2026-09-20.
+   ⚠ **I OPENED THAT FILE EARLIER THE SAME SESSION AND READ ONLY ITS D101 BANNER** (`head -22`),
+   stopping above the numbers. `bench/` is named in Rule Zero precisely because a measurement dies
+   to PRIOR MEASUREMENT in your own `bench/`. Reading a file's header instead of its body is the
+   same failure as reading `grep -c` instead of the matches, which I also did tonight.
+
+✅ **WHAT SURVIVES, and it is small:** the **arena + fix** cell of the 2x2 was genuinely unmeasured
+before today (`d71_pushdown_fix.txt`'s AFTER arm carries the D101 banner, i.e. it was measured on
+the stub runtime). This run and the adversary's independently fill it: **1.02x (adversary), 0.81x /
+0.69x (here)**. That is a REPLICATION plus one filled cell — **not a discovery**, and this file no
+longer claims otherwise.
+
+✅ **AND THE ONE THING WORTH THE PASS:** D71's ledger row still reads **OPEN** while its own exit
+criterion — *"pass their predicate to `visible_rows_where` ... and the D71 staged curve goes FLAT"*
+— has been MET since 2026-09-20 and is now measured three independent ways. The row is closed in
+`SCALE-LEDGER.md` on the strength of that, not of this file.
+
+===============================================================================================
+
 D170 — RAW DATA ONLY. THE D71 RE-RUN THAT HAD NEVER HAPPENED.
 ⛔ INTERPRETATION IS DELIBERATELY ABSENT AND IS PENDING AN ADVERSARY (Rule One).
    Do not quote a conclusion from this file. It exists so the measurement survives the analysis.
