@@ -201,3 +201,67 @@ any other existing assertion, to accommodate this change.
 
 
 =============================== AMENDMENTS (APPEND ONLY) ===============================
+
+--- AMENDMENT 1 — 2026-09-23, after run 1, before any interpretation of it -------------------
+
+H1 PROBE RESULT: branch **H1-a** fired. The refusal is LIVE and REACHABLE on the SELECT path in
+the unmodified tree. From `bench/d178_run1_BEFORE_RAW.txt`, 1,000 rows, index on `v`, ANALYZE run:
+
+    SELECT id FROM h WHERE v > 9980 ;  ERROR: binding error: lower bound sec index isn't supported
+    SELECT id FROM h WHERE v > 9900 ;  OK, 9 rows
+
+Same table, same index, same predicate SHAPE. Only the row estimate differs: the higher cutoff
+estimates few enough rows that the index side wins the cost comparison, and then `lower` cannot
+build what `build_index_scan` chose. A user sees a query start failing as their data moves.
+
+Action taken, exactly as pre-registered under H1-a and no further: one authority,
+`optimizer::secondary_scan_lower`, which either produces the secondary tree's lower bound or says
+it cannot be expressed. `build_index_scan` consults it through `index_scan_lowerable` BEFORE
+proposing a plan; `lower` consults the same function to build one. `lower`'s refusal is unchanged
+and `plan::tests::test_index_scan_secondary_rejects_strict_lower` is untouched and still passes.
+No fallback was added to `build_scan` (that was forbidden under section 8) and no test was edited.
+
+Landed as its own commit BEFORE the DML routing change, and run 2 was taken between them
+(`bench/d178_run2_MID_RAW.txt`) so the two changes cannot be credited with each other's effect:
+run 2's DML arms are identical to run 1's cell for cell, and only the H1 probe moved.
+
+
+--- AMENDMENT 2 — 2026-09-23, after run 3 — MUTATION RUN, and a defect it found IN MY OWN TEST ---
+
+Per the standing rule that a detector which found nothing is not a clean result until forced to
+fire, the two new test files were run against three deliberate mutants in a THROWAWAY worktree
+(`/Users/idide/wt/ferrodb-d178-firecheck`, branch `d178-firecheck`), never in the working tree.
+
+  M1  restore the original defect: `build_scan` always builds SeqScan + Filter.
+      => d178_dml_index_counters RED: "an UPDATE on a primary-key equality still read 400 tuples
+         sequentially, out of a 400-row table; the unindexed arm above read 400, so the counter
+         works". d178_dml_index_correctness GREEN — CORRECT, and the discrimination that matters:
+         the pre-D178 path was slow, not wrong, so a correctness file that reddened here would be
+         asserting something it has no business asserting.
+
+  M2  remove the H1 guard from `build_index_scan`.
+      => counters RED (the mixed-conjunct case) and correctness RED x2:
+         "v > 7980 must answer, not refuse: binding error: lower bound sec index isn't supported".
+
+  M3  the WRONG-ANSWER mutant: map `Bound::Excluded` to `Bound::Included` in
+      `secondary_scan_lower` — the "nearest expressible bound" fallthrough, which errors nowhere
+      and simply returns one row too many.
+      => correctness RED, on row IDENTITY rather than row count:
+         `v > 7980 returned the wrong rows   left: [798, 799]   right: [799]`
+      This is the mutant the correctness file exists for. A test asserting only "1 row affected"
+      would have passed it.
+
+⛔ M2 FOUND A REAL DEFECT IN THE TEST I HAD JUST WRITTEN, and it is recorded here rather than
+quietly fixed. The H1 correctness test originally used the 60-row fixture and PASSED under M2 —
+i.e. it was VACUOUS, and would have shipped as a guard that could never fire. The reason is scope,
+not logic: the optimizer only chooses the unbuildable plan when its row estimate is small enough,
+which needs both a large enough table and real statistics. Measured against the M2 tree:
+
+    n=400  analyze=true    v > 3980  ->  OK, 1 rows        <- does NOT fire
+    n=800  analyze=false   v > 7980  ->  OK, 1 rows        <- does NOT fire
+    n=800  analyze=true    v > 7980  ->  ERROR: lower bound sec index isn't supported
+
+So the test now uses an 800-row ANALYZEd fixture (`N_BIG`), with that table written into the
+fixture's doc comment and an explicit instruction not to shrink it — shrinking it does not make
+the file faster, it switches the guard off. Without the mutation run this would have been an
+untested test dressed as a passing one.

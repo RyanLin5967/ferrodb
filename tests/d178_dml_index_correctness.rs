@@ -127,6 +127,48 @@ fn fixture() -> (Db, Session) {
     (db, s)
 }
 
+/// The H1 fixture: **800 rows and `ANALYZE` run**, which is not decoration.
+///
+/// The defect H1 guards against is only reachable where the optimizer's cost comparison PICKS the
+/// index for `v > k`, and that needs a small enough row estimate. Measured against the unfixed tree
+/// (`tests/d178_probe_scope.rs`, run under the mutant that removes the guard):
+///
+/// ```text
+///   n=400  analyze=true   v > 3980  ->  OK, 1 rows       <- the defect does NOT fire here
+///   n=800  analyze=false  v > 7980  ->  OK, 1 rows       <- nor here
+///   n=800  analyze=true   v > 7980  ->  ERROR: lower bound sec index isn't supported
+/// ```
+///
+/// Without `ANALYZE` the cost model has no min/max for `v` and falls back to
+/// `DEFAULT_RANGE_SELECTIVITY`, which estimates a quarter of the table and makes the index side
+/// lose; with real statistics the estimate collapses to one row and the index side wins. So **a
+/// smaller table or a missing `ANALYZE` makes this test pass against the bug** — it was written
+/// that way first, and the mutation run is what caught it.
+///
+/// ⛔ Do not shrink this fixture or drop the `ANALYZE` to make the file faster. That does not speed
+/// the test up, it switches it off.
+const N_BIG: i64 = 800;
+
+fn big_fixture() -> (Db, Session) {
+    let mut db = Db::new();
+    let mut s = Session::new();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER, label VARCHAR(16));", &mut s);
+    for i in 0..N_BIG {
+        db.ok(&format!("INSERT INTO t VALUES ({i}, {}, 'row');", i * 10), &mut s);
+    }
+    db.ok("CREATE INDEX ix ON t (v);", &mut s);
+    db.ok("ANALYZE t;", &mut s);
+    (db, s)
+}
+
+fn big_expected_after_update(matches: impl Fn(i64, i64) -> bool, new_v: i64) -> Vec<(i64, i64)> {
+    (0..N_BIG).map(|i| if matches(i, i * 10) { (i, new_v) } else { (i, i * 10) }).collect()
+}
+
+fn big_expected_after_delete(matches: impl Fn(i64, i64) -> bool) -> Vec<(i64, i64)> {
+    (0..N_BIG).filter(|&i| !matches(i, i * 10)).map(|i| (i, i * 10)).collect()
+}
+
 /// The fixture as this test computes it, from the rule above and nothing else.
 fn expected_fixture() -> Vec<(i64, i64)> {
     (0..N).map(|i| (i, i * 10)).collect()
@@ -248,11 +290,12 @@ fn a_strict_lower_bound_on_a_secondary_index_answers_rather_than_erroring() {
     //
     // ⚠ This asserts that the statement ANSWERS, and answers correctly. It does NOT assert that
     // `v > k` uses the index — it does not, and making it do so is a separate row.
-    let (mut db, mut s) = fixture();
+    let (mut db, mut s) = big_fixture();
 
     // The top of `v`'s range is where the estimate is smallest and the index side of the cost
-    // comparison is cheapest — the corner that used to fail.
-    for cutoff in [(N - 2) * 10, (N - 5) * 10, (N / 2) * 10] {
+    // comparison is cheapest — the corner that used to fail. See `N_BIG` for why the fixture has
+    // to be this size and has to be ANALYZEd.
+    for cutoff in [(N_BIG - 2) * 10, (N_BIG - 5) * 10, (N_BIG / 2) * 10] {
         let rows = match db.exec(&format!("SELECT id FROM t WHERE v > {cutoff};"), &mut s) {
             Ok(Outcome::Rows(r)) => r,
             Ok(_) => panic!("v > {cutoff}: expected rows"),
@@ -266,21 +309,21 @@ fn a_strict_lower_bound_on_a_secondary_index_answers_rather_than_erroring() {
             })
             .collect();
         got.sort();
-        let want: Vec<i64> = (0..N).filter(|i| i * 10 > cutoff).collect();
+        let want: Vec<i64> = (0..N_BIG).filter(|i| i * 10 > cutoff).collect();
         assert_eq!(got, want, "v > {cutoff} returned the wrong rows");
     }
 
     // And the same shape on a WRITE statement, which is where D178 would otherwise have introduced
     // this error for the first time.
-    let (mut db2, mut s2) = fixture();
-    let cutoff = (N - 2) * 10;
-    let affected = db2.affected(&format!("UPDATE t SET v = 999 WHERE v > {cutoff};"), &mut s2);
+    let (mut db2, mut s2) = big_fixture();
+    let cutoff = (N_BIG - 2) * 10;
+    let affected = db2.affected(&format!("UPDATE t SET v = 99999 WHERE v > {cutoff};"), &mut s2);
     assert_eq!(affected, 1, "exactly one row has v > {cutoff}");
-    assert_eq!(db2.table(&mut s2), expected_after_update(|_, v| v > cutoff, 999));
+    assert_eq!(db2.table(&mut s2), big_expected_after_update(|_, v| v > cutoff, 99999));
 
-    let (mut db3, mut s3) = fixture();
+    let (mut db3, mut s3) = big_fixture();
     assert_eq!(db3.affected(&format!("DELETE FROM t WHERE v > {cutoff};"), &mut s3), 1);
-    assert_eq!(db3.table(&mut s3), expected_after_delete(|_, v| v > cutoff));
+    assert_eq!(db3.table(&mut s3), big_expected_after_delete(|_, v| v > cutoff));
 }
 
 #[test]
@@ -288,13 +331,13 @@ fn an_unlowerable_conjunct_does_not_cost_the_statement_its_other_index() {
     // `build_index_scan` passes over a conjunct it cannot lower and considers the next indexed one,
     // rather than abandoning indexes for the whole predicate. Correctness is what is asserted here;
     // that it really does reach the index is asserted by the counter test.
-    let (mut db, mut s) = fixture();
-    let cutoff = (N - 2) * 10;
-    let target = N - 1;
+    let (mut db, mut s) = big_fixture();
+    let cutoff = (N_BIG - 2) * 10;
+    let target = N_BIG - 1;
     let affected =
-        db.affected(&format!("UPDATE t SET v = 999 WHERE v > {cutoff} AND id = {target};"), &mut s);
+        db.affected(&format!("UPDATE t SET v = 99999 WHERE v > {cutoff} AND id = {target};"), &mut s);
     assert_eq!(affected, 1);
-    assert_eq!(db.table(&mut s), expected_after_update(|id, _| id == target, 999));
+    assert_eq!(db.table(&mut s), big_expected_after_update(|id, _| id == target, 99999));
 }
 
 #[test]
