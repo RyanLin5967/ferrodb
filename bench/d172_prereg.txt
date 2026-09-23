@@ -1,0 +1,75 @@
+D172 PRE-REGISTRATION — WHICH S-KEYED STRUCTURE CARRIES D171's ~70 ns PER STATEMENT?
+Cut 2026-09-23, BEFORE any measurement. Amendments append-only below the line.
+
+⚠ THIS ROW IS REGISTERED BUT NOT RUN. It needs the fleet measure lock, which is committed to
+`d170-land` for its landing. Written now so the next reader starts from a design rather than a
+blank page. Whoever runs it: re-read the falsifiers before the first number, and append an
+amendment if the design changes.
+
+## WHAT IS ALREADY ESTABLISHED, so this row does not re-measure it
+
+`frontier/d171_session_length_wall.md` (artifacts `bench/d171_stage_cost*.txt`, commit `6970be9`):
+an agent session's per-statement cost grows linearly in the number of statements it has already
+executed, ~46-107 ns per prior statement (~70 ns in the shipped configuration), **flat in the
+overlay size across 128x**, present in stub and arena and with and without the D71 pushdown.
+
+Two exclusions already hold, each behind a fire-checked measurement — DO NOT SPEND AN ARM ON EITHER:
+
+  * **W-keyed structures are out.** D171 arm C holds S fixed, sweeps W 128x, and is flat. That
+    excludes `ws.rows` and `ws.base_rows`, including the `PersistentMap` path-copying insert that
+    D170 led with.
+  * **SEARCH over the effect log's frames is out.** `bench/d138_index_slope/` measures scan = 0
+    across a log growing to 1750+ frames, and licenses that zero with its own fire-check
+    (`d138_ship_raw.txt:16-17`). Its arm (2), "1 session x 200 writes", is this regime.
+    ⛔ But D138 measured COUNTS, not durations ("⛔ COUNTS ONLY. No timing is reported and none was
+    taken"), so it excludes SEARCHING and not GROWING — and its axis is the effect LOG's frame
+    count, NOT the `ops` Vec inside one open `TxnFrame`, which is a different structure its sweep
+    never reaches.
+
+## THE SURVIVING CANDIDATES — all keyed by S, none checked
+
+  C1. `TxnFrame::push_op` (`src/tel/frame.rs:49`) appending to `ops` on the ONE open frame held in
+      the live workspace (`runtime.rs:360`). Append-only, never trimmed within a session.
+  C2. The effect-log `frames` Vec's own ALLOCATION growth — distinct from the search D138 zeroed.
+  C3. `record_write_scan`'s per-statement read-set retention.
+
+## THE INSTRUMENT — COUNTS FIRST, and a REMOVAL arm, because a shape cannot name a structure
+
+This row is licensed to name a structure ONLY via (b) or (c). (a) alone narrows, it does not name.
+
+  (a) **ALLOCATION COUNTS, not durations.** A counting global allocator, sampled around each
+      statement: allocations and bytes per statement, swept over S. Follow D129/D138's discipline
+      — report integers, and FIRE-CHECK the counter by forcing a known allocation before trusting
+      any zero. A candidate whose allocation count is FLAT in S cannot be carrying a term linear
+      in S.
+  (b) **REMOVAL.** Behind an env flag, make each candidate's growth not happen — e.g. `push_op`
+      returns without pushing — and re-run D171 arm B. ⛔ THIS BREAKS CORRECTNESS BY CONSTRUCTION;
+      it is an instrument that must never land, and the run must assert it is measuring a
+      deliberately broken binary so a later reader cannot mistake it for a result about ferrodb.
+  (c) **READING the structure**, which is free and should come first.
+
+## THE PREDICTION, FIXED BEFORE THE RUN
+
+  1. Allocations per statement RISE with S and removing C1 flattens D171 arm B -> C1 named.
+  2. Allocations FLAT in S while the duration still rises -> it is not allocation at all; memcpy
+     on `Vec` regrowth, cache behaviour, or something not yet listed. Report that the candidate
+     list was WRONG rather than forcing a fit.
+  3. Removing C1 leaves the slope intact -> C1 is dead whatever the counts say. The removal arm
+     OUTRANKS the counting arm.
+
+## FALSIFIERS — each says the INSTRUMENT failed, not that the cost is zero
+
+  1. The allocation counter not fire-checked, or reading 0 where an allocation is known to occur
+     -> VOID.
+  2. The removal arm changing `Affected`, the read-back, or the negative control -> it changed
+     more than the one structure; VOID.
+  3. D171 arm B not reproducing on the same tree before any of this -> stop; the baseline moved.
+
+## WHAT A CONFIRMED RESULT WOULD AND WOULD NOT LICENSE
+
+  OK   "The per-statement term is <structure>, shown by removing it and by its allocation count."
+  NOT  a fix. Naming the structure and deciding whether an append-only per-session frame SHOULD be
+       trimmed are different questions, and the second one has correctness consequences —
+       `tel/log.rs` states that stored index positions are valid ONLY because nothing prunes,
+       compacts or reorders `frames`. **Anything that trims must reckon with that invariant, and
+       it is not a tuning knob.**
