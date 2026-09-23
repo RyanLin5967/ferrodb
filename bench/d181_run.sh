@@ -57,8 +57,10 @@ fi
 
 sha=$(git rev-parse HEAD)
 branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" = HEAD ] && branch="(detached HEAD -- no branch)"
 # Exclude the artifact this run is about to write; see note 3.
-dirty=$(git status --porcelain -- . ":(exclude)$OUT" | wc -l | tr -d ' ')
+dirty_files=$(git status --porcelain -- . ":(exclude)$OUT")
+dirty=$(printf '%s' "$dirty_files" | grep -c . | tr -d ' ')
 
 tmp=$(mktemp)
 {
@@ -68,6 +70,15 @@ tmp=$(mktemp)
     echo "commit        : $sha"
     echo "branch        : $branch"
     echo "dirty files   : $dirty   (excluding this artifact; 0 means the binary IS this commit)"
+    # NAME them when non-zero. A bare count cannot tell a reader whether the dirt was a SOURCE file
+    # -- which would mean the binary is not this commit and the header is lying -- or an unrelated
+    # text artifact. The first AFTER run reported `1` and the reader had no way to find out which.
+    if [ "$dirty" != "0" ]; then
+        echo "                ^ WHICH:"
+        printf '%s\n' "$dirty_files" | sed 's/^/                  /'
+        echo "                Check this list before trusting the run: anything under src/ or"
+        echo "                examples/ means the binary does NOT correspond to the commit above."
+    fi
     echo "note          : $NOTE"
     echo "binary        : $BIN"
     echo "binary mtime  : $(stat -f '%Sm' -t '%FT%TZ' "$BIN" 2>/dev/null)"
