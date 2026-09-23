@@ -1,0 +1,105 @@
+FIRE-CHECK — D173, the leadership lapse inside `ClusterAgents::pump_until`
+Run 2026-09-23 in /Users/idide/wt/ferrodb-d173-leadership-lapse, branch d173-leadership-lapse.
+Tree committed at 3d48230 BEFORE the first mutation; restored after each with
+`git restore --source=HEAD --worktree <file>` — source named explicitly, because `git checkout --`
+restores the INDEX and has eaten a fix on this project.
+
+Instrument: `timeout 1800 cargo test --test integration_cluster_agents`, one target, 37 tests.
+
+⛔ WHAT THIS IS NOT. It is not the check in `bench/cluster_agents_notleader_retry_firecheck.txt`.
+That one substituted the RETURN VALUE at the CALL SITE — `if attempt == 0 { Err(NotLeader) } else
+{ agents.merge(..) }` — so `agents.merge` never ran on the forced attempt. It exercised the
+CALLER's retry and says nothing about either site that PRODUCES `NotLeader`. Every arm below
+changes the CONDITION INSIDE THE CALLEE and lets the real check at the head of `pump_until`'s loop
+observe a real lapse on a real in-flight round. No arm substitutes a return value anywhere.
+
+WHAT IS ON TRIAL. Two independent halves of one change:
+  H1  the loop no longer aborts on a leadership lapse (it polls through it)
+  H2  the timeout exit no longer claims "nothing was published"
+Arms 1 and 2 show each half is covered by a test that the OTHER half does not keep green, so
+neither test is riding on the other.
+
+------------------------------------------------------------------------------------------------
+ARM 1 — REVERT H1. Put the abort back at the lapse site:
+      other => return Err(not_leader(other, &self.client_addresses)),
+→ test result: FAILED. 34 passed; 3 failed
+
+  a_leadership_lapse_mid_wait_does_not_fail_a_merge_the_cluster_goes_on_to_commit ... FAILED
+    panicked at tests/integration_cluster_agents.rs:1161:9:
+    a leadership lapse inside the wait failed a merge that the cluster committed at the very next
+    turn — the client is told `not the leader: this node does not accept writes. The leader is at
+    n99 (no client address for it is configured on this node); reconnect there. Reads served here
+    could be stale, so they are refused too.` about an operation that landed
+    ★ This is the defect, printed. The client is handed a REDIRECT — reconnect elsewhere — about a
+      merge that this very node goes on to seal and publish one turn later.
+
+  a_merge_that_loses_the_leadership_while_waiting_refuses_rather_than_blocking ... FAILED
+    panicked at tests/integration_cluster_agents.rs:1099:5:
+    assertion `left == right` failed: the wait did not poll through the leadership lapse: it looked
+    at the leader 1 times while deposed, and polling through would have looked 999 times
+      left: 1   right: 999
+    ★ 1 vs 999 is the discriminator. `> 0` would have passed under the mutant, because the aborting
+      version also looks exactly once.
+
+  a_timeout_after_the_merge_was_proposed_says_it_stopped_looking_not_that_nothing_happened ...
+    FAILED (the aborting version never reaches the timeout, so there is no message to check)
+
+  The other 34 are untouched by the mutant, which bounds it: this is a change to one loop, not a
+  change that moves the whole target.
+
+------------------------------------------------------------------------------------------------
+ARM 2 — REVERT H2 ONLY. Keep the polling fix; restore the old timeout text verbatim
+("...Refusing rather than blocking a client for ever; nothing was published").
+→ test result: FAILED. 35 passed; 2 failed
+
+  a_timeout_after_the_merge_was_proposed_says_it_stopped_looking_not_that_nothing_happened FAILED
+  a_merge_that_loses_the_leadership_while_waiting_refuses_rather_than_blocking            FAILED
+  a_leadership_lapse_mid_wait_does_not_fail_a_merge_the_cluster_goes_on_to_commit          ok
+
+  ★ The headline test stays GREEN, which is the point of running this arm: the wording is covered
+    by tests of its own rather than by the behaviour change. Had arm 2 killed nothing, H2 would
+    have shipped untested behind H1's coverage.
+
+------------------------------------------------------------------------------------------------
+ARM 3 — ANTI-VACUITY. Make the scripted lapse a no-op (`depose_for_one_turn_then_keep_applying`
+does nothing), so the merge runs on an undisturbed leader.
+→ test result: FAILED. 36 passed; 1 failed
+    panicked at tests/integration_cluster_agents.rs:1170:5:
+    assertion `left == right` failed: the leadership check inside the wait never observed the
+    lapse, so this test exercised nothing: reads while deposed = 0
+      left: 0   right: 1
+
+  ★ EVERY OTHER ASSERTION IN THAT TEST PASSES UNDER THIS MUTANT — Ok, merge_round 2, Applied,
+    applied_to_target, qty 42, quorum_waits 1. A merge on a healthy leader satisfies all of them.
+    Only `reads_while_deposed` distinguishes "survived a lapse" from "never saw one", which is
+    what makes it the anti-vacuity counter rather than decoration.
+
+------------------------------------------------------------------------------------------------
+ARM 4 — THE SKIPPED TURN IS LOAD-BEARING, not a detail of the harness. Make the deposing turn also
+apply its entry (delete the early `return Ok(())`).
+→ test result: FAILED. 36 passed; 1 failed
+    ... reads while deposed = 0 ... left: 0  right: 1
+
+  ★ Deposing and applying in one turn satisfies the wait's `done` immediately, so the loop's
+    leadership check never runs a second time and never looks. The test would then pass on outcome
+    while exercising nothing — the failure mode arm 3 exists to catch, reached by a different
+    route. This is why the harness skips exactly one turn, and the claim is now checked rather
+    than asserted in a comment.
+
+------------------------------------------------------------------------------------------------
+AFTER RESTORE
+  git status --short           → (empty)
+  grep -c MUTANT src/agent_sql/cluster.rs tests/integration_cluster_agents.rs  → 0 and 0
+  timeout 1800 cargo test --test integration_cluster_agents
+    → test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; in 2.73s
+
+WHAT THIS DOES NOT SHOW. The lapse is SCRIPTED, not raced: no arm here makes a real lease expire
+under a real election. So this says the wait behaves correctly WHEN a lapse is observed mid-flight
+and the round still commits; it does not measure how often that interleaving occurs in a real
+cluster. The three-node `Fleet` tests in the same file run real elections over real sockets but
+cannot place a lapse at a chosen turn, which is why the scripted log exists at all.
+
+It also does not extend to the OTHER post-propose exit in `merge` — the `None` verdict branch,
+which still ends "Nothing was published; re-run MERGE". That sentence is about this node's rows
+and is true as written, and re-running is correct there because the round was replaced; it was
+outside D173's scope and was left alone deliberately rather than overlooked.
