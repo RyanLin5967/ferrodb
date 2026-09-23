@@ -5,9 +5,19 @@
 #
 # WHY THE LOCK. This harness issues real fsyncs, and so does every other suite on this box. The
 # quantity being measured is `f/sync`, a ratio of two counters taken in one process over one run,
-# which is load-immune by construction — but a concurrent suite competing for the same device
-# changes the fsync LATENCY `D`, and the model under test is `min(1/S, T/D)`. Holding the lock is
-# therefore not about noise in a timing; it is about not moving the term the model is about.
+# which needs no clock — but it is NOT load-immune, and the rest of this paragraph is the reason:
+# a concurrent suite competing for the same device changes the fsync LATENCY `D`, and the model
+# under test is `min(1/S, T/D)`. Holding the lock is therefore not about noise in a timing; it is
+# about not moving the term the model is about.
+#
+# ⛔ 2026-09-23 (S5): this used to open "load-immune by construction", and that half-sentence got
+# quoted without the "but" that follows it. It is true of the instrument's ERROR and false of the
+# QUANTITY — f/sync is a BATCH SIZE, so SLOWER FORKS GIVE LARGER BATCHES, not noisier ones. In
+# bench/d130_at_head_default_arm.txt the one direct rep running 1.5-2.9x slower returned the
+# LARGEST ratios (28.6 against 18.0 and 16.7 at T=128). ⛔ AND THIS LOCK DOES NOT MAKE THE BOX
+# QUIET: it serialises measurements, while a teammate's `cargo build` contends for the same device
+# and takes no lock at all — that rep ran under a held lock. Quote an INTERVAL over reps, never a
+# point. Full band: examples/d130_pgwire_batch.rs, "# The instrument".
 #
 # The lock is acquired, never polled-then-taken, and it records THIS script's `$$`, which lives for
 # the whole run — the property `tools/verify-suite.sh` relies on when it breaks a dead holder's
@@ -169,6 +179,11 @@ case " $PHASES " in *" direct "*)
     echo "  the L0->L3 ladder were measured at. It is NOT what any shipped front-end does."
     echo
     echo "  N=$DIRECT_N forks per arm, matching the rung of bench/ceiling_raw/22_direct_crosscheck.txt."
+    echo
+    echo "  ⚠ READING THE forks COLUMN: it is N rounded DOWN to a whole number of forks per thread,"
+    echo "    so at T=128 with N=8000 it reads 7936 (62x128), not 8000. The T=128 row is PRESENT."
+    echo "    A reader took that shorter row for a ladder that stops at T=64 and concluded the"
+    echo "    control was missing at exactly the rung the headline is quoted from."
     echo "  The rung is the REAL fork: no stub level. The ceiling ladder's L0 row (the only"
     echo "  unstubbed one) reported f/sync 23.8 at T=64; its 32.0 is L3, which is not a database."
     echo

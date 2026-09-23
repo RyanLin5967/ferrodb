@@ -73,6 +73,39 @@
 //! statements/sec an upper bound, each fork here is a TCP round trip, and a throughput number from
 //! this harness would be a fact about the socket.
 //!
+//! ⛔⛔ **BAND, 2026-09-23 (S5). "USABLE ON A LOADED BOX" IS TRUE OF THIS INSTRUMENT'S ERROR AND
+//! FALSE OF THE QUANTITY IT MEASURES, AND ELSEWHERE THIS FILE SAYS THE STRONGER THING OUTRIGHT —
+//! "so it is load-immune", in the banner `main` prints into every output file. Both readings have
+//! been believed and acted on. The paragraph above is left standing so a reader of a banked run can
+//! see what that run was taken to mean.**
+//!
+//! The distinction the original wording misses:
+//!
+//! * **A count fixed by CONTROL FLOW is load-immune.** Same input, same count, every time — no
+//!   clock is consulted and no scheduler decision changes it.
+//! * **A count fixed by CONCURRENCY is a timing measurement wearing an integer's clothes.**
+//!   `f/sync` is one of these. It is a BATCH SIZE, and `src/branch/group_commit.rs`'s leader reads
+//!   `st.requested` at the instant it begins its fsync — so the batch is whatever happened to have
+//!   arrived by then, which is a function of the fsync latency `D` and the arrival rate. The model
+//!   `bench/d130_run.sh` names in its own WHY THE LOCK comment is `min(1/S, T/D)`, and **`D` is
+//!   exactly what a loaded device moves.** That script has this right; this header did not.
+//!
+//! ⇒ **Slower forks produce LARGER batches, not noisier ones.** Measured, not reasoned about:
+//! `bench/d130_at_head_default_arm.txt`, MODE=direct, three reps under one lock hold. Rep 2's
+//! per-cell wall time ran 1.5×–2.9× the other two at every `T ≥ 4` (T=8: 18.357 s against 6.329
+//! and 6.750) and it returned the LARGEST ratios at the top of the ladder — 24.0 and 28.6 at T=64
+//! and T=128, against 17.5/16.6 and 18.0/16.7. One rep, one direction, with a mechanism.
+//!
+//! ⛔ **AND THE SUITE LOCK DOES NOT MAKE THE BOX QUIET.** It serialises *measurements*; a
+//! teammate's `cargo build` contends for the same device and takes no lock at all. Rep 2 happened
+//! under a held lock.
+//!
+//! ⇒ **What to do about it: quote an INTERVAL over reps, not a point, and never compare a ratio
+//! taken under load against one taken quiet.** The qualitative readings this harness was built for
+//! survive — arm P pinned at exactly 1.00 across eight rungs is a structural fact (no two forks
+//! ever shared an fsync) that no amount of load manufactures — but any specific magnitude is a
+//! fact about the box as much as about the code.
+//!
 //! # Two arms, because the connection shape is a confound
 //!
 //! * **P — conn per fork.** One TCP connection, one `BEGIN AGENT SESSION`, disconnect. This is the
@@ -1050,7 +1083,14 @@ fn main() {
     println!("  is `examples/fork_concurrency.rs`. Amendment 1 binds each number to its layer.");
     println!();
     println!("  f/sync   = forks the server named, divided by fsyncs the catalog issued. A ratio of");
-    println!("             two counters taken by one instrument over one run, so it is load-immune.");
+    println!("             two counters taken by one instrument over one run, so it needs no clock.");
+    println!("             ⛔ BUT IT IS NOT LOAD-IMMUNE, AND THIS LINE USED TO SAY IT WAS. f/sync is");
+    println!("             a BATCH SIZE, so it is a function of the fsync latency D that a loaded");
+    println!("             device moves: min(1/S, T/D). SLOWER FORKS GIVE LARGER BATCHES — measured,");
+    println!("             bench/d130_at_head_default_arm.txt, where the one rep running 1.5-2.9x");
+    println!("             slower returned the LARGEST ratios (28.6 vs 18.0/16.7 at T=128). The");
+    println!("             suite lock does not help: a teammate's cargo build takes no lock. Quote");
+    println!("             an INTERVAL over reps, never a point. See this file's header band.");
     println!("  f/sync÷T = the pre-registered discriminator. ≈0.5 flat ⇒ outcome 1 (wake-up race);");
     println!("             falling in T ⇒ outcome 2 (the batch is not bounded by the threads);");
     println!("             ≈1.0 ⇒ outcome 3 (the batch already captures everyone).");
@@ -1164,8 +1204,13 @@ fn stamp() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// The box is shared. `f/sync` is load-immune by construction, but a reader deserves to see what
-/// the machine was doing rather than take that on trust.
+/// The box is shared, and this number is load-BEARING rather than decoration.
+///
+/// ⛔ Corrected 2026-09-23 (S5): this doc used to say `f/sync` is "load-immune by construction, but
+/// a reader deserves to see what the machine was doing rather than take that on trust." The second
+/// clause was right for the wrong reason. `f/sync` is a batch size and therefore a function of
+/// fsync latency, so the load a run saw is part of what its ratios MEAN, not a courtesy for a
+/// sceptical reader. See the band in this file's header.
 fn loadavg() -> String {
     std::process::Command::new("uptime")
         .output()
