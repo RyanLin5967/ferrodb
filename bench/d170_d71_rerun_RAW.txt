@@ -175,11 +175,17 @@ Prediction, printed before the first number:
 
 RESULT: **RISES.** Not flat. The "probe-served" branch of the prediction did NOT fire.
 
-Arithmetic, stated as arithmetic: the median update sees ~N/2 staged rows, so N=60 -> ~30 and
-N=4000 -> ~2000. Δ = 0.190 - 0.051 = 0.139 ms over ~1970 staged rows ≈ **70 ns per staged row**.
-⚠ **D167 measured 13-17 ns/staged row. This is 4-5x higher and the two are NOT claimed to agree** —
-different harness, different method (D167 timed an EXCESS over a control), and load 17 here. The
-SHAPE (rises with staged rows) is the result; the rate is not.
+⛔ **MY ~70 ns/STAGED ROW FIGURE IS RETRACTED — IT WAS INFLATED BY A SATURATION I DID NOT KNOW
+ABOUT.** I computed 0.139 ms over ~1970 staged rows from N=60 → 4000 at a fixed 4000-row table.
+**`examples/d71_point_update_curve.rs:156` is `let id = 1 + (i as i64 * 7919) % rows`, so above
+N = rows the keys REPEAT and the overlay cannot exceed the table size.** My largest point sat
+inside the saturated region, which inflates the slope. The honest range is **50..3200**, where the
+adversary measures **~35 ns per staged row** — that figure supersedes mine.
+⚠ And the test was **mis-cast as a two-way discriminator**: the adversary ran it to N=12800 (256x)
+and it does not go linear (48.62 → 494.58 us/update; 48.62 → 157.71 over the unsaturated range, 3.2x
+over 64x). **Both branches of my prediction answer "flat", so it separates nothing** — and the stub
+run's own N-sweep had already said so: *"64x the session size costs 1.45x per update. THE
+HYPOTHESIS IS DEAD."*
 
 WHAT THIS ESTABLISHES, AND ONLY THIS:
 - The staged path's residual cost is **O(staged rows)**, measured, on this harness at HEAD.
@@ -192,3 +198,50 @@ ordering is exact: `cc6cbf6` stub artifact **2026-09-20 13:21:52**, `e6958d6` "D
 predicate through the agent WRITE paths" **2026-09-20 14:14:44** (53 minutes later), `fc443c4`
 harness correction **2026-09-21 01:10:50**. Attribution is the adversary's question
 (`frontier/d170_adversary.md`), not settled here.
+
+
+=== APPENDIX B — ROUND 2 OF THE ADVERSARY: ALL FOUR 2x2 CELLS IN ONE BINARY ===
+
+Not mine. `frontier/d170_adversary.md` (`65e4836`), raw at `bench/d170_adversary_probe2.txt`
+(`af69685`) on branch `d170-adversary`. Reproduced here because it closes this file's question.
+
+The STUB config reproduced in-process (`Session::new()`, `storage: None`, no `ServerContext` —
+which `designated::check` explicitly permits, *"Returns Ok(()) when nothing is designated"*, so the
+D101 guard is honoured rather than bypassed). One binary, block order reversed, ratio over 16x rows:
+
+                      pushdown ON (HEAD)        NOPUSHDOWN (pre-e6958d6)
+      STUB            0.98x / 0.29x             15.54x / 15.71x
+      ARENA           0.99x / 0.97x             12.53x / 12.79x
+
+**Across a row the complexity class changes; down a column it does not.** Every NOPUSHDOWN cell is
+a scan (ms/1000 flat ~0.12-0.18); every pushdown-ON cell falls. The stub cells reproduce
+`d71_pushdown_fix.txt`'s own stub arms (BEFORE 15.71/15.61/14.95 vs 15.54/15.71; AFTER 0.013-0.016
+ms vs 0.0117-0.0120 ms).
+
+✅ **WHAT THE STUB/ARENA AXIS ACTUALLY COSTS: a ~4x CONSTANT**, not a class. With the fix in, at
+16,000 rows: stub **0.0117 ms** vs arena **0.0509 ms**. ⇒ **This is D101's banner met exactly** —
+*"the COMPLEXITY CLASS may therefore hold while every absolute here ... do not."* D101 was right,
+D71 was right, and this re-run is D71's exit criterion being met.
+
+⛔ **AND MY `unprobeable_rows` HYPOTHESIS IS FALSE, MEASURED IN THE STUB CONFIG ITSELF.** The
+adversary instrumented both arms of `visible_rows_where` and **FIRE-CHECKED the detector first** —
+all three arms shown on demand: `pk=` undemoted → `probe=1`; non-pk predicate → `walk_nopk=1`;
+`pk=` after a PK-moving UPDATE → `walk_unprob=1, unprob_rows=1`. With that proven, **every block
+including the stub reads `max_unprobeable_rows=0`, `walk_unprobeable=0`, and `probe_fired` ==
+statement count (60/60; 12800/12800 at the largest N).** The probe fires in the stub exactly as on
+the arena.
+⭐ **And the AXIS is the decisive reason, not the magnitude:** the walk iterates `staged.range(..)`
+— rows staged IN THE SESSION, bounded by `D71_N` (max_overlay_len=59 measured) — which has **no
+dependence on table size**, so it cannot produce a table-size slope at all. D167's own rate makes
+it quantitative: 60 x 17 ns ≈ **1 microsecond** against a curve that grows by **2.2 milliseconds**.
+
+=== ⇒ ONE NEW OPEN QUESTION, BANKED AS OPEN AND UNATTRIBUTED ===
+
+Over the unsaturated range 50..3200 the excess is **~35 ns per staged row WHILE THE PROBE FIRES ON
+EVERY STATEMENT AND THE WALK IS NEVER TAKEN.** So there is a residual per-staged-row term in the
+staged WRITE path at HEAD that is **not** the overlay walk. ⚠ **D167 could not have caught it** — it
+pre-staged W and measured READS, and its control was flat.
+⛔ **NO MECHANISM IS ASSERTED.** Candidates named by the adversary and **NOT CHECKED**:
+`PersistentMap` path-copying inserts in `stage_all`, `base_rows`, frame growth.
+⇒ If chased, it must be **its own pre-registered row, not an appendix to D170** — D170's framing is
+dead and anything hung off it inherits that.
