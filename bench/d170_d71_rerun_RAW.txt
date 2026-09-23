@@ -72,3 +72,41 @@ committed `cc6cbf6` **2026-09-20**, so the probe cannot be the explanation. ⚠ 
 correction predicts the OPPOSITE of what is above, in its own words: "the overlay walk in
 `visible_rows_where` ... runs in both configurations. **The COMPLEXITY CLASS may therefore hold**
 while every absolute here ... do not."
+
+=== APPENDIX A — THE AXIS TEST. RAW. Prediction stated BEFORE the run, quoted verbatim. ===
+
+Run 2026-09-23, same binary, fleet lock held with trap-release, **load_at_acquire=17 — NOT a quiet
+box, every ms below is an UPPER BOUND.**
+
+Prediction, printed before the first number:
+  "Hold TABLE ROWS fixed at 4000; vary D71_N (= rows staged during the run).
+   * If the overlay WALK is live: median ms RISES with N. D167 measured 13-17 ns/staged row, so at
+     N=4000 (~2000 staged at the median) expect ~+30 us against a ~50 us baseline -- visible.
+   * If the PROBE fires (pk = literal takes staged.get, O(1)): median ms FLAT in N.
+   FLAT in N => the staged path is probe-served and the overlay walk is NOT the residual term."
+
+  D71_ARM=staged  D71_SIZES=4000  (table rows FIXED)
+    N=60     med 0.051 ms    ms/1000rows 0.0128    fsync/upd 0.00
+    N=250    med 0.059 ms    ms/1000rows 0.0147    fsync/upd 0.00
+    N=1000   med 0.083 ms    ms/1000rows 0.0208    fsync/upd 0.00
+    N=4000   med 0.190 ms    ms/1000rows 0.0476    fsync/upd 0.00
+
+RESULT: **RISES.** Not flat. The "probe-served" branch of the prediction did NOT fire.
+
+Arithmetic, stated as arithmetic: the median update sees ~N/2 staged rows, so N=60 -> ~30 and
+N=4000 -> ~2000. Δ = 0.190 - 0.051 = 0.139 ms over ~1970 staged rows ≈ **70 ns per staged row**.
+⚠ **D167 measured 13-17 ns/staged row. This is 4-5x higher and the two are NOT claimed to agree** —
+different harness, different method (D167 timed an EXCESS over a control), and load 17 here. The
+SHAPE (rises with staged rows) is the result; the rate is not.
+
+WHAT THIS ESTABLISHES, AND ONLY THIS:
+- The staged path's residual cost is **O(staged rows)**, measured, on this harness at HEAD.
+- It is therefore **NOT O(table rows)** — which is why the main curve above is flat in table rows.
+- ⚠ The probe (`overlay_probe_key`, fires only when `unprobeable_rows == 0`) is evidently **not
+  serving these updates**, or not always. WHY is UNKNOWN and is not investigated here.
+
+⛔ STILL NOT A CONCLUSION ABOUT D71. Two things changed between the stub run and this one and the
+ordering is exact: `cc6cbf6` stub artifact **2026-09-20 13:21:52**, `e6958d6` "D71 FIX: push the
+predicate through the agent WRITE paths" **2026-09-20 14:14:44** (53 minutes later), `fc443c4`
+harness correction **2026-09-21 01:10:50**. Attribution is the adversary's question
+(`frontier/d170_adversary.md`), not settled here.
