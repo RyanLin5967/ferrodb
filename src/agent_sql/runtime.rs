@@ -757,7 +757,7 @@ fn ancestry_error(e: AncestryError) -> FerroError {
 /// ⚠ D193: this used to read "what one page-derived `DIFF` cost". A `DIFF <branch>` statement
 /// never produces one of these: it runs [`AgentRuntime::diff`], which reads the workspace's
 /// touched-rows map and descends no page tree, and `page_changeset_with_cost` has no caller in
-/// `src/`. Numbers in this type are the cost of the page-derived changeset only.
+/// `src/` outside `page_changeset`, which has none either. Numbers in this type are the cost of the page-derived changeset only.
 ///
 /// **Integers and not a duration, deliberately.** This box runs a build fleet and a 46x
 /// quiet-vs-loaded spread has been measured on it, so a wall clock here would report the load
@@ -766,7 +766,7 @@ fn ancestry_error(e: AncestryError) -> FerroError {
 ///
 /// `visited` is every node this diff READ — there is no second, uncounted enumeration behind it.
 /// That is precisely what `cow::btree::TreeDiff::pages_examined` could not say on its own, which
-/// is why `page_changeset` no longer reports through it. See
+/// is why `page_changeset_with_cost` reports a `DiffCost` rather than a `TreeDiff`. See
 /// [`AgentRuntime::page_changeset_with_cost`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffCost {

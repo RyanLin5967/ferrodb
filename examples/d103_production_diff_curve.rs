@@ -237,7 +237,7 @@ fn main() {
     out.push_str("Subject: AgentRuntime::page_changeset_with_cost. This is NOT what DIFF <branch> runs.\n");
     out.push_str("  DIFF <branch> dispatches to AgentRuntime::diff, which builds the changeset from the\n");
     out.push_str("  workspace's touched-rows map and descends no page tree. page_changeset_with_cost has\n");
-    out.push_str("  no caller in src/ (tests and this harness only). That wiring fact was read from\n");
+    out.push_str("  no caller in src/ outside page_changeset, which has none either (tests and this harness only). That wiring fact was read from\n");
     out.push_str("  source at D193 (fc9556a), not checked by this binary: re-read dispatch.rs before\n");
     out.push_str("  quoting it against a later commit. These numbers are NOT the cost of a DIFF statement.\n");
     out.push_str("Question: is the page-derived changeset O(delta · log_m N), or O(N)?\n");

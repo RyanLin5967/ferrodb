@@ -296,9 +296,10 @@ impl CowTree {
     /// expensive half — is proportional to what actually changed.
     ///
     /// ⚠ **BOTH halves are now reported, and the second one is why.** `pages_examined` alone is
-    /// O(delta), so a reader who trusted it read this O(N) operation as cheap — including
-    /// `AgentRuntime::page_changeset`, which used to call this and report a handful of decoded
-    /// pages while the two `walk_pages` calls below had just enumerated a million. `pages_walked`
+    /// O(delta), so a reader who trusted it read this O(N) operation as cheap — `tests/prop_cow_diff.rs`
+    /// did exactly that while the two `walk_pages` calls below had just enumerated a million.
+    /// (D193: `AgentRuntime::page_changeset` called this before D103, but it consumed only `deltas`
+    /// and never surfaced `pages_examined`, so it was not the reader that was misled.) `pages_walked`
     /// is that enumeration, and it is the number to compare against
     /// [`crate::cow::diff::DiffReport::visited`].
     ///
