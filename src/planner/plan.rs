@@ -362,10 +362,48 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
         assert_eq!(rows, vec![vec![Value::Integer(3), Value::Varchar("c".into())]])
     }
 
+    /// **D179 — the `// todo: composite bound handling` that used to sit on this line, done.**
+    ///
+    /// This test was `test_index_scan_secondary_rejects_strict_lower` and asserted that `lower`
+    /// returned an **error** for exactly this plan — same table, same column, same bound. That
+    /// `// todo` was the original author's own note, written on the assertion line, and it is what
+    /// makes the change safe to reason about: the author labelled the behaviour a LIMITATION, not a
+    /// guarantee. The test pinned a WALL, and a test that pins a wall must fail when the wall
+    /// falls — that failure is the signal the fix worked, and it is how D179 was confirmed.
+    ///
+    /// The premise died, not the coverage. `(value, pk)` still has no start key for `> v`; the
+    /// exclusion simply moved to where the upper bound has always been enforced.
+    /// `optimizer::secondary_scan_start` opens the scan at `(v, Null)` and
+    /// `SecondaryIndexScan::next` skips the leading `sec == v` run. So there is no refusal left to
+    /// pin, and this asserts what replaced it: the rows, exactly, with `'b'` excluded.
+    ///
+    /// `lower`'s error path has not lost its test — `d179_secondary_strict_lower::
+    /// lower_refuses_a_column_with_no_index` pins a refusal whose premise stays true, a hand-built
+    /// plan naming a secondary column that carries no index at all, and carries the full band.
     #[test]
-    fn test_index_scan_secondary_rejects_strict_lower() {
+    fn test_index_scan_secondary_strict_lower() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
-        assert!(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Arc::new(Snapshot {high_water: 99, active: HashSet::new()}), txn_id: 0 })).is_err()); // todo: composite bound handling 
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Arc::new(Snapshot {high_water: 99, active: HashSet::new()}), txn_id: 0 })).unwrap());
+        assert_eq!(rows, vec![
+            vec![Value::Integer(3), Value::Varchar("c".into())],
+            vec![Value::Integer(4), Value::Varchar("d".into())],
+            vec![Value::Integer(5), Value::Varchar("e".into())]],
+            "`name > 'b'` must start at 'c' and must not return 'b'");
+    }
+
+    /// The inclusive bound over the identical fixture, so the pair brackets the boundary row: `'b'`
+    /// is the only difference between them and it appears in exactly one.
+    #[test]
+    fn test_index_scan_secondary_inclusive_lower_keeps_the_boundary() {
+        let (c, bp, _d) = setup();
+        let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Included(Value::Varchar("b".into())), upper: Bound::Unbounded };
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Arc::new(Snapshot {high_water: 99, active: HashSet::new()}), txn_id: 0 })).unwrap());
+        assert_eq!(rows, vec![
+            vec![Value::Integer(2), Value::Varchar("b".into())],
+            vec![Value::Integer(3), Value::Varchar("c".into())],
+            vec![Value::Integer(4), Value::Varchar("d".into())],
+            vec![Value::Integer(5), Value::Varchar("e".into())]],
+            "`name >= 'b'` must keep the boundary row the strict bound drops");
     }
 }
