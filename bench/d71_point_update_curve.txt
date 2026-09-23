@@ -141,6 +141,39 @@ agent that writes a lot into one branch that would be quadratic in its own sessi
                     1600                   0.790
                     3200                   1.027
 
+⛔⛔ **BANDED 2026-09-23 — THIS CONCLUSION IS REVERSED. THE NUMBERS ABOVE ARE CORRECT AND ARE NOT
+EDITED; THEY CONTAIN THE EFFECT THEY WERE READ AS EXCLUDING.** See D171
+(`frontier/d171_session_length_wall.md`) and `bench/d170_d71_rerun_RAW.txt`.
+
+⇒ **The measurement was right. The STATISTIC was wrong, in TWO ways, and a ratio hid both.**
+
+**(1) A RATIO AGAINST A HUGE BASELINE HIDES AN ADDITIVE TERM.** These points run 0.708 → 1.027 ms,
+i.e. **+0.319 ms ADDITIVE**, against an unpredicated O(table) baseline of ~0.7 ms. As a ratio that
+is 1.45x and reads as noise. `e6958d6` later dropped that baseline ~25x and **unmasked a
+session-length wall that was always here** — D171 measures it at **~70 ns per PRIOR STATEMENT** in
+the shipped configuration, a 15x slowdown inside one long session.
+
+**(2) THIS SWEEP MIXES TWO TERMS AND READS THEIR SUM.** It was run with **W = S** (staged rows and
+statements swept together) and with the **probe OFF** (no predicate pushed ⇒ `bound` is None ⇒
+`overlay_probe_key` cannot fire ⇒ the walk is taken). So it contains **an S-keyed per-statement
+term AND a W-keyed overlay-walk term (~44 ns/staged row) summed together**, and neither can be
+recovered from it. D171 separates them: with the probe ON the W term vanishes (W=S and W-fixed arms
+are equal, ~70 ns both); with it OFF the W=S arm is steeper than the W-fixed arm. **The W term
+appears exactly when the probe is off and disappears exactly when it is on — which is what the
+probe is for.**
+
+⛔ **DO NOT QUOTE A RATE FROM THESE SEVEN POINTS.** Segment-by-segment they read −520, +440, +480,
+−15, +70, +296 ns/statement: **two segments are NEGATIVE**, and this file records its own load as
+99 falling to 23. These points fix the **SIGN and the ADDITIVE MAGNITUDE** and nothing finer.
+⚠ An earlier version of this banding claimed their slope agreed with D171's reproduction "to 6%".
+**That agreement was manufactured by mixing denominator conventions** and is withdrawn — a
+median-of-growing-session instrument requires x = N/2, a pre-loaded fixed-window instrument
+requires x = S, and the two were compared without converting. Same factor of 2 this lane had
+already corrected once. **A rate is not a number until its denominator convention is stated.**
+
+⇒ ✅ **What stands from the text below: the SIGN, the additive magnitude, and the honesty of
+measuring instead of banking.** What falls: "THE HYPOTHESIS IS DEAD", "no session-size wall", and
+any rate derived from these points.
 ⛔ **64x the session size costs 1.45x per update. THE HYPOTHESIS IS DEAD.** The overlay walk is
 sublinear in practice — consistent with a BTreeMap range plus allocator pressure, not with a walk
 proportional to staged rows. There is no session-size wall and no quadratic term.
