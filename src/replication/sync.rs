@@ -48,15 +48,28 @@ use crate::error::FerroError;
 
 /// Tracks how far each replica has acknowledged, and lets a committer wait for a quorum of one.
 #[derive(Default)]
-pub struct AckTracker {
+/// What the primary knows about its replicas.
+///
+/// **Two questions, deliberately separated after D184.** `peers` answers "who is connected and
+/// where are they" — a disconnect must change it. `retained` answers "what has been acknowledged"
+/// — and a disconnect must NOT change that, because an acknowledgement means the data reached
+/// that replica's disk and a replica going away does not un-write it. They lived in one map until
+/// D184, so `forget` answered both the same way and a disconnect retracted an ack.
+struct Acks {
     /// peer name -> highest LSN that peer has durably applied.
-    acks: Mutex<HashMap<String, u64>>,
+    peers: HashMap<String, u64>,
+    /// Highest LSN ANY peer has ever acknowledged. Monotonic, and survives `forget`.
+    retained: u64,
+}
+
+pub struct AckTracker {
+    acks: Mutex<Acks>,
     changed: Condvar,
 }
 
 impl AckTracker {
     pub fn new() -> Self {
-        Self { acks: Mutex::new(HashMap::new()), changed: Condvar::new() }
+        Self { acks: Mutex::new(Acks { peers: HashMap::new(), retained: 0 }), changed: Condvar::new() }
     }
 
     /// Record a peer's position.
@@ -68,9 +81,11 @@ impl AckTracker {
     /// it must not un-commit anything here.
     pub fn record(&self, peer: &str, lsn: u64) {
         let mut acks = self.acks.lock().unwrap();
-        let slot = acks.entry(peer.to_string()).or_insert(0);
+        let slot = acks.peers.entry(peer.to_string()).or_insert(0);
         if lsn > *slot {
             *slot = lsn;
+            // The retained high-water mark rises with it and never falls. See [`Acks`].
+            acks.retained = acks.retained.max(lsn);
             self.changed.notify_all();
         }
     }
@@ -84,18 +99,25 @@ impl AckTracker {
     /// peers would be worse, because a replica reconnecting inside the deadline is exactly the case
     /// synchronous commit exists to ride out. Waiting out the deadline is the behaviour, and the
     /// deadline is the caller's to choose.
+    /// ⚠ **D184: this removes the PEER, not its acknowledgement.** Until D184 it removed both,
+    /// because one map answered both questions — so a replica that acked an LSN and then dropped
+    /// retracted that ack, and a commit it had already satisfied was reported unacknowledged.
+    /// That is the failure `record`'s own doc names one line up: *"a durability promise that can
+    /// be withdrawn after the fact is not a promise"*. `record` guarded the going-backwards exit;
+    /// this was the other exit into the same state. Pinned by
+    /// `an_ack_survives_the_replica_disconnecting`.
     pub fn forget(&self, peer: &str) {
-        self.acks.lock().unwrap().remove(peer);
+        self.acks.lock().unwrap().peers.remove(peer);
     }
 
     /// Highest LSN acknowledged by any peer, or 0 if there are none.
     pub fn max_acked(&self) -> u64 {
-        self.acks.lock().unwrap().values().copied().max().unwrap_or(0)
+        self.acks.lock().unwrap().retained
     }
 
     /// Number of peers currently reporting.
     pub fn peer_count(&self) -> usize {
-        self.acks.lock().unwrap().len()
+        self.acks.lock().unwrap().peers.len()
     }
 
     /// Block until some replica has acknowledged `lsn`, or the deadline passes.
@@ -110,7 +132,7 @@ impl AckTracker {
         let deadline = Instant::now() + timeout;
         let mut acks = self.acks.lock().unwrap();
         loop {
-            let best = acks.values().copied().max().unwrap_or(0);
+            let best = acks.retained;
             if best >= lsn {
                 return Ok(());
             }
@@ -121,7 +143,7 @@ impl AckTracker {
                      replica is at {best} ({} replica(s) connected). The commit is durable on the \
                      PRIMARY and is not confirmed on any replica, so this transaction has only \
                      asynchronous durability. Nothing was rolled back.",
-                    acks.len()
+                    acks.peers.len()
                 )));
             }
             let (guard, _) = self.changed.wait_timeout(acks, deadline - now).unwrap();
@@ -193,6 +215,47 @@ mod tests {
         assert_eq!(t.max_acked(), 2000);
         assert!(t.wait_for(1500, Duration::from_millis(50)).is_ok());
         assert_eq!(t.peer_count(), 2);
+    }
+
+    /// **D184 — the MIRROR of `an_ack_never_goes_backwards`, aimed at the OTHER exit.**
+    ///
+    /// That test pins "a replica that reports going backwards must not retract an
+    /// acknowledgement" using two `record` calls. But `record` is not the only way an ack can
+    /// leave this map: `forget` removes the peer outright, and `wait_for` recomputes `best` from
+    /// whatever is in the map at that moment. So the same invariant has a second exit, and only
+    /// one of them is guarded.
+    ///
+    /// **This is the invariant under test, stated as a promise rather than as code:** an
+    /// acknowledgement means the data is on that replica's disk. A replica going away does not
+    /// un-write it. So an ack that has already been given must keep counting, and a commit it
+    /// already satisfied must not later be reported as unacknowledged.
+    ///
+    /// ⚠ **PRE-REGISTERED BEFORE RUNNING, from the source and not from the run:** `forget` is
+    /// `self.acks.lock().unwrap().remove(peer)`, so `max_acked()` should fall to 0 and this test
+    /// should FAIL. If it passes, my reading of `forget` is wrong and this comment is the thing to
+    /// correct.
+    #[test]
+    fn an_ack_survives_the_replica_disconnecting() {
+        let t = AckTracker::new();
+        t.record("r", 1000);
+        assert_eq!(t.max_acked(), 1000, "fixture: the ack was never recorded");
+
+        t.forget("r");
+
+        // The peer really is gone -- that half is correct and is not what is under test.
+        assert_eq!(t.peer_count(), 0, "fixture: the peer was not forgotten");
+
+        assert_eq!(
+            t.max_acked(),
+            1000,
+            "a disconnect retracted an acknowledgement the primary may have already acted on: the \
+             data is on that replica's disk and going away does not un-write it"
+        );
+        assert!(
+            t.wait_for(1000, Duration::from_millis(50)).is_ok(),
+            "a commit that was already satisfied is now reported unacknowledged because its \
+             replica disconnected afterwards"
+        );
     }
 
     /// **A replica that drops and reconnects inside the deadline still satisfies the commit.**
