@@ -114,6 +114,36 @@ correction predicts the OPPOSITE of what is above, in its own words: "the overla
 `visible_rows_where` ... runs in both configurations. **The COMPLEXITY CLASS may therefore hold**
 while every absolute here ... do not."
 
+⛔⛔ **APPENDIX A'S CONCLUSION IS RETRACTED IN FULL, 2026-09-23. THE RAW NUMBERS STAND; WHAT I
+CONCLUDED FROM THEM WAS WRONG THREE WAYS.** Retracted here, where the claim was written.
+
+1. ⛔ **I CITED D167 INVERTED.** I wrote "the staged path is O(staged rows)". `d167_prereg.txt:33-35`
+   says the opposite: *"**demoted** (`D56_DEMOTE=1`): **the probe is disabled**, so
+   `visible_rows_where` walks the whole table prefix of the overlay — **O(W) per read** … The
+   discriminator is the SLOPE of the **demoted** arm against a **flat control**."* **O(W) is the
+   DEMOTED arm; the probeable state is the FLAT CONTROL.** Demotion requires a PK-MOVING update
+   (`d167_prereg.txt:15`, `UPDATE t SET id = …`), which increments `unprobeable_rows`
+   (`runtime.rs:3057`). **D71 writes `SET v = {i}` and never moves the PK**, so
+   `unprobeable_rows == 0`, the probe fires, and **the overlay here is O(1)** — D167's flat control
+   regime, not its demoted arm.
+
+2. ⛔ **MY PREDICTION WAS MISCAST AS A BINARY AND THE DATA FIT NEITHER BRANCH.** I wrote
+   "rises ⇒ walk live; flat ⇒ probe-served". The rise is **SUBLINEAR**: the adversary's sweep at a
+   fixed 4000-row table gives 50.25 → 161.75 us/update for **64x** the staged rows (**3.2x**), and
+   the pre-fix arm 600.63 → 785.21 (**1.31x**). Sublinear in both states, **linear in neither**. A
+   sublinear rise is not evidence of the O(W) walk, and my two-branch prediction had no cell for it.
+
+3. ⛔ **AND THE HYPOTHESIS WAS ALREADY DEAD IN THE STUB RUN'S OWN FILE**, which I had open:
+   *"64x the session size costs 1.45x per update. THE HYPOTHESIS IS DEAD."* Third time tonight that
+   I re-derived something sitting in a file I had already opened.
+
+⇒ ✅ **WHAT THE APPENDIX-A NUMBERS ACTUALLY SHOW:** a sublinear rise with staged rows, consistent
+with the stub run's own N-sweep, and **not** an O(staged-rows) term. The claim that the overlay is
+the residual is withdrawn. The real residual question — why the probe does or does not serve — is
+answered: it **does** serve here, by construction.
+
+===============================================================================================
+
 === APPENDIX A — THE AXIS TEST. RAW. Prediction stated BEFORE the run, quoted verbatim. ===
 
 Run 2026-09-23, same binary, fleet lock held with trap-release, **load_at_acquire=17 — NOT a quiet
