@@ -4640,6 +4640,77 @@ mod tests {
         let _ = std::fs::remove_file(&control);
     }
 
+    /// ⭐ **D183 — the fallback is the correctness backstop, so it gets its own test.**
+    ///
+    /// `put_pending` writes the O(released) difference record only while
+    /// [`PersistState::drain_mark`] proves the durable log is the one `take_pending` handed out.
+    /// Every other case is supposed to write the O(whole log) absolute record instead, and that
+    /// branch is what makes the optimisation safe rather than merely fast.
+    ///
+    /// **Nothing else reaches it.** Every other drain in the suite satisfies the proof, so the
+    /// fallback would be dead code that still compiles — and a weakened proof (one that said
+    /// "usable" always) would pass every other test in this file. Each arm below invalidates the
+    /// proof a different way, asserts from the FILE that the absolute record was chosen, and then
+    /// requires the restore to be byte-identical to a full rewrite anyway.
+    #[test]
+    fn a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record() {
+        // `invalidate` runs between the take and the put.
+        fn case(tag: &str, invalidate: impl Fn(&Harness, &std::path::Path)) {
+            let h = Harness::new_with(true);
+            let armed = std::env::temp_dir()
+                .join(format!("ferro-arena-d183-fb-{}-{}.bin", std::process::id(), tag));
+            let _ = std::fs::remove_file(&armed);
+            h.store.checkpoint_to(armed.clone());
+
+            let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            for _ in 0..4 {
+                h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            }
+            h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+            let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+            let taken = h.store.take_pending();
+            assert!(taken.len() >= 2, "{tag} fixture: the reap parked too little to drop one");
+            invalidate(&h, &armed);
+            h.store.release_page(taken[0].page_id, taken[0].arena_id);
+            h.store.put_pending(taken[1..].to_vec()).unwrap();
+
+            let kinds = ArenaPageStore::tail_kinds(&armed);
+            assert!(
+                kinds.is_empty()
+                    || kinds.last().copied() != Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+                "{tag}: the difference record was written although its proof was invalidated \
+                 ({kinds:?})"
+            );
+
+            let control = std::env::temp_dir()
+                .join(format!("ferro-arena-d183-fbc-{}-{}.bin", std::process::id(), tag));
+            h.store.checkpoint(&control).unwrap();
+            let from_tail = h.fresh_store();
+            assert!(from_tail.restore(&armed).unwrap());
+            let from_image = h.fresh_store();
+            assert!(from_image.restore(&control).unwrap());
+            assert_eq!(
+                from_tail.state_bytes(),
+                from_image.state_bytes(),
+                "{tag}: the fallback did not reproduce a full rewrite"
+            );
+            let _ = std::fs::remove_file(&armed);
+            let _ = std::fs::remove_file(&control);
+        }
+
+        // A full image rewrite publishes the DRAINED, empty log, so the file no longer holds the
+        // entries the take handed out and removing from it would remove nothing. `rewrites` moves.
+        case("rewrite", |h, armed| h.store.checkpoint(armed).unwrap());
+
+        // A second drain: two takes cannot both be "the log the file still holds", and neither
+        // put can say whose entries it is holding.
+        case("overlap", |h, _| {
+            let _ = h.store.take_pending();
+        });
+    }
+
     /// `put_pending`'s own persist, isolated for the same reason as the test above it.
     #[test]
     fn putting_the_pending_log_back_reaches_the_durable_map() {
