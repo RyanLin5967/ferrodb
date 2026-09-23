@@ -3778,33 +3778,65 @@ mod tests {
 
     /// **D183 — which reap door a branch leaves by, COUNTED rather than argued.**
     ///
-    /// D81 replaced the per-fork full image rewrite with a 45-byte delta append and its note
-    /// (`:2215`) calls that "the only site that changes shape". This asks what REAP costs, and the
-    /// answer is not one number: `reaper.rs:679` splits on `has_live_children`, and only the fast
-    /// side reaches a delta. `retire_arenas_by_rule` ends in `persist_if_configured`, which is
-    /// `persist_full_locked` unconditionally — it never consults `compact_threshold`, so it is not
-    /// amortised at all.
+    /// ⛔⛔⛔ **RETRACTED 2026-09-23. THIS TEST DOES NOT MEASURE WHAT A REAP COSTS, AND THE
+    /// NUMBERS THIS BAND USED TO CARRY WERE WRONG. DO NOT QUOTE IT.** ⛔⛔⛔
     ///
-    /// **Pre-registered from the SOURCE, before running it** (never from what the run printed):
-    /// `retire_arenas_by_rule` performs exactly one full rewrite per call and the reaper calls it
-    /// once per branch, so the INTERIOR arm's rewrites must rise one-for-one with branches reaped.
-    /// The LEAF arm goes through `free_arena` -> `TAIL_EXTENT_FREED` and must not.
+    /// **It never calls `Reaper::reap`.** The loop below hand-rolls two lines of
+    /// `reaper.rs:679-687` under a comment claiming to be "exactly what `reaper.rs:679-687`
+    /// does", and then reports the cost of the copy. `reap` also runs `drain_pending_seeded`
+    /// (`reaper.rs:483`) on EVERY branch, whose `take_pending` and `put_pending` both persist,
+    /// and neither is in this loop. `reap` is the production entry — `cli.rs:120` arms the
+    /// store, `reaper.rs:211` and `reaper.rs:860` are its two callers — so the difference is
+    /// not academic.
     ///
-    /// Two sizes, so the claim is a SLOPE and not a ratio, and both arms in the same run so the
-    /// leaf arm is a live control rather than a remembered number.
+    /// **What this test prints:** LEAF 8/16 -> rewrites 0/0, appends 24/48; INTERIOR 8/16 ->
+    /// rewrites 8/16, appends 0/0. Those are correct numbers about the hand-rolled loop.
     ///
-    /// ⛔⛔ **THIS TEST PINS A WALL, NOT A GUARANTEE. WHEN D183 IS FIXED IT MUST FAIL, AND
-    /// THAT FAILURE IS THE SIGNAL THE FIX WORKED — DO NOT WEAKEN IT TO GET GREEN.** Measured
-    /// 2026-09-23: LEAF 8/16 branches -> rewrites 0/0, appends 24/48; INTERIOR 8/16 ->
-    /// rewrites 8/16, appends 0/0. One full image rewrite per interior branch reaped, zero
-    /// deltas, against a leaf control that pays zero at both sizes. The correct fix is a NEW
-    /// tail record kind describing the list-shaped state `:2220` says a per-extent record
-    /// cannot (the pending-free log, per-extent recycled lists); when that lands, invert the
-    /// `int_r16 - int_r8` assertion to expect appends and re-record the numbers here.
+    /// **What `Reaper::reap` actually costs**, measured over four sizes (n = 4, 8, 16, 24) in
+    /// `super::d183_adversary::d183adv_a1_the_intercept_separates_the_two_mechanisms`:
+    ///
+    /// | arm | rewrites | appends | pages reclaimed |
+    /// |---|---|---|---|
+    /// | LEAF, n branches | **n - 1** | 3n - (n-1) | all of them |
+    /// | INTERIOR, n branches | **2n** | **0** | **0**, while the child lives |
+    ///
+    /// So the retracted headline — "one full rewrite per interior branch, zero for a leaf" —
+    /// is wrong on both halves. `has_live_children` does still split the cost; it splits it
+    /// **2 against 1**, not 1 against 0.
+    ///
+    /// **THE MECHANISM THIS LOOP CANNOT SEE.** `take_pending` (`arena.rs:932`) bumps
+    /// `pending_version` UNCONDITIONALLY — before the `mem::take`, so an empty log invalidates
+    /// the tail too — and `persist_delta_locked`'s third guard (`arena.rs:1495`) then forces the
+    /// next delta into a full image rewrite. `drain_pending_seeded` runs at the end of every
+    /// reap, so **each reap poisons the NEXT reap's first `free_arena`**. That is the whole of
+    /// the leaf side's cost, and the intercept proves it: the line is `n - 1`, not `n`, because
+    /// the FIRST reap has nothing drained before it. The interior's two are
+    /// `retire_arenas_by_rule`'s own `persist_if_configured` plus the drain's `put_pending`,
+    /// decomposed and summed against the real reap in
+    /// `super::d183_adversary::d183adv_mech_the_interior_two_rewrites_decompose`; its appends
+    /// are 0 because the pages are parked rather than freed, so 0/3 extents are empty and
+    /// `sweep_touched_extents` never reaches `free_arena`.
+    ///
+    /// **A REPLACEMENT MUST MEASURE THROUGH `Reaper::reap`.** Pre-registering from the source
+    /// is not enough on its own — this band did that and still got the magnitude wrong, because
+    /// the pre-registration was made about a function the fixture did not call.
+    ///
+    /// The fix direction survives and now has three sites, not one: a new tail record kind for
+    /// the list-shaped state `:2220` says a per-extent record cannot describe. The cheapest
+    /// independent win is the `take_pending` bump, which fires on every reap including ones
+    /// that drain an empty log.
+    ///
+    /// **THE TEST BELOW IS LEFT EXACTLY AS IT WAS AND STILL PASSES.** It is kept, unweakened
+    /// and undeleted, so the correction is attached to the claim rather than replacing it with
+    /// an absence — and because it remains a true, useful pin on `retire_arenas_by_rule` being
+    /// one unconditional full rewrite per call. Read its assertions as statements about that
+    /// function, never about a reap.
     ///
     /// ⚠ `new_with(true)` — the catalog that SHIPS. `Harness::new()` is the log catalog, whose
     /// `live_children` lives in the record; a reclamation test on it proves nothing about the
-    /// shipped path. That is D19, and this test would be worthless without it.
+    /// shipped path. That is D19, and this test would be worthless without it. (This part held:
+    /// the adversary read `has_live_children` for every branch on both arms and the fixture does
+    /// take the side it assumes.)
     #[test]
     fn d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends() {
         fn run(branches: usize, interior: bool) -> (u64, u64) {
@@ -4907,6 +4939,49 @@ mod d183_adversary {
         assert_eq!(cells[1].1 .0 + cells[1].1 .1, 48, "leaf 16 records != 48 arenas");
     }
 
+    /// **The INTERCEPT is evidence, and two points cannot show one.** Four sizes, so slope and
+    /// intercept are separable.
+    ///
+    /// If the leaf's rewrites were simply "one per reap" the line would be `n`. It is `n - 1`,
+    /// and the missing one is the FIRST reap: nothing has drained before it, so its
+    /// `pending_version` is still the durable one and all three of its `free_arena` calls
+    /// append. Every later reap inherits the previous reap's `take_pending` bump. An intercept
+    /// of exactly -1 is what "each reap poisons the NEXT one" predicts and what "each reap
+    /// costs a rewrite" does not.
+    ///
+    /// The interior line has intercept 0 and slope 2: both of its rewrites are paid inside the
+    /// branch's own reap, so there is nothing to carry and nothing to miss on the first one.
+    #[test]
+    fn d183adv_a1_the_intercept_separates_the_two_mechanisms() {
+        fn run(branches: usize, interior: bool) -> (u64, u64) {
+            let (h, path) = armed("icpt", branches * 2 + interior as usize);
+            let (ids, _) = build(&h, branches, 4, interior);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+        println!("A1b rewrites against branch count, through the REAL reaper, four sizes:");
+        for n in [4usize, 8, 16, 24] {
+            let (lr, la) = run(n, false);
+            let (ir, ia) = run(n, true);
+            println!(
+                "  n={n:2}: LEAF rewrites={lr:3} (n-1={}) appends={la:3} |                  INTERIOR rewrites={ir:3} (2n={}) appends={ia:3}",
+                n - 1,
+                2 * n
+            );
+            assert_eq!(lr, n as u64 - 1, "leaf at n={n} is not n-1");
+            assert_eq!(ir, 2 * n as u64, "interior at n={n} is not 2n");
+            // The leaf phase table closes at every size: one durable record per arena.
+            assert_eq!(lr + la, 3 * n as u64, "leaf records at n={n} != 3 arenas per branch");
+            assert_eq!(ia, 0, "interior appended at n={n}");
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // AXIS 2. Can each counter be forced to move on purpose?
     // ---------------------------------------------------------------------------------------
@@ -5277,6 +5352,78 @@ mod d183_adversary {
             (1, 0),
             "put_pending is not one unconditional full rewrite"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **THE PHASE TABLE, CLOSED.** One interior branch through the REAL `Reaper::reap`, then
+    /// the same branch again with the reap's three persisting stages run one at a time and
+    /// counted between each. The stage integers are asserted to SUM TO THE REAL TOTAL, which is
+    /// what stops this from being another hand-rolled copy standing in for the thing itself.
+    ///
+    /// One branch, not eight, so the carry-over mechanism (`take_pending` poisoning the NEXT
+    /// reap) is out of the picture and what is left is what a single interior reap pays.
+    #[test]
+    fn d183adv_mech_the_interior_two_rewrites_decompose() {
+        // Measured through the real reaper.
+        let (h, path) = armed("dec-real", 0);
+        let (ids, _) = build(&h, 1, 4, true);
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+        let (r0, a0) = h.store.persist_counters();
+        let freed = reaper.reap(ids[0]).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        let real = (r1 - r0, a1 - a0);
+        println!("DEC real Reaper::reap of ONE interior branch: rewrites={} appends={} freed={freed}", real.0, real.1);
+        let _ = std::fs::remove_file(&path);
+
+        // The same branch, stage by stage.
+        let (h, path) = armed("dec-stage", 1);
+        let (ids, _) = build(&h, 1, 4, true);
+        let rec = h.catalog.get_raw(ids[0].id).unwrap();
+        let own: Vec<ArenaId> = rec.arenas.iter().copied().collect();
+        assert_eq!(own.len(), 3, "fixture: expected 3 arenas for 4 pages");
+        let ep = h.catalog.next_epoch();
+
+        let (s0, t0) = h.store.persist_counters();
+        let released = h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        let (s1, t1) = h.store.persist_counters();
+        let stage_retire = (s1 - s0, t1 - t0);
+
+        let taken = h.store.take_pending();
+        assert!(!taken.is_empty(), "fixture: the interior branch parked nothing");
+        let n_parked = taken.len();
+        h.store.put_pending(taken).unwrap();
+        let (s2, t2) = h.store.persist_counters();
+        let stage_drain = (s2 - s1, t2 - t1);
+
+        // Stage 3, `sweep_touched_extents`: it frees an extent only when `extent_is_empty`.
+        // Prove the precondition is false for every one of this branch's arenas rather than
+        // calling a private method -- that is WHY the interior arm never reaches `free_arena`
+        // and therefore why its appends are 0.
+        let empties = own.iter().filter(|a| h.store.extent_is_empty(**a)).count();
+        let owners = own.iter().filter(|a| h.store.arena_owner(**a).is_some()).count();
+        let stage_sweep = (0u64, 0u64);
+
+        println!("DEC staged, one interior branch, {} arenas, {n_parked} pages parked:", own.len());
+        println!("  retire_arenas_by_rule  : rewrites={} appends={} (released={released})", stage_retire.0, stage_retire.1);
+        println!("  drain: take + put_pending: rewrites={} appends={}", stage_drain.0, stage_drain.1);
+        println!("  sweep_touched_extents  : rewrites=0 appends=0 -- {empties}/{} extents empty, {owners}/{} still owned", own.len(), own.len());
+
+        assert_eq!(stage_retire, (1, 0), "retire_arenas_by_rule is not one full rewrite");
+        assert_eq!(stage_drain, (1, 0), "the drain's put_pending is not one full rewrite");
+        assert_eq!(released, 0, "the interior branch released pages it should have parked");
+        assert_eq!(empties, 0, "an extent was empty, so the sweep COULD have freed one");
+        assert_eq!(owners, own.len(), "an extent lost its owner before the sweep");
+
+        let summed = (
+            stage_retire.0 + stage_drain.0 + stage_sweep.0,
+            stage_retire.1 + stage_drain.1 + stage_sweep.1,
+        );
+        println!("  SUM = {summed:?}, real Reaper::reap = {real:?}");
+        assert_eq!(
+            summed, real,
+            "the stages do not sum to what the real reap cost -- a fourth site is persisting"
+        );
+        assert_eq!(real, (2, 0), "one interior reap is not 2 full rewrites and 0 appends");
         let _ = std::fs::remove_file(&path);
     }
 }
