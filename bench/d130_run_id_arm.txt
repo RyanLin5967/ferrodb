@@ -1,0 +1,194 @@
+D130 / S5 — THE RUN-ID ARM: NO-COLLATERAL PROOF AND FIRE CHECK
+================================================================================
+NOT EVIDENCE FOR S5. Every number in this file comes from the 12-fork smoke
+ladder `4 1,2` (f=4 forks/thread, T=1 and T=2). At that size f/sync is dominated
+by whichever thread arrived first and no ratio here means anything. This file
+exists to answer three questions and nothing else:
+
+  1. does the default arm still behave exactly as it did before the knobs?
+  2. do the new refusals actually fire, and do the pre-existing ones still fire?
+  3. does D130_PROV=durable actually install a store that writes?
+
+The real sweep has not been run. It takes /tmp/ferrodb-suite.lock, which was
+held by another lane throughout this work, and was deliberately not taken.
+
+tree:    0b8f115a612ffc79754f9ca01a5e581748f61059
+base:    630afaa (unmodified, the 'before' runs below)
+branch:  s5-intern-arm
+host:    Darwin 25.6.0 arm64
+written: 2026-09-23T15:12:48Z
+NOTE: the box was NOT quiet — another lane held the suite lock and was
+compiling throughout. f/sync is a ratio of two counters taken in one
+process over one run, so a count diff is valid under load; a timing
+would not have been, and none is reported.
+
+================================================================================
+1. NO COLLATERAL CHANGE TO THE DEFAULT ARM
+================================================================================
+
+Command, identical before and after (no env set = D130_RUN_ID=distinct,
+D130_PROV=mem):
+    ./target/release/examples/d130_pgwire_batch 4 1,2
+
+--- data rows, BEFORE (630afaa, unmodified):
+  P  conn per fork, BEGIN only          1        4        4      1.00     1.0000
+  P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+  S  persistent conn, BEGIN+ABANDON      1        4       20      0.20     0.2000
+  S  persistent conn, BEGIN+ABANDON      2        8       40      0.20     0.1000
+  D  POSITIVE CONTROL, no socket        1        4        4      1.00     1.0000
+  D  POSITIVE CONTROL, no socket        2        8        8      1.00     0.5000
+
+--- data rows, AFTER (both knobs added):
+  P  conn per fork, BEGIN only          1        4        4      1.00     1.0000
+  P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+  S  persistent conn, BEGIN+ABANDON      1        4       20      0.20     0.2000
+  S  persistent conn, BEGIN+ABANDON      2        8       40      0.20     0.1000
+  D  POSITIVE CONTROL, no socket        1        4        4      1.00     1.0000
+  D  POSITIVE CONTROL, no socket        2        8        8      1.00     0.5000
+
+--- diff of the data rows:
+    (empty — zero differing rows)
+
+--- full output diff. Every changed line is header text or a timestamp;
+    no cell, count or ratio moves:
+    -# start: 2026-09-23T14:53:23Z  load: 10.44 14.78 18.27
+    +RUN-ID MODE: distinct  (D130_RUN_ID unset or `distinct` — the default arm)
+    +  Every fork carries `(a<thread>, r<thread>_<iter>)`, a key the provenance
+    +  store has never seen, so `intern` mints a NEW entity on every fork, while
+    +  AgentRuntime's `state` mutex is held. Whether minting one also costs an
+    +  FSYNC depends entirely on WHICH STORE — see PROV STORE below; under the
+    +  default `mem` it does not. D130_RUN_ID=shared removes the mint.
+    +PROV STORE: mem  (D130_PROV unset or `mem` — MemProvenanceStore, the default)
+    +  ⛔ `intern` ISSUES NO FSYNC IN THIS ARM. AgentRuntime::with_storage builds
+    +  MemProvenanceStore; only `with_durable_provenance` installs the store whose
+    +  append_locked calls file.sync_data(), and neither this rig nor
+    +  examples/pgserver.rs calls it — only src/cli/cli.rs does. So `shared` here
+    +  removes an in-memory insert: this is the NEGATIVE CONTROL and must not move
+    +  f/sync. Run D130_PROV=durable for the arm where the fsync exists to remove.
+    +  The arm is pre-registered in this file's header, written before any cell was run.
+    +# start: 2026-09-23T15:09:49Z  load: 18.31 18.25 17.86
+    +
+    -  arm                                threads    forks    syncs    f/sync   f/sync÷T
+    +  arm                                threads    forks    syncs    f/sync   f/sync÷T   [run-id: distinct  prov: mem]
+    -# end: 2026-09-23T14:53:24Z  load: 10.44 14.78 18.27
+    +# run-id mode: distinct  prov store: mem
+    +# end: 2026-09-23T15:09:49Z  load: 18.31 18.25 17.86
+
+================================================================================
+2. ARM D IS A BATCH RACE — ITS CELLS MOVE WITHOUT ANY KNOB CHANGING
+================================================================================
+
+A first draft of the pre-registration said arm D 'MUST read the same in both
+modes'. It was caught by this smoke pass and corrected BEFORE the arm had any
+evidence in it. Arm D calls TableBranchCatalog::fork directly, builds no
+RunEntity and reads no environment, so no code path carries either knob into
+it — but it is itself a batch race, which is the reason it exists.
+
+30 consecutive runs at the IDENTICAL default knob, ladder 4 1,2, arm D only:
+    30  T=1 forks=4 syncs=4 f/sync=1.00
+     1  T=2 forks=8 syncs=6 f/sync=1.33
+     4  T=2 forks=8 syncs=7 f/sync=1.14
+    25  T=2 forks=8 syncs=8 f/sync=1.00
+
+So a single shared-mode cell reading 7 sits inside the DEFAULT arm's own
+distribution. The invariant is that arm D shows no reproducible TREND across
+modes — not that any one cell matches.
+
+================================================================================
+3. THE 2x2, AND THE MECHANISM VISIBLE IN prov.log
+================================================================================
+
+Arm P (the clean ratio), ladder 4 1,2. Read no f/sync out of this — see the
+banner at the top. The prov.log column is the finding here:
+
+  D130_PROV=mem D130_RUN_ID=distinct
+    P  conn per fork, BEGIN only          1        4        4      1.00     1.0000
+    P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+  D130_PROV=mem D130_RUN_ID=shared
+    P  conn per fork, BEGIN only          1        4        4      1.00     1.0000
+    P  conn per fork, BEGIN only          2        8        8      1.00     0.5000
+  D130_PROV=durable D130_RUN_ID=distinct
+    P  conn per fork, BEGIN only          1        4        4      1.00     1.0000   prov.log=412B
+    P  conn per fork, BEGIN only          2        8        8      1.00     0.5000   prov.log=816B
+  D130_PROV=durable D130_RUN_ID=shared
+    P  conn per fork, BEGIN only          1        4        4      1.00     1.0000   prov.log=109B
+    P  conn per fork, BEGIN only          2        8        8      1.00     0.5000   prov.log=109B
+
+  ⭐ prov.log under durable is the mechanism, stated by the store itself:
+       distinct:  412B at 4 forks, 816B at 8 forks   — LINEAR in forks,
+                  one appended+fsynced frame per fork.
+       shared:    109B at 4 forks, 109B at 8 forks   — CONSTANT, exactly one
+                  frame for the whole cell.
+     That is DurableProvenanceStore::intern taking its repeat path
+     (`if self.mem.run_count() == before { return Ok(id); }`) and never
+     reaching append_locked's file.sync_data().
+
+  ⛔ Under mem there is no prov.log at all and no fsync to remove, which is why
+     mem x shared is the arm's NEGATIVE CONTROL rather than its test.
+
+================================================================================
+4. FIRE CHECK — EVERY REFUSAL FORCED TO FIRE
+================================================================================
+
+A guard that has never fired is not a guard. Each mutation below was applied to
+the committed source, built, and run; the tree was restored with
+`git checkout --` after each. M4's first attempt used a pattern that did not
+match, so the mutation never landed and the run passed — recorded here because
+a non-matching mutation looks exactly like a dead guard, and it was re-run with
+a shasum check proving the edit landed before the result was believed.
+
+  M1  shared mode emits distinct ids instead of the pinned tuple
+      -> REFUSING ... D130_RUN_ID=shared pins every fork to run id `r0_0`, but
+         the server echoed 4 distinct ids: {"r0_0","r0_1","r0_2","r0_3"}    exit 1
+
+  M2  shared mode drops one run-id echo per thread
+      -> REFUSING ... asked for 4 forks but the server echoed a run id 3
+         times.                                                            exit 1
+
+  M3  [PRE-EXISTING] branch names not counted (named += 0)
+      -> REFUSING ... 4 statements returned 0 branch names.                exit 1
+
+  M4  [PRE-EXISTING] sync counter frozen (let after = before)
+      -> REFUSING ... the catalog issued 0 fsyncs across 4 forks.          exit 1
+         (mutation landed: faf302e9 -> f52df8d7)
+
+  M5  D130_PROV=durable made a no-op (builder never applied)
+      -> REFUSING ... D130_PROV=durable, but .../prov.log does not exist.
+         The runtime is still on MemProvenanceStore, so the knob did
+         nothing and every `durable` cell in this run is mislabelled.      exit 1
+
+  M6  shared mode mints a second entity (agent alternates a0/a1)
+      -> REFUSING ... the store holds a SECOND entity at ProvId(2) after 4
+         forks. `intern` minted a new run instead of taking its repeat
+         path.                                                             exit 1
+
+  And the knobs themselves refuse an unrecognised value rather than defaulting:
+      D130_RUN_ID=bogus -> REFUSING ... is neither `distinct` nor `shared`. exit 1
+      (bench/d130_run.sh validates both knobs ABOVE the suite lock, so a typo
+       cannot spend a fifteen-minute hold to discover itself.)
+
+  The two guards the dispatch brief named as untouchable — the sync counter not
+  moving (M4) and the server naming a different branch count than the clients
+  asked for (M3) — both still fire, and were forced to fire on the NEW shared
+  path rather than only on the default one.
+
+================================================================================
+5. THE COMMAND FOR THE REAL SWEEP
+================================================================================
+
+Four runs, each taking the suite lock in turn. The direct phase is identical in
+all four (fork_concurrency reads neither knob), so it is run once and the other
+three are pgwire-only and APPEND:
+
+  bench/d130_run.sh bench/d130_s5_run_id_arm.txt 3 1
+  PHASES=pgwire APPEND=1 D130_RUN_ID=shared \
+      bench/d130_run.sh bench/d130_s5_run_id_arm.txt 3 1
+  PHASES=pgwire APPEND=1 D130_PROV=durable \
+      bench/d130_run.sh bench/d130_s5_run_id_arm.txt 3 1
+  PHASES=pgwire APPEND=1 D130_PROV=durable D130_RUN_ID=shared \
+      bench/d130_run.sh bench/d130_s5_run_id_arm.txt 3 1
+
+Defaults are the pre-registration: TLIST=1,2,4,8,16,32,64,128, PGWIRE_F=40.
+Read A/B/C off the durable pair. mem x shared is the negative control and must
+not move f/sync; if it does, the knob is doing something it does not claim and
+every other cell is suspect.
