@@ -1,0 +1,305 @@
+D178 RUN 5 — PLAN-SPACE DIFFERENTIAL: what the H1 guard did to SELECT's planning.
+date   : 2026-09-23T13:18:55Z
+harness: examples/d178_planspace_diff.rs, one binary, built twice from the same source:
+         once with the H1 guard, once with only the guard's four lines reverted.
+         Worktree /Users/idide/wt/ferrodb-d178-planspace at a9fd980.
+
+WHY THIS RUN EXISTS. The H1 fix narrows what build_index_scan may PROPOSE, and that is
+SELECT's planner, not just DML's. 'It only removes plans that could not run' was an
+ARGUMENT I made from the code's structure. This measures it instead, and the measurement
+is NOT what the argument predicted.
+
+RESULT: 7 of 104 corpus rows differ. On EVERY row where both trees answer, the row set is
+identical -- same count and same checksum. No answer changed anywhere. But the 7 rows are
+of TWO kinds, not one:
+
+  (1) SIX rows, fixture n=800 ANALYZE=true: unguarded ERRORS, guarded answers correctly.
+      The index candidate wins the cost comparison and then cannot be lowered.
+
+  (2) ONE row, fixture n=800 ANALYZE=FALSE: BOTH trees answer, and the PLAN differs.
+        v > 7980 AND id = 799   unguarded -> Sequential scan (rows=1000 cost=23.00)
+        v > 7980 AND id = 799   guarded   -> Index scan on col 0 ([799,799]) cost=13.00
+      Both return 1 row, sum=799. The guarded plan is strictly better.
+
+⭐ THE MECHANISM BEHIND (2), AND IT IS THE MORE INTERESTING HALF OF THE H1 DEFECT.
+  build_index_scan picks the FIRST conjunct carrying an index. An unlowerable conjunct
+  therefore CONSUMED THE CHOICE, and a later usable index was never considered. Whether
+  that ended in an error or merely a worse plan depended on the COST COMPARISON:
+    - with statistics, the index candidate WINS the comparison, is returned, and then
+      lower() refuses it            => a hard ERROR  (kind 1)
+    - without statistics, it LOSES the comparison, so build_index_scan returns the seq
+      plan and nothing errors       => a SILENTLY WORSE PLAN  (kind 2)
+  So the same defect has two faces depending on whether anyone ran ANALYZE, and only one
+  of them is visible as a failure.
+
+⭐ IT WAS ALSO ORDER-DEPENDENT, which the corpus caught by carrying both spellings:
+        v > 7980 AND id = 799   unguarded -> Sequential scan
+        id = 799 AND v > 7980   unguarded -> Index scan on col 0
+  The same predicate, the same answer, a different plan, decided by the order the user
+  happened to type the conjuncts in. The guard removes that.
+
+⇒ NET: of 104 rows, 97 identical, 6 ERROR -> correct answer, 1 worse plan -> better plan.
+  Nothing got worse and no answer moved. But 'the guard only removes unexecutable plans'
+  is FALSE as stated: it also stops an unusable conjunct from shadowing a usable one.
+
+=============================== GUARDED (the shipped tree) ===============================
+D178 PLAN-SPACE DIFFERENTIAL — access path + result, per predicate.
+Diff this against the same binary built with the H1 guard REMOVED.
+CLAIM UNDER TEST: every differing line is one where the unguarded tree ERRORS.
+
+== fixture n=800 analyze=true secondary_indexes=true ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319200
+  v = 4000                         | Index scan on t (col 1, [4000, 4000]) (rows=1 cost=17.00) | 1 rows sum=400
+  v > 7980                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7000                         | Sequential scan on t (rows=800 cost=19.00)     | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319600
+  v >= 7980                        | Index scan on t (col 1, [7980, inf)) (rows=1 cost=17.01) | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=800 cost=19.00)     | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=800 cost=19.00)     | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=800 cost=19.00)     | 228 rows sum=91428
+  v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  id > 400 AND v > 7980            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=800 cost=19.00)     | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=800 cost=19.00)     | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+
+== fixture n=800 analyze=false secondary_indexes=true ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=1000 cost=23.00)    | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=1000 cost=23.00)    | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 799 rows sum=319200
+  v = 4000                         | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=400
+  v > 7980                         | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7000                         | Sequential scan on t (rows=1000 cost=23.00)    | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=1000 cost=23.00)    | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=1000 cost=23.00)    | 799 rows sum=319600
+  v >= 7980                        | Sequential scan on t (rows=1000 cost=23.00)    | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=1000 cost=23.00)    | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=1000 cost=23.00)    | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=1000 cost=23.00)    | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=1000 cost=23.00)    | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=1000 cost=23.00)    | 228 rows sum=91428
+  v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  id > 400 AND v > 7980            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=1000 cost=23.00)    | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=1000 cost=23.00)    | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+
+== fixture n=200 analyze=true secondary_indexes=true ==
+  id = 400                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id > 400                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id >= 400                        | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id < 400                         | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  id <= 400                        | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  id != 400                        | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  v = 4000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 4000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 0                            | Sequential scan on t (rows=200 cost=5.00)      | 199 rows sum=19900
+  v >= 7980                        | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v < 100                          | Sequential scan on t (rows=200 cost=5.00)      | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=200 cost=5.00)      | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=200 cost=5.00)      | 29 rows sum=2929
+  w > 5                            | Sequential scan on t (rows=200 cost=5.00)      | 28 rows sum=2814
+  w >= 5                           | Sequential scan on t (rows=200 cost=5.00)      | 56 rows sum=5600
+  v > 7980 AND id = 799            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id = 799 AND v > 7980            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND w = 1               | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id > 400 AND v > 7980            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  label = 'row'                    | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  label = 'zz'                     | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+
+== fixture n=800 analyze=true secondary_indexes=false ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319200
+  v = 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=400
+  v > 7980                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7000                         | Sequential scan on t (rows=800 cost=19.00)     | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319600
+  v >= 7980                        | Sequential scan on t (rows=800 cost=19.00)     | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=800 cost=19.00)     | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=800 cost=19.00)     | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=800 cost=19.00)     | 228 rows sum=91428
+  v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  id > 400 AND v > 7980            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=800 cost=19.00)     | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=800 cost=19.00)     | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+
+
+=============================== UNGUARDED (guard reverted) ==============================
+D178 PLAN-SPACE DIFFERENTIAL — access path + result, per predicate.
+Diff this against the same binary built with the H1 guard REMOVED.
+CLAIM UNDER TEST: every differing line is one where the unguarded tree ERRORS.
+
+== fixture n=800 analyze=true secondary_indexes=true ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319200
+  v = 4000                         | Index scan on t (col 1, [4000, 4000]) (rows=1 cost=17.00) | 1 rows sum=400
+  v > 7980                         | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+  v > 7000                         | Sequential scan on t (rows=800 cost=19.00)     | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319600
+  v >= 7980                        | Index scan on t (col 1, [7980, inf)) (rows=1 cost=17.01) | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=800 cost=19.00)     | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=800 cost=19.00)     | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=800 cost=19.00)     | 228 rows sum=91428
+  v > 7980 AND id = 799            | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+  v > 7980 AND v < 7995            | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+  id > 400 AND v > 7980            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=800 cost=19.00)     | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=800 cost=19.00)     | 0 rows sum=0
+  label = 'row' AND v > 7980       | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+  v > 7980 AND label = 'row'       | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+
+== fixture n=800 analyze=false secondary_indexes=true ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=1000 cost=23.00)    | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=1000 cost=23.00)    | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=1000 cost=23.00)    | 799 rows sum=319200
+  v = 4000                         | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=400
+  v > 7980                         | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7000                         | Sequential scan on t (rows=1000 cost=23.00)    | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=1000 cost=23.00)    | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=1000 cost=23.00)    | 799 rows sum=319600
+  v >= 7980                        | Sequential scan on t (rows=1000 cost=23.00)    | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=1000 cost=23.00)    | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=1000 cost=23.00)    | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=1000 cost=23.00)    | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=1000 cost=23.00)    | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=1000 cost=23.00)    | 228 rows sum=91428
+  v > 7980 AND id = 799            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  id > 400 AND v > 7980            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=1000 cost=23.00)    | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=1000 cost=23.00)    | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
+
+== fixture n=200 analyze=true secondary_indexes=true ==
+  id = 400                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id > 400                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id >= 400                        | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id < 400                         | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  id <= 400                        | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  id != 400                        | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  v = 4000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 4000                         | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 0                            | Sequential scan on t (rows=200 cost=5.00)      | 199 rows sum=19900
+  v >= 7980                        | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v < 100                          | Sequential scan on t (rows=200 cost=5.00)      | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=200 cost=5.00)      | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=200 cost=5.00)      | 29 rows sum=2929
+  w > 5                            | Sequential scan on t (rows=200 cost=5.00)      | 28 rows sum=2814
+  w >= 5                           | Sequential scan on t (rows=200 cost=5.00)      | 56 rows sum=5600
+  v > 7980 AND id = 799            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id = 799 AND v > 7980            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND w = 1               | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  id > 400 AND v > 7980            | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  label = 'row'                    | Sequential scan on t (rows=200 cost=5.00)      | 200 rows sum=19900
+  label = 'zz'                     | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=200 cost=5.00)      | 0 rows sum=0
+
+== fixture n=800 analyze=true secondary_indexes=false ==
+  id = 400                         | Index scan on t (col 0, [400, 400]) (rows=1 cost=13.00) | 1 rows sum=400
+  id > 400                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  id >= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=239800
+  id < 400                         | Sequential scan on t (rows=800 cost=19.00)     | 400 rows sum=79800
+  id <= 400                        | Sequential scan on t (rows=800 cost=19.00)     | 401 rows sum=80200
+  id != 400                        | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319200
+  v = 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=400
+  v > 7980                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7000                         | Sequential scan on t (rows=800 cost=19.00)     | 99 rows sum=74250
+  v > 4000                         | Sequential scan on t (rows=800 cost=19.00)     | 399 rows sum=239400
+  v > 0                            | Sequential scan on t (rows=800 cost=19.00)     | 799 rows sum=319600
+  v >= 7980                        | Sequential scan on t (rows=800 cost=19.00)     | 2 rows sum=1597
+  v < 100                          | Sequential scan on t (rows=800 cost=19.00)     | 10 rows sum=45
+  v <= 100                         | Sequential scan on t (rows=800 cost=19.00)     | 11 rows sum=55
+  w = 3                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45429
+  w > 5                            | Sequential scan on t (rows=800 cost=19.00)     | 114 rows sum=45771
+  w >= 5                           | Sequential scan on t (rows=800 cost=19.00)     | 228 rows sum=91428
+  v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  id = 799 AND v > 7980            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+  v > 7980 AND w = 1               | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND v < 7995            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  id > 400 AND v > 7980            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  label = 'row'                    | Sequential scan on t (rows=800 cost=19.00)     | 800 rows sum=319600
+  label = 'zz'                     | Sequential scan on t (rows=800 cost=19.00)     | 0 rows sum=0
+  label = 'row' AND v > 7980       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+  v > 7980 AND label = 'row'       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+
+
+=============================== DIFF (guarded < / unguarded >) ==========================
+13c13
+<   v > 7980                         | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+---
+>   v > 7980                         | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+23c23
+<   v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+---
+>   v > 7980 AND id = 799            | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+25,26c25,26
+<   v > 7980 AND w = 1               | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+<   v > 7980 AND v < 7995            | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+---
+>   v > 7980 AND w = 1               | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+>   v > 7980 AND v < 7995            | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+30,31c30,31
+<   label = 'row' AND v > 7980       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+<   v > 7980 AND label = 'row'       | Sequential scan on t (rows=800 cost=19.00)     | 1 rows sum=799
+---
+>   label = 'row' AND v > 7980       | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+>   v > 7980 AND label = 'row'       | Index scan on t (col 1, (7980, inf)) (rows=1 cost=17.01) | ERROR: binding error: lower bound sec index isn't supported
+51c51
+<   v > 7980 AND id = 799            | Index scan on t (col 0, [799, 799]) (rows=1 cost=13.00) | 1 rows sum=799
+---
+>   v > 7980 AND id = 799            | Sequential scan on t (rows=1000 cost=23.00)    | 1 rows sum=799
