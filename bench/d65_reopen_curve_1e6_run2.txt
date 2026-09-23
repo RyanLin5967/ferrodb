@@ -68,3 +68,72 @@ EXPECTED, with what a different value would mean:
     Predicted data at 10^6: 4.1 GB (well inside 8 GB); free space at registration ~120 GiB.
 
 ====================================================================================================
+
+=== AMENDMENT 1 — appended 2026-09-23 ~21:55Z, BEFORE the first number of this run exists ===========
+The text above is unchanged. This amendment supersedes it where it says so, and nowhere else.
+Cause: a /code-review of a6f87ec (full text: artie-research frontier/lane_d65_reopen_codereview.md,
+bebf82f). Every finding was adjudicated against source at a6f87ec. The queued run was killed while
+still WAITING for the suite lock (it never acquired it, never built, and produced no number).
+
+A1. [review 1+2, CONFIRMED FROM SOURCE] The arena control as registered could never pass.
+    `ArenaPageStore::load_state` deserialises `current` and then calls `current.clear()` ("Never
+    resume filling a restored extent"), so `reopened.state_bytes() == img` is false for every N > 0
+    and rule 5 would have voided the arena column at every checkpoint. SUPERSEDED BY: column
+    `reload ctl` (harness fn `reload_control`), which must read `ok` at every row:
+      - bytes before `current` (header, free list, EVERY extent record + recycled list) identical;
+      - `current` holds exactly N entries in the image and 0 in the reload (the documented clear);
+      - `pending` identical; reload length exactly 16*N shorter.
+    It proves the extents section — the O(extents) work this column exists to time — was
+    deserialised in full. It does not prove the timer held only that work.
+    The control is FIRE-CHECKED IN-RUN: at the first checkpoint the harness feeds it three wrong
+    reloads — a store assembled at the same base with NO image loaded (`ArenaPageStore::reopen`
+    without `load_file`), the image itself (a load that kept `current`), and the true reload with
+    one extent byte flipped — and ASSERTS each is refused, printing the three refusals. If any
+    passes, the run panics before printing a row.
+A2. [review 3, CONFIRMED; the review's byte offset is wrong, the substance is right] `arena re pg`
+    is NOT a load control: `load_state` stores `live_pages` straight from the image header (bytes
+    13..17 by `image_len`'s layout comment; the review said 17..21, which is `reserved`). It reads
+    N whether or not any extent was loaded. Kept as a header round-trip check only.
+A3. [review 4, CONFIRMED FROM SOURCE] The cost model in rule 3 undercounted. Inside the arena timer:
+    `base_page_in_state` -> `image_len` (walk + CRC32), `reopen` (bitmap scan of main.db, small),
+    `load_file` -> `image_len` AGAIN (second walk + CRC32), `load_state` (third CRC32 + the
+    deserialisation, ~5 hash inserts per branch: extents, recycled, current, claim_epoch,
+    fill_unknown). Three passes over ~48 B/branch, not "two passes and a CRC, ~2 inserts".
+    Rule 3's MAGNITUDE band is SUPERSEDED: INFERRED 0.3 - 3 s at 10^6. A cell of 1-10 s at 10^6
+    is this stated work and is NOT called a wall; > 10 s at 10^6 is still a restart wall by
+    magnitude.
+A4. [review 5, CONFIRMED] Both reopen columns are WARM-CACHE: the probe is written and fsynced
+    moments before and read once before the timer; the catalog sidecar is live in this process.
+    A cold restart (after reboot) additionally reads the image from SSD. No cold arm: purging the
+    OS cache needs root. Every number here is warm and is quoted as warm.
+A5. [review 6, CONFIRMED] Verdict gaps closed. Exhaustive rules:
+    CATALOG (7 points): b = log-log OLS slope over all points, R = last/first cell, inc = number of
+    increases across the 6 steps.
+      NO GROWTH     b < 0.05 AND R < 2   (includes a falling curve; this is rule 1's FLAT)
+      WALL          b >= 0.05 AND R >= 2 AND inc >= 4   (reported as the finding)
+      INCONCLUSIVE  anything else — both statistics and the load log reported, no class claimed.
+    ARENA: primary statistic b_hi = log-log slope over the N >= 10^5 points only (5 points), since
+    at small N constants dominate and flatten any slope. Rule 3's single 10^5 -> 10^6 per-decade
+    ratio is reported as a secondary and no longer decides anything.
+      LINEAR        0.8 <= b_hi <= 1.2
+      SUPERLINEAR   b_hi > 1.2 — an S1-shaped wall in the restart path; the finding
+      LINEAR+CONST  0.5 <= b_hi < 0.8 — accepted as LINEAR iff ns/branch at 7.5e5 and 1e6 agree
+                    within 1.5x; otherwise INCONCLUSIVE
+      NOT O(ext)    b_hi < 0.5 — with `reload ctl` = ok at every row the source reading is wrong
+                    (itself a finding); with any NO the column is void
+    A run that stops before 5 points exist at N >= 10^5 gets no arena class: INCONCLUSIVE by rule.
+A6. [review 7, CONFIRMED] Panic paths skipped the run dir's removal. Fixed: a Drop guard
+    (`RemoveOnDrop`) declared first in `main` removes it on every exit, unwinding included (no
+    [profile] override in Cargo.toml, so release unwinds). The run script also runs with
+    TMPDIR=~/wt/logs/d65-reopen/tmp/ and removes it in its EXIT trap.
+A7. [review 8, PARTLY RIGHT] Line 3 names branch and sha already; the exact read is
+    `git show af8ebbe:bench/d65_reopen_curve_1e6.txt` (not on main).
+A8. [review 9, CONFIRMED] Instrument for "~120 GiB free": `df -h /private/tmp` at 21:39Z read 120Gi
+    avail on /dev/disk3s5 (/System/Volumes/Data); at ~21:54Z `df -h` read 109Gi for BOTH
+    ~/wt/logs/d65-reopen (this run's TMPDIR, where `free_bytes` looks) and /private/tmp — same volume.
+A9. [review 10, CONFIRMED] Nothing committed wrote the load log. The run script is now committed as
+    bench/d65_run2.sh: it samples `uptime` every 30 s for the whole lock hold (build included) and
+    appends that log to this file after the run.
+Rule 4 (4096 / 334 / pages live = N), rule 2 (run 1 reproduction ±50%) and rule 6 (stops are the
+result, no limit raised, FREE_FLOOR untouched) stand unchanged.
+====================================================================================================

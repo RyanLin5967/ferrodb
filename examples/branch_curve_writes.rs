@@ -119,6 +119,80 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
 /// [`free_bytes`]. 20 GiB leaves a working margin for every other lane on a shared machine.
 const FREE_FLOOR: u64 = 20 * (1u64 << 30);
 
+/// Removes the run directory when dropped — including during a panic's unwind.
+struct RemoveOnDrop(std::path::PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn be_u32(b: &[u8], at: usize) -> Option<usize> {
+    b.get(at..at.checked_add(4)?).map(|s| u32::from_be_bytes(s.try_into().unwrap()) as usize)
+}
+
+/// Byte offset of the `current` section in a v3 arena image, walking the layout
+/// `ArenaPageStore::image_len` walks: 21-byte header, counted free list of 8-byte entries, counted
+/// extents of 28 bytes plus a counted recycled list of 4-byte ids. `None` for anything else.
+///
+/// A mis-walk cannot produce a false pass: [`reload_control`] requires the count found at this
+/// offset to equal the run's branch count, which a wrong offset does not reproduce.
+fn current_section_offset(img: &[u8]) -> Option<usize> {
+    if img.first() != Some(&3) {
+        return None;
+    }
+    let mut at = 21usize;
+    let n_free = be_u32(img, at)?;
+    at = at.checked_add(n_free.checked_mul(8)?.checked_add(4)?)?;
+    let n_ext = be_u32(img, at)?;
+    at = at.checked_add(4)?;
+    for _ in 0..n_ext {
+        at = at.checked_add(28)?;
+        let rec = be_u32(img, at)?;
+        at = at.checked_add(rec.checked_mul(4)?.checked_add(4)?)?;
+    }
+    Some(at)
+}
+
+/// D65 run 2's POSITIVE CONTROL on the arena column: did the timed reopen really load the map?
+///
+/// ⛔ **Run 2 first shipped this as `reopened.state_bytes() == img`, which can NEVER hold for
+/// N > 0**: `ArenaPageStore::load_state` deserialises `current` and then deliberately clears it
+/// ("Never resume filling a restored extent"), so the re-serialised state is `16 * N` bytes
+/// shorter than the image. Found by review before the first run; the column would have read "NO"
+/// at every checkpoint and voided itself under its own pre-registration.
+///
+/// The control now states the round trip `load_state` actually promises. Relative to `img`, the
+/// re-serialisation `reload` must have: every byte before `current` (header, free list, EVERY
+/// extent with its owner, start, length, fill mark and recycled list) identical; `current` present
+/// in `img` with exactly `n` entries and EMPTY in `reload`; the `pending` section identical; and a
+/// length exactly `16 * n` shorter. The CRC is not compared — `state_bytes` recomputes it.
+///
+/// What it proves: the extents section — the O(extents) part this column exists to time — was
+/// deserialised in full, because a store that skipped it re-serialises an empty extent list.
+/// What it does not prove: that the timer contained only that work.
+fn reload_control(img: &[u8], reload: &[u8], n: usize) -> Result<(), &'static str> {
+    let cur = current_section_offset(img).ok_or("walk")?;
+    let n_cur = be_u32(img, cur).ok_or("walk")?;
+    if n_cur != n {
+        return Err("walk");
+    }
+    let removed = 16 * n_cur;
+    if img.len() < cur + 4 + removed + 4 || reload.len() + removed != img.len() {
+        return Err("len");
+    }
+    if reload[..cur] != img[..cur] {
+        return Err("ext");
+    }
+    if reload[cur..cur + 4] != [0u8; 4] {
+        return Err("cur");
+    }
+    if reload[cur + 4..reload.len() - 4] != img[cur + 4 + removed..img.len() - 4] {
+        return Err("pend");
+    }
+    Ok(())
+}
+
 fn main() {
     let checkpoints: Vec<usize> = std::env::args()
         .nth(1)
@@ -132,6 +206,10 @@ fn main() {
 
     let dir = std::env::temp_dir().join(format!("ferrodb-wcurve-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // Declared first so it drops LAST, after every handle below. A panic anywhere in this run
+    // (every `expect` here is one) used to skip the old trailing `remove_dir_all` and leave a
+    // multi-GB database in the temp dir of a disk this harness is guarding with FREE_FLOOR.
+    let _cleanup = RemoveOnDrop(dir.clone());
     let main_path = dir.join("main.db");
     let mf = std::fs::OpenOptions::new()
         .create(true).read(true).write(true).open(&main_path).unwrap();
@@ -186,10 +264,11 @@ fn main() {
     // The first nine columns are the historical ones, byte-for-byte in format, so every earlier
     // artifact of this harness still lines up. The five after `reopen ms` are D65 run 2's; see the
     // block that computes them for what each one proves.
-    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   cat live@re   img B/branch   arena re ms   arena re pg   img==reload");
+    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   cat live@re   img B/branch   arena re ms   arena re pg    reload ctl");
 
     let mut done = 0usize;
     let mut stopped_early: Option<(usize, u64)> = None;
+    let mut negatives_checked = false;
 
     for &target in &checkpoints {
         if target <= done || stopped_early.is_some() {
@@ -266,8 +345,16 @@ fn main() {
         // different structure — so without this block a flat catalog column would be read as
         // closing a question it never asked.
         //
-        // This is the production restart, not a model of it: `cli.rs` writes `store.checkpoint` at
-        // clean exit and opens with `ArenaPageStore::reopen_from_checkpoint`. The checkpoint goes
+        // This is the production restart's CODE PATH: `cli.rs` writes `store.checkpoint` at clean
+        // exit and opens with `ArenaPageStore::reopen_from_checkpoint`. ⚠ It is timed WARM-CACHE:
+        // the probe was written and fsynced moments before and is read once below, so the OS page
+        // cache holds it. A cold restart (after a reboot) additionally pays reading the image off
+        // the SSD; that arm is not measured here — purging the cache needs root. The catalog
+        // column above is warm for the same reason. What IS inside the timer, by source:
+        // `base_page_in_state` (a structural walk + CRC32 via `image_len`), `reopen` (bitmap scan
+        // of `main.db`, small), `load_file` (`image_len` AGAIN: a second walk + CRC32), and
+        // `load_state` (a third CRC32 plus the deserialisation: per extent ~5 hash inserts —
+        // `extents`, `recycled`, `current`, `claim_epoch`, `fill_unknown`). The checkpoint goes
         // to a SEPARATE probe path, so the live run's file (if `CURVE_PERSIST=1` armed one) is
         // never touched — `checkpoint` aimed anywhere but the armed path leaves its accounting
         // alone, by its own doc comment. The fresh pool over `main.db` is built OUTSIDE the timer:
@@ -287,10 +374,48 @@ fn main() {
         let reopened = ArenaPageStore::reopen_from_checkpoint(pool2, Arc::clone(&re), &probe)
             .expect("arena reopen");
         let arena_ms = t_arena.elapsed().as_secs_f64() * 1000.0;
-        // POSITIVE CONTROL for the arena column: re-serialise what was loaded and compare it with
-        // the bytes it was loaded from. Byte-identical means the timed call really deserialised
-        // the whole map; a flat column over a load that skipped the extents would fail here.
-        let reload_same = if reopened.state_bytes() == img { "yes" } else { "NO" };
+        // POSITIVE CONTROL for the arena column — see `reload_control` for what it proves, and for
+        // why its first version (plain byte equality) could never pass.
+        let reload = reopened.state_bytes();
+        let reload_ctl = match reload_control(&img, &reload, done) {
+            Ok(()) => "ok".to_string(),
+            Err(why) => format!("NO:{why}"),
+        };
+        // ...and the control must be able to FIRE. Once, at the first checkpoint, feed it three
+        // reloads that are wrong in the three ways that matter; each must be refused, or the
+        // column above means nothing and the run stops here rather than print it.
+        if !negatives_checked {
+            negatives_checked = true;
+            // (1) A load that skipped the map entirely: a store assembled at the same base with
+            //     NO image loaded, which is exactly what `reopen` without `load_file` produces.
+            let pool3 = {
+                let f = std::fs::OpenOptions::new().read(true).write(true).open(&main_path).unwrap();
+                Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())))
+            };
+            let unloaded = ArenaPageStore::reopen(pool3, Arc::clone(&re), base)
+                .expect("assemble unloaded store")
+                .state_bytes();
+            // (2) A load that kept `current` — the premise of the control's first version.
+            // (3) A load that got one extent byte wrong: the last byte before `current`.
+            let cur = current_section_offset(&img).expect("walk the probe image");
+            let mut flipped = reload.clone();
+            flipped[cur - 1] ^= 1;
+            let neg = [
+                ("unloaded", reload_control(&img, &unloaded, done)),
+                ("kept-current", reload_control(&img, &img, done)),
+                ("flipped-extent", reload_control(&img, &flipped, done)),
+            ];
+            for (name, r) in &neg {
+                assert!(r.is_err(), "reload control PASSED the {name} negative: it cannot fire");
+            }
+            println!(
+                "  # reload-control negatives at N={done}: {}",
+                neg.iter().map(|(n, r)| format!("{n}={r:?}")).collect::<Vec<_>>().join("  ")
+            );
+        }
+        // NOT a load control (review finding 3): `load_state` stores `live_pages` straight from
+        // the image HEADER, so this reads N whether or not a single extent was deserialised. It
+        // proves the header round-trips, nothing more.
         let arena_pages = reopened.live_page_count().unwrap_or(u32::MAX);
         drop(reopened);
         drop(re);
@@ -311,7 +436,7 @@ fn main() {
             img.len() as f64 / done as f64,
             arena_ms,
             arena_pages,
-            reload_same,
+            reload_ctl,
         );
 
         if data >= budget {
@@ -360,5 +485,5 @@ fn main() {
             verdict(data as f64 / done.max(1) as f64);
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // The run directory is removed by `_cleanup` on the way out, panic or not.
 }
