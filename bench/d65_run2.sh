@@ -4,11 +4,34 @@ set -u
 LOCK=/tmp/ferrodb-suite.lock; ME=""; SAMP=""
 W=/Users/idide/wt/ferrodb-d65-reopen-curve
 L=/Users/idide/wt/logs/d65-reopen
-OUT=$W/bench/d65_reopen_curve_1e6_run2.txt
+OUT=${D65_OUT:-$W/bench/d65_reopen_curve_1e6_run2.txt}
+PIDF=$L/run.pid
 rel(){ [ -n "$ME" ] && [ "$(cat $LOCK/owner 2>/dev/null)" = "$ME" ] && rm -rf "$LOCK"; }
-cleanup(){ [ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null; rm -rf "$L/tmp"; rel; echo "$(date -u +%FT%TZ) released" >> "$L/status"; }
+cleanup(){ [ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null; rel; [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ] && { rm -rf "$L/tmp"; rm -f "$PIDF"; }; echo "$(date -u +%FT%TZ) released (pid $$)" >> "$L/status"; }
 trap cleanup EXIT
 for s in TERM INT HUP; do trap "echo \"\$(date -u +%FT%TZ) got SIG$s (ppid \$PPID)\" >> \"\$L/status\"; exit 143" $s; done
+
+# >>> single-instance guard (added after two copies of this lane each launched this script) >>>
+# Refuses rather than warns, and runs BEFORE the lock wait, so a duplicate never even queues.
+#  (1) ONE LIVE INSTANCE: $PIDF is created with O_EXCL (noclobber). If it exists and its pid is
+#      alive, refuse. If its pid is dead, take over. If it cannot be parsed, refuse and say so.
+#  (2) ONE RUN PER ARTIFACT: if $OUT already carries a run header ("[HERE]" at line start), refuse;
+#      a re-run needs a NEW path via D65_OUT. Checked again right before appending.
+# Blind spots, stated: kill -0 says only that SOME process has that pid — a recycled pid makes a
+# dead holder look alive, which REFUSES (fails safe, never duplicates). The guard cannot see a
+# launch of a DIFFERENT script at the same artifact; (2) catches that only once it has appended.
+claim(){ ( set -o noclobber; echo "$$" > "$PIDF" ) 2>/dev/null; }
+refuse(){ echo "$(date -u +%FT%TZ) REFUSED launch pid $$: $1" >> "$L/status"; echo "REFUSED: $1" >&2; exit "$2"; }
+if ! claim; then
+  op=$(cat "$PIDF" 2>/dev/null)
+  case "$op" in ''|*[!0-9]*) refuse "$PIDF exists but holds '$op', not a pid; resolve by hand" 9 ;; esac
+  kill -0 "$op" 2>/dev/null && refuse "run pid $op named in $PIDF is alive" 9
+  echo "$(date -u +%FT%TZ) pid $$: $PIDF named dead pid $op; taking over" >> "$L/status"
+  rm -f "$PIDF"; claim || refuse "lost the race to re-claim $PIDF" 9
+fi
+has_run(){ grep -q '^\[HERE\]' "$OUT" 2>/dev/null; }
+has_run && { rm -f "$PIDF"; refuse "$OUT already holds a run header; one run, one path - set D65_OUT" 10; }
+# <<< single-instance guard <<<
 echo "$(date -u +%FT%TZ) waiting for lock (pid $$)" >> "$L/status"
 until mkdir "$LOCK" 2>/dev/null; do o=$(awk '{print $1}' "$LOCK/owner" 2>/dev/null)
   [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && { rm -rf "$LOCK"; continue; }; sleep 5; done
@@ -38,6 +61,7 @@ echo "$(date -u +%FT%TZ) smoke rows=$rows good=$good" >> "$L/status"
 [ "$rows" = 2 ] && [ "$good" = 2 ] || { echo "smoke: controls did not all pass, not running the curve" >> "$L/status"; exit 7; }
 rm -rf "$L/tmp"/*
 
+has_run && refuse "$OUT gained a run header while this launch waited" 10
 {
   echo "[HERE] $(date -u +%FT%TZ)  binary built from $(git rev-parse --short HEAD) (tree dirty=[$(git status --short | tr '\n' ' ')])"
   echo "suite lock owner: $(cat $LOCK/owner)   measure lock: $(/Users/idide/wt/logs/measure-lock.sh status 2>&1 | tr '\n' ' ')"
