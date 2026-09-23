@@ -1,19 +1,55 @@
-//! D103 — does the PRODUCTION `DIFF` path cost O(delta · log_m N) now, or is the wiring cosmetic?
+//! D103 — does the PAGE-DERIVED changeset, `AgentRuntime::page_changeset_with_cost`, cost
+//! O(delta · log_m N), or is its `cow::diff` wiring cosmetic?
+//!
+//! # ⛔ D193 correction (2026-09-23): this is NOT the cost of `DIFF <branch>`
+//!
+//! This harness and the file it banks used to call its subject "the PRODUCTION `DIFF` path" and
+//! "the function `DIFF <branch>` reaches through `dispatch::exec_agent`". **Both were false, at
+//! every commit.** Read from source at `fc9556a`, by symbol:
+//!
+//! * `dispatch::exec_agent`, arm `BoundAgentStmt::Diff`, calls `AgentRuntime::diff` and nothing
+//!   else.
+//! * `AgentRuntime::diff` builds the changeset from the workspace's own touched-rows map
+//!   (`ws.rows`, `ws.base_rows`, `ws.frame`) and descends no page tree. It calls neither
+//!   `page_changeset_with_cost` nor `cow::diff::diff` nor `CowTree::diff`.
+//! * `page_changeset_with_cost` has **no caller in `src/`** outside `page_changeset`, which has
+//!   none either. Its callers are integration tests and this example.
+//! * `git log -S page_changeset -- src/` finds no commit that routed `DIFF` to it, so "the
+//!   production `DIFF` path used to call `CowTree::diff`" was never true either: `page_changeset`
+//!   used to call it.
+//!
+//! So the integers this harness banks are a real measurement of a real function — the
+//! page-derived changeset, which `page_changeset`'s own doc describes as "what `DIFF` looks like
+//! when shadow paging provides it", i.e. a candidate, not the wiring — and they are **not** the
+//! cost of a `DIFF` statement. Do not quote them as one. What `DIFF` costs is
+//! `AgentRuntime::diff`'s question, and nothing here measures it.
+//!
+//! The example and the banked file keep the name `d103_production_diff_curve` only because
+//! renaming them would break every existing citation. **The name is historical and it is wrong.**
+//! Every sentence the harness writes into the banked file now says what was measured, and its
+//! first line names the commit the binary was built at, because the "not reached by `DIFF`" fact
+//! is a fact about a tree and would go stale silently if `DIFF` were ever rewired.
+//!
+//! # What it measures
 //!
 //! D91 measured `cow::diff::diff` directly, on a `CowTree` built by the example itself. That
-//! proves the algorithm and proves nothing about the database: the module had **zero external
-//! callers**. This harness drives `AgentRuntime::page_changeset_with_cost` — the function
-//! `DIFF <branch>` reaches through `dispatch::exec_agent` — over a real agent branch forked from a
-//! real trunk tree, and reports what that call cost.
+//! proves the algorithm on a tree the example owned; the module then had **zero external
+//! callers**. This harness drives `AgentRuntime::page_changeset_with_cost` — which, since D103,
+//! calls `cow::diff::diff` on the agent branch's own page tree — over a real agent branch forked
+//! from a real trunk tree, and reports what that call cost.
 //!
 //! # Pre-registered, before the first run
 //!
-//! delta is held at exactly 4 changed rows at every N, so N is the only axis.
+//! delta is held at exactly 4 changed rows at every N, so N is the only axis. (D193: the two
+//! outcome labels below originally read "the production path" and "the wiring"; they are
+//! corrected in place and marked. The thresholds are unchanged.)
 //!
 //!   * `visited` grows like log N — roughly one more level per 4x in N, and the 1k -> 256k ratio
-//!     well under the 256x growth in N                  -> the production path is O(delta · log N).
-//!   * `visited` grows like N (ratio near 256x)         -> the wiring is decoration and the row is
-//!                                                         a negative result to be reported as one.
+//!     well under the 256x growth in N  -> `page_changeset_with_cost` [D193: was "the production
+//!                                         path"] is O(delta · log N).
+//!   * `visited` grows like N (ratio near 256x)  -> its `cow::diff` wiring [D193: was "the
+//!                                         wiring"] is decoration and the row is a negative result
+//!                                         to be reported as one.
 //!   * `visited` is 0 while 4 changes are still reported
 //!                                                      -> impossible; the harness is not diffing
 //!                                                         what it thinks and the row is void.
@@ -133,10 +169,10 @@ fn measure(n: usize) -> Row {
     }
     let head_root = runtime.root_of(branch).unwrap();
 
-    // ---- the claim: the production DIFF path -------------------------------------------------
+    // ---- the subject: page_changeset_with_cost. NOT what `DIFF` runs — see the module doc -----
     let (changes, cost) = runtime.page_changeset_with_cost(branch).unwrap();
 
-    // ---- the control: what that path called before D103 --------------------------------------
+    // ---- the control: what page_changeset called before D103 ----------------------------------
     let tree = runtime.storage().unwrap().tree();
     let old = tree.diff(fork_root, head_root).unwrap();
 
@@ -145,7 +181,7 @@ fn measure(n: usize) -> Row {
     assert_eq!(
         changes.len(),
         CHANGED.len(),
-        "the production path reported {} changes at n={n}, expected {}",
+        "page_changeset_with_cost reported {} changes at n={n}, expected {}",
         changes.len(),
         CHANGED.len()
     );
@@ -188,23 +224,35 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut out = String::new();
+    // D193: the title and Subject lines below used to call the subject "the PRODUCTION DIFF
+    // path" and "the call DIFF <branch> reaches". Neither was ever true; see the module doc. The
+    // build commit is printed because the "not reached by DIFF" sentence below is a fact about a
+    // tree, checked by reading source, and it goes stale silently if DIFF is ever rewired.
     out.push_str(&format!(
-        "d103 — the PRODUCTION DIFF path, cost curve {provenance}\n"
+        "d103 — the PAGE-DERIVED changeset (AgentRuntime::page_changeset_with_cost), cost curve \
+         {provenance}\n"
     ));
+    out.push_str(&format!("built {}\n", ferrodb::build_provenance()));
     out.push_str(&format!("run at unix {unix}\n\n"));
-    out.push_str("Subject: AgentRuntime::page_changeset_with_cost, the call DIFF <branch> reaches.\n");
-    out.push_str("Question: does the production path cost O(delta · log_m N) now, or O(N)?\n");
+    out.push_str("Subject: AgentRuntime::page_changeset_with_cost. This is NOT what DIFF <branch> runs.\n");
+    out.push_str("  DIFF <branch> dispatches to AgentRuntime::diff, which builds the changeset from the\n");
+    out.push_str("  workspace's touched-rows map and descends no page tree. page_changeset_with_cost has\n");
+    out.push_str("  no caller in src/ (tests and this harness only). That wiring fact was read from\n");
+    out.push_str("  source at D193 (fc9556a), not checked by this binary: re-read dispatch.rs before\n");
+    out.push_str("  quoting it against a later commit. These numbers are NOT the cost of a DIFF statement.\n");
+    out.push_str("Question: is the page-derived changeset O(delta · log_m N), or O(N)?\n");
     out.push_str("delta is held at exactly 4 changed rows; N is the only axis.\n\n");
     out.push_str("Instruments:\n");
     out.push_str("  visited   DiffCost::visited — nodes the synchronised descent DECODED, which on\n");
     out.push_str("            that path is also every node it read. THE CLAIM.\n");
     out.push_str("  skipped   subtree pairs found equal by page identity and abandoned unread.\n");
-    out.push_str("  walked    TreeDiff::pages_walked — walk_pages(base)+walk_pages(head), what the\n");
-    out.push_str("            path this replaced must enumerate before it can prune. THE CONTROL.\n");
+    out.push_str("  walked    TreeDiff::pages_walked — walk_pages(base)+walk_pages(head), what\n");
+    out.push_str("            CowTree::diff (page_changeset's body before D103) must enumerate\n");
+    out.push_str("            before it can prune. THE CONTROL.\n");
     out.push_str("  examined  TreeDiff::pages_examined — the old counter. It reports the DECODE\n");
     out.push_str("            half only, which is why an O(N) operation read as cheap.\n\n");
-    out.push_str("Both paths were asserted to report the same 4 changes at every N; a row that did\n");
-    out.push_str("not would have aborted the run rather than been banked.\n\n");
+    out.push_str("Subject and control were asserted to report the same 4 changes at every N; a row\n");
+    out.push_str("that did not would have aborted the run rather than been banked.\n\n");
     out.push_str("      N   nodes  depth | visited  skipped  changes |     walked   examined\n");
     out.push_str("                       |                           |  (control)   (the lie)\n");
     out.push_str("-------  ------  ----- | -------  -------  ------- |  ---------   ---------\n");
@@ -249,12 +297,16 @@ fn main() {
         first.control_examined, last.control_examined
     ));
 
+    // D193: outcome labels corrected from "the production path" / "The wiring"; thresholds
+    // unchanged.
     let verdict = if visited_growth < n_growth / 8.0 && control_growth > n_growth / 2.0 {
-        "PRE-REGISTERED OUTCOME 1: the production path is O(delta · log N)."
+        "PRE-REGISTERED OUTCOME 1: page_changeset_with_cost is O(delta · log N).\n\
+         (A statement about the page-derived changeset, not about DIFF <branch> — see Subject.)"
     } else if control_growth <= n_growth / 2.0 {
         "VOID: the control did not track N, so it is not the control this run assumed."
     } else {
-        "PRE-REGISTERED OUTCOME 2: visited tracks N. The wiring is decoration."
+        "PRE-REGISTERED OUTCOME 2: visited tracks N. The cow::diff wiring inside \
+         page_changeset_with_cost is decoration."
     };
     out.push_str(&format!("\n{verdict}\n"));
 

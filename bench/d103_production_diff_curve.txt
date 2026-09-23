@@ -1,3 +1,32 @@
+===============================================================================================
+⛔⛔ D193 CORRECTION — 2026-09-23. THIS FILE'S LABEL IS FALSE. ITS NUMBERS ARE NOT.
+The title ("the PRODUCTION DIFF path"), the Subject ("the call DIFF <branch> reaches"), the
+Question ("does the production path cost ...") and the verdict ("the production path is
+O(delta · log N)") all say the measured function is what a `DIFF <branch>` statement runs.
+IT IS NOT, AND IT NEVER WAS. Read from source at fc9556a, by symbol:
+  * dispatch::exec_agent, arm BoundAgentStmt::Diff  ->  AgentRuntime::diff, and nothing else.
+  * AgentRuntime::diff builds the changeset from the workspace's own touched-rows map
+    (ws.rows, ws.base_rows, ws.frame, state.applied) and descends no page tree. It calls
+    neither page_changeset_with_cost, nor cow::diff::diff, nor CowTree::diff.
+  * AgentRuntime::page_changeset_with_cost -- the SUBJECT of every number below -- has no
+    caller in src/ outside page_changeset, which has none either. Its callers are integration
+    tests and examples/d103_production_diff_curve.rs. `git log -S page_changeset -- src/`
+    finds no commit that ever routed DIFF to it.
+=> WHAT STANDS: the table is a real measurement of page_changeset_with_cost, the PAGE-DERIVED
+   changeset: `visited` tracks depth (10 -> 14) while N grows 256x, and the CowTree::diff
+   control tracks N. That is true of that function and of cow::diff's synchronised descent.
+=> WHAT IS WITHDRAWN: every reading of this file as the cost of a DIFF statement. Read the
+   verdict at the bottom as "page_changeset_with_cost is O(delta · log N)". What
+   DIFF <branch> costs is AgentRuntime::diff's question, and nothing in this file measures it.
+   Anything that quoted this file as "the production DIFF cost" inherits the error.
+The false label was PRODUCED by the harness (its out.push_str lines), so correcting this file
+alone would have been undone by the next run. The generator, its module doc, and the same false
+sentence in src/cow/btree.rs, src/agent_sql/runtime.rs (DiffCost, page_changeset_with_cost) and
+tests/integration_production_diff_wiring.rs are corrected in the same D193 commit that adds this
+block. The file name is historical; renaming it would break its citations.
+⛔⛔ END D193 CORRECTION — everything below is the original file, unedited.
+===============================================================================================
+
 d103 — the PRODUCTION DIFF path, cost curve (release)
 run at unix 1790019730
 

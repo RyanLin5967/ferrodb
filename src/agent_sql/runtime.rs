@@ -752,7 +752,12 @@ fn ancestry_error(e: AncestryError) -> FerroError {
     FerroError::Branch(format!("ancestry index: {e}"))
 }
 
-/// What one page-derived `DIFF` cost, in integers.
+/// What one page-derived changeset ([`AgentRuntime::page_changeset_with_cost`]) cost, in integers.
+///
+/// ⚠ D193: this used to read "what one page-derived `DIFF` cost". A `DIFF <branch>` statement
+/// never produces one of these: it runs [`AgentRuntime::diff`], which reads the workspace's
+/// touched-rows map and descends no page tree, and `page_changeset_with_cost` has no caller in
+/// `src/`. Numbers in this type are the cost of the page-derived changeset only.
 ///
 /// **Integers and not a duration, deliberately.** This box runs a build fleet and a 46x
 /// quiet-vs-loaded spread has been measured on it, so a wall clock here would report the load
@@ -761,7 +766,7 @@ fn ancestry_error(e: AncestryError) -> FerroError {
 ///
 /// `visited` is every node this diff READ — there is no second, uncounted enumeration behind it.
 /// That is precisely what `cow::btree::TreeDiff::pages_examined` could not say on its own, which
-/// is why the production path no longer reports through it. See
+/// is why `page_changeset` no longer reports through it. See
 /// [`AgentRuntime::page_changeset_with_cost`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffCost {
@@ -2052,7 +2057,13 @@ impl AgentRuntime {
 
     /// [`AgentRuntime::page_changeset`], with what the descent cost as integers.
     ///
-    /// # Why the production `DIFF` path stopped calling `CowTree::diff`
+    /// # Why `page_changeset` stopped calling `CowTree::diff`
+    ///
+    /// ⚠ D193: this heading used to read "Why the production `DIFF` path stopped calling
+    /// `CowTree::diff`". This function is not the production `DIFF` path and never was: `DIFF
+    /// <branch>` runs [`AgentRuntime::diff`] (the workspace's touched-rows map, no page tree), and
+    /// this function's callers are integration tests and `examples/d103_production_diff_curve.rs`.
+    /// Everything below is true of THIS function; none of it is a statement about `DIFF`'s cost.
     ///
     /// `CowTree::diff` prunes by page identity — sound here, and the right test — but it finds the
     /// shared pages by calling `walk_pages` on **both roots** into two `HashSet<PageId>` before it
