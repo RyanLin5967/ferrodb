@@ -1600,3 +1600,363 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
     fleet.settle_to(*merged.iter().max().unwrap());
     fleet.shutdown();
 }
+
+// =================================================================================================
+// D173 — the output-commit window, forced to fire
+//
+// NOT FOR MAIN. This block exists to decide whether `ClusterAgents::merge` can return
+// `FerroError::NotLeader` to a caller whose merge command has already been committed and applied by
+// the cluster — and, if it can, whether the caller's retry produces the exact string Windows CI run
+// 35835903937 printed:
+//
+//     branch 2: merge error: round 8 merges n3/b2, which is Merged { at: 5 }
+//
+// Production code is untouched. The only thing this harness changes is what `Replicated::leader`
+// reports, which is precisely the input `pump_until` re-reads every turn.
+// =================================================================================================
+
+/// A seam that tells **one** lie, at one moment: the first leadership re-check that
+/// [`ClusterAgents::merge`]'s `pump_until` performs *after* a `BranchOp::Merge` has been appended
+/// to the log reports that somebody else leads. Every other call is the truth, so the retry that
+/// follows runs against a node that really is the leader.
+///
+/// This is the deposition modelled at the seam the coordinator actually reads. What it does not
+/// model is the *survival* of the proposed entry — see the assertions below, which record whether
+/// the entry was already committed at the instant the lie was told.
+struct DeposeOnceAfterMergePropose {
+    inner: FleetSeam,
+    me: NodeId,
+    /// `Some(round)` once the merge under test has been proposed and until the lie has been told.
+    armed: Mutex<Option<Round>>,
+    /// Arm on the first merge proposal only: the retry must not be deposed as well.
+    arm_used: Mutex<bool>,
+    /// What the cluster knew at the instant of the lie: `(round, committed_head, last_applied)`.
+    at_lie: Mutex<Option<(Round, Round, Round)>>,
+}
+
+impl DeposeOnceAfterMergePropose {
+    fn new(me: usize, fleet: Arc<Fleet>) -> DeposeOnceAfterMergePropose {
+        DeposeOnceAfterMergePropose {
+            inner: FleetSeam { me, fleet },
+            me: NodeId(me as u32 + 1),
+            armed: Mutex::new(None),
+            arm_used: Mutex::new(false),
+            at_lie: Mutex::new(None),
+        }
+    }
+
+    fn someone_else(&self) -> NodeId {
+        if self.me == N1 {
+            NodeId(2)
+        } else {
+            N1
+        }
+    }
+}
+
+impl Replicated for DeposeOnceAfterMergePropose {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        let is_merge = matches!(&c, Command::Branch { op: BranchOp::Merge { .. } });
+        let round = self.inner.propose(c)?;
+        if is_merge && !*lock(&self.arm_used) {
+            *lock(&self.arm_used) = true;
+            *lock(&self.armed) = Some(round);
+        }
+        Ok(round)
+    }
+
+    fn committed_head(&self) -> Round {
+        self.inner.committed_head()
+    }
+
+    fn pump(&self) -> Result<(), FerroError> {
+        self.inner.pump()
+    }
+
+    fn leader(&self) -> Option<NodeId> {
+        let mut armed = lock(&self.armed);
+        if let Some(round) = *armed {
+            *armed = None;
+            let applied = lock(&self.inner.fleet.ledgers[self.inner.me]).last_applied();
+            *lock(&self.at_lie) = Some((round, self.inner.committed_head(), applied));
+            return Some(self.someone_else());
+        }
+        self.inner.leader()
+    }
+}
+
+/// **D173.** A merge that committed, reported to its caller as `NotLeader`, and the retry that
+/// cannot succeed.
+///
+/// The round arithmetic is the CI run's, on purpose: round 1 is the leader's term-establishing
+/// `NoOp`, 2 forks `b1`, 3 merges it, 4 forks `b2`, 5 merges `b2`. The agent writes cost no rounds,
+/// so three writes per branch reproduce the same numbering as the hundred the failing test does.
+#[test]
+fn d173_a_merge_that_committed_is_reported_to_its_caller_as_not_leader() {
+    let mut db = Db::new();
+    db.seed();
+    {
+        let mut s = db.session();
+        db.ok("INSERT INTO inventory VALUES (2, 100);", &mut s);
+    }
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let me = NodeId(leader as u32 + 1);
+    let seam = Arc::new(DeposeOnceAfterMergePropose::new(leader, fleet.clone()));
+    let agents = ClusterAgents::new(me, db.runtime.clone(), seam.clone(), fleet.ledgers[leader].clone());
+
+    assert_eq!(
+        lock(&fleet.tallies[leader]).as_slice(),
+        &[Command::NoOp],
+        "round 1 must be the term-establishing NoOp, or every round number below is a different \
+         claim from the one the CI log makes"
+    );
+
+    let mut outcome = None;
+    for row in 1..=2 {
+        fleet.hold_leader(leader);
+        let cs = agents.fork(agent("d173"), BranchId::TRUNK).unwrap();
+        fleet.settle_to(cs.fork_round);
+        for i in 0..3 {
+            db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = {row};", 100 - i));
+            fleet.pump_all();
+        }
+        fleet.hold_leader(leader);
+        let bp = db.bp.clone();
+        let txn = db.txn.clone();
+        let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+
+        // The caller's contract, exactly as `integration_cluster_agents.rs:1568` writes it:
+        // NotLeader is transient, so re-establish leadership and try again.
+        let mut attempt = 0;
+        let r = loop {
+            match agents.merge(&mut ctx, cs.branch()) {
+                Ok(r) => break Ok(r),
+                Err(FerroError::NotLeader { .. }) if attempt < 10 => {
+                    attempt += 1;
+                    drop(ctx);
+                    fleet.hold_leader(leader);
+                    let bp = db.bp.clone();
+                    let txn = db.txn.clone();
+                    ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+                }
+                Err(e) => break Err((e, attempt, cs.branch())),
+            }
+        };
+        drop(ctx);
+        match r {
+            Ok(ok) => {
+                assert!(ok.report.applied_to_target, "row {row} did not publish");
+                loopcount(format_args!(
+                    "D173 row={row} merged ok at round {:?}",
+                    ok.merge_round
+                ));
+            }
+            Err(e) => {
+                outcome = Some((row, e));
+                break;
+            }
+        }
+    }
+
+    let (round, committed, applied) =
+        lock(&seam.at_lie).expect("the harness never told its lie: nothing was deposed");
+    loopcount(format_args!(
+        "D173 lie told at merge round={round} committed_head={committed} last_applied={applied}"
+    ));
+
+    let (row, (err, attempts, branch)) =
+        outcome.expect("the retry SUCCEEDED: no output-commit window on this path");
+    let cid = ClusterBranchId::of(me, branch).unwrap();
+    let text = err.to_string();
+    loopcount(format_args!("D173 row={row} attempts={attempts} err={text}"));
+
+    assert_eq!(round, 5, "the merge under test must be the round-5 one the CI log names");
+    assert!(
+        text.contains(&format!("round 6 merges {cid}, which is Merged {{ at: 5 }}")),
+        "expected the CI signature shape with no election rounds in between; got: {text}"
+    );
+    assert!(
+        applied < round,
+        "this node had already applied round {round} when the lie was told, so pump_until would \
+         have returned Ok and there is no window: applied={applied}"
+    );
+    assert_eq!(
+        lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state),
+        Some(ReplicatedState::Merged { at: round }),
+        "the cluster must have sealed the branch the caller was told it did not merge"
+    );
+    assert_eq!(
+        db.main_qty(row),
+        Some(100),
+        "the rows must NOT be in the target: the merge the cluster committed was never published"
+    );
+    fleet.shutdown();
+}
+
+/// The stronger harness: **a real deposition, by the real mechanism**, with nothing faked.
+///
+/// `DeposeOnceAfterMergePropose` above lies at the seam, which reproduces the *signature* but not
+/// the *survival*: it leaves this node in office, so the entry commits because nothing ever
+/// threatened it. This one changes no answer — every `leader()` is the node's own — and instead
+/// controls **who gets driven**, which is the one thing a test harness legitimately owns (`pump_all`
+/// exists for exactly that reason).
+///
+/// After the merge has been appended, only *this* node is pumped. Its peers answer nothing, so
+/// `since_quorum` reaches `lease` and `election.rs`'s leader tick steps it down on its own — the
+/// same lapse the failing test's own comment names ("NOTHING PUMPS HEARTBEATS between that call
+/// and this one, so on a slow machine the lease lapses"). `pump_until`'s next leadership re-check
+/// then refuses, with the merge entry sitting in this node's log, unacknowledged.
+struct StarveIntoRealDeposition {
+    fleet: Arc<Fleet>,
+    me: usize,
+    /// `Some(round)` from the moment the merge is proposed: while set, only this node is driven.
+    starving: Mutex<Option<Round>>,
+    /// `(round, committed_head, last_applied)` at the turn this node's own state machine first
+    /// reported that it no longer leads.
+    at_step_down: Mutex<Option<(Round, Round, Round)>>,
+}
+
+impl StarveIntoRealDeposition {
+    fn new(me: usize, fleet: Arc<Fleet>) -> StarveIntoRealDeposition {
+        StarveIntoRealDeposition { fleet, me, starving: Mutex::new(None), at_step_down: Mutex::new(None) }
+    }
+}
+
+impl Replicated for StarveIntoRealDeposition {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        let is_merge = matches!(&c, Command::Branch { op: BranchOp::Merge { .. } });
+        // `Node::propose` drains inline, so the `Append` carrying this entry is written to the
+        // peers' sockets before this returns. Whether they ever read it is the harness's to decide.
+        let round = self.fleet.reps[self.me].propose(c)?;
+        if is_merge && lock(&self.starving).is_none() {
+            *lock(&self.starving) = Some(round);
+        }
+        Ok(round)
+    }
+
+    fn committed_head(&self) -> Round {
+        self.fleet.reps[self.me].committed_head()
+    }
+
+    fn pump(&self) -> Result<(), FerroError> {
+        match *lock(&self.starving) {
+            None => {
+                for r in &self.fleet.reps {
+                    r.pump()?;
+                }
+            }
+            Some(_) => self.fleet.reps[self.me].pump()?,
+        }
+        Ok(())
+    }
+
+    fn leader(&self) -> Option<NodeId> {
+        let who = self.fleet.reps[self.me].leader();
+        if who != Some(NodeId(self.me as u32 + 1)) {
+            if let Some(round) = *lock(&self.starving) {
+                let applied = lock(&self.fleet.ledgers[self.me]).last_applied();
+                let mut slot = lock(&self.at_step_down);
+                if slot.is_none() {
+                    *slot = Some((round, self.fleet.reps[self.me].committed_head(), applied));
+                }
+            }
+        }
+        who
+    }
+}
+
+/// **D173, with nothing faked.** A leader whose lease lapses between its merge's proposal and its
+/// commit refuses its own caller, the cluster commits the merge anyway, and the retry the failing
+/// test performs is refused for ever — with the rows nowhere.
+#[test]
+fn d173_a_real_deposition_commits_the_merge_and_refuses_its_caller() {
+    let mut db = Db::new();
+    db.seed();
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let me = NodeId(leader as u32 + 1);
+    let seam = Arc::new(StarveIntoRealDeposition::new(leader, fleet.clone()));
+    let agents =
+        ClusterAgents::new(me, db.runtime.clone(), seam.clone(), fleet.ledgers[leader].clone());
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+
+    fleet.hold_leader(leader);
+    let cs = agents.fork(agent("d173"), BranchId::TRUNK).unwrap();
+    fleet.settle_to(cs.fork_round);
+    let cid = ClusterBranchId::of(me, cs.branch()).unwrap();
+    for i in 0..3 {
+        db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
+        fleet.pump_all();
+    }
+    fleet.hold_leader(leader);
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let first = agents.merge(&mut ctx, cs.branch());
+    drop(ctx);
+
+    let first = match first {
+        Ok(r) => panic!("NOT FIRED: the merge succeeded at round {:?}", r.merge_round),
+        Err(e) => e,
+    };
+    let (round, committed, applied) = lock(&seam.at_step_down)
+        .expect("NOT FIRED: this node never stopped believing it led");
+    loopcount(format_args!(
+        "D173-real step-down at merge round={round} own_committed_head={committed} \
+         own_last_applied={applied} caller_got={first}"
+    ));
+    assert!(
+        matches!(first, FerroError::NotLeader { .. }),
+        "the caller must see the transient-by-contract error: {first}"
+    );
+    assert!(applied < round, "if this node had applied the round, pump_until would have said Ok");
+
+    // Stop starving the peers. They read the backlog — the `Append` carrying the merge round is
+    // already on their sockets — and hold the election this node's silence entitles them to.
+    *lock(&seam.starving) = None;
+    for _ in 0..200 {
+        for i in &others {
+            fleet.reps[*i].pump().unwrap();
+        }
+    }
+
+    // The caller's documented recovery, verbatim from `integration_cluster_agents.rs:1568`.
+    fleet.hold_leader(leader);
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let second = agents.merge(&mut ctx, cs.branch());
+    drop(ctx);
+
+    let state = lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state);
+    loopcount(format_args!(
+        "D173-real after recovery: ledger_state={state:?} committed_head={} retry={:?}",
+        fleet.reps[leader].committed_head(),
+        second.as_ref().map(|r| r.merge_round).map_err(|e| e.to_string())
+    ));
+    assert_eq!(
+        state,
+        Some(ReplicatedState::Merged { at: round }),
+        "NOT FIRED: the proposed round did not survive the deposition — it was truncated, which is \
+         the refutation, not the finding"
+    );
+    let e = second.expect_err("the retry SUCCEEDED: there is no unrecoverable state here");
+    let text = e.to_string();
+    loopcount(format_args!("D173-real retry err={text}"));
+    assert!(
+        text.starts_with("merge error: round ")
+            && text.ends_with(&format!(" merges {cid}, which is Merged {{ at: {round} }}")),
+        "expected the CI signature; got: {text}"
+    );
+    assert_eq!(
+        db.main_qty(1),
+        Some(100),
+        "the merge the cluster committed was never published: the branch is sealed and its rows \
+         are nowhere"
+    );
+    fleet.shutdown();
+}
