@@ -1,0 +1,203 @@
+D178 PRE-REGISTRATION — route UPDATE/DELETE through the optimizer so they can reach an index
+=============================================================================================
+
+Written and committed BEFORE the first number is taken. Amendments are APPEND-ONLY, at the
+bottom, each dated and numbered. Nothing above the amendment line is edited after this commit.
+
+Worktree : /Users/idide/wt/ferrodb-d178-dml-index
+Branch   : d178-dml-index, forked from main fe40276
+Design   : /Users/idide/wt/artie-research/SCALE-DESIGN.md section D178 (binding, written before
+           this work was dispatched)
+Evidence : /Users/idide/wt/artie-research/frontier/d176_merge_rowcount.md
+
+
+0. THE CLAIM UNDER TEST
+-----------------------
+
+D176 measured, with integers, that a plain `MERGE;` writing `delta` rows pulls exactly `delta * n`
+tuples off the heap, and attributed it to the PUBLISH path rather than to merge itself. The root
+cause it names, verified again from source in this worktree at fe40276:
+
+    src/planner/plan.rs:137  fn build_scan(entry, predicate, bp, view) -> Box<dyn Executor>
+      - opens the heap, builds a SeqScan, wraps it in a Filter when there is a predicate
+      - NEVER consults an index
+      - only callers: plan.rs:35 (Stmt::Delete) and plan.rs:75 (Stmt::Update)
+
+    src/optimizer/optimizer.rs:5   fn optimize(...)  -- reached ONLY by Stmt::Select (plan.rs:17)
+      :9   build_index_scan(table, &predicate, catalog)
+      :131,:133  predicate_to_bounds(..) + has_index(..)  -- the index-selection rewrite
+
+So SELECT may get an IndexScan and UPDATE/DELETE structurally cannot.
+
+CHANGE UNDER TEST (design decision option 1, in the shape of option 4): `build_scan` builds a
+`LogicalPlan::Filter { input: LogicalPlan::Scan, predicate }` and obtains its executor from
+`pushdown -> optimize -> lower`, the identical three steps `Stmt::Select` takes at plan.rs:16-18.
+Exactly ONE planning path exists afterwards. Option 2 (special-casing `build_scan` to call
+`predicate_to_bounds` + `has_index` itself) is REJECTED by the design entry and is not attempted.
+
+
+1. THE INSTRUMENT — REUSED, NOT INVENTED
+----------------------------------------
+
+D176's counters, taken by `git cherry-pick 81173de` from branch `d176-merge-rowcount`:
+
+    src/execution/seq_scan.rs    SEQ_SCANS, SEQ_SCAN_TUPLES, seq_scan_counters() -> (u64, u64)
+    src/execution/index_scan.rs  INDEX_SCANS, index_scan_counter() -> u64
+
+SEQ_SCAN_TUPLES counts tuples the heap YIELDED, before visibility filtering — the work the engine
+paid for, not the rows a caller saw. One relaxed `fetch_add` per SCAN, flushed in `Drop` from a
+plain local field, so the instrument cannot create the slope it measures.
+
+⚠ Both counters are process-global and are read twice and subtracted to scope them to a phase.
+The harness is single-threaded by construction, so read-twice-and-subtract is exact. It would not
+be under concurrency and this experiment says nothing about the concurrent case.
+
+⚠ A `SeqScan` flushes in `Drop`. The harness therefore takes the closing read AFTER the statement
+and its plan have been dropped, not while a plan is still alive. A missing flush would show as
+SEQ_SCANS below the number of scans issued, not as a silently low tuple count.
+
+
+2. ARMS — one binary, one process, one moment per cell
+------------------------------------------------------
+
+Fixture per cell: a fresh database; `CREATE TABLE t (id INTEGER NOT NULL, v INTEGER, label
+VARCHAR(16));` populated with n rows, id = 0..n-1. No ANALYZE is run: column 0 is the primary key
+and `apply_unique_key_fact` (cost_model.rs:255, D56) makes its distinct count equal the row count
+as a SCHEMA FACT, so a point lookup on it prefers the index with or without statistics. Running
+ANALYZE is therefore not required and is deliberately omitted, so that a cell cannot be carried by
+a statistic that a real workload might not have.
+
+  A  TREATMENT   delta x `UPDATE t SET v = <lit> WHERE id = <k>`     indexed, pk equality
+  B  CONTROL     delta x `UPDATE t SET v = <lit> WHERE label = 'zz'` NOT indexed, matches 0 rows
+  C  TREATMENT   delta x `DELETE FROM t WHERE id = <k>`              indexed, pk equality
+  D  CONTROL     one    `SELECT v FROM t WHERE id = <k>`             SELECT path, already indexed
+
+Size axis: n in {500, 1000, 2000, 4000}.   delta fixed at 4 for A, B, C.
+Every cell is repeated 5 times; min and max are reported SEPARATELY, never averaged. These are
+integer counters, so min == max is expected and a cell where they differ is reported as such
+rather than summarised.
+
+ARM B is the control in the strict sense: the change cannot affect it. `label` carries no index,
+so `has_index(entry, col)` is false, `build_index_scan` returns None, and `optimize` falls through
+to `PhysicalPlan::Filter { input: SeqScan }` — the same executor tree `build_scan` builds today.
+If ARM B MOVES between the BEFORE and AFTER runs, the two halves did not come from the same base
+and BOTH are void.
+
+ARM D is the second control, on the axis of the other direction: SELECT already reaches the index
+at fe40276, so it must read the same number of tuples before and after.
+
+
+3. BEFORE / AFTER — TWO COMMITS, ONE HARNESS SOURCE
+----------------------------------------------------
+
+BEFORE = the instrument commit, with `build_scan` untouched.
+AFTER  = BEFORE + the planner change only.
+
+The harness source is IDENTICAL in both runs (same file, committed before the BEFORE run, not
+edited between them). If the harness is edited after the BEFORE run, the BEFORE run is discarded
+and retaken. Both runs are on the same quiet machine in the same session.
+
+
+4. PREDICTIONS — registered now, scored later, wrong ones left visible
+----------------------------------------------------------------------
+
+P1  BEFORE, ARM A: SEQ_SCAN_TUPLES == delta * n exactly, at every n. (D176 measured delta*n on
+    the merge path; this is the same planner gap reached by a plain session UPDATE, so the same
+    identity should hold.)
+P2  AFTER, ARM A: SEQ_SCAN_TUPLES is FLAT in n — the same value at n=500 and n=4000.
+P3  AFTER, ARM A: INDEX_SCANS == delta (non-zero). Required. A flat tuple count with zero index
+    scans means the statement stopped doing work, not that it got faster, and the cell is VOID.
+P4  BEFORE and AFTER, ARM B: SEQ_SCAN_TUPLES == delta * n in BOTH, identical cell for cell.
+P5  BEFORE and AFTER, ARM C: same shape as ARM A (delta*n before, flat after).
+P6  BEFORE and AFTER, ARM D: identical, and small.
+P7  Rows affected: every UPDATE in ARM A reports exactly 1, every DELETE in ARM C reports exactly
+    1, every UPDATE in ARM B reports exactly 0. Asserted against literals written into this file,
+    never read back out of the system under test.
+
+
+5. EXIT CRITERION (from the design entry, restated so it can be scored)
+------------------------------------------------------------------------
+
+  Sequentially-scanned tuples stop growing with table size, at fixed delta, for an indexed
+  `UPDATE ... WHERE pk = k`.
+
+Scored as: AFTER ARM A SEQ_SCAN_TUPLES at n=4000 equals the value at n=500, AND AFTER ARM A
+INDEX_SCANS == delta > 0, AND P7 holds at every n.
+
+
+6. FALSIFIERS — what makes this row FAIL rather than succeed
+-------------------------------------------------------------
+
+F1  AFTER ARM A tuples still proportional to n (slope within 10% of delta) => the change did not
+    take; report the fix as NOT LANDED. No re-framing of the exit criterion is permitted.
+F2  AFTER ARM A flat but INDEX_SCANS == 0 => VOID, not a win. See P3.
+F3  ARM B moves between BEFORE and AFTER => the two halves came from different bases; both runs
+    discarded and retaken. (A control that is supposed to be untouched and moves is the signature
+    of a mixed base.)
+F4  ARM B FLAT in n in the AFTER run => the instrument has stopped being able to report a slope
+    at all, so ARM A being flat carries no information. This is the FIRE-CHECK: ARM B must fire.
+F5  Any test in the suite goes red => that is the finding and it is reported as the result. The
+    design entry and the dispatch brief both say a correctness regression outweighs the perf win.
+F6  Rows affected disagrees with P7 at any cell => the workload is not doing what it says and
+    every number in that run is void.
+
+
+7. THE FIRE-CHECK, STATED AS ITS OWN STEP
+------------------------------------------
+
+A flat curve is what a BROKEN counter also produces. ARM B runs in the SAME process, the SAME
+binary and the SAME run as ARM A, and must come back proportional to n. One arm flat and one arm
+sloped, from one instrument in one moment, is the evidence that the flat arm means something. If
+both arms are flat the run reports NO VERDICT (F4), not a win.
+
+
+8. NAMED HAZARD — THE ONE WAY THIS CHANGE COULD REGRESS CORRECTNESS
+--------------------------------------------------------------------
+
+Routing DML through `optimize` makes UPDATE/DELETE inherit every property of SELECT's planning,
+including its defects. One is already visible in the tree at fe40276:
+
+    optimizer.rs:84-88, in `lower`, for a SECONDARY index (column != 0):
+        Bound::Excluded(_) => return Err(FerroError::Bind("lower bound sec index isn't supported"))
+
+`predicate_to_bounds` maps `col > v` to `(Bound::Excluded(v), Bound::Unbounded)`. So a predicate
+`secondary_indexed_col > v` that `build_index_scan` chooses cannot be lowered and the STATEMENT
+ERRORS. On the SELECT path this is pre-existing and reachable today. On the UPDATE/DELETE path it
+would be NEW, because those statements have never been able to select an index scan at all.
+
+H1 is tested explicitly, on the SELECT path FIRST, at fe40276 + instrument only:
+    does `SELECT ... WHERE secondary > v` already error in the unmodified tree?
+
+  H1-a  If YES (pre-existing SELECT bug, reachable): the correct repair is in the PLANNER — stop
+        `build_index_scan` from PROPOSING an access path that `lower` cannot build. That is one
+        change inside the single shared planning path, it fixes the live SELECT bug as well, and
+        it does NOT touch `lower`'s refusal or the existing test that asserts that refusal
+        (`plan.rs::test_index_scan_secondary_rejects_strict_lower`, which builds a
+        `PhysicalPlan::IndexScan` by hand and must keep erroring).
+  H1-b  If NO (the cost model never picks that plan): record the arithmetic that shows why, and
+        change nothing.
+
+⛔ What is NOT permitted under either branch: adding a fallback in `build_scan` that catches
+`lower`'s error and retries as a SeqScan. That would be a second planning policy that diverges
+from SELECT on the same predicate, which is option 2 under another name, and option 2 is rejected.
+
+⛔ Also not permitted: editing or weakening `test_index_scan_secondary_rejects_strict_lower`, or
+any other existing assertion, to accommodate this change.
+
+
+9. SCOPE — what this experiment does NOT say
+---------------------------------------------
+
+- Nothing about wall-clock time. No duration is recorded anywhere in this row. The claim is a
+  complexity class and it is settled with integers.
+- Nothing about concurrency. Single-threaded by construction (see section 1).
+- Nothing about the merge path directly. D176 already measured that `delta * n` reaches merge
+  through publish; this row measures the planner gap at its source, with a plain session UPDATE.
+  Whether merge's own number falls is a consequence to be measured separately, not claimed here.
+- Nothing about the CoW/agent overlay paths (`scan_table_where` and friends), which do not go
+  through `planner::plan`.
+- SEQ_SCAN_TUPLES counts tuples yielded BEFORE visibility filtering, so it is engine work, not
+  rows returned. The two differ and only the first is reported.
+
+
+=============================== AMENDMENTS (APPEND ONLY) ===============================
