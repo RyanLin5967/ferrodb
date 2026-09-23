@@ -149,4 +149,45 @@ ledger measured, because the ledger measured a different tree.
 
 AMENDMENTS (append-only)
 ------------------------
-(none yet)
+
+AMENDMENT 1 — ARM D added AFTER the first run. Declared here because it was.
+-----------------------------------------------------------------------------
+The first run (raw kept at bench/d176_rowcount_RAW.txt) produced, for ARM A:
+
+    nrows   rows/merge   tuples/merge
+      500            4           2000
+     1000            4           4000
+     2000            4           8000
+     4000            4          16000
+
+rows is FLAT, which is F1. tuples is 4n — LINEAR IN TABLE SIZE — which is P5, the
+pre-registered case in which F1 does NOT hold and the flat rows curve is an artifact of
+counting rows returned. At delta = 4 the merge issues 4 point lookups and each one pulls
+the ENTIRE table off the heap. ARM C confirms the second axis: at n = 2000, tuples run
+2000, 4000, 8000, 16000, 32000, 64000 for delta 1..32 — exactly delta * n.
+
+So P1 is WRONG as I wrote it, P5 fires, and the claim survives rather than dying. That is
+recorded here rather than quietly rewritten, because the pre-registration is only worth
+something if a prediction that failed stays visible.
+
+⛔ BUT P5 FIRING IS NOT YET A RESULT, because the fixture may be the cause. `build_sized`
+creates `t (id INTEGER NOT NULL, v INTEGER)` with NO INDEX on `id`. The merge's point
+lookup pushes `id = k` into the planner (D55), and a pushed predicate with no index to
+pick can only become a sequential scan. A table with no index is exactly the fixture in
+which every point lookup looks O(table) whether or not the merge is at fault.
+
+  ARM D — plain MERGE, same size axis, same fixed delta, against
+          `CREATE INDEX ix ON t (id);` built after the inserts and ANALYZE'd.
+
+  D1. If ARM D's tuples/merge COLLAPSES (flat, or growing far slower than n), then ARM A
+      measured MY SCHEMA and not the merge. The honest claim is then narrow: merge is
+      O(delta * table) ON A TABLE WITH NO INDEX ON THE LOOKUP COLUMN, and on an indexed
+      table it is O(delta * log n). That is a much weaker statement and it will be
+      reported as the weaker one.
+  D2. If ARM D's tuples/merge still grows ~linearly in n, the merge cannot use the index
+      and the finding is about the MERGE. O(delta * table) stands unqualified.
+
+No other arm, prediction or falsifier is changed. F4 (the fire-check) already passed on
+the first run: ARM B reached 2n + 12 rows, so the instrument demonstrably sees a full
+scan, and B-CTL was flat at 14 rows across an 8x size span, so ARM B's slope is the scan
+of `t` and not the candidate's writes.
