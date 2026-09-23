@@ -26,6 +26,19 @@
 #    VERIFY_IGNORE_LOCK=1 bypasses it, for the genuinely single-agent case. Say so in the artifact
 #    if you use it.
 #
+#    ⚠ THE FIRST VERSION OF THIS GUARD HAD THE BUG IT EXISTS TO PREVENT. It checked the lock ONCE,
+#    at script start, and then ran two heavy steps -- a release build and the harness itself. That
+#    is precisely the shape that failed by hand: check once, then act several times while the lock
+#    changes hands underneath. A guard that inherits the bug looks like protection and provides
+#    none. `lock_check` is therefore called IMMEDIATELY BEFORE EACH heavy step, and reads the state
+#    at the moment of the action rather than at the moment of the decision.
+#
+#    IT ALSO REFUSES WHEN IT CANNOT TELL. The test is on the lock DIRECTORY, not on the `owner`
+#    file inside it: a run that has created the directory but not yet written `owner` holds the
+#    lock just as much, and testing the file would have fallen through to ALLOW in exactly that
+#    window. If the directory exists but `owner` is unreadable or missing, it refuses and says so
+#    rather than guessing. A guard that cannot parse its own input must ask, never allow.
+#
 # 3. THE DIRTY-FILE COUNT EXCLUDES THE OUTPUT FILE. The first header reported `dirty files: 1`
 #    because `git status` saw the artifact the run was in the middle of writing. A provenance field
 #    that counts the run's own output is a field that can never read zero, so it would have been
@@ -37,18 +50,30 @@ cd "$(dirname "$0")/.." || exit 1
 OUT=${1:?usage: d181_run.sh <out> <half-label> <note>}
 HALF=${2:?}
 NOTE=${3:-}
-LOCK=/tmp/ferrodb-suite.lock/owner
+LOCKDIR=/tmp/ferrodb-suite.lock
+LOCK=$LOCKDIR/owner
 BIN=$(pwd)/target/release/examples/d181_conjunct_order
 
-if [ -e "$LOCK" ] && [ "${VERIFY_IGNORE_LOCK:-0}" != "1" ]; then
-    echo "REFUSING — another agent holds the machine-wide suite lock:" >&2
-    sed 's/^/    /' "$LOCK" >&2
-    echo "  Building here would steal CPU from their run. This harness's numbers are integers and" >&2
+# Refuse unless the lock can be POSITIVELY established as absent. Called immediately before every
+# heavy step -- see note 2. Tests the DIRECTORY, because a run that has created it but not yet
+# written `owner` holds the lock just as much.
+lock_check() {
+    [ "${VERIFY_IGNORE_LOCK:-0}" = "1" ] && return 0
+    [ -e "$LOCKDIR" ] || return 0
+    echo "REFUSING ($1) — the machine-wide suite lock is held:" >&2
+    if [ -r "$LOCK" ]; then
+        sed 's/^/    /' "$LOCK" >&2
+    else
+        echo "    (the lock directory exists but its owner file is unreadable or absent." >&2
+        echo "     Refusing anyway: a guard that cannot read its own input must ask, never allow.)" >&2
+    fi
+    echo "  Working here would steal CPU from their run. This harness's numbers are integers and" >&2
     echo "  do not need a quiet box; their suite does. Wait for the lock, or set" >&2
     echo "  VERIFY_IGNORE_LOCK=1 and say so in the artifact." >&2
     exit 2
-fi
+}
 
+lock_check "before the build"
 if ! cargo build --release --example d181_conjunct_order >/dev/null 2>&1; then
     echo "REFUSING — the harness did not build. No artifact written." >&2
     cargo build --release --example d181_conjunct_order 2>&1 | tail -20 >&2
@@ -90,7 +115,8 @@ tmp=$(mktemp)
     echo "run at        : $(date -u +%FT%TZ)"
     echo "host          : $(uname -srm)"
     echo "load at start : $(uptime | sed 's/.*load averages*: //')"
-    echo "suite lock    : free at start -- this script refuses to run otherwise (VERIFY_IGNORE_LOCK=${VERIFY_IGNORE_LOCK:-0})"
+    echo "suite lock    : free, checked immediately before the build AND immediately before the"
+    echo "                run -- not once at start. (VERIFY_IGNORE_LOCK=${VERIFY_IGNORE_LOCK:-0})"
     echo ""
     echo "LOAD IMMUNITY. Every number below is an INTEGER COUNT -- heap tuples pulled and index"
     echo "entries walked -- not a duration. The same plan examines the same rows on a quiet box and"
@@ -109,6 +135,9 @@ tmp=$(mktemp)
     echo ""
 } > "$tmp"
 
+# Re-checked here, not inherited from the check above: the build may have taken minutes and the
+# lock changes hands. This is the second heavy step and it gets its own look at the state.
+lock_check "before the harness run"
 if ! "$BIN" >> "$tmp" 2>&1; then
     echo "REFUSING — the harness exited non-zero (its own fire-check refuses a run it cannot" >&2
     echo "  vouch for). No artifact written. Output kept at $tmp" >&2
