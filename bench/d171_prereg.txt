@@ -1,0 +1,104 @@
+D171 PRE-REGISTRATION — WHAT IS THE RESIDUAL PER-STAGED-ROW COST IN THE STAGED WRITE PATH?
+Cut 2026-09-23, BEFORE the first measurement. Amendments append-only below the line.
+
+## WHERE THIS ROW COMES FROM
+
+`frontier/d170_adversary.md` (round 2, ferrodb branch `d170-adversary`, artifact
+`bench/d170_adversary_probe2.txt` at `af69685`) recorded an OPEN QUESTION, deliberately
+unattributed:
+
+  At a fixed 4,000-row table, HEAD, arena path, sweeping the session's staged rows N from 50 to
+  3200, the per-statement cost rises 48.62 -> 157.71 us -- ~35 ns per staged row -- WHILE
+  `probe_fired` equals the statement count at every point (3200/3200) and `walk_unprobeable` is 0.
+  So it is NOT the overlay walk, and D167 could not have seen it: D167 pre-staged W and measured
+  READS, and its control arm was FLAT (7.59 -> 7.27 us across 32x W).
+
+Candidates were listed and NOT checked: `PersistentMap` path-copying inserts in `stage_all`,
+`base_rows`, frame growth. This row checks them instead of asserting one.
+
+## THE CONFOUND IN THE MEASUREMENT THAT RAISED THE QUESTION -- STATED FIRST, BECAUSE IT MAY BE
+## THE WHOLE ANSWER
+
+The D170 N-sweep ran a SEPARATE SESSION per N and took the MEDIAN of that session's N samples.
+The median of a session that grows from 0 to N therefore samples the accumulation curve at about
+N/2, not the cost "at overlay size N". Two different things are confounded in every point:
+
+  W = the number of DISTINCT rows staged (the overlay's size), and
+  S = the number of STATEMENTS the session has executed.
+
+In that sweep W == S by construction. They are not the same quantity and they touch different
+structures: `ws.rows` / `ws.base_rows` are keyed by row and grow with **W**, while
+`ws.frame.push_op(op)` appends per statement and grows with **S**. A per-statement term that
+grows with S would present as "~35 ns per staged row" in a sweep where S == W, and would have
+nothing to do with the overlay at all.
+
+⛔ A SECOND, ALREADY-CONFIRMED DEFECT IN THAT SWEEP, which is why its top two points are excluded
+here: `examples/d71_point_update_curve.rs:156` is `id = 1 + (i*7919) % rows`, so above N = rows
+the keys REPEAT and the overlay SATURATES at the table size. D170 measured `max_overlay_len =
+4000` at N = 6400 and N = 12800 on a 4,000-row table. Any W axis must use a table larger than the
+largest W.
+
+## THE INSTRUMENT
+
+A new example. Fixed table of **20,000 rows** (so W = 12,800 never saturates -- the defect above).
+An agent session is PRE-LOADED to the target state, and only THEN is a FIXED number of statements
+timed, so the timed window does not itself move the axis. This is D167's method -- pre-stage, then
+measure -- applied to WRITES, which is the one direction D167 did not go.
+
+  * PRELOAD: run `U` untimed UPDATEs to reach the target (W, S).
+  * TIMED WINDOW: exactly **200** UPDATEs, all on keys ALREADY staged, so W does not grow while
+    timing. Median of the 200 is the statistic.
+
+## THE THREE ARMS -- the point is to SEPARATE W from S
+
+  ARM A  (reproduce)     W = S, both swept 100..12800.   Should reproduce D170's rise.
+  ARM B  (S alone)       W FIXED at 100 distinct keys, S swept 100..12800 by re-updating those
+                         same 100 keys. The overlay NEVER grows; only the statement count does.
+  ARM C  (W alone)       S FIXED at 12800 statements, W swept 100..12800 by choosing how many
+                         distinct keys those statements spread over. Statement count constant.
+
+## THE PREDICTION, FIXED BEFORE THE RUN
+
+  1. **RISE IN B, FLAT IN C** -> the term is PER-STATEMENT (frame / effect log / escrow), not the
+     overlay. D170's "~35 ns per staged row" is then the wrong unit for a real effect, and must be
+     restated per STATEMENT. This is my leading candidate, because `frame.push_op` is the one
+     structure that grows with S and is never trimmed within a session.
+  2. **FLAT IN B, RISE IN C** -> the term really is a function of overlay size, and the candidates
+     are `ws.rows` / `ws.base_rows` insertion. Then the SHAPE of C decides between O(log W) path
+     copying and a genuine O(W).
+  3. **RISE IN BOTH** -> two terms; report both rates and do not merge them.
+  4. **FLAT IN BOTH, while A still rises** -> the rise is an artifact of the D170 sweep's
+     median-over-a-growing-session design. **The open question is then RETIRED and D170's residual
+     claim must be WITHDRAWN**, not merely narrowed. This outcome is live and I am naming it
+     first-class rather than as a footnote.
+
+## CONTROLS -- required BEFORE any slope is read
+
+  * `probe_fired` MUST equal the timed statement count (200) in every cell, and
+    `walk_unprobeable` MUST be 0. If the walk is taken, this is D167's demoted regime and a
+    different question; the cell is VOID.
+  * `max_overlay_len` MUST equal the intended W in every cell. This is the saturation guard, and
+    it is the check D170 did not have.
+  * Every timed statement asserts `AgentOutput::Affected(n) == 1`, and a NEGATIVE CONTROL on an
+    absent key must report 0 -- so a no-op cannot be read as a fast write.
+  * A W=100/S=100 cell is common to all three arms and must agree across them.
+
+## FALSIFIERS -- each says the INSTRUMENT failed, not that the cost is zero
+
+  1. Any control above failing -> VOID, report as a stop.
+  2. Arm A failing to reproduce D170's rise -> the two instruments disagree and NOTHING may be
+     concluded until that is resolved. Arm A exists for exactly this reason.
+  3. All three arms flat -> the effect was never there; say so plainly and withdraw it.
+
+## WHAT A CONFIRMED RESULT WOULD AND WOULD NOT LICENSE
+
+  OK   "A staged UPDATE costs an extra <rate> per <statement|staged row>, measured, on the shipped
+       arena path at HEAD, with the overlay probe firing on every statement."
+  NOT  any absolute us figure as a property of ferrodb -- this box is contended.
+  NOT  a mechanism. Naming the structure requires reading it or removing it, not inferring it from
+       a shape. This project has lost rows to exactly that, and D170 is one of them.
+
+## BOX STATE
+
+Recorded at launch by the runner: fleet measure lock acquired with `trap ... EXIT` in the same
+command, `load_at_acquire`, and `ferrodb::build_provenance()` printed by the harness itself.
