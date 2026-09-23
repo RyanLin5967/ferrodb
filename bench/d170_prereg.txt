@@ -1,0 +1,61 @@
+D170 PRE-REGISTRATION — the D71 RE-RUN THAT NEVER HAPPENED. Written BEFORE the first measurement.
+
+## Why this run exists
+
+`bench/d71_point_update_curve.txt` and `bench/d71_pushdown_fix.txt` both open with a D101
+CORRECTION: the harness built **NO `AgentRuntime` and NO `ServerContext` AT ALL** — everything ran
+on `Session::new()`, whose implicit `AgentRuntime::new()` is `storage: None` over an in-memory
+branch catalog. So the STAGED arm timed an in-memory overlay, not the arena path `cli.rs` ships.
+The PLAIN arm is unaffected (ordinary DML never touches the runtime), which means **the two arms of
+the 12.91x were not drawn from the same engine configuration.**
+
+`d71_pushdown_fix.txt` states the consequence and the debt in its own words:
+  "⛔ THE RE-RUN HAS NOT HAPPENED. It was attempted and VOIDED — disk hit 0G ... eleven of its
+   blocks exited rc=127 while the runner printed 'ALL FIVE COMPLETE' over them."
+  "Everything above marked 'plausibly survives' REMAINS A HYPOTHESIS, not a finding."
+
+✅ **Both repairs ARE on main and were verified as ancestors of HEAD before this prereg was
+written:** harness correction `fc443c4`, and the guard `ca61e38` (`agent_sql/designated.rs:94`,
+"Refuse if a live `ServerContext` designated a runtime and this is not it") which makes the stub
+configuration unrepresentable rather than merely discouraged. The harness at HEAD builds
+`AgentRuntime::with_storage` over an `ArenaPageStore` behind a real `ServerContext`.
+
+## What is measured
+
+`examples/d71_point_update_curve.rs` at HEAD, UNMODIFIED. Axis `D71_SIZES` (table rows), `D71_N`
+updates per size, arms `D71_ARM` ∈ {plain, staged}. Counterbalanced: plain,staged then staged,plain.
+Fleet measure lock (`~/wt/logs/measure-lock.sh`) acquired with `trap ... EXIT` **in the same
+command as the acquire** — tonight's fix, after I held an invented lock path for 3h08m.
+
+## THE PREDICTION — the harness's OWN trichotomy, re-registered on the shipped path
+
+The harness pre-registered these before its first (stub) run. They are re-registered unchanged,
+because the question is whether the SAME trichotomy resolves the same way on the arena path:
+
+  1. **PLAIN flat, STAGED linear** -> the wall is the agent staging path. This is what the stub run
+     concluded (12.91x). Re-confirming it on the shipped path CONVERTS D71 from hypothesis to
+     finding.
+  2. **BOTH linear** -> the planner is not using the primary index for an equality on the primary
+     key. A general engine defect, and a bigger finding than D71.
+  3. **BOTH flat** -> the slope is neither, and `d69_fsync_counted.txt` is wrong about where it
+     lives. Report and reopen D69.
+
+## OUTCOMES ADDED FOR THIS RE-RUN
+
+  4. **The arms disagree with the stub run's DIRECTION** (e.g. staged now flat) -> the 12.91x was
+     an artifact of the overlay and D71's headline is not merely unproven but WRONG. Say so.
+  5. **`fsyncs/update` is not ~1 in either arm** -> the harness's own stated assumption ("ONE fsync
+     per commit dominates each individual UPDATE") is violated and every absolute here is void.
+     Report as an instrument failure, not a result.
+  6. **The guard fires / the run errors / disk floor** -> NOT A RESULT. Report as a stop. ⛔ The
+     previous attempt died exactly this way and a runner printed "ALL FIVE COMPLETE" over rc=127
+     blocks; **this run checks each arm's exit status and quotes it.**
+
+## Controls
+
+- `fsyncs/update` is the load-independent integer column; it must be ~1 and equal across arms.
+- `ferrodb::build_provenance()` is printed by the harness itself — the run's own header states
+  which binary it is, rather than a pre-run echo that is already stale.
+- Box state at launch recorded: `pgrep -x cargo` (NOT `pgrep -f`, which matches this project's own
+  PATH-export shells), fleet measure lock status, suite lock, and `df -h /System/Volumes/Data`
+  (NEVER bare `df /`, which reads the sealed system volume and under-reports by ~2x).
