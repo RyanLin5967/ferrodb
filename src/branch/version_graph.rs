@@ -62,7 +62,7 @@
 //! labelling that needs renumbering on every insert is exactly the disqualification the brief
 //! names, and this is the option it disqualifies.
 //!
-//! **ORDPATH (Li & Moon 2001), shipped as SQL Server's `hierarchyid`.** The repair for the above:
+//! **ORDPATH (O'Neil, O'Neil, Pal, Cseri, Schaller & Westbury, SIGMOD 2004), shipped as SQL Server's `hierarchyid`.** The repair for the above:
 //! variable-length labels with gaps, so an insert appends rather than renumbers. It keeps O(1)
 //! ancestor tests by prefix comparison and is genuinely the strongest option on the table. It
 //! loses on two counts, both about *this* system rather than about ORDPATH. Labels grow with

@@ -72,7 +72,7 @@ depth and jump[k] = its 2^k-th ancestor. A child's table is built from its paren
 
 Rejected, with reasons, in the module header: nested sets / interval labelling (Dietz 1982,
 Celko, Django-MPTT) — O(n) renumbering per insert, disqualified because branches are created
-live; ORDPATH / SQL Server hierarchyid (Li & Moon 2001) — strongest rival, O(1) ancestor test,
+live; ORDPATH / SQL Server hierarchyid (O'Neil et al., SIGMOD 2004) — strongest rival, O(1) ancestor test,
 but its labels grow with depth, which reintroduces a depth-proportional per-node cost the project
 just finished removing, and an interior delete strands a prefix descendants still encode;
 Euler tour + RMQ (Bender & Farach-Colton 2000) — O(1) LCA but O(n log n) non-incremental
