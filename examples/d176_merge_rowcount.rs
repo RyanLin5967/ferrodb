@@ -56,7 +56,7 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::dispatch::AgentOutput;
-use ferrodb::agent_sql::runtime::{scan_table_counters, AgentRuntime};
+use ferrodb::agent_sql::runtime::{scan_table_counters, scan_table_seq_tuples, AgentRuntime};
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
@@ -64,6 +64,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::cow::PageStore;
 use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::index_scan::index_scan_counter;
 use ferrodb::execution::seq_scan::seq_scan_counters;
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -92,20 +93,21 @@ struct Server {
     txn: Arc<TxnManager>,
 }
 
-/// One counter reading: `(scan calls, rows returned, seq scans, tuples pulled)`.
+/// One counter reading: `(scan_table_where calls, rows returned, seq scans, tuples pulled,
+/// index scans)`.
 #[derive(Clone, Copy)]
-struct Counts(u64, u64, u64, u64);
+struct Counts(u64, u64, u64, u64, u64, u64);
 
 fn read_counts() -> Counts {
     let (c, r) = scan_table_counters();
     let (s, t) = seq_scan_counters();
-    Counts(c, r, s, t)
+    Counts(c, r, s, t, index_scan_counter(), scan_table_seq_tuples())
 }
 
 /// Read twice and subtract to scope a phase — the pattern `ours_scan_counters` documents.
 /// Exact here because the harness is single-threaded; it would not be under concurrency.
 fn since(a: Counts, b: Counts) -> Counts {
-    Counts(b.0 - a.0, b.1 - a.1, b.2 - a.2, b.3 - a.3)
+    Counts(b.0 - a.0, b.1 - a.1, b.2 - a.2, b.3 - a.3, b.4 - a.4, b.5 - a.5)
 }
 
 /// Run one statement the way the server does: take the catalog, run, drop.
@@ -145,6 +147,24 @@ fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<Outcome, String> {
 ///  3. `checkpoint_to`, because production sets one and a harness without it skips the free-space
 ///     persistence work entirely — an omission that flatters the result.
 fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
+    build_sized_indexed(dir, tag, nrows, false)
+}
+
+/// As above, but optionally with a B-tree index on `t(id)` — the column the merge's point lookups
+/// filter on.
+///
+/// # ⛔ WHY THIS PARAMETER DECIDES WHETHER THE RESULT MEANS ANYTHING
+///
+/// ARM A's tuple count is `delta * nrows`: every point lookup drags the whole table through a
+/// sequential scan. A table created as `CREATE TABLE t (id INTEGER NOT NULL, v INTEGER)` has NO
+/// INDEX on `id`, so a sequential scan is the only plan available and that number could be a
+/// property of THE FIXTURE rather than of the merge. Pushing a predicate into the planner (D55)
+/// buys nothing when there is no index for it to pick.
+///
+/// ARM D is the same merge against `CREATE INDEX ix ON t (id)`. If its tuple count collapses, ARM
+/// A measured my schema and the honest claim is narrow. If it does not, the merge cannot use the
+/// index and the claim is about the merge.
+fn build_sized_indexed(dir: &std::path::Path, tag: &str, nrows: i64, indexed: bool) -> Server {
     let d = dir.join(tag);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -188,6 +208,13 @@ fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
     // held"), so an empty table here would make B-CTL measure a refusal rather than a merge.
     exec(&s, "CREATE TABLE small (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
     exec(&s, "INSERT INTO small VALUES (1, 1);", &mut sess).unwrap();
+    if indexed {
+        // Built AFTER the inserts so it is populated, and ANALYZE'd because the optimizer is
+        // cost-based: an index the statistics do not know about is an index the planner will not
+        // choose, and this arm would then report "no index helped" while never having offered one.
+        exec(&s, "CREATE INDEX ix ON t (id);", &mut sess).unwrap();
+        let _ = exec(&s, "ANALYZE t;", &mut sess);
+    }
     s
 }
 
@@ -270,6 +297,22 @@ struct Cell {
     tuples_min: u64,
     tuples_max: u64,
     calls_max: u64,
+    /// SeqScan executors that ran and were dropped in the window.
+    ///
+    /// ⛔ THIS COLUMN IS THE ATTRIBUTION, AND WITHOUT IT THE MECHANISM IS A GUESS. A merge window
+    /// showing `delta * n` tuples has at least two explanations that the tuple count alone cannot
+    /// separate: the `delta` point lookups at `runtime.rs:4421` each scanning the table, or the
+    /// publish step re-applying the branch's `delta` writes as ordinary UPDATEs that each scan.
+    /// `scans` against `calls` tells them apart — `calls` counts only `scan_table_where`, while
+    /// `scans` counts every SeqScan from any source. Equal means the merge's own scan helper is
+    /// the whole story; `scans > calls` means something else in the merge is scanning too.
+    scans_max: u64,
+    /// Index scans in the same window. See `execution::index_scan::INDEX_SCANS`: this is the
+    /// column that says WHICH of the merge's two per-delta statement loops is scanning.
+    idx_max: u64,
+    /// Of `tuples_max`, the share pulled by trees `scan_table_where` built itself. The rest came
+    /// from some other scan in the window — in a merge, that means the publish path.
+    own_max: u64,
     ok: usize,
 }
 
@@ -277,11 +320,17 @@ fn cell(mut f: impl FnMut(u64) -> Option<Counts>) -> Cell {
     let mut rows = Vec::new();
     let mut tuples = Vec::new();
     let mut calls = Vec::new();
+    let mut scans = Vec::new();
+    let mut idx = Vec::new();
+    let mut own = Vec::new();
     for i in 0..REPS {
         if let Some(c) = f(i as u64 + 1) {
             calls.push(c.0);
             rows.push(c.1);
+            scans.push(c.2);
             tuples.push(c.3);
+            idx.push(c.4);
+            own.push(c.5);
         }
     }
     Cell {
@@ -290,6 +339,9 @@ fn cell(mut f: impl FnMut(u64) -> Option<Counts>) -> Cell {
         tuples_min: tuples.iter().copied().min().unwrap_or(0),
         tuples_max: tuples.iter().copied().max().unwrap_or(0),
         calls_max: calls.iter().copied().max().unwrap_or(0),
+        scans_max: scans.iter().copied().max().unwrap_or(0),
+        idx_max: idx.iter().copied().max().unwrap_or(0),
+        own_max: own.iter().copied().max().unwrap_or(0),
         ok: rows.len(),
     }
 }
@@ -305,50 +357,65 @@ fn main() {
 
     // ---------------- ARM A: plain MERGE, table-size axis at fixed delta ----------------
     println!("== ARM A — plain MERGE;  delta FIXED at {FIXED_DELTA}, table size varies 8x ==");
-    println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>4}", "nrows", "rows_min", "rows_max", "tuples_min", "tuples_max", "calls", "ok");
+    println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}", "nrows", "rows_min", "rows_max", "tuples_min", "tuples_max", "calls", "scans", "idxscn", "own_tup", "ok");
     let mut arm_a = Vec::new();
     for n in SIZES {
         let s = build_sized(&dir, &format!("a{n}"), n);
         let c = cell(|seq| arm_a_cycle(&s, n, FIXED_DELTA, seq));
-        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>4}", n, c.rows_min, c.rows_max, c.tuples_min, c.tuples_max, c.calls_max, c.ok);
-        arm_a.push((n, c.rows_max, c.tuples_max));
+        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}", n, c.rows_min, c.rows_max, c.tuples_min, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max, c.ok);
+        arm_a.push((n, c.rows_max, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max));
     }
     println!();
 
     // ---------------- ARM B / B-CTL: SIMULATE, same axis ----------------
     println!("== ARM B — SIMULATE … ASSERT ON t   (the surviving full scan; ALSO THE FIRE-CHECK) ==");
     println!("== B-CTL — SIMULATE … ASSERT ON small  (identical statement, 1-row assertion table) ==");
-    println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>4}  arm", "nrows", "rows_min", "rows_max", "tuples_min", "tuples_max", "calls", "ok");
+    println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  arm", "nrows", "rows_min", "rows_max", "tuples_min", "tuples_max", "calls", "scans", "idxscn", "own_tup", "ok");
     let mut arm_b = Vec::new();
     let mut arm_bctl = Vec::new();
     for n in SIZES {
         let s = build_sized(&dir, &format!("b{n}"), n);
         let c = cell(|seq| arm_b_cycle(&s, n, FIXED_DELTA, seq, "t"));
-        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>4}  B", n, c.rows_min, c.rows_max, c.tuples_min, c.tuples_max, c.calls_max, c.ok);
+        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  B", n, c.rows_min, c.rows_max, c.tuples_min, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max, c.ok);
         arm_b.push((n, c.rows_max, c.tuples_max));
 
         let s2 = build_sized(&dir, &format!("bc{n}"), n);
         let c2 = cell(|seq| arm_b_cycle(&s2, n, FIXED_DELTA, seq, "small"));
-        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>4}  B-CTL", n, c2.rows_min, c2.rows_max, c2.tuples_min, c2.tuples_max, c2.calls_max, c2.ok);
+        println!("{:>7}  {:>10} {:>10}  {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  B-CTL", n, c2.rows_min, c2.rows_max, c2.tuples_min, c2.tuples_max, c2.calls_max, c2.scans_max, c2.idx_max, c2.own_max, c2.ok);
         arm_bctl.push((n, c2.rows_max, c2.tuples_max));
     }
     println!();
 
     // ---------------- ARM C: delta axis at fixed table size ----------------
     println!("== ARM C — delta axis, table size FIXED at {FIXED_SIZE} ==");
-    println!("{:>7}  {:>10} {:>12}  {:>4}  path", "delta", "rows_max", "tuples_max", "ok");
+    println!("{:>7}  {:>10} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  path", "delta", "rows_max", "tuples_max", "calls", "scans", "idxscn", "own_tup", "ok");
     let mut arm_c_a = Vec::new();
     let mut arm_c_b = Vec::new();
     for d in DELTAS {
         let s = build_sized(&dir, &format!("ca{d}"), FIXED_SIZE);
         let c = cell(|seq| arm_a_cycle(&s, FIXED_SIZE, d, seq));
-        println!("{:>7}  {:>10} {:>12}  {:>4}  A (plain MERGE)", d, c.rows_max, c.tuples_max, c.ok);
+        println!("{:>7}  {:>10} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  A (plain MERGE)", d, c.rows_max, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max, c.ok);
         arm_c_a.push((d, c.rows_max, c.tuples_max));
 
         let s2 = build_sized(&dir, &format!("cb{d}"), FIXED_SIZE);
         let c2 = cell(|seq| arm_b_cycle(&s2, FIXED_SIZE, d, seq, "t"));
-        println!("{:>7}  {:>10} {:>12}  {:>4}  B (SIMULATE+ASSERT ON t)", d, c2.rows_max, c2.tuples_max, c2.ok);
+        println!("{:>7}  {:>10} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  B (SIMULATE+ASSERT ON t)", d, c2.rows_max, c2.tuples_max, c2.calls_max, c2.scans_max, c2.idx_max, c2.own_max, c2.ok);
         arm_c_b.push((d, c2.rows_max, c2.tuples_max));
+    }
+    println!();
+
+    // ---------------- ARM D: is ARM A's tuple count the merge, or my schema? ----------------
+    println!("== ARM D — plain MERGE on an INDEXED t(id).  Same axis as ARM A. ==");
+    println!("   AMENDMENT 1 to the pre-registration: added AFTER seeing ARM A, and recorded as");
+    println!("   such. ARM A's tuples = delta*n could be a property of a table with no index on");
+    println!("   the column the point lookups filter. This offers the planner one.");
+    println!("{:>7}  {:>10} {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  arm", "nrows", "rows_max", "tuples_min", "tuples_max", "calls", "scans", "idxscn", "own_tup", "ok");
+    let mut arm_d = Vec::new();
+    for n in SIZES {
+        let s = build_sized_indexed(&dir, &format!("d{n}"), n, true);
+        let c = cell(|seq| arm_a_cycle(&s, n, FIXED_DELTA, seq));
+        println!("{:>7}  {:>10} {:>12} {:>12}  {:>6} {:>6} {:>5} {:>9} {:>4}  D (indexed)", n, c.rows_max, c.tuples_min, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max, c.ok);
+        arm_d.push((n, c.rows_max, c.tuples_max, c.calls_max, c.scans_max, c.idx_max, c.own_max));
     }
     println!();
 
@@ -375,22 +442,90 @@ fn main() {
     let ctl_flat = bc_last <= bc_first + 8;
     println!("B-CTL control is flat in table size ({bc_first} -> {bc_last}):  {}", if ctl_flat { "YES — B's slope is the scan of t" } else { "⛔ NO — control moved, halves not comparable" });
 
-    println!("ARM A rows/merge: {a_first} at n={n_first} -> {a_last} at n={n_last}");
-    println!("ARM B rows/merge: {b_first} at n={n_first} -> {b_last} at n={n_last}  (ratio to n: {:.2}x at n={n_last})", b_last as f64 / n_last as f64);
-    let a_flat = a_last <= a_first + 8;
-    if a_flat {
-        println!("⇒ F1 HOLDS: ARM A is FLAT in table size. The O(table) claim as banked is DEAD");
-        println!("  for the plain-MERGE path at this commit.");
+    println!("ARM A rows/merge:   {a_first} at n={n_first} -> {a_last} at n={n_last}");
+    println!("ARM B rows/merge:   {b_first} at n={n_first} -> {b_last} at n={n_last}  (= {:.2}x n)", b_last as f64 / n_last as f64);
+
+    // ⛔ P5 IS CHECKED BEFORE F1, AND THAT ORDER IS THE WHOLE POINT.
+    //
+    // `rows` is rows RETURNED. A flat `rows` curve is consistent with two different worlds: a
+    // merge that reads `delta` rows, and a merge that reads the whole table `delta` times and
+    // throws all but one row of each away. Declaring F1 on a flat `rows` curve without looking at
+    // `tuples` would ship the second world as the first.
+    let ta_first = arm_a.first().map(|x| x.2).unwrap_or(0);
+    let ta_last = arm_a.last().map(|x| x.2).unwrap_or(0);
+    let td_first = arm_d.first().map(|x| x.2).unwrap_or(0);
+    let td_last = arm_d.last().map(|x| x.2).unwrap_or(0);
+    println!("ARM A tuples/merge: {ta_first} at n={n_first} -> {ta_last} at n={n_last}  (= {:.2}x n)", ta_last as f64 / n_last as f64);
+    println!("ARM D tuples/merge: {td_first} at n={n_first} -> {td_last} at n={n_last}  (indexed t(id))");
+
+    let a_rows_flat = a_last <= a_first + 8;
+    let a_tuples_grow = ta_last > 2 * ta_first;
+    let d_tuples_grow = td_last > 2 * td_first;
+
+    if a_rows_flat && !a_tuples_grow {
+        println!("⇒ F1 HOLDS: ARM A is flat in BOTH counters. The O(table) claim is DEAD for the");
+        println!("  plain-MERGE path at this commit, and it is not an artifact of rows-returned.");
+    } else if a_rows_flat && a_tuples_grow {
+        println!("⇒ ⛔ P5 FIRES — F1 DOES *NOT* HOLD. ARM A's rows are flat, but the TUPLES PULLED");
+        println!("  OFF THE HEAP GROW LINEARLY IN TABLE SIZE. The merge returns `delta` rows and");
+        println!("  reads the whole table to find them. The O(table) claim SURVIVES, through a");
+        println!("  mechanism the ledger did not name.");
+        // WHICH statement loop scans is read off the counters, never asserted. Two loops inside
+        // one MERGE each issue `delta` statements — evaluate_merge's point lookups and publish's
+        // UPDATEs — so `delta` sequential scans is equally consistent with either.
+        let calls = arm_a.last().map(|x| x.3).unwrap_or(0);
+        let scans = arm_a.last().map(|x| x.4).unwrap_or(0);
+        let idx = arm_a.last().map(|x| x.5).unwrap_or(0);
+        let own = arm_a.last().map(|x| x.6).unwrap_or(0);
+        let other = ta_last.saturating_sub(own);
+        println!("  ATTRIBUTION at n={n_last}, delta={FIXED_DELTA}:");
+        println!("    scan_table_where calls = {calls}   seq scans = {scans}   index scans = {idx}");
+        println!("    tuples seq-scanned BY scan_table_where's own trees = {own}");
+        println!("    tuples seq-scanned by every OTHER scan in the window = {other}");
+        // `scans` and `idx` both equalling `delta` is consistent with EITHER loop scanning, so the
+        // verdict is taken from `own`, which is incremented only inside scan_table_where.
+        if own == 0 && other > 0 {
+            println!("  ⇒ scan_table_where's own trees scanned ZERO tuples, so the {calls} point lookups");
+            println!("    at runtime.rs:4421 DO use the index — D69 did what its message says. Every one");
+            println!("    of the {other} sequentially-scanned tuples came from the OTHER per-delta loop:");
+            println!("    publish turning each PendingWrite into an UPDATE (into_stmt/apply_dml_in).");
+            println!("    ⇒ THE O(delta*table) COST IS IN THE PUBLISH PATH, NOT IN evaluate_merge.");
+        } else if other == 0 && own > 0 {
+            println!("  ⇒ All {own} sequentially-scanned tuples came from scan_table_where itself, so the");
+            println!("    point lookups at runtime.rs:4421 each degenerate to a full scan.");
+            println!("    ⇒ THE COST IS IN evaluate_merge's LOOKUP LOOP.");
+        } else {
+            println!("  ⇒ Both loops scan ({own} own / {other} other). Neither site alone explains the cost;");
+            println!("    report both and do not name a single one.");
+        }
+        if d_tuples_grow {
+            println!("  ARM D: an index on t(id) DOES NOT FIX IT ({td_first} -> {td_last}). So this is a");
+            println!("  property of the MERGE, not of the fixture's schema.");
+        } else {
+            println!("  ARM D: an index on t(id) DOES fix it ({td_first} -> {td_last}). So ARM A measured a");
+            println!("  table with no usable index, and the claim is narrow: it is about UNINDEXED");
+            println!("  tables, not about merge. Report it that way.");
+        }
     } else if a_last >= 2 * (n_last as u64) {
         println!("⇒ F3 HOLDS: ARM A grew to ~2n. The banked claim STANDS exactly as written.");
     } else {
         println!("⇒ ARM A grew but not to 2n — neither F1 nor F3. Report the shape, claim nothing.");
     }
-    let c_moves_with_delta = arm_c_a.last().map(|x| x.1).unwrap_or(0) > arm_c_a.first().map(|x| x.1).unwrap_or(0);
-    println!("⇒ F2: ARM A rows move with DELTA at fixed size ({} -> {}): {}",
-        arm_c_a.first().map(|x| x.1).unwrap_or(0),
-        arm_c_a.last().map(|x| x.1).unwrap_or(0),
-        if c_moves_with_delta { "YES — 'independent of how much changed' is false" } else { "no" });
+
+    // F2 is asked of the TUPLE axis too, for the same reason.
+    let ca_r0 = arm_c_a.first().map(|x| x.1).unwrap_or(0);
+    let ca_r1 = arm_c_a.last().map(|x| x.1).unwrap_or(0);
+    let ca_t0 = arm_c_a.first().map(|x| x.2).unwrap_or(0);
+    let ca_t1 = arm_c_a.last().map(|x| x.2).unwrap_or(0);
+    println!("⇒ F2 (rows):   ARM A rows move with DELTA at fixed n ({ca_r0} -> {ca_r1}): {}",
+        if ca_r1 > ca_r0 { "YES" } else { "no" });
+    println!("⇒ F2 (tuples): ARM A tuples move with DELTA at fixed n ({ca_t0} -> {ca_t1}): {}",
+        if ca_t1 > ca_t0 { "YES" } else { "no" });
+    if ca_t1 > ca_t0 && a_tuples_grow {
+        println!("  ⇒ Cost moves with BOTH axes: it is O(delta * table), which is STRICTLY WORSE");
+        println!("    than the O(table) that was banked. 'Independent of how much the branch");
+        println!("    actually changed' is FALSE, and false in the expensive direction.");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
