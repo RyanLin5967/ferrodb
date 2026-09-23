@@ -238,10 +238,40 @@ fn strict_lower_with_an_upper_bound() {
 
 /// `lower` still refuses a hand-built plan naming a secondary column that carries NO index.
 ///
-/// This replaces the coverage that `plan::tests::test_index_scan_secondary_rejects_strict_lower`
-/// used to give `lower`'s error path. That test pinned the refusal of a strict lower bound, whose
-/// premise D179 removes; this one pins a refusal whose premise is a fact about the catalog — the
-/// tree does not exist — and stays true.
+/// # BAND — read this before re-adding the refusal you will find deleted in `git log`
+///
+/// A test named `plan::tests::test_index_scan_secondary_rejects_strict_lower` was **removed** by
+/// D179. It asserted, in full:
+///
+/// ```ignore
+/// let plan = PhysicalPlan::IndexScan {
+///     table: "users".into(), column: 1,
+///     lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
+/// assert!(lower(plan, &c, bp, ..).is_err()); // todo: composite bound handling
+/// ```
+///
+/// **That trailing `// todo: composite bound handling` is the original author's own note, on the
+/// assertion line itself.** It is what makes the deletion safe to reason about: the author labelled
+/// the behaviour a LIMITATION, not a guarantee. The test therefore pinned a WALL — and a test that
+/// pins a wall has to fail when the wall falls, because that failure IS the signal that the fix
+/// worked. It did fail, exactly there, and that was the evidence D179 landed.
+///
+/// The premise died rather than the coverage. `(value, pk)` still has no start key for `> v` —
+/// that part was always true and still is — but `optimizer::secondary_scan_start` now opens at
+/// `(v, Null)` and `SecondaryIndexScan::next` skips the leading `sec == v` run, so there is nothing
+/// left to refuse. `secondary_scan_lower`'s `Option` and `index_scan_lowerable` went with it: after
+/// the fix both could only ever return the permissive answer, and a branch that cannot be false is
+/// one no test can hold to account.
+///
+/// Two things replaced it, and between them `lower`'s error path is still covered:
+///
+///  * the positive contract, at `plan::tests::test_index_scan_secondary_strict_lower` and its
+///    inclusive-bound twin — the same fixture and the same bound, now asserting the ROWS;
+///  * **this test**, which pins a refusal whose premise is a fact about the catalog — the tree does
+///    not exist — and so cannot be removed by making a bound expressible.
+///
+/// ⛔ Do not restore the deleted assertion. `lower` builds that plan now; re-adding it would pin a
+/// wall that is gone and fail on a correct engine.
 #[test]
 fn lower_refuses_a_column_with_no_index() {
     let mut db = Db::new();
