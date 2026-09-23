@@ -15,6 +15,29 @@ write was attributed to the overlay walk in `visible_rows_where` (`runtime.rs`),
 the storage layer and runs in both configurations. The COMPLEXITY CLASS may therefore hold while
 every absolute here, and the ~36,000-row crossover computed from two fits, do not.
 
+✅✅ **RESOLVED 2026-09-23 — IN THE AFFIRMATIVE. THE HYPOTHESIS ABOVE IS NOW A FINDING.** See
+`bench/d170_d71_rerun_RAW.txt` and `frontier/d170_adversary.md`.
+  On the shipped ARENA path at HEAD, an agent-staged point UPDATE on the primary key is FLAT in
+  table size (**1.27x and 0.76x** over 16x the rows, counterbalanced), every statement verified to
+  change exactly one row (`affected_sum 60/60`, read-back confirmed, negative control on an absent
+  key returns 0). Restoring ONLY `branch_update`'s pre-`e6958d6` unpredicated scan in the SAME
+  binary returns the curve to **11.78x and 14.55x** with ms-per-1000-rows flat at **~0.14-0.17**,
+  reproducing this file's **12.91x** and its ~0.17 signature ON THE ARENA.
+  ⇒ **D71's O(table) finding AND the descent delivered by its fix are BOTH confirmed on the shipped
+  path, and the D101 stub defect moved the headline ratio by LESS THAN THE RUN-TO-RUN SPREAD**
+  (pre-fix arena mean 13.17x vs this file's 12.91x). **This file's numbers are no longer a
+  hypothesis.**
+
+⛔ **ONE CORRECTION OWED TO THE BANNER ABOVE, AND IT MISLED A READER — ME.** It names *"the overlay
+walk in `visible_rows_where`"* as the surviving O(table) term. **That is the wrong term.** The
+O(table) cost was the BASE SCAN reached through the unpredicated form — `runtime.rs` at the fix
+site says it exactly: *"This was `visible_rows(..)` — the UNPREDICATED form — which is
+`visible_rows_where(.., None, None, None)` and therefore **`scan_table_where(table, alias, None,
+ctx)`: it materialises EVERY row of the table into a `Vec<Vec<Value>>`**"*. The **overlay** is
+**O(1)** here via `overlay_probe_key`, because `UPDATE t SET v = ?` never moves the primary key and
+so never sets `unprobeable_rows` (D167's demoted arm needs `SET id = …`). ⇒ Naming the overlay sent
+me to D167 and to a retracted "O(staged rows)" claim. Read `scan_table_where`, not the overlay.
+
 The numbers are NOT deleted and they are not noise: they are a real measurement of a real code
 path. They are simply not a measurement of the path this file's headline names.
 Guard that now refuses this configuration: `src/agent_sql/designated.rs` (commit ca61e38).
