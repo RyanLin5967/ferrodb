@@ -1517,10 +1517,19 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     // OTHER error fails immediately, and running out of attempts fails loudly with the last one.
     let mut attempt = 0;
     let report = loop {
+        // D173 instrument -- see the identical note in the neighbouring test.
+        let p_before = agents.cost().proposals;
         match agents.merge(&mut ctx, cs.branch()) {
             Ok(r) => break r,
             Err(FerroError::NotLeader { .. }) if attempt < 10 => {
                 attempt += 1;
+                let cid = ClusterBranchId::of(NodeId(leader as u32 + 1), cs.branch()).unwrap();
+                loopcount(format_args!(
+                    "NOTLEADER site=followers-log/retry-arm attempt={attempt} proposed={} \
+                     ledger={:?}",
+                    agents.cost().proposals - p_before,
+                    lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
+                ));
                 drop(ctx);
                 fleet.hold_leader(leader, "followers-log/retry-arm");
                 let bp = db.bp.clone();
@@ -1611,10 +1620,23 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
         // test still passed, so the recovery works rather than merely compiling.
         let mut attempt = 0;
         let r = loop {
+            // D173 instrument. `proposals` increments inside `merge` only after `propose` has
+            // assigned a round, so its delta across one failed attempt says WHICH `not_leader`
+            // call site refused: 0 is `require_leader` before anything was proposed (benign), 1 is
+            // `pump_until`'s re-check AFTER the entry is in the log (the output-commit window).
+            // Nothing here changes an assertion; a green run stays green and now says why.
+            let p_before = agents.cost().proposals;
             match agents.merge(&mut ctx, cs.branch()) {
                 Ok(r) => break r,
                 Err(FerroError::NotLeader { .. }) if attempt < 10 => {
                     attempt += 1;
+                    let cid = ClusterBranchId::of(me, cs.branch()).unwrap();
+                    loopcount(format_args!(
+                        "NOTLEADER site=hundred-writes/retry-arm row={row} attempt={attempt} \
+                         proposed={} ledger={:?}",
+                        agents.cost().proposals - p_before,
+                        lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
+                    ));
                     drop(ctx);
                     fleet.hold_leader(leader, "hundred-writes/retry-arm");
                     let bp = db.bp.clone();

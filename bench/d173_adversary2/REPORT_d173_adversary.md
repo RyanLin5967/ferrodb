@@ -15,8 +15,8 @@ Instrument for every number below: `cargo test --test integration_cluster_agents
 
 | exit item | answer |
 |---|---|
-| (1) can the CI signature be made to fire from a forced lease death? | **YES. 8 of 8 runs.** |
-| (2) which `hold_leader` site is the slow one? | **the retry arm.** Structurally necessary, and corroborated by 36 measurements of the other sites. |
+| (1) can the CI signature be made to fire from a forced lease death? | **YES. 8 of 8 with the harness — and 12 of 12 with NO harness at all, on the unmodified test.** See §15. |
+| (2) which `hold_leader` site is the slow one? | **the retry arm — MEASURED, not argued.** The unmodified test now reproduces the CI log with the sites labelled: `pre-fork turns=0 ms=4`, `pre-merge turns=0 ms=4`, **`retry-arm turns=555 ms=2358`**, then the panic. 12 of 12. See §15. |
 | (3) does losing leadership always truncate the proposed entry? | **NO — and it is worse than the D173 row thought.** The entry survives even when, at the instant of deposition, it is on **one node's log only**. |
 
 ⭐ **The claim in `d173_output_commit.md` is upheld, and its own self-narrowing paragraph ("the
@@ -128,31 +128,33 @@ not-live arm (`cluster.rs:609`, `fn merge_verdict` at `:595`) reaching `Err(e) =
 slow line was `pre-merge` — requires a retry-arm line to have printed between it and the panic, and
 the D173 row's own timeline places the panic 220 ms after the slow line with nothing in between.
 
-### 3c. And it is corroborated by measurement, not only by argument
+### 3c. ⛔ AND HERE I FALSIFIED MY OWN CORROBORATION — the magnitude does NOT discriminate
 
-Across 3 full-target runs I collected **36 labelled `hold_leader` observations** (12 per run).
-Every single one is a `pre-fork` or `pre-merge` site, and every single one reads
-`turns=0 bound=100000 ms=0..4` — `turns=0` is the *only* value that occurs, across all 7 runs.
-**The retry-arm sites printed zero times** — on a quiet machine the retry arm never runs at all.
+My first report said: 36 labelled observations, every one a `pre-fork`/`pre-merge` site at
+`turns=0 bound=100000 ms=0..4`, therefore the `pre-*` sites are structurally cheap and the CI's
+`turns=14 ms=6467` cannot be one of them.
 
-That asymmetry is not an accident of load. The `pre-*` sites run when leadership is already stable,
-so they cost one turn. The retry-arm site is the only one that runs *immediately after a
-`NotLeader`*, i.e. the only one that must pay for an election. For comparison, on this machine:
+**That inference is wrong, and I killed it myself by running the same tests on a machine that
+behaves like the CI runner.** All 36 observations were taken on a quiet box, which is exactly the
+condition under which a `pre-*` site cannot be slow — the wrong scope returning the calmer number.
+Under a real `SIGSTOP`/`SIGCONT` deschedule of the whole test process (48 runs, `stop=0.2` and
+`stop=0.35`, `bench/d173_adversary2/sweep_summary.txt`):
 
-| what | turns | ms |
-|---|---|---|
-| `pre-fork` / `pre-merge`, leadership stable (36 obs) | 0 | 0–4 |
-| taking office back after a **real** deposition, with a forced head start (8 obs) | 65–80 | 698–736 |
-| `hold_leader` after a real deposition, **no** head start (1 obs) | 100000 (bound) | 354168 |
-| CI, the line in question | 14 | 6467 |
+    max pre-merge turns observed: 1823, 1023, 692, ... (every run had a slow one)
+    first tuning run: LOOPCOUNT hold_leader site=hundred-writes/pre-merge turns=372 ms=1601
 
-⚠ **`turns` is not comparable across machines and the D173 row should stop treating it as if it
-were.** `Node::poll` catches up *whole missed ticks* per call, so on a runner at 460 ms/turn one
-`pump_all` advances ~23 ticks. CI's `turns=14` is ~320 ticks of protocol time — far more than my
-65–80 turns at ~1 tick each. The `turns < bound` conclusion (converged, not a D73 stall) still
-holds; any reading of `turns` as "fast" does not.
+⇒ **A `pre-merge` site reaching `turns=372, ms=1601` — and up to 1823 turns — is ordinary under
+load.** The CI's `turns=14 ms=6467` is therefore *not* out of range for a `pre-*` site, and any
+argument from the magnitude alone is dead. I should not have offered it.
 
----
+**The structural argument in §3b is untouched by this and still settles the question**: the panic is
+reachable only on attempt ≥ 1, and the retry arm's `hold_leader` is the only one that can run
+between the `NotLeader` and the panic. That argument never depended on how long anything took.
+
+⚠ Separately, and this also stands: `turns` is not comparable across machines. `Node::poll` catches
+up whole missed ticks per call, so on a runner at 460 ms/turn one `pump_all` advances ~23 ticks.
+CI's `turns=14` is ~320 ticks of protocol time. The `turns < bound` reading (converged, not a D73
+stall) holds; nothing else read off that integer does.
 
 ## 4. ⭐⭐ EXIT ITEM (3) — NO, AND THE WINDOW IS **WIDER** THAN THE ROW CLAIMED
 
@@ -255,3 +257,186 @@ adversary. Six call sites, `tests/integration_cluster_agents.rs`.
 section stands unchanged: do not widen the retry arm, do not weaken an assertion. What this run adds
 to that design decision is that the in-doubt state is **reachable in 127 ms on a three-node cluster
 with one starved driver**, not narrow.
+
+---
+
+# ADDENDUM — answering the CORRECTED brief (third CI sample: b90bde1 PASSED, D173 is 2-of-3)
+
+The brief changed after my first report: "I could not make it fire" is no longer a refutation,
+because an intermittent defect is not refuted by a deterministic harness. Three new refutation
+targets were named. I aimed at all three. **None of them refutes the claim.**
+
+## 8. REFUTATION TARGET 1 — "prove a proposed-but-uncommitted entry is ALWAYS truncated"
+
+**CLOSED, and it fails.** Two independent answers, one from source and one from measurement.
+
+**From source.** `become_follower` (`src/consensus/mod.rs:588`) is the only step-down path, shared by
+`election.rs` and `replicate.rs`. Its whole body touches `hard.term`, `hard.voted_for`, `role`,
+`leader`, `campaign`, `votes`, `since_heard`. ⭐ **It does not touch the log at all.** Losing office
+therefore truncates nothing by itself. The only local truncation is `replicate.rs:1042`
+(`truncate_from`, inside `accept_append`), reached only where an incoming entry's term conflicts at
+a round — i.e. only when a *later leader* holds a different entry there. §5.4.1
+(`election.rs:535`, `log_is_at_least_as_complete`, compared `(term, round)` term-first) makes that
+impossible once the entry is on a quorum, and `tests_replicate.rs:688`
+(`a_follower_refuses_to_truncate_a_committed_round`) is the guard for the committed case.
+⇒ "always truncated" is false a fortiori.
+
+**From measurement.** §4 above: at the deposition the entry was on **one** node's log
+(`tails=[2,2,3]`); one poll of each node later it was on all three (`tails=[3,3,3]`) with no
+election yet held; it then committed on all three (`Merged { at: 3 }`, `heads=[4,4,4]`). 8 of 8.
+
+⇒ **The strongest refutation available to you is dead.** The state `Merged { at: M }` *is* reachable
+from a deposition, and I have it on the record eight times.
+
+## 9. REFUTATION TARGET 2 — "a DIFFERENT mechanism that produces the same signature"
+
+**I enumerated instead of guessing, because a hand-built list of candidates fails silently in the
+direction that looks like success.** Enumerating from the assignment site:
+
+`grep -rn "ReplicatedState::Merged" src/` returns **two** lines, and only one is a write:
+
+- `cluster.rs:441` — a *read*, in `merges_owned_by`.
+- `cluster.rs:539` — the **sole** assignment: `b.state = ReplicatedState::Merged { at: round }`,
+  reached only inside `BranchOp::Merge`'s apply arm and only when `merge_verdict` returned
+  `MergeVerdict::Applied`.
+
+And `BranchLedger` has no other mutator: `apply(&Entry)` (`cluster.rs:450`) is the only way in —
+**no snapshot, no restore, no deserialize path** that could install a `Merged` state without a
+committed entry. So the ledger can hold `Merged { at: M }` only if a `BranchOp::Merge` for that
+branch committed at round M. `ClusterBranchId` carries the owning node (`b.id.owner()`), so that
+command was proposed by a coordinator on that node; the failing test has exactly one coordinator,
+and forks a fresh branch per loop iteration.
+
+⇒ ⭐ **There is no second mechanism.** Inside that test, `Merged { at: M }` on the retry implies
+attempt 0 of the same iteration proposed and committed. The other exits of `merge` are all excluded
+by their own text: `MergeVerdict::Applied` + a failed publish returns the in-doubt error (different
+string, and the test panics on it directly, no retry); a `pump_until` budget exhaustion returns
+"was not applied within N turns" (also panics directly, no retry); a refused `propose` assigns no
+round at all.
+
+## 10. REFUTATION TARGET 3 — "already explained by something recorded"
+
+Checked `frontier/` and `bench/`. D73's leadership stall is already excluded by the `LOOPCOUNT` data
+(`turns=14` against `bound=100000`). The only other recorded failure on this test family is the
+Windows `STATUS_ACCESS_VIOLATION`, and `bench/windows_access_violation.txt` refuses the link in its
+own text — "A panic is not a 0xc0000005 and no mechanism links them"; the AV produces no
+`panicked at` and no `test result: FAILED`, whereas both D173 samples produced both.
+`bench/d175-b90bde1_certified/README.txt` records the third sample and draws the same 2-of-3
+conclusion. **No third recorded thing explains it.**
+
+## 11. ⭐ A THIRD DEMONSTRATION, ON THE UNMODIFIED `FleetSeam` — mutant M2
+
+Independent of the starvation harness entirely. Mutant M2 makes `pump_until` refuse **only** on the
+post-propose wait (`what.starts_with("round ")`), never on the pre-propose fork wait, and changes
+nothing else. The test then runs with its own real `FleetSeam`, no starvation, no faked leader
+(`bench/d173_adversary2/mutant_m2.txt`):
+
+    NOTLEADER site=hundred-writes/retry-arm row=1 attempt=1 proposed=1 ledger=Some(Live)
+    NOTLEADER site=hundred-writes/retry-arm row=1 attempt=2 proposed=1 ledger=Some(Merged { at: 3 })
+    ... attempts 3..10 all ledger=Some(Merged { at: 3 })
+
+⇒ The entry proposed at round 3 **committed while its caller was being refused**, on a cluster
+nobody was starving. Restored afterwards; `grep -c "MUTANT M2"` → 0.
+
+## 12. THE INSTRUMENT THAT MAKES A ZERO READABLE, AND ITS TWO-ARMED FIRE-CHECK
+
+Both real tests' retry arms now print which `not_leader` site refused, using only public API:
+`agents.cost().proposals` increments inside `merge` only *after* `propose` has assigned a round.
+
+    proposed=0  ->  require_leader, before anything was proposed  (BENIGN)
+    proposed=1  ->  pump_until's re-check, entry already in the log (THE WINDOW)
+
+Forced to fire in both directions before any zero from it was believed:
+
+| arm | how forced | printed | test |
+|---|---|---|---|
+| benign | test-side: attempt 0 returns `NotLeader` without calling `merge` | `proposed=0 ledger=Some(Live)` ×3 | **ok** |
+| window | mutant M2 (above) | `proposed=1`, ledger → `Merged { at: 3 }` | **FAILED** |
+
+## 13. RATES — and the forced one is not a rate
+
+⛔ **The 8-of-8 in §2 is a FORCED rate and says nothing about frequency.** The harness makes the
+lease die on purpose; 100% is what "I aimed it and it fired" looks like, not a probability.
+
+The unforced numbers on this box, `SIGSTOP`/`SIGCONT` descheduling the whole test process (which is
+what a loaded runner does to three driver loops living in one process):
+
+| probe | runs | test result | window reached (`proposed=1`) | CI signature |
+|---|---|---|---|---|
+| periodic freeze, `stop=0.2` and `0.35`, both real tests | **48** | 48 ok | **0** | 0 |
+| aimed freeze only, no sustained load | 3 | stalled in recovery | **3** | 0 |
+| aimed freeze + sustained background freezes (§15) | **12** | **12 FAILED** | **12** | **12** |
+
+⭐ **The 0-of-48 is the most useful number here, and it is not a refutation — it is the explanation
+of the intermittency.** Leadership lapses were *abundant* in those 48 runs (a `pre-merge`
+`hold_leader` recovering one, up to `turns=1823`), and every single one landed outside `merge`.
+That is exactly what the geometry predicts: on a fast box `merge` occupies well under 1% of the
+test's wall clock, so a lapse almost never lands in its post-propose window. On the CI runner
+*every* `pump_all` turn costs ~460 ms, so `merge`'s share of wall time is far larger and the same
+lapse rate lands inside the window far more often. **2 of 3 on Windows against 0 of 48 here is
+consistent with one mechanism whose rate scales with how slow the box is** — which is also why
+`b90bde1` passing changes nothing about whether the window exists.
+
+⚠ The aimed probe reaches the window 3 of 3 but then leaves the box fast, so a peer wins the
+election and `hold_leader(original)` never returns — the same 354 168 ms behaviour as §6.2. Getting
+the full signature out of the *unmodified* test needs the recovery to be slow too, which is what CI
+has and a single freeze does not.
+
+## 14. ON THE `Scripted` SEAM YOU SENT
+
+Your description is accurate — `Scripted` is at `tests/integration_cluster_agents.rs:630`,
+`depose_on_next_pump` at `:675`, the flip inside `pump()` at `:720`, and `impl Replicated for
+Scripted` at `:695`. I did not use it, and I would not now: the trap you identified is real (it
+stops making progress, so the entry never commits), but more importantly **a scripted seam cannot
+answer exit item (3) at all.** Whether a proposed entry survives a deposition is a fact about real
+logs, a real election restriction and a real commit rule; a seam that hands `pump_until` a
+`Some(NodeId(99))` proves only that `pump_until` believes what it is told. The real-driver harness
+had already fired by the time your message arrived, and it carries the one thing the scripted one
+cannot: `tails=[2,2,3] -> [3,3,3] -> Merged { at: 3 }` on three real logs.
+
+## 15. ⭐⭐ THE DECIDING RUN — THE UNMODIFIED TEST, NO HARNESS, 12 OF 12
+
+Everything above this section used either `StarvePeersOnMerge` or a mutant. **This section uses
+neither.** Production code is untouched (`git diff HEAD -- src/` is empty), the failing test is the
+one on `main`, and the only change to the test file is the read-only `NOTLEADER` print from §12.
+The whole intervention is `bench/d173_adversary2/aimed_freeze.sh`: a real `SIGSTOP`/`SIGCONT` of the
+real test process, aimed at the moment the test prints its pre-merge `LOOPCOUNT` line.
+
+`bench/d173_adversary2/aim3_1.txt`, verbatim and complete:
+
+    LOOPCOUNT hold_leader site=hundred-writes/pre-fork  want=2 turns=0   bound=100000 ms=4
+    LOOPCOUNT hold_leader site=hundred-writes/pre-merge want=2 turns=0   bound=100000 ms=4
+    NOTLEADER site=hundred-writes/retry-arm row=1 attempt=1 proposed=1 ledger=Some(Live)
+    LOOPCOUNT hold_leader site=hundred-writes/retry-arm want=2 turns=555 bound=100000 ms=2358
+    thread '...' panicked at tests/integration_cluster_agents.rs:1646:27:
+    branch 1: merge error: round 6 merges n3/b1, which is Merged { at: 3 }
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 3.70s
+
+**12 runs, 12 failures, the identical signature and the identical site every time**
+(`bench/d173_adversary2/aimed_summary.txt`).
+
+⭐ **This is the CI log, reproduced, with the labels the CI log lacked.** Read it against the
+excerpt in `d173_output_commit.md`:
+
+| | CI 35840046443 | this run |
+|---|---|---|
+| every other `hold_leader` | `turns=0`, `ms=2–31` | `turns=0`, `ms=4` (both `pre-*` sites) |
+| the last one before the panic | `turns=14`, `ms=6467` | **`turns=555`, `ms=2358` — `site=retry-arm`** |
+| then the panic | `round 9 merges n1/b3, which is Merged { at: 7 }` | `round 6 merges n3/b1, which is Merged { at: 3 }` |
+
+⇒ **Exit item (2) is settled by measurement: the slow `hold_leader` is the RETRY ARM.** The
+structural argument in §3b predicted it; this is the same answer from the other direction, on the
+real test, twelve times.
+
+⇒ And `proposed=1` with `ledger=Some(Live)` at the retry-arm check says exactly what the window is:
+`merge` had **proposed** (delta 1) and the entry had **not yet applied here** (`Live`) at the moment
+the caller was told `NotLeader`. It committed during the recovery, and the retry then found it.
+
+### Why the aim is legitimate and not a thumb on the scale
+
+The unaimed probe (48 runs) shows lapses are abundant and land outside `merge` every time, because
+`merge` is under 1% of this test's wall clock on a fast box. CI is not a fast box: at ~460 ms per
+`pump_all` turn, `merge`'s pump loop is seconds long, so a lapse lands inside it often. Aiming the
+freeze at that window reproduces on a fast box the *proportion of time spent in the window* that CI
+has by default. **The project's own standing rule is to aim a real break at the exact window**;
+nothing about the break is simulated — it is `SIGSTOP`, and the deposition is `election.rs`'s own.

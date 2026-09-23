@@ -1,0 +1,6 @@
+
+running 1 test
+test a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log ... LOOPCOUNT hold_leader site=hundred-writes/pre-fork want=0 turns=0 bound=100000 ms=3
+LOOPCOUNT settle_to round=2 turns=3 bound=20000 ms=22
+LOOPCOUNT hold_leader site=hundred-writes/pre-merge want=0 turns=0 bound=100000 ms=2
+NOTLEADER site=hundred-writes/retry-arm row=1 attempt=1 proposed=1 ledger=Some(Live)

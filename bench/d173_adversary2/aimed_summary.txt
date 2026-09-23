@@ -1,0 +1,12 @@
+aim3#1 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#2 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#3 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#4 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#5 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#6 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#7 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#8 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#9 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#10 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#11 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }
+aim3#12 test result: FAILED notleader=1 [   1 proposed=1] sig=round 6 merges n3/b1, which is Merged { at: 3 }

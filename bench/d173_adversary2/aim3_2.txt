@@ -1,0 +1,20 @@
+
+running 1 test
+test a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log ... LOOPCOUNT hold_leader site=hundred-writes/pre-fork want=2 turns=0 bound=100000 ms=4
+LOOPCOUNT settle_to round=2 turns=3 bound=20000 ms=13
+LOOPCOUNT hold_leader site=hundred-writes/pre-merge want=2 turns=0 bound=100000 ms=4
+NOTLEADER site=hundred-writes/retry-arm row=1 attempt=1 proposed=1 ledger=Some(Live)
+LOOPCOUNT hold_leader site=hundred-writes/retry-arm want=2 turns=338 bound=100000 ms=1567
+
+thread 'a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log' (292676311) panicked at tests/integration_cluster_agents.rs:1646:27:
+branch 1: merge error: round 6 merges n3/b1, which is Merged { at: 3 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 2.96s
+
