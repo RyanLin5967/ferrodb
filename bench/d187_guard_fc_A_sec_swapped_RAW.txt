@@ -1,0 +1,67 @@
+# phase: A_sec_swapped
+# lock: 28693 d187-guard-firecheck 2026-09-23T22:02:23Z
+# head: 5220e8eb05462e3c6f670da32c76c61212a88b4e
+# shasum BEFORE sec_index_scan.rs: 6a043252a4e772f3af9ac15c3a7b33ba6941be5d
+# shasum BEFORE index_scan.rs:     d5f9e17f6939ea246016f11a25387362a7e4b9e8
+# mutated: src/execution/sec_index_scan.rs
+# shasum AFTER  src/execution/sec_index_scan.rs: e4046f3f0523a7e4d1bdccb53e58cbbc79cc3ad9
+diff --git a/src/execution/sec_index_scan.rs b/src/execution/sec_index_scan.rs
+index b26f270..15d7b2b 100644
+--- a/src/execution/sec_index_scan.rs
++++ b/src/execution/sec_index_scan.rs
+@@ -131,13 +131,13 @@ impl Executor for SecondaryIndexScan {
+             // over 500 NULL entries on a plan it proves is this scan, and fails if they go uncounted.
+             // No D181/D179 counter fixture can catch the swap — none puts a NULL in an indexed
+             // column, so the skip never fires under them and their arms read the same either way.
+-            self.examined += 1;
+             // D187 — see `skip_nulls`. Ahead of the bound arms, and `continue` rather than
+             // `return None`: NULL entries are a PREFIX of the tree, so stopping here would truncate
+             // the scan before it reached a single real row.
+             if self.skip_nulls && matches!(sec, Value::Null) {
+                 continue;
+             }
++            self.examined += 1;
+             let past = match &self.sec_upper {
+                 Bound::Included(u) => &sec > u,
+                 Bound::Excluded(u) => &sec >= u,
+# git status:
+ M src/execution/sec_index_scan.rs
+# cmd: cargo test --test d187_null_skip_is_counted -- --nocapture
+# start: 2026-09-23T22:02:43Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d187-null-index-scan)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.50s
+     Running tests/d187_null_skip_is_counted.rs (target/debug/deps/d187_null_skip_is_counted-659ecc0f80e7daf6)
+
+running 1 test
+d187_null_skip_is_counted measured:
+  secondary `SELECT id FROM t WHERE v < 5;`: entries=2 rows=1 index_scans=1 seq_tuples=0
+    plan: Projection [#0] (rows=2 cost=21.66)
+  Index scan on t (col 1, (-inf, 5)) (rows=2 cost=21.64)
+  primary   `SELECT v FROM p WHERE id < 3;`: entries=3 rows=2 index_scans=1 seq_tuples=0
+    plan: Projection [#1] (rows=2 cost=17.04)
+  Index scan on p (col 0, (-inf, 3)) (rows=2 cost=17.02)
+
+thread 'an_index_entry_the_null_skip_drops_is_still_counted_as_pulled' (315423184) panicked at tests/d187_null_skip_is_counted.rs:274:5:
+assertion `left == right` failed: SecondaryIndexScan pulled 500 NULL entries + 1 match + 1 terminator = 502, and INDEX_SCAN_ENTRIES must say so. A reading of exactly 2 (500 short) means `examined += 1` has moved BELOW the NULL skip in `SecondaryIndexScan::next`: the NULLs are still pulled, just no longer counted — a fabricated improvement, not a real one
+  secondary `SELECT id FROM t WHERE v < 5;`: entries=2 rows=1 index_scans=1 seq_tuples=0
+    plan: Projection [#0] (rows=2 cost=21.66)
+  Index scan on t (col 1, (-inf, 5)) (rows=2 cost=21.64)
+  primary   `SELECT v FROM p WHERE id < 3;`: entries=3 rows=2 index_scans=1 seq_tuples=0
+    plan: Projection [#1] (rows=2 cost=17.04)
+  Index scan on p (col 0, (-inf, 3)) (rows=2 cost=17.02)
+  left: 2
+ right: 502
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test an_index_entry_the_null_skip_drops_is_still_counted_as_pulled ... FAILED
+
+failures:
+
+failures:
+    an_index_entry_the_null_skip_drops_is_still_counted_as_pulled
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.52s
+
+error: test failed, to rerun pass `--test d187_null_skip_is_counted`
+# test rc=101  end: 2026-09-23T22:03:03Z
+# restored src/execution/sec_index_scan.rs via git checkout --; shasum now: 6a043252a4e772f3af9ac15c3a7b33ba6941be5d
+# git status after restore:

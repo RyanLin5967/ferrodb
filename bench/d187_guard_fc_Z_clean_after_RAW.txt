@@ -1,0 +1,25 @@
+# phase: Z_clean_after
+# lock: 28693 d187-guard-firecheck 2026-09-23T22:02:23Z
+# head: 5220e8eb05462e3c6f670da32c76c61212a88b4e
+# shasum BEFORE sec_index_scan.rs: 6a043252a4e772f3af9ac15c3a7b33ba6941be5d
+# shasum BEFORE index_scan.rs:     d5f9e17f6939ea246016f11a25387362a7e4b9e8
+# git status:
+# cmd: cargo test --test d187_null_skip_is_counted -- --nocapture
+# start: 2026-09-23T22:03:22Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d187-null-index-scan)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.66s
+     Running tests/d187_null_skip_is_counted.rs (target/debug/deps/d187_null_skip_is_counted-659ecc0f80e7daf6)
+
+running 1 test
+d187_null_skip_is_counted measured:
+  secondary `SELECT id FROM t WHERE v < 5;`: entries=502 rows=1 index_scans=1 seq_tuples=0
+    plan: Projection [#0] (rows=2 cost=21.66)
+  Index scan on t (col 1, (-inf, 5)) (rows=2 cost=21.64)
+  primary   `SELECT v FROM p WHERE id < 3;`: entries=3 rows=2 index_scans=1 seq_tuples=0
+    plan: Projection [#1] (rows=2 cost=17.04)
+  Index scan on p (col 0, (-inf, 3)) (rows=2 cost=17.02)
+test an_index_entry_the_null_skip_drops_is_still_counted_as_pulled ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.53s
+
+# test rc=0  end: 2026-09-23T22:03:41Z
