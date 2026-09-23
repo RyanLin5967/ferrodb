@@ -1,3 +1,16 @@
+⛔⛔ **THE TIMING HALF OF THIS ARTIFACT IS SUPERSEDED. Banded 2026-09-23, not deleted.**
+This run is dated 2026-09-20. **D81 (`53a6b66`) landed 2026-09-21 and deleted the mechanism measured
+below** — a claim now appends a 45-byte record instead of rewriting the 48·L image. So the 4.32x, and
+especially the "penalty GROWING with branch count (1.88x at L=500 to 3.29x at L=4,000)", describe code
+that no longer exists.
+⇒ **D168 re-derived it at HEAD: the OFF/ON ratio is FLAT, 1.36x → 1.36x across N=500..4000.**
+   See `bench/d168_persistence_penalty_at_head.txt` (pre-registered in `bench/d168_prereg.txt`).
+✅ **WHAT STILL STANDS, UNCHANGED:** the SPACE finding — `len B/branch` identical at 4104 both ways,
+   so D61's space claim is untouched by persistence — and the fact that D61's published 10⁶ curve ran
+   with persistence OFF, a configuration production does not use. D168 reproduced the identical-space
+   control at all four N.
+—————————————————————————————————————————————————————————————————————————
+
 D80 — D61'S OWN HARNESS, PERSISTENCE OFF vs ON. 4.3x at N=500, and the space claim survives intact.
 
 [HERE] `examples/branch_curve_writes.rs` — **the harness that produced D61's published 10^6 curve**

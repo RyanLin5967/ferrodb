@@ -1,3 +1,12 @@
+⛔⛔ **THE 10⁶ PROJECTION IN THIS ARTIFACT IS SUPERSEDED. Banded 2026-09-23, not deleted.**
+D79's LAW — the map is exactly 48 bytes per live branch — **STANDS** and is what D81 was built from.
+What is superseded is the CONSEQUENCE drawn from it: `sum(48·i) = 24·N²` ≈ 24 TB at 10⁶ assumed the
+image is rewritten IN FULL on every claim. **D81 (`53a6b66`, 2026-09-21) made a claim append a
+45-byte record instead, so the write volume is O(N).** D168 (2026-09-23) confirmed the consequence
+in D61's own harness: the OFF/ON penalty is FLAT in N (1.36x → 1.36x, N=500..4000) where D80 had
+measured it growing 1.88x → 3.29x. See `bench/d168_persistence_penalty_at_head.txt`.
+—————————————————————————————————————————————————————————————————————————
+
 D79 — CONCURRENT BRANCH MANAGEMENT SCALES HERE *ONLY WITH DURABILITY TURNED OFF*.
 
 [HERE] `examples/d75_live_branch_scaling.rs` with the `D75_PERSIST` axis, built at ac55f718d6c9.

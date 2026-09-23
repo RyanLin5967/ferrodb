@@ -147,11 +147,23 @@ fn main() {
     let store = Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap());
     // **D79: this harness did NOT persist the free-space map, and the shipped binary does.**
     //
-    // `ArenaPageStore` writes the map only if `checkpoint_to` has been called (`arena.rs:914`).
-    // `cli.rs:120` calls it; this file never did — so D61's published 10^6 curve, and every other
-    // 10^6 result in this repo, measured a configuration production does not run. The map is
-    // exactly 48 bytes per live branch and is re-serialised and re-fsynced IN FULL on every new
-    // branch's first page write, which is `sum(48i) = 24N^2` bytes over a run: ~24 TB at 10^6.
+    // `ArenaPageStore` writes the map only if `checkpoint_to` has been called (see
+    // `ArenaPageStore::checkpoint_to`; cited as `arena.rs:914` when D79 was written, and the line
+    // has since moved — grep the name, not the number). `cli.rs` calls it; this file never did —
+    // so D61's published 10^6 curve, and every other 10^6 result in this repo, measured a
+    // configuration production does not run. THAT HALF STILL STANDS.
+    //
+    // ⛔ **THE NEXT SENTENCE OF D79 IS SUPERSEDED — BANDED, NOT DELETED, SO THE REVERSAL IS
+    // VISIBLE WHERE THE CLAIM WAS MADE.** D79 said the map "is re-serialised and re-fsynced IN
+    // FULL on every new branch's first page write, which is `sum(48i) = 24N^2` bytes over a run:
+    // ~24 TB at 10^6." **That was true when written and is FALSE AT HEAD.** D81 (`53a6b66`) made
+    // a claim append a 45-byte tail record instead, so the write volume is O(N); the three
+    // remaining full-rewrite sites fire once per REAP, not once per branch created.
+    //
+    // D168 re-derived the consequence in THIS harness: the OFF/ON penalty is **flat in N**
+    // (1.36x -> 1.36x across N=500..4000) where D80 measured it GROWING 1.88x -> 3.29x before
+    // D81 landed. See `bench/d168_persistence_penalty_at_head.txt`. A flat ~1.4x remains and is
+    // the per-claim fsync, which D81 never claimed to remove.
     //
     // `CURVE_PERSIST=1` turns it on so the two curves can be compared. It is OFF by default so
     // that re-running this file reproduces the historical numbers rather than silently replacing
