@@ -1,0 +1,45 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d173-adversary-2)
+warning: fields `tails` and `leaders` are never read
+    --> tests/integration_cluster_agents.rs:1631:5
+     |
+1624 | struct AtDeposition {
+     |        ------------ fields in this struct
+...
+1631 |     tails: Vec<Round>,
+     |     ^^^^^
+1632 |     /// Who each node believed led.
+1633 |     leaders: Vec<Option<NodeId>>,
+     |     ^^^^^^^
+     |
+     = note: `AtDeposition` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_cluster_agents") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.77s
+     Running tests/integration_cluster_agents.rs (target/debug/deps/integration_cluster_agents-3b12af37878b8d8b)
+
+running 2 tests
+test d173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed ... LOOPCOUNT hold_leader site=d173/pre-fork want=2 turns=0 bound=100000 ms=3
+LOOPCOUNT settle_to round=2 turns=2 bound=20000 ms=6
+LOOPCOUNT hold_leader site=d173/pre-merge want=2 turns=0 bound=100000 ms=3
+D173 attempt1 took ms=141 result=Err("not the leader, and this node does not currently know who is - an election is in progress or this node is partitioned from the cluster. Retry shortly; do not treat this as the leader being down.")
+D173 at-deposition AtDeposition { round: 3, own_committed: 2, own_applied: 2, tails: [2, 2, 3], leaders: [Some(NodeId(3)), Some(NodeId(3)), None] }
+
+thread 'd173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed' (290957118) panicked at tests/integration_cluster_agents.rs:1271:9:
+node 2 never regained the leadership at site d173/retry-arm after 100000 turns in 354168 ms; leaders = [Some(NodeId(1)), Some(NodeId(1)), Some(NodeId(1))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test d173_control_the_same_script_without_starvation_merges_and_publishes ... LOOPCOUNT hold_leader site=d173/pre-fork want=2 turns=0 bound=100000 ms=3
+LOOPCOUNT settle_to round=2 turns=3 bound=20000 ms=13
+LOOPCOUNT hold_leader site=d173/pre-merge want=2 turns=0 bound=100000 ms=3
+D173-control merged n3/b1 at round Some(3); qty=Some(98)
+ok
+
+failures:
+
+failures:
+    d173_a_lease_death_after_propose_refuses_a_caller_whose_merge_committed
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 355.71s
+
+error: test failed, to rerun pass `--test integration_cluster_agents`
