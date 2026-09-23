@@ -954,9 +954,31 @@ impl ArenaPageStore {
         // `put_pending` now vouches for a version it read beside the log itself; bumped outside,
         // a reader holding `state` can see the new version before the change it announces, and
         // would record a log it has not written as durable.
+        //
+        // ⭐ **D183 — AND ONLY WHEN IT ACTUALLY TOOK SOMETHING. This was the largest of the four
+        // rewrite sites and neither the design entry nor the row's own counter test had it in
+        // scope.** The bump means "the log changed and no record says so". Draining a log that
+        // was ALREADY EMPTY changes nothing: memory held `[]` before and holds `[]` after, so the
+        // durable file cannot have been made stale by it. The unconditional bump therefore
+        // announced a change that did not happen, and `persist_delta_locked`'s third condition
+        // turned the next delta — any delta, from any caller — into a full image rewrite.
+        //
+        // `Reaper::reap` runs `drain_pending_seeded` on EVERY reap, leaf or interior, and its
+        // first act is this call. So every reap forced the NEXT reap's first `free_arena` into a
+        // full rewrite, and the leaf path — which the measurement that opened this row called
+        // free — was paying one full image rewrite per branch. Measured through the real reaper
+        // at `753b266`: LEAF 8/16 branches -> 7/15 rewrites, slope exactly 1.0 per branch, and an
+        // empty drain placed between two `free_arena` calls turns `(0 rewrites, 2 appends)` into
+        // `(1, 1)`. Both are pinned in `mod d183_adversary`.
+        //
+        // The guard stays exactly as strong: every drain that removes an entry still bumps, and
+        // `put_pending`'s record is what discharges it afterwards.
         let mut st = self.state.lock().unwrap();
-        self.pending_version.fetch_add(1, Ordering::SeqCst);
-        std::mem::take(&mut st.pending)
+        let taken = std::mem::take(&mut st.pending);
+        if !taken.is_empty() {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+        }
+        taken
     }
 
     /// Put entries that are still pinned back on the pending-free log, and checkpoint.
