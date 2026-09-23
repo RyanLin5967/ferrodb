@@ -1,0 +1,56 @@
+D168 PRE-REGISTRATION — written BEFORE the first measurement, amendments append-only.
+
+## The question
+
+D80 (bench/d80_d61_curve_with_persistence.txt, artifact dated 2026-09-20) measured the free-space
+map's durability cost in D61's own headline harness and found **4.32x fewer forks/sec at N=500**,
+with the penalty GROWING in N: "1.88x at L=500 to 3.29x at L=4,000, because the image rewritten on
+each new branch is 48 bytes longer than the last one."
+
+**D81 (53a6b66, 2026-09-21 — ONE DAY LATER) deleted the mechanism D80 was measuring.** Its message:
+"alloc_arena and free_arena now append a 45- and 25-byte tail record and fsync it, instead of
+re-serialising and re-fsyncing the whole 48*L-byte image ... which makes total write volume O(N)
+where it was sum(48*i) = 24*N^2."
+
+So D80's headline is STALE AT HEAD and has never been re-derived. Nothing in the repo measures what
+the persistence penalty is now.
+
+⚠ AND THE HARNESS ITSELF STILL ASSERTS THE REMOVED WALL. examples/branch_curve_writes.rs:150-155
+says the map "is re-serialised and re-fsynced IN FULL on every new branch's first page write, which
+is sum(48i) = 24N^2 bytes over a run: ~24 TB at 10^6". That is false at HEAD. It is left UNTOUCHED
+for this run so the run measures the code as it stands, and is corrected in the same commit as the
+result, never before it.
+
+## What is measured
+
+`examples/branch_curve_writes.rs` (unmodified) at HEAD 160a154, CURVE_PERSIST off vs on.
+Checkpoints 500,1000,2000,4000 — the same N range D80/D79 quoted, so the numbers are comparable.
+4 threads, 0.5 GB budget. Counterbalanced arm order OFF,ON then ON,OFF (two blocks), because
+interleaving does not cancel drift on this box.
+
+## THE PREDICTION — the SLOPE, not the ratio
+
+D81 removes a per-branch cost that grew by 48 bytes per branch. A ratio at one N cannot tell a
+constant from a complexity class, so the registered claim is about the SHAPE:
+
+  **The ON/OFF forks/sec ratio must be FLAT in N.** Pre-D81 it grew 1.88x -> 3.29x across
+  L=500 -> 4,000. If D81 did what it says, that growth is gone.
+
+## OUTCOMES, fixed now
+
+  1. Ratio FLAT in N (no monotone growth 500->4000), at any level ⇒ D81 CONFIRMED in the headline
+     harness. A flat ratio > 1 is still a real per-claim fsync cost and is reported as such, NOT as
+     a failure — D81 claimed to remove the N^2 BYTES, not the fsync.
+  2. Ratio still GROWS monotonically in N ⇒ D81's fix does not reach this path. That falsifies
+     "the O(N^2) BYTES are gone" as an observable claim and is the more valuable outcome.
+  3. Ratio INVERTS (ON faster than OFF) ⇒ instrument fault, not a finding. Both arms write the same
+     data file; suspect the harness and do not report a speedup.
+  4. Stops on the 20 GiB disk floor ⇒ NOT A RESULT. Report as a stop. The floor is not a knob:
+     D80 already refused to lower it and that refusal stands.
+
+## Controls
+
+- `len B/branch` is the load-independent column and MUST be identical across arms (D80 measured
+  4104 both ways). If it moves, the two arms are not the same workload and the timing is void.
+- forks/sec is measured on a shared box. The measure lock is HELD for this run. Machine had 33 GiB
+  free and no cargo running at launch.
