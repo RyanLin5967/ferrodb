@@ -464,9 +464,21 @@ fn seeded_wide() -> Db {
 fn sql_delete_does_not_destroy_null_rows() {
     let mut d = seeded_wide();
 
-    // Same predicate, same table, same statistics as the SELECT case, so `build_index_scan` makes
-    // the same choice. Asserted rather than assumed: if DML took a sequential scan here, its
-    // `Filter` would answer correctly and this test would be vacuous.
+    // ⚠ `explain` refuses anything but SELECT ("EXPLAIN only supports SELECT"), so the DELETE's own
+    // plan cannot be printed. Two things stand in for it, and the second is the real one:
+    //
+    // 1. The SELECT plan below. `build_scan` hands `optimize` a `Filter{Scan}` and the SELECT path
+    //    hands it `Projection{Filter{Scan}}`; both recurse into the same
+    //    `build_index_scan(table, predicate, catalog)` with identical arguments, and the Projection
+    //    wrapper cannot change that decision. So the SELECT's plan determines the DELETE's scan.
+    //    That is an argument from the code, not a measurement.
+    //
+    // 2. THE AFFECTED COUNT ITSELF DISCRIMINATES THE PLAN, and this is the measurement. A
+    //    sequential scan wrapped in a `Filter` can only ever delete 1 here, because `compare`
+    //    returns `Value::Null` for a NULL operand and the Filter drops those rows. So
+    //    `deleted == 501` is only reachable through the index scan — the number proves the path.
+    //    Conversely `deleted == 1` before the fix means DML did NOT take the index on this fixture,
+    //    this test is vacuous, and the write-path claim is unproven rather than disproven.
     let plan = d.explain("SELECT id FROM t WHERE v < 5;");
     assert!(
         plan.contains("Index scan"),

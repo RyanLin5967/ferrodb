@@ -122,3 +122,22 @@ Revised totals: **Run A = 13 passed / 0 failed, rc=0. Run B = 9 failed / 4 passe
 
 Same falsifier as Amendment 1: if DML does not take the index on this fixture, this test passes
 before the fix, is vacuous, and the write-corruption claim is UNPROVEN.
+
+## Amendment 3 — how "which plan did the DELETE take" is actually answered
+
+`planner::plan::explain` refuses anything but SELECT, so the DELETE's plan cannot be printed. The
+answer therefore comes from the affected count itself, which discriminates the two plans:
+
+- A sequential scan wrapped in a `Filter` can only delete **1**, because `compare` returns
+  `Value::Null` for a NULL operand and the Filter drops those rows.
+- So **`deleted == 501` is reachable only through the index scan.** The number IS the plan evidence.
+
+Corroborating but weaker, and explicitly an argument rather than a measurement: `build_scan` hands
+`optimize` a `Filter{Scan}` while SELECT hands it `Projection{Filter{Scan}}`, and both recurse into
+the same `build_index_scan(table, predicate, catalog)` with identical arguments, so the Projection
+wrapper cannot change the decision.
+
+⇒ Run B verdict rule, fixed in advance:
+- `deleted == 501` → DML took the index; the write-path data-loss finding is MEASURED.
+- `deleted == 1`   → DML did not take the index on this fixture; the test is VACUOUS and the
+  write-path claim is UNPROVEN. Not "DML is unaffected".
