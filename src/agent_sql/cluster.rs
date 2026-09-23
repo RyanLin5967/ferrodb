@@ -1246,9 +1246,34 @@ impl ClusterAgents {
 
     /// Pump the driver until `done` holds, counting a quorum wait only if it had to.
     ///
-    /// Leadership is re-checked every turn. A merge whose leader was deposed mid-flight cannot
-    /// complete, and a refusal that names it is worth more than a client blocked until the budget
-    /// runs out.
+    /// # A leadership lapse observed here does not end the wait
+    ///
+    /// **Both callers reach this function after their command has already been proposed**, and
+    /// [`Replicated::propose`] documents its round as *not* an acknowledgement. So a lapse seen
+    /// from inside the wait says nothing whatever about that command: it may already sit on a
+    /// quorum's disk and commit under the next leader. This loop used to return `NotLeader` the
+    /// moment it saw one, which told the client the operation had **failed** while the cluster
+    /// went on to apply it — wrong in the one direction a client cannot recover from, because
+    /// "it failed" is exactly what makes it retry an operation that already happened.
+    ///
+    /// A deposed leader is still a follower. It keeps receiving the new leader's entries, so the
+    /// round being waited on can still arrive *here*, by replication, and the honest thing is to
+    /// keep looking for it until the budget says stop. The lapse is not discarded — it is named
+    /// in the timeout below, where it is a diagnosis rather than a verdict.
+    ///
+    /// **And continuing is not merely honest, it is the repair.** The merge's rows are node-local
+    /// to this node; if the round commits and this node refuses to publish because it lost office,
+    /// the cluster holds a branch sealed as merged whose rows never arrived — the one window this
+    /// module's header says it cannot close, opened on purpose by a node that was still alive and
+    /// still held the rows.
+    ///
+    /// The cost is stated rather than hidden: a node that is deposed and stays deposed now burns
+    /// the whole pump budget before refusing, where it used to refuse at once. That is the price
+    /// of not lying, and the bound is still finite.
+    ///
+    /// The **pre-propose** check in [`ClusterAgents::require_leader`] is untouched and is where a
+    /// follower is turned away: a refusal issued before anything is proposed is a true statement
+    /// that nothing happened.
     fn pump_until(
         &self,
         what: &str,
@@ -1257,10 +1282,14 @@ impl ClusterAgents {
         if done(&lock(&self.ledger)) {
             return Ok(());
         }
+        // The last non-leader reading this wait took, if it took one. `Some(_)` is "a lapse
+        // happened at all"; the inner value is who led when it was last looked at, which is what
+        // a refused client would need to reconnect.
+        let mut lapsed: Option<Option<NodeId>> = None;
         for _ in 0..self.pump_budget {
             match self.repl.leader() {
                 Some(n) if n == self.node => {}
-                other => return Err(not_leader(other, &self.client_addresses)),
+                other => lapsed = Some(other),
             }
             self.repl.pump()?;
             if done(&lock(&self.ledger)) {
@@ -1268,9 +1297,25 @@ impl ClusterAgents {
                 return Ok(());
             }
         }
+        // One copy of the address-book wording, `not_leader`'s: a second would be a second answer
+        // to "where does this client reconnect".
+        let lapse = match lapsed.map(|o| not_leader(o, &self.client_addresses)) {
+            None => String::new(),
+            Some(FerroError::NotLeader { leader: Some(addr) }) => format!(
+                ", and this node lost the leadership while waiting — the leader is now at {addr}"
+            ),
+            Some(_) => ", and this node lost the leadership while waiting, with no node known to \
+                        lead since — an election is in progress, or this node is partitioned"
+                .to_string(),
+        };
         Err(FerroError::Merge(format!(
-            "{what} was not applied within {} turns of the consensus driver. Refusing rather than \
-             blocking a client for ever; nothing was published",
+            "{what} was not observed to apply within {} turns of the consensus driver{lapse}. \
+             **This is a timeout on OBSERVATION, not a report that nothing happened.** The \
+             command was already proposed before this wait began and a round is not an \
+             acknowledgement, so it may have reached a quorum and may yet commit. What is known \
+             is local: this node published no rows. What is not known, and is not decided here, \
+             is whether the cluster applies the operation. Read the ledger for the round before \
+             retrying — a second attempt at an operation that committed is not a no-op",
             self.pump_budget
         )))
     }
