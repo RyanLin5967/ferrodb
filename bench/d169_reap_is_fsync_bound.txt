@@ -133,14 +133,35 @@ makes (`self.storage.sync_all()`, `disk_manager.rs:487-489` — `fcntl(F_FULLFSY
 reap has a **~12 ms floor** that is a property of the disk, not of ferrodb, and no amount of CPU work
 removes it.
 
+⚠ **THE FLOOR IS LOAD-IMMUNE; THE FRACTION IS NOT. State this row in the INTEGER, not the
+millisecond.** 4 × 3.03 = 12.1 ms is ~90% of the 13.5 ms/branch measured on a quiet box — but the
+adversary's own `d31` run at load 20 showed **the same 4.00 syncs and 22.3 ms/branch**, where 12.1 ms
+is only **54%**. Its durations were not even monotone in work (1113.7 ms at 1 extent/branch vs
+766.6 ms at 15). ⇒ The **12 ms floor** and the **integer 4** survive any load; **"fsync is ~90% of
+reap" does not** and must not be quoted without the load it was taken at.
+
 === 5. WHAT THIS IS NOT ============================================================
 
 - ⛔ **NOT an invention.** Group commit is prior art and this project already applied it to `fork`.
   "Reap pays a private fsync per operation; batch them" is the SAME fix on a second path. Reporting
   it as a discovery would be the thirteenth killed pitch.
-- ⛔ **NOT previously measured here** — checked, with a positive control: no `bench/*.txt`
-  reports a reap sync count, while 25 of them contain `forks/sec`, so the zero is a real zero and
-  not a dead grep.
+- ⛔ **THE NOVELTY CLAIM WAS TOO BROAD AND IS NARROWED.** What is new here is the **sync COUNT and
+  its ATTRIBUTION**, not the characterisation. **"Reap is fsync-bound" is already asserted in this
+  tree three times**, and I missed all three because I grepped `fsync.*reap`, saw the hit counts,
+  and read only the `src/` one — violating this project's own standing rule, *read the matches,
+  never the list*:
+    • `lease_thread.rs:484-486` — *"a reap is dominated by a durable catalog write — measured at
+      ~58 ms each on this machine, fsync-bound — so a chunk of four is a four-fsync stall"*
+    • `lease_thread.rs:696` — *"(~58 ms each, fsync-bound)"*
+    • `bench/land-2655e3b_certified/SUMMARY.txt:28` — *"This box is fsync-bound — a reap costs
+      16-38 ms in every shape"*
+  ⭐ **What those three do NOT say is the number.** All three model a reap as *"**a** durable
+  catalog write"* — singular. D169's contribution is that it is **four** (for the leaf shape),
+  which four, and that the count is shape-dependent (`2 .. 3+chain`). The sync count itself IS new:
+  no `bench/*.txt` reports one, with a positive control — 25 contain `forks/sec`, so that zero is
+  a real zero and not a dead grep.
+  ⚠ Their ~58 ms and 16–38 ms vs this row's 13.5 ms are different boxes, loads and shapes; the
+  discrepancy is NOT investigated here and is not claimed to be reconciled.
 - ⛔ **NOT an absolute or cross-engine claim.** A ferrodb duration cannot support one. The integer
   4.00 and the serial-sweep mechanism are the parts that transfer.
 - ✅ **ADVERSARIALLY REVIEWED 2026-09-23** — `frontier/reap_fsync_adversary.md`, verdict
