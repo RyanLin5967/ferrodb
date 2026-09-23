@@ -4759,3 +4759,524 @@ mod tests {
         assert_eq!(h.store.persist_counters(), (0, 0));
     }
 }
+
+/// **D183 ADVERSARY — an attack on `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends`.**
+///
+/// The test under attack never calls `Reaper::reap`. It hand-rolls the two sides of
+/// `reaper.rs:679` and counts those. Everything here exists to ask whether that hand-rolled
+/// loop is the thing production runs, whether the counters can be made to move at all, and
+/// whether the slope is a property of BRANCHES or of the fixture's shape.
+#[cfg(test)]
+mod d183_adversary {
+    use super::harness::Harness;
+    use super::*;
+    use crate::branch::types::LeaseDeadline;
+    use crate::branch::{Reaper, TwoTierReaper};
+
+    /// Arm the store at a private path and hand back the path so the caller can unlink it.
+    fn armed(tag: &str, n: usize) -> (Harness, std::path::PathBuf) {
+        let h = Harness::new_with(true);
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d183adv-{}-{}-{}.bin", std::process::id(), tag, n));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+        (h, path)
+    }
+
+    /// Build `branches` branches under TRUNK, each with `pages` pages, each optionally forked
+    /// once AFTER its pages were born (which is what makes the interval rule park them).
+    ///
+    /// Returns the branch handles and the total number of arenas they own — the fixture's own
+    /// shape, read from the records rather than assumed.
+    fn build(h: &Harness, branches: usize, pages: usize, interior: bool) -> (Vec<BranchId>, usize) {
+        let mut ids = Vec::new();
+        let mut arenas = 0usize;
+        for _ in 0..branches {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            for _ in 0..pages {
+                h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            }
+            if interior {
+                h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            }
+            arenas += h.catalog.get_raw(b.branch_id.id).unwrap().arenas.len();
+            ids.push(b.branch_id);
+        }
+        (ids, arenas)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 1 + 5. Does the fixture reach the code under test, and does the REAL reaper agree?
+    // ---------------------------------------------------------------------------------------
+
+    /// The predicate the claim is about, READ, for every branch, on both arms.
+    ///
+    /// The test under attack asserts nothing about `has_live_children`; it picks a side of
+    /// `reaper.rs:679` itself and then reports the cost of the side it picked. If the shipped
+    /// catalog answered `false` for the "interior" fixture, the slow path would never run in
+    /// production and the measured number would be a property of a call nobody makes.
+    #[test]
+    fn d183adv_a1_the_predicate_is_what_the_fixture_assumes() {
+        for (interior, want) in [(false, false), (true, true)] {
+            let (h, path) = armed("a1", interior as usize);
+            let (ids, arenas) = build(&h, 8, 4, interior);
+            assert!(arenas > 0, "fixture: no arenas at all");
+            for id in &ids {
+                let got = h.catalog.has_live_children(id.id).unwrap();
+                assert_eq!(
+                    got, want,
+                    "interior={interior}: has_live_children({}) = {got}, fixture assumes {want}",
+                    id.id
+                );
+            }
+            println!(
+                "A1 interior={interior}: has_live_children = {want} for all 8 branches, \
+                 {arenas} arenas total ({} per branch)",
+                arenas / 8
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The same four cells, measured through `TwoTierReaper::reap` instead of a hand-rolled
+    /// copy of two of its lines.
+    ///
+    /// `reap` is not `retire_arenas_by_rule`. It also runs `drain_pending_seeded`, whose
+    /// `take_pending` bumps `pending_version` UNCONDITIONALLY (`arena.rs:932`) and whose
+    /// `put_pending` is another `persist_if_configured`. Both are inside the per-branch reap,
+    /// so both belong in any number described as "what a reap costs".
+    #[test]
+    fn d183adv_a1_what_the_real_reaper_costs() {
+        fn run(branches: usize, interior: bool) -> (u64, u64, u32) {
+            let (h, path) = armed("a1r", branches * 2 + interior as usize);
+            let (ids, _) = build(&h, branches, 4, interior);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            let mut freed = 0u32;
+            for id in ids {
+                freed += reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, freed)
+        }
+
+        let cells = [
+            ("LEAF      8", run(8, false)),
+            ("LEAF     16", run(16, false)),
+            ("INTERIOR  8", run(8, true)),
+            ("INTERIOR 16", run(16, true)),
+        ];
+        println!("A1 REAL `Reaper::reap` -- (full rewrites, delta appends, pages freed)");
+        for (label, (r, a, f)) in cells {
+            println!("  {label}: rewrites={r:3} appends={a:3} pages_freed={f:3}");
+        }
+
+        // Anti-vacuity: an arm that reaped nothing satisfies every shape assertion. The LEAF
+        // arm must return pages; the INTERIOR arm returns NONE (every page is parked for the
+        // live child), so it is checked separately, below, by what it parked.
+        assert!(cells[0].1 .2 > 0 && cells[1].1 .2 > 0, "the leaf arm freed no pages at all");
+        assert_eq!(
+            cells[2].1 .2, 0,
+            "an interior reap returned pages -- the fixture is not parking them"
+        );
+
+        let leaf_slope = cells[1].1 .0 as i64 - cells[0].1 .0 as i64;
+        let int_slope = cells[3].1 .0 as i64 - cells[2].1 .0 as i64;
+        println!("  rewrite slope over 8 more branches: LEAF={leaf_slope}, INTERIOR={int_slope}");
+
+        // ⛔ THE REFUTATION, PINNED. The claim under attack is "one full image rewrite per
+        // INTERIOR branch reaped (slope exactly 1.0), zero for a leaf". Through `Reaper::reap`
+        // -- the function production calls -- BOTH HALVES ARE WRONG:
+        //   * the interior slope is 2.0, not 1.0 (`retire_arenas_by_rule`, then a second
+        //     rewrite whose source differs by arm -- see `d183adv_mech_...put_pending`);
+        //   * the leaf slope is 1.0, not 0.0, because `drain_pending_seeded` runs on EVERY
+        //     reap and its `take_pending` bumps `pending_version` even on an empty log, which
+        //     forces the next reap's first `free_arena` into a full rewrite.
+        // The predicate at `reaper.rs:679` still splits the cost. It splits it 2 against 1.
+        assert_eq!(int_slope, 16, "interior cost is not 2 full rewrites per branch");
+        assert_eq!(leaf_slope, 8, "leaf cost is not 1 full rewrite per branch");
+        assert_eq!(
+            cells[0].1 .0,
+            7,
+            "leaf 8 paid {} rewrites, not branches-1 (the first reap precedes any drain)",
+            cells[0].1 .0
+        );
+        // The leaf phase table closes: one durable record per arena, 3 arenas per branch.
+        assert_eq!(cells[0].1 .0 + cells[0].1 .1, 24, "leaf 8 records != 24 arenas");
+        assert_eq!(cells[1].1 .0 + cells[1].1 .1, 48, "leaf 16 records != 48 arenas");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 2. Can each counter be forced to move on purpose?
+    // ---------------------------------------------------------------------------------------
+
+    /// Push a LEAF arm's tail past `compact_threshold` and see whether its zero survives.
+    ///
+    /// A zero that cannot be made non-zero is not evidence about the leaf path; it is evidence
+    /// the instrument is not wired.
+    #[test]
+    fn d183adv_a2_the_leaf_zero_is_only_a_small_n_zero() {
+        fn leaf(branches: usize) -> (u64, u64) {
+            let (h, path) = armed("a2l", branches);
+            let (ids, _) = build(&h, branches, 4, false);
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                for arena in rec.arenas.iter().copied() {
+                    h.store.free_arena(arena).unwrap();
+                }
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+        println!("A2 LEAF arm, hand-rolled exactly as the test under attack does it:");
+        let mut first_nonzero = None;
+        for n in [8usize, 16, 64, 256] {
+            let (r, a) = leaf(n);
+            println!("  branches={n:4}: rewrites={r:4} appends={a:4}");
+            if r > 0 && first_nonzero.is_none() {
+                first_nonzero = Some(n);
+            }
+        }
+        match first_nonzero {
+            Some(n) => println!("  -> the leaf arm's rewrite counter FIRES at branches={n}"),
+            None => println!("  -> the leaf arm's rewrite counter could NOT be made to fire"),
+        }
+    }
+
+    /// The INTERIOR arm's `appends = 0` is not a measurement.
+    ///
+    /// `retire_arenas_by_rule` ends in `persist_if_configured`, which is `persist_full_locked`
+    /// with no threshold and no delta encoder anywhere on the path. There is no fixture that
+    /// makes it append, and this records that as a structural fact rather than a result.
+    #[test]
+    fn d183adv_a2_the_interior_zero_appends_is_unfalsifiable() {
+        let (h, path) = armed("a2i", 0);
+        let (ids, _) = build(&h, 32, 64, true);
+        let ep = h.catalog.next_epoch();
+        let (r0, a0) = h.store.persist_counters();
+        for id in ids {
+            let rec = h.catalog.get_raw(id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        }
+        let (r1, a1) = h.store.persist_counters();
+        println!(
+            "A2 INTERIOR, 32 branches x 64 pages (8x the pages, 4x the branches of the original): \
+             rewrites={} appends={}",
+            r1 - r0,
+            a1 - a0
+        );
+        assert_eq!(
+            a1 - a0,
+            0,
+            "an interior arm produced an append -- the structural claim is wrong"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 3. Is the slope a property of branches, or of arenas/pages?
+    // ---------------------------------------------------------------------------------------
+
+    /// Three sizes, three page counts, plus a branch with NO pages at all.
+    ///
+    /// `ARENA_FIRST_EXTENT_PAGES` is 1 and extents double, so 4 pages is 3 arenas and 16 pages
+    /// is 5. If rewrites tracked arenas or pages, these rows would disagree.
+    #[test]
+    fn d183adv_a3_the_slope_is_per_branch_not_per_arena_or_page() {
+        fn interior(branches: usize, pages: usize) -> (u64, u64, usize) {
+            let (h, path) = armed("a3", branches * 100 + pages);
+            let (ids, arenas) = build(&h, branches, pages, true);
+            let ep = h.catalog.next_epoch();
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, arenas)
+        }
+        println!("A3 INTERIOR rewrites against branches x pages (arenas read from the records)");
+        for pages in [0usize, 1, 4, 16] {
+            let mut row = Vec::new();
+            for branches in [8usize, 16, 24] {
+                let (r, _, arenas) = interior(branches, pages);
+                row.push((branches, r, arenas));
+                assert_eq!(
+                    r, branches as u64,
+                    "pages={pages} branches={branches}: rewrites={r} is not one per branch"
+                );
+            }
+            let s: Vec<String> = row
+                .iter()
+                .map(|(b, r, ar)| format!("b={b} rewrites={r} arenas={ar}"))
+                .collect();
+            println!("  pages/branch={pages:2}: {}", s.join(" | "));
+        }
+    }
+
+    /// The LEAF arm's cost, by contrast, tracks ARENAS and not branches.
+    #[test]
+    fn d183adv_a3_the_leaf_arm_is_counted_per_arena() {
+        println!("A3 LEAF appends against branches x pages");
+        for pages in [1usize, 4, 16] {
+            for branches in [8usize, 16] {
+                let (h, path) = armed("a3l", branches * 100 + pages);
+                let (ids, arenas) = build(&h, branches, pages, false);
+                let (r0, a0) = h.store.persist_counters();
+                for id in ids {
+                    let rec = h.catalog.get_raw(id.id).unwrap();
+                    for arena in rec.arenas.iter().copied() {
+                        h.store.free_arena(arena).unwrap();
+                    }
+                }
+                let (r1, a1) = h.store.persist_counters();
+                println!(
+                    "  pages/branch={pages:2} branches={branches:2}: arenas={arenas:3} \
+                     rewrites={} appends={}",
+                    r1 - r0,
+                    a1 - a0
+                );
+                // One durable record per arena freed -- an append, or a full rewrite when the
+                // tail has outgrown `compact_threshold`. The 16x16 cell is where that happens.
+                assert_eq!(
+                    (a1 - a0) + (r1 - r0),
+                    arenas as u64,
+                    "leaf durable records did not equal the arena count"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 4. Is `has_live_children` the splitter, or is it parking / pending_len?
+    // ---------------------------------------------------------------------------------------
+
+    /// A branch with live children whose pages are ALL releasable.
+    ///
+    /// The child is forked BEFORE the pages are born, so `live_child_in_epoch_range` is false
+    /// for every page and nothing is parked. If the cost followed parking or `pending_len`,
+    /// this cell would be cheap. If it follows the predicate, it costs the same rewrite.
+    #[test]
+    fn d183adv_a4_live_children_with_nothing_parked_still_pays() {
+        let branches = 8usize;
+        let (h, path) = armed("a4a", 0);
+        let mut ids = Vec::new();
+        for _ in 0..branches {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            // Child FIRST, so its fork epoch is below every page's birth epoch.
+            h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            let birth = h.catalog.next_epoch();
+            for _ in 0..4 {
+                h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+            }
+            ids.push(b.branch_id);
+        }
+        for id in &ids {
+            assert!(h.catalog.has_live_children(id.id).unwrap(), "fixture: no live child");
+        }
+        let ep = h.catalog.next_epoch();
+        let (r0, a0) = h.store.persist_counters();
+        let mut released = 0u32;
+        for id in &ids {
+            let rec = h.catalog.get_raw(id.id).unwrap();
+            released += h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        }
+        let (r1, a1) = h.store.persist_counters();
+        let parked = h.store.pending_len();
+        println!(
+            "A4a live children, all pages RELEASABLE: released={released} parked_after={parked} \
+             rewrites={} appends={}",
+            r1 - r0,
+            a1 - a0
+        );
+        assert!(released > 0, "fixture: nothing was released, so nothing was releasable");
+        assert_eq!(parked, 0, "fixture: something was parked after all");
+        assert_eq!(
+            r1 - r0,
+            branches as u64,
+            "a branch that parked NOTHING still had to pay one rewrite each"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hold the branch shape fixed and flip ONLY `has_live_children`, by reaping the child
+    /// first. Same pages, same arenas, same epochs; one bit different.
+    #[test]
+    fn d183adv_a4_flipping_only_the_predicate_flips_the_cost() {
+        fn run(kill_child: bool) -> (u64, u64, bool) {
+            let (h, path) = armed("a4b", kill_child as usize);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let mut ids = Vec::new();
+            for _ in 0..8 {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                for _ in 0..4 {
+                    h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                }
+                let child = h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                if kill_child {
+                    reaper.reap(child.branch_id).unwrap();
+                }
+                ids.push(b.branch_id);
+            }
+            let pred = h.catalog.has_live_children(ids[0].id).unwrap();
+            // Count only the parents' reaps; the children's are fixture.
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, pred)
+        }
+        let (r_live, a_live, p_live) = run(false);
+        let (r_dead, a_dead, p_dead) = run(true);
+        println!("A4b same shape, only the predicate differs, through the REAL reaper:");
+        println!("  child live  (has_live_children={p_live:5}): rewrites={r_live:3} appends={a_live:3}");
+        println!("  child reaped(has_live_children={p_dead:5}): rewrites={r_dead:3} appends={a_dead:3}");
+        assert!(p_live, "fixture: the live-child arm had no live child");
+        assert!(!p_dead, "fixture: reaping the child did not clear has_live_children");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // MECHANISM. Why the REAL leaf reap pays N-1 rewrites that the hand-rolled loop does not.
+    // ---------------------------------------------------------------------------------------
+
+    /// `take_pending` bumps `pending_version` **even when the log is empty** (`arena.rs:932`),
+    /// and `persist_delta_locked`'s third condition then forces the NEXT delta to be a full
+    /// image rewrite. `Reaper::reap` calls `drain_pending_seeded` -- and therefore
+    /// `take_pending` -- at the end of EVERY reap, leaf or not.
+    ///
+    /// So the leaf path's cost is not what freeing an arena costs; it is what freeing an arena
+    /// costs plus one forced rewrite carried over from the previous reap's empty drain. Forced
+    /// on purpose here, with nothing else in the picture.
+    #[test]
+    fn d183adv_mech_an_empty_take_pending_forces_the_next_append_into_a_rewrite() {
+        let (h, path) = armed("mech", 0);
+        let (ids, _) = build(&h, 4, 4, false);
+        let recs: Vec<_> =
+            ids.iter().map(|id| h.catalog.get_raw(id.id).unwrap()).collect();
+
+        // Control: two arena frees back to back, no drain in between.
+        let (r0, a0) = h.store.persist_counters();
+        h.store.free_arena(recs[0].arenas[0]).unwrap();
+        h.store.free_arena(recs[0].arenas[1]).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+
+        // Treatment: the SAME two frees, with an empty `take_pending` between them.
+        assert_eq!(h.store.pending_len(), 0, "fixture: the pending log is not empty");
+        h.store.free_arena(recs[1].arenas[0]).unwrap();
+        let drained = h.store.take_pending();
+        assert!(drained.is_empty(), "fixture: the drain was not empty");
+        h.store.free_arena(recs[1].arenas[1]).unwrap();
+        let (r2, a2) = h.store.persist_counters();
+
+        println!("MECH two arena frees, nothing between: rewrites={} appends={}", r1 - r0, a1 - a0);
+        println!(
+            "MECH two arena frees, EMPTY take_pending between: rewrites={} appends={}",
+            r2 - r1,
+            a2 - a1
+        );
+        assert_eq!((r1 - r0, a1 - a0), (0, 2), "control: both frees should have appended");
+        assert_eq!(
+            (r2 - r1, a2 - a1),
+            (1, 1),
+            "an empty drain did not force the following free into a full rewrite"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Where the interior arm's SECOND rewrite per branch comes from -- and it is not one
+    /// mechanism, it is two, which is why this test names both arms.
+    ///
+    /// ⚠ **This test's first draft asserted that the releasable arm would pay only ONE rewrite,
+    /// because `put_pending` never runs when the drain comes back empty. Its own measurement
+    /// refuted that: the releasable arm pays two as well.** The accounting below is what the
+    /// numbers force, and every term in it is a counted integer:
+    ///
+    ///   * PARKED (pages first, child after): `retire_arenas_by_rule` = 1 rewrite;
+    ///     `drain_pending_seeded` re-parks the survivors through `put_pending` = 1 rewrite;
+    ///     the extents are NOT empty (pages parked, not recycled) so `sweep_touched_extents`
+    ///     frees nothing. **2 rewrites, 0 appends, 3 arenas untouched.**
+    ///   * RELEASABLE (child first, pages after): `retire_arenas_by_rule` = 1 rewrite; the
+    ///     drain is empty so `put_pending` does NOT run -- but `take_pending` already bumped
+    ///     `pending_version`, so the FIRST of the three extents `sweep_touched_extents` now
+    ///     frees is forced into a full rewrite by the mechanism pinned in the test above, and
+    ///     the other two append. **2 rewrites, 2 appends, 3 arenas freed.**
+    ///
+    /// Same headline number, two different mechanisms, neither of them the one the claim under
+    /// attack names.
+    #[test]
+    fn d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending() {
+        fn run(park: bool) -> (u64, u64, usize) {
+            let (h, path) = armed("mech2", park as usize);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let mut ids = Vec::new();
+            for _ in 0..8 {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                if park {
+                    // Pages first, child after: the interval rule must park them.
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                    }
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                } else {
+                    // Child first, pages after: live child, nothing parkable.
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                    let birth = h.catalog.next_epoch();
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+                    }
+                }
+                assert!(h.catalog.has_live_children(b.branch_id.id).unwrap());
+                ids.push(b.branch_id);
+            }
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let parked = h.store.pending_len();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, parked)
+        }
+        let (r_park, a_park, p_park) = run(true);
+        let (r_free, a_free, p_free) = run(false);
+        println!("MECH2 8 interior branches through the REAL reaper:");
+        println!("  pages PARKED     : rewrites={r_park:3} appends={a_park:3} pending_after={p_park}");
+        println!("  pages RELEASABLE : rewrites={r_free:3} appends={a_free:3} pending_after={p_free}");
+        assert!(p_park > 0, "fixture: the parking arm parked nothing");
+        assert_eq!(p_free, 0, "fixture: the releasable arm parked something");
+
+        // The accounting in the doc comment, pinned. 8 branches, 3 arenas each.
+        assert_eq!((r_park, a_park), (16, 0), "parked arm: retire + put_pending, nothing swept");
+        assert_eq!(
+            (r_free, a_free),
+            (16, 16),
+            "releasable arm: retire + one forced sweep free, then two appends"
+        );
+
+        // And the term the parked arm's second rewrite is charged to, priced on its own.
+        let (h, path) = armed("mech3", 0);
+        let (ids, _) = build(&h, 1, 4, true);
+        let rec = h.catalog.get_raw(ids[0].id).unwrap();
+        let ep = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        let taken = h.store.take_pending();
+        assert!(!taken.is_empty(), "fixture: the interior branch parked nothing");
+        let (r0, a0) = h.store.persist_counters();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        println!("MECH3 one put_pending on its own: rewrites={} appends={}", r1 - r0, a1 - a0);
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "put_pending is not one unconditional full rewrite"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
