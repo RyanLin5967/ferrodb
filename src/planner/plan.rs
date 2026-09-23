@@ -138,9 +138,8 @@ fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPo
     let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
     let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
     let scanner = heap.scan();
-    let mut node: Box<dyn Executor> = Box::new(SeqScan {
-        scanner, schema: entry.schema.clone(), tt_heap, view
-    });
+    let mut node: Box<dyn Executor> =
+        Box::new(SeqScan::new(scanner, entry.schema.clone(), view, tt_heap));
     if let Some(pred) = predicate {
         node = Box::new(Filter { child: node, predicate: pred})
     }
