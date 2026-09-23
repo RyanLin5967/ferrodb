@@ -35,9 +35,38 @@ LABEL="d130-$(git rev-parse --short HEAD 2>/dev/null || echo nohead)"
 SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 LOCK_WAIT=${LOCK_WAIT:-5400}
 _HELD_LOCK=0
+_LOCK_OWNER_PID=
+# A RELEASE MUST PROVE THE LOCK IS STILL THIS RUN'S. This function carried the identical
+# flag-only shape as tools/verify-suite.sh and therefore the identical defect, which fired live on
+# 2026-09-23 and deleted a running suite's lock: the flag says "I acquired A lock once", not "the
+# directory on disk is still MINE". Remove only on a pid match; every other reading is a refusal
+# that warns. Fail closed — the acquire loop below breaks a lock whose pid is dead, so refusing
+# strands nothing. Full reasoning: note 8 in tools/verify-suite.sh.
+# LOCK-RELEASE-OWNERSHIP-CHECKED (D188) — see tools/verify-suite-selftest.sh part 4.
 _release_lock() {
     [ "$_HELD_LOCK" = "1" ] || return 0
     _HELD_LOCK=0
+    local _o _p
+    if [ ! -d "$SUITE_LOCK" ]; then
+        echo "$LABEL: WARNING — this run held $SUITE_LOCK as pid $_LOCK_OWNER_PID and it is ALREADY" >&2
+        echo "  GONE at release; another run may have shared the machine with this sweep." >&2
+        return 0
+    fi
+    _o=$(cat "$SUITE_LOCK/owner" 2>/dev/null) || _o=
+    _p=${_o%% *}
+    case "$_p" in
+        '' | *[!0-9]*)
+            echo "$LABEL: REFUSING to release — $SUITE_LOCK/owner is missing or unparseable (read:" >&2
+            echo "  '$_o'); this run held it as pid $_LOCK_OWNER_PID. Leaving the directory alone." >&2
+            return 0 ;;
+    esac
+    if [ "$_p" != "$_LOCK_OWNER_PID" ]; then
+        echo "$LABEL: REFUSING to release — $SUITE_LOCK is now owned by pid $_p, not this run (pid" >&2
+        echo "  $_LOCK_OWNER_PID). Owner line: '$_o'. This sweep's lock was removed and re-created" >&2
+        echo "  by another run, which has been running UNPROTECTED alongside it: treat BOTH results" >&2
+        echo "  as contended. Leaving the new owner's lock intact." >&2
+        return 0
+    fi
     rm -rf "$SUITE_LOCK"
 }
 _abort() {
@@ -72,6 +101,7 @@ while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
     sleep 5; _waited=$((_waited+5))
 done
 printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
+_LOCK_OWNER_PID=$$        # what the release compares against; a flag cannot identify a directory
 _HELD_LOCK=1
 echo "$LABEL: holding the suite lock as pid $$ (waited ${_waited}s)" >&2
 

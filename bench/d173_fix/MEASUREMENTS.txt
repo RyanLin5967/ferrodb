@@ -1,0 +1,157 @@
+D173 — TWO MEASUREMENTS THE FIX HAD TO ANSWER
+Run 2026-09-23 on this machine. Branch `d173-leadership-lapse` at 97ad822 (fixed arm) against
+`727a8ec` (base arm, worktree /Users/idide/wt/ferrodb-d173-cost-control, branch d173-cost-control).
+Both test binaries' provenance was asked of the ARTIFACT, not assumed:
+    base  --list | grep -c a_leadership_lapse_mid_wait -> 0 ; 35 tests
+    fixed --list | grep -c a_leadership_lapse_mid_wait -> 1 ; 37 tests
+
+=================================================================================================
+Q1. WHAT THE FIX COSTS A PERMANENTLY PARTITIONED NODE
+=================================================================================================
+
+INSTRUMENT: `d173_probe_partition_cost`, a temporary `#[test]` in
+tests/integration_cluster_agents.rs, source banked beside this file as
+`partition_cost_probe.rs.txt`. It is NOT committed to the branch — the suite count is unchanged at
+37. To re-run, paste it back at the end of that file.
+
+It is a REAL driver, not a scripted seam. `Fleet::start(3)` — three `Node`s, three real TCP
+listeners, three real round logs, `tick_of(20ms)`, `NodeReplicator::new(node, 1ms)`. A leader is
+elected for real, the fork is proposed and settled for real. Then `PartitionableSeam` flips: from
+that moment `pump()` drives ONLY this node, so the peers' sockets go unread, nothing this node
+proposes can reach a quorum, and `election.rs`'s own lease deposes it. Nothing about `leader()` is
+faked — it returns the node's own answer.
+
+NON-VACUITY, built into every row: `lapse_named=true` means the returned error contained "lost the
+leadership while waiting". If the lapse had not happened, that clause would be absent and the row
+would be measuring an ordinary timeout instead.
+
+THE SLOPE, not a single ratio (four budgets, one run each):
+
+    D173COST budget=1000 ms=1435  us_per_turn=1435 lapse_named=true err_class=Merge
+    D173COST budget=2000 ms=2911  us_per_turn=1455 lapse_named=true err_class=Merge
+    D173COST budget=4000 ms=5737  us_per_turn=1434 lapse_named=true err_class=Merge
+    D173COST budget=8000 ms=11357 us_per_turn=1419 lapse_named=true err_class=Merge
+
+⇒ Linear in the budget across an 8x range; per-turn cost flat at 1.42-1.46 ms. It is a CONSTANT
+  per turn, not a complexity class.
+
+THE REAL DEFAULT, MEASURED RATHER THAN EXTRAPOLATED. `DEFAULT_PUMP_BUDGET` is 100_000. Two draws,
+with a small arm interleaved between them so drift in the box would show as a moved control:
+
+    D173COST budget=100000 ms=143572 us_per_turn=1435 lapse_named=true err_class=Merge
+    D173COST budget=1000   ms=1441   us_per_turn=1441 lapse_named=true err_class=Merge   <- control
+    D173COST budget=100000 ms=143127 us_per_turn=1431 lapse_named=true err_class=Merge
+
+  load averages 7.12 -> 6.45 across the run (`uptime`, before and after).
+
+⭐ ANSWER: ~143 SECONDS (2 min 23 s), twice, 0.3% apart. The interleaved 1 000-turn control read
+  1441 ms against 1435 ms in the earlier sweep, so the box did not move under the two big arms.
+  ⚠ This is at the only `NodeReplicator` poll value that exists in this repo, 1 ms, chosen in
+  `Fleet::start`. There is no production construction of `ClusterAgents` to read a value from
+  (`grep -rn 'ClusterAgents::new' src/ examples/ tests/` -> 4 hits, all in the test file), so
+  "143 s" is a property of the test wiring as much as of the fix.
+
+IS EACH TURN BOUNDED? — and this is where I was WRONG and the measurement corrected me.
+
+  I was about to report "bounded in the wait, unbounded in the I/O, because a partitioned node
+  campaigns and fsyncs its vote every election timeout". That mechanism is FALSE here, and the
+  instrument says so:
+
+    D173FSYNC budget=5000 role_transitions=30 role_now=PreCandidate term_now=1
+              hard_state_writes_during_partition=0
+              POSITIVE_CONTROL_writes_before_partition=5
+
+  The node oscillates into PreCandidate 30 times over 5 000 turns and its TERM NEVER LEAVES 1.
+  That is Raft PreVote doing its job: a node that cannot reach a quorum does not inflate the term,
+  so it never reaches `Action::PersistHardState`, so `store_hard_state` — the only fsync on this
+  path (`node.rs`, "Temp-then-rename with both fsyncs") — is never called.
+
+  ⭐ FORCED TO FIRE BEFORE THE ZERO WAS BELIEVED. The same counter reads 5 for the election phase
+  of the same run. A detector that has only ever returned 0 is not a clean result; this one was
+  made to fire on purpose, in the same process, immediately before the measurement.
+
+  ⇒ SO THE WORST CASE IS BOUNDED, for three reasons, two of them measured:
+     1. the receive is bounded by construction — `Node::poll` waits `budget.min(until_tick)`,
+        i.e. never more than the 1 ms poll (read from source);
+     2. `drain()` is bounded in STEP COUNT by `MAX_DRAIN_STEPS` (read from source);
+     3. the fsync-bearing path is NOT TAKEN AT ALL on a partitioned wait — measured, 0 writes
+        over 5 000 turns, with a positive control of 5.
+     The residual honest caveat: a node that is DEPOSED BUT STILL CONNECTED does receive entries
+     and does append-and-fsync in `drain`. That node exits the wait the moment its round arrives,
+     which is the fast path — so the path that fsyncs is short and the path that is long does not
+     fsync. Those are the two arms and neither is unbounded.
+
+=================================================================================================
+Q2. DOES THE FIX CHANGE THE WINDOWS CI FAILURE?
+=================================================================================================
+
+INSTRUMENT: `bench/d173_adversary2/aimed_freeze.sh`, unchanged, taken from branch
+`d173-adversary-2`. A real SIGSTOP/SIGCONT of the real test process aimed at the moment the test
+prints its pre-merge LOOPCOUNT line. Parameters AIM=0.5 STOP=0.3 EVERY=2 — found by me; the
+adversary banked its outputs but not its parameter values, and these reproduce its signature on
+the first attempt.
+
+CONTROL FIRST: the unaimed base run passes (`test result: ok. 1 passed`), so the freeze, not the
+test, is what produces the failure.
+
+A/B, ARMS ALTERNATING EVERY PAIR so box drift cannot land on one arm. Raw in
+`ab_aimed_base_vs_fixed.txt`:
+
+    BASE  (727a8ec):  12 runs, 12 FAILED, every one notleader=1 proposed1=1
+    FIXED (97ad822):  12 runs, 12 ok,     every one notleader=0
+
+  Base signatures, verbatim, one per run — the CI shape, on six different owner/round pairs:
+    round 6 merges n3/b1, which is Merged { at: 3 }      round 8 merges n1/b1, ... Merged { at: 5 }
+    round 6 merges n1/b1, which is Merged { at: 3 }      round 9 merges n2/b1, ... Merged { at: 6 }
+    round 7 merges n1/b1, which is Merged { at: 3 }      round 10 merges n3/b1, ... Merged { at: 3 }
+    round 9 merges n3/b2, which is Merged { at: 7 }      round 10 merges n2/b1, ... Merged { at: 7 }
+
+⛔ 12/12 GREEN IS NOT BY ITSELF EVIDENCE. `notleader=0` on the fixed arm is equally consistent with
+"the fix worked" and with "the freeze never reached the window on this binary". That had to be
+discriminated, not argued.
+
+DISCRIMINATOR: a read-only `eprintln!` added at the lapse arm inside `pump_until` — the changed
+line itself — on a throwaway build. Raw in `lapse_instrument_reps.txt`:
+
+    NEGATIVE CONTROL, instrumented binary, NO freeze:  lapse prints = 0,  test ok
+    AIMED, 8 reps:  lapse prints = 155, 103, 208, 192, 209, 173, 185, 203   ALL 8 ok, notleader=0
+    every first print: `what=round 3, the merge of nX/b1  saw=None`
+
+⭐ So the fixed arm reaches the window 103-209 times per run — inside the MERGE wait, post-propose,
+  which `what=round N, the merge of ...` names exactly — and the merge completes anyway. The green
+  is survival, not absence. The instrument was restored and confirmed absent by grep.
+
+ANSWER, in three parts, and the third is a gap I am NOT closing:
+
+  (a) THE ENTRY CONDITION IS REMOVED, measured. The CI log's `NOTLEADER site=hundred-writes/
+      retry-arm ... proposed=1` cannot occur: `pump_until` no longer produces `NotLeader` at all,
+      so no post-propose refusal reaches the caller. 12/12 base vs 12/12 fixed, lapse proven
+      present in the fixed arm.
+
+  (b) THE PANIC LINE IS REACHED ONLY THROUGH THAT ARM. `fleet.hold_leader(leader,
+      "hundred-writes/retry-arm")` — the helper whose 100000-turn failure produced CI's
+      "node 0 never regained the leadership at site hundred-writes/retry-arm after 100000 turns in
+      1428634 ms" — sits inside `Err(FerroError::NotLeader { .. }) if attempt < 10 =>` and has no
+      other caller. Read from source.
+
+  (c) ⛔ BUT A SECOND DOOR TO THE SAME PANIC REMAINS, AND THE FIX DOES NOT TOUCH IT. `merge` can
+      still return `NotLeader` from `require_leader` — PRE-propose, `proposed=0`, benign in
+      itself — and that also enters the retry arm and also calls `hold_leader`. If the ex-leader
+      never regains office, the identical panic occurs with `proposed=0`. The CI log quoted says
+      `proposed=1`, so the observed instance is closed; the FAILURE MODE is not eliminated.
+      The inability of `hold_leader(original)` to recover a genuinely deposed node is a defect in
+      the TEST HELPER, already measured by `d173-adversary-2` (the 354168 ms figure), and is
+      untouched by this row.
+
+  ⚠ WHAT I DID NOT REPRODUCE: the exact panic in the lead's CI log. My local base arm reproduces
+  the ENTRY (`proposed=1`) and then takes the OTHER exit — `hold_leader` recovers in ~555 turns and
+  the retry finds `Merged { at: N }`. CI took the exit where it never recovers. Both exits are
+  downstream of the same retry arm, so (a) and (b) apply to both, but I have not made the
+  "never regained" exit fire on this box and I am not claiming I have. What would settle it: run
+  the aimed freeze on a Windows runner, or slow every driver at once rather than only the peers —
+  the adversary's note that CI recovers differently because EVERY driver is slow there, not just
+  the ones this harness starves.
+
+  ⇒ SO: NOT "this fixes the red CI". It removes the one entry path the CI log shows, on a
+    measured 12/12-vs-12/12; the panic line stays reachable by a second, benign-refusal path that
+    is a separate defect.

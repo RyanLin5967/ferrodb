@@ -23,9 +23,20 @@
 #   UNKNOWN            could not be determined -> exits non-zero and REFUSES. A guard that
 #                      cannot parse its own input must never fall through to allow.
 #
+# ⛔ THE DEFAULT BASE IS PART OF THE GUARD, NOT A CONVENIENCE. It was `agent-isolation` until
+# 2026-09-23, chosen when that branch was the integration target. The project moved to `main` and
+# the default did not: `agent-isolation` fell 533 commits behind, so a DIRECT call (the form
+# `~/.claude/skills/ferrodb-scale/SKILL.md` tells agents to run) measured the branch against an
+# ancient commit and STRUCTURALLY COULD NOT REPORT "behind". Measured on one branch, two bases:
+# default -> "vs agent-isolation: 0 behind, 550 ahead" COVERED; explicit -> "vs main: 0 behind,
+# 17 ahead" COVERED. Same verdict, and only one of them was an answer to the question asked.
+# ⇒ A guard whose default silently passes is worse than no guard: it is a clean bill of health
+#   from an instrument pointed at the wrong tree. Fire-checked at the new default -- see
+#   bench/d180_staleness_base_fire_check.txt, where a branch genuinely behind `main` REFUSES.
+#
 # Usage: tools/staleness.sh [worktree-or-repo] [base-ref] [head-ref]
 set -u
-wt="${1:-.}"; base="${2:-agent-isolation}"; head="${3:-HEAD}"
+wt="${1:-.}"; base="${2:-main}"; head="${3:-HEAD}"
 
 die() { echo "UNKNOWN: $*"; exit 2; }
 

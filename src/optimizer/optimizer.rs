@@ -1,4 +1,4 @@
-use std::{collections::HashSet, ops::Bound, sync::Arc};
+use std::{cmp::Ordering, collections::HashSet, ops::Bound, sync::Arc};
 
 use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::ReadView};
 
@@ -68,8 +68,8 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                     None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp),
                 };
                 let scanner = tree.range_scan(lower, upper)?;
-                return Ok(Box::new(IndexScan{heap, scanner, schema, tt_heap, view}))
-            } 
+                return Ok(Box::new(IndexScan::new(heap, scanner, schema, view, tt_heap)))
+            }
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
             let sec_tree = match catalog.root_cell(&table, Some(&col_name)) {
@@ -81,10 +81,12 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                 None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
             };
 
-            let scan_lower = secondary_scan_lower(&lower)
-                .ok_or_else(|| FerroError::Bind("lower bound sec index isn't supported".into()))?;
-            let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
-            Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper, tt_heap, view, col_index: column}))
+            // D179 — the scanner is opened at the START KEY, which is not the bound. `Excluded(v)`
+            // opens at `(v, Null)` like `Included(v)` does and the exclusion is applied by
+            // `SecondaryIndexScan::next`, which skips the leading `sec == v` run. Both bounds are
+            // handed to the executor unchanged for that reason.
+            let scanner = sec_tree.range_scan(secondary_scan_start(&lower), Bound::Unbounded)?;
+            Ok(Box::new(SecondaryIndexScan::new(heap, scanner, primary_index, schema, lower, upper, view, tt_heap, column)))
         }
         PhysicalPlan::HashJoin { left, right, on, join_type, left_keys, right_keys, right_width } => {
             let left_exec = lower(*left, catalog, bp.clone(), view.clone())?;
@@ -121,86 +123,179 @@ pub fn build_join(left: PhysicalPlan, right: PhysicalPlan, on: BoundExpr, join_t
     }
 }
 
-/// The secondary tree's lower bound for a `(value, pk)` key — or `None` when this bound **cannot
-/// be expressed at all** against that key shape.
+/// Where a scan of the `(value, pk)` secondary tree must START, for a bound in the column's own
+/// value space.
 ///
-/// A secondary index is keyed on `(value, pk)`, so `Bound::Included(v)` becomes `(v, Value::Null)`:
-/// `Null` sorts below every pk, so that is exactly the first key whose value is `v`. A *strictly
-/// excluded* `v` has no such spelling — it would have to start just past the LAST key with value
-/// `v`, and there is no maximum pk to write down. Hence `None` rather than an approximation: the
-/// nearest expressible bound is `Included`, which would silently return the rows `> v` was asked to
-/// exclude.
+/// `Included(v)` and `Excluded(v)` both open at `(v, Value::Null)`, and that is not an oversight.
+/// `Null` sorts below every pk (type rank 0, and column 0 is `NOT NULL`), so `(v, Null)` is exactly
+/// the first key whose value is `v` — right for `Included`. For `Excluded` it is the first key that
+/// bound **excludes**, and no key is right: the scan would have to start just past the LAST key
+/// with value `v`, and there is no maximum pk to write down.
 ///
-/// # D178 — this is the SINGLE authority, and that is the point
+/// # D179 — so the start key does not carry the exclusion, and the executor does
 ///
-/// This predicate had one consumer: `lower`, which refused and returned an error. `build_index_scan`
-/// did not consult it, so the optimizer could **choose a plan that could not then be built**, and on
-/// the SELECT path that is a live, reachable defect rather than a latent one. Measured at `fe40276`
-/// + D176's counters, in `bench/d178_run1_BEFORE_RAW.txt`, on a 1,000-row table with an index on
-/// `v` and `ANALYZE` run:
+/// `SecondaryIndexScan::next` skips the leading run of entries whose value is still `v` — the exact
+/// mirror of the `sec_upper` check it has always carried, for the same reason: a bound in value
+/// space is not a key in `(value, pk)` space. That is why this function is total and why it returns
+/// a start key rather than a bound. **It is not a predicate about what is supported**, and a reader
+/// who turns it back into one will reintroduce D178's defect from the other side.
+///
+/// Before D179 this returned `Option` with `None` for `Excluded`, and `lower` turned that `None`
+/// into `FerroError::Bind("lower bound sec index isn't supported")`. `WHERE sec > v` therefore
+/// could not use the index at all: D178 made the optimizer stop CHOOSING such a plan (so the error
+/// became unreachable and the query fell back to a correct sequential scan) but could not make the
+/// plan buildable. Measured at `fe40276` + D176's counters, in `bench/d178_run1_BEFORE_RAW.txt`, on
+/// a 1,000-row table with an index on `v` and `ANALYZE` run:
 ///
 /// ```text
 ///   SELECT id FROM h WHERE v > 9980 ;  ERROR: binding error: lower bound sec index isn't supported
 ///   SELECT id FROM h WHERE v > 9900 ;  OK, 9 rows
 /// ```
 ///
-/// Same table, same index, same predicate shape — the only difference is that the higher cutoff
-/// estimates few enough rows for the index side to win the cost comparison, at which point the
-/// engine refuses a query it answers correctly one row-estimate lower. A user sees a statement
-/// start failing because their data grew.
+/// Both of those now build, and both use the index.
 ///
-/// So `build_index_scan` now asks this question BEFORE proposing an `IndexScan`, through
-/// [`index_scan_lowerable`], and falls through to the sequential scan it was already costing
-/// against. Both callers read this one function; neither carries its own copy of the rule, so they
-/// cannot drift apart. `lower`'s refusal STAYS — a hand-built `PhysicalPlan` can still name an
-/// unbuildable scan, and `plan::tests::test_index_scan_secondary_rejects_strict_lower` pins that.
+/// ## What went away with the `Option`, and why nothing replaced it
 ///
-/// ⚠ What this does NOT do is make `secondary > v` use the index. That needs a real fix in
-/// `SecondaryIndexScan` — start at `Included((v, Null))` and skip the `sec == v` run, the mirror of
-/// the `sec_upper` check it already carries — and that is a separate row, not this one. Until then
-/// the honest outcome is a correct sequential scan instead of an error.
-fn secondary_scan_lower(lower: &Bound<Value>) -> Option<Bound<(Value, Value)>> {
+/// `index_scan_lowerable` — D178's gate in `build_index_scan`, which passed over a conjunct `lower`
+/// could not build and considered the next one. Every bound is now buildable against every tree
+/// shape, so the gate could only ever return `true`: a branch that cannot be false is one no test
+/// can hold to account, and keeping it would have left a guard that looks like a check and is not.
+/// `lower`'s matching `ok_or_else` went the same way and for the same reason. `lower` still refuses
+/// a hand-built `PhysicalPlan` that names a secondary column carrying no index
+/// (`plan::tests::test_index_scan_rejects_unindexed_secondary_column` pins it) — that refusal is
+/// about a tree that does not exist, which is a fact about the catalog and stays true.
+fn secondary_scan_start(lower: &Bound<Value>) -> Bound<(Value, Value)> {
     match lower {
-        Bound::Included(v) => Some(Bound::Included((v.clone(), Value::Null))),
-        Bound::Unbounded => Some(Bound::Unbounded),
-        Bound::Excluded(_) => None,
+        Bound::Included(v) | Bound::Excluded(v) => Bound::Included((v.clone(), Value::Null)),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
-/// Can [`lower`] actually build an `IndexScan` on `column` with this lower bound?
+/// Choose an access path for a single-relation `Filter`: the cheapest of the sequential scan and
+/// one `IndexScan` per usable conjunct.
 ///
-/// Column 0 is the primary tree, keyed on the value alone, so every bound is expressible there.
-/// Everything else is a `(value, pk)` secondary tree and defers to [`secondary_scan_lower`].
-fn index_scan_lowerable(column: usize, lower: &Bound<Value>) -> bool {
-    column == 0 || secondary_scan_lower(lower).is_some()
-}
-
+/// # D181 — this used to cost ONE candidate, and which one was decided by the user's typing
+///
+/// The selection was `conjuncts.iter().position(..)`, and `position` returns the FIRST match.
+/// `split_and` preserves source order, so with two usable indexed conjuncts exactly one candidate
+/// was ever built — the leftmost — and it was costed against the sequential scan and against
+/// nothing else. The second index was never built, never costed, and could not win. **Index
+/// selection was decided by the order the predicate was typed**, and the cost model was only ever
+/// asked to ratify that choice against a full scan.
+///
+/// Measured in `bench/d181_conjunct_order_BEFORE_RAW.txt` (`examples/d181_conjunct_order.rs`), on
+/// a table with two indexed secondary columns — `sel` unique, `broad` two-valued — after `ANALYZE`,
+/// in rows examined (heap tuples pulled + index entries walked) for the SAME predicate:
+///
+/// ```text
+///     n                                  400      800     1600
+///     SELECT .. WHERE sel = k AND broad = b     400        2        2
+///     SELECT .. WHERE broad = b AND sel = k     400      800     1600
+///     gap                                         0      798     1598      <- n - 2, not a constant
+/// ```
+///
+/// The fire-check arm (`pad = 'zz'`, no index) read exactly `n` at every size in the same process,
+/// so the zeros above are readings and not a dead counter, and every arm returned its one row.
+/// Typing `broad` first did not merely pick the worse index: the broad candidate loses to the
+/// sequential scan on cost, so the statement reached NO index at all and read the whole table,
+/// while the other spelling of the identical predicate read two index entries.
+///
+/// Note the `ANALYZE: no` half of that run shows no gap. Without statistics both columns get
+/// `DEFAULT_DISTINCT`, so the two candidates cost the same and both lose to the sequential scan —
+/// the defect needs statistics to become visible, which is exactly the case where the engine has
+/// the information to choose correctly and throws it away.
+///
+/// # What this does instead
+///
+/// Every conjunct that `predicate_to_bounds` can read AND whose column carries an index becomes a
+/// candidate plan, each with the remaining conjuncts as a residual `Filter`; all of them are costed
+/// and the cheapest wins. The sequential scan is the starting incumbent rather than a special case,
+/// so it still wins ties — the same `<` comparison as before, and the same result for every
+/// predicate with at most one usable conjunct.
+///
+/// # The tie, and why it is broken on the candidate rather than on where it was typed
+///
+/// A strict `<` alone leaves the defect's residue: on an EXACT cost tie the incumbent stands, so
+/// between two index candidates the earliest-typed would win and typing order would still decide.
+/// Cost is an estimate, so two plans the model scores identically can examine wildly different
+/// numbers of rows — which means the residue is not merely cosmetic, and a test asserting that the
+/// two typing orders examine the same rows would fail intermittently rather than never.
+///
+/// So a tie is broken on [`candidate_key`] — `(column, lower bound, upper bound)`, a property of
+/// the candidate and not of its position in the predicate. Because the update rule keeps the
+/// running MINIMUM key among equal-cost candidates, the result is the same whichever order the
+/// conjuncts arrive in, for any number of them. Plan choice is then a function of the predicate
+/// SET, which is the law D181 is actually about.
+///
+/// A tie with the SEQUENTIAL incumbent still keeps the sequential scan, exactly as `<` did: the
+/// incumbent carries no key, and that case is the first thing the match arm below rules out.
+///
+/// What remains order-dependent is the residual `Filter`'s own conjunct order —
+/// `Filter(#2 = 1 AND #1 = 801)` against `Filter(#1 = 801 AND #2 = 1)`. Both evaluate both
+/// conjuncts over the same rows, so no access path and no row count depends on it. Tests assert
+/// COUNTERS across a typing swap, not plan-string equality, for that reason.
+///
+/// This is one candidate per conjunct, not a subset search: an `IndexScan` here reads one tree and
+/// a multi-index intersection is a different physical operator this engine does not have.
 fn build_index_scan(table: &str, predicate: &BoundExpr, catalog: &Catalog) -> Option<PhysicalPlan> {
     let mut conjuncts = Vec::new();
     let entry = catalog.get_table(table)?;
     split_and(predicate.clone(), &mut conjuncts);
-    // D178 — an index on the column is necessary but NOT sufficient: the bound has to be one
-    // `lower` can express against that tree's key. A conjunct that fails this is passed over and
-    // the next indexed one is considered, so `sec > v AND id = 7` still reaches the primary index
-    // instead of falling all the way back to a sequential scan.
-    let chosen = conjuncts.iter().position(|c| {
-        predicate_to_bounds(c)
-            .is_some_and(|(col, lo, _)| has_index(entry, col) && index_scan_lowerable(col, &lo))
-    })?;
-    let index_conjunct = conjuncts.remove(chosen);
-    let (column, lower, upper) = predicate_to_bounds(&index_conjunct)?;
-    let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };
-    let candidate = if conjuncts.is_empty() {
-        scan
-    } else {
-        PhysicalPlan::Filter { input: Box::new(scan), predicate: combine_and(conjuncts) }
-    };
 
-    let seq = PhysicalPlan::Filter { input: Box::new(PhysicalPlan::SeqScan { table: table.into() }), predicate: predicate.clone() };
-    if cost(&candidate, catalog).cost < cost(&seq, catalog).cost {
-        return Some(candidate)
+    // The incumbent. `optimize` builds exactly this tree when we return `None`, so starting here
+    // rather than returning early keeps the no-usable-conjunct case identical to what it was.
+    // `best_key` is `None` for it, which is what makes a tie against the sequential scan keep the
+    // sequential scan.
+    let mut best = PhysicalPlan::Filter { input: Box::new(PhysicalPlan::SeqScan { table: table.into() }), predicate: predicate.clone() };
+    let mut best_cost = cost(&best, catalog).cost;
+    let mut best_key: Option<CandidateKey> = None;
+
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        let Some((column, lower, upper)) = predicate_to_bounds(conjunct) else { continue };
+        if !has_index(entry, column) { continue }
+        let key = candidate_key(column, &lower, &upper);
+        let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };
+        let residual: Vec<BoundExpr> = conjuncts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| c.clone()).collect();
+        let candidate = if residual.is_empty() {
+            scan
+        } else {
+            PhysicalPlan::Filter { input: Box::new(scan), predicate: combine_and(residual) }
+        };
+        let candidate_cost = cost(&candidate, catalog).cost;
+        let better = match (candidate_cost.partial_cmp(&best_cost), &best_key) {
+            (Some(Ordering::Less), _) => true,
+            // A tie between two INDEX candidates, broken on the candidate itself. See the doc.
+            (Some(Ordering::Equal), Some(incumbent)) => &key < incumbent,
+            // A tie with the sequential incumbent, or a NaN cost: keep what we have.
+            _ => false,
+        };
+        if better {
+            best_cost = candidate_cost;
+            best_key = Some(key);
+            best = candidate;
+        }
     }
-    Some(seq)
+    Some(best)
+}
+
+/// The tie-break key for an `IndexScan` candidate — see [`build_index_scan`].
+///
+/// `Bound` does not implement `Ord` (std derives only `Clone, Copy, Debug, Hash, PartialEq, Eq`),
+/// so the bounds are ranked explicitly. The ranks are arbitrary and that is fine: the key exists to
+/// be TOTAL and to depend on nothing but the candidate, not to express a preference. What it must
+/// not do is read the conjunct's position, because that is the defect.
+type CandidateKey = (usize, (u8, Option<Value>), (u8, Option<Value>));
+
+fn candidate_key(column: usize, lower: &Bound<Value>, upper: &Bound<Value>) -> CandidateKey {
+    (column, bound_key(lower), bound_key(upper))
+}
+
+fn bound_key(bound: &Bound<Value>) -> (u8, Option<Value>) {
+    match bound {
+        Bound::Unbounded => (0, None),
+        Bound::Included(v) => (1, Some(v.clone())),
+        Bound::Excluded(v) => (2, Some(v.clone())),
+    }
 }
 
 fn has_index(entry: &TableEntry, col: usize) -> bool {

@@ -159,7 +159,7 @@ fn dml_reaches_the_index_and_plans_it_the_way_select_does() {
         "id > 300",               // primary-key range — `Bound::Excluded` on the primary tree
         "v = 70",                 // secondary-index equality
         "label = 'row'",          // no index at all
-        "v > 3990 AND id = 399",  // an UNLOWERABLE conjunct beside an indexed one (D178 H1)
+        "v > 3990 AND id = 399",  // two indexed conjuncts, one far cheaper (D178 H1, D181)
     ] {
         let select = signature(&format!("SELECT id, v FROM t WHERE {predicate};"));
         let update = signature(&format!("UPDATE t SET label = 'x' WHERE {predicate};"));
@@ -171,11 +171,21 @@ fn dml_reaches_the_index_and_plans_it_the_way_select_does() {
         );
     }
 
-    // ---- 4. The conjunct that cannot be lowered must not cost the statement its index. ---------
+    // ---- 4. A second usable conjunct must not cost the statement its index. --------------------
     //
-    // `v > 3990` is a strictly-excluded lower bound on a SECONDARY index, which `lower` cannot
-    // build (see `optimizer::secondary_scan_lower`). `build_index_scan` passes over it and takes
-    // the `id = 399` conjunct instead, rather than giving up on indexes altogether.
+    // `v > 3990` is a strictly-excluded lower bound on a SECONDARY index. Until D179 `lower` could
+    // not build one, and `build_index_scan` passed over the conjunct and took `id = 399` instead.
+    //
+    // ⚠ **BOTH HALVES OF THAT SENTENCE ARE NOW OBSOLETE, AND THIS ASSERTION IS UNCHANGED.** D179
+    // makes `v > 3990` buildable, so it is no longer passed over — and D181 stopped
+    // `build_index_scan` taking the FIRST usable conjunct, so being no-longer-passed-over does not
+    // mean being chosen. Every usable conjunct is costed and the cheapest wins, which on this
+    // fixture is the primary-key point lookup `id = 399` by a wide margin.
+    //
+    // This assertion caught exactly that. With D179 alone it failed at 400 vs 0: `v > 3990` became
+    // lowerable, `position` took it, the candidate lost to the sequential scan on cost and dragged
+    // the whole statement into a full 400-row scan. D178's gate had been accidentally shielding
+    // the plan from D181's first-match defect. The fix was to D181, not to this line.
     let (mixed_tuples, mixed_index) = signature("UPDATE t SET label = 'x' WHERE v > 3990 AND id = 399;");
     assert_eq!(
         mixed_tuples, 0,

@@ -639,6 +639,15 @@ struct Scripted {
     /// When set, the next `pump` deposes this node and applies nothing — a leader that loses
     /// office while a caller is waiting on a round.
     depose_on_pump: Mutex<bool>,
+    /// One-shot version of the above: lose office on the next `pump`, skip that one turn, and
+    /// **keep applying afterwards**. See `depose_for_one_turn_then_keep_applying`.
+    depose_once: Mutex<bool>,
+    /// How many times `leader()` answered with something other than this node.
+    ///
+    /// **The anti-vacuity counter for every leadership-lapse test below.** A lapse scripted into
+    /// `pump` is only interesting if the code under test actually *looked*; without this, a test
+    /// that deposed a node whose wait had already finished would pass while exercising nothing.
+    reads_while_deposed: Mutex<u32>,
 }
 
 impl Scripted {
@@ -652,6 +661,8 @@ impl Scripted {
             sticky: Mutex::new(false),
             leader: Mutex::new(Some(node)),
             depose_on_pump: Mutex::new(false),
+            depose_once: Mutex::new(false),
+            reads_while_deposed: Mutex::new(0),
         })
     }
 
@@ -674,6 +685,26 @@ impl Scripted {
     /// deposed leader looks like to something waiting on a round.
     fn depose_on_next_pump(&self) {
         *lock(&self.depose_on_pump) = true;
+    }
+
+    /// **Lose office, then go on applying** — a deposed leader that is still a live follower.
+    ///
+    /// The one skipped turn is not decoration: it is what puts the lapse *in front of* the
+    /// leadership check inside `pump_until`, on the iteration after the one that deposed us.
+    /// Deposing and applying in the same turn would satisfy the wait's `done` immediately and the
+    /// check would never look, so the test would be about nothing.
+    ///
+    /// What it stands for is ordinary and is the whole reason option 2 was chosen for D173: the
+    /// entry this node proposed had already reached a quorum, the new leader commits it, and it
+    /// arrives here by replication like any other. A node losing office is not a node losing its
+    /// socket.
+    fn depose_for_one_turn_then_keep_applying(&self) {
+        *lock(&self.depose_once) = true;
+    }
+
+    /// Times `leader()` answered with a node other than this one — see the field.
+    fn reads_while_deposed(&self) -> u32 {
+        *lock(&self.reads_while_deposed)
     }
 
     /// Apply everything proposed. Stands for the time an agent spends working after its fork.
@@ -717,6 +748,11 @@ impl Replicated for Scripted {
     }
 
     fn pump(&self) -> Result<(), FerroError> {
+        if *lock(&self.depose_once) {
+            *lock(&self.depose_once) = false;
+            *lock(&self.leader) = Some(NodeId(99));
+            return Ok(());
+        }
         if *lock(&self.depose_on_pump) {
             *lock(&self.leader) = Some(NodeId(99));
             return Ok(());
@@ -735,7 +771,11 @@ impl Replicated for Scripted {
     }
 
     fn leader(&self) -> Option<NodeId> {
-        *lock(&self.leader)
+        let who = *lock(&self.leader);
+        if who != Some(self.node) {
+            *lock(&self.reads_while_deposed) += 1;
+        }
+        who
     }
 }
 
@@ -1021,13 +1061,27 @@ fn a_fork_on_a_node_that_does_not_lead_is_refused_and_creates_nothing() {
     );
 }
 
-/// A merge that loses its leader **while waiting on a round** must refuse, rather than block a
-/// client until the pump budget runs out. The check is inside the wait loop and not only at its
-/// entry, because losing office during the wait is the case that actually happens.
+/// A merge that loses its leader **while waiting on a round** must still terminate, rather than
+/// block a client until something notices. What it may **not** do is report the lapse as a verdict
+/// on the operation.
+///
+/// ⚠ **D173 changed this test's expected error, and the change is a specification change, not a
+/// weakening.** It used to require `FerroError::NotLeader` from inside the wait. That refusal was
+/// unsafe: both callers of `pump_until` reach it *after* their command has been proposed, so a
+/// lapse seen there says nothing about whether the command committed — and `NotLeader` is
+/// documented as transient and retryable, which is precisely the wrong advice about an operation
+/// that may already have landed. The wait now polls through the lapse (option 2: a deposed leader
+/// is still a follower and can still observe the round arrive) and, if the budget runs out, says
+/// what is actually known.
+///
+/// Both halves of the original claim survive and are asserted below: the wait **terminates**, and
+/// a deposed leader **publishes nothing**. What is added is that it kept looking — the whole
+/// remaining budget, not one turn — and that its refusal no longer claims nothing happened.
 #[test]
 fn a_merge_that_loses_the_leadership_while_waiting_refuses_rather_than_blocking() {
+    const BUDGET: u32 = 1_000;
     let (mut db, repl, agents) = scripted_cluster();
-    let agents = agents.with_pump_budget(1_000);
+    let agents = agents.with_pump_budget(BUDGET);
     // Deliberately not settled: the fork is proposed and not yet applied, so the merge must wait.
     let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
     db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
@@ -1037,11 +1091,159 @@ fn a_merge_that_loses_the_leadership_while_waiting_refuses_rather_than_blocking(
     let txn = db.txn.clone();
     let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
     let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+
+    // **It kept looking.** The first turn is spent as leader — the lapse is scripted into that
+    // turn's `pump` — so every one of the remaining `BUDGET - 1` turns read a non-leader and
+    // carried on anyway. The pre-D173 code read exactly one and returned; the arithmetic is what
+    // separates "polled through the lapse" from "aborted on it", and `> 0` would not.
+    assert_eq!(
+        repl.reads_while_deposed(),
+        BUDGET - 1,
+        "the wait did not poll through the leadership lapse: it looked at the leader {} times \
+         while deposed, and polling through would have looked {} times",
+        repl.reads_while_deposed(),
+        BUDGET - 1
+    );
+    // **It terminated**, which is the original claim and is still the reason the bound exists.
+    let msg = format!("{e}");
+    assert!(matches!(e, FerroError::Merge(_)), "the wait ended in the wrong class of error: {msg}");
+    // **And it did not lie.** The old wording ended "nothing was published", which is a statement
+    // about the *cluster* that this node is in no position to make once it has proposed.
     assert!(
-        matches!(e, FerroError::NotLeader { .. }),
-        "a leader deposed mid-wait blocked until its budget ran out instead of refusing: {e}"
+        !msg.contains("nothing was published"),
+        "a post-propose timeout still tells the client nothing happened: {msg}"
+    );
+    assert!(
+        msg.contains("timeout on OBSERVATION") && msg.contains("may yet commit"),
+        "the timeout does not say what it actually knows: {msg}"
+    );
+    assert!(
+        msg.contains("lost the leadership while waiting"),
+        "the lapse was swallowed instead of reported as the diagnosis it is: {msg}"
     );
     assert_eq!(db.main_qty(1), Some(100), "a deposed leader published a merge");
+}
+
+/// **The lie, at the one moment it is a lie: the operation commits.**
+///
+/// A leadership lapse lands *inside* the merge's wait — on the turn after the merge command was
+/// proposed — and then the cluster goes on to apply that command anyway, which is exactly what a
+/// deposed leader whose entry already reached a quorum sees. Before D173 the leadership check at
+/// the head of `pump_until` aborted the wait with `NotLeader`, so the client was told the merge
+/// had failed *while this very node was about to seal and publish it*. The branch would then be
+/// sealed as merged with its rows unpublished, and the client — told a transient, retryable
+/// error — would re-run a `MERGE` that is refused as not-live.
+///
+/// # Where this injects, and why not at the call site
+///
+/// `bench/cluster_agents_notleader_retry_firecheck.txt` substitutes the **return value** at the
+/// caller (`if attempt == 0 { Err(NotLeader) } else { agents.merge(..) }`), so `agents.merge` never
+/// ran on the forced attempt. That exercised the caller's retry and says nothing about either site
+/// that *produces* `NotLeader`. This test changes no return value: it makes the **condition inside
+/// the callee** true, by deposing the node on a turn of the driver that `pump_until` is itself
+/// running, and lets the check at the head of that loop see a real lapse on a real in-flight
+/// round. `reads_while_deposed` is what proves the check looked.
+#[test]
+fn a_leadership_lapse_mid_wait_does_not_fail_a_merge_the_cluster_goes_on_to_commit() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+
+    // Lose office one turn into the merge's wait, and keep applying after it: the merge command is
+    // already in the log, a quorum has it, and the new leader commits it.
+    repl.depose_for_one_turn_then_keep_applying();
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = agents.merge(&mut ctx, cs.branch()).unwrap_or_else(|e| {
+        panic!(
+            "a leadership lapse inside the wait failed a merge that the cluster committed at the \
+             very next turn — the client is told `{e}` about an operation that landed"
+        )
+    });
+
+    // **The check saw the lapse.** Exactly one non-leader read: `require_leader` ran before the
+    // lapse and read the leader, so this one can only be `pump_until`'s own check. Zero here would
+    // mean the wait finished before anything was deposed and the test is about nothing.
+    assert_eq!(
+        repl.reads_while_deposed(),
+        1,
+        "the leadership check inside the wait never observed the lapse, so this test exercised \
+         nothing: reads while deposed = {}",
+        repl.reads_while_deposed()
+    );
+    // **And the operation really did commit**, which is what makes the old refusal a lie rather
+    // than a pessimistic guess.
+    assert_eq!(report.merge_round, Some(2), "the merge did not linearize where the log says it did");
+    assert!(
+        matches!(lock(agents.ledger()).verdict_at(2), Some(MergeVerdict::Applied { .. })),
+        "round 2 is not an applied merge, so nothing committed across the lapse: {:?}",
+        lock(agents.ledger()).verdict_at(2)
+    );
+    assert!(report.report.applied_to_target, "the committed merge was not published");
+    assert_eq!(
+        db.main_qty(1),
+        Some(42),
+        "the branch's row never reached the target, so a merge the cluster sealed left the trunk \
+         holding the old value — the divergence the header calls the one window it cannot close"
+    );
+    assert_eq!(agents.cost().quorum_waits, 1, "the merge did not actually block on the cluster");
+}
+
+/// A **post-propose** timeout may not tell the client nothing happened.
+///
+/// This is the wait at the merge's own round rather than the fork's, which is the case where the
+/// old wording was most false: the merge command is in the log, every node will decide it, and the
+/// only thing this node can honestly report is that it stopped looking. `Replicated::propose`
+/// says so itself — the round it returned is not an acknowledgement.
+#[test]
+fn a_timeout_after_the_merge_was_proposed_says_it_stopped_looking_not_that_nothing_happened() {
+    const BUDGET: u32 = 1_000;
+    let (mut db, repl, agents) = scripted_cluster();
+    let agents = agents.with_pump_budget(BUDGET);
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+    // The fork is applied, so the merge's *own* round is the one that is waited on and lost.
+    repl.depose_on_next_pump();
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+    let msg = format!("{e}");
+
+    // The premise this test is about: the command really was proposed before the wait began.
+    let log = repl.log_commands();
+    assert_eq!(log.len(), 2, "expected the fork and the merge in the log, got {log:?}");
+    assert!(
+        matches!(log[1], Command::Branch { op: BranchOp::Merge { .. } }),
+        "the second round is not the merge, so this timeout is not the post-propose case: {log:?}"
+    );
+
+    assert!(
+        !msg.contains("nothing was published"),
+        "the client is told nothing happened about a merge command that is in the log: {msg}"
+    );
+    assert!(
+        msg.contains("timeout on OBSERVATION") && msg.contains("not a report that nothing happened"),
+        "the timeout does not name itself as an observation timeout: {msg}"
+    );
+    assert!(
+        msg.contains("this node published no rows"),
+        "the timeout dropped the one thing it does know — what happened locally: {msg}"
+    );
+    assert!(
+        msg.contains("may have reached a quorum and may yet commit"),
+        "the timeout does not say the operation may still land: {msg}"
+    );
+    assert!(
+        msg.contains("a second attempt at an operation that committed is not a no-op"),
+        "the timeout gives no guidance about the retry it used to invite unconditionally: {msg}"
+    );
+    assert_eq!(db.main_qty(1), Some(100), "rows were published on a wait that timed out");
 }
 
 /// A merge that loses its leader mid-flight must refuse and publish nothing, rather than block a
@@ -1474,7 +1676,7 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     // OTHER error fails immediately, and running out of attempts fails loudly with the last one.
     let mut attempt = 0;
     let report = loop {
-        // D173 instrument -- see the identical note in the neighbouring test.
+        // D173 instrument and assertion -- see the identical note in the neighbouring test.
         let p_before = agents.cost().proposals;
         match agents.merge(&mut ctx, cs.branch()) {
             Ok(r) => break r,
@@ -1487,6 +1689,12 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
                     agents.cost().proposals - p_before,
                     lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
                 ));
+                assert_eq!(
+                    agents.cost().proposals - p_before,
+                    0,
+                    "a NotLeader came back AFTER a round was proposed, so the merge may already \
+                     have committed and this retry is not safe"
+                );
                 drop(ctx);
                 fleet.hold_leader(leader, "followers-log/retry-arm");
                 let bp = db.bp.clone();
@@ -1577,11 +1785,17 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
         // test still passed, so the recovery works rather than merely compiling.
         let mut attempt = 0;
         let r = loop {
-            // D173 instrument. `proposals` increments inside `merge` only after `propose` has
-            // assigned a round, so its delta across one failed attempt says WHICH `not_leader`
-            // call site refused: 0 is `require_leader` before anything was proposed (benign), 1 is
-            // `pump_until`'s re-check AFTER the entry is in the log (the output-commit window).
-            // Nothing here changes an assertion; a green run stays green and now says why.
+            // D173 instrument, now an assertion. `proposals` increments inside `merge` only after
+            // `propose` has assigned a round, so its delta across one failed attempt says WHICH
+            // call site refused: 0 is `require_leader` before anything was proposed, 1 would be a
+            // refusal raised AFTER the entry reached the log.
+            //
+            // **Since D173 the second case cannot happen and this asserts it.** `pump_until` no
+            // longer turns a leadership lapse into `NotLeader`, so every `NotLeader` out of
+            // `merge` is pre-propose and therefore genuinely retryable — which is the precondition
+            // this retry arm has always silently assumed. A delta of 1 here means a post-propose
+            // refusal came back, the assumption is void, and retrying re-runs an operation that
+            // may have committed.
             let p_before = agents.cost().proposals;
             match agents.merge(&mut ctx, cs.branch()) {
                 Ok(r) => break r,
@@ -1594,6 +1808,12 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
                         agents.cost().proposals - p_before,
                         lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
                     ));
+                    assert_eq!(
+                        agents.cost().proposals - p_before,
+                        0,
+                        "branch {row}: a NotLeader came back AFTER a round was proposed, so the \
+                         merge may already have committed and this retry is not safe"
+                    );
                     drop(ctx);
                     fleet.hold_leader(leader, "hundred-writes/retry-arm");
                     let bp = db.bp.clone();

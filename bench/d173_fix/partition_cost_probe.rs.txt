@@ -1,0 +1,69 @@
+// ================= D173 COST PROBE — TEMPORARY, NOT FOR COMMIT =================
+struct PartitionableSeam {
+    me: usize,
+    fleet: Arc<Fleet>,
+    /// Once set, `pump` drives ONLY this node: the peers' sockets go unread, so nothing this node
+    /// proposes can reach a quorum and its lease dies. A real partition, not a faked `leader()`.
+    partitioned: Mutex<bool>,
+}
+impl Replicated for PartitionableSeam {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> { self.fleet.reps[self.me].propose(c) }
+    fn committed_head(&self) -> Round { self.fleet.reps[self.me].committed_head() }
+    fn pump(&self) -> Result<(), FerroError> {
+        if *lock(&self.partitioned) {
+            return self.fleet.reps[self.me].pump();
+        }
+        for r in &self.fleet.reps { r.pump()?; }
+        Ok(())
+    }
+    fn leader(&self) -> Option<NodeId> { self.fleet.reps[self.me].leader() }
+}
+
+#[test]
+fn d173_probe_partition_cost() {
+    for budget in [5_000u32] {
+        let mut db = Db::new();
+        db.seed();
+        let fleet = Fleet::start(3);
+        let leader = fleet.elect();
+        let me = NodeId(leader as u32 + 1);
+        let seam = Arc::new(PartitionableSeam {
+            me: leader,
+            fleet: fleet.clone(),
+            partitioned: Mutex::new(false),
+        });
+        let agents = ClusterAgents::new(me, db.runtime.clone(), seam.clone(), fleet.ledgers[leader].clone())
+            .with_pump_budget(budget);
+        let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+        fleet.settle_to(cs.fork_round);
+        db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+
+        let hs_before = ferrodb::consensus::node::D173_HARD_STATE_WRITES
+            .load(std::sync::atomic::Ordering::Relaxed);
+        *lock(&seam.partitioned) = true;
+        let bp = db.bp.clone();
+        let txn = db.txn.clone();
+        let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+        let t0 = std::time::Instant::now();
+        let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+        let ms = t0.elapsed().as_millis();
+        drop(ctx);
+        loopcount(format_args!(
+            "D173COST budget={budget} ms={ms} us_per_turn={} lapse_named={} err_class={}",
+            (t0.elapsed().as_micros() as u64) / budget as u64,
+            format!("{e}").contains("lost the leadership while waiting"),
+            if matches!(e, FerroError::Merge(_)) { "Merge" } else { "OTHER" }
+        ));
+        let (terms, role) = fleet.reps[leader].with_node(|n| {
+            (n.take_transitions().len(), format!("{:?}", n.role()))
+        });
+        let term_now = fleet.reps[leader].with_node(|n| format!("{:?}", n.term()));
+        loopcount(format_args!(
+            "D173FSYNC budget={budget} role_transitions={terms} role_now={role} term_now={term_now} \
+             hard_state_writes_during_partition={} POSITIVE_CONTROL_writes_before_partition={hs_before}",
+            ferrodb::consensus::node::D173_HARD_STATE_WRITES
+                .load(std::sync::atomic::Ordering::Relaxed) - hs_before
+        ));
+        fleet.shutdown();
+    }
+}

@@ -1,0 +1,253 @@
+D181 PRE-REGISTRATION — expected counter values, derived from SOURCE, before the run
+====================================================================================
+
+Written and committed BEFORE the tests below were executed. Every number here comes from reading
+src/optimizer/cost_model.rs, src/optimizer/optimizer.rs and src/execution/sec_index_scan.rs and
+doing the arithmetic by hand. None of it is copied from a run. Amendments append only, at the
+bottom, dated and labelled.
+
+Requested by the team lead: "PRE-REGISTER the expected counter values from the source BEFORE
+running — not from what the run prints."
+
+Tree: branch d179-sec-index, parent of the commit that adds this file. Base 727a8ec.
+
+
+CONSTANTS (src/optimizer/cost_model.rs)
+---------------------------------------
+  DEFAULT_SEQ_PAGE_COST      1.0
+  DEFAULT_RANDOM_PAGE_COST   4.0
+  DEFAULT_CPU_TUPLE_COST     0.01
+  DEFAULT_RANGE_SELECTIVITY  0.25
+  DEFAULT_TABLE_ROWS         1000
+  DEFAULT_DISTINCT           100
+  DEFAULT_INDEX_FANOUT       100.0
+  DEFAULT_ENTRIES_PER_LEAF   100.0
+
+FORMULAE (cost_model.rs::cost)
+------------------------------
+  IndexScan:  rows   = max(base.rows * bound_selectivity(col, lower, upper), 1.0)
+              height = tree_height(BASE.rows)      <- base.rows, not rows
+              leaves = max(ceil(rows / 100), 1)
+              cost   = height*4 + leaves*1 + rows*4   (+ rows*4 again when column != 0)
+  Filter:     cost   = child.cost + child.stats.rows * 0.01
+  SeqScan:    cost   = table_pages * 1.0 + rows * 0.01     (table_pages >= 1 always)
+  tree_height(r) = 1.0 if r <= 1 else max(ceil(ln r / ln 100), 1.0)
+  apply_unique_key_fact: columns[0].distinct = row count, statistics or not (D56)
+
+
+(a) `v > 3990 AND id = 399`  — tests/d178_dml_index_counters.rs section 4, UNTOUCHED
+-----------------------------------------------------------------------------------
+Fixture: t(id INTEGER NOT NULL, v INTEGER, label VARCHAR(16)), 400 rows, v = id*10,
+         CREATE INDEX ix ON t (v), **no ANALYZE**.
+
+No statistics, so base_stats falls back: rows = 1000, every column distinct = 100, min/max = None;
+then columns[0].distinct = 1000 by the unique-key fact.
+
+  candidate `id = 399`   IndexScan{col 0, [399, 399]}
+      sel  = 1/1000                     (lo == hi arm)
+      rows = max(1000 * 0.001, 1.0)     = 1.0
+      cost = 2*4 + 1*1 + 1*4            = 13.0       (column 0: no second random-page term)
+      + Filter(v > 3990)  + 1 * 0.01    = 13.01
+
+  candidate `v > 3990`   IndexScan{col 1, (3990, inf)}
+      sel  = 0.25                       (min/max are None -> DEFAULT_RANGE_SELECTIVITY)
+      rows = max(1000 * 0.25, 1.0)      = 250.0
+      cost = 2*4 + 3*1 + 250*4 + 250*4  = 2011.0
+      + Filter(id = 399)  + 250 * 0.01  = 2013.5
+
+  incumbent              Filter{SeqScan}
+      cost = P + 1000*0.01 + 1000*0.01  = P + 20  >= 21      (P = table_pages >= 1)
+
+  CHEAPEST = 13.01, the PRIMARY KEY point lookup.
+
+  ==> PRE-REGISTERED: heap tuples pulled sequentially = 0, via `id = 399`. Index scans >= 1.
+      13.01 < 2013.5 and 13.01 < 21 are STRICT, so this outcome does not depend on tie-breaking
+      and does not depend on which conjunct was typed first.
+
+  (Before D181's fix, with D179 in: `position` took `v > 3990`, 2013.5 lost to the sequential
+   scan, and the statement read all 400 rows. That is the 400-vs-0 failure this row was found by.)
+
+
+(b) ORDER SWAP — tests/d181_conjunct_order_independence.rs
+----------------------------------------------------------
+Fixture: t(id INTEGER NOT NULL, sel INTEGER, broad INTEGER, pad VARCHAR(16)), n = 1000,
+         sel = id, broad = id % 2, CREATE INDEX on BOTH sel and broad, ANALYZE t.
+
+  Statistics: rows 1000; columns[1] sel  distinct 1000, min 0, max 999
+                         columns[2] broad distinct 2,    min 0, max 1
+
+  Predicate A: `sel = 501 AND broad = 1`      (cheaper conjunct typed FIRST)
+  Predicate B: `broad = 1 AND sel = 501`      (cheaper conjunct typed SECOND)
+
+  candidate SEL    IndexScan{col 1, [501, 501]}
+      sel  = 1/1000, rows = 1.0
+      cost = 2*4 + 1*1 + 1*4 + 1*4      = 17.0      (column != 0: BOTH random-page terms)
+      + Filter(broad = 1) + 1 * 0.01    = 17.01
+
+  candidate BROAD  IndexScan{col 2, [1, 1]}
+      sel  = 1/2,    rows = 500.0
+      cost = 2*4 + 5*1 + 500*4 + 500*4  = 4013.0
+      + Filter(sel = 501) + 500 * 0.01  = 4018.0
+
+  incumbent        Filter{SeqScan}       = P + 20  >= 21
+
+  CHEAPEST = 17.01, candidate SEL, in BOTH typing orders. Strict on both sides
+  (17.01 < 4018.0 and 17.01 < 21), so this test does NOT rest on tie-breaking.
+
+  Counters for that plan, derived from the scanner walk in
+  optimizer::secondary_scan_start + execution::sec_index_scan::next:
+
+      secondary_scan_start(Included(501))            = Included((501, Null))
+      range_scan((501,Null), Unbounded) -> binary_search lands on (501, 501),
+        because Null sorts below every pk and sel = id makes the entry (501, 501)
+      next() #1  yields (501,501)   examined = 1   not past, not before   -> RETURNS the row
+      next() #2  yields (502,502)   examined = 2   502 > upper 501        -> None
+      Drop       INDEX_SCANS += 1, INDEX_SCAN_ENTRIES += 2
+      no SeqScan is constructed                     SEQ_SCANS += 0, SEQ_SCAN_TUPLES += 0
+
+  ==> PRE-REGISTERED, IDENTICAL FOR BOTH TYPING ORDERS:
+          seq_scans      = 0
+          seq_tuples     = 0
+          index_scans    = 1
+          index_entries  = 2
+          rows returned  = 1
+
+      The entries count is 2 and not 1 because the scan must READ the first entry past the upper
+      bound in order to learn that it is past it. That entry is counted where the tree yielded it.
+
+  ==> PRE-REGISTERED FIRE-CHECK (same fixture, `pad = 'zz'`, no index on pad):
+          seq_tuples = 1000, index_scans = 0, rows returned = 0.
+
+  ==> PRE-REGISTERED FAILS-BEFORE: with `position` (pre-D181), order B takes the BROAD conjunct,
+      4018.0 loses to the sequential scan, and order B reports seq_tuples = 1000 / index_scans = 0
+      while order A reports 0 / 1. The two orders disagree. That disagreement is the defect.
+
+
+(c) EXACT COST TIE — tests/d181_tie_break.rs
+--------------------------------------------
+Fixture: t(id INTEGER NOT NULL, a INTEGER, b INTEGER, pad VARCHAR(16)), n = 1000,
+         a = id AND b = id (IDENTICAL data), CREATE INDEX on both, ANALYZE t.
+
+  a and b hold identical values, so ANALYZE gives them identical ColumnStats
+  (distinct 1000, min 0, max 999, nulls 0). `cost` reads nothing else about a column, and both
+  are column != 0, so the two candidates evaluate the SAME formula on the SAME inputs:
+
+      candidate A  IndexScan{col 1, [5,5]}  rows 1.0  cost 17.0  + Filter(b = 5)  = 17.01
+      candidate B  IndexScan{col 2, [5,5]}  rows 1.0  cost 17.0  + Filter(a = 5)  = 17.01
+
+  These are bitwise-equal f64: an EXACT tie, and both beat the incumbent (>= 21).
+
+  Tie-break key (optimizer::candidate_key) = (column, bound_key(lower), bound_key(upper)).
+  A's key is (1, ..) and B's is (2, ..), so A < B.
+
+  ==> PRE-REGISTERED: BOTH typing orders — `a = 5 AND b = 5` and `b = 5 AND a = 5` — choose
+      COLUMN 1, i.e. EXPLAIN contains "Index scan on t (col 1,".
+
+  ==> PRE-REGISTERED FAILS-BEFORE: with a strict `<` and no tie-break key, the first-typed
+      candidate wins the tie, so `a = 5 AND b = 5` chooses col 1 and `b = 5 AND a = 5` chooses
+      col 2. Typing order still decides. That is the residual the team lead flagged.
+
+
+WHAT WOULD FALSIFY THE FIX
+--------------------------
+  * (b) reporting different counters for the two typing orders.
+  * (c) reporting different columns for the two typing orders.
+  * the fire-check in (b) reporting anything other than 1000 sequential tuples — the counter would
+    then be unable to show the bad case, and every zero above would be vacuous.
+  * any arm returning the wrong number of rows. An arm that stopped answering is not a faster arm.
+
+
+================================================================================
+AMENDMENT 1 -- 2026-09-23, after the merge of main @ 0e20c72
+================================================================================
+Append-only, as the header requires. Nothing above is edited.
+
+PRE-REGISTERED SUITE COUNT FOR THE MERGED TIP: 2560 per-target.
+
+Written BEFORE the run, and derived rather than recalled:
+
+  merge-base of main and d179-sec-index          = 727a8ec  (git merge-base; it is
+                                                             this branch's own base)
+  this branch's per-target total, MEASURED       = 2558     (run 3, head=54cf116)
+  this branch's addition, MEASURED per target    =  +13     (cargo test <target> -- --list
+                                                             at 727a8ec and at 54cf116:
+                                                             --lib 1661->1662, plus 7+1+1+3)
+  => 727a8ec                                     = 2545     (derived: 2558 - 13)
+
+  main's addition since 727a8ec                  =   +2     (D173; tests/integration_cluster_agents.rs
+                                                             35 -> 37 `#[test]`. Indicative --
+                                                             `#[test]` occurrences are NOT a test
+                                                             count in general, so this is the weakest
+                                                             link in the chain and is flagged as such.
+                                                             The team lead derived the same +2
+                                                             independently from D173's own record.)
+  => main @ 0e20c72                              = 2547     (derived)
+
+  => MERGED TIP                                  = 2560     (2545 + 13 + 2)
+
+WHAT A DIFFERENT NUMBER WOULD MEAN, stated before seeing one:
+  * 2558  -- the merge did not bring D173's tests in. Check the merge actually took.
+  * 2547  -- this branch's own tests are not being collected. That is the serious one.
+  * anything else -- something moved beyond these two changes, and THAT is the finding
+    rather than a nuisance to be explained away.
+
+MERGE HYGIENE, recorded because it is what the gate refused twice for:
+  merged main @ 0e20c72 into 54cf116, clean, no conflicts. The merge touched
+  9 files: 6 bench text files, src/agent_sql/cluster.rs,
+  tests/integration_cluster_agents.rs and tools/staleness.sh. NONE of them is a
+  file this branch edits. All 13 files this branch owns were verified
+  BYTE-IDENTICAL across the merge by sha, before the suite was launched.
+
+
+================================================================================
+AMENDMENT 2 -- 2026-09-23, after the merge of main @ e7210ed (D184)
+================================================================================
+Append-only. Nothing above is edited. Amendment 1 is NOT withdrawn -- it was
+correct for the tree it named and its prediction of 2560 was met exactly.
+
+PRE-REGISTERED SUITE COUNT FOR THE NEW MERGED TIP: 2564 per-target.
+
+WHY THERE IS A SECOND AMENDMENT AT ALL. Amendment 1 predicted 2560 and the
+suite measured 2560 at head=4e5e22e, rc=0, failed=0. That certification was
+valid and is not being discarded. But main moved from 0e20c72 to e7210ed while
+that result was being written up -- D184 landed -- so the branch went from 0
+behind to 5 behind and the green stopped being landable. This is the third time
+the gap between a green suite and the gate has gone stale, and the lesson is
+the same each time: merge and suite are ONE action, and a report written
+between them is "other work".
+
+DERIVATION, two independent routes to the same number:
+
+  route A, from main's measured count
+    main @ ed52543, MEASURED by the team lead's D184 suite   = 2551
+      (mode=per-target rc=0 passed=2551 failed=0 head=ed52543;
+       e7210ed is the merge commit of that same tree)
+    this branch's addition, MEASURED per target              =  +13
+      (--lib +1, and 7+1+1+3 for the four new test files, all read from
+       this branch's own run-4 verdict lines at head=4e5e22e)
+    => 2551 + 13                                             = 2564
+
+  route B, from this branch's measured count
+    this branch @ 4e5e22e, MEASURED                          = 2560
+    D184's addition since 0e20c72                            =   +4
+      (corroborated two ways: the lead's suite gives 2551 - 2547 = 4, and an
+       anchored diff of ^[+-][[:space:]]*#\[test\] over src/ between 0e20c72
+       and main gives 4 added / 0 removed, in src/replication/sync.rs.
+       The harness number is the instrument; the grep is only corroboration --
+       `#[test]` occurrences are not a test count in general.)
+    => 2560 + 4                                              = 2564
+
+Two routes, two different measured anchors, same answer.
+
+WHAT A DIFFERENT NUMBER WOULD MEAN, stated before seeing one:
+  * 2560 -- the merge did not bring D184's tests in.
+  * 2551 -- this branch's own tests are not being collected. The serious one.
+  * 2562 -- D184 contributed 2, not 4, and the anchored grep over-counted;
+            that would be a finding about the instrument, not about the code.
+  * anything else -- something moved beyond these two changes, and THAT is the
+    finding rather than a nuisance to be explained away.
+
+MERGE HYGIENE: main @ e7210ed merged clean into 4e5e22e, no conflicts, touching
+2 files -- examples/repl_primary.rs and src/replication/sync.rs. Neither is a
+file this branch edits. All 14 files this branch owns verified BYTE-IDENTICAL
+across the merge by sha before the suite was launched.

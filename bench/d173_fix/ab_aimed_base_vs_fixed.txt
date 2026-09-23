@@ -1,0 +1,24 @@
+rep1 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 6 merges n3/b1, which is Merged { at: 3 }
+rep1 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep2 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep2 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 6 merges n1/b1, which is Merged { at: 3 }
+rep3 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 8 merges n1/b1, which is Merged { at: 5 }
+rep3 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep4 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep4 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 7 merges n1/b1, which is Merged { at: 3 }
+rep5 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 9 merges n2/b1, which is Merged { at: 6 }
+rep5 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep6 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep6 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 8 merges n3/b1, which is Merged { at: 3 }
+rep7 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 10 merges n3/b1, which is Merged { at: 3 }
+rep7 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep8 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep8 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 6 merges n3/b1, which is Merged { at: 3 }
+rep9 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 9 merges n3/b2, which is Merged { at: 7 }
+rep9 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep10 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep10 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 6 merges n1/b1, which is Merged { at: 3 }
+rep11 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 10 merges n2/b1, which is Merged { at: 7 }
+rep11 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep12 FIXED | test result: ok | notleader=0 proposed1=0 proposed0=0 | sig=none
+rep12 BASE | test result: FAILED | notleader=1 proposed1=1 proposed0=0 | sig=merge error: round 6 merges n1/b1, which is Merged { at: 3 }

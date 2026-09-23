@@ -23,12 +23,43 @@ use crate::storage::heap_file_manager::RecordId;
 /// the wrong one would send a fix to the wrong function.
 ///
 /// ⚠ One relaxed add per SCAN in `Drop`, never per row — the rule at `agent_sql/runtime.rs:115`.
-/// Only the scan COUNT is kept: rows are already covered by the counters this pairs with.
+/// The per-entry total lives in [`INDEX_SCAN_ENTRIES`], accumulated in a plain field and flushed
+/// beside this one.
+///
+/// **D179 — `SecondaryIndexScan` flushes into this too, and did not before.** Until D179 only the
+/// primary-tree `IndexScan` had a `Drop`, so a statement served entirely by a secondary index
+/// reported ZERO index scans: the shape a statement that reached no index at all reports. Nothing
+/// depended on the gap while `sec > v` could not use the index; D179 makes secondary range scans
+/// reachable from the optimizer, so leaving it would have made the counter read "no index" for
+/// exactly the plans D179 adds.
 pub static INDEX_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// **Index entries the scan walked — D181's rows-examined instrument.**
+///
+/// Every `(key, value)` the tree's `RangeScanner` yielded, counted where the scanner yielded it and
+/// BEFORE visibility filtering, the primary lookup, or the `sec == v` skip — the engine paid for
+/// the entry whether or not the caller ever sees the row. Terminating entries count: the one whose
+/// key is past `sec_upper` was read to learn that.
+///
+/// This is the number `INDEX_SCANS` alone cannot give. Two plans that each run exactly one index
+/// scan report `1` apiece however much of the tree they walk, so a choice BETWEEN two indexes is
+/// invisible in the scan count and plain in this one. `SEQ_SCAN_TUPLES` is its sequential-side
+/// twin; the pair is what makes "rows examined" answerable for any access path.
+///
+/// ⚠ Same rule as `SEQ_SCAN_TUPLES`: one relaxed add per scan in `Drop`, never per entry. A
+/// per-entry `fetch_add` on a shared line is the one shape that could manufacture the slope it is
+/// there to measure.
+pub static INDEX_SCAN_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 /// Index scans since process start. Read twice and subtract to scope it to a phase.
 pub fn index_scan_counter() -> u64 {
     INDEX_SCANS.load(Ordering::Relaxed)
+}
+
+/// `(scans, entries_examined)` since process start — the pair, read together. Read twice and
+/// subtract to scope it to a phase, exactly as `seq_scan_counters` is used.
+pub fn index_scan_counters() -> (u64, u64) {
+    (INDEX_SCANS.load(Ordering::Relaxed), INDEX_SCAN_ENTRIES.load(Ordering::Relaxed))
 }
 
 pub struct IndexScan {
@@ -37,11 +68,28 @@ pub struct IndexScan {
     pub schema: Schema,
     pub view: Arc<ReadView>,
     pub tt_heap: HeapFileManager,
+    /// D181 — entries pulled, accumulated locally and flushed once in `Drop`. Not `pub`: a caller
+    /// that could set it could forge the measurement. See `SeqScan::pulled`.
+    examined: u64,
+}
+
+impl IndexScan {
+    /// The only way to build one, so `examined` cannot start at anything but zero.
+    pub fn new(
+        heap: HeapFileManager,
+        scanner: RangeScanner<Value, RecordId>,
+        schema: Schema,
+        view: Arc<ReadView>,
+        tt_heap: HeapFileManager,
+    ) -> Self {
+        Self { heap, scanner, schema, view, tt_heap, examined: 0 }
+    }
 }
 
 impl Drop for IndexScan {
     fn drop(&mut self) {
         INDEX_SCANS.fetch_add(1, Ordering::Relaxed);
+        INDEX_SCAN_ENTRIES.fetch_add(self.examined, Ordering::Relaxed);
     }
 }
 
@@ -52,6 +100,8 @@ impl Executor for IndexScan {
                 Ok((k ,v)) => (k,v),
                 Err(e) => return Some(Err(e))
             };
+            // Counted where the tree yielded it, before anything can discard it. Plain field.
+            self.examined += 1;
             let tuple = match self.heap.read(rid) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e))

@@ -69,12 +69,36 @@ if [ "${BREAK_PS:-0}" = "1" ]; then
     chmod +x "$FAKEBIN/ps"
 fi
 
-held=0; keeper=""
+held=0; keeper=""; lock_pid=
 kids() { pgrep -f "$PAT" 2>/dev/null; }
+# LOCK-RELEASE-OWNERSHIP-CHECKED (D188). `[ "$held" = 1 ] && rm -rf "$LOCK"` tests a flag meaning
+# "I acquired A lock once" and never asks whether the directory on disk is still THE lock it
+# acquired. That shape fired live on 2026-09-23 and deleted a RUNNING suite's lock. Remove only on
+# a pid match; anything else refuses and warns. Reasoning: note 8 in tools/verify-suite.sh.
+release_lock_if_ours() {
+    [ "$held" = 1 ] || return 0
+    held=0
+    [ -d "$LOCK" ] || { echo "WARNING: held $LOCK as pid $lock_pid; ALREADY GONE at release" >&2; return 0; }
+    local o q
+    o=$(cat "$LOCK/owner" 2>/dev/null) || o=
+    q=${o%% *}
+    case "$q" in
+        '' | *[!0-9]*)
+            echo "REFUSING to release $LOCK — owner missing or unparseable (read: '$o'); this run" >&2
+            echo "  held it as pid $lock_pid. Leaving the directory alone." >&2
+            return 0 ;;
+    esac
+    [ "$q" = "$lock_pid" ] || {
+        echo "REFUSING to release $LOCK — now owned by pid $q, not this run (pid $lock_pid)." >&2
+        echo "  Owner line: '$o'. This run's lock was removed and re-created by another run, which" >&2
+        echo "  has been running UNPROTECTED alongside it. Leaving the new owner's lock intact." >&2
+        return 0; }
+    rm -rf "$LOCK"
+}
 cleanup() {
     [ -n "$keeper" ] && kill -9 "$keeper" 2>/dev/null
     for p in $(kids); do kill -CONT "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
-    [ "$held" = 1 ] && rm -rf "$LOCK"
+    release_lock_if_ours
     rm -f "$STOPLOG"
     [ -n "$FAKEBIN" ] && rm -rf "$FAKEBIN"
     return 0
@@ -107,6 +131,7 @@ else
         sleep 15; w=$((w+15))
     done
     printf '%s %s %s\n' "$$" "d42-fire-children" "$(date -u +%FT%TZ)" > "$LOCK/owner"
+    lock_pid=$$        # what the release compares against; a flag cannot identify a directory
     held=1
 fi
 

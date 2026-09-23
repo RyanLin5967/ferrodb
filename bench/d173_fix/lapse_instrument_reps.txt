@@ -1,0 +1,25 @@
+inst_rep1: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep1: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep2: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep2: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep3: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+inst_rep3: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+inst_rep4: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep4: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep5: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+inst_rep5: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+inst_rep6: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep6: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep7: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep7: D173LAPSE-INSTRUMENT what=round 3, the merge of n3/b1 saw=None
+inst_rep8: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+inst_rep8: D173LAPSE-INSTRUMENT what=round 3, the merge of n1/b1 saw=None
+negative_control: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 2.01s
+inst_rep1 lapse_prints=155
+inst_rep2 lapse_prints=103
+inst_rep3 lapse_prints=208
+inst_rep4 lapse_prints=192
+inst_rep5 lapse_prints=209
+inst_rep6 lapse_prints=173
+inst_rep7 lapse_prints=185
+inst_rep8 lapse_prints=203

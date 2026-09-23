@@ -14,6 +14,16 @@
 //! The plan is printed whole, not just its top line: `EXPLAIN` renders a tree and the access path
 //! is at the BOTTOM of it. An earlier probe in this row printed only the first line and got
 //! `Projection [#0]` for every row, which says nothing about whether an index was used.
+//!
+//! ⚠ **THE GUARD THIS DIFFS AGAINST NO LONGER EXISTS — D179.** `lower` can now build a secondary
+//! `IndexScan` with a strictly excluded lower bound, so `build_index_scan` has nothing to decline
+//! and `index_scan_lowerable` has been deleted. There is no "tree with the H1 guard removed" to
+//! build any more, so the diff this harness instructs is not runnable and its banked output is a
+//! record of the tree at the time it was taken, not a check anyone can repeat.
+//!
+//! D181 also changed what this would print even where it still runs: candidate selection is now
+//! the cheapest usable conjunct rather than the leftmost, so a multi-conjunct predicate may choose
+//! a different access path than the banked output shows, and correctly so.
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;

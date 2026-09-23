@@ -141,7 +141,9 @@ fn main() {
                     };
                     // A Hello IS the ack: the replica records its position only after the pages it
                     // describes are durable, so "send me what follows N" asserts N is safe there.
-                    acks.record(&peer, from);
+                    // The frontier bounds it: this primary cannot have shipped what it never
+                    // had, so a Hello above `durable_lsn()` is false by construction (D184).
+                    acks.record(&peer, from, src.durable_lsn());
                     match src.read_from(from, 64 * 1024) {
                         Ok((bytes, _next)) if bytes.is_empty() => {
                             let _ = Message::UpToDate { durable_lsn: src.durable_lsn() }
