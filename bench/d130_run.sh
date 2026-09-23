@@ -114,6 +114,14 @@ while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
 done
 printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
 _HELD_LOCK=1
+# The harness REFUSES to run while a live foreign holder owns this lock (see
+# `refuse_if_another_suite_holds_the_lock` in examples/d130_pgwire_batch.rs). These two exports are
+# how it recognises its own runner: it proceeds only when D130_SUITE_LOCK_OWNER matches the pid
+# actually written into <lock>/owner above, so "I hold the lock" is grounded in the lock file rather
+# than in a caller's claim. SUITE_LOCK is exported too, so the harness checks the SAME path this
+# script took rather than the default.
+export SUITE_LOCK
+export D130_SUITE_LOCK_OWNER=$$
 echo "$LABEL: holding the suite lock as pid $$ (waited ${_waited}s)" >&2
 
 run_bounded() {

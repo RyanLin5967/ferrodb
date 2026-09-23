@@ -1055,7 +1055,95 @@ fn self_check(root: &Path, prov: ProvMode) {
 
 // ---------------------------------------------------------------------------------------------
 
+/// ⛔ REFUSE TO RUN INSIDE SOMEONE ELSE'S MEASUREMENT.
+///
+/// **Added 2026-09-23 (S5) because the author of this function ran this harness during another
+/// lane's suite, having thought about it first.** The reasoning was: twelve forks, two seconds,
+/// against a suite already running beside three `cargo` builds. The reasoning was sound and the
+/// call was still wrong, for a structural reason worth writing into the code rather than a comment:
+/// **the lock exists precisely to take that judgement away from the person who wants the box.**
+/// Everyone's own contribution looks negligible — that is the mechanism by which contention
+/// accumulates. A check you have to remember is a check you will eventually skip, and that one was
+/// skipped knowingly, which is the harder version to guard against.
+///
+/// So this is a refusal, not a warning, and it has no override flag. If you genuinely need the box
+/// while a suite holds it, take the lock — `bench/d130_run.sh` does, and running under it is the
+/// supported path. A `D130_IGNORE_SUITE_LOCK=1` would just reinstate the judgement call this
+/// exists to remove.
+///
+/// **How it avoids refusing its own runner.** `bench/d130_run.sh` acquires the lock, writes its
+/// `$$` into `<lock>/owner`, and exports `D130_SUITE_LOCK_OWNER=$$`. This function proceeds only
+/// when that variable matches the pid actually recorded in the lock file — so it is grounded in
+/// observable state, not in a caller's say-so. Claiming to hold the lock requires having written
+/// the lock.
+///
+/// **It refuses when it cannot parse its own input.** A lock directory that exists with an
+/// unreadable or malformed `owner` is refused, never waved through: a guard that falls back to
+/// "allow" when confused is not a guard. The one case that proceeds is a genuinely STALE lock —
+/// the recorded holder is gone — which is the same rule, and the same reasoning,
+/// `bench/d130_run.sh` uses when it breaks a dead holder's lock.
+fn refuse_if_another_suite_holds_the_lock() {
+    let lock = std::env::var("SUITE_LOCK").unwrap_or_else(|_| "/tmp/ferrodb-suite.lock".to_string());
+    let dir = Path::new(&lock);
+    if !dir.exists() {
+        return; // Nobody is measuring. Nothing to refuse.
+    }
+    let owner_path = dir.join("owner");
+    let owner = match std::fs::read_to_string(&owner_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "d130: REFUSING. {lock} exists but its `owner` could not be read ({e}). A suite \
+                 lock this harness cannot parse is one it must not run through: falling back to \
+                 `allow` here would make the guard decorative."
+            );
+            std::process::exit(1);
+        }
+    };
+    let holder = owner.split_whitespace().next().unwrap_or("");
+    let holder_pid: i32 = match holder.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "d130: REFUSING. {lock} is held but its `owner` does not start with a pid (it \
+                 reads {owner:?}). See above: unparseable means refuse, not proceed."
+            );
+            std::process::exit(1);
+        }
+    };
+    // `kill -0`, not `ps`: `ps -e`/`-a`/`-x` override `-p` and will happily print a plausible line
+    // for the WRONG process, which is how a dead holder gets read as alive.
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &holder_pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !alive {
+        eprintln!(
+            "d130: the suite lock at {lock} records pid {holder_pid}, which is gone. Treating it \
+             as stale and proceeding — the same rule bench/d130_run.sh applies."
+        );
+        return;
+    }
+    if std::env::var("D130_SUITE_LOCK_OWNER").ok().as_deref() == Some(holder) {
+        return; // Our own runner holds it; this is the supported path.
+    }
+    eprintln!(
+        "d130: REFUSING. the machine-wide suite lock {lock} is held by a LIVE pid {holder_pid} \
+         ({}). Running now would put this harness's fsyncs inside someone else's measurement.\n\
+         \n     There is no override, deliberately. `f/sync` is a BATCH SIZE and therefore a \
+         function of the fsync latency a loaded device moves, so contention does not merely add \
+         noise to a d130 number — it INFLATES it (see this file's header band). Two seconds of \
+         'negligible' work is how that accumulates.\n\
+         \n     Run it under `bench/d130_run.sh`, which acquires the lock and exports \
+         D130_SUITE_LOCK_OWNER, or wait for the holder to finish.",
+        owner.trim()
+    );
+    std::process::exit(1);
+}
+
 fn main() {
+    refuse_if_another_suite_holds_the_lock();
     let f: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     let threads: Vec<usize> = std::env::args()
         .nth(2)
