@@ -1270,11 +1270,18 @@ impl ClusterAgents {
     /// keep looking for it until the budget says stop. The lapse is not discarded — it is named
     /// in the timeout below, where it is a diagnosis rather than a verdict.
     ///
-    /// **And continuing is not merely honest, it is the repair.** The merge's rows are node-local
-    /// to this node; if the round commits and this node refuses to publish because it lost office,
-    /// the cluster holds a branch sealed as merged whose rows never arrived — the one window this
-    /// module's header says it cannot close, opened on purpose by a node that was still alive and
-    /// still held the rows.
+    /// **And continuing is not merely honest, it is the repair — for the half of the window that
+    /// is repairable at all.** The merge's rows are node-local to this node; if the round commits
+    /// and this node refuses to publish because it lost office, the cluster holds a branch sealed
+    /// as merged whose rows are in nobody's target — the shape this module's header names, opened
+    /// on purpose by a node that was still alive and still held the rows. Publishing them here
+    /// puts *this* node's target in the state the cluster agreed on.
+    ///
+    /// It does **not** replicate them, and the claim stops there rather than being rounded up:
+    /// nothing in this layer proposes a `Command::WalBatch` for a merge — [`moves_base`]
+    /// classifies one, and no path in this file produces one — so the header's window stays open
+    /// for the node that *dies* with its rows. That is a different failure from the node that is
+    /// merely *deposed*, and only the second is reachable from inside this loop.
     ///
     /// The cost is stated rather than hidden: a node that is deposed and stays deposed now burns
     /// the whole pump budget before refusing, where it used to refuse at once. That is the price
