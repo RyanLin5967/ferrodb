@@ -1,68 +1,138 @@
-D183 FIRE-CHECK — does the new restore test actually detect a wrong delta?
-=========================================================================
+D183 FIRE-CHECK — do the D183 tests actually detect a wrong delta?
+==================================================================
 worktree: /Users/idide/wt/ferrodb-d183-reap-delta   branch: d183-reap-delta
-tree at mutation time: clean (git status --porcelain = 0 lines), HEAD 80003fa
-recorded: 2026-09-23
-instrument: `cargo test --lib branch::arena` (debug). Nothing here is a timing. Every assertion is
-            on an integer (`pending_len`) or on a byte string (`state_bytes`, CRC32-terminated).
+tree at mutation time: clean (git status --porcelain = 0 lines), HEAD 742a381
+recorded: 2026-09-23   (SUPERSEDES the version committed at cb747a2 — see the correction below)
+instrument: `cargo test --lib branch::arena::tests` and `--lib d183_adversary` (debug). Nothing
+            here is a timing. Every assertion is on an integer (`persist_counters`, `pending_len`),
+            a byte string (`state_bytes`, CRC32-terminated), or a record kind read back out of the
+            file (`ArenaPageStore::tail_kinds`).
+
+⛔ CORRECTION — THE cb747a2 VERSION OF THIS FILE DESCRIBED CODE THAT WAS NOT IN THE TREE
+-----------------------------------------------------------------------------------------
+Commit cb747a2's message says the restore test "now compares image+tail against a full rewrite
+after stage 1 and again after stage 2", and the version of this file it committed reported all
+four mutants firing against that structure. **cb747a2 contains exactly one file: this one.** The
+arena.rs restructuring it describes was still uncommitted when I ran `git checkout --
+src/branch/arena.rs` to revert mutant M1, and went with it. So:
+
+  * the committed test remained the END-ONLY version — the one M1 had just proved is masked;
+  * M1's "fires" result was measured against a version that was never committed;
+  * M2/M3/M4's results were measured against the END-ONLY version, so they are true of it but
+    were reported as being true of the other one.
+
+Nothing was wrong with the mutants or the measurements. What was wrong is that a commit message
+and an evidence file both asserted a structure the tree did not have, which is the same failure as
+a stale doc header — and it is the failure this project has hit before under exactly this cause,
+`git checkout --` eating an uncommitted fix. The code is restored at 5bfa8ab and every mutant
+below is re-run against the committed tree. **The rule that would have prevented it: commit
+before mutating, not after.** That is now how this file was produced.
 
 WHY THIS FILE EXISTS
 --------------------
-D183 replaced two full-image rewrites on the reap path with two appended tail records. The whole
-row rests on those records reproducing what the rewrite produced — and this is a durability path,
-so a record that is wrong is a page that never comes back or a page freed under a live reader. A
-green test that has never been made to fail asserts nothing about that.
+D183 replaced four full-image rewrite sites on the reap path with appended tail records. The row
+rests on those records reproducing what the rewrite produced — and this is a durability path, so a
+record that is wrong is a page that never comes back or a page freed under a live reader. A green
+test that has never been made to fail asserts nothing about that.
 
-⛔ THE FIRST VERSION OF THE TEST WAS ALREADY WRONG, AND THIS IS HOW IT WAS FOUND
---------------------------------------------------------------------------------
+⛔ THE STRUCTURAL FINDING: A DOWNSTREAM RECORD MASKS THE ONE IN FRONT OF IT
+----------------------------------------------------------------------------
 `an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite` originally ran the
-interior reap AND the drain, then compared ONCE at the end. Mutant M1 below — the parked record
-silently dropping its last entry — **PASSED that test.**
+interior reap AND the drain, then compared once at the end. Mutant M1 — the parked record silently
+dropping its last entry — PASSED that test.
 
-The reason is structural, not a slip: `TAIL_PENDING_REPLACED` carries the WHOLE pending log, so it
-restates whatever `TAIL_PAGES_PARKED` got wrong. A downstream record that re-states the same state
-masks every mutant of the one in front of it, exactly as a redundant downstream check does. The
-test now compares after EACH record, so the parked record is examined while it is still the last
-word on the log. All four mutants below are run against that version.
+The reason is structural, not a slip: the drain's record carries the pending log, so it restates
+whatever `TAIL_PAGES_PARKED` got wrong. A downstream record that re-states the same state masks
+every mutant of the one in front of it, exactly as a redundant downstream check does. The test now
+compares after EACH record, so the parked record is examined while it is still the last word on
+the log.
 
-THE MUTANTS — each one line, each the plausible way to get this wrong
-----------------------------------------------------------------------
+⛔ THE SECOND STRUCTURAL FINDING: AN ALWAYS-CORRECT FALLBACK HIDES THE THING IT BACKS UP
+------------------------------------------------------------------------------------------
+`put_pending` writes the O(released) difference record only while `PersistState::drain_mark` proves
+the durable log is the one `take_pending` handed out, and the O(whole log) absolute record
+otherwise. Every drain in the suite satisfies the proof — so a weakened proof that said "usable"
+always would have passed every test in the file, and the fallback would have been untested code
+that still compiles. Two things were added: `a_drain_that_cannot_prove_the_log_falls_back_to_the_
+absolute_record`, which invalidates the proof two different ways and requires the fallback to be
+exact; and a `tail_kinds` assertion at each stage of the restore test, because `persist_counters`
+says how many records were appended and cannot say WHICH.
+
+THE MUTANTS
+-----------
 M1  `retire_arenas_by_rule`'s payload encodes `&parked[..len-1]` — the parked record loses one
-    entry. (A real record that miscounts, or a loop that stops one short.)
-M2  `put_pending`'s payload encodes `st.pending.iter().skip(1)` — the replaced log loses its first
-    entry.
-M3  `encode_arena_sections` writes an EMPTY recycled list for every arena it names — i.e. the
-    record describes the extents but not what came back into them.
+    entry. (A record that miscounts, or a loop that stops one short.)
+M3  `encode_arena_sections` writes an EMPTY recycled list for every arena it names — the record
+    describes the extents but not what came back into them.
 M4  `release_page` no longer inserts into `StoreState::recycled_dirty` — the mechanism that decides
     WHICH arenas ride the next record is disabled, while both encoders stay correct.
+M5  `put_pending`'s difference record drops one removal.
+M6  the `drain_mark` proof is always accepted (`mark.as_ref()` with no validity test) — the
+    fallback is never taken.
+M7  `take_pending` bumps `pending_version` unconditionally again — the fourth rewrite site, worth
+    1.0 full image rewrites per branch on the leaf path, restored.
 
-RESULTS
--------
-M1  FAILED at stage 1, and the message names the defect:
-      after the interior reap: the replayed pending-free log has 2 entries where a full rewrite
-      gives 3
-    (Against the END-ONLY version of the test: PASSED. That is the finding above.)
+(M2 in the superseded version mutated the absolute record's encoder. That record is now the
+fallback rather than the normal path, and M5 + M6 cover the same ground on the path that is
+actually taken. It is not reported as a result here because it was not re-run.)
 
-M2  FAILED at stage 2:
-      the replayed pending-free log has 1 entries where a full rewrite gives 2
+RESULTS — against HEAD 742a381, each mutant applied to a clean tree and reverted after
+-----------------------------------------------------------------------------------------
+M1  FAILED, and at STAGE 1, which is the whole point:
+      an_interior_reap_replayed_..._full_rewrite:
+        after the interior reap: the replayed pending-free log has 2 entries where a full
+        rewrite gives 3
+      parking_pages_by_the_interval_rule_reaches_the_durable_map also failed.
+      test result: FAILED. 55 passed; 2 failed
+    (Against the END-ONLY version of the test: PASSED. That is the first finding above.)
 
-M3  FAILED on the byte comparison (src/branch/arena.rs:4397).
-      test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 1607 filtered out
+M3  FAILED on the byte comparison, in two tests:
+      after the interior reap: a store restored from image+tail is not byte-identical ...
+      rewrite: the fallback did not reproduce a full rewrite
+      test result: FAILED. 55 passed; 2 failed
 
-M4  FAILED on the byte comparison (src/branch/arena.rs:4397).
-      test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 1607 filtered out
+M4  FAILED on the byte comparison, in two tests:
+      after the drain put the log back: ... not byte-identical ...
+      rewrite: the fallback did not reproduce a full rewrite
+      test result: FAILED. 55 passed; 2 failed
+
+M5  FAILED at STAGE 2 and in the pinned contract test:
+      after the drain put the log back: the replayed pending-free log has 3 entries where a
+      full rewrite gives 2
+      the durable pending-free log still lists entries the drain resolved, so a restart would
+      park released pages all over again
+      test result: FAILED. 55 passed; 2 failed
+
+M6  FAILED in exactly ONE test, and it is the one added for it:
+      a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record
+      test result: FAILED. 56 passed; 1 failed
+    ⇒ nothing else in `branch::arena::tests` sees a weakened proof. That test is not redundant.
+
+M7  PASSED the whole of `branch::arena::tests` — 57 passed, 0 failed.
+    ⇒ **nothing in that module pins the fourth site.** It is pinned in `mod d183_adversary`, where
+    the same mutant FAILS three bands:
+      d183adv_a1_what_the_real_reaper_costs:
+        the leaf arm still pays full image rewrites: 8->7, 16->15
+      d183adv_mech_an_empty_take_pending_no_longer_forces_a_rewrite:
+        an empty drain still forces the following free into a full image rewrite — the fourth
+        D183 site is back (it read (1, 1) at 630afaa)
+      d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending:
+        full image rewrites survive on the interior path: parked=0, releasable=8
+      test result: FAILED. 8 passed; 3 failed
+    This is worth stating plainly: a unit module that is green is not coverage of a cost that only
+    appears through the real entry point.
 
 WHAT M3 AND M4 SAY ABOUT THE REST OF THE SUITE
 -----------------------------------------------
-Both are recycled-list defects, and under both the OTHER 55 arena tests passed. The durability of
-the per-extent recycled list across a reap had no test before this row — `retire_arenas_by_rule`'s
-own comment says losing it leaks the extent permanently, and nothing was checking. So the "55
-passed" line is not reassurance; it is the measurement of what the new test adds.
+Both are recycled-list defects, and under both the OTHER arena tests passed. The durability of the
+per-extent recycled list across a reap had no test before this row — `retire_arenas_by_rule`'s own
+comment says losing it leaks the extent permanently, and nothing was checking.
 
 NOT CLAIMED HERE
 ----------------
 The order-independence argument — that a `TAIL_EXTENT_FREED` for the same arena may land on either
-side of these records because both skip arenas absent from `extents`, and that the (page, arena)
-dedupe makes the parked record safe to replay behind a replaced one — is NOT fire-checked. It needs
-two threads racing a reap against an extent free, which this harness cannot arrange. It is argued
-in the code at both replay arms and it is the weakest part of this row's evidence.
+side of these records because they skip arenas absent from `extents`, that the `(page, arena)`
+dedupe makes the parked record safe to replay behind a drain record, and that an overlapping drain
+poisons the mark — is NOT fire-checked. It needs two threads racing a reap against an extent free,
+which this harness cannot arrange. It is argued in the code at each replay arm and at
+`take_pending`, and it is the weakest part of this row's evidence.

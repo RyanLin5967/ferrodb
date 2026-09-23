@@ -4341,18 +4341,34 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **D183 — which reap door a branch leaves by, COUNTED rather than argued.**
+    /// **D183 — what the two STORE METHODS cost per call. ⛔ NOT what a reap costs.**
+    ///
+    /// ⛔⛔ **THIS TEST'S ORIGINAL NAME AND HEADLINE WERE WRONG AND WERE ACTED ON.** It was
+    /// called `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends` and its
+    /// band read "LEAF 8/16 -> rewrites 0/0; INTERIOR 8/16 -> rewrites 8/16 — one full image
+    /// rewrite per interior branch reaped, zero for a leaf". **It never calls `Reaper::reap`.**
+    /// It hand-rolls the two lines at `reaper.rs:679-687` and therefore never runs
+    /// `drain_pending`, which is half of what a reap does and the source of the leaf path's
+    /// entire cost. A design entry and an implementation brief were both written against that
+    /// number before `mod d183_adversary` measured the real thing and refuted BOTH halves of it:
+    /// through `TwoTierReaper::reap` the leaf slope was 1.0 per branch, not 0, and the interior
+    /// slope 2.0, not 1.0.
+    ///
+    /// ⇒ **For what a reap costs, read `d183adv_a1_what_the_real_reaper_costs` and
+    /// `d183adv_a5_the_interior_cost_is_no_longer_a_class`.** This test is kept because a
+    /// per-method cost is a real thing to know and the two methods are this row's subject — but
+    /// it is a measurement of `retire_arenas_by_rule` and `free_arena` called directly, and its
+    /// numbers must never again be quoted as the cost of reaping anything.
     ///
     /// D81 replaced the per-fork full image rewrite with a 45-byte delta append and its note
-    /// called that "the only site that changes shape". This asks what REAP costs, and the answer
-    /// used to be two different numbers: `reaper.rs:679` splits on `has_live_children`, and only
-    /// the fast side reached a delta. `retire_arenas_by_rule` ended in `persist_if_configured`,
-    /// which was `persist_full_locked` unconditionally — it never consulted `compact_threshold`,
-    /// so it was not amortised at all.
+    /// called that "the only site that changes shape". `retire_arenas_by_rule` ended in
+    /// `persist_if_configured`, which was `persist_full_locked` unconditionally — it never
+    /// consulted `compact_threshold`, so it was not amortised at all.
     ///
-    /// **⭐ THIS TEST HAS BEEN INVERTED. It pinned a WALL and now pins the FIX.** The wall,
-    /// measured 2026-09-23 at `630afaa`, and kept here because a before/after with only the
-    /// after is a claim rather than a measurement:
+    /// **⭐ THIS TEST HAS BEEN INVERTED. It pinned a WALL and now pins the FIX.** The wall, as
+    /// this hand-rolled loop measured it at `630afaa` — kept because a before/after with only the
+    /// after is a claim rather than a measurement, and kept labelled because these four cells are
+    /// exactly the numbers that misled the row:
     ///
     /// | arm | branches | rewrites | appends |
     /// |---|---|---|---|
@@ -4392,7 +4408,7 @@ mod tests {
     /// `live_children` lives in the record; a reclamation test on it proves nothing about the
     /// shipped path. That is D19, and this test would be worthless without it.
     #[test]
-    fn d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends() {
+    fn d183_what_the_two_reclamation_store_methods_cost_per_call() {
         fn run(branches: usize, interior: bool) -> (u64, u64) {
             let h = Harness::new_with(true);
             let path = std::env::temp_dir().join(format!(
@@ -5589,7 +5605,11 @@ mod tests {
     }
 }
 
-/// **D183 ADVERSARY — an attack on `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends`.**
+/// **D183 ADVERSARY — an attack on what is now
+/// `d183_what_the_two_reclamation_store_methods_cost_per_call`, and was called
+/// `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends` when this module
+/// was written. The rename is this module's doing: the old name asserted the thing the attack
+/// refuted.**
 ///
 /// The test under attack never calls `Reaper::reap`. It hand-rolls the two sides of
 /// `reaper.rs:679` and counts those. Everything here exists to ask whether that hand-rolled
