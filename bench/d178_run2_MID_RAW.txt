@@ -1,0 +1,40 @@
+D178 RUN 2 — MID: the H1 planner guard ONLY. build_scan still UNTOUCHED.
+commit : 74b2982  (D178 H1: stop the optimizer proposing an index scan lower() cannot build)
+tree   : 1 uncommitted files at the time of the run
+cmd    : cargo run --example d178_dml_index   (debug profile)
+date   : 2026-09-23T12:13:10Z
+
+PURPOSE: isolate the H1 fix from the DML fix. Every DML arm must be IDENTICAL
+to run 1, and the H1 probe must stop erroring. Both hold, so neither change can
+be credited with the other's effect.
+
+D178 — can UPDATE/DELETE reach an index? Counters, not durations.
+delta = 4 statements per cell, 5 repeats per cell, sizes [500, 1000, 2000, 4000]
+counters: SEQ_SCAN_TUPLES / SEQ_SCANS / INDEX_SCANS (D176, cherry-picked 81173de)
+min..max shown when they differ; a bare number means every repeat agreed.
+
+| arm   |     n |     tuples |   scans |  index  | rows affected |
+|-------|-------|------------|---------|---------|---------------|
+| A     |   500 |       2000 |       4 |       0 | 4 x 1 (indexed UPDATE) |
+| A     |  1000 |       4000 |       4 |       0 | 4 x 1 (indexed UPDATE) |
+| A     |  2000 |       8000 |       4 |       0 | 4 x 1 (indexed UPDATE) |
+| A     |  4000 |      16000 |       4 |       0 | 4 x 1 (indexed UPDATE) |
+| B-CTL |   500 |       2000 |       4 |       0 | 4 x 0 (UNindexed UPDATE) |
+| B-CTL |  1000 |       4000 |       4 |       0 | 4 x 0 (UNindexed UPDATE) |
+| B-CTL |  2000 |       8000 |       4 |       0 | 4 x 0 (UNindexed UPDATE) |
+| B-CTL |  4000 |      16000 |       4 |       0 | 4 x 0 (UNindexed UPDATE) |
+| C     |   500 |       2000 |       4 |       0 | 4 x 1 (indexed DELETE) |
+| C     |  1000 |       4000 |       4 |       0 | 4 x 1 (indexed DELETE) |
+| C     |  2000 |       8000 |       4 |       0 | 4 x 1 (indexed DELETE) |
+| C     |  4000 |      16000 |       4 |       0 | 4 x 1 (indexed DELETE) |
+| D-CTL |   500 |          0 |       0 |       4 | 4 x 1 (indexed SELECT) |
+| D-CTL |  1000 |          0 |       0 |       4 | 4 x 1 (indexed SELECT) |
+| D-CTL |  2000 |          0 |       0 |       4 | 4 x 1 (indexed SELECT) |
+| D-CTL |  4000 |          0 |       0 |       4 | 4 x 1 (indexed SELECT) |
+
+H1 probe — is the secondary strict-lower-bound refusal REACHABLE on the SELECT path?
+  v > 9980   plan=Projection [#0] (rows=1 cost=28.01)                  run=OK, 1 rows
+  v > 9900   plan=Projection [#0] (rows=9 cost=28.09)                  run=OK, 9 rows
+  v > 9000   plan=Projection [#0] (rows=99 cost=28.99)                 run=OK, 99 rows
+  v > 5000   plan=Projection [#0] (rows=499 cost=32.99)                run=OK, 499 rows
+  id > 995    plan=Projection [#1] (rows=4 cost=25.06)                  run=OK, 4 rows   (primary key, contrast)
