@@ -856,6 +856,15 @@ fn not_leader(id: Option<NodeId>, book: &BTreeMap<NodeId, String>) -> FerroError
 /// A bound and not a timeout: a timeout is a clock, and the point of the whole `consensus/` design
 /// is that this layer owns none. Large enough that a real localhost round trip never reaches it,
 /// finite so a partitioned node refuses instead of hanging a client for ever.
+///
+/// **D173 made this bound load-bearing where it used to be nearly unreachable.** [`pump_until`] no
+/// longer short-circuits on a leadership lapse, so the one caller that now spends the whole budget
+/// is a node that is *partitioned* — which is exactly the case the budget was written for, and the
+/// case that used to exit early with a `NotLeader` it had no grounds to issue. A deposed but
+/// connected node still returns as soon as the round reaches it by replication, which is the
+/// common case and costs nothing extra. The wall-clock cost of exhausting it is
+/// `budget * NodeReplicator::poll`, and it is paid only by a caller that would otherwise have been
+/// told a falsehood.
 const DEFAULT_PUMP_BUDGET: u32 = 100_000;
 
 /// How many times a merge may be re-evaluated before it is refused.
