@@ -45,11 +45,20 @@
 //! # H1 — the named hazard, probed rather than assumed
 //!
 //! Routing DML through `optimize` makes it inherit SELECT's planning defects as well as its wins.
-//! `lower` refuses a strictly-excluded lower bound on a SECONDARY index
+//! At the time of this run `lower` refused a strictly-excluded lower bound on a SECONDARY index
 //! (`optimizer.rs`, `"lower bound sec index isn't supported"`), and `predicate_to_bounds` maps
-//! `col > v` to exactly that. The probe asks whether the cost model actually CHOOSES that plan on
-//! the SELECT path in the unmodified tree — i.e. whether this is a live, pre-existing SELECT bug
-//! or unreachable arithmetic. It is reported in both runs and is not a pass/fail gate here.
+//! `col > v` to exactly that. The probe asked whether the cost model actually CHOOSES that plan on
+//! the SELECT path — i.e. whether this was a live, pre-existing SELECT bug or unreachable
+//! arithmetic. It is reported, not a pass/fail gate here.
+//!
+//! ⚠ **D179 REMOVED THE REFUSAL THE PROBE ASKS ABOUT, so re-running this harness today cannot
+//! answer the question its own header poses.** `lower` now builds that plan: it opens the scan at
+//! `(v, Null)` and skips the leading `sec == v` run. A fresh run prints `OK, N rows` with an
+//! `Index scan` plan on every H1 line, which is the correct answer to a different question — *does
+//! `v > k` reach the index* — and says nothing about a guard that no longer exists. The H1 lines in
+//! `bench/d178_run1_BEFORE_RAW.txt` and `bench/d178_run3_AFTER_RAW.txt` remain valid as a record of
+//! the tree at the time they were taken. Index USE is now asserted in
+//! `tests/d179_secondary_strict_lower_counters.rs`.
 //!
 //! Pre-registration: `bench/d178_prereg.txt`, committed before the first number.
 
@@ -263,6 +272,9 @@ fn arm_d(n: i64) -> (Counts, usize) {
 
 /// H1 — is `lower`'s refusal of a strictly-excluded lower bound on a SECONDARY index REACHABLE on
 /// the SELECT path in this tree? Reported, not gated.
+///
+/// ⚠ **After D179 there is no such refusal**, so this now prints which access path the cost model
+/// picks for `v > k` rather than whether the plan can be built. See the module header.
 fn h1_probe(out: &mut String) {
     let mut db = Db::new();
     let mut s = Session::new();
@@ -375,7 +387,9 @@ fn main() {
         cell(&mut out, "D-CTL", n, &reps, "4 x 1 (indexed SELECT)");
     }
 
-    let _ = writeln!(out, "\nH1 probe — is the secondary strict-lower-bound refusal REACHABLE on the SELECT path?");
+    let _ = writeln!(out, "\nH1 probe — access path for a secondary strict lower bound on the SELECT path.");
+    let _ = writeln!(out, "  (This asked whether `lower`'s refusal was REACHABLE. D179 removed that refusal;");
+    let _ = writeln!(out, "   these lines now report which plan is CHOSEN, not whether it can be built.)");
     h1_probe(&mut out);
 
     print!("{out}");
