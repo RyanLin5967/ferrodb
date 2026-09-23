@@ -38,7 +38,7 @@ fn main() {
 
     println!("D31 reap cost. {branches} branches per row, TableBranchCatalog on a real file.");
     println!();
-    println!("  pages/branch   extents/branch   reserved pages/branch   reaped   reap ms");
+    println!("  pages/branch   extents/branch   reserved pages/branch   reaped   reap ms   catalog syncs   syncs/branch");
 
     for &per_branch in &sizes {
         let dir = std::env::temp_dir()
@@ -52,12 +52,31 @@ fn main() {
             .open(dir.join("main.db"))
             .unwrap();
         let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
-        let catalog: Arc<dyn BranchCatalog> = Arc::new(
+        // D169: two handles to ONE catalog. `syncs_issued` is on the concrete type, not on the
+        // `BranchCatalog` trait, and an integer sync COUNT is what separates "reap is slow" (a
+        // number, load-dependent) from "reap pays a private fsync per branch" (a shape that
+        // transfers to any engine). A duration alone cannot tell those apart.
+        let cat_concrete = Arc::new(
             TableBranchCatalog::open_sidecar(&dir.join("branches.branchcat"), 1).unwrap(),
         );
+        let catalog: Arc<dyn BranchCatalog> = cat_concrete.clone();
         let base = pool.disk_manager.high_water().unwrap();
         let store =
             Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap());
+        // **D169: this harness did NOT persist the free-space map, and the shipped binary does.**
+        //
+        // Same blind spot D79 found in `branch_curve_writes.rs`, on the other path. `free_arena`
+        // ends in `persist_if_configured()` -> `persist_full_locked`, a FULL rewrite of the ~48-byte
+        // -per-live-branch map, once per branch reaped -- so a reap sweep of N branches rewrites
+        // 48*(N-i) bytes at step i. D81 left these three sites whole on purpose and wrote the risk
+        // into `arena.rs`: "a workload that reaps as often as it forks pays a full rewrite per reap
+        // and only half of this row's benefit." `REAP_PERSIST=1` is what makes that measurable.
+        //
+        // OFF by default so re-running this file reproduces D31's historical numbers rather than
+        // silently replacing them with different ones under the same name.
+        if std::env::var("REAP_PERSIST").map(|v| v == "1").unwrap_or(false) {
+            store.checkpoint_to(dir.join("main.db.arena"));
+        }
         let reaper = TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store));
 
         let mut ids = Vec::with_capacity(branches);
@@ -81,9 +100,11 @@ fn main() {
             ids.iter().map(|b| catalog.get(*b).map(|r| r.arenas.len()).unwrap_or(0)).sum();
         let reserved = store.reserved_page_count();
 
+        let syncs_before = cat_concrete.syncs_issued();
         let t0 = Instant::now();
         let reaped = reaper.reap_expired(u64::MAX).unwrap();
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let syncs = cat_concrete.syncs_issued() - syncs_before;
 
         println!(
             "  {:>12}   {:>14.2}   {:>21.1}   {:>6}   {:>7.1}",
@@ -93,6 +114,8 @@ fn main() {
             reaped.len(),
             ms
         );
+        println!("      (catalog syncs during reap: {syncs}, = {:.2} per branch reaped)",
+                 syncs as f64 / reaped.len().max(1) as f64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,100 @@
+D169 — MY PREDICTION WAS FALSIFIED, THE BOUND IS NAMED, AND THE REAL WALL IS AN INTEGER: 4.00.
+Prereg: bench/d169_prereg.txt (7beaf7b), committed BEFORE the first measurement.
+
+[HERE] 2026-09-23  examples/d31_reap_cost.rs at HEAD + a REAP_PERSIST knob and a catalog sync
+counter, release build, pages/branch=1, measure lock HELD, 0 real `cargo` processes at launch
+(`pgrep -x cargo` — `pgrep -f` matches this project's own PATH-export shells and reports phantoms).
+
+=== 1. THE PRE-REGISTERED PREDICTION IS FALSIFIED ===================================
+
+Registered: "the ON/OFF ratio must GROW ~LINEARLY in N — doubling the branch count roughly
+doubles it", derived from `free_arena -> persist_if_configured -> persist_full_locked` being a
+FULL rewrite once per branch reaped, giving `Σ 48·i = 24·N²`.
+
+     N   OFF mean   ON mean   ratio
+   100     1475.8    2031.0    1.38
+   200     2915.3    4377.8    1.50
+   400     6977.5    9009.4    1.29
+   800    11611.1   19400.2    1.67
+   (reap ms, mean of two counterbalanced blocks; `reaped` == N in every arm)
+
+  log-log slope  OFF   : 1.019   (1.0 = linear, 2.0 = quadratic)
+  log-log slope  ON    : 1.081
+  log-log slope  RATIO : 0.062   ⇐ registered prediction was ~1.0
+
+⇒ ⛔ **PREDICTION FALSIFIED. Outcome 3 (sub-linear), not outcome 1.** Both arms are linear in N.
+An 8× increase in N moved the ratio 1.38 → 1.67, a factor of 1.21, not 8.
+
+=== 2. OUTCOME 2 REQUIRED ME TO NAME THE BOUND. HERE IT IS. =========================
+
+The prereg said: "Ratio FLAT in N ⇒ risk NOT realised. Then something bounds it that I have not
+found, and **finding what is the result** — do not report 'no effect' without naming the bound."
+
+**The bound is `src/branch/arena.rs:2378`, and it is D81 itself.** My prereg read D81's comment at
+the CLAIM site ("the other three `persist_if_configured` sites keep the full rewrite deliberately")
+and concluded the reaper still paid a full rewrite. It does not. Verbatim, at the FREE site:
+
+  "**D81:** a 16-byte record and one fsync, not the whole image and two. The reaper's fast path is
+   as frequent as the claim it mirrors in any workload that reaps what it forks, so leaving it on
+   the full rewrite would cap this row's benefit at half."
+
+`free_arena`'s fast path appends `TAIL_EXTENT_FREED` via `persist_delta_locked` — a delta, exactly
+like the claim path. **So D81 fixed BOTH paths, the workload it names as its own risk is already
+covered on the fast path, and the flat ratio is D81 working as designed, measured.** The three
+surviving full-rewrite sites are the SLOW path and the pending-free log, not the per-branch free.
+
+⇒ This is a CONFIRMATION of D81 on a second path, and a correction to my own prereg's premise.
+
+=== 3. THE REAL WALL, AND IT IS AN INTEGER ==========================================
+
+Durations are load-dependent; an operation count is not. Instrumenting `syncs_issued()` around
+the sweep:
+
+       N   reap ms   catalog syncs   syncs/branch
+     100    1416.0            400          4.00
+     200    2638.4            800          4.00
+     400    5390.5           1600          4.00
+
+⇒ ⭐ **EXACTLY 4.00 CATALOG FSYNCS PER BRANCH REAPED, at every N.** At ~13.5 ms/branch that is
+~3.4 ms per fsync — the reap sweep is **fsync-bound**, not CPU- or map-bound.
+
+**The phase table CLOSES — all four attributed, no remainder:**
+
+  1. `reaper.rs:656`        `set_state(branch, Live -> Reaping)`
+  2. `reaper.rs:275`        `detach_child(parent.id, fork_epoch)`
+  3. `reaper.rs:713`        `set_state(branch, Reaping -> Reaped)`
+  4. `table_catalog.rs:1332` `release_id(id)` — recycles the reaped id slot
+     (confirmed on the reap path by `runtime.rs:725`: "catalog recycles a reaped branch's id SLOT
+     (`reaper.rs` `release_id` ...)"; its body ends `stage()` / drop lock / `durable(seq)`)
+
+=== 4. WHY GROUP COMMIT DOES NOT SAVE THIS — the mechanism, read from source ========
+
+Every one of the four is *built* to batch. `table_catalog.rs:1373`, on `detach_child`:
+
+  "Lock dropped BEFORE the fsync, so this joins the commit group rather than ..."
+
+**But `reap_expired` is a SERIAL loop** — `reaper.rs:733`, `for rec in candidates`, no threads, no
+rayon, no chunked parallelism. Group commit batches *concurrent* committers. A single-threaded
+sweep supplies none, so each of the four `durable(seq)` calls is its own fsync.
+
+⇒ **SHAPE, and it transfers to any engine:** *the mechanism that gave `fork` ×17.3 (f/sync
+1.00 → 17.12) is present on the reap path and structurally cannot fire there, because the sweep
+that would feed it is serial.* The batching primitive and the workload that needs it are in the
+same binary and never meet.
+
+⇒ **ARITHMETIC, NOT A MEASUREMENT, and labelled as such:** 10⁶ branches × 4 fsyncs × ~3.4 ms
+≈ 3.8 hours of pure durability latency on reap alone, if the sweep stays serial and fsync cost
+stays flat. Neither has been measured at that scale here. Largest N measured: 800.
+
+=== 5. WHAT THIS IS NOT ============================================================
+
+- ⛔ **NOT an invention.** Group commit is prior art and this project already applied it to `fork`.
+  "Reap pays a private fsync per operation; batch them" is the SAME fix on a second path. Reporting
+  it as a discovery would be the thirteenth killed pitch.
+- ⛔ **NOT previously measured here** — checked, with a positive control: no `bench/*.txt`
+  reports a reap sync count, while 25 of them contain `forks/sec`, so the zero is a real zero and
+  not a dead grep.
+- ⛔ **NOT an absolute or cross-engine claim.** A ferrodb duration cannot support one. The integer
+  4.00 and the serial-sweep mechanism are the parts that transfer.
+- ⚠ **NOT yet adversarially reviewed** at the time of writing — the mechanism claim in §4 is
+  dispatched for attack. Treat §4 as a finding pending its adversary; §§1–3 are measurements.
