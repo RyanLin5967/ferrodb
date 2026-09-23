@@ -183,7 +183,10 @@ fn main() {
     // Two space columns on purpose. `data MB` is FILE LENGTH; `alloc MB` is blocks*512, what the
     // filesystem actually gave out. A reservation scheme can inflate length far past allocation, and
     // quoting only length would overstate the wall. Both are reported so neither can be cherry-picked.
-    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms");
+    // The first nine columns are the historical ones, byte-for-byte in format, so every earlier
+    // artifact of this harness still lines up. The five after `reopen ms` are D65 run 2's; see the
+    // block that computes them for what each one proves.
+    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   cat live@re   img B/branch   arena re ms   arena re pg   img==reload");
 
     let mut done = 0usize;
     let mut stopped_early: Option<(usize, u64)> = None;
@@ -244,10 +247,57 @@ fn main() {
         let t_reopen = Instant::now();
         let re = TableBranchCatalog::open_sidecar(&cat_path, root).expect("reopen");
         let reopen_ms = t_reopen.elapsed().as_secs_f64() * 1000.0;
+
+        // D65 run 2 — POSITIVE CONTROL for the column above. A flat `reopen ms` is only evidence if
+        // the catalog it opened is the populated one: an open that found an empty or stale tree
+        // would be flat for the wrong reason. So ask the REOPENED handle how many branches are
+        // live. Expected N + 1 (the trunk is Live too). Untimed — this is O(N) by construction
+        // (`TableBranchCatalog::live_count` walks the Live span) and is not part of an open.
+        let re_live = re.live_count().map(|n| n.to_string()).unwrap_or_else(|e| format!("ERR:{e:?}"));
+        let re: Arc<dyn BranchCatalog> = Arc::new(re);
+
+        // D65 run 2 — THE ARENA'S reopen, which the catalog column above does NOT measure.
+        //
+        // SCALE-DESIGN D189's addendum routed this question to D65: `<db>.arena`'s image holds every
+        // extent, `current` entry and `pending` entry, and `reopen_from_checkpoint` deserialises
+        // all of it in counted loops, so by source the arena's open is O(extents), once, at open.
+        // D189 says in so many words not to quote the catalog's O(1) reopen for the arena. The
+        // block above times `TableBranchCatalog::open_sidecar` only — a different file and a
+        // different structure — so without this block a flat catalog column would be read as
+        // closing a question it never asked.
+        //
+        // This is the production restart, not a model of it: `cli.rs` writes `store.checkpoint` at
+        // clean exit and opens with `ArenaPageStore::reopen_from_checkpoint`. The checkpoint goes
+        // to a SEPARATE probe path, so the live run's file (if `CURVE_PERSIST=1` armed one) is
+        // never touched — `checkpoint` aimed anywhere but the armed path leaves its accounting
+        // alone, by its own doc comment. The fresh pool over `main.db` is built OUTSIDE the timer:
+        // it is the same constant the catalog column already pays, and the question is the
+        // arena's deserialisation, not a second copy of that constant.
+        //
+        // Nothing is written through the reopened store: `reopen_from_checkpoint` arms the probe
+        // path but writes only on a later claim, and the store is dropped without one.
+        let probe = dir.join("probe.arena");
+        store.checkpoint(&probe).expect("probe checkpoint");
+        let img = std::fs::read(&probe).expect("read probe image");
+        let pool2 = {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&main_path).unwrap();
+            Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())))
+        };
+        let t_arena = Instant::now();
+        let reopened = ArenaPageStore::reopen_from_checkpoint(pool2, Arc::clone(&re), &probe)
+            .expect("arena reopen");
+        let arena_ms = t_arena.elapsed().as_secs_f64() * 1000.0;
+        // POSITIVE CONTROL for the arena column: re-serialise what was loaded and compare it with
+        // the bytes it was loaded from. Byte-identical means the timed call really deserialised
+        // the whole map; a flat column over a load that skipped the extents would fail here.
+        let reload_same = if reopened.state_bytes() == img { "yes" } else { "NO" };
+        let arena_pages = reopened.live_page_count().unwrap_or(u32::MAX);
+        drop(reopened);
         drop(re);
+        let _ = std::fs::remove_file(&probe);
 
         println!(
-            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}   {:>9.3}",
+            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}   {:>9.3}   {:>11}   {:>12.1}   {:>11.3}   {:>11}   {:>11}",
             done,
             actually as f64 / secs,
             data as f64 / 1e6,
@@ -257,6 +307,11 @@ fn main() {
             cbytes as f64 / done as f64,
             store.live_page_count().unwrap_or(0),
             reopen_ms,
+            re_live,
+            img.len() as f64 / done as f64,
+            arena_ms,
+            arena_pages,
+            reload_same,
         );
 
         if data >= budget {
