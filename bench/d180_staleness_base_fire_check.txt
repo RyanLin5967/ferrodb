@@ -1,0 +1,105 @@
+D180 -- tools/staleness.sh default base: agent-isolation -> main. FIRE-CHECK.
+Run 2026-09-23 on branch d180-staleness-base, worktree /Users/idide/wt/ferrodb-d180-staleness-base.
+
+THE DEFECT
+  tools/staleness.sh:28 was  base="${2:-agent-isolation}".
+  `agent-isolation` was the integration target when the script was written; the project moved to
+  `main` and the DEFAULT did not. Measured at fire-check time:
+      agent-isolation = f949add     main = 727a8ec     agent-isolation..main = 550 commits
+  So a DIRECT call -- `tools/staleness.sh <worktree>`, the form with no base argument -- measured
+  every branch against a commit 550 behind the tree it was about to be merged into. It could not
+  report "behind" for anything that had branched from main in the last 550 commits. A guard whose
+  default cannot fire is worse than no guard: it is a clean bill of health from an instrument
+  pointed at the wrong tree.
+
+THE FIX
+  -wt="${1:-.}"; base="${2:-agent-isolation}"; head="${3:-HEAD}"
+  +wt="${1:-.}"; base="${2:-main}"; head="${3:-HEAD}"
+  (plus a comment block above line 28 recording why the default is part of the guard.)
+  tools/land-gate.sh is DELIBERATELY UNTOUCHED: :86 already passes the base explicitly
+  (`bash tools/staleness.sh . "$BASE_SHA" "$WANT_SHA"`) and is correct.
+
+THE FIXTURE
+  A branch that GENUINELY IS BEHIND main, built so the overlap arm has something to find:
+      git worktree add -b d180-fixture-behind <path> main~40      -> 03d47f9
+      + one branch-side edit to src/optimizer/optimizer.rs         -> 7a90863
+  main had ALSO moved under src/optimizer/optimizer.rs in that window, so both sides edit it.
+      d180-fixture-behind..main            = 61 commits
+      d180-fixture-behind..agent-isolation =  0 commits   <-- why the old default could not fire
+  This fixture is a throwaway; it is never merged and its worktree is removed after the check.
+
+================================================================================================
+A. NEGATIVE CONTROL -- the one that matters. FIXED script, DEFAULT base, branch 61 behind main.
+   EXPECTED: refuse.
+================================================================================================
+$ bash tools/staleness.sh /Users/idide/wt/ferrodb-d180-fixture-behind
+branch d180-fixture-behind vs main: 61 behind, 1 ahead
+  base moved under: 17 Rust file(s), 0 other code file(s)
+STALE-GREEN: the base moved under code this branch has not seen.
+  code files changed on main since the fork point: 17
+  ** BOTH SIDES EDIT THESE -- this is where an unmeasured interaction lives:
+      src/optimizer/optimizer.rs
+  tests present on main but NOT on this branch:
+      tests/d178_dml_index_correctness.rs
+      tests/d178_dml_index_counters.rs
+      tests/d55_pushdown_commutes_server.rs
+EXIT CODE = 1
+   => WATCHED IT REFUSE. STALE-GREEN, non-zero exit, the overlapping file named, and the three
+      tests the branch would have merged without named too.
+
+================================================================================================
+B. DISCRIMINATING CONTROL -- PRE-FIX script, DEFAULT base, THE SAME FIXTURE.
+   EXPECTED: silently pass. This is the defect reproduced, not argued.
+================================================================================================
+$ bash <pre-fix staleness.sh> /Users/idide/wt/ferrodb-d180-fixture-behind
+branch d180-fixture-behind vs agent-isolation: 0 behind, 490 ahead
+COVERED
+EXIT CODE = 0
+   => Same branch, same defaulted call form, same instant. 61 commits behind the tree it would be
+      merged into, 17 code files moved under it, and the old default returned COVERED at exit 0.
+      A/B is the evidence that the fix changed the VERDICT and not just the header line.
+
+================================================================================================
+C. POSITIVE CONTROL -- FIXED script, DEFAULT base, branch AT main's tip. EXPECTED: COVERED.
+================================================================================================
+$ bash tools/staleness.sh /Users/idide/wt/ferrodb-d180-staleness-base
+branch d180-staleness-base vs main: 0 behind, 0 ahead
+COVERED
+EXIT CODE = 0
+
+================================================================================================
+D. POSITIVE CONTROL -- FIXED script, ZERO ARGS (worktree AND base both defaulted).
+================================================================================================
+$ bash tools/staleness.sh
+branch d180-staleness-base vs main: 0 behind, 0 ahead
+COVERED
+EXIT CODE = 0
+   => The fix does not make the guard cry wolf: a current branch still passes, by both defaults.
+
+================================================================================================
+E. FAIL-CLOSED CHECK -- the one NEW failure mode the change could introduce.
+   A tree where `main` does not resolve (the old default might have resolved where the new one
+   does not). EXPECTED: refuse, never fall through to allow.
+================================================================================================
+$ bash tools/staleness.sh <fresh repo whose only branch is `trunk`>
+UNKNOWN: cannot resolve base 'main' in .../scratchpad/nomain
+EXIT CODE = 2
+   => Fails CLOSED. land-gate.sh:106 maps exit 2 / UNKNOWN to `die`, so an unresolvable base
+      refuses the landing rather than allowing it. Every ferrodb worktree shares one .git, so
+      `main` resolves from all of them -- A, C and D each resolved it from a different worktree.
+
+OTHER CALLERS OF staleness.sh, checked BEFORE the change
+  `grep -rn staleness.sh` across the repo, plus ~/.claude and ~/wt:
+  * tools/land-gate.sh:86 -- the ONLY executing caller in the repo. Passes base explicitly.
+    Unaffected by this change, and deliberately not touched.
+  * ~/.claude/skills/ferrodb-scale/SKILL.md:399 -- NOT in this repo, and the caller that actually
+    relied on the old default. It instructs agents: "Before merging ANY agent branch, run this and
+    act on it: tools/staleness.sh <worktree>" -- the defaulted form, annotated "on agent-isolation".
+    That is the path the defect travelled: every agent following that instruction since the project
+    moved to main got a COVERED that measured nothing. This fix repairs that call without the skill
+    changing. The skill file is outside this worktree and is left for the session owner; its
+    "on agent-isolation" annotation is now stale prose, not a live dependency on the old default.
+  * Everything else -- ~40 hits across bench/*.txt, bench/*_certified/, tools/{certify-head,
+    verify-suite}.sh comments, and src/ and tests/ doc comments -- is PROSE about the script or
+    about an unrelated in-engine "staleness" concept. No other executable call site exists.
+  * No hook, settings.json, or cron entry invokes it.
