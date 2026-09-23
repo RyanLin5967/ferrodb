@@ -1,4 +1,8 @@
-D169 — MY PREDICTION WAS FALSIFIED, THE BOUND IS NAMED, AND THE REAL WALL IS AN INTEGER: 4.00.
+D169 — MY PREDICTION WAS FALSIFIED, THE BOUND IS NAMED, AND THE WALL IS FSYNCS WHOSE COUNT
+IS SET BY TREE SHAPE: 2 ≤ syncs ≤ 3 + chain, and 4 for the leaf shape this harness measures.
+⚠ The header of the first version read "THE REAL WALL IS AN INTEGER: 4.00" — the universal its
+own §3 now retracts. Audit the header against the body; a title outlives the paragraph that
+corrects it.
 Prereg: bench/d169_prereg.txt (7beaf7b), committed BEFORE the first measurement.
 
 [HERE] 2026-09-23  examples/d31_reap_cost.rs at HEAD + a REAP_PERSIST knob and a catalog sync
