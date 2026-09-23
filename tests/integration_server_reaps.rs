@@ -41,12 +41,18 @@
 //! "the whole image is rewritten only when the tail outgrows its share" was true of the claim and
 //! the free and of nothing else: the slow-path retire and the pending-free drain both ended in
 //! `persist_full_locked`, which never consults the threshold, so they rewrote the whole image
-//! EVERY time — one per interior branch reaped, counted by
-//! `branch::arena::tests::d183_an_interior_reap_...`. They append now too
-//! (`TAIL_PAGES_PARKED`, `TAIL_PENDING_REPLACED`), so the sentence is finally true of all four
-//! events. Again the property is untouched: a record still reaches the device, fsynced, at each
+//! EVERY time — two per interior branch reaped and, through the empty-drain `pending_version`
+//! bump, one per leaf reap, counted through `Reaper::reap` by
+//! `branch::arena::d183_adversary::d183adv_a1_what_the_real_reaper_costs`. (An earlier version of
+//! this paragraph said "one per interior branch" and cited a test, since renamed
+//! `d183_what_the_two_reclamation_store_methods_cost_per_call`, that never called the reaper.)
+//! They append now too — `TAIL_PAGES_PARKED`, and `TAIL_PENDING_DRAINED` or its absolute fallback
+//! `TAIL_PENDING_REPLACED` — so the sentence is true of all four events, EXCEPT where a change no
+//! record kind describes forces the next persist to be whole: a pending-log push with no record
+//! (`pending_version`), a recycled page handed out again (`recycled_reissued`), or an authority
+//! change. Again the property is untouched: a record still reaches the device, fsynced, at each
 //! one. Recorded here because this header is where the next reader checks what the file's numbers
-//! rest on, and it is the second time this paragraph described a mechanism it did not have.
+//! rest on, and it is the THIRD time this paragraph described a mechanism it did not have.
 //!
 //! * `reserved_page_count` is exact whenever the map is read, because it only ever changes at an
 //!   extent event, which is the moment the map is made durable.

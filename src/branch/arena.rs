@@ -487,6 +487,25 @@ struct DrainMark {
     taken: Vec<(PageId, ArenaId)>,
 }
 
+/// **D183 — parked entries still owed a `TAIL_PAGES_PARKED` record, bound to the persist guard.**
+///
+/// `push_pending_recorded` first took `&mut PersistState`, so a push made without the guard stopped
+/// compiling. That bound the PUSH and not the SPAN: dropping the guard and taking it again between
+/// the push loop and the append still compiled, and re-opened exactly the window it was written to
+/// close — a `take_pending` in the gap reads `level == true` for a file that does not yet list the
+/// entries, cuts a `DrainMark` on that false premise, and the park's record then lands behind the
+/// drain's and puts a released page back in the durable log. Fire-checked (`d183-reverify`, M8,
+/// `bench/d183_reverify.txt`): at `4b1ab2d` that spelling compiled and the whole lib target passed
+/// (1673 passed, 0 failed), because nothing races two threads on one store's durability path.
+///
+/// This holds the guard's `&mut` borrow for as long as any entry is owed a record, so releasing the
+/// guard before the append — or before [`ArenaPageStore::abandon_park`] on the append's failure
+/// arm — is a borrow error rather than a review finding.
+struct RecordedParks<'g> {
+    persist: &'g mut PersistState,
+    parked: Vec<PendingFree>,
+}
+
 struct PersistState {
     /// Bytes of the image THIS process last wrote to `checkpoint_path`, or 0 for "none".
     image_bytes: u64,
@@ -1016,16 +1035,19 @@ impl ArenaPageStore {
 
     /// Push onto the pending-free log as part of a change a tail record is about to describe.
     ///
-    /// **The `&mut PersistState` is the point.** It is unused, and it is the whole signature: a
-    /// caller can only obtain one by holding the persist lock, so "mutate the log under the lock
-    /// that orders the records" stops being a rule in a comment and becomes the only spelling
-    /// that compiles. The defect this replaces was exactly a push that happened outside it while
-    /// a comment three functions away asserted the invariant — see `retire_arenas_by_rule`.
+    /// **The [`RecordedParks`] is the point.** A caller can only build one from the persist guard,
+    /// and it keeps that guard borrowed until the entries it collects are written, so "mutate the
+    /// log under the lock that orders the records, and keep it until the record lands" stops being
+    /// a rule in a comment and becomes the only spelling that compiles. The defect this replaces
+    /// was exactly a push that happened outside it while a comment three functions away asserted
+    /// the invariant — see `retire_arenas_by_rule`. An earlier version took `&mut PersistState`,
+    /// which bound the push but not the span to the append; see [`RecordedParks`].
     ///
-    /// The caller must append a record covering this entry before releasing the guard, or route
-    /// through [`Self::abandon_park`] if it cannot.
-    fn push_pending_recorded(&self, _persist: &mut PersistState, entry: PendingFree) {
+    /// The caller must append a record covering `parks.parked` before the borrow ends, or route
+    /// through [`Self::abandon_park`] — still holding it — if it cannot.
+    fn push_pending_recorded(&self, parks: &mut RecordedParks<'_>, entry: PendingFree) {
         self.state.lock().unwrap().pending.push(entry);
+        parks.parked.push(entry);
     }
 
     /// Push onto the pending-free log with NO record describing it, and say so durably.
@@ -1382,7 +1404,7 @@ impl ArenaPageStore {
         // page reads and catalog queries, which stayed in phase 1.
         let mut persist = self.persist.lock().unwrap();
         let mut released = 0u32;
-        let mut parked: Vec<PendingFree> = Vec::new();
+        let mut parks = RecordedParks { persist: &mut persist, parked: Vec::new() };
         for (page_id, arena, birth, pinned) in plan {
             if !pinned {
                 self.release_page(page_id, arena);
@@ -1395,8 +1417,7 @@ impl ArenaPageStore {
                     free_epoch,
                     owner: rec.branch_id,
                 };
-                self.push_pending_recorded(&mut persist, entry);
-                parked.push(entry);
+                self.push_pending_recorded(&mut parks, entry);
             }
         }
         // The slow path changes the durable map every bit as much as the fast one: pages recycled
@@ -1440,8 +1461,8 @@ impl ArenaPageStore {
             covered.extend(rec.arenas.iter().copied());
             let mut p = Vec::new();
             p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-            p.extend_from_slice(&(parked.len() as u32).to_be_bytes());
-            for e in &parked {
+            p.extend_from_slice(&(parks.parked.len() as u32).to_be_bytes());
+            for e in &parks.parked {
                 Self::encode_pending_entry(&mut p, e);
             }
             Self::encode_arena_sections(&mut p, &st, &covered);
@@ -1450,14 +1471,18 @@ impl ArenaPageStore {
         // `None`: this record carries its OWN parked entries and nobody else's, so it is only
         // correct against a durable log already level with memory. See `persist_delta_locked`.
         if let Err(e) =
-            self.persist_delta_locked(&mut persist, Self::TAIL_PAGES_PARKED, &payload, None)
+            self.persist_delta_locked(&mut *parks.persist, Self::TAIL_PAGES_PARKED, &payload, None)
         {
             // Nothing reached the file. Put the marks back — and the record that was going to
             // describe the parked entries did not land either, so they are in exactly the state
             // `abandon_park` exists for.
+            //
+            // **With the guard STILL HELD.** This arm used to `drop(persist)` first, which left a
+            // gap in which a `take_pending` read `level == true` for a file missing every entry
+            // parked above — the ordering defect again, on the failure arm. `parks` borrows the
+            // guard, so that `drop` no longer compiles here.
             self.state.lock().unwrap().recycled_dirty.extend(dirty);
-            drop(persist);
-            return self.abandon_park(&parked, e);
+            return self.abandon_park(&parks.parked, e);
         }
         Ok(released)
     }
@@ -1472,9 +1497,11 @@ impl ArenaPageStore {
     /// append behind a file that does not list them, and a crash before the next compaction leaks
     /// every one. Marking the log dirty makes the next persist a full rewrite instead.
     ///
-    /// Both ways out of that method come here: an error inside the decision loop, and a failure to
-    /// append at the end. The second is the easier one to miss, because by then the payload has
-    /// been built and it *looks* finished.
+    /// Only one way out of that method comes here now: a failure to append at the end, which is the
+    /// easy one to miss, because by then the payload has been built and it *looks* finished. (An
+    /// error inside the decision loop used to come here too; since the two-phase split that loop
+    /// parks nothing, so it returns with a plain `?`.) Called with the persist guard still held, so
+    /// the bump lands before any `take_pending` can read the counter — see [`RecordedParks`].
     ///
     /// The recycled lists need no equivalent from the loop: `release_page` marks its arena in
     /// [`StoreState::recycled_dirty`] as it goes, and the loop never takes that set.
