@@ -73,6 +73,11 @@ impl Executor for IndexScan {
                 Ok((k ,v)) => (k,v),
                 Err(e) => return Some(Err(e))
             };
+            // ⛔ ANY PER-ENTRY COUNTER MUST INCREMENT ABOVE THIS SKIP, NEVER BELOW IT — see the
+            // long form of this note in `sec_index_scan.rs::next`. D181 adds `examined += 1` at
+            // this line; below the skip it under-counts by the NULLs dropped and reads as a
+            // performance improvement rather than a measurement change.
+            //
             // D187 — see `skip_nulls`. `continue`, never `return None`: NULL keys sort at the FRONT
             // of the tree, so stopping here would truncate the scan before it reached a single real
             // row rather than skipping one entry.
