@@ -1,0 +1,103 @@
+D178 RUN 4 — THE MERGE CONSEQUENCE, measured with D176'S OWN HARNESS, unmodified.
+commit : f18987d  (D178: fire-check the new tests against three mutants; one was vacuous)
+harness: examples/d176_merge_rowcount.rs, cherry-picked from d176-merge-rowcount as
+         81173de + 1b39d3b and NOT edited. Same source that produced D176's table.
+date   : 2026-09-23T12:56:45Z
+
+WHAT THE BEFORE HALF IS, stated rather than implied: the BEFORE numbers are D176's,
+measured at 4912302 and published in frontier/d176_merge_rowcount.md. I did NOT
+re-measure them. fe40276 is a docs-only commit on top of 4912302 and the instrument
+commits are the same two, so the only functional difference between D176's tree and
+this one is the D178 fix.
+
+  ARM A, tuples pulled per MERGE, delta fixed at 4:
+     n           500     1000     2000     4000
+     D176       2000     4000     8000    16000      (= delta * n)
+     here          0        0        0        0
+
+  ARM A, tuples pulled per MERGE, delta axis at n=2000:
+     delta         1        2        4        8       16       32
+     D176       2000     4000     8000    16000    32000    64000
+     here          0        0        0        0        0        0
+
+  index scans per MERGE at delta=4 went 4 -> 8, and seq scans 4 -> 0. That is the
+  mechanism, visible as a count: the publish loop's delta SEQUENTIAL scans became
+  delta INDEX scans, on top of evaluate_merge's delta point lookups that were
+  already indexed. Nothing disappeared; one scan kind was exchanged for another.
+
+⭐ THE CONTROL THAT DID NOT MOVE, which is what makes the two halves comparable:
+  ARM B (SIMULATE ... ASSERT ON t) is IDENTICAL to D176's, cell for cell --
+  1012/2012/4012/8012 rows and own_tup 1000/2000/4000/8000. The assertion scan goes
+  through scan_table_where, a SELECT path this change does not touch, so it must not
+  move, and it did not. B-CTL is flat at 14 rows across the whole 8x span.
+
+⭐ AND THE FIRE-CHECK FIRED IN THIS RUN, not merely in D176's: ARM B reached 2n in
+  the same process and the same binary where ARM A read zero. A blind counter cannot
+  produce that pair.
+
+⚠ The harness's own closing verdict block was pre-registered by D176 to answer D176's
+  question. It now prints 'the O(table) claim is DEAD for the plain-MERGE path at this
+  commit', which is TRUE AND MISLEADING READ ALONE: the claim was true when D176 banked
+  it and it is false here because this branch fixed it, not because D176 was wrong.
+  The harness header is banded in this same commit so a future reader cannot take that
+  line as evidence the wall never existed.
+
+D176 — merge cost as an INTEGER. rows = rows RETURNED by scans; tuples = tuples
+pulled off the heap by SeqScan. Both scoped to the statement window by read-twice-
+and-subtract. reps=5 per cell; min==max means the count is deterministic.
+
+== ARM A — plain MERGE;  delta FIXED at 4, table size varies 8x ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls  scans idxscn   own_tup   ok
+    500           4          4             0            0       4      0     8         0    5
+   1000           4          4             0            0       4      0     8         0    5
+   2000           4          4             0            0       4      0     8         0    5
+   4000           4          4             0            0       4      0     8         0    5
+
+== ARM B — SIMULATE … ASSERT ON t   (the surviving full scan; ALSO THE FIRE-CHECK) ==
+== B-CTL — SIMULATE … ASSERT ON small  (identical statement, 1-row assertion table) ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls  scans idxscn   own_tup   ok  arm
+    500        1012       1012          1000         1000      14      2    16      1000    5  B
+    500          14         14             2            2      14      2    16         2    5  B-CTL
+   1000        2012       2012          2000         2000      14      2    16      2000    5  B
+   1000          14         14             2            2      14      2    16         2    5  B-CTL
+   2000        4012       4012          4000         4000      14      2    16      4000    5  B
+   2000          14         14             2            2      14      2    16         2    5  B-CTL
+   4000        8012       8012          8000         8000      14      2    16      8000    5  B
+   4000          14         14             2            2      14      2    16         2    5  B-CTL
+
+== ARM C — delta axis, table size FIXED at 2000 ==
+  delta    rows_max   tuples_max   calls  scans idxscn   own_tup   ok  path
+      1           1            0       1      0     2         0    5  A (plain MERGE)
+      1        4003         4000       5      2     4      4000    5  B (SIMULATE+ASSERT ON t)
+      2           2            0       2      0     4         0    5  A (plain MERGE)
+      2        4006         4000       8      2     8      4000    5  B (SIMULATE+ASSERT ON t)
+      4           4            0       4      0     8         0    5  A (plain MERGE)
+      4        4012         4000      14      2    16      4000    5  B (SIMULATE+ASSERT ON t)
+      8           8            0       8      0    16         0    5  A (plain MERGE)
+      8        4024         4000      26      2    32      4000    5  B (SIMULATE+ASSERT ON t)
+     16          16            0      16      0    32         0    5  A (plain MERGE)
+     16        4048         4000      50      2    64      4000    5  B (SIMULATE+ASSERT ON t)
+     32          32            0      32      0    64         0    5  A (plain MERGE)
+     32        4096         4000      98      2   128      4000    5  B (SIMULATE+ASSERT ON t)
+
+== ARM D — plain MERGE on an INDEXED t(id).  Same axis as ARM A. ==
+   AMENDMENT 1 to the pre-registration: added AFTER seeing ARM A, and recorded as
+   such. ARM A's tuples = delta*n could be a property of a table with no index on
+   the column the point lookups filter. This offers the planner one.
+  nrows    rows_max   tuples_min   tuples_max   calls  scans idxscn   own_tup   ok  arm
+    500           4            0            0       4      0     8         0    5  D (indexed)
+   1000           4            0            0       4      0     8         0    5  D (indexed)
+   2000           4            0            0       4      0     8         0    5  D (indexed)
+   4000           4            0            0       4      0     8         0    5  D (indexed)
+
+== VERDICT against bench/d176_prereg.txt ==
+F4 fire-check — ARM B grew with table size and reached >= n:  FIRED — instrument sees a full scan
+B-CTL control is flat in table size (14 -> 14):  YES — B's slope is the scan of t
+ARM A rows/merge:   4 at n=500 -> 4 at n=4000
+ARM B rows/merge:   1012 at n=500 -> 8012 at n=4000  (= 2.00x n)
+ARM A tuples/merge: 0 at n=500 -> 0 at n=4000  (= 0.00x n)
+ARM D tuples/merge: 0 at n=500 -> 0 at n=4000  (indexed t(id))
+⇒ F1 HOLDS: ARM A is flat in BOTH counters. The O(table) claim is DEAD for the
+  plain-MERGE path at this commit, and it is not an artifact of rows-returned.
+⇒ F2 (rows):   ARM A rows move with DELTA at fixed n (1 -> 32): YES
+⇒ F2 (tuples): ARM A tuples move with DELTA at fixed n (0 -> 0): no

@@ -1,4 +1,31 @@
 //! D176 — **is merge cost O(table) or O(delta)?** Answered with an INTEGER, not a stopwatch.
+//! ⛔⛔ **BANDED BY D178 — THE WALL THIS HARNESS MEASURES NO LONGER EXISTS IN THIS TREE.** ⛔⛔
+//!
+//! Read the closing verdict block with this in front of you. It is pre-registered to answer
+//! D176's question and it still answers it correctly — but run against THIS branch it prints
+//! *"the O(table) claim is DEAD for the plain-MERGE path at this commit"*, and a reader who
+//! meets that line first will conclude the wall was never there. **It was.** D176 measured it at
+//! `4912302` and the numbers are in `frontier/d176_merge_rowcount.md`; D178 removed it, and the
+//! two facts are not in conflict. A claim can be true when it is banked and false later because
+//! somebody fixed it.
+//!
+//! ```text
+//!   ARM A, tuples pulled per MERGE, delta fixed at 4
+//!     n          500     1000     2000     4000
+//!     D176      2000     4000     8000    16000     <- delta * n
+//!     D178         0        0        0        0
+//! ```
+//!
+//! The cause is `build_scan` (`src/planner/plan.rs`): it always built a `SeqScan`, so publish's
+//! one-`UPDATE`-per-changed-row loop read the whole table `delta` times. D178 routes it through
+//! `optimize`. Index scans per merge went 4 -> 8 and sequential scans 4 -> 0 — one scan kind
+//! exchanged for another, which is what the counts show.
+//!
+//! ⚠ This band is NOT a repair of the harness and the harness must not be repaired. Its ARM B
+//! fire-check and its B-CTL control still work and still fire — measured in
+//! `bench/d178_run4_MERGE_RAW.txt`, ARM B reached `2n` in the same run where ARM A read zero —
+//! and that is exactly what makes the zero trustworthy. Only the closing PROSE has aged.
+//!
 //!
 //! # Why this run exists, and why it is a count
 //!
