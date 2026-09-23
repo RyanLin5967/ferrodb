@@ -483,6 +483,35 @@ fn sql_delete_does_not_destroy_null_rows() {
     );
 }
 
+/// The other DML executor. `Update::execute` and `Delete::execute` are different code consuming the
+/// same scan, so proving one says nothing about the other — the scan fix is shared, the consumers
+/// are not.
+///
+/// Assigns to `w`, not `id`: `Update` refuses to assign to column 0, so a scan driven by the
+/// primary index can never have its own key rewritten underneath it.
+///
+/// The `w = 9` recount is an INDEPENDENT instrument — `w` carries no index, so that query is a
+/// sequential scan whose `Filter` is known-correct for NULLs. If the index scan wrote 501 rows and
+/// reported 1, this is what catches it.
+#[test]
+fn sql_update_does_not_overwrite_null_rows() {
+    let mut d = seeded_wide();
+    let plan = d.explain("SELECT id FROM t WHERE v < 5;");
+    assert!(
+        plan.contains("Index scan"),
+        "this case only tests the index path if the index path is chosen; plan was:\n{plan}"
+    );
+
+    let updated = d.affected("UPDATE t SET w = 9 WHERE v < 5;");
+    let carrying = d.select_rows("SELECT id FROM t WHERE w = 9;");
+    assert_eq!(
+        (updated, carrying),
+        (1, 1),
+        "`UPDATE t SET w = 9 WHERE v < 5` must touch exactly the one v=1 row; the 500 NULL-valued \
+         rows do not satisfy `v < 5`. plan:\n{plan}"
+    );
+}
+
 /// Every shape is MEASURED FIRST and asserted once at the end, deliberately.
 ///
 /// The first version asserted inline and aborted on the first mismatch, so on the unfixed tree only

@@ -102,3 +102,23 @@ UNPROVEN and must not be made on this evidence.
 
 This is the severity escalation of the whole row — wrong answer to wrong write — so it is the claim
 most worth being wrong about, and it is pre-registered with its own falsifier for that reason.
+
+## Amendment 2 — `UPDATE` covered separately, added before the runs
+
+`Update::execute` and `Delete::execute` are different code consuming the same scan, so proving one
+says nothing about the other. New test `sql_update_does_not_overwrite_null_rows`. **Test count is
+now 13.**
+
+Assigns to `w` because `Update` refuses to assign to column 0. The `w = 9` recount is an INDEPENDENT
+instrument: `w` carries no index, so that query is a sequential scan whose `Filter` is known-correct
+for NULLs, and it catches a bug that writes 501 rows while reporting 1.
+
+| run | `affected` | rows carrying `w = 9` | verdict |
+|---|---|---|---|
+| Run B (before fix) | **501** | **501** | FAIL |
+| Run A (after fix) | 1 | 1 | pass |
+
+Revised totals: **Run A = 13 passed / 0 failed, rc=0. Run B = 9 failed / 4 passed, rc=101.**
+
+Same falsifier as Amendment 1: if DML does not take the index on this fixture, this test passes
+before the fix, is vacuous, and the write-corruption claim is UNPROVEN.
