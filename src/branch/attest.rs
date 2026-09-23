@@ -743,6 +743,33 @@ pub struct AttestedHistory {
     levels: Vec<Vec<[u8; 32]>>,
 }
 
+/// Lengths and capacities of every collection inside an [`AttestedHistory`] — see
+/// [`AttestedHistory::footprint`]. Element counts, never bytes.
+///
+/// `*_table_cap` is `HashMap::capacity()`, the number of items the table holds before it must
+/// grow — NOT its bucket count. Turning it into bytes needs the hash table's layout, which is a
+/// model the D192 harness states and checks against an allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AttestFootprint {
+    pub entries_len: usize,
+    pub entries_cap: usize,
+    pub by_branch_keys: usize,
+    pub by_branch_table_cap: usize,
+    /// Sum over branches of `by_branch[b].len()`.
+    pub by_branch_idx_len: usize,
+    /// Sum over branches of `by_branch[b].capacity()`.
+    pub by_branch_idx_cap: usize,
+    pub heads_keys: usize,
+    pub heads_table_cap: usize,
+    /// `levels.len()`: Merkle levels, leaves included.
+    pub levels: usize,
+    pub levels_outer_cap: usize,
+    /// Sum over levels of `levels[k].len()`.
+    pub level_nodes_len: usize,
+    /// Sum over levels of `levels[k].capacity()`.
+    pub level_nodes_cap: usize,
+}
+
 impl Default for AttestedHistory {
     fn default() -> Self {
         Self::new()
@@ -769,6 +796,33 @@ impl AttestedHistory {
 
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
+    }
+
+    /// **Observing only (D192):** the lengths and capacities that decide this structure's heap
+    /// footprint. It reads, it never changes anything, and nothing on a production path calls it.
+    ///
+    /// Raw counts rather than a byte total, on purpose: the byte arithmetic (element sizes, the
+    /// hash table's control bytes) is a MODEL, and a model belongs where it can be checked against
+    /// an allocator — `examples/d192_attest_footprint.rs` does that — not baked into an accessor
+    /// whose output would then look like a measurement.
+    ///
+    /// O(branches), because it sums every per-branch index `Vec`. Fine for a harness; do not put
+    /// it on a request path.
+    pub fn footprint(&self) -> AttestFootprint {
+        AttestFootprint {
+            entries_len: self.entries.len(),
+            entries_cap: self.entries.capacity(),
+            by_branch_keys: self.by_branch.len(),
+            by_branch_table_cap: self.by_branch.capacity(),
+            by_branch_idx_len: self.by_branch.values().map(Vec::len).sum(),
+            by_branch_idx_cap: self.by_branch.values().map(Vec::capacity).sum(),
+            heads_keys: self.heads.len(),
+            heads_table_cap: self.heads.capacity(),
+            levels: self.levels.len(),
+            levels_outer_cap: self.levels.capacity(),
+            level_nodes_len: self.levels.iter().map(Vec::len).sum(),
+            level_nodes_cap: self.levels.iter().map(Vec::capacity).sum(),
+        }
     }
 
     /// The latest attestation for a branch, if it has any history.

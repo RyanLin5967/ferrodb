@@ -3663,6 +3663,12 @@ impl AgentRuntime {
         self.attested.lock().unwrap().len()
     }
 
+    /// **Observing only (D192):** lengths and capacities inside the resident attested history.
+    /// See [`AttestedHistory::footprint`]; O(branches), for harnesses, not for request paths.
+    pub fn attested_footprint(&self) -> crate::branch::attest::AttestFootprint {
+        self.attested.lock().unwrap().footprint()
+    }
+
     /// Record a fork. The child's `prev` is the **parent's** head, which is what makes a
     /// verification walk of a child continue into the ancestry it forked from.
     ///
