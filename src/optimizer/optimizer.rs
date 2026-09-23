@@ -43,7 +43,7 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
             let tt_heap = HeapFileManager::open(entry.time_travel_root, bp);
-            Ok(Box::new(SeqScan { scanner: heap.scan(), schema: entry.schema.clone(), tt_heap, view}))
+            Ok(Box::new(SeqScan::new(heap.scan(), entry.schema.clone(), view, tt_heap)))
         }
         PhysicalPlan::Projection { input, exprs, .. } => {
             let child = lower(*input, catalog, bp, view)?;
