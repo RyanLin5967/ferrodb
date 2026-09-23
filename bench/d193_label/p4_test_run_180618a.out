@@ -1,0 +1,12 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d193-diff-label)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.69s
+     Running tests/integration_production_diff_wiring.rs (target/debug/deps/integration_production_diff_wiring-fddd0eafc5e05abc)
+
+running 4 tests
+test every_leaf_differs_so_nothing_is_skipped ... ok
+test the_memoised_content_identity_agrees ... ok
+test two_identical_roots_read_nothing ... ok
+test a_production_diff_reads_pages_in_proportion_to_depth ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+
