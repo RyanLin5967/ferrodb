@@ -3776,6 +3776,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **D183 — which reap door a branch leaves by, COUNTED rather than argued.**
+    ///
+    /// D81 replaced the per-fork full image rewrite with a 45-byte delta append and its note
+    /// (`:2215`) calls that "the only site that changes shape". This asks what REAP costs, and the
+    /// answer is not one number: `reaper.rs:679` splits on `has_live_children`, and only the fast
+    /// side reaches a delta. `retire_arenas_by_rule` ends in `persist_if_configured`, which is
+    /// `persist_full_locked` unconditionally — it never consults `compact_threshold`, so it is not
+    /// amortised at all.
+    ///
+    /// **Pre-registered from the SOURCE, before running it** (never from what the run printed):
+    /// `retire_arenas_by_rule` performs exactly one full rewrite per call and the reaper calls it
+    /// once per branch, so the INTERIOR arm's rewrites must rise one-for-one with branches reaped.
+    /// The LEAF arm goes through `free_arena` -> `TAIL_EXTENT_FREED` and must not.
+    ///
+    /// Two sizes, so the claim is a SLOPE and not a ratio, and both arms in the same run so the
+    /// leaf arm is a live control rather than a remembered number.
+    ///
+    /// ⛔⛔ **THIS TEST PINS A WALL, NOT A GUARANTEE. WHEN D183 IS FIXED IT MUST FAIL, AND
+    /// THAT FAILURE IS THE SIGNAL THE FIX WORKED — DO NOT WEAKEN IT TO GET GREEN.** Measured
+    /// 2026-09-23: LEAF 8/16 branches -> rewrites 0/0, appends 24/48; INTERIOR 8/16 ->
+    /// rewrites 8/16, appends 0/0. One full image rewrite per interior branch reaped, zero
+    /// deltas, against a leaf control that pays zero at both sizes. The correct fix is a NEW
+    /// tail record kind describing the list-shaped state `:2220` says a per-extent record
+    /// cannot (the pending-free log, per-extent recycled lists); when that lands, invert the
+    /// `int_r16 - int_r8` assertion to expect appends and re-record the numbers here.
+    ///
+    /// ⚠ `new_with(true)` — the catalog that SHIPS. `Harness::new()` is the log catalog, whose
+    /// `live_children` lives in the record; a reclamation test on it proves nothing about the
+    /// shipped path. That is D19, and this test would be worthless without it.
+    #[test]
+    fn d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends() {
+        fn run(branches: usize, interior: bool) -> (u64, u64) {
+            let h = Harness::new_with(true);
+            let path = std::env::temp_dir().join(format!(
+                "ferro-arena-d183-{}-{}-{}.bin",
+                std::process::id(),
+                branches,
+                interior
+            ));
+            let _ = std::fs::remove_file(&path);
+            h.store.checkpoint_to(path.clone());
+
+            let mut ids = Vec::new();
+            for _ in 0..branches {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                for _ in 0..4 {
+                    h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                }
+                if interior {
+                    // Forked AFTER those pages were born, so the interval rule must PARK them
+                    // and the reaper is forced down the slow side of `reaper.rs:679`.
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                }
+                ids.push(b.branch_id);
+            }
+
+            // Count only the reap loop: everything above is fixture.
+            let (r0, a0) = h.store.persist_counters();
+
+            // Exactly what `reaper.rs:679-687` does, per branch, on each side of the predicate.
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                if interior {
+                    h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+                } else {
+                    for arena in rec.arenas.iter().copied() {
+                        h.store.free_arena(arena).unwrap();
+                    }
+                }
+            }
+
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+
+        let (leaf_r8, leaf_a8) = run(8, false);
+        let (leaf_r16, leaf_a16) = run(16, false);
+        let (int_r8, int_a8) = run(8, true);
+        let (int_r16, int_a16) = run(16, true);
+
+        println!("D183 reap cost -- (full rewrites, delta appends) over the reap loop only");
+        println!("  LEAF      8: rewrites={leaf_r8:3} appends={leaf_a8:3}");
+        println!("  LEAF     16: rewrites={leaf_r16:3} appends={leaf_a16:3}");
+        println!("  INTERIOR  8: rewrites={int_r8:3} appends={int_a8:3}");
+        println!("  INTERIOR 16: rewrites={int_r16:3} appends={int_a16:3}");
+
+        // Anti-vacuity: a fixture that reaped nothing satisfies every shape assertion below.
+        assert!(leaf_a8 + leaf_r8 > 0, "fixture: the leaf arm persisted nothing at all");
+        assert!(int_r8 + int_a8 > 0, "fixture: the interior arm persisted nothing at all");
+
+        // THE PRE-REGISTERED SHAPE: one full image rewrite per interior branch reaped.
+        assert_eq!(
+            int_r16 - int_r8,
+            8,
+            "interior reaps did not cost one full image rewrite each: 8->{int_r8}, 16->{int_r16}"
+        );
+
+        // THE CONTROL: the leaf side must not pay them, or the predicate is not what splits it.
+        assert!(
+            leaf_r16 - leaf_r8 < int_r16 - int_r8,
+            "the leaf arm paid as many rewrites as the interior arm ({leaf_r8}->{leaf_r16} vs \
+             {int_r8}->{int_r16}), so `has_live_children` is not what decides the cost"
+        );
+    }
+
     /// `put_pending`'s own persist, isolated for the same reason as the test above it.
     #[test]
     fn putting_the_pending_log_back_reaches_the_durable_map() {
