@@ -102,3 +102,19 @@ measure -- applied to WRITES, which is the one direction D167 did not go.
 
 Recorded at launch by the runner: fleet measure lock acquired with `trap ... EXIT` in the same
 command, `load_at_acquire`, and `ferrodb::build_provenance()` printed by the harness itself.
+
+-------------------------------------------------------------------------------------------
+AMENDMENTS (append-only)
+
+A1. 2026-09-23, BEFORE the first measured run, found while building the instrument.
+    The CONTROLS section says "A W=100/S=100 cell is common to all three arms and must agree
+    across them." That is WRONG for arm C. Arm C holds S FIXED at 12800, so its W=100 cell is
+    (W=100, S=12800), not (100,100). The shared cell is common to arms A and B ONLY, and that is
+    what will be checked. Arm C has no cell in common with A or B by construction; its internal
+    control is that its own statement count is constant across the sweep, which the printed S
+    column shows directly.
+
+A2. Table size set to 16,000 rows rather than 20,000. The requirement is only that the table be
+    larger than the largest W (12,800) so the overlay cannot saturate; 16,000 satisfies it, is the
+    largest size D170 used, and cuts ~25% off the per-cell build. `max_overlay_len == W` is
+    asserted in every cell regardless, so saturation cannot pass silently whatever the table size.
