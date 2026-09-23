@@ -118,6 +118,26 @@ impl Db {
         explain_plan(&physical, &self.catalog)
     }
 
+    /// Rows a DML statement reported changing.
+    fn affected(&mut self, sql: &str) -> usize {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+        match run(
+            stmts.remove(0),
+            &mut self.catalog,
+            self.bp.clone(),
+            self.txn.clone(),
+            &mut self.session,
+        )
+        .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        {
+            ferrodb::execution::executor::Outcome::Affected(n) => n,
+            other => panic!("expected an affected count, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
     fn select_rows(&mut self, sql: &str) -> usize {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
@@ -425,6 +445,44 @@ fn seeded_wide() -> Db {
 /// cost model prefers a filtered sequential scan whose `Filter` rejects NULLs correctly, so a GREEN
 /// without it would mean "the index was never used", not "the index is right". That is not
 /// hypothetical — it is what the first version of this test actually did.
+/// ⛔ **THE DEFECT IS NOT CONFINED TO READS. THIS IS A WRONG WRITE.**
+///
+/// D178 stopped `UPDATE`/`DELETE` building their own scan and routed them through the same
+/// `optimize`/`lower` path `SELECT` uses — `plan::build_scan` ends in
+/// `lower(optimize(pushdown(logical), catalog)?, ..)`, deliberately, so there is exactly ONE
+/// planning path. The consequence for D187 is that both scans are reached by DML, and the same
+/// predicate that returns 501 rows to a `SELECT` hands 501 rows to a `DELETE`.
+///
+/// So before the fix, `DELETE FROM t WHERE v < 5` **destroys the 500 NULL-valued rows** alongside
+/// the one row that actually matches. That is data loss from a predicate those rows do not satisfy,
+/// and it is a strictly more serious failure than the wrong answer this row was opened for.
+///
+/// The `affected` count is the instrument, not the surviving row count, because it reports what the
+/// scan handed the writer — the same number the `SELECT` shapes above measure, taken on the write
+/// path. The survivor count is asserted too, so a bug that reports 1 and deletes 501 cannot pass.
+#[test]
+fn sql_delete_does_not_destroy_null_rows() {
+    let mut d = seeded_wide();
+
+    // Same predicate, same table, same statistics as the SELECT case, so `build_index_scan` makes
+    // the same choice. Asserted rather than assumed: if DML took a sequential scan here, its
+    // `Filter` would answer correctly and this test would be vacuous.
+    let plan = d.explain("SELECT id FROM t WHERE v < 5;");
+    assert!(
+        plan.contains("Index scan"),
+        "this case only tests the index path if the index path is chosen; plan was:\n{plan}"
+    );
+
+    let deleted = d.affected("DELETE FROM t WHERE v < 5;");
+    let survivors = d.select_rows("SELECT id FROM t;");
+    assert_eq!(
+        (deleted, survivors),
+        (1, 3000),
+        "`DELETE FROM t WHERE v < 5` must remove exactly the one v=1 row and leave the 500 \
+         NULL-valued rows untouched — NULL < 5 is UNKNOWN. plan:\n{plan}"
+    );
+}
+
 /// Every shape is MEASURED FIRST and asserted once at the end, deliberately.
 ///
 /// The first version asserted inline and aborted on the first mismatch, so on the unfixed tree only

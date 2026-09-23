@@ -69,3 +69,36 @@ this run will not demonstrate it end to end and I will not claim it does.
 - Run A leaving any test red.
 - `sql_index_path_answers_correctly` reporting a **seq** plan for `v < 5` in either run — the
   headline assertion fires and the row counts mean nothing, whatever they say.
+
+---
+
+## Amendment 1 — the defect reaches WRITES, added before the runs
+
+Found while reviewing my own diff, from `plan.rs::build_scan`, which ends in
+`lower(optimize(pushdown(logical), catalog)?, ..)`. D178 deliberately routed `UPDATE`/`DELETE`
+through the same planning path as `SELECT` so there would be exactly one. The consequence for D187
+is that **both scans are reached by DML**, so the predicate that returns 501 rows to a `SELECT`
+hands 501 rows to a `DELETE`.
+
+New test `sql_delete_does_not_destroy_null_rows`. **Test count is now 12, not 11.**
+
+Predicted, on the same 3001-row `seeded_wide()` fixture:
+
+| run | `affected` | survivors | verdict |
+|---|---|---|---|
+| Run B (before fix) | **501** | **2500** | FAIL — 500 NULL rows destroyed by a predicate they do not satisfy |
+| Run A (after fix) | 1 | 3000 | pass |
+
+Revised totals: **Run A = 12 passed / 0 failed, rc=0. Run B = 8 failed / 4 passed, rc=101.**
+
+⚠ The prediction that this test FAILS before the fix rests on `build_index_scan` making the same
+choice for the DELETE as for the SELECT — same predicate, same table, same statistics. If DML
+instead takes a sequential scan here, its `Filter` answers correctly, the test passes before the fix
+and is **vacuous**. The `explain_plan` assertion inside it does not settle that, because it explains
+the SELECT rather than the DELETE; it is there to catch the fixture drifting off the index path
+entirely. So: if Run B shows this test passing, the correct conclusion is "DML did not take the
+index on this fixture", NOT "DML is unaffected" — and the claim that this is a data-loss bug is then
+UNPROVEN and must not be made on this evidence.
+
+This is the severity escalation of the whole row — wrong answer to wrong write — so it is the claim
+most worth being wrong about, and it is pre-registered with its own falsifier for that reason.
