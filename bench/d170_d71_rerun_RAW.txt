@@ -98,8 +98,19 @@ fix `fc443c4` and guard `ca61e38` are both ancestors of HEAD.
   ⚠ The prereg's outcome 5 called "not ~1 in either arm" an instrument failure. **That was written
   too bluntly and is not invoked**: a staged write does not commit, so 0.00 is correct behaviour on
   the staged path, not a broken instrument.
-- **PLAIN is the arm the D101 defect provably could NOT touch** (ordinary DML never touches the
-  runtime). Its ms/1000 at 16000 rows: stub **0.3373**, block 1 **0.3497**, block 2 **0.3120**.
+⛔ **THE 'PLAIN IS THE CONTROL' CLAIM IS WITHDRAWN — IT WAS INVALID *AND* IT DID NOT HOLD.**
+  (a) **Invalid by construction.** The D101 banner says verbatim *"The PLAIN arm is UNAFFECTED:
+      ordinary DML never touches the runtime."* A control that cannot see the change is not
+      evidence the change didn't happen — its stability carries **zero** information about a
+      `branch_update` edit. The adversary demonstrated this directly: across its pushdown switch,
+      **staged moved ~13x and PLAIN moved 1%** (0.3148 vs 0.3117 ms/1000).
+  (b) **And it did not actually agree.** "0.3373 vs 0.3497 vs 0.3120" is the **LAST ROW ONLY**. At
+      1,000 rows the stub reads **4.032** and this re-run **3.027** — 25% apart — and the ratio
+      moved **1.34x → 1.85x** (38%). The adversary's own PLAIN runs read 4.0884 and 3.7400 at
+      1,000 rows against the stub's 4.032: **my 3.027 is the outlier the "agreement" was read off.**
+  ⇒ I picked the one row where two numbers coincided and called it a passing control. A moved
+    control means two bases — and this one moved.
+
 - Block-to-block reproducibility within this re-run, PLAIN: 3.027/3.048/3.897/4.013/5.595 vs
   3.017/3.029/3.803/4.008/4.992.
 
