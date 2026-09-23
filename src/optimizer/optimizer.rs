@@ -457,3 +457,5 @@ mod tests {
         }
     }
 }
+// d180 fire-check fixture: a branch-side edit to a file `main` has ALSO moved under,
+// so the overlap arm of staleness.sh has something to find. Throwaway, never merged.
