@@ -1255,21 +1255,21 @@ impl Fleet {
     /// **Reports its ITERATION COUNT on both exits.** See `settle_to` for why: the bound here is a
     /// turn count, not a deadline, so "six minutes" is ambiguous between a slow `pump()` and a
     /// non-converging election until an integer says which.
-    fn hold_leader(&self, want: usize) {
+    fn hold_leader(&self, want: usize, site: &str) {
         let l = NodeId(want as u32 + 1);
         let t0 = std::time::Instant::now();
         for turn in 0..100_000u32 {
             self.pump_all();
             if self.reps.iter().all(|r| r.leader() == Some(l)) {
                 loopcount(format_args!(
-                    "LOOPCOUNT hold_leader want={want} turns={turn} bound=100000 ms={}",
+                    "LOOPCOUNT hold_leader site={site} want={want} turns={turn} bound=100000 ms={}",
                     t0.elapsed().as_millis()
                 ));
                 return;
             }
         }
         panic!(
-            "node {want} never regained the leadership after 100000 turns in {} ms; leaders = {:?}",
+            "node {want} never regained the leadership at site {site} after 100000 turns in {} ms; leaders = {:?}",
             t0.elapsed().as_millis(),
             self.reps.iter().map(|r| r.leader()).collect::<Vec<_>>()
         );
@@ -1439,7 +1439,7 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
         fleet.ledgers[leader].clone(),
     );
 
-    fleet.hold_leader(leader);
+    fleet.hold_leader(leader, "followers-log/pre-fork");
     let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
     for i in 0..30 {
         db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
@@ -1447,7 +1447,7 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     }
     fleet.settle_to(cs.fork_round);
 
-    fleet.hold_leader(leader);
+    fleet.hold_leader(leader, "followers-log/pre-merge");
     let bp = db.bp.clone();
     let txn = db.txn.clone();
     let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
@@ -1474,12 +1474,21 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     // OTHER error fails immediately, and running out of attempts fails loudly with the last one.
     let mut attempt = 0;
     let report = loop {
+        // D173 instrument -- see the identical note in the neighbouring test.
+        let p_before = agents.cost().proposals;
         match agents.merge(&mut ctx, cs.branch()) {
             Ok(r) => break r,
             Err(FerroError::NotLeader { .. }) if attempt < 10 => {
                 attempt += 1;
+                let cid = ClusterBranchId::of(NodeId(leader as u32 + 1), cs.branch()).unwrap();
+                loopcount(format_args!(
+                    "NOTLEADER site=followers-log/retry-arm attempt={attempt} proposed={} \
+                     ledger={:?}",
+                    agents.cost().proposals - p_before,
+                    lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
+                ));
                 drop(ctx);
-                fleet.hold_leader(leader);
+                fleet.hold_leader(leader, "followers-log/retry-arm");
                 let bp = db.bp.clone();
                 let txn = db.txn.clone();
                 ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
@@ -1536,7 +1545,7 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
 
     let mut merged = Vec::new();
     for row in 1..=3 {
-        fleet.hold_leader(leader);
+        fleet.hold_leader(leader, "hundred-writes/pre-fork");
         let cs = agents.fork(agent("fanout"), BranchId::TRUNK).unwrap();
         fleet.settle_to(cs.fork_round);
         for i in 0..100 {
@@ -1546,7 +1555,7 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
             );
             fleet.pump_all();
         }
-        fleet.hold_leader(leader);
+        fleet.hold_leader(leader, "hundred-writes/pre-merge");
         let bp = db.bp.clone();
         let txn = db.txn.clone();
         let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
@@ -1568,12 +1577,25 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
         // test still passed, so the recovery works rather than merely compiling.
         let mut attempt = 0;
         let r = loop {
+            // D173 instrument. `proposals` increments inside `merge` only after `propose` has
+            // assigned a round, so its delta across one failed attempt says WHICH `not_leader`
+            // call site refused: 0 is `require_leader` before anything was proposed (benign), 1 is
+            // `pump_until`'s re-check AFTER the entry is in the log (the output-commit window).
+            // Nothing here changes an assertion; a green run stays green and now says why.
+            let p_before = agents.cost().proposals;
             match agents.merge(&mut ctx, cs.branch()) {
                 Ok(r) => break r,
                 Err(FerroError::NotLeader { .. }) if attempt < 10 => {
                     attempt += 1;
+                    let cid = ClusterBranchId::of(me, cs.branch()).unwrap();
+                    loopcount(format_args!(
+                        "NOTLEADER site=hundred-writes/retry-arm row={row} attempt={attempt} \
+                         proposed={} ledger={:?}",
+                        agents.cost().proposals - p_before,
+                        lock(&fleet.ledgers[leader]).get(cid).map(|b| b.state)
+                    ));
                     drop(ctx);
-                    fleet.hold_leader(leader);
+                    fleet.hold_leader(leader, "hundred-writes/retry-arm");
                     let bp = db.bp.clone();
                     let txn = db.txn.clone();
                     ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
