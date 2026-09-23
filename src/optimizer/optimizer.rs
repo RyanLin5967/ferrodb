@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashSet, ops::Bound, sync::Arc};
+use std::{collections::HashSet, ops::Bound, sync::Arc};
 
 use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::ReadView};
 
@@ -171,131 +171,33 @@ fn secondary_scan_start(lower: &Bound<Value>) -> Bound<(Value, Value)> {
     }
 }
 
-/// Choose an access path for a single-relation `Filter`: the cheapest of the sequential scan and
-/// one `IndexScan` per usable conjunct.
-///
-/// # D181 — this used to cost ONE candidate, and which one was decided by the user's typing
-///
-/// The selection was `conjuncts.iter().position(..)`, and `position` returns the FIRST match.
-/// `split_and` preserves source order, so with two usable indexed conjuncts exactly one candidate
-/// was ever built — the leftmost — and it was costed against the sequential scan and against
-/// nothing else. The second index was never built, never costed, and could not win. **Index
-/// selection was decided by the order the predicate was typed**, and the cost model was only ever
-/// asked to ratify that choice against a full scan.
-///
-/// Measured in `bench/d181_conjunct_order_BEFORE_RAW.txt` (`examples/d181_conjunct_order.rs`), on
-/// a table with two indexed secondary columns — `sel` unique, `broad` two-valued — after `ANALYZE`,
-/// in rows examined (heap tuples pulled + index entries walked) for the SAME predicate:
-///
-/// ```text
-///     n                                  400      800     1600
-///     SELECT .. WHERE sel = k AND broad = b     400        2        2
-///     SELECT .. WHERE broad = b AND sel = k     400      800     1600
-///     gap                                         0      798     1598      <- n - 2, not a constant
-/// ```
-///
-/// The fire-check arm (`pad = 'zz'`, no index) read exactly `n` at every size in the same process,
-/// so the zeros above are readings and not a dead counter, and every arm returned its one row.
-/// Typing `broad` first did not merely pick the worse index: the broad candidate loses to the
-/// sequential scan on cost, so the statement reached NO index at all and read the whole table,
-/// while the other spelling of the identical predicate read two index entries.
-///
-/// Note the `ANALYZE: no` half of that run shows no gap. Without statistics both columns get
-/// `DEFAULT_DISTINCT`, so the two candidates cost the same and both lose to the sequential scan —
-/// the defect needs statistics to become visible, which is exactly the case where the engine has
-/// the information to choose correctly and throws it away.
-///
-/// # What this does instead
-///
-/// Every conjunct that `predicate_to_bounds` can read AND whose column carries an index becomes a
-/// candidate plan, each with the remaining conjuncts as a residual `Filter`; all of them are costed
-/// and the cheapest wins. The sequential scan is the starting incumbent rather than a special case,
-/// so it still wins ties — the same `<` comparison as before, and the same result for every
-/// predicate with at most one usable conjunct.
-///
-/// # The tie, and why it is broken on the candidate rather than on where it was typed
-///
-/// A strict `<` alone leaves the defect's residue: on an EXACT cost tie the incumbent stands, so
-/// between two index candidates the earliest-typed would win and typing order would still decide.
-/// Cost is an estimate, so two plans the model scores identically can examine wildly different
-/// numbers of rows — which means the residue is not merely cosmetic, and a test asserting that the
-/// two typing orders examine the same rows would fail intermittently rather than never.
-///
-/// So a tie is broken on [`candidate_key`] — `(column, lower bound, upper bound)`, a property of
-/// the candidate and not of its position in the predicate. Because the update rule keeps the
-/// running MINIMUM key among equal-cost candidates, the result is the same whichever order the
-/// conjuncts arrive in, for any number of them. Plan choice is then a function of the predicate
-/// SET, which is the law D181 is actually about.
-///
-/// A tie with the SEQUENTIAL incumbent still keeps the sequential scan, exactly as `<` did: the
-/// incumbent carries no key, and that case is the first thing the match arm below rules out.
-///
-/// What remains order-dependent is the residual `Filter`'s own conjunct order —
-/// `Filter(#2 = 1 AND #1 = 801)` against `Filter(#1 = 801 AND #2 = 1)`. Both evaluate both
-/// conjuncts over the same rows, so no access path and no row count depends on it. Tests assert
-/// COUNTERS across a typing swap, not plan-string equality, for that reason.
-///
-/// This is one candidate per conjunct, not a subset search: an `IndexScan` here reads one tree and
-/// a multi-index intersection is a different physical operator this engine does not have.
+/// ⛔ **CONTROL BRANCH ONLY — NOT FOR MERGING.** This is `build_index_scan` as it stood with D179
+/// applied and D181 NOT applied: selection by `conjuncts.iter().position(..)`, which returns the
+/// FIRST usable conjunct, so exactly one candidate is built and it is costed only against the
+/// sequential scan. This branch exists so that the BEFORE half of
+/// `bench/d181_conjunct_order_BEFORE_RAW.txt` has a commit anyone can check out and re-run, instead
+/// of being a number taken on an uncommitted working tree. See `d179-sec-index` for the fix.
 fn build_index_scan(table: &str, predicate: &BoundExpr, catalog: &Catalog) -> Option<PhysicalPlan> {
     let mut conjuncts = Vec::new();
     let entry = catalog.get_table(table)?;
     split_and(predicate.clone(), &mut conjuncts);
+    let chosen = conjuncts.iter().position(|c| {
+        predicate_to_bounds(c).is_some_and(|(col, _, _)| has_index(entry, col))
+    })?;
+    let index_conjunct = conjuncts.remove(chosen);
+    let (column, lower, upper) = predicate_to_bounds(&index_conjunct)?;
+    let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };
+    let candidate = if conjuncts.is_empty() {
+        scan
+    } else {
+        PhysicalPlan::Filter { input: Box::new(scan), predicate: combine_and(conjuncts) }
+    };
 
-    // The incumbent. `optimize` builds exactly this tree when we return `None`, so starting here
-    // rather than returning early keeps the no-usable-conjunct case identical to what it was.
-    // `best_key` is `None` for it, which is what makes a tie against the sequential scan keep the
-    // sequential scan.
-    let mut best = PhysicalPlan::Filter { input: Box::new(PhysicalPlan::SeqScan { table: table.into() }), predicate: predicate.clone() };
-    let mut best_cost = cost(&best, catalog).cost;
-    let mut best_key: Option<CandidateKey> = None;
-
-    for (i, conjunct) in conjuncts.iter().enumerate() {
-        let Some((column, lower, upper)) = predicate_to_bounds(conjunct) else { continue };
-        if !has_index(entry, column) { continue }
-        let key = candidate_key(column, &lower, &upper);
-        let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };
-        let residual: Vec<BoundExpr> = conjuncts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| c.clone()).collect();
-        let candidate = if residual.is_empty() {
-            scan
-        } else {
-            PhysicalPlan::Filter { input: Box::new(scan), predicate: combine_and(residual) }
-        };
-        let candidate_cost = cost(&candidate, catalog).cost;
-        let better = match (candidate_cost.partial_cmp(&best_cost), &best_key) {
-            (Some(Ordering::Less), _) => true,
-            // A tie between two INDEX candidates, broken on the candidate itself. See the doc.
-            (Some(Ordering::Equal), Some(incumbent)) => &key < incumbent,
-            // A tie with the sequential incumbent, or a NaN cost: keep what we have.
-            _ => false,
-        };
-        if better {
-            best_cost = candidate_cost;
-            best_key = Some(key);
-            best = candidate;
-        }
+    let seq = PhysicalPlan::Filter { input: Box::new(PhysicalPlan::SeqScan { table: table.into() }), predicate: predicate.clone() };
+    if cost(&candidate, catalog).cost < cost(&seq, catalog).cost {
+        return Some(candidate)
     }
-    Some(best)
-}
-
-/// The tie-break key for an `IndexScan` candidate — see [`build_index_scan`].
-///
-/// `Bound` does not implement `Ord` (std derives only `Clone, Copy, Debug, Hash, PartialEq, Eq`),
-/// so the bounds are ranked explicitly. The ranks are arbitrary and that is fine: the key exists to
-/// be TOTAL and to depend on nothing but the candidate, not to express a preference. What it must
-/// not do is read the conjunct's position, because that is the defect.
-type CandidateKey = (usize, (u8, Option<Value>), (u8, Option<Value>));
-
-fn candidate_key(column: usize, lower: &Bound<Value>, upper: &Bound<Value>) -> CandidateKey {
-    (column, bound_key(lower), bound_key(upper))
-}
-
-fn bound_key(bound: &Bound<Value>) -> (u8, Option<Value>) {
-    match bound {
-        Bound::Unbounded => (0, None),
-        Bound::Included(v) => (1, Some(v.clone())),
-        Bound::Excluded(v) => (2, Some(v.clone())),
-    }
+    Some(seq)
 }
 
 fn has_index(entry: &TableEntry, col: usize) -> bool {
