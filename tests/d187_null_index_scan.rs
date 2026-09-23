@@ -339,15 +339,24 @@ fn control_primary_excluded_lower_bound_already_excludes_null() {
     assert_eq!(rows.len(), 5, "ids 6..=10 satisfy id > 5; got {:?}", v_of(&rows, 0));
 }
 
-/// The semantics this fix commits to, pinned so a later blanket skip cannot pass silently.
+/// ⚠ **THIS IS A PREMISE TEST, NOT A CODE-PATH TEST. DO NOT DELETE IT AS REDUNDANT.**
 ///
-/// A NULL entry is dropped because the row's membership is decided by a **comparison against a
-/// bound**, and that comparison is UNKNOWN. With no bound on either end there is no comparison and
-/// nothing to be UNKNOWN about, so the NULL rows stay. `predicate_to_bounds` cannot currently
-/// produce `(Unbounded, Unbounded)` — every one of its five arms bounds at least one side — so this
-/// shape is unreachable from SQL today. It is pinned because the moment a full index scan is added
-/// for ordering, a blanket skip would start dropping rows that belong in the answer, and this test
-/// is what would say so.
+/// What it guards is a REACHABILITY PREMISE about `predicate_to_bounds`, not the branch it happens
+/// to execute. The premise: **no planner-built scan is unbounded on both ends** — all five arms of
+/// `predicate_to_bounds` bound at least one side, `build_index_scan` is the only non-test producer
+/// of a `PhysicalPlan::IndexScan`, and `IS NULL` does not exist anywhere in the parser, binder or
+/// planner. That premise is why `skip_nulls` is `true` for every real query today, and therefore
+/// why an unconditional skip would ALSO have been correct.
+///
+/// The semantics the fix commits to: a NULL entry is dropped because the row's membership is
+/// decided by a **comparison against a bound**, and that comparison is UNKNOWN. With no bound on
+/// either end there is no comparison, nothing to be UNKNOWN about, and the NULL rows belong.
+///
+/// So if someone adds a full index scan for ordering, or any arm that yields an unbounded side,
+/// **this test is what tells them the premise changed** — and at that moment a blanket skip would
+/// silently start dropping rows that belong in the answer. It is also the only exercise of
+/// `skip_nulls == false`, so deleting it leaves that branch untested. Both reasons are load-bearing;
+/// the first is the one a reader is likely to miss.
 #[test]
 fn fully_unbounded_scan_keeps_nulls() {
     let d = seeded(5, 3);
@@ -453,10 +462,21 @@ fn sql_index_path_answers_correctly() {
         }
     }
 
-    // Load-bearing: below a few thousand rows the cost model prefers a filtered sequential scan,
-    // whose `Filter` rejects NULLs correctly — so a GREEN with no index scan anywhere would mean
-    // "the index was never used", not "the index is right". That is not hypothetical; it is what
-    // the first version of this fixture actually did, at 501 rows.
+    // ⚠ PERMANENT, not scaffolding from the hunt. Below a few thousand rows the cost model prefers
+    // a filtered sequential scan, whose `Filter` rejects NULLs correctly — so a GREEN with no index
+    // scan anywhere means "the index was never used", NOT "the index is right".
+    //
+    // This is not hypothetical and it is not a risk that went away with the fix: the FIRST version
+    // of this fixture, at 501 rows, silently got
+    //
+    //     Filter (#1 < 5) (rows=125 cost=15.02)
+    //       Sequential scan on t (rows=501 cost=10.01)
+    //
+    // and would have passed after the fix while testing a heap filter. Anything that shifts the
+    // cost model, the row count, the `v` spread or `analyze`'s statistics can put it back there,
+    // and every one of those is a change someone would make for an unrelated reason. Deleting this
+    // assertion does not make the test weaker in a visible way — it makes it green in a useless
+    // one.
     let headline = d.explain("SELECT id FROM t WHERE v < 5;");
     assert!(
         headline.contains("Index scan"),
