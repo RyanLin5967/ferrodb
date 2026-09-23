@@ -494,11 +494,20 @@ struct PersistState {
     /// whole log.
     ///
     /// `rewrites` and `durable_pending_version` as they stood at the take, plus the KEYS the take
-    /// handed out. Between the take and the put, exactly two things can make the durable log stop
-    /// being the pre-take log: a full image rewrite (which publishes the drained, empty log) and
-    /// another record that carries the log. The first moves `rewrites`; the second moves
-    /// `durable_pending_version`. Both unchanged means the file still lists precisely
-    /// `DrainMark::taken`.
+    /// handed out.
+    ///
+    /// **THREE things can make the durable log stop being the pre-take log, and the two counters
+    /// only see two of them.** A full image rewrite publishes the drained, empty log and moves
+    /// `rewrites`; another record that carries the whole log moves `durable_pending_version`. The
+    /// third is [`ArenaPageStore::TAIL_PAGES_PARKED`], which APPENDS to the durable log and moves
+    /// **neither** — `persist_delta_locked`'s `pending_covered` is `None` for it precisely because
+    /// it leaves the log's accounting where it found it.
+    ///
+    /// ⚠ **An earlier version of this comment said "exactly two", and was wrong.** What actually
+    /// covers the third is the subset test in `put_pending`: a parked record landing between the
+    /// take and the put also pushes its entry into memory, so the log being put back holds a key
+    /// the take never handed out, `kept ⊄ taken`, and the absolute record is written instead. The
+    /// counters are not the whole guard and this comment must not claim they are.
     ///
     /// ⛔ **The keys are carried because `put_pending`'s contract is "the log is now exactly
     /// this", NOT "I released what I dropped".** An earlier draft derived the removals from
@@ -978,6 +987,33 @@ impl ArenaPageStore {
         Ok(Some(encoded))
     }
 
+    /// Push onto the pending-free log as part of a change a tail record is about to describe.
+    ///
+    /// **The `&mut PersistState` is the point.** It is unused, and it is the whole signature: a
+    /// caller can only obtain one by holding the persist lock, so "mutate the log under the lock
+    /// that orders the records" stops being a rule in a comment and becomes the only spelling
+    /// that compiles. The defect this replaces was exactly a push that happened outside it while
+    /// a comment three functions away asserted the invariant — see `retire_arenas_by_rule`.
+    ///
+    /// The caller must append a record covering this entry before releasing the guard, or route
+    /// through [`Self::abandon_park`] if it cannot.
+    fn push_pending_recorded(&self, _persist: &mut PersistState, entry: PendingFree) {
+        self.state.lock().unwrap().pending.push(entry);
+    }
+
+    /// Push onto the pending-free log with NO record describing it, and say so durably.
+    ///
+    /// The other discipline, and the reason the pair exists rather than one function: `free_page`
+    /// parks on the page path, which must not take a durability mutex. Such a push bumps
+    /// [`Self::pending_version`] instead, which makes the next persist a full image rewrite. Both
+    /// are correct; what is not correct is a push that does neither, and neither of these two
+    /// functions can be that.
+    fn push_pending_unrecorded(&self, entry: PendingFree) {
+        let mut st = self.state.lock().unwrap();
+        st.pending.push(entry);
+        self.pending_version.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Take the pending-free log for re-evaluation.
     pub fn take_pending(&self) -> Vec<PendingFree> {
         // **D81.** Draining the log changes it and persists nothing; no tail record describes
@@ -1072,6 +1108,13 @@ impl ArenaPageStore {
             let mut st = self.state.lock().unwrap();
             st.pending.extend(entries);
             let dirty = std::mem::take(&mut st.recycled_dirty);
+            // ⚠ **`dirty` alone, where `retire_arenas_by_rule` passes `dirty ∪ rec.arenas`, and
+            // the asymmetry is deliberate.** That site unions in the arenas it WALKED because it
+            // can raise an extent's `next_free` (through `resolve_fill`) and park every page of an
+            // extent without ever calling `release_page` on it — so its walked set is not covered
+            // by the marks. A drain's only mutation is `release_page`, which marks its arena in
+            // the same critical section as the push, so here the marks ARE the complete set. If a
+            // drain ever gains a second mutator, this line has to gain its union too.
             // Read under the SAME lock as the log this encodes. See `persist_delta_locked`'s
             // `pending_covered`: a version read outside would vouch for a push the record misses.
             let version = self.pending_version.load(Ordering::SeqCst);
@@ -1131,6 +1174,13 @@ impl ArenaPageStore {
             // Re-marking rather than assuming: an arena dirtied again while the append was in
             // flight is already back in the set and `extend` leaves it there.
             self.state.lock().unwrap().recycled_dirty.extend(dirty);
+            // **D183 — and the log itself is now ahead of the file with nothing saying so.** This
+            // used to be safe by accident: `take_pending` bumped unconditionally, so the caller
+            // had always bumped before reaching here. The conditional bump removed that
+            // guarantee — a `put_pending` after an EMPTY take, or from any caller that did not
+            // take at all, extends the log and bumps nothing. Same repair `abandon_park` makes,
+            // and for the same reason.
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
             return Err(e);
         }
         Ok(())
@@ -1251,44 +1301,75 @@ impl ArenaPageStore {
         rec: &BranchRecord,
         free_epoch: Epoch,
     ) -> Result<u32, FerroError> {
-        let mut released = 0u32;
-        // **D183.** Collected as they are parked so the record can carry exactly them. The pushes
-        // themselves still happen as they are decided — holding the durability lock across a loop
-        // that reads a page and queries the catalog per page would serialise every extent claim in
-        // the store behind one reap.
-        let mut parked: Vec<PendingFree> = Vec::new();
+        // ⛔⛔ **D183 — TWO PHASES, AND THE SPLIT IS A CORRECTNESS FIX, NOT A TIDY-UP.**
+        //
+        // This loop used to DECIDE and MUTATE together, holding only `state`, and take `persist`
+        // afterwards to write its record. That put a pending-log mutation outside the lock whose
+        // entire job is to make the durable record order equal the in-memory mutation order — the
+        // rule [`PersistState`] states and every other delta site obeys. The hole it opened, found
+        // by review and reproduced from the committed blob at `149666b`:
+        //
+        //   1. this loop pushes entry K under `state`, and is descheduled before taking `persist`;
+        //   2. a concurrent drain's `take_pending` takes `persist` + `state`, SEES K, and cuts a
+        //      [`PersistState::drain_mark`] asserting "the durable log is the log I just took" —
+        //      which is false, because K's record has not been appended yet;
+        //   3. the drain releases K and its `TAIL_PENDING_DRAINED` removes K from a durable log
+        //      that never had it: a no-op;
+        //   4. this loop finally appends `TAIL_PAGES_PARKED`, putting K back.
+        //
+        // Replay then holds an entry memory dropped, for a page that is also in the recycled list.
+        // **Removal is idempotent but it does not COMMUTE with an append**, so no amount of
+        // care in the replay arms can fix step 4 — the order itself has to be impossible.
+        //
+        // Gated today only by the per-statement lock that serialises reaps, which `reaper.rs`'s
+        // own D124 note says W4 removes. Latent, and armed by a change already on the roadmap.
+        //
+        // PHASE 1 decides and mutates nothing durable: page reads and catalog queries, which are
+        // what would make holding the lock across the whole loop expensive. **The decision is
+        // stable across the phase boundary** because `reap` publishes `Reaping` before calling
+        // this, `BranchRecord::check_readable` refuses that state, and `fork` calls it — so no new
+        // live child of this branch can appear in between, which is the only way a page decided
+        // reclaimable could become pinned. The reverse (a pinned page becoming reclaimable) parks
+        // a page the next drain releases, which is the safe direction and already possible.
+        let mut plan: Vec<(PageId, ArenaId, Epoch, bool)> = Vec::new();
         for arena in rec.arenas.iter().copied() {
             // **D85.** `allocated_pages` is `(0..next_free)`, so an understated `next_free` makes
             // this loop park NONE of a live child's pages. Probe first.
             self.resolve_fill(arena);
             for page_id in self.allocated_pages(arena) {
-                let birth = match self.page_birth(page_id) {
-                    Ok(b) => b,
-                    Err(e) => return self.abandon_park(&parked, e),
-                };
+                // Nothing has been parked yet, so an error here needs no repair — which is why
+                // these are plain `?` where they used to route through `abandon_park`.
+                let birth = self.page_birth(page_id)?;
                 // The reclamation rule as an index question rather than an array walk: is
                 // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
                 // structure that can answer it without holding every child resident.
                 let pinned =
-                    match self.catalog.live_child_in_epoch_range(rec.branch_id.id, birth, free_epoch)
-                    {
-                        Ok(p) => p,
-                        Err(e) => return self.abandon_park(&parked, e),
-                    };
-                if !pinned {
-                    self.release_page(page_id, arena);
-                    released += 1;
-                } else {
-                    let entry = PendingFree {
-                        page_id,
-                        arena_id: arena,
-                        birth_epoch: birth,
-                        free_epoch,
-                        owner: rec.branch_id,
-                    };
-                    self.state.lock().unwrap().pending.push(entry);
-                    parked.push(entry);
-                }
+                    self.catalog.live_child_in_epoch_range(rec.branch_id.id, birth, free_epoch)?;
+                plan.push((page_id, arena, birth, pinned));
+            }
+        }
+
+        // PHASE 2 applies and records with `persist` held throughout, exactly as `free_arena` and
+        // `put_pending` do. What is newly serialised against extent claims is one `evict` per
+        // released page — the same work `free_arena` already does under this lock — and not the
+        // page reads and catalog queries, which stayed in phase 1.
+        let mut persist = self.persist.lock().unwrap();
+        let mut released = 0u32;
+        let mut parked: Vec<PendingFree> = Vec::new();
+        for (page_id, arena, birth, pinned) in plan {
+            if !pinned {
+                self.release_page(page_id, arena);
+                released += 1;
+            } else {
+                let entry = PendingFree {
+                    page_id,
+                    arena_id: arena,
+                    birth_epoch: birth,
+                    free_epoch,
+                    owner: rec.branch_id,
+                };
+                self.push_pending_recorded(&mut persist, entry);
+                parked.push(entry);
             }
         }
         // The slow path changes the durable map every bit as much as the fast one: pages recycled
@@ -1307,13 +1388,12 @@ impl ArenaPageStore {
         // above actually did: the entries it parked, and the recycled lists and fills of the
         // arenas it walked. The existing threshold decides when to compact, as it does for a claim.
         //
-        // **Outermost and held across the record's snapshot and its append**, per [`PersistState`].
-        // The MUTATIONS are already behind us and that is safe on purpose: the recycled half is
-        // absolute and skips dead arenas, and the parked half is keyed and skips dead arenas, so
-        // neither cares which order it and a `TAIL_EXTENT_FREED` for the same extent reach the
-        // file in. The snapshot is taken under this lock so that two records for one arena cannot
-        // be appended in the opposite order to the states they describe.
-        let mut persist = self.persist.lock().unwrap();
+        // **The guard taken at the top of phase 2 is STILL HELD here, and that is the fix.** The
+        // mutations above, this snapshot and the append below are one critical section, so the
+        // order records reach the file is the order memory changed in — which is what
+        // [`PersistState`] requires and what the old two-phase-lock shape violated. Re-acquiring
+        // it here would deadlock: `std::sync::Mutex` is not reentrant, and doing exactly that is
+        // how this comment came to be written.
         let (payload, dirty) = {
             let mut st = self.state.lock().unwrap();
             let dirty = std::mem::take(&mut st.recycled_dirty);
@@ -1904,11 +1984,25 @@ impl ArenaPageStore {
     /// must use: append only while the durable log still equals the in-memory one, because such a
     /// record leaves the log exactly as it found it.
     ///
-    /// `Some(v)` is for a record that carries the WHOLE log — today only
-    /// [`Self::TAIL_PENDING_REPLACED`]. Such a record does not need the log to be clean, it makes
-    /// it clean, so the third condition does not apply and `durable_pending_version` advances to
-    /// the version the caller read **under the same `state` lock as the log it encoded**. A `v`
-    /// read anywhere else would claim durability for a push the record does not contain.
+    /// `Some(v)` says "after this record the durable log is at version `v`", so the third
+    /// condition does not apply. **TWO different records pass it and they earn it two different
+    /// ways — do not add a third by reading only one of them:**
+    ///
+    ///   * [`Self::TAIL_PENDING_REPLACED`] carries the WHOLE log. It does not need the log to be
+    ///     clean, it MAKES it clean, so any `v` it read under the same `state` lock as the log it
+    ///     encoded is true by construction.
+    ///   * [`Self::TAIL_PENDING_DRAINED`] carries only REMOVALS and makes nothing clean. It is
+    ///     correct only against a durable log that already equals the one `take_pending` handed
+    ///     out, and its whole safety is [`PersistState::drain_mark`] plus `put_pending`'s subset
+    ///     test. Passing `Some(v)` for it is a claim those two guards have to have checked first.
+    ///
+    /// ⚠ An earlier version of this paragraph said `Some(v)` was "for a record that carries the
+    /// WHOLE log — today only `TAIL_PENDING_REPLACED`", which was false the moment the drain
+    /// record existed. A future kind added on the strength of that sentence would skip the third
+    /// condition with no equivalent of `drain_mark` behind it, and the failure would be a durable
+    /// log silently short an entry. In every case `v` must be read under the same `state` lock as
+    /// the log the record describes; a `v` read anywhere else claims durability for a push the
+    /// record does not contain.
     ///
     /// ⚠ [`Self::TAIL_PAGES_PARKED`] passes `None` deliberately even though it APPENDS to the
     /// log. It carries its own entries and nobody else's, so it is only correct against a durable
@@ -2209,11 +2303,16 @@ impl ArenaPageStore {
                 {
                     let mut st = self.state.lock().unwrap();
                     // **Idempotent by key, and that is a durability property rather than tidiness.**
-                    // This record APPENDS, so it has to be safe to replay behind a
-                    // `TAIL_PENDING_REPLACED` whose own snapshot already contained these entries —
-                    // which happens whenever a concurrent drain cut its record between this
-                    // caller's in-memory push and its append. Without the test, the log comes back
-                    // with the same page twice and `pending_len` disagrees with a full rewrite.
+                    // This record APPENDS, so replaying it behind another record that already
+                    // holds these entries must not double them — otherwise the log comes back with
+                    // the same page twice and `pending_len` disagrees with a full rewrite.
+                    //
+                    // ⚠ **The race this comment used to cite is gone**: it said a concurrent drain
+                    // could cut its record between this caller's in-memory push and its append.
+                    // `retire_arenas_by_rule` now holds `persist` across both, so that
+                    // interleaving cannot be produced. What remains is the ordinary reason a
+                    // replayed log record should be idempotent — a resumed reap re-parking the
+                    // same page, and replay being re-runnable at all.
                     //
                     // The FIRST entry for a key wins, and that is the one that MATCHES MEMORY
                     // rather than the one that is safest in isolation. A page parked twice — a
@@ -2277,9 +2376,21 @@ impl ArenaPageStore {
                 }
                 {
                     let mut st = self.state.lock().unwrap();
-                    // Idempotent, and independent of what else is in the log: removing a key that
-                    // is not there is the identity. That is what lets this record sit on either
-                    // side of a `TAIL_EXTENT_FREED` or a `TAIL_PAGES_PARKED` for the same pages.
+                    // Idempotent: removing a key that is not there is the identity, so replaying
+                    // this record twice is the same as replaying it once.
+                    //
+                    // ⛔ **IDEMPOTENT IS NOT COMMUTATIVE, and an earlier version of this comment
+                    // claimed it "can sit on either side of a `TAIL_EXTENT_FREED` or a
+                    // `TAIL_PAGES_PARKED` for the same pages". That is false by inspection**:
+                    // PARKED pushes key K if absent and this removes K, so `[DRAINED][PARKED]`
+                    // ends with K in the log and `[PARKED][DRAINED]` without it. Removal commutes
+                    // with removal, not with an append.
+                    //
+                    // What makes the order safe is not this arm — it is that `persist` is held
+                    // across the mutation AND the append at every site that writes one of these
+                    // records, so the file order equals the memory order. `retire_arenas_by_rule`
+                    // did not do that until the fix its own comment now describes, and that was
+                    // the defect. Idempotence here is a second line, not the guarantee.
                     st.pending.retain(|p| !removed.contains(&(p.page_id, p.arena_id)));
                     Self::apply_arena_sections(&mut c, &mut st)?;
                 }
@@ -2482,7 +2593,18 @@ impl PageStore for ArenaPageStore {
                 ))
                 .into());
             }
-            if let Some(p) = st.recycled.get_mut(&arena).and_then(|v| v.pop()) {
+            let popped = st.recycled.get_mut(&arena).and_then(|v| v.pop());
+            if let Some(p) = popped {
+                // ⛔ **D183 — a pop is a durable change and nothing used to mark it.** Every other
+                // mutator of a recycled list marks its arena; this one did not, and a full image
+                // rewrite on every reap used to cover it incidentally. With the reap path on
+                // deltas that window runs to the next compaction, and the direction is the unsafe
+                // one: a durable recycled list that still names a page memory has handed out
+                // makes `extent_is_empty` answer true for an extent holding live pages, and
+                // `sweep_empty_extents` frees it. D85's `resolve_fill` does not repair this —
+                // it RAISES `next_free`, and an overstated recycled count is the other half of
+                // that comparison.
+                st.recycled_dirty.insert(arena);
                 p
             } else {
                 let ext = st
@@ -2686,18 +2808,17 @@ impl PageStore for ArenaPageStore {
             // so this marks the log changed and the next claim rewrites the image instead of
             // appending. See [`PersistState::durable_pending_version`].
             //
-            // **D183 — the bump moved INSIDE the lock, for the reason `take_pending` gives.** The
+            // **D183 — the bump is INSIDE the lock, for the reason `take_pending` gives.** The
             // push and the announcement of the push have to be one step, or a record builder
-            // holding `state` reads the new version and the old log.
-            let mut st = self.state.lock().unwrap();
-            st.pending.push(PendingFree {
+            // holding `state` reads the new version and the old log. That pairing is what
+            // `push_pending_unrecorded` exists to make unskippable.
+            self.push_pending_unrecorded(PendingFree {
                 page_id,
                 arena_id: arena,
                 birth_epoch: header.birth_epoch,
                 free_epoch,
                 owner,
             });
-            self.pending_version.fetch_add(1, Ordering::SeqCst);
         } else {
             self.release_page(page_id, arena);
         }
@@ -4378,8 +4499,12 @@ mod tests {
     /// One full image rewrite per interior branch reaped, zero deltas — `sum(48·i) = 24·N²` bytes
     /// — against a leaf control that paid zero at both sizes.
     ///
-    /// **After D183's two new tail record kinds** ([`ArenaPageStore::TAIL_PAGES_PARKED`] and
-    /// [`ArenaPageStore::TAIL_PENDING_REPLACED`]), measured 2026-09-23 on this branch:
+    /// **After D183's THREE new tail record kinds** — [`ArenaPageStore::TAIL_PAGES_PARKED`],
+    /// [`ArenaPageStore::TAIL_PENDING_DRAINED`] and its always-correct fallback
+    /// [`ArenaPageStore::TAIL_PENDING_REPLACED`] — plus the conditional `take_pending` bump,
+    /// measured 2026-09-23 on this branch. ⚠ The two kinds named in the first version of this
+    /// band are NOT the ones that deliver the headline: the drain record and the conditional bump
+    /// are, and `d183adv_a5_the_interior_cost_is_no_longer_a_class` has the evidence.
     ///
     /// | arm | branches | rewrites | appends |
     /// |---|---|---|---|
@@ -5444,12 +5569,43 @@ mod tests {
         let path = arm(&h);
         claim(&h);
         claim(&h);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(0x7f, b"from the future"));
+        let base = std::fs::read(&path).unwrap();
 
-        let restored = h.fresh_store();
-        let err = restored.load_file(&bytes).expect_err("an unknown kind must be refused");
-        assert!(format!("{err}").contains("newer build"), "unhelpful refusal: {err}");
+        // **D183 — the kind that matters is the one JUST PAST the allowlist, not a distant one.**
+        // `0x7f` alone leaves the boundary untested: it is the same refusal whatever the allowlist
+        // holds, so it would keep passing if a future kind were added to the constant and never
+        // given a match arm. The first unknown kind is the one a real downgrade meets — a build
+        // predating this row meets kind 3, and the build after the next row meets one past the end
+        // of today's list. Both spellings are asserted, and `max + 1` is computed from the
+        // allowlist so it tracks it instead of going stale.
+        let past_the_end = ArenaPageStore::KNOWN_TAIL_KINDS.iter().copied().max().unwrap() + 1;
+        for kind in [0x7f, past_the_end] {
+            let mut bytes = base.clone();
+            bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(kind, b"from the future"));
+            let restored = h.fresh_store();
+            let err = restored
+                .load_file(&bytes)
+                .expect_err(&format!("kind {kind} must be refused"));
+            assert!(format!("{err}").contains("newer build"), "unhelpful refusal: {err}");
+        }
+
+        // And every kind the allowlist DOES name must reach a match arm rather than the
+        // "reached apply after the kind allowlist" refusal — a constant added without an arm
+        // fails closed, which is right, but it must not be how a shipped kind behaves.
+        for kind in ArenaPageStore::KNOWN_TAIL_KINDS.iter().copied() {
+            let mut bytes = base.clone();
+            // A deliberately truncated payload: a known kind fails on its own parse, never on the
+            // allowlist. What is asserted is WHICH refusal it is.
+            bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(kind, b""));
+            let restored = h.fresh_store();
+            if let Err(err) = restored.load_file(&bytes) {
+                let m = format!("{err}");
+                assert!(
+                    !m.contains("newer build") && !m.contains("reached apply"),
+                    "kind {kind} is in the allowlist but has no match arm: {m}"
+                );
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5705,9 +5861,10 @@ mod d183_adversary {
     /// copy of two of its lines.
     ///
     /// `reap` is not `retire_arenas_by_rule`. It also runs `drain_pending_seeded`, whose
-    /// `take_pending` bumps `pending_version` UNCONDITIONALLY (`arena.rs:932`) and whose
-    /// `put_pending` is another `persist_if_configured`. Both are inside the per-branch reap,
-    /// so both belong in any number described as "what a reap costs".
+    /// `take_pending` bumped `pending_version` UNCONDITIONALLY at `630afaa` and whose
+    /// `put_pending` was another `persist_if_configured` — a function this row deleted. Both are
+    /// inside the per-branch reap, so both belong in any number described as "what a reap costs",
+    /// which is the whole finding of this module.
     #[test]
     fn d183adv_a1_what_the_real_reaper_costs() {
         fn run(branches: usize, interior: bool) -> (u64, u64, u32) {
@@ -5918,8 +6075,8 @@ mod d183_adversary {
     /// The INTERIOR arm's `appends = 0` was not a measurement — and now it is.
     ///
     /// **At `630afaa` this test recorded a STRUCTURAL zero**: `retire_arenas_by_rule` ended in
-    /// `persist_if_configured`, which is `persist_full_locked` with no threshold and no delta
-    /// encoder anywhere on the path, so no fixture could make it append. 32 branches x 64 pages —
+    /// `persist_if_configured` — since deleted — which was `persist_full_locked` with no threshold
+    /// and no delta encoder anywhere on the path, so no fixture could make it append. 32 branches x 64 pages —
     /// 4x the branches and 8x the pages of the original fixture — gave `rewrites=32 appends=0`.
     ///
     /// That is exactly the kind of zero worth re-testing after a change, because a zero which no
