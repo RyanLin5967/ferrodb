@@ -27,7 +27,7 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::agent_sql::runtime::{d170_overlay_counters, d170_reset_overlay_counters, AgentRuntime};
 use ferrodb::agent_sql::AgentOutput;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
@@ -92,6 +92,83 @@ impl Db {
     }
 }
 
+/// The EXACT pre-`fc443c4` stub configuration: no `ArenaPageStore`, no `ServerContext`, and every
+/// session from `Session::new()` -- whose implicit `AgentRuntime::new()` is `storage: None` over
+/// an in-memory branch catalog. `designated::check` returns `Ok(())` when nothing is designated,
+/// so a process that never builds a `ServerContext` runs this without touching the D101 guard.
+/// **This mode must never share a process with the arena mode**, or the guard would (correctly)
+/// refuse it.
+struct StubDb {
+    catalog: Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    _dir: tempfile::TempDir,
+}
+
+impl StubDb {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dir.path().join("p.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(WalManager::new(dir.path().join("p.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        StubDb { catalog, bp, txn, _dir: dir }
+    }
+    fn exec(&mut self, sql: &str, s: &mut Session) -> Outcome {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), s)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+}
+
+/// The stub arm of the size sweep, with the same assertions the arena arm carries.
+fn stub_sweep(sizes: &[i64], n: usize) {
+    println!("\n  STUB CONFIG (Session::new(), storage: None) — the pre-fc443c4 harness");
+    println!("  table rows   median ms   ms per 1000   affected_sum   probe/walk_unprob/walk_nopk   max_unprob   max_overlay");
+    let mut first: Option<(i64, f64)> = None;
+    for &rows in sizes {
+        let mut db = StubDb::new();
+        let mut s = Session::new();
+        db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut s);
+        for i in 1..=rows {
+            db.exec(&format!("INSERT INTO t VALUES ({i}, 0);"), &mut s);
+        }
+        let mut a = Session::new();
+        db.exec("BEGIN AGENT SESSION AS 'd170';", &mut a);
+        // Same negative control as the arena arm.
+        let nout = db.exec(&format!("UPDATE t SET v = -1 WHERE id = {};", rows + 1_000_000), &mut a);
+        assert_eq!(affected(&nout), Some(0), "STUB negative control failed at {rows} rows");
+        d170_reset_overlay_counters();
+        let mut samples = Vec::new();
+        let mut affected_sum = 0usize;
+        for i in 0..n {
+            let id = 1 + (i as i64 * 7919) % rows;
+            let t = Instant::now();
+            let out = db.exec(&format!("UPDATE t SET v = {i} WHERE id = {id};"), &mut a);
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(affected(&out), Some(1), "STUB staged UPDATE is a NO-OP at {rows} rows, i={i}");
+            affected_sum += 1;
+        }
+        let (pf, wu, wn, mu, mo) = d170_overlay_counters();
+        let med = median(&mut samples);
+        println!("  {rows:>10}   {med:>9.4}   {:>11.4}   {affected_sum:>12}   {pf:>5}/{wu:>5}/{wn:>5}            {mu:>10}   {mo:>11}",
+                 med / (rows as f64 / 1000.0));
+        if first.is_none() { first = Some((rows, med)); }
+        if let Some((r0, m0)) = first {
+            if rows != r0 {
+                println!("             ^ {:.1}x the rows, {:.2}x the time", rows as f64 / r0 as f64, med / m0);
+            }
+        }
+    }
+}
+
 fn build(rows: i64) -> (Db, Session) {
     let mut db = Db::new(rows);
     let mut s = db.ctx.session();
@@ -134,19 +211,66 @@ fn main() {
     let staged_arm = std::env::var("D71_ARM").map(|a| a == "staged").unwrap_or(false);
     println!("arm = {}", if staged_arm { "STAGED" } else { "PLAIN" });
 
+    if std::env::var("D170_STUB").is_ok() {
+        let sizes: Vec<i64> = std::env::var("D71_SIZES")
+            .unwrap_or_else(|_| "1000,2000,4000,8000,16000".to_string())
+            .split(',').filter_map(|v| v.parse().ok()).collect();
+        let n: usize = std::env::var("D71_N").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        stub_sweep(&sizes, n);
+        return;
+    }
+
+    // ---- FIRE-CHECK the overlay-arm detector ------------------------------------------------
+    //
+    // A counter reading "probe_fired=60, walks=0" is worth nothing until it has been FORCED to
+    // report the other two arms. This drives all three on purpose and refuses to continue unless
+    // each one is observed, so the main sweep's reading is a measurement and not an assumption.
+    if std::env::var("D170_FIRECHECK").is_ok() {
+        println!("\nFIRE-CHECK — force each overlay arm and require the counter to see it.");
+        let (mut db, _s) = build(200);
+        let mut a = db.ctx.session();
+        db.exec("BEGIN AGENT SESSION AS 'd170fc';", &mut a);
+
+        d170_reset_overlay_counters();
+        db.exec("UPDATE t SET v = 1 WHERE id = 7;", &mut a);
+        let (pf, wu, wn, mu, _) = d170_overlay_counters();
+        println!("  1. pk= predicate, nothing demoted     -> probe={pf} walk_unprob={wu} walk_nopk={wn} unprob_rows={mu}");
+        assert!(pf >= 1 && wu == 0, "the PROBE did not fire on a plain `id = k` staged UPDATE");
+
+        d170_reset_overlay_counters();
+        db.exec("UPDATE t SET v = 2 WHERE v = 999999;", &mut a);
+        let (pf, wu, wn, mu, _) = d170_overlay_counters();
+        println!("  2. NON-pk predicate                   -> probe={pf} walk_unprob={wu} walk_nopk={wn} unprob_rows={mu}");
+        assert!(wn >= 1, "a predicate with no `pk = literal` conjunct did not take the WALK arm");
+
+        // D167's door: a PK-MOVING update makes `unprobeable_rows` non-zero, permanently.
+        db.exec("UPDATE t SET id = 1000000 WHERE id = 5;", &mut a);
+        d170_reset_overlay_counters();
+        db.exec("UPDATE t SET v = 3 WHERE id = 7;", &mut a);
+        let (pf, wu, wn, mu, _) = d170_overlay_counters();
+        println!("  3. same pk= predicate AFTER a PK move -> probe={pf} walk_unprob={wu} walk_nopk={wn} unprob_rows={mu}");
+        assert!(wu >= 1 && mu > 0,
+            "demotion did not reach the counter: a PK-moving UPDATE should leave unprobeable_rows>0 \
+             and force the walk, but probe={pf} walk_unprob={wu} unprob_rows={mu}");
+
+        println!("  ALL THREE ARMS OBSERVED. The detector discriminates.");
+        return;
+    }
+
     // ---- Q3: sweep the number of staged rows at a FIXED table size ---------------------------
     if std::env::var("D170_NSWEEP").is_ok() {
         let rows: i64 = std::env::var("D170_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
         let ns: Vec<usize> = std::env::var("D170_NS")
-            .unwrap_or_else(|_| "50,100,200,400,800,1600,3200".to_string())
+            .unwrap_or_else(|_| "50,100,200,400,800,1600,3200,6400,12800".to_string())
             .split(',').filter_map(|v| v.parse().ok()).collect();
         println!("\nQ3 — N-SWEEP at a FIXED {rows}-row table. Axis = rows staged in the session.");
-        println!("  staged N     median ms   us/update   affected!=1");
+        println!("  staged N     median ms   us/update   affected!=1   probe/walk_unprob/walk_nopk   max_unprob   max_overlay");
         for &n in &ns {
             let (mut db, mut s) = build(rows);
             let mut a = db.ctx.session();
             if staged_arm { db.exec("BEGIN AGENT SESSION AS 'd170';", &mut a); }
             let sess: &mut Session = if staged_arm { &mut a } else { &mut s };
+            d170_reset_overlay_counters();
             let mut samples = Vec::new();
             let mut bad = 0usize;
             for i in 0..n {
@@ -158,7 +282,9 @@ fn main() {
                 if affected(&out) != Some(1) { bad += 1; }
             }
             let med = median(&mut samples);
-            println!("  {n:>8}     {med:>9.4}   {:>9.2}   {bad:>11}", med * 1000.0);
+            let (pf, wu, wn, mu, mo) = d170_overlay_counters();
+            println!("  {n:>8}     {med:>9.4}   {:>9.2}   {bad:>11}   {pf:>5}/{wu:>5}/{wn:>5}            {mu:>10}   {mo:>11}",
+                     med * 1000.0);
         }
         return;
     }
@@ -186,6 +312,7 @@ fn main() {
             "NEGATIVE CONTROL FAILED at {rows} rows: an UPDATE on absent key {ncid} reported {neg:?}, \
              so `affected` cannot distinguish a no-op from a write and this run is VOID");
 
+        d170_reset_overlay_counters();
         let (f0, _) = fsync_counters();
         let mut samples = Vec::new();
         let mut affected_sum = 0usize;
@@ -214,6 +341,8 @@ fn main() {
             "READ-BACK MISMATCH at {rows} rows, id={last_id}: stored {:?}, wrote {want:?} — the \
              statement was COUNTED but the row did not change", got[0][0]);
 
+        let (pf, wu, wn, mu, mo) = d170_overlay_counters();
+        println!("             overlay arms: probe_fired={pf} walk_unprobeable={wu} walk_no_pk_conjunct={wn} max_unprobeable_rows={mu} max_overlay_len={mo}");
         let med = median(&mut samples);
         println!("  {rows:>10}   {med:>9.4}   {:>11.4}   {:>10.2}   {affected_sum:>12}   {:>11}   {:>7}",
                  med / (rows as f64 / 1000.0),

@@ -266,6 +266,34 @@ pub fn row_id_of(row: &[Value]) -> RowId {
 /// key would probe a key no staged row was ever stored under and MISS a staged version — the one
 /// wrong answer. On any mismatch this returns `None` and the caller walks the table prefix, which
 /// is always correct.
+/// D170 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Which arm of the overlay each staged statement
+/// took. `d170_overlay_counters()` reads them; `d170_reset_overlay_counters()` zeroes them.
+pub static D170_PROBE_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_WALK_UNPROBEABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_WALK_NO_PK_CONJUNCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_MAX_UNPROBEABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_MAX_OVERLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (probe_fired, walk_unprobeable, walk_no_pk_conjunct, max_unprobeable_rows, max_overlay_len)
+pub fn d170_overlay_counters() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        D170_PROBE_FIRED.load(Relaxed),
+        D170_WALK_UNPROBEABLE.load(Relaxed),
+        D170_WALK_NO_PK_CONJUNCT.load(Relaxed),
+        D170_MAX_UNPROBEABLE.load(Relaxed),
+        D170_MAX_OVERLAY.load(Relaxed),
+    )
+}
+
+pub fn d170_reset_overlay_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [&D170_PROBE_FIRED, &D170_WALK_UNPROBEABLE, &D170_WALK_NO_PK_CONJUNCT,
+              &D170_MAX_UNPROBEABLE, &D170_MAX_OVERLAY] {
+        c.store(0, Relaxed);
+    }
+}
+
 fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u64> {
     let pk_type = pk_type?;
     let mut conjuncts = Vec::new();
@@ -2170,6 +2198,18 @@ impl AgentRuntime {
                 // key AND holds column 0 in the declared variant; `unprobeable_rows` says whether
                 // either has ever stopped being true here (see `Workspace`).
                 let probe = if unprobeable_rows == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
+                // D170 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Counts which arm each statement
+                // took, and WHY the walk was taken when it was, so "the probe fired" is a
+                // measurement rather than a reading of the source.
+                if unprobeable_rows != 0 {
+                    D170_WALK_UNPROBEABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if probe.is_none() {
+                    D170_WALK_NO_PK_CONJUNCT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    D170_PROBE_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                D170_MAX_UNPROBEABLE.fetch_max(unprobeable_rows, std::sync::atomic::Ordering::Relaxed);
+                D170_MAX_OVERLAY.fetch_max(staged.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 match probe {
                     Some(row) => {
                         if let Some(st) = staged.get(&(tbl.0, row)) {

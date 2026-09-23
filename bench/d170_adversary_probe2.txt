@@ -1,0 +1,244 @@
+ACQUIRED d170-adversary2  load_at_acquire=16
+CAVEAT: load 16 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=16 beside it and say it is an upper bound.
+host: Darwin arm64  started: 2026-09-23T06:54:24Z
+load: 16.70 14.80 18.16
+tree: ded8fd91afac9248470916b204ab6066850c5716  (worktree d170-adversary, instrumented)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d170-adversary)
+    Finished `release` profile [optimized] target(s) in 9.73s
+
+=== FIRE-CHECK: the overlay-arm detector must report all three arms ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+FIRE-CHECK — force each overlay arm and require the counter to see it.
+  1. pk= predicate, nothing demoted     -> probe=1 walk_unprob=0 walk_nopk=0 unprob_rows=0
+  2. NON-pk predicate                   -> probe=0 walk_unprob=0 walk_nopk=1 unprob_rows=0
+  3. same pk= predicate AFTER a PK move -> probe=0 walk_unprob=1 walk_nopk=0 unprob_rows=1
+  ALL THREE ARMS OBSERVED. The detector discriminates.
+rc=0
+
+############ BLOCK A (forward order) ############
+
+=== A1 STUB  + pushdown ON — load 20.32 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  STUB CONFIG (Session::new(), storage: None) — the pre-fc443c4 harness
+  table rows   median ms   ms per 1000   affected_sum   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        1000      0.0120        0.0120             60      60/    0/    0                     0            59
+        2000      0.0112        0.0056             60      60/    0/    0                     0            59
+             ^ 2.0x the rows, 0.93x the time
+        4000      0.0114        0.0028             60      60/    0/    0                     0            59
+             ^ 4.0x the rows, 0.95x the time
+        8000      0.0114        0.0014             60      60/    0/    0                     0            59
+             ^ 8.0x the rows, 0.95x the time
+       16000      0.0117        0.0007             60      60/    0/    0                     0            59
+             ^ 16.0x the rows, 0.98x the time
+rc=0
+
+=== A2 STUB  + NOPUSHDOWN — load 13.01 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  STUB CONFIG (Session::new(), storage: None) — the pre-fc443c4 harness
+  table rows   median ms   ms per 1000   affected_sum   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        1000      0.1378        0.1378             60       0/    0/   60                     0            59
+        2000      0.2430        0.1215             60       0/    0/   60                     0            59
+             ^ 2.0x the rows, 1.76x the time
+        4000      0.5505        0.1376             60       0/    0/   60                     0            59
+             ^ 4.0x the rows, 3.99x the time
+        8000      1.0875        0.1359             60       0/    0/   60                     0            59
+             ^ 8.0x the rows, 7.89x the time
+       16000      2.1415        0.1338             60       0/    0/   60                     0            59
+             ^ 16.0x the rows, 15.54x the time
+rc=0
+
+=== A3 ARENA + NOPUSHDOWN — load 7.44 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        1000      0.1710        0.1710         0.00             60           YES         0
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        2000      0.3378        0.1689         0.00             60           YES         0
+             ^ 2.0x the rows, 1.97x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        4000      0.5463        0.1366         0.00             60           YES         0
+             ^ 4.0x the rows, 3.19x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        8000      1.1314        0.1414         0.00             60           YES         0
+             ^ 8.0x the rows, 6.61x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+       16000      2.1438        0.1340         0.00             60           YES         0
+             ^ 16.0x the rows, 12.53x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== A4 ARENA + pushdown ON — load 4.68 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        1000      0.0512        0.0512         0.00             60           YES         0
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        2000      0.0495        0.0247         0.00             60           YES         0
+             ^ 2.0x the rows, 0.97x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        4000      0.0490        0.0123         0.00             60           YES         0
+             ^ 4.0x the rows, 0.96x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        8000      0.0512        0.0064         0.00             60           YES         0
+             ^ 8.0x the rows, 1.00x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+       16000      0.0509        0.0032         0.00             60           YES         0
+             ^ 16.0x the rows, 0.99x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+############ BLOCK B (reversed order) ############
+
+=== B1 ARENA + pushdown ON — load 5.43 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        1000      0.0523        0.0523         0.00             60           YES         0
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        2000      0.0492        0.0246         0.00             60           YES         0
+             ^ 2.0x the rows, 0.94x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        4000      0.0492        0.0123         0.00             60           YES         0
+             ^ 4.0x the rows, 0.94x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+        8000      0.0488        0.0061         0.00             60           YES         0
+             ^ 8.0x the rows, 0.93x the time
+             overlay arms: probe_fired=61 walk_unprobeable=0 walk_no_pk_conjunct=0 max_unprobeable_rows=0 max_overlay_len=60
+       16000      0.0506        0.0032         0.00             60           YES         0
+             ^ 16.0x the rows, 0.97x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== B2 ARENA + NOPUSHDOWN — load 8.92 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        1000      0.1798        0.1798         0.00             60           YES         0
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        2000      0.2847        0.1424         0.00             60           YES         0
+             ^ 2.0x the rows, 1.58x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        4000      0.5909        0.1477         0.00             60           YES         0
+             ^ 4.0x the rows, 3.29x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+        8000      1.1075        0.1384         0.00             60           YES         0
+             ^ 8.0x the rows, 6.16x the time
+             overlay arms: probe_fired=1 walk_unprobeable=0 walk_no_pk_conjunct=60 max_unprobeable_rows=0 max_overlay_len=60
+       16000      2.2993        0.1437         0.00             60           YES         0
+             ^ 16.0x the rows, 12.79x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== B3 STUB  + NOPUSHDOWN — load 4.89 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  STUB CONFIG (Session::new(), storage: None) — the pre-fc443c4 harness
+  table rows   median ms   ms per 1000   affected_sum   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        1000      0.1410        0.1410             60       0/    0/   60                     0            59
+        2000      0.2448        0.1224             60       0/    0/   60                     0            59
+             ^ 2.0x the rows, 1.74x the time
+        4000      0.5045        0.1261             60       0/    0/   60                     0            59
+             ^ 4.0x the rows, 3.58x the time
+        8000      1.0757        0.1345             60       0/    0/   60                     0            59
+             ^ 8.0x the rows, 7.63x the time
+       16000      2.2141        0.1384             60       0/    0/   60                     0            59
+             ^ 16.0x the rows, 15.71x the time
+rc=0
+
+=== B4 STUB  + pushdown ON — load 5.35 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  STUB CONFIG (Session::new(), storage: None) — the pre-fc443c4 harness
+  table rows   median ms   ms per 1000   affected_sum   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        1000      0.0415        0.0415             60      60/    0/    0                     0            59
+        2000      0.0260        0.0130             60      60/    0/    0                     0            59
+             ^ 2.0x the rows, 0.63x the time
+        4000      0.0482        0.0120             60      60/    0/    0                     0            59
+             ^ 4.0x the rows, 1.16x the time
+        8000      0.0111        0.0014             60      60/    0/    0                     0            59
+             ^ 8.0x the rows, 0.27x the time
+       16000      0.0118        0.0007             60      60/    0/    0                     0            59
+             ^ 16.0x the rows, 0.29x the time
+rc=0
+
+=== N-SWEEP to 12800 — ARENA — NOPUSHDOWN=0 — load 4.65 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+Q3 — N-SWEEP at a FIXED 4000-row table. Axis = rows staged in the session.
+  staged N     median ms   us/update   affected!=1   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        50        0.0486       48.62             0      50/    0/    0                     0            49
+       100        0.0523       52.29             0     100/    0/    0                     0            99
+       200        0.0569       56.92             0     200/    0/    0                     0           199
+       400        0.0615       61.46             0     400/    0/    0                     0           399
+       800        0.0762       76.17             0     800/    0/    0                     0           799
+      1600        0.1065      106.54             0    1600/    0/    0                     0          1599
+      3200        0.1577      157.71             0    3200/    0/    0                     0          3199
+      6400        0.2739      273.88             0    6400/    0/    0                     0          4000
+     12800        0.4946      494.58             0   12800/    0/    0                     0          4000
+rc=0
+
+=== N-SWEEP to 12800 — ARENA — NOPUSHDOWN=1 — load 3.66 ===
+D170 ADVERSARY PROBE
+at ded8fd91afac +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+Q3 — N-SWEEP at a FIXED 4000-row table. Axis = rows staged in the session.
+  staged N     median ms   us/update   affected!=1   probe/walk_unprob/walk_nopk   max_unprob   max_overlay
+        50        0.5430      542.96             0       0/    0/   50                     0            49
+       100        0.5645      564.46             0       0/    0/  100                     0            99
+       200        0.5581      558.12             0       0/    0/  200                     0           199
+       400        0.6283      628.29             0       0/    0/  400                     0           399
+       800        0.5938      593.83             0       0/    0/  800                     0           799
+      1600        0.6697      669.67             0       0/    0/ 1600                     0          1599
+      3200        0.7838      783.83             0       0/    0/ 3200                     0          3199
+      6400        1.0098     1009.79             0       0/    0/ 6400                     0          4000
+     12800        1.2282     1228.17             0       0/    0/12800                     0          4000
+rc=0
+
+finished: 2026-09-23T07:13:33Z  load: 5.69 5.36 8.94
+RELEASED d170-adversary2
+D170_ADV2_COMPLETE
