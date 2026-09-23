@@ -1,0 +1,70 @@
+D65 RUN 2 — DOES REOPEN STAY FLAT TO 10^6 *WITH DATA PRESENT*? CATALOG AND ARENA, SEPARATELY.
+Harness: examples/branch_curve_writes.rs at 6136be2 (branch d65-reopen-curve, off main fc9556a).
+Run 1 (branch D61-write-curve @ af8ebbe, bench/d65_reopen_curve_1e6.txt) stopped at N=250,000 on
+the 20 GiB FREE_FLOOR: catalog reopen 1.144 ms @100k, 1.184 ms @250k, len B/branch 4096 at both,
+and it correctly claimed NO complexity class from two points. FREE_FLOOR is NOT changed here.
+
+=== PRE-REGISTRATION — written and committed BEFORE the first number of this run exists =========
+
+Invocation: release build; CURVE_PERSIST unset (OFF, the historical default and run 1's setting);
+checkpoints 1000,10000,100000,250000,500000,750000,1000000 (7 points, 3 decades); 8 threads;
+8 GB budget. Suite lock /tmp/ferrodb-suite.lock held across the whole build AND run.
+
+WHAT IS TIMED (READ-FROM-SOURCE at 6136be2, cited by symbol):
+  reopen ms     TableBranchCatalog::open_sidecar on the live sidecar file: DiskManager::new
+                (file length only), BufferPoolManager::new (MAX_BUFFER_POOL_PAGES = 1024 frames,
+                a constant), open_from_header (one page), TableBranchCatalog::open (one tree
+                search for the header key). Structurally O(log N) — one descent — and the descent
+                is expected to be invisible under the pool-construction constant.
+  arena re ms   ArenaPageStore::reopen_from_checkpoint on a clean-exit image written by
+                ArenaPageStore::checkpoint to a SEPARATE probe path — the exact pair cli.rs runs
+                (checkpoint at exit, reopen_from_checkpoint at open). By source this is O(extents):
+                image_len walks the structure, load_state verifies a CRC32 over the whole image
+                and deserialises every extent and `current` entry in counted loops (D189's
+                addendum). The fresh main pool is built OUTSIDE the timer.
+
+EXPECTED, with what a different value would mean:
+
+ 1. CATALOG reopen ms is FLAT across all 7 points, ~1.1-1.2 ms (S4's claim; run 1's two cells).
+    Flat = log-log slope |b| < 0.05 over 10^3..10^6 AND the 10^6 cell < 2x the 10^3 cell.
+    ⇒ A MONOTONE CLIMB (>= 4 consecutive increases, 10^6 cell > 2x the 10^3 cell) is a NEW WALL
+      at exactly the scale D61 reached — restart cost growing with branch count — and it is worth
+      MORE than the flat result. It would be reported as the finding, not smoothed.
+    ⚠ DISCRIMINATING POWER, stated before the data: against a ~1.1 ms constant, an O(N) term is
+      visible only if it exceeds ~0.5 ms at 10^6, i.e. > ~0.5 ns/branch. A scan-shaped reopen
+      (reading the 334 MB catalog) would cost 100s of ms and is excluded easily. An O(log N)
+      descent (one more tree level ≈ one warm 4 KB pread, microseconds) is NOT distinguishable
+      from O(1) by this instrument, and this run will not claim to distinguish them.
+    ⚠ Wall clock on a shared box: noisy UPWARD. A single high cell is load until the shape says
+      otherwise. Load is sampled every 30 s into this file's companion log and stamped here.
+
+ 2. REPRODUCTION of run 1: catalog reopen at 100k and 250k within ±50% of 1.144 / 1.184 ms.
+    ⇒ Outside that band: the two runs disagree and BOTH are suspect until the gap is explained
+      by a checked mechanism (not by "load").
+
+ 3. ARENA reopen ms is LINEAR in N (it is O(extents) by source): per-decade ratio 10^5 -> 10^6
+    in [5, 15]. Magnitude at 10^6: 0.1 - 1 s (INFERRED: ~48 MB image, two structural passes and
+    a CRC, ~2 HashMap inserts per branch).
+    ⇒ Ratio > 15 per decade = SUPERLINEAR: an S1-shaped wall in the restart path — a finding.
+    ⇒ Ratio < 3 per decade = NOT O(extents): either the source reading is wrong or the timed call
+      skipped the load. The img==reload control (below) says which.
+    ⇒ Linear but > 10 s at 10^6 = a restart wall by magnitude, worth its own row.
+    ⚠ This is ONE-SHOT-per-checkpoint wall clock too; the SLOPE is the claim, not a cell.
+
+ 4. RECONCILIATION with D61 (bench/d61_write_curve_1e6_run2.txt): len B/branch reads EXACTLY 4096
+    at every N >= 100000 (small N carries a few bytes of fixed overhead — D94 read 4100 at 1000);
+    cat B/branch reads 334 at N >= 100000; pages live = N.
+    ⇒ Any other value at N >= 100000: this run and D61 disagree and both are suspect.
+
+ 5. POSITIVE CONTROLS — a flat column only counts if the thing timed was the populated structure:
+    cat live@re = N + 1 (trunk is Live) — the REOPENED catalog sees every branch.
+    img B/branch ≈ 48 (source: 32 B per extent + 16 B per `current` entry, header amortised).
+    arena re pg = N (live_pages round-trips through the image).
+    img==reload = yes (the reopened store re-serialises byte-identically to what it loaded).
+    ⇒ Any control failing voids the corresponding column for this run, whatever it reads.
+
+ 6. STOPS: if the 8 GB budget or the 20 GiB FREE_FLOOR fires, the stopping N IS the result for
+    this run, reported as a stop, with every completed checkpoint's cells. No limit is raised.
+    Predicted data at 10^6: 4.1 GB (well inside 8 GB); free space at registration ~120 GiB.
+
+====================================================================================================
