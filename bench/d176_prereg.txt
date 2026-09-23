@@ -1,0 +1,152 @@
+D176 PRE-REGISTRATION — merge cost as an INTEGER, not a duration
+================================================================
+Written and committed BEFORE the first number exists. Amendments append-only, below.
+
+base commit : 4912302 (main)
+branch      : d176-merge-rowcount
+worktree    : /Users/idide/wt/ferrodb-d176-merge-rowcount
+
+
+THE CLAIM UNDER TEST
+--------------------
+Banked at SCALE-LEDGER.md:4059:
+
+  "A merge that writes FOUR ROWS reads every row of the table TWICE, while holding the
+   global catalog mutex. That is not a locking constant, it is a COMPLEXITY CLASS: merge
+   cost is O(table), independent of how much the branch actually changed."
+
+Cited sites, with the line numbers the ledger carries (from the tree it was written
+against, NOT this one):
+  1. runtime.rs:2691  in evaluate_merge     — "full scan of every touched table"
+  2. runtime.rs:3459  in fingerprint_tables — "the same full scan a second time"
+  3. runtime.rs:4317  fingerprint_rows      — "hashes EVERY ROW"
+
+Why a count and not a duration: the duration version of this experiment
+(examples/d68_merge_is_o_table.rs) has been VOIDED TWICE — once for timing an in-memory
+stub (D101), once by a disk emergency mid-sweep (bench/d101_rerun_VOID_disk_emergency.txt,
+rc=137). An integer cannot be voided by machine load or a disk event.
+
+
+WHAT I READ BEFORE MEASURING, AND WHY IT CHANGES THE PREDICTION
+---------------------------------------------------------------
+Recorded here because a pre-registration that hides a prior code read is not a
+pre-registration. All three cited sites were resolved BY SYMBOL in the tree at 4912302
+(the ledger's line numbers no longer land on these functions: evaluate_merge is at :4214
+here, not :2691).
+
+  * fingerprint_rows  — DELETED. Removed by 68c966d (2026-09-20). `git grep fingerprint_rows`
+    returns nothing in src/. Cite 3 names a function that does not exist.
+  * fingerprint_tables — at runtime.rs:5210. Body folds `ctx.catalog.table_version(*t)`, a
+    COUNTER, once per table. It is O(#tables), not O(rows). Replaced by f949add
+    ("D69 steps 2+3: merge is O(delta) — both fingerprints read counters, and the scan is
+    gone"). Cite 2 names a scan that is gone.
+  * evaluate_merge — at runtime.rs:4214. The blanket scan is now GATED:
+        if assertion_tables.contains(t) { for row in scan_table(name, &ctx.read())? { ... } }
+    (runtime.rs:4365-4370, added by 68c966d as a regression fix). Rows the branch touched
+    are fetched by per-key point lookup instead (runtime.rs:4421).
+  * assertions reach evaluate_merge ONLY from SIMULATE (simulate.rs:512, :555). A plain
+    `MERGE;` passes `&[]` (runtime.rs:3333, cluster.rs:1123), so assertion_tables is empty
+    and the full scan is unreachable on that path.
+
+Both D69 commits are ancestors of 4912302 (`git merge-base --is-ancestor` = YES for
+f949add and 68c966d). So the ledger claim was banked against a tree that no longer exists,
+and this run is asked to settle it against the tree that does.
+
+
+THE INSTRUMENT
+--------------
+No existing counter answers this. `scan_rows_observed` (runtime.rs:1042) was checked FIRST,
+per the brief, and CANNOT fire on a merge: it is not a global counter but a per-workspace
+field derived in `run_activity` (runtime.rs:1869-1897) by summing `p.rows_observed` over
+ReadSet::Predicate entries in `state.captures[ws.txn]`. A merge's internal scans call
+`scan_table(name, &ctx.read())` directly (runtime.rs:4367), which builds a plan in
+`scan_table_where` (runtime.rs:6716) and drains it — recording nothing into `captures`.
+Reported to the dispatcher as: does not fire, new counter required.
+
+Two counters are added, both following the repo's own pattern and its cardinal rule stated
+at runtime.rs:115 — count PER SCAN, one relaxed fetch_add, "so the instrument cannot create
+the slope it measures":
+
+  A. SCAN_TABLE_CALLS / SCAN_TABLE_ROWS  (src/agent_sql/runtime.rs, beside OURS_SCAN_*)
+     One relaxed fetch_add per `scan_table_where` call, of `out.len()`. Rows RETURNED.
+
+  B. SEQ_SCANS / SEQ_SCAN_TUPLES  (src/execution/seq_scan.rs)
+     Tuples pulled from the heap by a SeqScan. Accumulated in a plain non-atomic local
+     field and flushed with ONE relaxed fetch_add in `Drop`.
+
+  Why B is not optional. A is rows RETURNED. The point-lookup path (runtime.rs:4421) pushes
+  `pk = k` into the planner and returns ONE row. If the planner does not pick an index and
+  degenerates to a sequential scan, the engine reads O(table) while A reports 1 — a flat A
+  curve produced by an O(table) merge. That is a non-discriminating falsifier, and B is what
+  discriminates it. A count that is flat in A AND flat in B is a real O(delta) merge; flat in
+  A while B grows is the claim surviving underneath a blind instrument.
+
+Scoping: both are process-global. Read twice and subtract around the phase, which is the
+pattern `ours_scan_counters` documents at runtime.rs:1036. The harness is SINGLE-THREADED
+so the subtraction is exact.
+
+
+ARMS
+----
+Harness: examples/d176_merge_rowcount.rs, reusing `build_sized` from
+examples/d68_merge_is_o_table.rs unchanged in configuration — with_storage (not
+with_catalog), ctx.session() (not Session::new), checkpoint_to armed. Those three are
+D101's corrections and a harness that drops them measures a stub.
+
+  ARM A — plain MERGE, table size axis at FIXED delta.
+    sizes  N in {500, 1000, 2000, 4000}   (8x span, as required)
+    delta  = 4 writes per branch, constant
+    metric rows_scanned per merge = SCAN_TABLE_ROWS delta across the MERGE statement alone,
+           and SEQ_SCAN_TUPLES delta across the same window.
+
+  ARM B — SIMULATE with `ASSERT ON t (...)`, same size axis, same fixed delta.
+    This is the arm where the surviving full scan lives. It is ALSO THE FIRE-CHECK: it is
+    the proof that the counter can see a full scan at all. If ARM B is flat, the instrument
+    is broken and ARM A's flatness means NOTHING and will not be reported as a result.
+
+  ARM C — delta axis at FIXED table size.
+    N = 2000 fixed, delta in {1, 2, 4, 8, 16, 32}
+    Run for both the plain-MERGE and the SIMULATE path.
+
+
+PREDICTIONS, RECORDED BEFORE THE FIRST NUMBER
+---------------------------------------------
+The brief's banked prediction, stated as the dispatcher gave it:
+  "rows_scanned grows with table size and is independent of delta; if the claim is exactly
+   right, ~2x table size."
+
+My prediction after the code read above, which DISAGREES with it:
+  P1. ARM A rows_scanned is FLAT in N. Expected magnitude ~= delta (4 point lookups), not 2N,
+      not N, not 0.
+  P2. ARM A rows_scanned GROWS WITH DELTA (one point lookup per distinct touched key) —
+      the exact opposite of "independent of how much the branch actually changed".
+  P3. ARM B rows_scanned is LINEAR in N with slope ~1 per assertion table per candidate,
+      NOT ~2. The second scan (fingerprint_rows) is gone; only one survives.
+  P4. ARM B rows_scanned is INDEPENDENT of delta.
+  P5. SEQ_SCAN_TUPLES in ARM A does not grow with N. If it does, P1 is an artifact of
+      instrument A and the O(table) claim SURVIVES through the point-lookup path.
+
+
+FALSIFIERS — stated explicitly, in both directions
+--------------------------------------------------
+  F1. ⛔ If ARM A's rows_scanned is FLAT in table size, the O(table) claim as banked is DEAD
+      for the plain-MERGE path. That is the valuable outcome and it will be reported as the
+      headline, not buried.
+  F2. ⛔ If ARM A's rows_scanned MOVES WITH DELTA AND NOT WITH SIZE, the claim is dead a
+      second, independent way — "independent of how much the branch actually changed" is
+      then false on its own terms.
+  F3. ⛔ If ARM A's rows_scanned grows ~2N, I am wrong, the D69 commits did not do what their
+      messages say, and the banked claim stands exactly as written. I will report that.
+  F4. ⛔ If ARM B is FLAT, the instrument never fired and NO conclusion is drawn from ARM A.
+      The run is reported as a failed measurement, not as a dead claim.
+  F5. ⛔ If ARM B grows at ~2N rather than ~1N, the "TWICE" half of the claim survives on the
+      assertion path and only the "every merge" half dies.
+
+Note on scope, so the result is not overclaimed later: whatever ARM A shows is a statement
+about the plain-MERGE path at commit 4912302 ONLY. It is not a statement about what the
+ledger measured, because the ledger measured a different tree.
+
+
+AMENDMENTS (append-only)
+------------------------
+(none yet)
