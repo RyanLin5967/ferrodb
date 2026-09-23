@@ -301,6 +301,27 @@ struct StoreState {
     /// Split across two locks in either order there is an interleaving where a push is neither in
     /// the record nor still marked — which is a page that never comes back.
     recycled_dirty: std::collections::HashSet<ArenaId>,
+    /// **D183 — a recycled page has been handed out again, and NO tail record can say so.**
+    ///
+    /// The asymmetry that makes this a separate flag rather than another entry in
+    /// `recycled_dirty`: a PUSH onto a recycled list that has not reached the file leaves the
+    /// durable list SHORTER than memory, so `extent_is_empty` (`recycled >= next_free`) answers
+    /// "not empty" and the extent merely leaks. A POP leaves it LONGER, so a restored extent that
+    /// still holds live pages answers "empty" and `sweep_empty_extents` frees it. One direction
+    /// is a leak; the other is data loss.
+    ///
+    /// ⚠ **This predates D183 — it has been open since D81 put claims on deltas.** Neither
+    /// `TAIL_ARENA_CLAIMED` nor `TAIL_EXTENT_FREED` refreshes an existing extent's recycled list
+    /// (checked at `630afaa`: the claim arm only seeds the NEW arena's list, the free arm only
+    /// removes one), so a pop followed by any number of deltas was already stale. What D183
+    /// changes is the WINDOW: reaps used to rewrite the whole image and close it incidentally,
+    /// and now they append.
+    ///
+    /// So the pop does what every other undescribable change here does — it makes the next
+    /// persist a full image rewrite, exactly as [`ArenaPageStore::pending_version`] does for the
+    /// pending log. It costs one rewrite per burst of reuse, not one per pop, because the flag
+    /// stays set until a persist actually happens.
+    recycled_popped: bool,
     /// The authority epoch each live extent was **claimed** under.
     ///
     /// Kept beside `extents` rather than inside `ArenaExtent`, because that type is a durable
@@ -625,6 +646,7 @@ impl ArenaPageStore {
                 current: HashMap::new(),
                 pending: Vec::new(),
                 recycled_dirty: std::collections::HashSet::new(),
+                recycled_popped: false,
                 claim_epoch: HashMap::new(),
                 shadow_base: HashMap::new(),
             }),
@@ -1732,6 +1754,7 @@ impl ArenaPageStore {
                 // just reset to 0 above, so the next persist is a full rewrite and carries
                 // everything anyway.
                 recycled_dirty: std::collections::HashSet::new(),
+                recycled_popped: false,
                 claim_epoch,
                 // Deliberately NOT restored from the image: see the field's own doc. A cold map
                 // makes the next shadow a chain root, which can only shorten chains.
@@ -1955,6 +1978,7 @@ impl ArenaPageStore {
         let bytes = {
             let mut st = self.state.lock().unwrap();
             st.recycled_dirty.clear();
+            st.recycled_popped = false;
             self.state_bytes_locked(&st)
         };
         replace_atomically(&OsFileOps, &p, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
@@ -2021,6 +2045,11 @@ impl ArenaPageStore {
             || g.image_epoch != crate::cluster::epoch()
             || (pending_covered.is_none()
                 && g.durable_pending_version != self.pending_version.load(Ordering::SeqCst))
+            // **D183 — a recycled page was handed out again and no record can describe it.**
+            // The fifth condition, and the only one whose absence is data loss rather than a
+            // leak: see [`StoreState::recycled_popped`]. Read under `state`, which is the
+            // documented inner lock and the one the pop itself is taken under.
+            || self.state.lock().unwrap().recycled_popped
             || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
         {
             // The rewrite folds in the mutation this record described, because `state_bytes`
@@ -2605,6 +2634,12 @@ impl PageStore for ArenaPageStore {
                 // it RAISES `next_free`, and an overstated recycled count is the other half of
                 // that comparison.
                 st.recycled_dirty.insert(arena);
+                // ⛔ And the mark alone is NOT enough, which is the whole reason this flag
+                // exists: `recycled_dirty` is only read by the records that carry arena sections,
+                // and the record this allocation leads to — `TAIL_ARENA_CLAIMED` — does not.
+                // Nothing in the tail format can express a pop, so the next persist must be a
+                // full image. See [`StoreState::recycled_popped`].
+                st.recycled_popped = true;
                 p
             } else {
                 let ext = st
@@ -4776,6 +4811,89 @@ mod tests {
              change at all"
         );
         same_as_a_full_rewrite("after the drain put the log back");
+
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// ⭐ **D183 — a pop from a recycled list is a durable change, and nothing marked it.**
+    ///
+    /// Found by review. Every other mutator of a per-extent recycled list marks its arena in
+    /// `StoreState::recycled_dirty`; `alloc_in_arena` reuses a recycled page and marked nothing.
+    /// That was survivable while every reap rewrote the whole image incidentally — the window
+    /// closed at the next reap. With the reap path on deltas it runs to the next compaction.
+    ///
+    /// **And the direction is the unsafe one.** `extent_is_empty` is `recycled >= next_free`. A
+    /// durable recycled list that still names a page memory has handed out OVERSTATES the left
+    /// side, so a restored extent holding live pages answers "empty" and `sweep_empty_extents`
+    /// frees it. D85's `resolve_fill` does not repair this: it raises `next_free`, which is the
+    /// other side of the comparison, and it raises it to include the very page that was reissued.
+    ///
+    /// The fixture forces exactly that shape: make a recycled list durable, reuse one of its
+    /// pages, append an unrelated record, and require the restore to match a full rewrite.
+    #[test]
+    fn reusing_a_recycled_page_reaches_the_durable_map() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-pop-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-popc-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let p1 = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        h.store.release_page(p1, arena);
+
+        // Make that recycled list DURABLE, and reset the tail accounting to this image, so the
+        // only thing that can carry the pop afterwards is a record.
+        h.store.checkpoint(&armed).unwrap();
+        let (r0, a0) = h.store.persist_counters();
+
+        // The pop. `arena_for` returns this extent precisely because it has a recycled page.
+        let reused = h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(2)).unwrap();
+        assert_eq!(reused, p1, "fixture: the allocation did not come from the recycled list");
+
+        // Any persist at all. Without the flag this one APPENDS a claim record, which carries no
+        // arena section, and the durable recycled list goes on naming a page that is live again.
+        //
+        // ⚠ `arena_for` and not `alloc_for`, and the difference is the whole fixture: `alloc_for`
+        // claims the extent (which persists) and THEN allocates a page into it, advancing
+        // `next_free` with nothing after it to write that down. The comparison below would then
+        // fail on that field instead — an ordinary unpersisted `next_free`, which D85 owns and
+        // this test is not about. Measured: it did, and the first version of this test read as a
+        // failure of the pop fix when the pop fix was working.
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(spare.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        // ⭐ **The persist after a pop must be a full image REWRITE, and that is the fix.** No
+        // tail record can express "a recycled page was handed out again" — `TAIL_ARENA_CLAIMED`
+        // carries no arena sections and the reclamation records are not on this path — so the
+        // only honest answer is to stop appending. An APPEND here is the defect: it leaves the
+        // durable recycled list naming a page that is live, and the byte comparison below is what
+        // shows the consequence.
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "the claim after a recycled-page reuse APPENDED ({} rewrites, {} appends) instead of \
+             rewriting the image",
+            r1 - r0,
+            a1 - a0
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the durable map still lists the reused page as recycled: a restored extent would \
+             answer `extent_is_empty` while holding a live page"
+        );
 
         let _ = std::fs::remove_file(&armed);
         let _ = std::fs::remove_file(&control);
