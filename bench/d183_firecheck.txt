@@ -1,0 +1,68 @@
+D183 FIRE-CHECK — does the new restore test actually detect a wrong delta?
+=========================================================================
+worktree: /Users/idide/wt/ferrodb-d183-reap-delta   branch: d183-reap-delta
+tree at mutation time: clean (git status --porcelain = 0 lines), HEAD 80003fa
+recorded: 2026-09-23
+instrument: `cargo test --lib branch::arena` (debug). Nothing here is a timing. Every assertion is
+            on an integer (`pending_len`) or on a byte string (`state_bytes`, CRC32-terminated).
+
+WHY THIS FILE EXISTS
+--------------------
+D183 replaced two full-image rewrites on the reap path with two appended tail records. The whole
+row rests on those records reproducing what the rewrite produced — and this is a durability path,
+so a record that is wrong is a page that never comes back or a page freed under a live reader. A
+green test that has never been made to fail asserts nothing about that.
+
+⛔ THE FIRST VERSION OF THE TEST WAS ALREADY WRONG, AND THIS IS HOW IT WAS FOUND
+--------------------------------------------------------------------------------
+`an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite` originally ran the
+interior reap AND the drain, then compared ONCE at the end. Mutant M1 below — the parked record
+silently dropping its last entry — **PASSED that test.**
+
+The reason is structural, not a slip: `TAIL_PENDING_REPLACED` carries the WHOLE pending log, so it
+restates whatever `TAIL_PAGES_PARKED` got wrong. A downstream record that re-states the same state
+masks every mutant of the one in front of it, exactly as a redundant downstream check does. The
+test now compares after EACH record, so the parked record is examined while it is still the last
+word on the log. All four mutants below are run against that version.
+
+THE MUTANTS — each one line, each the plausible way to get this wrong
+----------------------------------------------------------------------
+M1  `retire_arenas_by_rule`'s payload encodes `&parked[..len-1]` — the parked record loses one
+    entry. (A real record that miscounts, or a loop that stops one short.)
+M2  `put_pending`'s payload encodes `st.pending.iter().skip(1)` — the replaced log loses its first
+    entry.
+M3  `encode_arena_sections` writes an EMPTY recycled list for every arena it names — i.e. the
+    record describes the extents but not what came back into them.
+M4  `release_page` no longer inserts into `StoreState::recycled_dirty` — the mechanism that decides
+    WHICH arenas ride the next record is disabled, while both encoders stay correct.
+
+RESULTS
+-------
+M1  FAILED at stage 1, and the message names the defect:
+      after the interior reap: the replayed pending-free log has 2 entries where a full rewrite
+      gives 3
+    (Against the END-ONLY version of the test: PASSED. That is the finding above.)
+
+M2  FAILED at stage 2:
+      the replayed pending-free log has 1 entries where a full rewrite gives 2
+
+M3  FAILED on the byte comparison (src/branch/arena.rs:4397).
+      test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 1607 filtered out
+
+M4  FAILED on the byte comparison (src/branch/arena.rs:4397).
+      test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 1607 filtered out
+
+WHAT M3 AND M4 SAY ABOUT THE REST OF THE SUITE
+-----------------------------------------------
+Both are recycled-list defects, and under both the OTHER 55 arena tests passed. The durability of
+the per-extent recycled list across a reap had no test before this row — `retire_arenas_by_rule`'s
+own comment says losing it leaks the extent permanently, and nothing was checking. So the "55
+passed" line is not reassurance; it is the measurement of what the new test adds.
+
+NOT CLAIMED HERE
+----------------
+The order-independence argument — that a `TAIL_EXTENT_FREED` for the same arena may land on either
+side of these records because both skip arenas absent from `extents`, and that the (page, arena)
+dedupe makes the parked record safe to replay behind a replaced one — is NOT fire-checked. It needs
+two threads racing a reap against an extent free, which this harness cannot arrange. It is argued
+in the code at both replay arms and it is the weakest part of this row's evidence.
