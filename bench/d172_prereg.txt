@@ -73,3 +73,57 @@ This row is licensed to name a structure ONLY via (b) or (c). (a) alone narrows,
        `tel/log.rs` states that stored index positions are valid ONLY because nothing prunes,
        compacts or reorders `frames`. **Anything that trims must reckon with that invariant, and
        it is not a tuning knob.**
+
+-------------------------------------------------------------------------------------------
+AMENDMENTS (append-only)
+
+B1. 2026-09-23, BEFORE any D172 measurement. THE SITE IS LOCATED BY READING, which this prereg's
+    step (c) said should come first and which cost ten minutes.
+
+    `src/agent_sql/runtime.rs:3069`, the last statement inside `stage_all`'s state-lock block:
+
+        ws.frame.clone()
+
+    `stage_all` runs ONCE PER STATEMENT (`branch_update:2670`, `branch_delete:2840`,
+    `stage:2861`). `ws.frame` is a `TxnFrame` whose `ops: Vec<Op>` is append-only and never
+    trimmed within a session, so at statement S it holds ~S ops. **Cloning it is Theta(S), once
+    per statement.**
+
+    ⭐ AND THE CONSUMER NO LONGER NEEDS IT. `MemEffectLog::append` (`src/tel/log.rs:389`) takes
+    `&TxnFrame`, and on the `Reappend::Grew` path — the path every statement after the first takes
+    — it reads ONLY THE NEW TAIL:
+
+        stored.ops.extend_from_slice(&frame.ops[ops..]);
+
+    Its own comment names the very cost this row is chasing, as something it FIXED:
+      "The open frame grew. **Extended rather than replaced**, and the difference is not
+       performance (though it is also that: replacing cloned the whole frame on every statement of
+       a task, which is quadratic in the ops it ran)."
+    ⇒ The STORAGE half of that fix landed. The CALLER still materialises the full O(S) clone to
+    hand to it. This is one fix with two halves and one of them landed.
+
+    FITS EVERY D171 CONSTRAINT WITHOUT ADJUSTMENT: linear in S (clone of an S-length Vec); flat in
+    W (arm C — the Vec is keyed by ops, not by distinct rows); present in stub AND arena (the
+    clone is above the storage layer); present with and without pushdown; and it is a `Vec`
+    reallocation-and-copy, which is what `d71_point_update_curve.txt`'s discarded profile saw as
+    `RawVecInner::finish_grow` / `do_reserve_and_handle`.
+
+    ⛔ THIS IS NOT YET CONFIRMED. A site that COULD produce the shape is not the site that DOES.
+
+B2. THE CONFIRMATION ARM, registered before running it. **A PHASE TIMER, NOT A REMOVAL.**
+    Removing the clone cannot be done without breaking `append`'s `Grew` path, which indexes
+    `frame.ops[ops..]` by ABSOLUTE position and so requires the full frame; a truncated frame
+    would silently mis-index rather than fail. So the non-destructive instrument is used instead:
+
+      time `ws.frame.clone()` alone, and pair it with the INTEGER `ws.frame.ops.len()` at the same
+      moment — a timer paired with a counter, per this project's rule.
+
+    PREDICTIONS:
+      B2a. clone_ns rises LINEARLY with ops.len(), and clone_ns at S accounts for most of D171's
+           measured per-statement excess at S -> the site is CONFIRMED as the dominant term.
+      B2b. clone_ns rises linearly but is a SMALL fraction of the excess -> it is A term, not THE
+           term; report the fraction and keep looking. This is a live outcome.
+      B2c. clone_ns FLAT in ops.len() -> the reading is wrong somewhere; report and stop.
+
+    FALSIFIER: if `ops.len()` does not itself grow ~1 per statement in this workload, the axis is
+    not what I think and the fit is meaningless — so `ops.len()` is REPORTED, never assumed.
