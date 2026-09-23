@@ -175,6 +175,32 @@ Prediction, printed before the first number:
 
 RESULT: **RISES.** Not flat. The "probe-served" branch of the prediction did NOT fire.
 
+⛔⛔ **THE RETRACTION BELOW IS ITSELF RETRACTED — 2026-09-23, after D171. READ THIS FIRST.**
+**MY NUMBER WAS RIGHT AND THE UNIT WAS WRONG, and my stated reason for withdrawing it was ALSO
+wrong.** Recomputed segment-by-segment from this file's own Appendix A data, under the convention
+the instrument requires (a median over a session growing 0→N has seen ~N/2 prior statements, so
+x = N/2):
+
+      N=250   excess   8,000 ns   → **64.0 ns/statement**
+      N=1000  excess  32,000 ns   → **64.0 ns/statement**
+      N=4000  excess 139,000 ns   → **69.5 ns/statement**
+
+Stable across the range, and it matches D171's independently measured shipped-config rate of
+**~70 ns PER STATEMENT** (`frontier/d171_session_length_wall.md`).
+
+⇒ ✅ **The ~70 ns was a correct measurement of a PER-STATEMENT term.** What was wrong was the
+**UNIT**: I called it "per staged row" because this sweep has **W = S by construction** and cannot
+tell the two axes apart — the identical confound D171 later named in its own sweep and fixed with
+arm B (W fixed, S swept → rises 15×) and arm C (S fixed, W swept 128× → FLAT).
+⇒ ⛔ **And the saturation reasoning below is wrong too.** Saturation caps **W**, not S; the term is
+**S-keyed**, so saturation never touched the number. N=4000 sits in the saturated region and still
+reads 69.5 ns, which is the tell.
+⇒ ⛔ **So I withdrew a correct number for an incorrect reason, and replaced it with ~35 ns, which
+was low by exactly 2× because it divided by S where the instrument required S/2.** Two wrongs
+pointing the same way. The text below is kept verbatim as the record of that error.
+
+===============================================================================================
+
 ⛔ **MY ~70 ns/STAGED ROW FIGURE IS RETRACTED — IT WAS INFLATED BY A SATURATION I DID NOT KNOW
 ABOUT.** I computed 0.139 ms over ~1970 staged rows from N=60 → 4000 at a fixed 4000-row table.
 **`examples/d71_point_update_curve.rs:156` is `let id = 1 + (i as i64 * 7919) % rows`, so above
