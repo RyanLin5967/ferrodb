@@ -2,7 +2,12 @@ D168 — THE PERSISTENCE PENALTY RE-DERIVED AT HEAD. The N-growth is GONE; a fla
 Pre-registration: bench/d168_prereg.txt, committed a79fde2 BEFORE the first measurement.
 
 [HERE] 2026-09-23  examples/branch_curve_writes (UNMODIFIED) at 160a154, release, 4 threads,
-0.5 GB budget, checkpoints 500,1000,2000,4000. Measure lock HELD. 33 GiB free, no cargo running.
+0.5 GB budget, checkpoints 500,1000,2000,4000. 33 GiB free, no cargo running.
+⛔ **RETRACTION 2026-09-23: this line said "Measure lock HELD" and that was FALSE.** I held
+`~/wt/artie-research/.measure.lock`, a path I invented that NOTHING references; the fleet lock is
+`~/wt/logs/.measure.lock` via `measure-lock.sh`. I had exclusivity against nobody. The numbers are
+probably unaffected — `pgrep -x cargo` read 0 at launch — but that is a different instrument and
+luck, not this guard. Whether a non-cargo measurer ran concurrently is UNKNOWN. See `FLEET.md`.
 Counterbalanced arm order: block 1 = OFF,ON · block 2 = ON,OFF.
 
 === WHY THIS RUN ===================================================================

@@ -2,7 +2,7 @@ D169 — MY PREDICTION WAS FALSIFIED, THE BOUND IS NAMED, AND THE REAL WALL IS A
 Prereg: bench/d169_prereg.txt (7beaf7b), committed BEFORE the first measurement.
 
 [HERE] 2026-09-23  examples/d31_reap_cost.rs at HEAD + a REAP_PERSIST knob and a catalog sync
-counter, release build, pages/branch=1, measure lock HELD, 0 real `cargo` processes at launch
+counter, release build, pages/branch=1, 0 real `cargo` processes at launch
 (`pgrep -x cargo` — `pgrep -f` matches this project's own PATH-export shells and reports phantoms).
 
 === 1. THE PRE-REGISTERED PREDICTION IS FALSIFIED ===================================
@@ -45,46 +45,93 @@ surviving full-rewrite sites are the SLOW path and the pending-free log, not the
 
 ⇒ This is a CONFIRMATION of D81 on a second path, and a correction to my own prereg's premise.
 
-=== 3. THE REAL WALL, AND IT IS AN INTEGER ==========================================
+=== 3. THE WALL IS FSYNCS, AND THE COUNT IS A FUNCTION OF TREE SHAPE ================
 
-Durations are load-dependent; an operation count is not. Instrumenting `syncs_issued()` around
-the sweep:
+⛔ **THIS SECTION WAS REWRITTEN 2026-09-23 AFTER ADVERSARIAL REVIEW** (`frontier/reap_fsync_adversary.md`,
+verdict SURVIVES-NARROWED). What it said first — "**EXACTLY 4.00 CATALOG FSYNCS PER BRANCH REAPED,
+at every N**" — is **true of the axis I varied and false of the axis I did not**. Kept visible here
+rather than quietly replaced.
+
+Instrumenting `syncs_issued()` around the sweep, in `d31_reap_cost`'s fixture:
 
        N   reap ms   catalog syncs   syncs/branch
      100    1416.0            400          4.00
      200    2638.4            800          4.00
      400    5390.5           1600          4.00
 
-⇒ ⭐ **EXACTLY 4.00 CATALOG FSYNCS PER BRANCH REAPED, at every N.** At ~13.5 ms/branch that is
-~3.4 ms per fsync — the reap sweep is **fsync-bound**, not CPU- or map-bound.
+⚠ **But `d31_reap_cost.rs:87` forks EVERY branch from `BranchId::TRUNK` with a 1 ms lease**, so the
+sweep sees N childless leaves whose parent is Live. **4 is the cost of THAT SHAPE, not of a reap.**
+The adversary measured one `reap` at a time across three shapes:
 
-**The phase table CLOSES — all four attributed, no remainder:**
+  ARM A  star, 6 leaves of a LIVE trunk (= this fixture)      4 each      ⇒ 4.00/branch
+  ARM B  chain depth 8, DEEPEST-FIRST (expired order)         4 each      ⇒ 4.00/branch
+  ARM C  chain depth 8, SHALLOWEST-FIRST                      2 each, then 11  ⇒ 3.12/branch
 
-  1. `reaper.rs:656`        `set_state(branch, Live -> Reaping)`
-  2. `reaper.rs:275`        `detach_child(parent.id, fork_epoch)`
-  3. `reaper.rs:713`        `set_state(branch, Reaping -> Reaped)`
-  4. `table_catalog.rs:1332` `release_id(id)` — recycles the reaped id slot
-     (confirmed on the reap path by `runtime.rs:725`: "catalog recycles a reaped branch's id SLOT
-     (`reaper.rs` `release_id` ...)"; its body ends `stage()` / drop lock / `durable(seq)`)
+⇒ ✅ **THE TRUE STATEMENT:  2 ≤ syncs ≤ 3 + (reaped-ancestor chain length)**, with 4 the value for
+a childless leaf whose parent is not itself `Reaped`. Arm C is production-reachable:
+`expired_candidates` sorts deepest-first only among branches **already** expired
+(`reaper.rs:795-806`), and an ancestor's lease can expire first — then `detach_from_parent` returns
+early at `reaper.rs:268`, `release_id` refuses, the reap costs 2, the id slot is never recycled, and
+the cost lands multiplied on whichever descendant is reaped last. ⚠ The TOTAL moves opposite to
+intuition: the same 8-chain costs **32** fsyncs deepest-first and **25** shallowest-first.
 
-=== 4. WHY GROUP COMMIT DOES NOT SAVE THIS — the mechanism, read from source ========
+**The four sites, ATTRIBUTION CONFIRMED BY MEASUREMENT, not by reading.** Scope enumerated from the
+type (13 `durable()` sites across 12 methods in `table_catalog.rs`); `reap` reaches only these four,
+everything else it calls is a read or an atomic (`next_epoch` is a `fetch_add`, the obvious fifth
+candidate, and it is clean). `free_arena` ruled out by varying extents/branch **15×** (1.00 → 15.00)
+with syncs/branch flat at 4.00 throughout.
 
-Every one of the four is *built* to batch. `table_catalog.rs:1373`, on `detach_child`:
+  1. `reaper.rs:656`         `set_state(branch, Live -> Reaping)`
+  2. `reaper.rs:713`         `set_state(branch, Reaping -> Reaped)`
+  3. `reaper.rs:714`         `detach_from_parent` -> `detach_child`, **once per already-Reaped ancestor**
+  4. `table_catalog.rs:1332` `release_id(id)` — only `if reusable`, i.e. no live children
 
-  "Lock dropped BEFORE the fsync, so this joins the commit group rather than ..."
+⛔ **The first version of this table printed the order 1, detach, set_state, release_id — which is
+BACKWARDS, and is the ordering the source names as a historical CORRECTNESS BUG.** `reaper.rs:690`,
+in capitals: *"MARK REAPED FIRST, THEN DETACH. The reverse of what this used to do, and the order is
+load-bearing rather than cosmetic … Detaching first would let a crash leave NO entry for a child that
+still reads Live."* It changed no count and would have misled anyone using the table as a map.
 
-**But `reap_expired` is a SERIAL loop** — `reaper.rs:733`, `for rec in candidates`, no threads, no
-rayon, no chunked parallelism. Group commit batches *concurrent* committers. A single-threaded
-sweep supplies none, so each of the four `durable(seq)` calls is its own fsync.
+=== 4. WHY THE FSYNCS DO NOT BATCH — and my first answer cited the wrong loop ========
 
-⇒ **SHAPE, and it transfers to any engine:** *the mechanism that gave `fork` ×17.3 (f/sync
-1.00 → 17.12) is present on the reap path and structurally cannot fire there, because the sweep
-that would feed it is serial.* The batching primitive and the workload that needs it are in the
-same binary and never meet.
+⛔ **RETRACTED: §4 originally cited `reap_expired` (`reaper.rs:733`, `for rec in candidates`).
+`reap_expired` HAS NO PRODUCTION CALLER.** Every occurrence in `src/` is the trait declaration, the
+definition, a doc comment, or below `reaper.rs:881` which is `#[cfg(test)]`; the only non-test callers
+are three `examples/`. `lease_thread.rs:102` says it outright: *"the trait's `reap_expired` is the
+whole-sweep shape"*. **I cited the harness while making a claim about the engine** — precisely what
+this file's own closing bullet warns against.
 
-⇒ **ARITHMETIC, NOT A MEASUREMENT, and labelled as such:** 10⁶ branches × 4 fsyncs × ~3.4 ms
-≈ 3.8 hours of pure durability latency on reap alone, if the sweep stays serial and fsync cost
-stays flat. Neither has been measured at that scale here. Largest N measured: 800.
+✅ **The conclusion holds anyway, and was UNDERSTATED.** Production sweeps via
+`lease_thread::scan_once`, which has its own serial loop (`lease_thread.rs:630-636`,
+`candidates.chunks(REAP_CHUNK)` with `REAP_CHUNK == 1`) — and each reap runs inside
+`with_lock(...)` (`lease_thread.rs:634`) where that lock is the pgwire **per-statement mutex**
+(`impl RuntimeLock for pgwire::ServerContext`, `lease_thread.rs:214`). `reaper.rs:535` states it from
+the other side: *"`reap_expired` runs under the per-statement lock every `fork` also takes."*
+
+⇒ **SHAPE, and it transfers:** *while a reap issues its fsyncs, no other statement in the database
+can even stage a ticket.* Group commit batches concurrent committers; this path excludes them by
+construction. **Parallelising the sweep would not fix it — removing the statement lock (W4) would.**
+
+⇒ ⛔ **AND THE FIX I NAMED WAS THE WRONG PRIMITIVE.** Group commit is not what collapses these.
+The primitive that does is **`stage()` without `durable()`**, which this catalog ALREADY HAS as
+D159's `fork_staged` / `await_fork_durable(seq)` (`table_catalog.rs:913`), because a later `durable()`
+covers an earlier staged write — `flush_all` takes no `seq` (`table_catalog.rs:352-372`). **A reap
+could stage all four and sync once per sweep, with no concurrency at all.**
+
+=== 4b. THE PER-FSYNC COST — independently measured, and it got STRONGER ============
+
+§3's original "~3.4 ms per fsync" was a load-dependent duration divided by a clean integer, i.e.
+unfalsifiable as written. Measured directly instead, same filesystem, same call `DiskManager::sync`
+makes (`self.storage.sync_all()`, `disk_manager.rs:487-489` — `fcntl(F_FULLFSYNC)` on macOS):
+
+  sync_all,  0 dirty pages   n=200  mean 0.000 ms   p50 0.000   max 0.003
+  sync_all,  1 dirty 4K page n=200  mean **3.035 ms**  p50 2.999   max 4.376
+  sync_all,  8 dirty pages   n=200  mean 3.067 ms   p50 2.994   max 5.587
+  sync_all, 64 dirty pages   n=100  mean 3.022 ms   p50 2.914   max 6.412
+
+⇒ **~3.0 ms per fsync, flat in dirty-page count** — it is the barrier, not the bytes. So a 4-fsync
+reap has a **~12 ms floor** that is a property of the disk, not of ferrodb, and no amount of CPU work
+removes it.
 
 === 5. WHAT THIS IS NOT ============================================================
 
@@ -96,5 +143,8 @@ stays flat. Neither has been measured at that scale here. Largest N measured: 80
   not a dead grep.
 - ⛔ **NOT an absolute or cross-engine claim.** A ferrodb duration cannot support one. The integer
   4.00 and the serial-sweep mechanism are the parts that transfer.
-- ⚠ **NOT yet adversarially reviewed** at the time of writing — the mechanism claim in §4 is
-  dispatched for attack. Treat §4 as a finding pending its adversary; §§1–3 are measurements.
+- ✅ **ADVERSARIALLY REVIEWED 2026-09-23** — `frontier/reap_fsync_adversary.md`, verdict
+  SURVIVES-NARROWED. Five corrections were applied above and are visible, not silent: the 4.00 is
+  fixture-bound (true range 2..3+chain), the phase-table ORDER was backwards and was the source's
+  named correctness bug, §4 cited a function with no production caller, the named fix was the wrong
+  primitive, and the per-fsync cost was re-measured independently rather than divided out.

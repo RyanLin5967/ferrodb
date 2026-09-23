@@ -52,5 +52,7 @@ constant from a complexity class, so the registered claim is about the SHAPE:
 
 - `len B/branch` is the load-independent column and MUST be identical across arms (D80 measured
   4104 both ways). If it moves, the two arms are not the same workload and the timing is void.
-- forks/sec is measured on a shared box. The measure lock is HELD for this run. Machine had 33 GiB
+- forks/sec is measured on a shared box. ⛔ **RETRACTED 2026-09-23: "the measure lock is HELD" was
+  FALSE** — wrong path (`artie-research/.measure.lock`, referenced by nothing) instead of the fleet
+  lock `~/wt/logs/.measure.lock`. Exclusivity against nobody. See `FLEET.md`. Machine had 33 GiB
   free and no cargo running at launch.
