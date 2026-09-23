@@ -72,6 +72,69 @@ impl Db {
     }
 }
 
+/// ARM D (amendment A3): the EXACT stub configuration `d71_point_update_curve.txt`'s
+/// "second wall" sweep ran on -- `Session::new()`, `storage: None`, and **no `ServerContext`
+/// constructed anywhere in the process**, which `designated::check` permits ("Returns `Ok(())`
+/// when nothing is designated"). Must never share a process with the arena path.
+struct StubDb {
+    catalog: Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    _dir: tempfile::TempDir,
+}
+
+impl StubDb {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dir.path().join("p.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(WalManager::new(dir.path().join("p.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        StubDb { catalog, bp, txn, _dir: dir }
+    }
+    fn exec(&mut self, sql: &str, s: &mut Session) -> Outcome {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), s)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+}
+
+/// One stub cell, same shape as `cell`: pre-load untimed to (w, s), then time TIMED statements.
+fn stub_cell(rows: i64, w: usize, s: usize) -> (f64, u64, u64, u64, u64) {
+    let mut db = StubDb::new();
+    let mut base = Session::new();
+    db.exec("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut base);
+    for i in 1..=rows {
+        db.exec(&format!("INSERT INTO t VALUES ({i}, 0);"), &mut base);
+    }
+    let mut a = Session::new();
+    db.exec("BEGIN AGENT SESSION AS 'd171';", &mut a);
+    let nout = db.exec(&format!("UPDATE t SET v = -1 WHERE id = {};", rows + 1_000_000), &mut a);
+    assert_eq!(affected(&nout), Some(0), "D171 STUB negative control failed at w={w} s={s}");
+    for i in 0..s {
+        let out = db.exec(&format!("UPDATE t SET v = {i} WHERE id = {};", key(i, w, rows)), &mut a);
+        assert_eq!(affected(&out), Some(1), "STUB preload no-op at w={w} s={s} i={i}");
+    }
+    d170_reset_overlay_counters();
+    let mut samples = Vec::with_capacity(TIMED);
+    for i in 0..TIMED {
+        let k = key(i, w, rows);
+        let t = Instant::now();
+        let out = db.exec(&format!("UPDATE t SET v = {i} WHERE id = {k};"), &mut a);
+        samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(affected(&out), Some(1), "STUB timed no-op at w={w} s={s} i={i}");
+    }
+    let (pf, wu, _wn, mu, mo) = d170_overlay_counters();
+    (median(&mut samples), pf, wu, mu, mo)
+}
+
 fn affected(o: &Outcome) -> Option<usize> {
     match o {
         Outcome::Agent(AgentOutput::Affected(n)) => Some(*n),
@@ -142,6 +205,9 @@ fn main() {
     let w_fixed: usize = std::env::var("D171_W").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
 
     println!("table rows = {rows}, timed window = {TIMED} statements on already-staged keys");
+    println!("config = {}", if std::env::var("D171_STUB").is_ok() {
+        "STUB (Session::new(), storage: None, no ServerContext) — ARM D, amendment A3"
+    } else { "ARENA (ArenaPageStore + ServerContext) — the shipped path" });
     println!("ARM {arm}: {}", match arm.as_str() {
         "A" => "W = S, both swept (reproduces D170's axis)".to_string(),
         "B" => format!("W FIXED at {w_fixed}, S swept -- overlay never grows"),
@@ -158,7 +224,8 @@ fn main() {
             _ => panic!("D171_ARM must be A, B or C"),
         };
         assert!((w as i64) <= rows, "w={w} exceeds table rows={rows}: the overlay would SATURATE");
-        let (med, pf, wu, mu, mo) = cell(rows, w, s);
+        let stub = std::env::var("D171_STUB").is_ok();
+        let (med, pf, wu, mu, mo) = if stub { stub_cell(rows, w, s) } else { cell(rows, w, s) };
 
         // Controls, enforced before the number is printed.
         assert_eq!(pf, TIMED as u64, "probe did not fire on every timed statement (w={w} s={s}): {pf}/{TIMED}");

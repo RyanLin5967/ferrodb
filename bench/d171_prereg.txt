@@ -149,3 +149,41 @@ A3. 2026-09-23, after passes 1 and before any stub measurement. ⛔ MY RESULT CO
 
     ⛔ Whatever D returns, this row STILL MAY NOT NAME A STRUCTURE. "In or below the storage
     layer" is a narrowing, not a mechanism. `frame.push_op` remains a CANDIDATE NOT CHECKED.
+
+A4. 2026-09-23. ⛔ OUTCOME D2 FIRED ON A SMOKE RUN: THE STUB ALSO RISES (23.17 -> 40.96 us over
+    4x S, overlay held at 100, ~59 ns/statement). A3 says my number is then the suspect one and
+    nothing may be concluded until the disagreement is resolved. This registers the resolution
+    BEFORE running it.
+
+    THE CANDIDATE RESOLUTION, and why it is not special pleading: the disagreement may be in the
+    STATISTIC, not in the measurement. `d71_point_update_curve.txt`'s sweep ran PRE-`e6958d6`, so
+    its baseline was ~0.708 ms -- dominated by the unpredicated O(table) base scan. My stub runs at
+    HEAD WITH the pushdown, baseline ~23 us. The SAME additive per-statement term produces a
+    RATIO of ~1.45x against a 708 us baseline and ~1.8x against a 23 us baseline. If so, their
+    measurement is CORRECT and their READING of it ("no session-size wall") followed from taking a
+    ratio over an inflated baseline rather than the additive excess.
+
+    ⚠ This is arithmetic on THEIR PUBLISHED NUMBERS and is therefore a HYPOTHESIS, not a result:
+    their table gives excesses over N=50 of 163 / 72 / 53 / 101 ns per statement at N =
+    400 / 800 / 1600 / 3200 -- the right order of magnitude but very noisy (their load ran 99 -> 23).
+    It must be MEASURED, not inferred.
+
+    REGISTERED ARM E: reproduce their sweep EXACTLY and read it both ways.
+      rows = 4000, axis = 50,100,200,400,800,1600,3200, arm A (W = S, as theirs was), STUB config,
+      `D170_NOPUSHDOWN=1` -- their binary configuration as closely as this tree allows. Then the
+      same with `D170_NOPUSHDOWN=0`, and arm B (W fixed) in both, so the per-statement term is
+      separated from the baseline in all four.
+
+    PREDICTIONS:
+      E1. STUB+NOPUSHDOWN reproduces ~0.7 -> ~1.0 ms AND its additive excess is ~50-100 ns per
+          statement -> the disagreement is RESOLVED as a statistic, not a measurement. Their
+          numbers stand; their conclusion "there is no session-size wall" does NOT, and the
+          correct statement is that the pushdown fix UNMASKED a per-statement term that was always
+          present and hidden under the O(table) scan.
+      E2. STUB+NOPUSHDOWN is FLAT in its additive excess -> their conclusion stands on their
+          configuration and MY arm B is the suspect one. Withdraw arm B and report the conflict.
+      E3. STUB+NOPUSHDOWN fails to reproduce ~0.7 -> ~1.0 ms at all -> I have not reproduced their
+          measurement and NOTHING may be concluded. Report as a stop.
+
+    ⛔ STILL NO STRUCTURE MAY BE NAMED. The term is now measured in BOTH configurations, which
+    RULES OUT "storage layer only" (prediction D1 is dead) and rules nothing IN.
