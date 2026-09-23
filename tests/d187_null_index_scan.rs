@@ -320,6 +320,25 @@ fn control_primary_lower_bound_already_excludes_null() {
     assert_eq!(rows.len(), 6, "ids 5..=10 satisfy id >= 5; got {:?}", v_of(&rows, 0));
 }
 
+/// The strictly-excluded lower bound, which takes a different descent path: `range_scan` uses
+/// `leaf.upper_bound(k)` (first key `> k`) rather than `binary_search`. NULL still sorts beneath
+/// the start position, so this is a control too.
+///
+/// Only the PRIMARY scan can be asked this on `main`. `secondary_scan_lower` returns `None` for a
+/// strictly excluded bound and `lower` refuses with "lower bound sec index isn't supported", so the
+/// secondary equivalent is unbuildable here — it becomes reachable under D179, which enforces the
+/// exclusion in the executor instead.
+#[test]
+fn control_primary_excluded_lower_bound_already_excludes_null() {
+    let d = seeded_pk();
+    let rows = d.run_plan(pk_scan(Bound::Excluded(Value::Integer(5)), Bound::Unbounded));
+    assert!(
+        !v_of(&rows, 0).contains(&Value::Null),
+        "the tree descent should already have skipped the NULL key on a strict lower bound"
+    );
+    assert_eq!(rows.len(), 5, "ids 6..=10 satisfy id > 5; got {:?}", v_of(&rows, 0));
+}
+
 /// The semantics this fix commits to, pinned so a later blanket skip cannot pass silently.
 ///
 /// A NULL entry is dropped because the row's membership is decided by a **comparison against a
@@ -397,49 +416,58 @@ fn seeded_wide() -> Db {
 /// cost model prefers a filtered sequential scan whose `Filter` rejects NULLs correctly, so a GREEN
 /// without it would mean "the index was never used", not "the index is right". That is not
 /// hypothetical — it is what the first version of this test actually did.
+/// Every shape is MEASURED FIRST and asserted once at the end, deliberately.
+///
+/// The first version asserted inline and aborted on the first mismatch, so on the unfixed tree only
+/// `v < 5` was ever measured — the two-conjunct shape, the inclusive bound and the NULL-literal
+/// predicates all short-circuited and produced no before-number at all. A run that stops at the
+/// first failure reports one defect and hides four. Collecting first costs nothing and makes a
+/// single run show the whole picture, which is the point of a before-number.
 #[test]
 fn sql_index_path_answers_correctly() {
     let mut d = seeded_wide();
 
-    // 1. The reported shape. 501 before the fix, 1 after.
-    let plan = d.explain("SELECT id FROM t WHERE v < 5;");
-    assert!(
-        plan.contains("Index scan"),
-        "this case only tests the index path if the index path is chosen; plan was:\n{plan}"
-    );
-    assert_eq!(
-        d.select_rows("SELECT id FROM t WHERE v < 5;"),
-        1,
-        "only the v=1 row satisfies v < 5; the 500 NULL rows are UNKNOWN. plan:\n{plan}"
-    );
+    // `w = 1` holds for every row, so it changes no answer — it is there to put a residual `Filter`
+    // above the scan and prove the fix does not depend on one being present.
+    // The NULL-literal predicates answer nothing because every comparison with NULL is UNKNOWN;
+    // `v = NULL` reaches the index via `bound_selectivity`'s `lo == hi` branch (`1/distinct`).
+    let cases: [(&str, usize); 8] = [
+        ("v < 5", 1),
+        ("w = 1 AND v < 5", 1),
+        ("v <= 4", 1),
+        ("v = NULL", 0),
+        ("v >= NULL", 0),
+        ("v > NULL", 0),
+        ("v <= NULL", 0),
+        ("v < NULL", 0),
+    ];
 
-    // 2. The same, with a residual Filter above the scan. `w = 1` holds for every row, so it
-    //    changes no answer — it is here to prove the fix does not depend on a Filter being there.
-    assert_eq!(
-        d.select_rows("SELECT id FROM t WHERE w = 1 AND v < 5;"),
-        1,
-        "w = 1 holds for every row, so this is `v < 5` and answers 1. plan:\n{}",
-        d.explain("SELECT id FROM t WHERE w = 1 AND v < 5;")
-    );
-
-    // 3. The inclusive upper bound, which reaches the other arm of the same test.
-    assert_eq!(
-        d.select_rows("SELECT id FROM t WHERE v <= 4;"),
-        1,
-        "only the v=1 row satisfies v <= 4. plan:\n{}",
-        d.explain("SELECT id FROM t WHERE v <= 4;")
-    );
-
-    // 4. The NULL-literal defect, end to end. `v = NULL` takes `bound_selectivity`'s `lo == hi`
-    //    branch (`1/distinct`), which is selective enough that the INDEX wins here too — so before
-    //    the fix this returns all 500 NULL rows where SQL answers none.
-    for pred in ["v = NULL", "v >= NULL", "v > NULL", "v <= NULL", "v < NULL"] {
+    let mut wrong = Vec::new();
+    for (pred, want) in cases {
         let sql = format!("SELECT id FROM t WHERE {pred};");
-        assert_eq!(
-            d.select_rows(&sql),
-            0,
-            "`{pred}` is UNKNOWN for all 3001 rows and must answer nothing. plan:\n{}",
-            d.explain(&sql)
-        );
+        let got = d.select_rows(&sql);
+        let plan = d.explain(&sql);
+        let kind = if plan.contains("Index scan") { "index" } else { "seq" };
+        if got != want {
+            wrong.push(format!("  {pred:<18} got {got:<5} want {want:<5} ({kind} scan)"));
+        }
     }
+
+    // Load-bearing: below a few thousand rows the cost model prefers a filtered sequential scan,
+    // whose `Filter` rejects NULLs correctly — so a GREEN with no index scan anywhere would mean
+    // "the index was never used", not "the index is right". That is not hypothetical; it is what
+    // the first version of this fixture actually did, at 501 rows.
+    let headline = d.explain("SELECT id FROM t WHERE v < 5;");
+    assert!(
+        headline.contains("Index scan"),
+        "this case only tests the index path if the index path is chosen; plan was:\n{headline}"
+    );
+
+    assert!(
+        wrong.is_empty(),
+        "{} of {} SQL shapes answered wrongly:\n{}\nheadline plan:\n{headline}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
 }
