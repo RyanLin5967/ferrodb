@@ -1,0 +1,60 @@
+D169 PRE-REGISTRATION — written BEFORE the first measurement, amendments append-only.
+
+## The question — D81's OWN stated risk, never measured
+
+D81 (`53a6b66`) moved the fork path off a full free-space-map rewrite (45-byte append instead), and
+D168 confirmed the consequence: the fork-side persistence penalty is FLAT in N. D81 deliberately
+left THREE full-rewrite sites whole and wrote its own risk into the source, verbatim
+(`src/branch/arena.rs`, at the TAIL_ARENA_CLAIMED site):
+
+  "The other three `persist_if_configured` sites keep the full rewrite deliberately. They fire once
+   per REAP, not once per branch created ... ⚠ The condition under which that stops being the right
+   call, stated rather than discovered: a workload that reaps as often as it forks pays a full
+   rewrite per reap and only half of this row's benefit."
+
+**Nothing in this repo measures that.** `examples/d31_reap_cost.rs` forks N branches and reaps them
+all — the right shape — but like D61's harness it NEVER CALLS `checkpoint_to`, so it has measured a
+configuration production does not run (the same blind spot D79 found in `branch_curve_writes.rs`).
+
+## The mechanism, stated so the prediction is derived and not guessed
+
+`free_arena` ends in `persist_if_configured()` → `persist_full_locked` — a FULL rewrite, not a
+delta, documented in-source as "Once per branch reaped, not once per page." The map is ~48 bytes
+per LIVE branch. Reaping N branches therefore rewrites a map of ~48·(N−i) bytes at step i:
+
+    total bytes ≈ Σ 48·i = 24·N²   — the exact shape D81 removed from the fork path.
+
+## THE PREDICTION — the ratio's SLOPE in N
+
+Reap-with-persistence should be O(N²) in bytes; reap-without should be O(N). So:
+
+  **The ON/OFF ratio must GROW ~LINEARLY in N — doubling the branch count roughly doubles it.**
+
+This is deliberately the OPPOSITE of D168's fork-side result (flat, 1.36×→1.36×). One harness,
+one mechanism, two paths, two different predicted shapes — so a common-mode instrument fault
+cannot produce both.
+
+## What is measured
+
+`examples/d31_reap_cost.rs` at HEAD + a `REAP_PERSIST` env knob mirroring `CURVE_PERSIST`
+(arms `store.checkpoint_to(dir/"main.db.arena")`; OFF by default so historical runs reproduce).
+Branch counts **100, 200, 400, 800**; pages/branch fixed at **1** (the map is per-BRANCH, so the
+page axis only adds noise). Counterbalanced arm order across two blocks. Measure lock HELD.
+
+## OUTCOMES, fixed now
+
+  1. Ratio grows ~linearly in N (doubling N ≈ doubles the ratio) ⇒ **D81's risk CONFIRMED**: the
+     O(N²) was moved off fork and is still live on reap. This is the expected outcome.
+  2. Ratio FLAT in N ⇒ risk NOT realised. Then something bounds it that I have not found, and
+     finding what is the result — do not report "no effect" without naming the bound.
+  3. Ratio grows SUB-linearly ⇒ partial; report the observed exponent, claim nothing stronger.
+  4. Ratio INVERTS (ON faster) ⇒ instrument fault, not a finding. Both arms free identical state.
+  5. Stops on the disk floor, OOM, or a timeout ⇒ NOT A RESULT. Report as a stop.
+
+## Controls
+
+- `reaped` must equal the branch count in BOTH arms, at every N. A sweep that reaped fewer
+  branches did different work and its time is void.
+- `extents/branch` must be identical across arms.
+- Box was quiet at launch: **0 real `cargo` processes** (`pgrep -x cargo` = 0 — note `pgrep -f`
+  matches this project's own PATH-export shells and reports phantoms).
