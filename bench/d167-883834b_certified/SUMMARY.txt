@@ -1,0 +1,2 @@
+d167-444ad6a: mode=per-target rc=0 passed=2529 failed=0 build_errors=0 head=444ad6a log=/Users/idide/wt/artie-research/verify-out/d167-444ad6a/suite-d167-444ad6a.log
+d167-444ad6a: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d167-444ad6a/suite-d167-444ad6a.go.log
