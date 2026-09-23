@@ -1956,4 +1956,48 @@ mod tests {
         bad[84] = 200;
         assert!(HistoryEntry::from_canonical_bytes(&bad).is_none(), "accepted an unknown op code");
     }
+
+    /// D192: `footprint` counts what the production lifecycle leaves behind — fork, merge into
+    /// trunk, reap — and a reap ADDS to every count rather than removing anything.
+    ///
+    /// Expected values are worked by hand from the structure, not read back from the accessor:
+    /// after one lifecycle the log has 3 entries on 2 keys (the worker and trunk) and a Merkle tree
+    /// over 3 leaves (levels of 3, 2, 1 nodes); after two, 6 entries on 3 keys and levels of
+    /// 6, 3, 2, 1.
+    #[test]
+    fn footprint_counts_the_lifecycle_and_a_reap_only_adds() {
+        fn lifecycle(h: &mut AttestedHistory, worker: BranchId, n: u64) {
+            h.append_fork(worker, BranchId::TRUNK, Epoch(n), cid(n));
+            h.append(BranchId::TRUNK, Epoch(n + 1), BranchOp::Merge, cid(n + 1));
+            h.append(worker, Epoch(n + 2), BranchOp::Reap, cid(n + 2));
+        }
+        let mut h = AttestedHistory::new();
+        assert_eq!(h.footprint(), AttestFootprint::default(), "a new log is not empty");
+
+        lifecycle(&mut h, bid(1, 0), 10);
+        let one = h.footprint();
+        assert_eq!(
+            (one.entries_len, one.by_branch_keys, one.by_branch_idx_len, one.heads_keys),
+            (3, 2, 3, 2)
+        );
+        assert_eq!((one.levels, one.level_nodes_len), (3, 3 + 2 + 1));
+
+        lifecycle(&mut h, bid(2, 0), 20);
+        let two = h.footprint();
+        assert_eq!(
+            (two.entries_len, two.by_branch_keys, two.by_branch_idx_len, two.heads_keys),
+            (6, 3, 6, 3)
+        );
+        assert_eq!((two.levels, two.level_nodes_len), (4, 6 + 3 + 2 + 1));
+
+        // Every capacity covers its length — otherwise the accessor is reading the wrong field.
+        for f in [one, two] {
+            assert!(f.entries_cap >= f.entries_len);
+            assert!(f.by_branch_idx_cap >= f.by_branch_idx_len);
+            assert!(f.by_branch_table_cap >= f.by_branch_keys);
+            assert!(f.heads_table_cap >= f.heads_keys);
+            assert!(f.levels_outer_cap >= f.levels);
+            assert!(f.level_nodes_cap >= f.level_nodes_len);
+        }
+    }
 }
