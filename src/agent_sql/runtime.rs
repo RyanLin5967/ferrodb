@@ -2612,13 +2612,21 @@ impl AgentRuntime {
         // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
         // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
         // between the two paths. What changes is how many rows reach it, never which ones pass.
+        // ⚠⚠ D170 ADVERSARY INSTRUMENT — NOT FOR LANDING. `D170_NOPUSHDOWN=1` restores the
+        // PRE-`e6958d6` call EXACTLY: that commit states `visible_rows(..)` was
+        // `visible_rows_where(.., None, None, None)`, so passing `None, None` here IS the old
+        // path. ONE binary, TWO runtime states, so this A/B cannot be a build difference.
+        let nopush = {
+            static NP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NP.get_or_init(|| std::env::var("D170_NOPUSHDOWN").map(|v| v == "1").unwrap_or(false))
+        };
         let rows = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
             None,
-            where_clause.as_ref(),
-            bound_where.as_ref(),
+            if nopush { None } else { where_clause.as_ref() },
+            if nopush { None } else { bound_where.as_ref() },
         )?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
