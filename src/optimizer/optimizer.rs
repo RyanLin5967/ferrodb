@@ -163,7 +163,7 @@ fn secondary_scan_lower(lower: &Bound<Value>) -> Option<Bound<(Value, Value)>> {
     match lower {
         Bound::Included(v) => Some(Bound::Included((v.clone(), Value::Null))),
         Bound::Unbounded => Some(Bound::Unbounded),
-        Bound::Excluded(_) => None,
+        Bound::Excluded(v) => Some(Bound::Included((v.clone(), Value::Null))),
     }
 }
 
