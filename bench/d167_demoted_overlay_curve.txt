@@ -1,0 +1,68 @@
+D167 — the cost of the DEMOTED overlay state. Prediction registered in bench/d167_prereg.txt BEFORE this run.
+host: Darwin arm64  started: 2026-09-22T21:42:41Z  load: 13.61 11.39 9.85
+tree: 932e73b0b476e90683c2f18b9cea84976fdd8421  rows=5000 fixed, sweeping W=D56_STAGED
+POSITIVE CONTROL (run before the sweep): W=800 control=123349 demoted=50021 stmt/s -> the arms DIFFER, demotion fired.
+
+W          arm       median stmt/s
+100        control          131686
+100        demoted          112470
+400        control          126224
+400        demoted           76478
+800        control          125791
+800        demoted           53094
+1600       control          124303
+1600       demoted           31497
+3200       control          137501
+3200       demoted           16558
+
+finished: 2026-09-22T21:47:59Z
+
+================================================================================
+READING — ⛔ THIS IS A REPLICATION, NOT A NEW RESULT. Rule Zero fired on it.
+================================================================================
+
+⛔ BEFORE THE NUMBERS: `bench/d57_staged_curve_before.txt` / `_after.txt` (2026-09-19) ALREADY
+   MEASURE THIS CURVE — same harness, same axis, same table size. Their BEFORE arm is the walk
+   (143824 -> 19240 stmt/s, falling) and their AFTER arm is the probe (155256 -> 152590, flat).
+   I built this harness without running Rule Zero on the measurement, and Rule Zero is mine.
+   ⚠ And d57's METHOD IS BETTER: "Order: forward, reverse, forward (point-rotation)". This run
+   did NOT rotate — it ran control-then-demoted at every W, so drift is not cancelled between
+   arms. Treat the arms as adjacent-in-time, not as balanced.
+
+WHAT DIFFERS, stated narrowly so it is not inflated:
+  d57 compared TWO BINARIES (d635291 vs 145d6c0) — "did building the probe help?"
+  This compares TWO RUNTIME STATES IN ONE BINARY — "what does a branch demoted at runtime cost?"
+  Same curve, different question. The demotion is reachable by ONE statement at HEAD.
+
+PER-STATEMENT COST (1e6 / stmt-per-sec), and the EXCESS the demoted state pays:
+
+       W    ctl us    dem us   excess us   ns per staged row
+     100      7.59      8.89        1.30        13.0
+     400      7.92     13.08        5.15        12.9
+     800      7.95     18.83       10.88        13.6
+    1600      8.04     31.75       23.70        14.8
+    3200      7.27     60.39       53.12        16.6
+
+⇒ CONTROL IS FLAT: 7.59 -> 7.27 us across a 32x range of W, non-monotonic, no trend. The probe
+  does not care how much the lineage staged. (This is the control the pre-registration required;
+  had it fallen, the comparison would have been void.)
+⇒ DEMOTED IS LINEAR IN W: the excess is ~13-17 ns per staged row, roughly constant across 32x.
+  That is O(W) confirmed on the shape, which is what the prediction said.
+
+⚠ THE ns/row FIGURE DRIFTS UPWARD (13.0 -> 16.6) and I am NOT explaining it. Plausible causes
+  include cache behaviour at larger overlays and a machine at load 13.61, and this project's own
+  rule is that a mechanism for a gap must itself be checked before it is stated. Unchecked.
+
+⛔ NOT COMPARABLE TO d57's PUBLISHED CONSTANT, and the difference is not a finding.
+  `d57_staged_curve_before.txt:41` and `runtime.rs:2120` both say "~11.5 ns per staged row" — but
+  the source comment says "— all tables —", i.e. that constant was measured against the PRE-D57
+  walk over EVERY table, under the State mutex. This run measures ONE table's prefix on a
+  snapshot taken outside the lock. Different path, different denominator. The fact that mine is
+  higher while being narrower is unexplained and deliberately left so.
+
+WHAT THIS LICENSES
+  ✅ "At HEAD, a demoted branch pays ~13-17 ns per staged row per read, linear in W, while a
+     probeable branch is flat at ~7.7 us per statement." SHAPE, measured, with a control.
+  ⛔ NOT "this is a bug" — the monotone, inherited, never-decremented counter is DOCUMENTED INTENT
+     (runtime.rs:340-344) and deliberately TESTED (d57_overlay_probe.rs:346).
+  ⛔ NOT a new result. The shape was published in this repo three days before this run.
