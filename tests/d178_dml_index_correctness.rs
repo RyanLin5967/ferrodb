@@ -147,6 +147,13 @@ fn fixture() -> (Db, Session) {
 ///
 /// ⛔ Do not shrink this fixture or drop the `ANALYZE` to make the file faster. That does not speed
 /// the test up, it switches it off.
+///
+/// ⚠ The table above is the measurement that sized this fixture, taken against the tree as it was
+/// BEFORE D179. The error it shows no longer occurs — D179 makes that plan buildable — so the
+/// fixture's size now selects the cutoffs at which `v > k` reaches the INDEX rather than the
+/// cutoffs at which it used to fail. The reason not to shrink it is unchanged: a smaller table or
+/// a missing `ANALYZE` makes the cost model prefer a sequential scan and the test stops exercising
+/// the secondary range path at all.
 const N_BIG: i64 = 800;
 
 fn big_fixture() -> (Db, Session) {
@@ -265,9 +272,10 @@ fn updating_the_indexed_column_itself_is_not_a_moving_target() {
     // so no tree is mutated while a scanner over it is live — but "safe by construction" is a
     // claim, and this is the case that would expose it if the construction ever changed.
     //
-    // `v >= 400 AND v <= 400` is spelled as two conjuncts so the optimizer takes the first
-    // lowerable indexed one and leaves the other as a residual `Filter` — the plan shape that has
-    // both an index scan and a filter over the column being written.
+    // `v >= 400 AND v <= 400` is spelled as two conjuncts so one becomes the index scan and the
+    // other a residual `Filter` — the plan shape that has both an index scan and a filter over the
+    // column being written. (Which of the two is chosen was the leftmost until D181 and is now the
+    // cheaper; either way the SHAPE this test is about is the same.)
     let (mut db, mut s) = fixture();
     let affected = db.affected("UPDATE t SET v = 405 WHERE v >= 400 AND v <= 400;", &mut s);
     assert_eq!(affected, 1, "exactly one row has v = 400 in the fixture");
@@ -284,12 +292,19 @@ fn a_strict_lower_bound_on_a_secondary_index_answers_rather_than_erroring() {
     //     SELECT id FROM h WHERE v > 9980 ;  ERROR: lower bound sec index isn't supported
     //     SELECT id FROM h WHERE v > 9900 ;  OK, 9 rows
     //
-    // Same table, same index; only the row estimate differed. The optimizer now declines to propose
-    // a plan it cannot build and falls through to the sequential scan it was already costing
-    // against, so the answer is correct rather than absent.
+    // Same table, same index; only the row estimate differed. D178 made the optimizer decline to
+    // propose a plan it could not build, so the answer became correct rather than absent.
     //
-    // ⚠ This asserts that the statement ANSWERS, and answers correctly. It does NOT assert that
-    // `v > k` uses the index — it does not, and making it do so is a separate row.
+    // ⚠ **D179 SUPERSEDED THE MECHANISM UNDER THIS TEST, AND THE TEST IS UNCHANGED ON PURPOSE.**
+    // `lower` can now BUILD a strictly-excluded lower bound on a secondary index — it opens the
+    // scan at `(v, Null)` and skips the leading `sec == v` run — so there is nothing left to
+    // decline and `v > k` reaches the index at the cutoffs below rather than falling back. What
+    // this test asserts is unaffected by which of those two mechanisms is in force: the statement
+    // ANSWERS, and answers correctly. That is exactly why it is worth keeping across the change.
+    //
+    // The comment it replaces said `v > k` "does not" use the index and that making it do so was a
+    // separate row. That row is D179 and it has landed; `tests/d179_secondary_strict_lower.rs` and
+    // `tests/d179_secondary_strict_lower_counters.rs` are where the index USE is asserted.
     let (mut db, mut s) = big_fixture();
 
     // The top of `v`'s range is where the estimate is smallest and the index side of the cost
