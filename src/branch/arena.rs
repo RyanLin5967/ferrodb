@@ -5595,6 +5595,20 @@ mod tests {
 /// `reaper.rs:679` and counts those. Everything here exists to ask whether that hand-rolled
 /// loop is the thing production runs, whether the counters can be made to move at all, and
 /// whether the slope is a property of BRANCHES or of the fixture's shape.
+///
+/// ⭐ **THESE BANDS PINNED A WALL AND NOW PIN THE FIX. They were written against `630afaa` and
+/// every one of them has been RE-STATED, not deleted.** The attack succeeded: it refuted the
+/// claim that a reap costs one rewrite per interior branch and zero for a leaf, and the numbers
+/// it established — measured through `TwoTierReaper::reap`, the function production calls — are
+/// the baseline the fix is measured against. They are kept in each test's doc band, because a
+/// before/after with only the after is a claim rather than a measurement.
+///
+/// **One invariant runs through all of them and it is what the re-statements are built on: the
+/// NUMBER of durable records per reap did not change. Only the KIND did.** A reap still makes
+/// exactly the same number of writes to `<db>.arena`; each one used to be a full 48·L-byte image
+/// and is now a bounded appended record. Every band therefore asserts the unchanged total AND the
+/// inverted split, so a "fix" that simply stopped persisting — which is data loss, not a fix —
+/// fails the first half while satisfying the second.
 #[cfg(test)]
 mod d183_adversary {
     use super::harness::Harness;
@@ -5714,26 +5728,132 @@ mod d183_adversary {
         let int_slope = cells[3].1 .0 as i64 - cells[2].1 .0 as i64;
         println!("  rewrite slope over 8 more branches: LEAF={leaf_slope}, INTERIOR={int_slope}");
 
-        // ⛔ THE REFUTATION, PINNED. The claim under attack is "one full image rewrite per
-        // INTERIOR branch reaped (slope exactly 1.0), zero for a leaf". Through `Reaper::reap`
-        // -- the function production calls -- BOTH HALVES ARE WRONG:
-        //   * the interior slope is 2.0, not 1.0 (`retire_arenas_by_rule`, then a second
-        //     rewrite whose source differs by arm -- see `d183adv_mech_...put_pending`);
-        //   * the leaf slope is 1.0, not 0.0, because `drain_pending_seeded` runs on EVERY
-        //     reap and its `take_pending` bumps `pending_version` even on an empty log, which
-        //     forces the next reap's first `free_arena` into a full rewrite.
-        // The predicate at `reaper.rs:679` still splits the cost. It splits it 2 against 1.
-        assert_eq!(int_slope, 16, "interior cost is not 2 full rewrites per branch");
-        assert_eq!(leaf_slope, 8, "leaf cost is not 1 full rewrite per branch");
-        assert_eq!(
-            cells[0].1 .0,
-            7,
-            "leaf 8 paid {} rewrites, not branches-1 (the first reap precedes any drain)",
-            cells[0].1 .0
-        );
-        // The leaf phase table closes: one durable record per arena, 3 arenas per branch.
+        // ⛔ **THE REFUTATION THIS TEST WAS WRITTEN FOR, AND THE FIX THAT ANSWERED IT.**
+        //
+        // The claim under attack was "one full image rewrite per INTERIOR branch reaped, zero for
+        // a leaf". Through `Reaper::reap` both halves were wrong. Measured at `630afaa`:
+        //
+        //     LEAF      8 -> rewrites  7, appends 17      INTERIOR  8 -> rewrites 16, appends  0
+        //     LEAF     16 -> rewrites 15, appends 33      INTERIOR 16 -> rewrites 32, appends  0
+        //
+        // i.e. interior slope 2.0 per branch and leaf slope 1.0 per branch, not 1.0 and 0.0. The
+        // leaf cost was `take_pending` bumping `pending_version` on an EMPTY log, which forced
+        // the next reap's first `free_arena` into a full rewrite.
+        //
+        // Measured on this branch, same fixture, same instrument:
+        //
+        //     LEAF      8 -> rewrites  0, appends 24      INTERIOR  8 -> rewrites  0, appends 16
+        //     LEAF     16 -> rewrites  0, appends 48      INTERIOR 16 -> rewrites  1, appends 31
+        //
+        // ⚠ The assertions below are NOT those numbers. The two that are exact are the ones that
+        // did not move — the record TOTALS — because they are what makes "the reap still persists
+        // as often as it did" separable from "it persists more cheaply". The rest is stated as a
+        // shape, so that a compaction landing in a different place does not fail a green run.
+
+        // UNCHANGED, BEFORE AND AFTER: one durable record per arena on the leaf path, and two per
+        // branch on the interior path (the reap's record, then the drain's). A reap that stopped
+        // persisting would satisfy every slope assertion below and fail these.
         assert_eq!(cells[0].1 .0 + cells[0].1 .1, 24, "leaf 8 records != 24 arenas");
         assert_eq!(cells[1].1 .0 + cells[1].1 .1, 48, "leaf 16 records != 48 arenas");
+        assert_eq!(cells[2].1 .0 + cells[2].1 .1, 16, "interior 8 records != 2 per branch");
+        assert_eq!(cells[3].1 .0 + cells[3].1 .1, 32, "interior 16 records != 2 per branch");
+
+        // THE INVERSION. The leaf arm's rewrites were 1.0 per branch and are now flat at zero —
+        // exact, because `take_pending`'s empty-log bump was the whole of that cost and nothing
+        // in this fixture can reach `compact_threshold` at these sizes.
+        assert_eq!(
+            (cells[0].1 .0, cells[1].1 .0, leaf_slope),
+            (0, 0, 0),
+            "the leaf arm still pays full image rewrites: 8->{}, 16->{}",
+            cells[0].1 .0,
+            cells[1].1 .0
+        );
+        // The interior arm's rewrites were 2.0 per branch with appends structurally impossible.
+        // Now the growth must land in the APPENDS; what rewrites remain are compactions, which
+        // `d183adv_a5_the_interior_cost_is_no_longer_a_class` measures over a real size axis.
+        assert!(
+            int_slope < cells[3].1 .1 as i64 - cells[2].1 .1 as i64,
+            "interior rewrites did not stop tracking branches: rewrites +{int_slope} against \
+             appends +{}",
+            cells[3].1 .1 as i64 - cells[2].1 .1 as i64
+        );
+    }
+
+    /// ⭐ **Is the interior cost still a CLASS, or only a smaller constant?**
+    ///
+    /// This is the question two sizes cannot answer and the reason it gets its own test. A single
+    /// before/after pair moves whether the fix removed a quadratic or merely divided it.
+    ///
+    /// The history, all three points measured with the same instrument on the same fixture:
+    ///
+    /// | | 8 | 16 | 32 | 64 | 128 | rewrites/branch |
+    /// |---|---|---|---|---|---|---|
+    /// | `630afaa` | 16 | 32 | — | — | — | **2.0, flat** |
+    /// | after the first two record kinds | 1 | 5 | 16 | 38 | 74 | **0.58, flat** |
+    /// | after `TAIL_PENDING_DRAINED` | 0 | 1 | 1 | 2 | 3 | **0.062 → 0.023, falling** |
+    ///
+    /// The middle row is the one worth keeping: replacing the two `persist_if_configured` calls
+    /// with records made the constant four times better and left the CLASS untouched, because
+    /// `TAIL_PENDING_REPLACED` restates the whole pending log and the log grows with the branch
+    /// count. Only describing a drain by DIFFERENCE removed the quadratic.
+    ///
+    /// The assertion is therefore about the ratio between the ends of the axis, not about any
+    /// single cell: a per-branch cost that does not fall is a class, whatever its constant.
+    #[test]
+    fn d183adv_a5_the_interior_cost_is_no_longer_a_class() {
+        fn run(branches: usize) -> (u64, u64) {
+            let (h, path) = armed("a5", branches);
+            let (ids, _) = build(&h, branches, 4, true);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+        println!("A5 INTERIOR cost against branches, through the REAL reaper:");
+        let mut rows = Vec::new();
+        for n in [8usize, 16, 32, 64, 128] {
+            let (r, a) = run(n);
+            println!(
+                "  branches={n:4}: rewrites={r:4} appends={a:4}  rewrites/branch={:.3}  \
+                 records/branch={:.3}",
+                r as f64 / n as f64,
+                (r + a) as f64 / n as f64
+            );
+            rows.push((n, r, a));
+        }
+
+        // Anti-vacuity: an axis on which nothing happened proves nothing about its own slope.
+        for (n, r, a) in &rows {
+            assert!(r + a > 0, "branches={n}: the reap loop persisted nothing at all");
+            assert_eq!(
+                r + a,
+                2 * *n as u64,
+                "branches={n}: {} records, not the two per interior branch the reaper makes",
+                r + a
+            );
+        }
+
+        // THE CLASS CLAIM. At `630afaa` this ratio was 2.0 at every size, and after the first two
+        // record kinds it was 0.58 at every size — flat is what a class looks like. It must now
+        // FALL across the axis: the compactions that remain are amortised against an image that
+        // grows, so their share of the work per branch shrinks.
+        let first = rows[1].1 as f64 / rows[1].0 as f64; // 16 branches; 8 is 0 and gives no ratio
+        let last = rows[rows.len() - 1].1 as f64 / rows[rows.len() - 1].0 as f64;
+        assert!(
+            last < first,
+            "rewrites per branch did not fall across the size axis ({first:.3} at 16 -> \
+             {last:.3} at 128): the cost is still a class, not a constant"
+        );
+        // And it must be a small share of the records, not most of them.
+        let (_, r_last, a_last) = rows[rows.len() - 1];
+        assert!(
+            r_last * 10 < a_last,
+            "rewrites are {r_last} against {a_last} appends at the top of the axis"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -5775,11 +5895,17 @@ mod d183_adversary {
         }
     }
 
-    /// The INTERIOR arm's `appends = 0` is not a measurement.
+    /// The INTERIOR arm's `appends = 0` was not a measurement — and now it is.
     ///
-    /// `retire_arenas_by_rule` ends in `persist_if_configured`, which is `persist_full_locked`
-    /// with no threshold and no delta encoder anywhere on the path. There is no fixture that
-    /// makes it append, and this records that as a structural fact rather than a result.
+    /// **At `630afaa` this test recorded a STRUCTURAL zero**: `retire_arenas_by_rule` ended in
+    /// `persist_if_configured`, which is `persist_full_locked` with no threshold and no delta
+    /// encoder anywhere on the path, so no fixture could make it append. 32 branches x 64 pages —
+    /// 4x the branches and 8x the pages of the original fixture — gave `rewrites=32 appends=0`.
+    ///
+    /// That is exactly the kind of zero worth re-testing after a change, because a zero which no
+    /// fixture can move is a fact about the code and not about the workload. On this branch the
+    /// same fixture gives **`rewrites=5 appends=27`**: the path now has an encoder on it, the
+    /// total is still one record per branch, and the zero is gone.
     #[test]
     fn d183adv_a2_the_interior_zero_appends_is_unfalsifiable() {
         let (h, path) = armed("a2i", 0);
@@ -5797,10 +5923,22 @@ mod d183_adversary {
             r1 - r0,
             a1 - a0
         );
+        // One durable record per branch, before and after; what changed is which kind.
         assert_eq!(
-            a1 - a0,
-            0,
-            "an interior arm produced an append -- the structural claim is wrong"
+            (r1 - r0) + (a1 - a0),
+            32,
+            "the interior retire is no longer one durable record per branch"
+        );
+        assert!(
+            a1 - a0 > 0,
+            "the interior arm still cannot append: the structural zero this test recorded at \
+             630afaa is back, so nothing on this path reaches an encoder"
+        );
+        assert!(
+            r1 - r0 < a1 - a0,
+            "the interior arm is still mostly full rewrites: {} against {} appends",
+            r1 - r0,
+            a1 - a0
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -5832,17 +5970,32 @@ mod d183_adversary {
         for pages in [0usize, 1, 4, 16] {
             let mut row = Vec::new();
             for branches in [8usize, 16, 24] {
-                let (r, _, arenas) = interior(branches, pages);
+                let (r, a, arenas) = interior(branches, pages);
                 row.push((branches, r, arenas));
+                // **At `630afaa` this asserted `r == branches` and held at every cell** — the
+                // hand-rolled `retire_arenas_by_rule` loop cost exactly one full image rewrite
+                // per branch whatever its arenas or pages. That is the wall this row removes.
+                // What must still hold is the TOTAL: one durable record per branch, which is
+                // what makes "cheaper" separable from "skipped".
                 assert_eq!(
-                    r, branches as u64,
-                    "pages={pages} branches={branches}: rewrites={r} is not one per branch"
+                    r + a,
+                    branches as u64,
+                    "pages={pages} branches={branches}: {} durable records, not one per branch",
+                    r + a
+                );
+                assert!(
+                    r < branches as u64,
+                    "pages={pages} branches={branches}: rewrites={r} still tracks branches \
+                     one-for-one"
                 );
             }
             let s: Vec<String> = row
                 .iter()
                 .map(|(b, r, ar)| format!("b={b} rewrites={r} arenas={ar}"))
                 .collect();
+            // The original question this axis answered is unchanged and still worth asserting:
+            // whatever the cost is, it does not track ARENAS or PAGES — the three page counts
+            // give three different arena counts and the same per-branch record total.
             println!("  pages/branch={pages:2}: {}", s.join(" | "));
         }
     }
@@ -5925,10 +6078,23 @@ mod d183_adversary {
         );
         assert!(released > 0, "fixture: nothing was released, so nothing was releasable");
         assert_eq!(parked, 0, "fixture: something was parked after all");
+        // **At `630afaa`: `rewrites=8 appends=0` — a branch that parked NOTHING still paid one
+        // full image rewrite each, which is what established that the cost followed the
+        // `has_live_children` PREDICATE and not parking or `pending_len`.** On this branch the
+        // same fixture gives `rewrites=0 appends=8`. The predicate still decides which door the
+        // reap leaves by; it no longer decides whether the door costs the whole image.
+        assert_eq!(
+            (r1 - r0) + (a1 - a0),
+            branches as u64,
+            "still not one durable record per branch: {} rewrites + {} appends",
+            r1 - r0,
+            a1 - a0
+        );
         assert_eq!(
             r1 - r0,
-            branches as u64,
-            "a branch that parked NOTHING still had to pay one rewrite each"
+            0,
+            "a branch that parked nothing still pays {} full image rewrites",
+            r1 - r0
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -5975,16 +6141,26 @@ mod d183_adversary {
     // MECHANISM. Why the REAL leaf reap pays N-1 rewrites that the hand-rolled loop does not.
     // ---------------------------------------------------------------------------------------
 
-    /// `take_pending` bumps `pending_version` **even when the log is empty** (`arena.rs:932`),
-    /// and `persist_delta_locked`'s third condition then forces the NEXT delta to be a full
-    /// image rewrite. `Reaper::reap` calls `drain_pending_seeded` -- and therefore
-    /// `take_pending` -- at the end of EVERY reap, leaf or not.
+    /// ⭐ **THE FOURTH REWRITE SITE — found by this test, and the one neither the design entry
+    /// nor the row's own counter test had in scope.**
     ///
-    /// So the leaf path's cost is not what freeing an arena costs; it is what freeing an arena
-    /// costs plus one forced rewrite carried over from the previous reap's empty drain. Forced
-    /// on purpose here, with nothing else in the picture.
+    /// At `630afaa`, `take_pending` bumped `pending_version` **even when the log it drained was
+    /// empty**, and `persist_delta_locked`'s third condition then forced the NEXT delta to be a
+    /// full image rewrite. `Reaper::reap` calls `drain_pending_seeded` — and therefore
+    /// `take_pending` — at the end of EVERY reap, leaf or not. So the leaf path's cost was not
+    /// what freeing an arena costs; it was that plus one forced rewrite carried over from the
+    /// previous reap's empty drain, which is the whole of the 1.0-rewrites-per-branch the leaf
+    /// arm was measured at.
+    ///
+    /// **Measured here at `630afaa`: two arena frees back to back gave `(0 rewrites, 2 appends)`,
+    /// and the same two frees with an EMPTY `take_pending` between them gave `(1, 1)`.** On this
+    /// branch both give `(0, 2)`: draining a log that was already empty changes nothing in
+    /// memory, so it cannot have made the durable file stale, and the bump is gone.
+    ///
+    /// ⚠ **This is the only test in the file that pins that fix.** Restoring the unconditional
+    /// bump as a mutant leaves every test in `branch::arena::tests` green — checked, 57 passed.
     #[test]
-    fn d183adv_mech_an_empty_take_pending_forces_the_next_append_into_a_rewrite() {
+    fn d183adv_mech_an_empty_take_pending_no_longer_forces_a_rewrite() {
         let (h, path) = armed("mech", 0);
         let (ids, _) = build(&h, 4, 4, false);
         let recs: Vec<_> =
@@ -6013,8 +6189,9 @@ mod d183_adversary {
         assert_eq!((r1 - r0, a1 - a0), (0, 2), "control: both frees should have appended");
         assert_eq!(
             (r2 - r1, a2 - a1),
-            (1, 1),
-            "an empty drain did not force the following free into a full rewrite"
+            (0, 2),
+            "an empty drain still forces the following free into a full image rewrite — the \
+             fourth D183 site is back (it read (1, 1) at 630afaa)"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -6024,21 +6201,28 @@ mod d183_adversary {
     ///
     /// ⚠ **This test's first draft asserted that the releasable arm would pay only ONE rewrite,
     /// because `put_pending` never runs when the drain comes back empty. Its own measurement
-    /// refuted that: the releasable arm pays two as well.** The accounting below is what the
-    /// numbers force, and every term in it is a counted integer:
+    /// refuted that: the releasable arm pays two as well.** The accounting at `630afaa`, every
+    /// term a counted integer:
     ///
     ///   * PARKED (pages first, child after): `retire_arenas_by_rule` = 1 rewrite;
     ///     `drain_pending_seeded` re-parks the survivors through `put_pending` = 1 rewrite;
     ///     the extents are NOT empty (pages parked, not recycled) so `sweep_touched_extents`
-    ///     frees nothing. **2 rewrites, 0 appends, 3 arenas untouched.**
+    ///     frees nothing. **2 rewrites, 0 appends, 3 arenas untouched.** (8 branches: 16, 0.)
     ///   * RELEASABLE (child first, pages after): `retire_arenas_by_rule` = 1 rewrite; the
     ///     drain is empty so `put_pending` does NOT run -- but `take_pending` already bumped
     ///     `pending_version`, so the FIRST of the three extents `sweep_touched_extents` now
     ///     frees is forced into a full rewrite by the mechanism pinned in the test above, and
-    ///     the other two append. **2 rewrites, 2 appends, 3 arenas freed.**
+    ///     the other two append. **2 rewrites, 2 appends, 3 arenas freed.** (8 branches: 16, 16.)
     ///
     /// Same headline number, two different mechanisms, neither of them the one the claim under
     /// attack names.
+    ///
+    /// ⭐ **On this branch both mechanisms are gone and the two arms separate cleanly: PARKED
+    /// gives `(0, 16)` and RELEASABLE `(0, 32)`.** The totals — 16 and 32 durable records for 8
+    /// branches — are unchanged from `630afaa`, which is the point: the reap writes as often as
+    /// it ever did. The releasable arm's 32 is its 8 reap records plus the 24 arena frees its
+    /// sweep now reaches, every one an append. And `put_pending` on its own, which was ONE
+    /// unconditional full rewrite, is now one appended record.
     #[test]
     fn d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending() {
         fn run(park: bool) -> (u64, u64, usize) {
@@ -6082,11 +6266,17 @@ mod d183_adversary {
         assert_eq!(p_free, 0, "fixture: the releasable arm parked something");
 
         // The accounting in the doc comment, pinned. 8 branches, 3 arenas each.
-        assert_eq!((r_park, a_park), (16, 0), "parked arm: retire + put_pending, nothing swept");
+        //
+        // UNCHANGED from `630afaa`: the record totals. Both arms write exactly as often as they
+        // did, which is what separates "cheaper" from "skipped".
+        assert_eq!(r_park + a_park, 16, "parked arm: not 2 durable records per branch");
+        assert_eq!(r_free + a_free, 32, "releasable arm: not 4 durable records per branch");
+        // INVERTED: neither mechanism costs a full image any more.
         assert_eq!(
-            (r_free, a_free),
-            (16, 16),
-            "releasable arm: retire + one forced sweep free, then two appends"
+            (r_park, r_free),
+            (0, 0),
+            "full image rewrites survive on the interior path: parked={r_park}, \
+             releasable={r_free} (both were 16 at 630afaa)"
         );
 
         // And the term the parked arm's second rewrite is charged to, priced on its own.
@@ -6103,8 +6293,9 @@ mod d183_adversary {
         println!("MECH3 one put_pending on its own: rewrites={} appends={}", r1 - r0, a1 - a0);
         assert_eq!(
             (r1 - r0, a1 - a0),
-            (1, 0),
-            "put_pending is not one unconditional full rewrite"
+            (0, 1),
+            "put_pending is a full image rewrite again — it read (1, 0) at 630afaa, which is \
+             where the interior arm's second rewrite per branch came from"
         );
         let _ = std::fs::remove_file(&path);
     }
