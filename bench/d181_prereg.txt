@@ -155,3 +155,45 @@ WHAT WOULD FALSIFY THE FIX
   * the fire-check in (b) reporting anything other than 1000 sequential tuples — the counter would
     then be unable to show the bad case, and every zero above would be vacuous.
   * any arm returning the wrong number of rows. An arm that stopped answering is not a faster arm.
+
+
+================================================================================
+AMENDMENT 1 -- 2026-09-23, after the merge of main @ 0e20c72
+================================================================================
+Append-only, as the header requires. Nothing above is edited.
+
+PRE-REGISTERED SUITE COUNT FOR THE MERGED TIP: 2560 per-target.
+
+Written BEFORE the run, and derived rather than recalled:
+
+  merge-base of main and d179-sec-index          = 727a8ec  (git merge-base; it is
+                                                             this branch's own base)
+  this branch's per-target total, MEASURED       = 2558     (run 3, head=54cf116)
+  this branch's addition, MEASURED per target    =  +13     (cargo test <target> -- --list
+                                                             at 727a8ec and at 54cf116:
+                                                             --lib 1661->1662, plus 7+1+1+3)
+  => 727a8ec                                     = 2545     (derived: 2558 - 13)
+
+  main's addition since 727a8ec                  =   +2     (D173; tests/integration_cluster_agents.rs
+                                                             35 -> 37 `#[test]`. Indicative --
+                                                             `#[test]` occurrences are NOT a test
+                                                             count in general, so this is the weakest
+                                                             link in the chain and is flagged as such.
+                                                             The team lead derived the same +2
+                                                             independently from D173's own record.)
+  => main @ 0e20c72                              = 2547     (derived)
+
+  => MERGED TIP                                  = 2560     (2545 + 13 + 2)
+
+WHAT A DIFFERENT NUMBER WOULD MEAN, stated before seeing one:
+  * 2558  -- the merge did not bring D173's tests in. Check the merge actually took.
+  * 2547  -- this branch's own tests are not being collected. That is the serious one.
+  * anything else -- something moved beyond these two changes, and THAT is the finding
+    rather than a nuisance to be explained away.
+
+MERGE HYGIENE, recorded because it is what the gate refused twice for:
+  merged main @ 0e20c72 into 54cf116, clean, no conflicts. The merge touched
+  9 files: 6 bench text files, src/agent_sql/cluster.rs,
+  tests/integration_cluster_agents.rs and tools/staleness.sh. NONE of them is a
+  file this branch edits. All 13 files this branch owns were verified
+  BYTE-IDENTICAL across the merge by sha, before the suite was launched.
