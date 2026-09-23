@@ -45,6 +45,24 @@
 //!   inside the catalog guard. **That is a second serialiser this change does not touch.** A flat
 //!   arm P here is therefore the predicted reading, not evidence that the split did nothing — the
 //!   split's own evidence is `tests/d159_fork_sync_is_deferred.rs`, which is deterministic.
+//!   * ⛔⛔ **CORRECTED 2026-09-23 (S5), FROM SOURCE: THE CLAUSE ABOVE IS WRONG ABOUT THE FSYNC,
+//!     AND IT IS THE CLAUSE THE WHOLE "WHY IS ×17.3 INVISIBLE" QUESTION HAS BEEN RESTING ON.**
+//!     `prov_store.intern` **issues no fsync in this harness, and none in `examples/pgserver.rs`
+//!     either.** `AgentRuntime::with_storage` constructs
+//!     `prov_store: Arc::new(MemProvenanceStore::new())`; the durable store arrives only through
+//!     the builder `AgentRuntime::with_durable_provenance`, and the only caller of that builder in
+//!     the whole tree outside tests is **`src/cli/cli.rs`**. Neither `rig()` below nor
+//!     `examples/pgserver.rs` calls it. `MemProvenanceStore::intern` takes an in-memory
+//!     `RwLock` write and touches no disk; the `file.sync_data()` in
+//!     `DurableProvenanceStore::append_locked` is never reached from a pgwire fork.
+//!     ⇒ What survives is weaker and worth stating exactly: `intern` is still called **with the
+//!     runtime's `state` mutex held**, so it is still a serialised section on every fork — but an
+//!     in-memory one, not a disk round trip, and a microsecond-scale critical section is not a
+//!     plausible explanation for `f/sync` pinned at exactly 1.00.
+//!     ⇒ This is why the S5 arm below is a **2×2** and not the single knob it was commissioned as.
+//!     Removing a run id's uniqueness under `D130_PROV=mem` removes an in-memory insert and
+//!     nothing else; the fsync this bullet describes only exists to be removed under
+//!     `D130_PROV=durable`.
 //!
 //! # The instrument
 //!
@@ -86,6 +104,13 @@
 //!   id, it is the pinned one, and it was echoed back once per statement. Neither is a weakening of
 //!   the other — `shared` cannot use a distinct count as its witness by construction, so it counts
 //!   echoes instead, and it additionally pins the value. See `run_ids` and `RunIdMode`.
+//! - A `shared` cell whose provenance store does not hold **exactly one** entity afterwards
+//!   (`ProvId(1)` must resolve, `ProvId(2)` must not). Both halves, so that a probe which answered
+//!   `Err` to everything could not certify a cell where `intern` was never called.
+//! - A `D130_PROV=durable` cell whose `prov.log` is absent or empty. `syncs_issued()` counts the
+//!   CATALOG's fsyncs and never the provenance store's, so a `durable` knob that silently did
+//!   nothing would print exactly the table a working one prints. The log is the store's own
+//!   statement that it was installed and appended.
 //!
 //! Every refusal exits non-zero, so a run that could not see its subject cannot be read as a run
 //! that saw nothing wrong.
@@ -97,23 +122,40 @@
 //! the default arm was a 12-fork proof pass and is labelled as such in `bench/d130_run_id_arm.txt`.
 //!
 //! The `⚠ What this does NOT license` bullet above *names* a second serialiser and then does not
-//! test it. This knob tests it. Today every fork this harness issues carries a run id unique across
-//! the whole cell, so `prov_store.intern` appends and fsyncs **once per fork** — and it does that
-//! while holding `AgentRuntime`'s `state` mutex (`runtime.rs`, `begin_session_as_staged`: `state`
-//! is locked, then `intern` is called under it), inside the statement-wide catalog guard pgwire
-//! holds. A global mutex held across a disk round trip admits one forker at a time, which is
-//! exactly the shape that would make group commit's ×17.3 invisible to a client.
+//! test it. This knob tests it — **and testing it required first discovering that the serialiser
+//! as described does not exist on this path.** See the ⛔⛔ correction under that bullet: the rig's
+//! runtime, and `examples/pgserver.rs`'s, both build `MemProvenanceStore`, so `intern` performs no
+//! fsync here. What is true is that `intern` runs with `AgentRuntime`'s `state` mutex held
+//! (`begin_session_as_staged` locks `state`, then calls `intern` under it), inside the
+//! statement-wide catalog guard pgwire holds — a serialised section on every fork, but an
+//! in-memory one.
+//!
+//! So the arm is a **2×2**, and the axes are independent:
+//!
+//! | | `D130_RUN_ID=distinct` | `D130_RUN_ID=shared` |
+//! |---|---|---|
+//! | **`D130_PROV=mem`** (default, = today, = `pgserver.rs`) | the banked run | **negative control** |
+//! | **`D130_PROV=durable`** (= `src/cli/cli.rs`) | fsync per fork, PRESENT | **the actual test** |
+//!
+//! ⛔ **`mem × shared` is a NEGATIVE CONTROL, not the experiment.** There is no fsync under `mem`,
+//! so the run-id knob removes an in-memory hashmap insert. **It must NOT move `f/sync`.** If it
+//! does, the knob is doing something other than what it claims and every other cell is suspect.
+//! ⭐ **`durable × shared` vs `durable × distinct` is the comparison that answers S5**, because it
+//! is the only pair that differs by an fsync-under-a-global-mutex and nothing else.
 //!
 //! * **`distinct` (the DEFAULT, and today's behaviour, unchanged.)** Every fork carries
-//!   `(a<thread>, r<thread>_<iter>)`. `MemProvenanceStore::intern` keys on `(agent_id, run_id)`
+//!   `(a<thread>, r<thread>_<iter>)`. Both stores key on `(agent_id, run_id)`
 //!   (`src/provenance/store.rs`, `let key = (run.agent_id.clone(), run.run_id.clone())`), so that
-//!   key is new every time and `DurableProvenanceStore::intern` runs its append + fsync.
+//!   key is new every time: a fresh entity under `mem`, and under `durable` a fresh entity **plus**
+//!   `append_locked`'s `file.sync_data()`.
 //! * **`shared`.** Every fork in every thread carries the one tuple `(a0, r0_0)` — byte for byte
 //!   the statement thread 0 issues on its first iteration in `distinct` mode. The first fork of the
-//!   cell interns; every fork after it takes the repeat path in `DurableProvenanceStore::intern`
-//!   (`let before = self.mem.run_count(); … if self.mem.run_count() == before { return Ok(id); }`),
-//!   which returns the existing `ProvId` and never reaches `append_locked`. **That fsync is gone
-//!   for all but one fork of the entire cell.**
+//!   cell interns; every fork after it takes the repeat path
+//!   (`MemProvenanceStore::intern` returns `Ok(existing)` on a key hit, and
+//!   `DurableProvenanceStore::intern` wraps that with
+//!   `let before = self.mem.run_count(); … if self.mem.run_count() == before { return Ok(id); }`,
+//!   returning **before** `append_locked`). Under `durable` that fsync is gone for all but one fork
+//!   of the entire cell; under `mem` there was never one, and only the insert is gone.
 //!
 //! **Both halves of the key are pinned, because both halves ARE the key.** Sharing only the run id
 //! would leave `(a<thread>, r0_0)` distinct per thread and so one intern per thread — 128 of them
@@ -124,20 +166,30 @@
 //! ## The discriminator, in the column this file actually prints
 //!
 //! `f/sync` is **forks ÷ syncs**. The banked pgwire run reads P = 1.00 at every T — one catalog
-//! fsync per fork, no batch at all.
+//! fsync per fork, no batch at all. `syncs_issued()` counts the **catalog's** fsyncs only, so
+//! turning on `durable` does not add to the denominator; it adds a disk round trip *inside*
+//! `state`, and can only change the ratio by changing how forks batch.
 //!
-//!   **A.** `shared`'s `f/sync` RISES above 1.00 and keeps rising with T while `distinct` stays
-//!          ≈1.00 ⇒ `intern`'s fsync under `state` **was** the binding serialiser. Group commit's
-//!          batch was invisible to clients because no two forks could be inside `wait_durable` at
-//!          once, and D159's split was correct but bottled behind a term it did not touch.
-//!   **B.** BOTH arms stay ≈1.00 at every T ⇒ `intern` is **NOT** the binding term. A third
-//!          serialiser bounds the pgwire fork path and this arm has now excluded the named
-//!          suspect. **That is an equally real result and is not a failed run** — it retires the
-//!          only mechanism the file header currently offers, which is worth more than confirming
-//!          it.
-//!   **C.** `shared` rises but flattens at some batch `B` < T ⇒ `intern` was *a* serialiser and
-//!          something else bounds the batch at `B`. Outcome 2 of the ladder at the top of this
-//!          file, one layer in.
+//! **Read A/B/C off the `durable` row, comparing `shared` against `distinct` at the same `T`.**
+//!
+//!   **A.** `durable × shared`'s `f/sync` RISES above 1.00 and keeps rising with T while
+//!          `durable × distinct` stays ≈1.00 ⇒ `intern`'s fsync under `state` **was** a binding
+//!          serialiser. Group commit's batch was invisible to a client because no two forks could
+//!          be inside `wait_durable` at once, and D159's split was correct but bottled behind a
+//!          term it did not touch.
+//!   **B.** BOTH `durable` arms stay ≈1.00 at every T ⇒ `intern` is **NOT** the binding term even
+//!          when it fsyncs. A third serialiser bounds the pgwire fork path and this arm has
+//!          excluded the named suspect **in the one configuration where the suspect exists**.
+//!          That is an equally real result and is not a failed run.
+//!   **C.** `durable × shared` rises but flattens at some batch `B` < T ⇒ `intern` was *a*
+//!          serialiser and something else bounds the batch at `B`. Outcome 2 of the ladder at the
+//!          top of this file, one layer in.
+//!
+//! ⛔ **And the reading that is NOT one of A/B/C: `mem × distinct` ≈ `mem × shared` ≈ `durable ×
+//! distinct` ≈ 1.00 tells you nothing about `intern` at all** — it is the same flat 1.00 the
+//! banked run already reports, measured three more times. Only the `durable` pair moves the
+//! fsync, so only the `durable` pair can answer the question. A sweep that runs `mem` alone
+//! reproduces the header's old, false premise instead of testing it.
 //!
 //! ⚠ **The dispatch brief for this arm phrased the prediction as "the SHARED arm's `f/sync` must
 //! FALL below 1.00 as T rises".** That is outcome A with the ratio inverted — *syncs per fork*
@@ -191,6 +243,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
+use ferrodb::provenance::{ProvId, ProvenanceStore};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::wal::log::WalManager;
@@ -397,8 +450,14 @@ fn run_ids(reply: &Reply) -> Vec<String> {
 
 struct Rig {
     branches: Arc<TableBranchCatalog>,
+    /// The runtime's own provenance store, kept for the same reason `branches` is: it is the only
+    /// way to ask whether `intern` actually took its repeat path, and no SQL surface exposes that
+    /// (`ferro_runs` is one row per LIVE BRANCH, not one per interned entity).
+    prov: Arc<dyn ProvenanceStore>,
     addr: std::net::SocketAddr,
-    _dir: PathBuf,
+    /// The rig's directory. Named (not `_dir`) because the durable arm reads `prov.log` out of it
+    /// to prove `D130_PROV=durable` installed a store that actually wrote something.
+    dir: PathBuf,
 }
 
 /// Build one pgwire server, the shape `examples/pgserver.rs` ships, and start serving.
@@ -406,7 +465,7 @@ struct Rig {
 /// The `Arc<TableBranchCatalog>` is kept because `syncs_issued()` is an inherent method on the
 /// concrete catalog and not on the `BranchCatalog` trait the runtime holds — the server has no SQL
 /// surface that exposes the counter, so the only way to read it is to be the process that built it.
-fn rig(root: &Path, tag: &str) -> Rig {
+fn rig(root: &Path, tag: &str, prov: ProvMode) -> Rig {
     let dir = root.join(format!("d130-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("rig dir");
     let db = dir.join("ferro.db").to_string_lossy().into_owned();
@@ -438,15 +497,22 @@ fn rig(root: &Path, tag: &str) -> Rig {
         branches.clone() as Arc<dyn BranchCatalog>,
         store.clone(),
     ));
-    let runtime = Arc::new(
-        AgentRuntime::with_storage(
-            branches.clone() as Arc<dyn BranchCatalog>,
-            Arc::new(MemEffectLog::new()),
-            store.clone() as Arc<dyn PageStore>,
-        )
-        .expect("storage-backed runtime")
-        .with_reaper(reaper as Arc<dyn Reaper>),
-    );
+    // ⚠ The `Mem` arm constructs EXACTLY what this function has always constructed — the builder
+    // is applied only under `Durable`, so the default rig's shape is unchanged rather than
+    // reconstructed to look unchanged.
+    let mut runtime = AgentRuntime::with_storage(
+        branches.clone() as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        store.clone() as Arc<dyn PageStore>,
+    )
+    .expect("storage-backed runtime");
+    if prov == ProvMode::Durable {
+        runtime = runtime
+            .with_durable_provenance(dir.join("prov.log"))
+            .expect("durable provenance store");
+    }
+    let runtime = Arc::new(runtime.with_reaper(reaper as Arc<dyn Reaper>));
+    let prov_store = Arc::clone(runtime.provenance());
 
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -456,7 +522,7 @@ fn rig(root: &Path, tag: &str) -> Rig {
     std::thread::spawn(move || {
         let _ = serve(listener, ctx);
     });
-    Rig { branches, addr, _dir: dir }
+    Rig { branches, prov: prov_store, addr, dir }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -469,6 +535,49 @@ fn rig(root: &Path, tag: &str) -> Rig {
 /// the same statement at `T=1, f=1` and differ only in how the tuple varies after that.
 const SHARED_AGENT: &str = "a0";
 const SHARED_RUN: &str = "r0_0";
+
+/// Which provenance store the rig's runtime is built with — the other half of the S5 2×2.
+///
+/// ⛔ **`Mem` is the DEFAULT because it is what this rig has always built and what
+/// `examples/pgserver.rs` builds.** `AgentRuntime::with_storage` sets
+/// `prov_store: Arc::new(MemProvenanceStore::new())`, and `with_durable_provenance` is a *builder*
+/// that neither this file nor `pgserver.rs` has ever called — only `src/cli/cli.rs` does. So under
+/// `Mem` there is **no `intern` fsync to remove**, and `D130_RUN_ID=shared` removes only an
+/// in-memory insert. That combination is the arm's negative control, not its test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvMode {
+    /// `MemProvenanceStore` — today's rig, and `pgserver.rs`'s. `intern` is a `RwLock` write and
+    /// touches no disk.
+    Mem,
+    /// `DurableProvenanceStore` — the store `src/cli/cli.rs` installs, whose `append_locked` ends
+    /// in `file.sync_data()`. Only here does a fork pay an `intern` fsync, and only here can
+    /// removing it mean anything.
+    Durable,
+}
+
+impl ProvMode {
+    /// `D130_PROV`, or `Mem`. Unknown values refuse, for the reason `RunIdMode::from_env` gives.
+    fn from_env() -> ProvMode {
+        match std::env::var("D130_PROV").ok().as_deref() {
+            None | Some("") | Some("mem") => ProvMode::Mem,
+            Some("durable") => ProvMode::Durable,
+            Some(other) => {
+                eprintln!(
+                    "d130: REFUSING. D130_PROV={other:?} is neither `mem` nor `durable`. \
+                     Defaulting a mode knob would bank one arm's table under the other's name."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            ProvMode::Mem => "mem",
+            ProvMode::Durable => "durable",
+        }
+    }
+}
 
 /// Which provenance actor tuple each fork carries — the S5 arm. See the `D130_RUN_ID` section of
 /// this file's header for the pre-registration; this type only implements it.
@@ -556,8 +665,8 @@ impl Arm {
 ///
 /// A pgwire server IS listening throughout. It contributes nothing because nobody connects to it,
 /// which is a fact this arm demonstrates rather than assumes.
-fn run_direct_control(t: usize, f: usize, root: &Path) -> Cell {
-    let rig = rig(root, &format!("D-t{t}"));
+fn run_direct_control(t: usize, f: usize, root: &Path, prov: ProvMode) -> Cell {
+    let rig = rig(root, &format!("D-{}-t{t}", prov.tag()), prov);
     let before = rig.branches.syncs_issued();
 
     let lease = LeaseDeadline(u64::MAX);
@@ -598,12 +707,15 @@ fn run_direct_control(t: usize, f: usize, root: &Path) -> Cell {
         );
         std::process::exit(1);
     }
-    Cell { forks: ids.len(), syncs: after - before }
+    Cell { forks: ids.len(), syncs: after - before, prov_bytes: None }
 }
 
 struct Cell {
     forks: usize,
     syncs: u64,
+    /// Bytes in the rig's `prov.log`, under `D130_PROV=durable` only. `None` under `mem`, where
+    /// no such file exists, and for arm D, which never goes through the runtime.
+    prov_bytes: Option<u64>,
 }
 
 fn refuse_on_error(r: &Reply, what: &str) {
@@ -618,8 +730,8 @@ fn refuse_on_error(r: &Reply, what: &str) {
 }
 
 /// Run one cell: `t` client threads, `f` forks each, on a freshly built server.
-fn run_cell(arm: Arm, mode: RunIdMode, t: usize, f: usize, root: &Path) -> Cell {
-    let rig = rig(root, &format!("{}-{}-t{t}", arm.tag(), mode.tag()));
+fn run_cell(arm: Arm, mode: RunIdMode, prov: ProvMode, t: usize, f: usize, root: &Path) -> Cell {
+    let rig = rig(root, &format!("{}-{}-{}-t{t}", arm.tag(), mode.tag(), prov.tag()), prov);
 
     // Snapshot AFTER the rig is built. `Catalog::create`, the arena and the runtime's construction
     // are fixture cost; charging their syncs to the clients would inflate `f/sync`'s denominator
@@ -775,6 +887,84 @@ fn run_cell(arm: Arm, mode: RunIdMode, t: usize, f: usize, root: &Path) -> Cell 
         std::process::exit(1);
     }
 
+    // ⭐ DID `D130_PROV=durable` ACTUALLY INSTALL THE DURABLE STORE?
+    //
+    // Without this the provenance axis is unfalsifiable. `syncs_issued()` counts the CATALOG's
+    // fsyncs and never the provenance store's, so a `durable` knob that silently did nothing would
+    // print character for character the table a working one prints — the exact shape of a knob
+    // that looks like it is being tested and is not.
+    //
+    // `DurableProvenanceStore::open` creates the log, and every NEW entity appends a frame ending
+    // in `file.sync_data()`. A non-empty file is therefore the store itself saying both that it is
+    // installed and that it did the work whose removal this arm measures. Under `mem` there is no
+    // file and nothing is claimed.
+    let prov_bytes = if prov == ProvMode::Durable {
+        let log = rig.dir.join("prov.log");
+        match std::fs::metadata(&log) {
+            Ok(m) if m.len() > 0 => Some(m.len()),
+            Ok(_) => {
+                eprintln!(
+                    "d130: REFUSING. {} at T={t}: D130_PROV=durable, but {} is EMPTY after {asked} \
+                     forks. The durable store appends a frame per new run entity, so an empty log \
+                     means nothing was interned through it and this arm removed nothing.",
+                    arm.label(),
+                    log.display()
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "d130: REFUSING. {} at T={t}: D130_PROV=durable, but {} does not exist ({e}). \
+                     The runtime is still on MemProvenanceStore, so the knob did nothing and every \
+                     `durable` cell in this run is mislabelled.",
+                    arm.label(),
+                    log.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // ⭐ DID THE ARM ACTUALLY ENGAGE? The mechanism check, and the reason outcome B is readable.
+    //
+    // `shared` is worth running only if `intern` really took its repeat path. If it did, the
+    // store holds exactly ONE entity for the whole cell — nothing else in a cell interns, and
+    // `ABANDON` does not — so `ProvId(1)` resolves and `ProvId(2)` does not.
+    //
+    // ⛔ BOTH halves are asserted, and that is what stops this being a guard that cannot fail. A
+    // probe answering `Err` to everything would satisfy "`ProvId(2)` is absent" on its own and
+    // certify a cell in which `intern` was never called at all. Requiring `ProvId(1)` to RESOLVE
+    // forces the probe to demonstrate it can see an entity before it is believed about the absence
+    // of a second one.
+    //
+    // There is no SQL surface for this: `ferro_runs` is one row per LIVE BRANCH, not one per
+    // interned entity, so in arm P it counts the forks in either mode and answers a different
+    // question. Reading the store the server was built with is the same move `syncs_issued()`
+    // already makes, for the same reason.
+    if mode == RunIdMode::Shared {
+        if rig.prov.lookup(ProvId(1)).is_err() {
+            eprintln!(
+                "d130: REFUSING. {} at T={t}: D130_RUN_ID=shared, but the provenance store holds \
+                 no entity at ProvId(1) after {asked} forks. `intern` was never reached, so this \
+                 cell removed nothing and the probe below would pass vacuously.",
+                arm.label()
+            );
+            std::process::exit(1);
+        }
+        if rig.prov.lookup(ProvId(2)).is_ok() {
+            eprintln!(
+                "d130: REFUSING. {} at T={t}: D130_RUN_ID=shared pins one actor tuple, but the \
+                 store holds a SECOND entity at ProvId(2) after {asked} forks. `intern` minted a \
+                 new run instead of taking its repeat path, so this arm did not remove the term it \
+                 claims to remove.",
+                arm.label()
+            );
+            std::process::exit(1);
+        }
+    }
+
     // The run ids, not `reported.len()`: they are the witness that survives slot recycling, and in
     // arm S the distinct branch names are FEWER than the forks by construction. Which *statistic*
     // of them is the count differs by mode for the reason given at the refusal above — and in
@@ -785,7 +975,7 @@ fn run_cell(arm: Arm, mode: RunIdMode, t: usize, f: usize, root: &Path) -> Cell 
         RunIdMode::Distinct => runs.len(),
         RunIdMode::Shared => run_hits,
     };
-    Cell { forks, syncs: after - before }
+    Cell { forks, syncs: after - before, prov_bytes }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -797,8 +987,8 @@ fn run_cell(arm: Arm, mode: RunIdMode, t: usize, f: usize, root: &Path) -> Cell 
 /// Without the first half the whole table is unfalsifiable: a counter wired to nothing prints the
 /// same clean ratio a real one would. Without the second half a counter that ticks on something
 /// else — a background flush, a timer — would inflate every denominator and manufacture outcome 2.
-fn self_check(root: &Path) {
-    let rig = rig(root, "selfcheck");
+fn self_check(root: &Path, prov: ProvMode) {
+    let rig = rig(root, "selfcheck", prov);
 
     let quiet_a = rig.branches.syncs_issued();
     let quiet_b = rig.branches.syncs_issued();
@@ -846,6 +1036,7 @@ fn main() {
         std::process::exit(1);
     }
     let mode = RunIdMode::from_env();
+    let prov = ProvMode::from_env();
 
     let root = std::env::temp_dir().join(format!("ferrodb-d130-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
@@ -872,9 +1063,10 @@ fn main() {
         RunIdMode::Distinct => {
             println!("RUN-ID MODE: distinct  (D130_RUN_ID unset or `distinct` — the default arm)");
             println!("  Every fork carries `(a<thread>, r<thread>_<iter>)`, a key the provenance");
-            println!("  store has never seen, so `prov_store.intern` appends and fsyncs once per");
-            println!("  fork while holding `AgentRuntime`'s `state`. That serialiser is PRESENT in");
-            println!("  every row below. Run with D130_RUN_ID=shared for the arm that removes it.");
+            println!("  store has never seen, so `intern` mints a NEW entity on every fork, while");
+            println!("  AgentRuntime's `state` mutex is held. Whether minting one also costs an");
+            println!("  FSYNC depends entirely on WHICH STORE — see PROV STORE below; under the");
+            println!("  default `mem` it does not. D130_RUN_ID=shared removes the mint.");
         }
         RunIdMode::Shared => {
             println!("RUN-ID MODE: shared  (D130_RUN_ID=shared — THE S5 TERM-REMOVAL ARM)");
@@ -888,12 +1080,31 @@ fn main() {
             println!("  reproducible TREND across modes invalidates a run; header has the spread.");
         }
     }
+    match prov {
+        ProvMode::Mem => {
+            println!("PROV STORE: mem  (D130_PROV unset or `mem` — MemProvenanceStore, the default)");
+            println!("  ⛔ `intern` ISSUES NO FSYNC IN THIS ARM. AgentRuntime::with_storage builds");
+            println!("  MemProvenanceStore; only `with_durable_provenance` installs the store whose");
+            println!("  append_locked calls file.sync_data(), and neither this rig nor");
+            println!("  examples/pgserver.rs calls it — only src/cli/cli.rs does. So `shared` here");
+            println!("  removes an in-memory insert: this is the NEGATIVE CONTROL and must not move");
+            println!("  f/sync. Run D130_PROV=durable for the arm where the fsync exists to remove.");
+        }
+        ProvMode::Durable => {
+            println!("PROV STORE: durable  (D130_PROV=durable — DurableProvenanceStore)");
+            println!("  The store src/cli/cli.rs installs. Every NEW (agent, run) costs an append");
+            println!("  ending in file.sync_data(), taken while AgentRuntime's `state` mutex is");
+            println!("  held. ⭐ THIS is the arm where D130_RUN_ID actually removes an fsync, and");
+            println!("  the durable distinct/shared pair is the comparison that answers S5.");
+            println!("  ⚠ NOT the shape examples/pgserver.rs ships — see the header.");
+        }
+    }
     println!("  The arm is pre-registered in this file's header, written before any cell was run.");
     println!();
     println!("# start: {}  load: {}", stamp(), loadavg());
     println!();
 
-    self_check(&root);
+    self_check(&root, prov);
     println!();
 
     // The mode is repeated on the column header, not just in the banner above, so a row lifted out
@@ -901,24 +1112,34 @@ fn main() {
     // no count and no ratio below depends on it.
     println!(
         "  arm                                threads    forks    syncs    f/sync   f/sync÷T   \
-         [run-id: {}]",
-        mode.tag()
+         [run-id: {}  prov: {}]",
+        mode.tag(),
+        prov.tag()
     );
     let row = |label: &str, t: usize, c: &Cell| {
         let per = c.forks as f64 / c.syncs as f64;
+        // The trailing `prov.log` field appears only under D130_PROV=durable, so the default
+        // table's rows are byte-identical to what they have always been. It is the durable
+        // store's own appended bytes: ~one Run frame per NEW actor tuple, so a `shared` cell's
+        // log is a single frame where the matching `distinct` cell's holds one per fork. That
+        // contrast is the mechanism visible in the output rather than argued in a comment.
+        let tail = match c.prov_bytes {
+            Some(b) => format!("   prov.log={b}B"),
+            None => String::new(),
+        };
         println!(
-            "  {:32}  {:5}   {:6}   {:6}   {:7.2}   {:8.4}",
-            label, t, c.forks, c.syncs, per, per / t as f64
+            "  {:32}  {:5}   {:6}   {:6}   {:7.2}   {:8.4}{}",
+            label, t, c.forks, c.syncs, per, per / t as f64, tail
         );
     };
     for arm in [Arm::PerFork, Arm::Persistent] {
         for &t in &threads {
-            row(arm.label(), t, &run_cell(arm, mode, t, f, &root));
+            row(arm.label(), t, &run_cell(arm, mode, prov, t, f, &root));
         }
         println!();
     }
     for &t in &threads {
-        row("D  POSITIVE CONTROL, no socket", t, &run_direct_control(t, f, &root));
+        row("D  POSITIVE CONTROL, no socket", t, &run_direct_control(t, f, &root, prov));
     }
     println!();
     println!("⭐ ARM D IS THE FALSIFIER FOR ARMS P AND S. Same counter, same Arc<TableBranchCatalog>,");
@@ -927,7 +1148,7 @@ fn main() {
     println!("   the wire layer has none. If D is ALSO flat at 1.00, then nothing above is a fact");
     println!("   about pgwire and every cell in this run is a fact about this harness.");
 
-    println!("# run-id mode: {}", mode.tag());
+    println!("# run-id mode: {}  prov store: {}", mode.tag(), prov.tag());
     println!("# end: {}  load: {}", stamp(), loadavg());
     let _ = std::fs::remove_dir_all(&root);
 }
