@@ -236,3 +236,102 @@ instrument self-check: two idle reads moved the counter by 0, and one serial for
 # end: 2026-09-23T15:39:45Z  load: 9.36 6.17 7.93
 
 finished: 2026-09-23T15:39:45Z
+
+================================================================================
+ANALYSIS, APPENDED 2026-09-23 AFTER THE RAW RUN WAS COMMITTED (6c7bc8c)
+================================================================================
+
+⛔⛔ THE BIGGEST FINDING IS THAT THIS RUN HAS NO CONTROL, AND NEITHER DID THE
+     ONE BEFORE IT. Read this before quoting anything above.
+
+`src/branch/table_catalog.rs:903-907`:
+
+    fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        let (record, seq) = self.fork_staged(parent, lease)?;
+        self.await_fork_durable(seq)?;
+
+`TableBranchCatalog::fork` is implemented IN TERMS OF D159's own `fork_staged` +
+`await_fork_durable`. MODE=direct (`examples/fork_concurrency.rs`) calls
+`cat.fork(...)`. pgwire arm D (`run_direct_control`) calls `cat.fork(...)`.
+
+⇒ NEITHER MODE=direct NOR ARM D IS AN ARM "THE CHANGE CANNOT AFFECT". D159
+  rewrote the function both of them call. The claim that the direct layer is a
+  control for D159 — which this lane and its dispatch both asserted — is FALSE.
+
+  What a flat direct arm actually licenses is the weaker statement that D159's
+  refactor was BEHAVIOUR-PRESERVING at the direct layer. That is worth knowing
+  and it is not the same claim.
+
+  Corroboration that arm D tracks load rather than D159: it moved in OPPOSITE
+  directions across the two D159 comparisons — bench/d159_d130_{before,after}
+  gave 22.36 -> 18.69 at T=128 (down), this run gives 17.12 -> 22.86 (up). A
+  term driven by the change does not flip sign.
+
+  ⇒ d130 CANNOT SELF-CERTIFY A TWO-BASE COMPARISON: every arm it has forks, so
+    no arm is independent of D159. A real control must come from outside the
+    fork path, and this harness does not contain one.
+
+--------------------------------------------------------------------------------
+THE DIRECT ARM DOES REACH T=128. All three reps have a T=128 row. The forks
+column there reads 7936, not 8000, because the harness divides N by T and rounds
+down to whole forks per thread (7936 = 62 x 128). The row is present; only its
+fork count differs, which is what makes it look anomalous at a glance.
+
+--------------------------------------------------------------------------------
+MODE=direct, forks/fsync, all three reps, against the banked PRE-D159 value:
+
+    T      rep1    rep2    rep3    median   banked(dd2d1f5a)   median vs banked
+    32     13.0    14.5    12.6    13.0     12.49              +4.1%
+    64     17.5    24.0    16.6    17.5     17.28              +1.3%
+    128    18.0    28.6    16.7    18.0     17.30              +4.0%
+
+  ⇒ THE MEDIAN LANDS ON THE BANKED CURVE (within 4% at every top rung). AND the
+    interval is wide: 16.6-24.0 at T=64, 16.7-28.6 at T=128. Both are true, and
+    the honest statement carries the interval: the direct arm at HEAD is
+    CONSISTENT with the banked curve and cannot exclude a change of up to ~±40%
+    at T=64. It does not "merely fail to contradict" — the central value sits on
+    it — but it is not a tight bound either.
+
+REP 2 IS THE OUTLIER AND IT IS NOT MEASUREMENT NOISE. Its per-cell wall time is
+1.5x-2.9x the other two at every T >= 4:
+
+    T        rep1_s   rep2_s   rep3_s
+    4        15.551   25.997   13.564
+    8         6.329   18.357    6.750
+    16        3.372    7.711    3.550
+    32        2.001    3.977    2.265
+    64        1.435    2.419    1.648
+    128       1.433    2.062    1.536
+
+Slower forks at a FIXED fork count means each fork takes longer, so more forks
+accumulate behind a leader's fsync, so the BATCH IS LARGER. That is exactly the
+model this script's own "WHY THE LOCK" comment names: min(1/S, T/D), where
+contention raises the fsync latency D and the batch is T/D-bounded.
+
+⛔ SO `f/sync` IS NOT LOAD-IMMUNE, AND examples/d130_pgwire_batch.rs's header
+   OVERSTATES IT. The header says it is "a ratio of two counters taken by one
+   instrument over one run, so it is load-immune". That is true of measurement
+   ERROR — the ratio needs no clock — and FALSE of the QUANTITY: batch size is a
+   function of fsync latency, which load moves. The run script's WHY THE LOCK
+   comment has this right; the harness header does not.
+   And the suite lock does not protect against it: a teammate's `cargo build`
+   contends for the same device without ever taking the suite lock.
+
+--------------------------------------------------------------------------------
+WHAT SURVIVES ALL OF THAT, AND WHY THE HEADLINE STILL STANDS
+
+pgwire arm P, forks/sync:
+    pre-D159 (dd2d1f5a, banked):  1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00
+    post-D159 (da8e37ee, lane):   1.00 1.00 1.98 3.68 6.74 11.23 14.88 16.84
+    post-D159 (3c7a8ec, HEAD):    1.00 1.00 1.95 3.60 6.40 10.85 14.38 15.61
+
+The pre-D159 reading is not a performance number, it is a STRUCTURAL one: exactly
+1.00 at all eight rungs, 5120 forks at T=128, means NO TWO FORKS EVER SHARED AN
+FSYNC. Load cannot manufacture exactly 1.00 across eight rungs, and load cannot
+turn 1.00 into 15.61.
+
+⇒ The QUALITATIVE claim — group commit's batch is client-visible over pgwire
+  after D159, and was not before — is robust to everything above, because it does
+  not rest on the control and does not rest on the magnitude.
+⇒ The SPECIFIC VALUE 15.61 carries the load caveat and should be quoted as
+  "15.6 at T=128 on a contended box", not as a constant of the system.
