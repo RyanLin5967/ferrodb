@@ -37,7 +37,8 @@ pub static INDEX_SCANS: AtomicU64 = AtomicU64::new(0);
 /// **Index entries the scan walked — D181's rows-examined instrument.**
 ///
 /// Every `(key, value)` the tree's `RangeScanner` yielded, counted where the scanner yielded it and
-/// BEFORE visibility filtering, the primary lookup, or the `sec == v` skip — the engine paid for
+/// BEFORE visibility filtering, the primary lookup, the `sec == v` skip, or D187's NULL skip
+/// (`tests/d187_null_skip_is_counted.rs` pins that last one) — the engine paid for
 /// the entry whether or not the caller ever sees the row. Terminating entries count: the one whose
 /// key is past `sec_upper` was read to learn that.
 ///
@@ -130,8 +131,9 @@ impl Executor for IndexScan {
             //
             // ⛔ THIS INCREMENT MUST STAY ABOVE THE NULL SKIP BELOW — long form of this note in
             // `sec_index_scan.rs::next`. Below the skip it under-counts by the NULLs dropped and
-            // reads as a performance improvement rather than a measurement change, with no test
-            // failing. D181 and D187 both insert here and neither is wrong alone.
+            // reads as a performance improvement rather than a measurement change. D181 and D187
+            // both insert here and neither is wrong alone. ✅ ENFORCED BY
+            // `tests/d187_null_skip_is_counted.rs`, whose primary arm scans over a NULL key.
             self.examined += 1;
             // D187 — see `skip_nulls`. `continue`, never `return None`: NULL keys sort at the FRONT
             // of the tree, so stopping here would truncate the scan before it reached a single real

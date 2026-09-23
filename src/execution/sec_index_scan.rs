@@ -123,12 +123,14 @@ impl Executor for SecondaryIndexScan {
             //
             // `examined` is an entries-PULLED count. Put it below the skip and it under-counts by
             // exactly the number of NULL entries dropped: the same work reported as a smaller
-            // number — a fabricated improvement, in the direction the author is hoping for, with no
-            // test failing. D181 and D187 both insert at this line and NEITHER IS WRONG ALONE; the
-            // defect exists only in the resolution. Found by a trial merge before either landed.
+            // number — a fabricated improvement, in the direction the author is hoping for. D181
+            // and D187 both insert at this line and NEITHER IS WRONG ALONE; the defect exists only
+            // in the resolution. Found by a trial merge before either landed.
             //
-            // ✅ The check that catches a wrong resolution: D181's arms must still read 2 vs 800 at
-            // n=800 and 2 vs 1600 at n=1600. An arm that IMPROVES here is the symptom, not the goal.
+            // ✅ ENFORCED BY `tests/d187_null_skip_is_counted.rs`, which reads INDEX_SCAN_ENTRIES
+            // over 500 NULL entries on a plan it proves is this scan, and fails if they go uncounted.
+            // No D181/D179 counter fixture can catch the swap — none puts a NULL in an indexed
+            // column, so the skip never fires under them and their arms read the same either way.
             self.examined += 1;
             // D187 — see `skip_nulls`. Ahead of the bound arms, and `continue` rather than
             // `return None`: NULL entries are a PREFIX of the tree, so stopping here would truncate
