@@ -197,3 +197,57 @@ MERGE HYGIENE, recorded because it is what the gate refused twice for:
   tests/integration_cluster_agents.rs and tools/staleness.sh. NONE of them is a
   file this branch edits. All 13 files this branch owns were verified
   BYTE-IDENTICAL across the merge by sha, before the suite was launched.
+
+
+================================================================================
+AMENDMENT 2 -- 2026-09-23, after the merge of main @ e7210ed (D184)
+================================================================================
+Append-only. Nothing above is edited. Amendment 1 is NOT withdrawn -- it was
+correct for the tree it named and its prediction of 2560 was met exactly.
+
+PRE-REGISTERED SUITE COUNT FOR THE NEW MERGED TIP: 2564 per-target.
+
+WHY THERE IS A SECOND AMENDMENT AT ALL. Amendment 1 predicted 2560 and the
+suite measured 2560 at head=4e5e22e, rc=0, failed=0. That certification was
+valid and is not being discarded. But main moved from 0e20c72 to e7210ed while
+that result was being written up -- D184 landed -- so the branch went from 0
+behind to 5 behind and the green stopped being landable. This is the third time
+the gap between a green suite and the gate has gone stale, and the lesson is
+the same each time: merge and suite are ONE action, and a report written
+between them is "other work".
+
+DERIVATION, two independent routes to the same number:
+
+  route A, from main's measured count
+    main @ ed52543, MEASURED by the team lead's D184 suite   = 2551
+      (mode=per-target rc=0 passed=2551 failed=0 head=ed52543;
+       e7210ed is the merge commit of that same tree)
+    this branch's addition, MEASURED per target              =  +13
+      (--lib +1, and 7+1+1+3 for the four new test files, all read from
+       this branch's own run-4 verdict lines at head=4e5e22e)
+    => 2551 + 13                                             = 2564
+
+  route B, from this branch's measured count
+    this branch @ 4e5e22e, MEASURED                          = 2560
+    D184's addition since 0e20c72                            =   +4
+      (corroborated two ways: the lead's suite gives 2551 - 2547 = 4, and an
+       anchored diff of ^[+-][[:space:]]*#\[test\] over src/ between 0e20c72
+       and main gives 4 added / 0 removed, in src/replication/sync.rs.
+       The harness number is the instrument; the grep is only corroboration --
+       `#[test]` occurrences are not a test count in general.)
+    => 2560 + 4                                              = 2564
+
+Two routes, two different measured anchors, same answer.
+
+WHAT A DIFFERENT NUMBER WOULD MEAN, stated before seeing one:
+  * 2560 -- the merge did not bring D184's tests in.
+  * 2551 -- this branch's own tests are not being collected. The serious one.
+  * 2562 -- D184 contributed 2, not 4, and the anchored grep over-counted;
+            that would be a finding about the instrument, not about the code.
+  * anything else -- something moved beyond these two changes, and THAT is the
+    finding rather than a nuisance to be explained away.
+
+MERGE HYGIENE: main @ e7210ed merged clean into 4e5e22e, no conflicts, touching
+2 files -- examples/repl_primary.rs and src/replication/sync.rs. Neither is a
+file this branch edits. All 14 files this branch owns verified BYTE-IDENTICAL
+across the merge by sha before the suite was launched.
