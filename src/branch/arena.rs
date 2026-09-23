@@ -272,8 +272,8 @@ struct StoreState {
     current: HashMap<BranchId, ArenaId>,
     /// **D85.** Arenas restored from an image whose `next_free` may be UNDERSTATED.
     ///
-    /// `alloc_for` advances `next_free` without persisting — the `persist_if_configured` sites are
-    /// all off the page path — so an extent checkpointed while empty and then filled comes back
+    /// `alloc_for` advances `next_free` without persisting — the persist sites are all off the page
+    /// path — so an extent checkpointed while empty and then filled comes back
     /// reading zero. `load_state` already handles the ALLOCATION consequence by clearing
     /// `current`; this handles the COLLECTION one, which was silent data loss: with `next_free`
     /// at 0, `retire_arenas_by_rule` parked none of a live child's pages and `extent_is_empty`
@@ -286,6 +286,21 @@ struct StoreState {
     fill_unknown: std::collections::HashSet<ArenaId>,
     /// Pages logically freed but still visible to some live child. Slow-path reaping parks here.
     pending: Vec<PendingFree>,
+    /// **D183.** Arenas whose `recycled` list or `next_free` has moved since the durable file was
+    /// last brought level with memory, and which therefore have to ride the next tail record.
+    ///
+    /// This is the list-shaped state `:2220` named as the reason the reclamation sites could not
+    /// use a delta. It is a *set of arenas* rather than a list of pages because the record carries
+    /// each one's recycled list **absolutely**: a record of pushes would be wrong the moment a
+    /// page came back out of the list again, and an absolute list costs at most `page_count`
+    /// entries for an extent the caller was already walking page by page.
+    ///
+    /// **It lives inside `StoreState` and not beside it, and that is the whole of its
+    /// correctness.** `release_page` pushes the page and marks the arena in ONE critical section,
+    /// and a record builder takes the set and reads the lists it names in ONE critical section.
+    /// Split across two locks in either order there is an interleaving where a push is neither in
+    /// the record nor still marked — which is a page that never comes back.
+    recycled_dirty: std::collections::HashSet<ArenaId>,
     /// The authority epoch each live extent was **claimed** under.
     ///
     /// Kept beside `extents` rather than inside `ArenaExtent`, because that type is a durable
@@ -393,8 +408,8 @@ pub struct ArenaPageStore {
 ///
 /// So this mutex is held across `reserve` + the `state` mutation + the append, on both delta
 /// paths. It is **outermost**: taken before `state`, before the catalog's locks and before
-/// `REPLACE_LOCK`, and never acquired while any of them is held. Every `persist_if_configured`
-/// call site already drops the `state` guard before persisting, which is what makes that rule
+/// `REPLACE_LOCK`, and never acquired while any of them is held. Every persist site takes it
+/// before `state` and holds both only for the snapshot it encodes, which is what makes that rule
 /// satisfiable rather than aspirational.
 ///
 /// # What a tail record does NOT carry, and why that is not a hole
@@ -567,6 +582,7 @@ impl ArenaPageStore {
                 recycled: HashMap::new(),
                 current: HashMap::new(),
                 pending: Vec::new(),
+                recycled_dirty: std::collections::HashSet::new(),
                 claim_epoch: HashMap::new(),
                 shadow_base: HashMap::new(),
             }),
@@ -803,6 +819,10 @@ impl ArenaPageStore {
                     false
                 } else {
                     slot.push(page_id);
+                    // **D183 — marked in the SAME critical section as the push.** See
+                    // [`StoreState::recycled_dirty`]: a mark that can land on the other side of
+                    // the push is a page that is neither in the next record nor still owed one.
+                    st.recycled_dirty.insert(arena);
                     true
                 }
             }
@@ -929,8 +949,14 @@ impl ArenaPageStore {
         // **D81.** Draining the log changes it and persists nothing; no tail record describes
         // that, so the next claim must rewrite the image rather than append behind a file that
         // still lists these entries. See [`PersistState::durable_pending_version`].
+        //
+        // **D183 — bumped INSIDE the `state` lock, and that is what makes the counter readable.**
+        // `put_pending` now vouches for a version it read beside the log itself; bumped outside,
+        // a reader holding `state` can see the new version before the change it announces, and
+        // would record a log it has not written as durable.
+        let mut st = self.state.lock().unwrap();
         self.pending_version.fetch_add(1, Ordering::SeqCst);
-        std::mem::take(&mut self.state.lock().unwrap().pending)
+        std::mem::take(&mut st.pending)
     }
 
     /// Put entries that are still pinned back on the pending-free log, and checkpoint.
@@ -940,8 +966,48 @@ impl ArenaPageStore {
     /// are back on the log. That whole shape lives only in the free-space map, so it persists here
     /// for the same reason `free_arena` does — once per drain, which is once per reap.
     pub fn put_pending(&self, entries: Vec<PendingFree>) -> Result<(), FerroError> {
-        self.state.lock().unwrap().pending.extend(entries);
-        self.persist_if_configured()
+        // **D183 — a delta, not the whole image.** What this call changes is the pending-free log
+        // and the recycled lists of the extents the drain released into; that is list-shaped
+        // state, which is why it used to rewrite everything, and
+        // [`Self::TAIL_PENDING_REPLACED`] is the record that describes it.
+        //
+        // **Outermost, and held across the mutation AND the append**, per [`PersistState`]: a
+        // record that REPLACES the log has to be written in the order the log actually changed,
+        // or a `TAIL_PAGES_PARKED` cut by a concurrent reap lands on the wrong side of it.
+        let mut persist = self.persist.lock().unwrap();
+        let (payload, dirty, version) = {
+            let mut st = self.state.lock().unwrap();
+            st.pending.extend(entries);
+            let dirty = std::mem::take(&mut st.recycled_dirty);
+            // Read under the SAME lock as the log this encodes. See `persist_delta_locked`'s
+            // `pending_covered`: a version read outside would vouch for a push the record misses.
+            let version = self.pending_version.load(Ordering::SeqCst);
+            let mut p = Vec::new();
+            p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            p.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
+            for e in st.pending.iter() {
+                Self::encode_pending_entry(&mut p, e);
+            }
+            Self::encode_arena_sections(&mut p, &st, &dirty);
+            (p, dirty, version)
+        };
+        // ⚠ **This record is O(pending log), so it amortises WEAKLY where the others amortise
+        // strongly.** The log is also in the image, so a log that has grown past roughly a third
+        // of the map makes every such record exceed `compact_threshold` and the call degenerates
+        // to the full rewrite it replaces — never worse than that, and strictly better below it.
+        // Stated here rather than discovered: closing it needs the drain to name what it
+        // RELEASED, which `put_pending`'s signature does not carry, and
+        // `putting_the_pending_log_back_reaches_the_durable_map` pins that signature.
+        if let Err(e) =
+            self.persist_delta_locked(&mut persist, Self::TAIL_PENDING_REPLACED, &payload, Some(version))
+        {
+            // Nothing reached the file, so the arenas this record named are still owed one.
+            // Re-marking rather than assuming: an arena dirtied again while the append was in
+            // flight is already back in the set and `extend` leaves it there.
+            self.state.lock().unwrap().recycled_dirty.extend(dirty);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// True iff `arena` is live and every page ever handed out from it has been released.
@@ -1019,10 +1085,18 @@ impl ArenaPageStore {
             high = i + 1;
         }
         let mut st = self.state.lock().unwrap();
-        if let Some(e) = st.extents.get_mut(&arena) {
-            if high > e.next_free {
+        let raised = match st.extents.get_mut(&arena) {
+            Some(e) if high > e.next_free => {
                 e.next_free = high;
+                true
             }
+            _ => false,
+        };
+        if raised {
+            // **D183.** The probe moved a number the durable image records, and it is the number
+            // `extent_is_empty` compares the recycled count against. Owed to the next record for
+            // the same reason a recycled push is.
+            st.recycled_dirty.insert(arena);
         }
         st.fill_unknown.remove(&arena);
     }
@@ -1052,30 +1126,42 @@ impl ArenaPageStore {
         free_epoch: Epoch,
     ) -> Result<u32, FerroError> {
         let mut released = 0u32;
+        // **D183.** Collected as they are parked so the record can carry exactly them. The pushes
+        // themselves still happen as they are decided — holding the durability lock across a loop
+        // that reads a page and queries the catalog per page would serialise every extent claim in
+        // the store behind one reap.
+        let mut parked: Vec<PendingFree> = Vec::new();
         for arena in rec.arenas.iter().copied() {
             // **D85.** `allocated_pages` is `(0..next_free)`, so an understated `next_free` makes
             // this loop park NONE of a live child's pages. Probe first.
             self.resolve_fill(arena);
             for page_id in self.allocated_pages(arena) {
-                let birth = self.page_birth(page_id)?;
+                let birth = match self.page_birth(page_id) {
+                    Ok(b) => b,
+                    Err(e) => return self.abandon_park(&parked, e),
+                };
                 // The reclamation rule as an index question rather than an array walk: is
                 // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
                 // structure that can answer it without holding every child resident.
-                if !self.catalog.live_child_in_epoch_range(
-                    rec.branch_id.id,
-                    birth,
-                    free_epoch,
-                )? {
+                let pinned =
+                    match self.catalog.live_child_in_epoch_range(rec.branch_id.id, birth, free_epoch)
+                    {
+                        Ok(p) => p,
+                        Err(e) => return self.abandon_park(&parked, e),
+                    };
+                if !pinned {
                     self.release_page(page_id, arena);
                     released += 1;
                 } else {
-                    self.state.lock().unwrap().pending.push(PendingFree {
+                    let entry = PendingFree {
                         page_id,
                         arena_id: arena,
                         birth_epoch: birth,
                         free_epoch,
                         owner: rec.branch_id,
-                    });
+                    };
+                    self.state.lock().unwrap().pending.push(entry);
+                    parked.push(entry);
                 }
             }
         }
@@ -1085,8 +1171,77 @@ impl ArenaPageStore {
         // pending entries are gone so `drain_pending` never revisits them, the extent's durable
         // `next_free` is above its recycled count so `extent_is_empty` refuses, and nothing points
         // at the arena any more. Once per branch reaped, not once per page.
-        self.persist_if_configured()?;
+        //
+        // **D183 — and it is a 9+N·32-byte record now, not the whole 48·L-byte image.** This was
+        // `persist_if_configured`, i.e. `persist_full_locked` unconditionally: one full rewrite per
+        // INTERIOR branch reaped, never consulting `compact_threshold`, so `sum(48·i) = 24·N²`
+        // bytes over a run of N such reaps. That is the shape D81 took off the fork door, alive on
+        // the reap door, and it opens on exactly the predicate this project is aimed at — a reaped
+        // branch having live children, i.e. deep fork chains. The record describes what the loop
+        // above actually did: the entries it parked, and the recycled lists and fills of the
+        // arenas it walked. The existing threshold decides when to compact, as it does for a claim.
+        //
+        // **Outermost and held across the record's snapshot and its append**, per [`PersistState`].
+        // The MUTATIONS are already behind us and that is safe on purpose: the recycled half is
+        // absolute and skips dead arenas, and the parked half is keyed and skips dead arenas, so
+        // neither cares which order it and a `TAIL_EXTENT_FREED` for the same extent reach the
+        // file in. The snapshot is taken under this lock so that two records for one arena cannot
+        // be appended in the opposite order to the states they describe.
+        let mut persist = self.persist.lock().unwrap();
+        let (payload, dirty) = {
+            let mut st = self.state.lock().unwrap();
+            let dirty = std::mem::take(&mut st.recycled_dirty);
+            // **Every extent this call WALKED, not only the ones it released into.** An extent
+            // whose pages were all parked is never marked by `release_page`, and its `next_free`
+            // may still be the image's — `alloc_in_arena` advances that number and persists
+            // nothing (see [`PersistState`]). The full rewrite this record replaces wrote the
+            // true value, so leaving it out is a real divergence, and it is the one direction that
+            // matters: an UNDERSTATED durable `next_free` is what makes `extent_is_empty` call an
+            // extent that still holds a live child's pages collectable. D85's `fill_unknown` still
+            // catches it on restore; writing the number down is better than being caught.
+            // `an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite` failed
+            // on exactly this field before the union was added.
+            //
+            // Free asymptotically: the loop above already visited every page of every one of them.
+            let mut covered = dirty.clone();
+            covered.extend(rec.arenas.iter().copied());
+            let mut p = Vec::new();
+            p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            p.extend_from_slice(&(parked.len() as u32).to_be_bytes());
+            for e in &parked {
+                Self::encode_pending_entry(&mut p, e);
+            }
+            Self::encode_arena_sections(&mut p, &st, &covered);
+            (p, dirty)
+        };
+        // `None`: this record carries its OWN parked entries and nobody else's, so it is only
+        // correct against a durable log already level with memory. See `persist_delta_locked`.
+        if let Err(e) =
+            self.persist_delta_locked(&mut persist, Self::TAIL_PAGES_PARKED, &payload, None)
+        {
+            self.state.lock().unwrap().recycled_dirty.extend(dirty);
+            return Err(e);
+        }
         Ok(released)
+    }
+
+    /// Give up on a `retire_arenas_by_rule` that failed part way, without leaving the entries it
+    /// already parked invisible.
+    ///
+    /// **They are in memory and in no record**, and the pushes themselves do not bump
+    /// [`Self::pending_version`] precisely because the record at the end of the loop describes
+    /// them. Returning without that record would leave the counter saying the durable log is level
+    /// with memory when it is short by everything parked so far — so the next claim would happily
+    /// append behind a file that does not list them, and a crash before the next compaction leaks
+    /// every one. Marking the log dirty makes the next persist a full rewrite instead.
+    ///
+    /// The recycled lists need no equivalent: `release_page` marks its arena in
+    /// [`StoreState::recycled_dirty`] as it goes, and nothing here takes that set.
+    fn abandon_park<T>(&self, parked: &[PendingFree], e: FerroError) -> Result<T, FerroError> {
+        if !parked.is_empty() {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(e)
     }
 
     fn page_birth(&self, page_id: PageId) -> Result<Epoch, FerroError> {
@@ -1131,6 +1286,16 @@ impl ArenaPageStore {
     /// Serialize the free-space map and pending-free log.
     pub fn state_bytes(&self) -> Vec<u8> {
         let st = self.state.lock().unwrap();
+        self.state_bytes_locked(&st)
+    }
+
+    /// [`Self::state_bytes`] against a `state` lock the caller already holds.
+    ///
+    /// **D183** split this out for one reason: `persist_full_locked` has to clear
+    /// [`StoreState::recycled_dirty`] and serialise the image without letting go in between. Same
+    /// bytes, same order, same CRC — `two_stores_in_the_same_state_checkpoint_byte_identical_images`
+    /// still pins them.
+    fn state_bytes_locked(&self, st: &StoreState) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(Self::STATE_VERSION);
         b.extend_from_slice(&self.space.base_page.to_be_bytes());
@@ -1196,12 +1361,9 @@ impl ArenaPageStore {
 
         b.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
         for p in st.pending.iter() {
-            b.extend_from_slice(&p.page_id.to_be_bytes());
-            b.extend_from_slice(&p.arena_id.0.to_be_bytes());
-            b.extend_from_slice(&p.birth_epoch.0.to_be_bytes());
-            b.extend_from_slice(&p.free_epoch.0.to_be_bytes());
-            b.extend_from_slice(&p.owner.id.to_be_bytes());
-            b.extend_from_slice(&p.owner.generation.to_be_bytes());
+            // **D183** — the same five fields the tail records write, written once. The image's
+            // layout is unchanged; what changed is that there is now only one place it is spelled.
+            Self::encode_pending_entry(&mut b, p);
         }
 
         let crc = crc32(&b);
@@ -1288,13 +1450,7 @@ impl ArenaPageStore {
         let n = c.u32()? as usize;
         let mut pending = Vec::with_capacity(n);
         for _ in 0..n {
-            pending.push(PendingFree {
-                page_id: c.u32()?,
-                arena_id: ArenaId(c.u32()?),
-                birth_epoch: Epoch(c.u64()?),
-                free_epoch: Epoch(c.u64()?),
-                owner: BranchId::new(c.u64()?, c.u32()?),
-            });
+            pending.push(Self::decode_pending_entry(&mut c)?);
         }
         if c.at != c.b.len() {
             return Err(BranchError::Arena(format!(
@@ -1358,6 +1514,10 @@ impl ArenaPageStore {
                 recycled,
                 current,
                 pending,
+                // Nothing is dirty against a file this process did not write: `image_bytes` was
+                // just reset to 0 above, so the next persist is a full rewrite and carries
+                // everything anyway.
+                recycled_dirty: std::collections::HashSet::new(),
                 claim_epoch,
                 // Deliberately NOT restored from the image: see the field's own doc. A cold map
                 // makes the next shadow a chain root, which can only shorten chains.
@@ -1394,9 +1554,23 @@ impl ArenaPageStore {
     const TAIL_ARENA_CLAIMED: u8 = 1;
     /// A whole extent was freed. `free_arena`'s fast path.
     const TAIL_EXTENT_FREED: u8 = 2;
+    /// **D183.** The interval rule ran over a reaped branch's extents: entries were APPENDED to
+    /// the pending-free log and the arenas it walked have new recycled lists.
+    /// `retire_arenas_by_rule`'s record — the reap slow path, which used to rewrite the whole
+    /// image once per interior branch.
+    const TAIL_PAGES_PARKED: u8 = 3;
+    /// **D183.** The pending-free log was REPLACED wholesale, and the arenas the drain released
+    /// into have new recycled lists. `put_pending`'s record, and the closing half of
+    /// `take_pending`'s read-modify-write.
+    const TAIL_PENDING_REPLACED: u8 = 4;
     /// Kinds this build understands. An allowlist for the same reason `READABLE_STATE_VERSIONS`
     /// is one.
-    const KNOWN_TAIL_KINDS: &'static [u8] = &[Self::TAIL_ARENA_CLAIMED, Self::TAIL_EXTENT_FREED];
+    const KNOWN_TAIL_KINDS: &'static [u8] = &[
+        Self::TAIL_ARENA_CLAIMED,
+        Self::TAIL_EXTENT_FREED,
+        Self::TAIL_PAGES_PARKED,
+        Self::TAIL_PENDING_REPLACED,
+    ];
 
     /// Below this the tail may grow freely however small the image is.
     ///
@@ -1416,6 +1590,95 @@ impl ArenaPageStore {
     /// It also bounds the file at 1.5x the image and the replay at half of it.
     fn compact_threshold(image_bytes: u64) -> u64 {
         (image_bytes / 2).max(Self::TAIL_COMPACT_FLOOR_BYTES)
+    }
+
+    /// One pending-free entry, in exactly the 32-byte layout [`Self::state_bytes`] writes.
+    ///
+    /// Shared with the image on purpose: `putting_the_pending_log_back_reaches_the_durable_map`
+    /// and this row's own restore test both compare a replayed log against one a full rewrite
+    /// produced, and two spellings of the same five fields is the way that comparison silently
+    /// starts measuring the encoder instead of the mechanism.
+    fn encode_pending_entry(b: &mut Vec<u8>, p: &PendingFree) {
+        b.extend_from_slice(&p.page_id.to_be_bytes());
+        b.extend_from_slice(&p.arena_id.0.to_be_bytes());
+        b.extend_from_slice(&p.birth_epoch.0.to_be_bytes());
+        b.extend_from_slice(&p.free_epoch.0.to_be_bytes());
+        b.extend_from_slice(&p.owner.id.to_be_bytes());
+        b.extend_from_slice(&p.owner.generation.to_be_bytes());
+    }
+
+    fn decode_pending_entry(c: &mut StateCursor) -> Result<PendingFree, FerroError> {
+        // Field order is read order: this mirrors `encode_pending_entry` above, which mirrors
+        // `state_bytes`.
+        Ok(PendingFree {
+            page_id: c.u32()?,
+            arena_id: ArenaId(c.u32()?),
+            birth_epoch: Epoch(c.u64()?),
+            free_epoch: Epoch(c.u64()?),
+            owner: BranchId::new(c.u64()?, c.u32()?),
+        })
+    }
+
+    /// **D183.** The per-extent half of a reclamation record: for every arena owed one, its
+    /// `next_free` and its whole recycled list, **absolutely**.
+    ///
+    /// Absolute rather than incremental, and the difference is not a style choice. A record of
+    /// "these pages joined the list" is only true if nothing ever takes one back out, and
+    /// `alloc_in_arena` pops from exactly this list. An absolute list is what the extent *is* at
+    /// the moment the record is cut, so it is also idempotent on replay and immune to the order
+    /// two records for one arena reach the file in.
+    ///
+    /// Cost: at most `page_count` ids for an extent whose pages the caller was already visiting
+    /// one at a time, so it does not change the order of the work that produced it.
+    ///
+    /// Arenas no longer in `extents` are SKIPPED, which is what makes this record commute with
+    /// [`Self::TAIL_EXTENT_FREED`]: whichever order the two land in, replay ends with the extent
+    /// gone and nothing re-describing it. `release_page` makes the same test in memory.
+    ///
+    /// Sorted, for the reason `state_bytes` sorts: these bytes reach a file and go under a CRC.
+    fn encode_arena_sections(
+        b: &mut Vec<u8>,
+        st: &StoreState,
+        dirty: &std::collections::HashSet<ArenaId>,
+    ) {
+        let mut ids: Vec<ArenaId> =
+            dirty.iter().copied().filter(|a| st.extents.contains_key(a)).collect();
+        ids.sort_unstable();
+        b.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        let empty = Vec::new();
+        for a in ids {
+            b.extend_from_slice(&a.0.to_be_bytes());
+            b.extend_from_slice(&st.extents[&a].next_free.to_be_bytes());
+            let rec = st.recycled.get(&a).unwrap_or(&empty);
+            b.extend_from_slice(&(rec.len() as u32).to_be_bytes());
+            for p in rec {
+                b.extend_from_slice(&p.to_be_bytes());
+            }
+        }
+    }
+
+    /// Replay of [`Self::encode_arena_sections`]. Counts are **pushed, never reserved**: the CRC
+    /// is checked before this runs, but a count that decides an allocation is a habit worth not
+    /// having in a file parser — `StateCursor` bounds every read, so a bad count fails as
+    /// "truncated".
+    fn apply_arena_sections(c: &mut StateCursor, st: &mut StoreState) -> Result<(), FerroError> {
+        let n = c.u32()? as usize;
+        for _ in 0..n {
+            let arena = ArenaId(c.u32()?);
+            let next_free = c.u32()?;
+            let rn = c.u32()? as usize;
+            let mut r = Vec::new();
+            for _ in 0..rn {
+                r.push(c.u32()?);
+            }
+            // Read the whole section before deciding, so a skipped arena still advances the
+            // cursor. Skipping the BYTES would desynchronise every section behind it.
+            if let Some(ext) = st.extents.get_mut(&arena) {
+                ext.next_free = next_free;
+                st.recycled.insert(arena, r);
+            }
+        }
+        Ok(())
     }
 
     fn encode_tail_record(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -1444,11 +1707,6 @@ impl ArenaPageStore {
         g.image_epoch = crate::cluster::epoch();
     }
 
-    fn persist_if_configured(&self) -> Result<(), FerroError> {
-        let mut g = self.persist.lock().unwrap();
-        self.persist_full_locked(&mut g)
-    }
-
     /// Rewrite the whole image and drop the tail with it.
     ///
     /// `replace_atomically` renames a fresh inode over the target, so the previous tail goes away
@@ -1462,7 +1720,18 @@ impl ArenaPageStore {
         // Reading it afterwards would do the opposite: record a change as durable that the image
         // does not contain.
         let pending_version = self.pending_version.load(Ordering::SeqCst);
-        let written = self.checkpoint_with(&OsFileOps, &p)?;
+        // **D183 — the clear and the serialisation are ONE critical section.** A full image is
+        // every arena's recycled list, so nothing is owed a record afterwards. Clearing on either
+        // side of the serialisation instead leaves an interleaving where a `release_page` lands
+        // in the gap: cleared but not written, i.e. a page that comes back in no record and no
+        // image. That is why `state_bytes` was split rather than called.
+        let bytes = {
+            let mut st = self.state.lock().unwrap();
+            st.recycled_dirty.clear();
+            self.state_bytes_locked(&st)
+        };
+        replace_atomically(&OsFileOps, &p, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
+        let written = bytes.len();
         g.image_bytes = written as u64;
         g.tail_bytes = 0;
         g.image_epoch = crate::cluster::epoch();
@@ -1481,18 +1750,36 @@ impl ArenaPageStore {
     ///     record describes.
     ///   * the pending-free log changed — see [`PersistState::durable_pending_version`].
     ///   * the tail would exceed [`Self::compact_threshold`] — the amortisation bound.
+    ///
+    /// # `pending_covered` — **D183**
+    ///
+    /// `None` is the original rule and the one every record that does not mention the pending log
+    /// must use: append only while the durable log still equals the in-memory one, because such a
+    /// record leaves the log exactly as it found it.
+    ///
+    /// `Some(v)` is for a record that carries the WHOLE log — today only
+    /// [`Self::TAIL_PENDING_REPLACED`]. Such a record does not need the log to be clean, it makes
+    /// it clean, so the third condition does not apply and `durable_pending_version` advances to
+    /// the version the caller read **under the same `state` lock as the log it encoded**. A `v`
+    /// read anywhere else would claim durability for a push the record does not contain.
+    ///
+    /// ⚠ [`Self::TAIL_PAGES_PARKED`] passes `None` deliberately even though it APPENDS to the
+    /// log. It carries its own entries and nobody else's, so it is only correct against a durable
+    /// log that is already level with memory — which is precisely what `None` demands.
     fn persist_delta_locked(
         &self,
         g: &mut PersistState,
         kind: u8,
         payload: &[u8],
+        pending_covered: Option<u64>,
     ) -> Result<(), FerroError> {
         let path = self.checkpoint_path.lock().unwrap().clone();
         let Some(p) = path else { return Ok(()) };
         let rec = Self::encode_tail_record(kind, payload);
         if g.image_bytes == 0
             || g.image_epoch != crate::cluster::epoch()
-            || g.durable_pending_version != self.pending_version.load(Ordering::SeqCst)
+            || (pending_covered.is_none()
+                && g.durable_pending_version != self.pending_version.load(Ordering::SeqCst))
             || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
         {
             // The rewrite folds in the mutation this record described, because `state_bytes`
@@ -1503,6 +1790,9 @@ impl ArenaPageStore {
         append_durably(&OsFileOps, &p, &rec).map_err(|e| FerroError::Io(e.to_string()))?;
         g.tail_bytes += rec.len() as u64;
         g.appends += 1;
+        if let Some(v) = pending_covered {
+            g.durable_pending_version = v;
+        }
         Ok(())
     }
 
@@ -1729,6 +2019,61 @@ impl ArenaPageStore {
                     .push(start_page);
                 saturating_sub_atomic(&self.reserved_pages, page_count);
                 // Absolute, for the reason spelled out under the claim record above.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — the reap slow path's delta.** `retire_arenas_by_rule` parked these entries
+            // and recycled the rest of the pages it walked; this is that call, replayed.
+            Self::TAIL_PAGES_PARKED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut parked = Vec::new();
+                for _ in 0..n {
+                    parked.push(Self::decode_pending_entry(&mut c)?);
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // **Idempotent by key, and that is a durability property rather than tidiness.**
+                    // This record APPENDS, so it has to be safe to replay behind a
+                    // `TAIL_PENDING_REPLACED` whose own snapshot already contained these entries —
+                    // which happens whenever a concurrent drain cut its record between this
+                    // caller's in-memory push and its append. Without the test, the log comes back
+                    // with the same page twice and `pending_len` disagrees with a full rewrite.
+                    let mut seen: std::collections::HashSet<(PageId, ArenaId)> =
+                        st.pending.iter().map(|p| (p.page_id, p.arena_id)).collect();
+                    for e in parked {
+                        // Dead arena: `TAIL_EXTENT_FREED` landed first, and its replay drops every
+                        // pending entry naming the extent. Re-adding one here would send
+                        // `drain_pending` hunting for a page in a range already back on the free
+                        // list — the very thing that record's own comment refuses.
+                        if !st.extents.contains_key(&e.arena_id) {
+                            continue;
+                        }
+                        if seen.insert((e.page_id, e.arena_id)) {
+                            st.pending.push(e);
+                        }
+                    }
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
+                // Absolute, for the reason spelled out under the claim record above.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — `put_pending`'s delta.** The closing half of `take_pending`'s
+            // read-modify-write: the log is not appended to, it is REPLACED by what the drain put
+            // back, which is why this one record can also discharge every earlier unrecorded
+            // change to the log.
+            Self::TAIL_PENDING_REPLACED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut log = Vec::new();
+                for _ in 0..n {
+                    log.push(Self::decode_pending_entry(&mut c)?);
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    log.retain(|p| st.extents.contains_key(&p.arena_id));
+                    st.pending = log;
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
                 self.live_pages.store(live, Ordering::SeqCst);
             }
             other => {
@@ -2131,14 +2476,19 @@ impl PageStore for ArenaPageStore {
             // checkpoints the next claim wrote it down as a side effect. A tail record does not,
             // so this marks the log changed and the next claim rewrites the image instead of
             // appending. See [`PersistState::durable_pending_version`].
-            self.pending_version.fetch_add(1, Ordering::SeqCst);
-            self.state.lock().unwrap().pending.push(PendingFree {
+            //
+            // **D183 — the bump moved INSIDE the lock, for the reason `take_pending` gives.** The
+            // push and the announcement of the push have to be one step, or a record builder
+            // holding `state` reads the new version and the old log.
+            let mut st = self.state.lock().unwrap();
+            st.pending.push(PendingFree {
                 page_id,
                 arena_id: arena,
                 birth_epoch: header.birth_epoch,
                 free_epoch,
                 owner,
             });
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
         } else {
             self.release_page(page_id, arena);
         }
@@ -2212,18 +2562,20 @@ impl PageStore for ArenaPageStore {
         // already in use. Ordered AFTER the catalog write so a crash between the two leaves an
         // extent recorded as reserved but unreferenced, which leaks; the other order aliases.
         //
-        // **D81 — THIS is the wall, and it is the only site that changes shape.** D79 measured the
-        // whole 48·L-byte image being re-serialised and re-fsynced here, once per new branch, for
-        // `sum(48·i) = 24·N²` bytes over a run. It now appends 45 bytes and fsyncs once, and the
-        // image is rewritten only when the tail has grown past half of it.
+        // **D81 — THIS is the wall on the FORK door.** D79 measured the whole 48·L-byte image
+        // being re-serialised and re-fsynced here, once per new branch, for `sum(48·i) = 24·N²`
+        // bytes over a run. It now appends 45 bytes and fsyncs once, and the image is rewritten
+        // only when the tail has grown past half of it.
         //
-        // The other three `persist_if_configured` sites keep the full rewrite deliberately. They
-        // fire once per REAP, not once per branch created, and each one changes list-shaped state
-        // — the pending-free log, per-extent recycled lists — that a per-extent record does not
-        // describe. They double as compaction points, so leaving them whole costs a bounded tail
-        // rather than a missing guarantee. ⚠ The condition under which that stops being the right
-        // call, stated rather than discovered: a workload that reaps as often as it forks pays a
-        // full rewrite per reap and only half of this row's benefit.
+        // ⚠ **D183 corrected this note, which was wrong in both halves.** It said there were
+        // "three other `persist_if_configured` sites"; there were TWO (`retire_arenas_by_rule` and
+        // `put_pending`), and it said keeping them whole cost "a bounded tail rather than a missing
+        // guarantee". It cost neither: `persist_full_locked` never consults `compact_threshold`, so
+        // those two were not amortised at all — one full image rewrite per INTERIOR branch reaped,
+        // `24·N²` bytes again, on the door that opens for deep fork chains. The condition this note
+        // named as hypothetical ("a workload that reaps as often as it forks") is the one the
+        // project is aimed at. Both sites are deltas now; see [`Self::TAIL_PAGES_PARKED`] and
+        // [`Self::TAIL_PENDING_REPLACED`], and `persist_if_configured` is gone with them.
         let payload = {
             let mut p = Vec::with_capacity(36);
             p.extend_from_slice(&arena.0.to_be_bytes());
@@ -2241,7 +2593,7 @@ impl PageStore for ArenaPageStore {
             p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
             p
         };
-        self.persist_delta_locked(&mut persist, Self::TAIL_ARENA_CLAIMED, &payload)?;
+        self.persist_delta_locked(&mut persist, Self::TAIL_ARENA_CLAIMED, &payload, None)?;
         Ok(arena)
     }
 
@@ -2304,6 +2656,10 @@ impl PageStore for ArenaPageStore {
         // on a path whose whole job is to give per-arena state back, and at 10^6 restored extents
         // it is the set, not the leak, that is the wrong shape.
         st.fill_unknown.remove(&arena);
+        // **D183 — and the same argument, one row later.** This extent's recycled list no longer
+        // exists, so nothing is owed a record for it. Left behind, the id would make every later
+        // reclamation record re-encode an arena that `TAIL_EXTENT_FREED` has already removed.
+        st.recycled_dirty.remove(&arena);
         // **D102 — the whole extent's ids stop naming these pages, so their bases stop being
         // theirs.** `release_page` does this one id at a time; freeing an extent bypasses it
         // entirely (that bypass is the reaper's fast path and the reason arenas exist), so the
@@ -2383,7 +2739,7 @@ impl PageStore for ArenaPageStore {
             payload.extend_from_slice(&start.to_be_bytes());
             payload.extend_from_slice(&pages.to_be_bytes());
             payload.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-            self.persist_delta_locked(&mut persist, Self::TAIL_EXTENT_FREED, &payload)?;
+            self.persist_delta_locked(&mut persist, Self::TAIL_EXTENT_FREED, &payload, None)?;
         }
         Ok(allocated)
     }
@@ -3779,28 +4135,49 @@ mod tests {
     /// **D183 — which reap door a branch leaves by, COUNTED rather than argued.**
     ///
     /// D81 replaced the per-fork full image rewrite with a 45-byte delta append and its note
-    /// (`:2215`) calls that "the only site that changes shape". This asks what REAP costs, and the
-    /// answer is not one number: `reaper.rs:679` splits on `has_live_children`, and only the fast
-    /// side reaches a delta. `retire_arenas_by_rule` ends in `persist_if_configured`, which is
-    /// `persist_full_locked` unconditionally — it never consults `compact_threshold`, so it is not
-    /// amortised at all.
+    /// called that "the only site that changes shape". This asks what REAP costs, and the answer
+    /// used to be two different numbers: `reaper.rs:679` splits on `has_live_children`, and only
+    /// the fast side reached a delta. `retire_arenas_by_rule` ended in `persist_if_configured`,
+    /// which was `persist_full_locked` unconditionally — it never consulted `compact_threshold`,
+    /// so it was not amortised at all.
     ///
-    /// **Pre-registered from the SOURCE, before running it** (never from what the run printed):
-    /// `retire_arenas_by_rule` performs exactly one full rewrite per call and the reaper calls it
-    /// once per branch, so the INTERIOR arm's rewrites must rise one-for-one with branches reaped.
-    /// The LEAF arm goes through `free_arena` -> `TAIL_EXTENT_FREED` and must not.
+    /// **⭐ THIS TEST HAS BEEN INVERTED. It pinned a WALL and now pins the FIX.** The wall,
+    /// measured 2026-09-23 at `630afaa`, and kept here because a before/after with only the
+    /// after is a claim rather than a measurement:
+    ///
+    /// | arm | branches | rewrites | appends |
+    /// |---|---|---|---|
+    /// | LEAF | 8 / 16 | **0 / 0** | 24 / 48 |
+    /// | INTERIOR | 8 / 16 | **8 / 16** | 0 / 0 |
+    ///
+    /// One full image rewrite per interior branch reaped, zero deltas — `sum(48·i) = 24·N²` bytes
+    /// — against a leaf control that paid zero at both sizes.
+    ///
+    /// **After D183's two new tail record kinds** ([`ArenaPageStore::TAIL_PAGES_PARKED`] and
+    /// [`ArenaPageStore::TAIL_PENDING_REPLACED`]), measured 2026-09-23 on this branch:
+    ///
+    /// | arm | branches | rewrites | appends |
+    /// |---|---|---|---|
+    /// | LEAF | 8 / 16 | 0 / 0 | 24 / 48 |
+    /// | INTERIOR | 8 / 16 | **0 / 1** | **8 / 15** |
+    ///
+    /// **Pre-registered from the SOURCE, and stated as what must be TRUE rather than as the
+    /// numbers above.** The reaper calls `retire_arenas_by_rule` once per branch and that method
+    /// persists exactly once, so the two counters must still SUM to one per interior branch — the
+    /// site fires as often as it ever did. What D183 changed is which counter each one lands in:
+    /// `persist_delta_locked` now rewrites only when the tail would pass
+    /// `compact_threshold(image_bytes) = max(image/2, 4096)`, so the rewrites over the loop are
+    /// bounded by the BYTES it appends and not by the branch count. Hence the inverted assertion:
+    /// **rewrites must grow more slowly than appends** — 1 against 7 here, and 8 against 0 under
+    /// the defect, which is what makes it discriminating rather than merely satisfied.
+    ///
+    /// The single rewrite at 16 is a COMPACTION and not the old per-branch cost: the fixture's own
+    /// 48 claim records have already put ~2.2 KiB on the tail before the reap loop starts, so the
+    /// 4 KiB floor is crossed part way through. That is the amortisation rule working, and it is
+    /// why the assertion is about the slope rather than about zero.
     ///
     /// Two sizes, so the claim is a SLOPE and not a ratio, and both arms in the same run so the
     /// leaf arm is a live control rather than a remembered number.
-    ///
-    /// ⛔⛔ **THIS TEST PINS A WALL, NOT A GUARANTEE. WHEN D183 IS FIXED IT MUST FAIL, AND
-    /// THAT FAILURE IS THE SIGNAL THE FIX WORKED — DO NOT WEAKEN IT TO GET GREEN.** Measured
-    /// 2026-09-23: LEAF 8/16 branches -> rewrites 0/0, appends 24/48; INTERIOR 8/16 ->
-    /// rewrites 8/16, appends 0/0. One full image rewrite per interior branch reaped, zero
-    /// deltas, against a leaf control that pays zero at both sizes. The correct fix is a NEW
-    /// tail record kind describing the list-shaped state `:2220` says a per-extent record
-    /// cannot (the pending-free log, per-extent recycled lists); when that lands, invert the
-    /// `int_r16 - int_r8` assertion to expect appends and re-record the numbers here.
     ///
     /// ⚠ `new_with(true)` — the catalog that SHIPS. `Harness::new()` is the log catalog, whose
     /// `live_children` lives in the record; a reclamation test on it proves nothing about the
@@ -3867,19 +4244,146 @@ mod tests {
         assert!(leaf_a8 + leaf_r8 > 0, "fixture: the leaf arm persisted nothing at all");
         assert!(int_r8 + int_a8 > 0, "fixture: the interior arm persisted nothing at all");
 
-        // THE PRE-REGISTERED SHAPE: one full image rewrite per interior branch reaped.
+        // The SITE still fires once per interior branch — `retire_arenas_by_rule` persists exactly
+        // once and the reaper calls it once per branch. D183 changed which counter it lands in,
+        // not how often it runs, and stating that separately is what stops a "fix" that simply
+        // stopped persisting from passing the slope assertion below.
         assert_eq!(
-            int_r16 - int_r8,
-            8,
-            "interior reaps did not cost one full image rewrite each: 8->{int_r8}, 16->{int_r16}"
+            (int_r8 + int_a8, int_r16 + int_a16),
+            (8, 16),
+            "the interior reap no longer persists exactly once per branch: 8->({int_r8},{int_a8}) \
+             16->({int_r16},{int_a16}); a reap that persists LESS often is data loss, not a fix"
         );
 
-        // THE CONTROL: the leaf side must not pay them, or the predicate is not what splits it.
+        // ⭐ THE INVERTED PRE-REGISTERED SHAPE. Before D183 this read `int_r16 - int_r8 == 8`:
+        // rewrites rose one-for-one with branches and appends never moved (8 vs 0). The fix makes
+        // the interior door a delta, so the growth must land in the APPENDS and the rewrites must
+        // be whatever the amortisation rule leaves behind — strictly less.
         assert!(
-            leaf_r16 - leaf_r8 < int_r16 - int_r8,
-            "the leaf arm paid as many rewrites as the interior arm ({leaf_r8}->{leaf_r16} vs \
-             {int_r8}->{int_r16}), so `has_live_children` is not what decides the cost"
+            int_r16 - int_r8 < int_a16 - int_a8,
+            "interior reaps still rewrite the image per branch: rewrites {int_r8}->{int_r16} \
+             (+{}) against appends {int_a8}->{int_a16} (+{})",
+            int_r16 - int_r8,
+            int_a16 - int_a8
         );
+
+        // THE CONTROL, AND IT MUST NOT HAVE MOVED. The leaf door was already a delta before this
+        // row and D183 did not touch `free_arena`. A leaf arm that changed would mean the two
+        // halves of the before/after came from two different bases rather than that the interior
+        // arm improved.
+        assert_eq!(
+            (leaf_r8, leaf_r16),
+            (0, 0),
+            "the leaf control moved: it paid {leaf_r8}/{leaf_r16} rewrites where it paid 0/0 at \
+             630afaa, so this run is not comparable with the recorded before"
+        );
+        assert_eq!(
+            leaf_a16,
+            leaf_a8 * 2,
+            "the leaf control's appends stopped being linear in branches ({leaf_a8}->{leaf_a16})"
+        );
+    }
+
+    /// ⭐ **D183's load-bearing test: the delta must reproduce the full rewrite EXACTLY.**
+    ///
+    /// The row's whole argument is that the pending-free log and the per-extent recycled lists can
+    /// be described by a tail record instead of by re-serialising the map. That is a claim about
+    /// bytes, so it is asserted in bytes: run an interior reap AND the drain's read-modify-write
+    /// against an armed path, then compare a store restored from `image + tail` against a store
+    /// restored from a full image of the same live state. If the replay of
+    /// [`ArenaPageStore::TAIL_PAGES_PARKED`] and [`ArenaPageStore::TAIL_PENDING_REPLACED`] drops,
+    /// duplicates or reorders one entry, the two images differ and this fails.
+    ///
+    /// **Byte-identity is the right instrument and `pending_len()` is not.** A count agrees with a
+    /// full rewrite while naming different pages; `state_bytes` carries every field of every entry
+    /// plus every recycled id, under a CRC32.
+    ///
+    /// ⚠ **Anti-vacuity is the point of the counter assertion.** If either site quietly fell back
+    /// to `persist_full_locked`, the restore would of course match a full rewrite — and the test
+    /// would prove nothing at all. So it pins that the two calls produced TWO APPENDS AND NO
+    /// REWRITE first, and only then compares. Same for the fixture: it asserts the reap both
+    /// parked and released pages, because a log with nothing in it round-trips trivially.
+    ///
+    /// The crash this stands in for is the one `arena.rs`'s own note names: a kill after
+    /// `mark_reaped`, whose branch record no longer points at the arenas, so the parked entries and
+    /// the recycled pages exist ONLY in this file.
+    #[test]
+    fn an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite() {
+        // The catalog that ships — D19. The interval rule is asked of an INDEX here, not of a vec
+        // in the record, so the fixture's "some pinned, some not" split is decided by the code
+        // that runs in production.
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-control-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        // Born BEFORE the child forked, so the child can see them and the interval rule parks them.
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        // Born AFTER it forked: no live child's fork epoch lies in [birth, free), so these are
+        // RELEASED into the extent's recycled list rather than parked. Both halves of the record
+        // are therefore non-empty, which a fixture that parks everything cannot test.
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(9)).unwrap();
+        }
+
+        let (r0, a0) = h.store.persist_counters();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert!(released > 0, "fixture: nothing was released, so no recycled list changed");
+        let parked = h.store.pending_len();
+        assert!(parked > 0, "fixture: nothing was parked, so the pending log never changed");
+
+        // The drain's read-modify-write, spelled exactly as `reaper::drain_pending_seeded` spells
+        // it: take the whole log, hand one page back, put the survivors. This is what reaches
+        // `TAIL_PENDING_REPLACED`.
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), parked, "fixture: the take did not see the parked entries");
+        h.store.release_page(taken[0].page_id, taken[0].arena_id);
+        h.store.put_pending(taken[1..].to_vec()).unwrap();
+
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 2),
+            "the two reclamation sites did not APPEND: rewrites +{}, appends +{}. A fallback to \
+             the full rewrite would make the comparison below vacuously true",
+            r1 - r0,
+            a1 - a0
+        );
+
+        // What a full rewrite of this same live state would have produced, taken at a path that
+        // is NOT the armed one so the tail accounting is untouched.
+        h.store.checkpoint(&control).unwrap();
+
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap(), "fixture: the armed path holds nothing");
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+
+        assert_eq!(
+            from_tail.pending_len(),
+            from_image.pending_len(),
+            "the replayed pending-free log has {} entries where a full rewrite gives {}",
+            from_tail.pending_len(),
+            from_image.pending_len()
+        );
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "a store restored from image+tail is not byte-identical to one restored from a full \
+             image of the same state: the D183 deltas do not reproduce what they replaced"
+        );
+
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
     }
 
     /// `put_pending`'s own persist, isolated for the same reason as the test above it.
@@ -3954,8 +4458,8 @@ mod tests {
     /// **D85 diagnostic.** Is `next_free` understated after a crash, and does `extent_is_empty`
     /// then report an extent that still holds pages as empty?
     ///
-    /// `alloc_for` advances `ext.next_free` (`arena.rs`) and does NOT persist. The four
-    /// `persist_if_configured` sites are all off the page path, so a crash can leave the image's
+    /// `alloc_for` advances `ext.next_free` (`arena.rs`) and does NOT persist. The persist sites are
+    /// all off the page path, so a crash can leave the image's
     /// `next_free` behind by up to `ARENA_EXTENT_PAGES` pages. `load_state` knows and says so, and
     /// answers it on the ALLOCATION side by never resuming a restored extent. This asks the
     /// COLLECTION side's question instead: `extent_is_empty` is `recycled >= ext.next_free`.
