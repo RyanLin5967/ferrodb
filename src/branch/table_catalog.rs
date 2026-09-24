@@ -64,6 +64,9 @@ pub struct TableBranchCatalog {
     /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
     /// (measured x0.92, `bench/fork_concurrency_before.txt`).
     commit_group: CommitGroup,
+    /// FREE_ID keys `fork` skipped because the slot's record is not `Reaped` (D243). See
+    /// [`Self::stale_free_ids_skipped`].
+    stale_free_ids: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -341,6 +344,13 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
+    /// FREE_ID keys `fork` skipped because the slot's record was not `Reaped`, counted once per
+    /// skip (D233 review F5, ledger D243). Non-zero means a torn flush left a stale free-list entry;
+    /// a phantom no descent can reach is skipped, and counted, by every fork.
+    pub fn stale_free_ids_skipped(&self) -> u64 {
+        self.stale_free_ids.load(Ordering::Relaxed)
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
@@ -428,6 +438,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            stale_free_ids: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -451,6 +462,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            stale_free_ids: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -948,21 +960,43 @@ impl BranchCatalog for TableBranchCatalog {
         // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
         // generation comes from the slot's history, never from zero — a reused id whose generation
         // restarted would make a stale handle look current.
+        //
+        // **Only a slot whose record is `Reaped` is reused** (D233 review F5, ledger D243).
+        // `release_id` writes a FREE_ID key only for a `Reaped` record, so a FREE_ID over any other
+        // record is stale. The tree has no WAL, and a torn flush can leave one:
+        // - a fork that reused the id became durable, and its FREE_ID removal did not;
+        // - an unlink of the FREE_ID leaf was torn, leaving a key that the chain still lists and no
+        //   descent reaches.
+        // Reusing a stale slot overwrites a live branch's record. So it is skipped, counted
+        // ([`Self::stale_free_ids_skipped`]), and removed if a descent can reach it. It is NOT
+        // refused: the same phantom would then refuse every later fork. A phantom no descent
+        // reaches cannot be removed by key, so it is skipped again by every fork until D229/D243
+        // repair the torn unlink.
         let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
-        let recycled = self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .next()
-            .transpose()?
-            .and_then(|(k, _)| keys::free_id_from_key(&k));
+        let mut recycled = None;
+        let mut stale = Vec::new();
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, _) = entry?;
+            let Some(id) = keys::free_id_from_key(&k) else { continue };
+            match self.core(id)? {
+                Some(rec) if rec.state() == BranchState::Reaped => {
+                    recycled = Some((id, rec.generation()));
+                    break;
+                }
+                _ => stale.push(k),
+            }
+        }
+        for k in &stale {
+            self.stale_free_ids.fetch_add(1, Ordering::Relaxed);
+            self.remove_if_present(k)?;
+        }
 
         // `reused` decides which writer runs below, and it is the whole safety condition for
         // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
         // deadline keys, so its keys are NOT new.
         let (child_num, generation, reused) = match recycled {
-            Some(id) => {
+            Some((id, slot_gen)) => {
                 self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
                 (id, slot_gen, true)
             }
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
@@ -2855,6 +2889,38 @@ mod tests {
             "fork rewrote the Live record of branch {}",
             live.id
         );
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// D243's other half: a stale FREE_ID is skipped, counted and removed, and the fork goes on to
+    /// the next FREE_ID and reuses it if its record is `Reaped`. It is not refused. Uses the new
+    /// counter, so it cannot be red against `0eda6ca`; its mutant is `bench/d233/firecheck.sh`'s
+    /// F5 mutant, which reuses the head of the span without looking at its record.
+    #[test]
+    fn a_stale_free_id_is_skipped_counted_and_removed_and_the_next_is_reused() {
+        let (c, p, _pool) = cat("stale-free-id-skip");
+        let reaped = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let live = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let r = c.get(reaped).unwrap();
+        c.detach_child(BranchId::TRUNK.id, r.fork_epoch).unwrap();
+        c.set_state(reaped, BranchState::Live, BranchState::Reaped).unwrap();
+        c.release_id(reaped.id);
+        c.tree.upsert(keys::free_id(live.id), Vec::new()).unwrap();
+        assert!(
+            keys::free_id(live.id) < keys::free_id(reaped.id),
+            "premise: the stale FREE_ID sorts first, so the fork meets it before the good one"
+        );
+        let before = c.tree.search(&keys::record(live.id)).unwrap();
+        assert_eq!(c.stale_free_ids_skipped(), 0, "premise: nothing skipped yet");
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_eq!(child.branch_id.id, reaped.id, "the fork did not go on to reuse the Reaped slot");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the stale FREE_ID was not counted once");
+        assert_eq!(c.tree.search(&keys::free_id(live.id)).unwrap(), None, "the stale FREE_ID was not removed");
+        assert_eq!(c.tree.search(&keys::record(live.id)).unwrap(), before, "the Live record changed");
+        c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        assert_eq!(c.stale_free_ids_skipped(), 1, "a removed FREE_ID was skipped again");
         let _ = std::fs::remove_file(p);
     }
 }
