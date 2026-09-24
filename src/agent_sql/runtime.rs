@@ -942,52 +942,82 @@ pub struct DiffCost {
     pub skipped_subtrees: usize,
 }
 
-/// **D194 new-wall audit, term 1 — what `State::version_history` may forget.**
+/// **D194 new-wall audit, term 1 — what `State::version_history` may forget** (as revised by the
+/// cost review, Amendment 10).
 ///
-/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]),
-/// so the only entries a read can ask for are, for each LIVE pin, the one it reads. Two rules keep
-/// the history to those plus each row's newest entry:
+/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]).
+/// So a row's non-newest entry `h`, superseded by `s`, is read by exactly the live pins in `[h, s)`.
+/// The rule is that `h` is retained only while one exists:
 ///
-/// * **At supersession.** When a publish supersedes a row's newest entry `h` with `v`, `h` stays
-///   only if some live pin lies in `[h, v)`, since that pin is what reads it. A pin taken later is
-///   at or above every `begin_ts` already published, so if nobody reads `h` now, nobody ever
-///   will. The one pin that does not start there is a child's, and the child inherits a value that
-///   is already live.
-/// * **When the oldest pin leaves.** Everything older than the newest entry at or below the new
-///   oldest pin is unreachable, so it goes. That frees what a sealed or re-pinned pin DID read.
+/// * **At supersession** (`publish_version`), `h` goes into `readers` if a live pin lies in
+///   `[h, s)`, and is popped otherwise. A pin taken later is at or above every `begin_ts` already
+///   published, so if nobody reads `h` now, nobody ever will. The one pin that does not start
+///   there is a child's, and the child inherits a value that is already live.
+/// * **When ANY pin value leaves** (`drop_pin` takes its count to 0), the entries that can have
+///   lost their last reader are exactly those with `h` in `(a, p]`, where `a` is the next lower
+///   live pin. An entry with `h ≤ a` still contains `a`. That range is queued in `pending` and
+///   swept, re-testing each entry locally with `pins.range(h..s)`. The local test is exact whatever
+///   pins came and went in between.
 ///
-/// One thing is still held longer than it is needed. An entry kept for a pin that is then sealed
-/// while an OLDER pin lives stays until the oldest pin passes it. That is at most one entry per row
-/// per such pin.
+/// The bound is independent of merges: per row, the newest entry, plus one entry per distinct live
+/// pin value that reads an older version, plus garbage kept below half the row (see `garbage`).
+/// Entries still waiting in `pending` are over that, and are freed as it drains.
 ///
-/// Both fields are derived from `workspaces` and `version_history`, and they change only through
-/// `State`'s own methods. Neither holds per-branch state that a statement can write.
+/// All four fields are derived from `workspaces` and `version_history`, and they change only
+/// through `State`'s own methods. None holds per-branch state that a statement can write.
 #[derive(Default)]
 struct HistoryRetention {
     /// `fork_seq` -> the number of LIVE workspaces pinned there (`fork_snapshot` is `Some`).
     ///
-    /// The oldest pin is the first key, and "does any live pin lie in `[h, v)`" is one range probe.
-    /// Both cost O(log n) per publish. A scan of `workspaces` would answer the same questions at
-    /// O(open sessions), under the lock every statement takes. The keys are also the ONLY
-    /// `seen_through` values the history answers exactly. `record_read` checks membership here
-    /// before it asks.
+    /// "Does any live pin lie in `[h, s)`" is one range probe, and "the next lower live pin" is
+    /// one reverse step: O(log n) each. A scan of `workspaces` would answer both at O(open
+    /// sessions), under the lock every statement takes. The keys are also the ONLY `seen_through`
+    /// values the history answers exactly. `record_read` checks membership here before it asks.
     ///
     /// Maintained at every place a pin enters or leaves: `insert_workspace` (including its eviction
     /// of a recycled slot), `remove_workspace`, [`State::pin`] (a lazy pin) and [`State::repin`].
     /// Debug builds re-derive it by brute force at each of those places ([`State::audit_pins`]), as
     /// they do `txn_refs`.
     pins: BTreeMap<u64, u32>,
-    /// Every row with an entry that the next rise of the horizon could free, keyed
-    /// `(the entry just after the row's oldest reachable one, tbl, row)`.
+    /// Every retained non-newest entry, keyed by its value `h`: `h -> (tbl, row, s)`, where `s` is
+    /// the version that superseded it. The key is unique: every applied op gets its own seq.
     ///
-    /// When the oldest pin leaves, draining this from the front finds every row that now holds
-    /// something unreachable, and no other row. Without it, freeing would wait for each row's next
-    /// publish, and a row nobody writes again would keep what the sealed pin read.
+    /// Invariant: each entry has a live pin in `[h, s)`, or lies in a `pending` interval that has
+    /// not been swept yet. This index is what lets a departure find the entries it may have
+    /// orphaned without scanning every row.
+    readers: BTreeMap<u64, (u32, u64, u64)>,
+    /// Per row, how many entries still sit in its `Vec` although they have left `readers`.
     ///
-    /// A row's unreachable prefix is dropped only once it is at least half the row's vector
-    /// (`trim_history`). A drain therefore never moves more entries than it frees: amortised O(1)
-    /// moves per entry freed, plus O(log n) for the index.
-    trimmable: BTreeSet<(u64, u32, u64)>,
+    /// Taking an entry out of the middle of a row one at a time would cost O(len) per removal,
+    /// and a hot row read by many live pins would pay O(live pins) each time. So the row is
+    /// compacted only once its garbage reaches half its length, and the capacity is returned then.
+    /// That is O(1) moves per entry freed, amortised.
+    ///
+    /// A garbage entry never changes a live pin's answer. The newest version at or below a live pin
+    /// is always retained, and nothing retained lies between it and the pin.
+    garbage: std::collections::HashMap<(u32, u64), u32>,
+    /// Intervals `(lo, hi]` of `readers` keys still to be re-tested, disjoint, keyed by `lo`.
+    ///
+    /// A departure adds `(a, p]` and sweeps at most `DEPARTURE_SWEEP_BUDGET` entries. Every publish
+    /// sweeps `PUBLISH_SWEEP_BUDGET` more. So the work under the state lock is bounded per
+    /// operation, however many entries the departing pin read. With no publish and no departure,
+    /// what is queued waits.
+    pending: BTreeMap<u64, u64>,
+}
+
+/// Entries one pin departure may re-test while it holds the state lock (Amendment 10, decision 3).
+/// The rest of its range waits in `HistoryRetention::pending`.
+const DEPARTURE_SWEEP_BUDGET: usize = 4096;
+
+/// Entries every publish re-tests from `pending`, so the queue drains under ordinary merge traffic.
+const PUBLISH_SWEEP_BUDGET: usize = 2;
+
+/// Give back a row's spare capacity once it is more than twice what the row holds, plus a small
+/// constant so a short row does not reallocate on every change (Amendment 10, decision 2).
+fn release_spare(history: &mut Vec<u64>) {
+    if history.capacity() > 2 * history.len() + 4 {
+        history.shrink_to_fit();
+    }
 }
 
 #[derive(Default)]
@@ -1214,19 +1244,19 @@ impl State {
     /// across the move. It is the second workspace mutator D194 adds beside [`State::pin`], and
     /// `integration_capability_envelope` counts it.
     ///
-    /// Moving the pin moves it in `retention.pins` too. If the pin being replaced was the oldest,
-    /// the horizon rises and whatever only it could read is freed now.
+    /// Moving the pin moves it in `retention.pins` too. If no other branch holds the old value,
+    /// what only it read is swept (`drop_pin`).
     fn repin(&mut self, branch: BranchId, at: Arc<Snapshot>, seq: u64) -> bool {
         let Some(ws) = self.workspaces.get_mut(&branch) else { return false };
         let replaced = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
         ws.fork_snapshot = Some(at);
         ws.fork_seq = seq;
-        // Add before drop, so a re-pin to the same seq never passes through "no pin at all".
+        // Add before drop, so a re-pin to the same seq never passes through "no pin at all", and
+        // the departure's sweep already sees the new pin.
         self.add_pin(seq);
         if let Some(old) = replaced {
             self.drop_pin(old);
         }
-        self.reclaim_history();
         self.audit_pins();
         true
     }
@@ -1237,108 +1267,119 @@ impl State {
     /// `applied` and its index.
     ///
     /// The superseded newest entry is kept only if a live pin reads it (see [`HistoryRetention`]),
-    /// and the row is trimmed against the current horizon on the way out. So a merge loop with no
-    /// live pin holds one entry per row. The work is O(log n) in the pins and the index. An
-    /// out-of-order publish costs O(log H) more to find its insert position. That cannot happen
-    /// with one catalog, because a merge holds `&mut Catalog` from reservation to record.
+    /// so a merge loop with no live pin holds one entry per row. The work is O(log n) in the pins
+    /// and the index, plus `PUBLISH_SWEEP_BUDGET` entries of queued sweep. An out-of-order publish
+    /// costs O(len) more, to insert in the middle. That cannot happen with one catalog, because a
+    /// merge holds `&mut Catalog` from its reservation to its record.
     fn publish_version(&mut self, v: VersionRef) {
         let key = (v.tbl.0, v.row.0);
-        self.unindex_history(key);
         let pins = &self.retention.pins;
         let history = self.version_history.entry(key).or_default();
-        match history.last() {
-            Some(&newest) if newest < v.begin_ts => {
-                // `v` supersedes `newest`. A pin in `[newest, v)` reads it; any other pin, and
-                // every pin taken from now on, reads something else.
-                if pins.range(newest..v.begin_ts).next().is_none() {
+        match history.last().copied() {
+            Some(newest) if newest < v.begin_ts => {
+                // `v` supersedes `newest`. The live pins in `[newest, v)` read it; any other pin,
+                // and every pin taken from now on, reads something else.
+                if pins.range(newest..v.begin_ts).next().is_some() {
+                    self.retention.readers.insert(newest, (key.0, key.1, v.begin_ts));
+                } else {
                     history.pop();
                 }
                 history.push(v.begin_ts);
+                release_spare(history);
             }
             _ => {
+                // Out of order (two catalogs only). Its interval is taken as `[v, next retained)`,
+                // which can only be longer than the true one, so the error is over-retention.
                 let at = history.partition_point(|&s| s < v.begin_ts);
                 if history.get(at) != Some(&v.begin_ts) {
                     history.insert(at, v.begin_ts);
+                    if let Some(&next) = history.get(at + 1) {
+                        if pins.range(v.begin_ts..next).next().is_some() {
+                            self.retention.readers.insert(v.begin_ts, (key.0, key.1, next));
+                        } else {
+                            *self.retention.garbage.entry(key).or_insert(0) += 1;
+                        }
+                    }
                 }
             }
         }
         self.versions.insert(key, v);
-        let horizon = self.history_horizon();
-        self.trim_history(key, horizon);
+        self.sweep_pending(PUBLISH_SWEEP_BUDGET);
     }
 
-    /// The horizon a trim may use: the oldest live pin, or `u64::MAX` when there is none. At
-    /// `u64::MAX` only each row's newest entry is kept. That answers every pin taken from then on,
-    /// because such a pin is at or above every `begin_ts` already published.
-    ///
-    /// It only ever rises, except when it leaves `u64::MAX` for a first pin, and at `u64::MAX` no
-    /// row is indexed. A new pin is at or above every published `begin_ts`, so it cannot be older
-    /// than a live one; an inherited pin copies a live one.
-    fn history_horizon(&self) -> u64 {
-        self.retention.pins.keys().next().copied().unwrap_or(u64::MAX)
+    /// **Amendment 10, decision 1 — a pin value has left** (its count reached 0). The entries that
+    /// can have lost their last reader have `h` in `(a, p]`, with `a` the next lower live pin, or 0
+    /// when there is none. An entry with `h ≤ a` still contains `a`. Queue that range and sweep a
+    /// bounded amount of the queue now (decision 3). This departure's own work is the entries it
+    /// read that `a` does not, and what exceeds `DEPARTURE_SWEEP_BUDGET` waits for later sweeps.
+    fn on_pin_departed(&mut self, p: u64) {
+        let below = self.retention.pins.range(..p).next_back().map(|(&a, _)| a).unwrap_or(0);
+        self.add_pending(below, p);
+        self.sweep_pending(DEPARTURE_SWEEP_BUDGET);
     }
 
-    /// Where a row's reachable part starts, at `horizon`. That is the index of the newest entry at
-    /// or below it, which is the oldest entry any live pin can read. It is 0 when every entry is
-    /// above it.
-    fn reachable_from(history: &[u64], horizon: u64) -> usize {
-        history.partition_point(|&s| s <= horizon).saturating_sub(1)
-    }
-
-    /// Take one row out of `retention.trimmable`, recomputing the key it was filed under at the
-    /// current horizon. The recomputation gives the same key because an indexed row's key was
-    /// computed at the horizon now in force. `reclaim_history` re-files every row whose key the
-    /// last rise passed, and a key it did not pass names the same entry at both horizons.
-    fn unindex_history(&mut self, key: (u32, u64)) {
-        let horizon = self.history_horizon();
-        let next = self.version_history.get(&key).and_then(|h| {
-            h.get(Self::reachable_from(h, horizon) + 1).copied()
-        });
-        if let Some(next) = next {
-            self.retention.trimmable.remove(&(next, key.0, key.1));
+    /// Queue `(lo, hi]` for sweeping, merged with every queued interval it overlaps or touches, so
+    /// the queue holds disjoint intervals and no entry is queued twice.
+    fn add_pending(&mut self, mut lo: u64, mut hi: u64) {
+        if lo >= hi {
+            return;
         }
-    }
-
-    /// Drop one row's entries that no pin at or above `horizon` can read, meaning everything older
-    /// than the newest entry at or below it. Then file the row again. The row must already be out
-    /// of `trimmable` (see `unindex_history`).
-    ///
-    /// The unreachable prefix is dropped only once it is at least half the vector. Draining from
-    /// the front moves every entry that stays, so dropping it eagerly would cost O(entries kept) on
-    /// every rise of the horizon. Waiting until the drain frees at least as many entries as it
-    /// moves makes the cost amortised O(1) per entry freed. The price is holding at most as many
-    /// dead entries as live ones. A dead entry is still a real version, so leaving it answers
-    /// nothing wrongly: every `seen_through` that `record_read` lets through is a live pin, at or
-    /// above the horizon.
-    ///
-    /// Afterwards the row's key, if any, is above `horizon`, which is what makes
-    /// `reclaim_history`'s drain terminate.
-    fn trim_history(&mut self, key: (u32, u64), horizon: u64) {
-        let Some(history) = self.version_history.get_mut(&key) else { return };
-        let mut from = Self::reachable_from(history, horizon);
-        if from > 0 && 2 * from >= history.len() {
-            history.drain(..from);
-            from = 0;
-        }
-        if let Some(&next) = history.get(from + 1) {
-            self.retention.trimmable.insert((next, key.0, key.1));
-        }
-    }
-
-    /// Free every entry that only a departed pin could read. Called wherever the oldest pin can
-    /// rise: a pinned workspace removed, or a pin moved.
-    ///
-    /// Each row taken from the index has at least one more entry fall out of reach. So the cost is
-    /// O(log n) per entry freed, plus the amortised drain in `trim_history`. A seal that did not
-    /// raise the horizon takes nothing.
-    fn reclaim_history(&mut self) {
-        let horizon = self.history_horizon();
-        while let Some(&(next, tbl, row)) = self.retention.trimmable.first() {
-            if next > horizon {
-                break;
+        let touching: Vec<u64> = self
+            .retention
+            .pending
+            .range(..=hi)
+            .rev()
+            .take_while(|&(_, &h)| h >= lo)
+            .map(|(&l, _)| l)
+            .collect();
+        for l in touching {
+            if let Some(h) = self.retention.pending.remove(&l) {
+                lo = lo.min(l);
+                hi = hi.max(h);
             }
-            self.retention.trimmable.pop_first();
-            self.trim_history((tbl, row), horizon);
+        }
+        self.retention.pending.insert(lo, hi);
+    }
+
+    /// Re-test up to `budget` queued entries, front of the queue first. An entry is freed when no
+    /// live pin lies in `[h, s)`, which is a local test and exact whatever pins came and went since
+    /// it was queued: a pin taken later is at or above `s`.
+    fn sweep_pending(&mut self, mut budget: usize) {
+        use std::ops::Bound::{Excluded, Included};
+        while budget > 0 {
+            let Some((&lo, &hi)) = self.retention.pending.first_key_value() else { return };
+            let next = self
+                .retention
+                .readers
+                .range((Excluded(lo), Included(hi)))
+                .next()
+                .map(|(&h, &(tbl, row, s))| (h, (tbl, row), s));
+            self.retention.pending.remove(&lo);
+            let Some((h, key, s)) = next else { continue };
+            budget -= 1;
+            if h < hi {
+                self.retention.pending.insert(h, hi);
+            }
+            if self.retention.pins.range(h..s).next().is_none() {
+                self.free_entry(h, key);
+            }
+        }
+    }
+
+    /// `h` has no reader left. Take it out of `readers` and count it as its row's garbage. Once
+    /// that garbage is half the row, compact the row to its newest entry plus what `readers` still
+    /// holds, and give back the capacity. Amortised, that is O(1) moves per entry freed.
+    fn free_entry(&mut self, h: u64, key: (u32, u64)) {
+        self.retention.readers.remove(&h);
+        let Some(history) = self.version_history.get_mut(&key) else { return };
+        let garbage = self.retention.garbage.entry(key).or_insert(0);
+        *garbage += 1;
+        if 2 * (*garbage as usize) >= history.len() {
+            let newest = history.last().copied();
+            let readers = &self.retention.readers;
+            history.retain(|e| Some(*e) == newest || readers.contains_key(e));
+            release_spare(history);
+            self.retention.garbage.remove(&key);
         }
     }
 
@@ -1353,6 +1394,7 @@ impl State {
             Some(n) if *n > 1 => *n -= 1,
             Some(_) => {
                 self.retention.pins.remove(&seq);
+                self.on_pin_departed(seq);
             }
             // Loud in debug, and a no-op in release. An over-count keeps history longer than it
             // is needed. An under-count removes a live pin's value from the index: the history can
@@ -1444,23 +1486,18 @@ impl State {
         let olds: Vec<Workspace> =
             displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
         // A pinned workspace enters `retention.pins` with the workspace. The pins of displaced
-        // workspaces leave in the same call, and anything only they could read is freed.
+        // workspaces leave in the same call, and `drop_pin` sweeps what only they could read.
         let pinned_at = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
         self.workspaces.insert(branch, ws);
         if let Some(seq) = pinned_at {
             self.add_pin(seq);
         }
-        let mut released = false;
         for old in olds {
             self.drop_txn_refs(&old);
             if old.fork_snapshot.is_some() {
                 self.drop_pin(old.fork_seq);
-                released = true;
             }
             forget_captures_unless_published(self, &old);
-        }
-        if released {
-            self.reclaim_history();
         }
         self.audit_txn_refs();
         self.audit_pins();
@@ -1543,14 +1580,14 @@ impl State {
     /// `capture_is_protected` a question about the workspaces that REMAIN — the same thing the
     /// scan meant when it ran after `BTreeMap::remove` had already taken this one out.
     ///
-    /// A pinned workspace takes its pin out of `retention.pins`. If that was the oldest pin, the
-    /// history only it could read is freed here. Freeing does not wait for each row's next publish.
+    /// A pinned workspace takes its pin out of `retention.pins`. If no other branch holds that
+    /// value, `drop_pin` sweeps what only it read, whatever its age: freeing does not wait for the
+    /// oldest pin, nor for each row's next publish.
     fn remove_workspace(&mut self, branch: &BranchId) -> Option<Workspace> {
         let ws = self.workspaces.remove(branch)?;
         self.drop_txn_refs(&ws);
         if ws.fork_snapshot.is_some() {
             self.drop_pin(ws.fork_seq);
-            self.reclaim_history();
         }
         self.audit_txn_refs();
         self.audit_pins();
@@ -6434,6 +6471,12 @@ impl AgentRuntime {
              {reserved:?})"
         );
         let mut written: Vec<WriteRecord> = Vec::new();
+        // **D194, Amendment 10 (C2): nothing in this pass can fail.** The author stamps are the one
+        // fallible call here, and they come after every version, valued write, capture and merge
+        // record is in memory. When a stamp sat inside this loop and failed, the publish had
+        // already committed, so the rows were visible and the later versions unnamed: an exact read
+        // of such a row named the version before it, and nothing refused that read.
+        let mut stamps: Vec<(u32, u64)> = Vec::new();
         let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
@@ -6497,10 +6540,7 @@ impl AgentRuntime {
                 if seen.is_empty() {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
-                // Authorship of the published row, kept past `seal` AND past the process
-                // (exit criterion 9). This is the write that makes `who_wrote_row` durable.
-                self.prov_store
-                    .stamp_row(op.tbl.0, op.row.0, snapshot.prov)?;
+                stamps.push((op.tbl.0, op.row.0));
             }
         }
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
@@ -6546,6 +6586,12 @@ impl AgentRuntime {
             merge_id.to_string(),
             MergeRecord { branch, txns: vec![txn] },
         );
+        // Authorship of each published row, kept past `seal` AND past the process (exit criterion
+        // 9). This is the write that makes `who_wrote_row` durable. Last, so that a failure here
+        // leaves authorship incomplete and nothing else.
+        for (tbl, row) in stamps {
+            self.prov_store.stamp_row(tbl, row, snapshot.prov)?;
+        }
         Ok(())
     }
 
@@ -9469,6 +9515,49 @@ mod tests {
         let h = &st.version_history[&(1, 1)];
         assert_eq!(h.len(), 1, "no pin left: the newest entry alone");
         assert!(h.capacity() <= 6, "row 1 keeps capacity {} for one entry", h.capacity());
+    }
+
+    /// **W4: a departure re-tests at most `DEPARTURE_SWEEP_BUDGET` entries under the lock, and the
+    /// rest of its range is finished by later publishes** (Amendment 10, decision 3). One pin reads
+    /// an old version of `DEPARTURE_SWEEP_BUDGET + 100` rows, then departs.
+    ///
+    /// Mutant-only red: it names the new fields and the budget. M28 (no budget) leaves 0 in
+    /// `readers` after the departure, and M29 (no sweep at publish) leaves 100 after the publishes.
+    #[test]
+    fn version_history_departure_sweep_is_chunked_and_finishes_under_later_publishes() {
+        let n = DEPARTURE_SWEEP_BUDGET as u64 + 100;
+        let mut st = State::default();
+        for row in 1..=n {
+            publish_next(&mut st, row);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for row in 1..=n {
+            publish_next(&mut st, row);
+        }
+        assert_eq!(
+            st.retention.readers.len() as u64,
+            n,
+            "fixture: the pin should read one old version of every row"
+        );
+        assert!(st.remove_workspace(&BranchId::new(7, 0)).is_some(), "fixture: b_7 not live");
+        assert_eq!(
+            st.retention.readers.len(),
+            100,
+            "the departure re-tested a number of entries other than DEPARTURE_SWEEP_BUDGET under \
+             the lock"
+        );
+        assert!(!st.retention.pending.is_empty(), "the rest of the departure's range was not queued");
+        for _ in 0..50 {
+            publish_next(&mut st, n + 1);
+        }
+        assert!(
+            st.retention.readers.is_empty(),
+            "{} entries read by nobody are still indexed after 50 publishes",
+            st.retention.readers.len()
+        );
+        assert!(st.retention.pending.is_empty(), "the queue did not drain");
+        assert_eq!(held(&st) as u64, n + 1, "one entry per row once the sweep has finished");
     }
 
     /// A provenance store whose `fail_at`-th `stamp_row` fails. Everything else is the in-memory
