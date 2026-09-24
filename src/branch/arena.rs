@@ -1871,7 +1871,9 @@ impl ArenaPageStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(FerroError::Io(e.to_string())),
         };
-        dm.reserve_from(Self::base_page_in_state(&bytes)?)
+        // MUTANT (fire-check only, never land): the floor is the file's high-water mark, not the checkpoint's base.
+        Self::base_page_in_state(&bytes)?;
+        dm.reserve_from(dm.high_water()?)
     }
 
     /// Read `base_page` out of a checkpoint image, without loading it.
