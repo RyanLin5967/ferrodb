@@ -289,3 +289,109 @@ timeout 1800 target/release/examples/d16_chain_retention 1,10,100 2 fanout,chain
 timeout 14400 target/release/examples/d16_chain_retention 1000 2 fanout,chain,overwrite
 timeout 7200 python3 bench/d16_chain/firecheck.py
 ```
+
+---
+
+## Amendment 2 — 2026-09-24, after a fresh-context review; committed before the change it describes
+
+Still nothing compiled or run. A read-only reviewer traced all 63 cells of A1.6 (7 mutants × 9 cells)
+through source at `e7acf39` and found every registration correct. It also found no compile error
+against the real signatures. Neither statement is a build. Its findings, each re-checked against
+source before acting, change the following.
+
+### A2.1 Two of my own claims, corrected where they were made
+
+- **A1.1 named the wrong mechanism.** The ordering rule (census before the drain probe) is right,
+  but the column it protects is **after_leaf**, not retained. During sweep 1 every parked page is
+  pinned by the live leaf, so an early probe releases nothing there, and under a skipped-drain defect
+  (M2) the sweep-1 cells still MATCH. What an early probe would hide is sweep 2: it would zero
+  after_leaf_* under M2.
+- **A1.2 overstated G7.** Every early return in `drain_pending_seeded` propagates out of `reap`
+  (`reaper.rs`, the `?` on `drain_pending_seeded`). `reap_if_still_expired` then turns it into
+  `Refused`, which G3 and G3b catch first. G7 therefore catches only residue in `deferred` by a route
+  that does not error, such as a drain that never disarms (M7). M7 proves G7 reads `deferred`. It does
+  not prove G7 catches the early-return case A1.2 named, which G3 masks.
+
+### A2.2 Each half of a two-part guard gets its own id
+
+So that a fire-check can prove WHICH half fired:
+
+| id | condition | id | condition |
+|---|---|---|---|
+| G1 | P·D pages written | **G1b** | survivor depth is D (chain, overwrite) or 1 (fanout) |
+| G2 | page counter = enumeration | **G2b** | reserved counter = sum of live extent sizes |
+| G3 | each sweep reaped exactly its expected set | **G3b** | `refused_reaps() == 0` |
+| G4 | every doomed id reads Reaped after sweep 1 | **G4b** | the survivor reads Live after sweep 1 |
+
+G7 is also checked after the sweep-1 probe, so residue from that probe is labelled with its own
+phase rather than with sweep 2's. Every A1.6 row keeps its meaning under the split: M4 fires G2
+(pages), M5 fires G1 (written) and G6, M6 fires G3 and G4 (doomed).
+
+### A2.3 Six more mutants, each injected inside the measured path
+
+Anchors were checked with `git grep -nF` at `9aa6968`: one hit each in the named file. Arguments
+are as in A1.6. Notation as in A1.6.
+
+| # | mutant (file, anchor) | what it removes | `fanout` | `chain` | `overwrite` |
+|---|---|---|---|---|---|
+| M8 | `reaper.rs` `drain_pending_seeded`: `self.sweep_touched_extents(&guard.touched)?;` dropped | the drain's own extent sweep | = | D=1 `=`; D=3,10 **M** after_leaf_orphans | as chain |
+| M9 | `arena.rs` `retire_arenas_by_rule`: park only if not a recorded shadow BASE (`shadow_base` values) | **negative control for chain == overwrite**: a rule that sees supersession | = | = | D=1 `=`; D=3,10 **M** retained_pages, retained_reserved, retained_extents, pending |
+| M10 | `record.rs` `fork_child_parts`: `depth = parent_depth` | depth (G1b) | **N** G1b | **N** G1b | **N** G1b |
+| M11 | `arena.rs` `free_arena`: `reserved_pages.fetch_sub` dropped | the reserved counter (G2b) | **N** G2b | **N** G2b | **N** G2b |
+| M12 | `reaper.rs` `reap_if_still_expired`: `Ok(_) => Ok(ReapOutcome::Reaped)` becomes `refuse(..)` | a reap that happens but reports refused (G3b) | **N** G3, G3b | **N** G3, G3b | **N** G3, G3b |
+| M13 | `table_catalog.rs` `release_id`: `if reusable {` → `if false && reusable {` | every id-slot release | = | = | = |
+
+Notes, INFERRED from reading:
+- **M8.** The drain releases every interior page in sweep 2 but leaves the emptied extents. The
+  harness's collector, which runs before the census, frees them, so after_leaf_orphans = 2(D−1) and
+  the census reads 0.
+- **M9's exact retained counts.** Only the key set above is registered and checked. The counts are
+  D=3: 2 pages, D=10: 10 pages, against 4 and 18. `MAX_CHAIN_DEPTH` = 8 stops the level-10 copy
+  recording a base, and each release drops the released page's own `shadow_base` key, so under
+  deepest-first reaping every other level is left parked.
+- **M10.** Depth is read only by `expired_candidates`' sort, whose fork-epoch tiebreak is still
+  deepest first in a chain, so the retention cells would MATCH if G1b did not fire.
+- **M13.** No page changes. It is judged on the slot line (A2.4).
+
+### A2.4 What the fire-check script judges, beyond the verdict cells
+
+- **G0.** Every mutant run must print `build=DIRTY` on every verdict line and exit 2. Each baseline
+  must print `build=clean` and exit 0. This fire-checks the run-level G0 and proves every mutant
+  binary was built from the mutated tree.
+- **The chain == overwrite comparison.** Expected per D: `eq` (a `compare` line saying equal),
+  `differ {keys}`, or `absent` (no line, because a cell failed a guard).
+  - M0, M1, M2, M3, M8, M13: `eq` at every D.
+  - M4, M5: `eq` at D=1, `absent` at D=3,10.
+  - M6, M7, M10, M11, M12: `absent` at every D.
+  - M9: `eq` at D=1; `differ` {retained_pages, retained_reserved, retained_extents, pending} at D=3,10.
+- **The slot line.** A baseline passes if it matches EITHER registered tree state from A1.4: main
+  lineage (chain and overwrite 1, fanout D) or D200 (D everywhere). The script prints which one.
+  M13 must read 0 in every cell.
+
+### A2.5 Blind spots that remain, and why
+
+No single-anchor mutant I found inside the path can fire these in this fixture:
+- **the sweep-1 `extra_drain` and `orphans`.** After sweep 1, every chain page is pinned by the live
+  leaf, and fanout's reaps free whole extents. So nothing is reclaimable-but-parked, and no extent is
+  empty-and-ownerless.
+- **`survivor_pages`.** It would need a page attributed to the wrong owner.
+- **G4b.** Every path that reaps the survivor in sweep 1 goes through the deadline index and trips
+  G3 first.
+- **G5 and G8.**
+
+### A2.6 Script safety
+
+Fixes to what the review found:
+- SIGTERM and SIGHUP now unwind through `finally`. Before this, `timeout` sent SIGTERM and left the
+  mutant in `src/`.
+- Output goes to a fresh `bench/d16_chain/firecheck/<head>-<utc>/`, and the script refuses if that
+  directory exists. Before this, a re-run overwrote uncommitted raw files, or dirtied committed
+  ones, which made `M0-baseline-after` fail by construction.
+- Before every mutant, the file must equal its HEAD blob, and `src/` and `examples/` must be clean.
+  Before this, cleanliness was checked once.
+- cargo and the harness run in their own process group, and a timeout kills the whole group, so
+  no orphaned `rustc` keeps writing to `target/`.
+- The script refuses unless cwd is the repository top level, and it never creates `build.rs`.
+
+Registered command: `timeout 14400 python3 bench/d16_chain/firecheck.py` (13 mutant rebuilds plus
+two baselines).
