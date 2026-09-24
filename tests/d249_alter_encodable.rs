@@ -367,3 +367,41 @@ fn a_plan_held_across_a_change_to_its_own_table_is_refused() {
         "the stale plan was refused, but the table no longer has its column v with its index"
     );
 }
+
+/// The as-read check covers the SCHEMA: a plan held across another ALTER of the same table must be
+/// refused, not laid over it.
+///
+/// ST's intervening change is an index, which leaves the schema alone, so ST cannot tell a
+/// comparison that includes the schema from one that overwrites it first. Here the intervening
+/// change is a schema change that moves no root and no index, and a plan that rewrites rows, so a
+/// stale apply would install `[id, v, y]` over the `[id, v, x]` the table now has.
+#[test]
+fn a_plan_held_across_another_alter_of_its_own_table_is_refused() {
+    let mut db = Db::with_one_row();
+    let add_y = AlterAction::AddColumn(Column::new("y".to_string(), DataType::Integer, true));
+    let plan = db.catalog.plan_alters("t", std::slice::from_ref(&add_y), &db.txn, None).unwrap();
+
+    // The table changes while the plan is held: another column, by another statement.
+    db.exec("ALTER TABLE t ADD COLUMN x INTEGER;").unwrap();
+
+    match db.catalog.apply_plan(plan, &db.txn) {
+        Err(FerroError::Constraint(msg)) => assert!(
+            msg.contains("changed since"),
+            "the stale plan was refused, but not by the staleness check: {msg}"
+        ),
+        Err(e) => panic!("the stale plan was refused for some other reason: {e:?}"),
+        Ok(_) => panic!("a plan made before another ALTER of the same table was applied over it"),
+    }
+    let names: Vec<String> =
+        db.catalog.get_table("t").expect("the table is still there").schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["id".to_string(), "v".to_string(), "x".to_string()], "the table's shape moved");
+    match db.exec("SELECT * FROM t;") {
+        Ok(Outcome::Rows(rows)) => assert_eq!(
+            rows,
+            vec![vec![Value::Integer(1), Value::Integer(7), Value::Null]],
+            "the row no longer reads back as (1, 7, NULL) under [id, v, x]"
+        ),
+        Ok(_) => panic!("SELECT after the refusal returned something other than rows"),
+        Err(e) => panic!("SELECT after the refused stale plan failed: {e}"),
+    }
+}
