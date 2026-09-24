@@ -842,7 +842,8 @@ fn scan_once(
     // passes, so each is reported against what was last reported rather than against this pass.
     let unreadable = reaper.unreadable_owners();
     let seen = counters.reported_unreadable.swap(unreadable, Ordering::SeqCst);
-    if unreadable > seen {
+    // MUTANT (fire-check only, never land): the readings reach no reader.
+    if unreadable > seen && false {
         out(format!(
             "lease: {} orphan-sweep verdict(s) could not read the owning branch's record, so \
              those extents were NOT freed. Nothing is lost; the space stays charged. A healthy \
@@ -854,7 +855,7 @@ fn scan_once(
     }
     let foreign = reaper.foreign_arenas_skipped();
     let seen = counters.reported_foreign.swap(foreign, Ordering::SeqCst);
-    if foreign > seen {
+    if foreign > seen && false {
         out(format!(
             "lease: {} arena(s) listed under a reaped branch were NOT freed, because the store \
              charges them to a different branch. That is an aliased catalog key: a claim whose \
