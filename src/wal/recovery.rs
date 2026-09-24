@@ -33,15 +33,18 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             )));
         }
     }
-    // **AMENDED 3, item 10a: the store must be this database's.** The log declares its database's
-    // incarnation after every truncation and at the end of every open (`TxnManager::declare_history`);
-    // a store that names another is refused here, before recovery writes anything. Not checked,
-    // stated: a log written before this build, and a crash inside the open that first attaches a
-    // store, before its declaration is written.
+    // **AMENDED 3, item 10a: the store must be this database's.** For a store that holds history,
+    // the log declares its incarnation after every truncation and at an open that finds none
+    // (`TxnManager::declare_history`); a store that names another is refused here, before recovery
+    // writes anything. Not checked, stated: a log with no declaration — written before this build,
+    // or cut by a crash between a truncation and its declaration, whose next open then declares the
+    // store it finds — and a history file copied from a fork of this database, which shares its
+    // incarnation by construction.
     if let (Some(store), Some(declared)) =
         (txn.history_store(), crate::wal::history::declared_incarnation(&records))
     {
         store.adopt_or_check(declared)?;
+        txn.note_history_declared();
     }
     // A log that holds nothing but incarnation declarations has nothing to recover (review of
     // `a71d3ed`, F1): every truncation and every open writes one, and reading one as "recovered"
@@ -194,8 +197,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr(),
-            "ferrodb: {dropped} committed transaction(s) in the log began before it, so their REVERT \
-             history cannot be read back; REVERT of those merges will be refused"
+            "ferrodb: {dropped} committed REVERT history record(s) in the log begin before it and \
+             cannot be read back from it; unless the history store already holds them, REVERT of \
+             those merges will be refused"
         );
     }
     if let Some(store) = txn.history_store() {
@@ -753,11 +757,11 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     dropped_tables.sort_unstable();
     dropped_tables.dedup();
     // D212 (a') AMENDED 3, item 10a (review of `a71d3ed`, F5): the log this open leaves declares the
-    // history's incarnation, whether or not the checkpoint above truncated it. A log a pin kept, or a
-    // crash between a truncation and its declaration, would otherwise carry none, and the next open
-    // could not tell this database's history from another's. A log holding only declarations is not
-    // "recovered" (`recover`), so this costs the next open nothing.
-    txn.declare_history()?;
+    // history's incarnation when the store holds history and the retained log has no declaration,
+    // so a log a pin kept since a store was attached is checked at the next open. A log holding only
+    // declarations is not "recovered" (`recover`), so this costs the next open nothing, and an open
+    // that finds a declaration appends none.
+    txn.declare_history_if_missing()?;
     Ok(OpenedDatabase {
         bp,
         wal,

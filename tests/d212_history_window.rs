@@ -372,3 +372,31 @@ fn a_revert_after_ten_reverts_visits_only_its_plan() {
     );
     assert_eq!(db.qty_of(11), 10, "the last merge was not reverted");
 }
+
+/// **(8), the store's slack (mutant-table refresh at `0d3fbb9`, MA8b):** a merge the store still holds
+/// but the window has left is refused after a restart, by its ordinal. With `W` = 16 a prune runs
+/// once two publishes have been drained since the last one, so after 18 merges the store holds 17
+/// publishes and the oldest of them is outside the window. `exit_8` cannot tell this check from "not
+/// in the store": at W = 2 every drain prunes.
+///
+/// Mutant: `revert_merge` skips the ordinal check for an earlier run's merge — the REVERT goes ahead.
+#[test]
+fn a_merge_the_store_still_holds_but_the_window_has_left_is_refused_after_a_restart() {
+    const W: u64 = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path(), Some(W));
+    db.seed(18);
+    let mut ids = Vec::new();
+    for id in 1..=18 {
+        ids.push(db.merge_one(&format!("s{id}"), &format!("UPDATE inventory SET qty = qty + 1 WHERE id = {id};")));
+        db.txn.checkpoint().unwrap();
+    }
+    let store = db.store.clone().unwrap();
+    let held: Vec<u64> = store.records().iter().filter(|r| r.ordinal > 0).map(|r| r.ordinal).collect();
+    assert!(held.contains(&2), "premise: the store no longer holds the second merge: {held:?}");
+    assert!(held.len() as u64 > W, "premise: the store holds no publish beyond the window: {held:?}");
+
+    let mut db = db.restart();
+    let msg = db.revert_err(&ids[1]);
+    assert!(msg.contains("retention window"), "refused, but not for the window: {msg}");
+}

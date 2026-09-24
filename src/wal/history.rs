@@ -316,6 +316,13 @@ impl HistoryStore {
         &self.path
     }
 
+    /// Whether this store holds any history, durable or queued. A store that holds none has nothing
+    /// to protect, so the log carries no incarnation for it (review of `0d3fbb9`, N2).
+    pub fn holds_history(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        !s.window.is_empty() || !s.queue.is_empty()
+    }
+
     /// The window `W`, in publishes.
     pub fn retention(&self) -> u64 {
         self.retention
@@ -423,6 +430,7 @@ impl HistoryStore {
             Ok(Some((kept, floor))) => {
                 s.window = kept.into_iter().map(|r| (r.hseq, r)).collect();
                 s.floor = floor;
+                s.next_drain_at = QUEUE_DRAIN_BYTES;
                 s.queue.clear();
                 s.queued_bytes = 0;
                 s.image_written = true;
@@ -440,6 +448,7 @@ impl HistoryStore {
                     s.window.insert(r.hseq, r);
                 }
                 s.queued_bytes = 0;
+                s.next_drain_at = QUEUE_DRAIN_BYTES;
                 s.publishes_since_prune = since;
                 s.counters.appends += 1;
                 s.counters.drains += 1;
@@ -582,10 +591,10 @@ impl HistoryStore {
             return Ok(());
         }
         let result = self.drain_locked(&mut s);
-        s.next_drain_at = match &result {
-            Ok(()) => QUEUE_DRAIN_BYTES,
-            Err(_) => s.queued_bytes.saturating_mul(2),
-        };
+        // A success reset the threshold inside the drain, as every successful drain does.
+        if result.is_err() {
+            s.next_drain_at = s.queued_bytes.saturating_mul(2);
+        }
         result
     }
 }
@@ -769,12 +778,13 @@ pub(crate) fn declared_incarnation(records: &[crate::wal::log::LogRecord]) -> Op
 /// (`wal::recovery::recover`) and a snapshot install's re-queue of its redo window, so the two
 /// cannot disagree about what "committed" means.
 ///
-/// **Only transactions whose `Begin` is among `records`** (review of `a71d3ed`, F4 and F9): a
-/// transaction that began before them may have parts before them too, so its record cannot be
+/// **A record whose first part among `records` is not part 0 is DROPPED, not refused** (reviews of
+/// `a71d3ed` F4/F9 and of `0d3fbb9` N1): its leading parts precede `records`, so it cannot be
 /// reassembled here. A snapshot's redo window starts wherever the sender's backup began, and a log
 /// whose truncation raced a transaction (the D253 hazard, closed by its fence) can hold the tail of
-/// one. Such a transaction's history is DROPPED, not refused: refusing would fail every open and
-/// every install for ever. The second value counts the transactions dropped, so a caller can say so.
+/// one. Refusing would fail every open and every install for ever. A transaction whose `Begin`
+/// precedes `records` keeps its history when every part is present: the parts are written at its
+/// commit (item 6), long after its `Begin`. The second value counts the records dropped.
 pub(crate) fn committed_in(
     records: &[crate::wal::log::LogRecord],
 ) -> Result<(Vec<HistoryRecord>, usize), FerroError> {
@@ -782,26 +792,28 @@ pub(crate) fn committed_in(
     use std::collections::{HashMap, HashSet};
     let commit_lsns: HashMap<u64, u64> =
         records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| (r.txn_id, r.lsn)).collect();
-    let begun: HashSet<u64> =
-        records.iter().filter(|r| matches!(r.kind, RecKind::Begin)).map(|r| r.txn_id).collect();
-    let mut dropped: HashSet<u64> = HashSet::new();
-    let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
-        .iter()
-        .filter_map(|r| match (&r.kind, commit_lsns.get(&r.txn_id)) {
-            (RecKind::RevertHistory { .. }, Some(_)) if !begun.contains(&r.txn_id) => {
-                dropped.insert(r.txn_id);
-                None
-            }
-            (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) => {
-                Some((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    if parts.is_empty() {
-        return Ok((Vec::new(), dropped.len()));
+    // (txn, hseq) of every record seen so far, and of those whose first part here was not 0.
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut headless: HashSet<(u64, u64)> = HashSet::new();
+    let mut parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = Vec::new();
+    for r in records {
+        let (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) =
+            (&r.kind, commit_lsns.get(&r.txn_id))
+        else {
+            continue;
+        };
+        let key = (r.txn_id, *hseq);
+        if seen.insert(key) && *part != 0 {
+            headless.insert(key);
+        }
+        if !headless.contains(&key) {
+            parts.push((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()));
+        }
     }
-    Ok((assemble(parts)?, dropped.len()))
+    if parts.is_empty() {
+        return Ok((Vec::new(), headless.len()));
+    }
+    Ok((assemble(parts)?, headless.len()))
 }
 
 /// **Reassemble tag-12 WAL parts into records**, for the open's catch-up.
@@ -1317,5 +1329,23 @@ mod tests {
         assert_eq!(dropped, 1, "the transaction that began before the records was not counted");
         let got: Vec<(u64, u64)> = history.iter().map(|r| (r.hseq, r.commit_lsn)).collect();
         assert_eq!(got, [(2, 50)]);
+    }
+
+    /// **Review of `0d3fbb9`, N1.** A committed transaction whose `Begin` precedes the records but
+    /// whose parts are all among them keeps its history: the parts are written at its commit (item
+    /// 6), so a snapshot window that starts after its `Begin` still carries the whole record.
+    ///
+    /// Mutant: records dropped for a missing `Begin` (the `0d3fbb9` rule) — record 3 is lost.
+    #[test]
+    fn a_transaction_that_began_before_the_records_keeps_a_whole_record() {
+        use crate::wal::log::{LogRecord, RecKind};
+        let records = vec![
+            LogRecord { lsn: 10, prev_lsn: 0, txn_id: 7, kind: RecKind::RevertHistory { hseq: 3, ordinal: 3, part: 0, last: false, bytes: vec![1] } },
+            LogRecord { lsn: 20, prev_lsn: 0, txn_id: 7, kind: RecKind::RevertHistory { hseq: 3, ordinal: 3, part: 1, last: true, bytes: vec![2] } },
+            LogRecord { lsn: 30, prev_lsn: 0, txn_id: 7, kind: RecKind::Commit },
+        ];
+        let (history, dropped) = committed_in(&records).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(history, vec![HistoryRecord { hseq: 3, ordinal: 3, commit_lsn: 30, body: vec![1, 2] }]);
     }
 }

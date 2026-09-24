@@ -254,7 +254,10 @@ fn build(dir: &Path, nrows: i64) -> Server {
     // D212 (a') AMENDED 3, item 4: this harness counts page I/O through a `CountingStorage` under its
     // `DiskManager`, which `open_recovered` cannot take, so it registers REVERT's history store itself,
     // as `open_recovered` does before `recover` (the database is fresh, so there is nothing to
-    // recover). Merges then pay the history's cost here as they do in production.
+    // recover). Merges then pay the history's cost here as they do in production. MEASUREMENT CHANGE:
+    // the history file is not under the `CountingStorage`, so page I/O counts exclude it, while
+    // fsync-based and wall-clock columns include it; numbers taken before this change are not
+    // comparable with later ones.
     txn.attach_history_store(
         ferrodb::wal::history::HistoryStore::open(
             dir.join("main.db.history"),

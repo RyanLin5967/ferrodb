@@ -1,5 +1,10 @@
-//! **D212 (a') AMENDED 2, F6 — the pin on the one gap left open by decision:** a snapshot install
-//! does not carry `<db>.history`.
+//! **D212 (a') snapshots and REVERT history.** AMENDED 3 item 2 made a snapshot ship the history
+//! (`PageStoreSnapshots::with_history`); the tests after `an_install_carries_the_senders_revert_history`
+//! are its exit tests. That first test is AMENDED 2's F6 pin, kept as written and still ignored: it
+//! installs into an engine built WITHOUT a store, which the design now requires, so it cannot pass.
+//! It is superseded by `a_capture_ships_the_queued_history_and_nothing_past_its_end`.
+//!
+//! The pin's original text, for the record:
 //!
 //! `StorePaths` names the page file, the arena image and the branch catalog, and nothing else, so a
 //! follower re-seeded by `InstallSnapshot` (or a node restored from its payload) keeps whatever

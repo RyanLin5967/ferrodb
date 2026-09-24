@@ -104,6 +104,9 @@ fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<Outcome, String> {
 /// benchmark reporting on branch management.
 fn build(dir: &std::path::Path) -> Server {
     std::fs::create_dir_all(dir).unwrap();
+    // MEASUREMENT CHANGE (D212 (a')): every merge now also writes its REVERT history (WAL tag 12,
+    // drained into `<db>.history`), and this harness's fsync, byte and per-phase counters include
+    // those writes. Numbers taken before this change are not comparable with later ones.
     // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
     // carries REVERT's history store and pays for it as production does; a runtime on
     // `TxnManager::new` keeps no durable history. The lock is held for the process's life

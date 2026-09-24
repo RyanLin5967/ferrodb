@@ -178,6 +178,13 @@ pub fn take(
     dir: &Path,
 ) -> Result<BackupHandle, FerroError> {
     std::fs::create_dir_all(dir).map_err(|e| FerroError::Io(format!("create backup dir: {e}")))?;
+    // D212 (a') AMENDED 3 (review of `0d3fbb9`, N8): a REVERT history left by an earlier backup into
+    // this directory describes other pages; `take_with_history` writes this backup's own after this.
+    match std::fs::remove_file(dir.join(HISTORY_IMAGE)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(FerroError::Io(format!("remove a stale backup history: {e}"))),
+    }
 
     // Everything already written must be durable before it can be a replay floor.
     wal.flush()?;
@@ -333,15 +340,18 @@ pub fn restore_with_history(dir: &Path, dest: &Path) -> Result<BackupLabel, Ferr
     let mut wal_path = dest.as_os_str().to_os_string();
     wal_path.push(".wal");
     let wal_path = PathBuf::from(wal_path);
-    if std::fs::metadata(&wal_path).map(|m| m.len() > 0).unwrap_or(false) {
+    // Opened first: a fresh log moves any earlier `<dest>.history` aside (item 10b) before the
+    // restored one is written. A log that already holds records (not a header alone, which an
+    // interrupted restore leaves: review of `0d3fbb9`, N7) is refused.
+    let wal = WalManager::new(wal_path.clone())?;
+    if wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst) > wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(FerroError::Io(format!(
-            "{} holds a log, which belongs to the database this restore would replace; the first open \
-             would replay it over the restored pages. Move it away first",
+            "{} holds log records, which belong to the database this restore would replace; the first \
+             open would replay them over the restored pages. Move it away first",
             wal_path.display()
         )));
     }
     let label = restore(dir, dest)?;
-    let wal = WalManager::new(wal_path)?;
     let (incarnation, floor, records) =
         crate::wal::history::HistoryStore::records_through(&bytes, label.end_lsn)?;
     let history = crate::wal::history::HistoryStore::path_for_database(dest);
@@ -599,8 +609,9 @@ mod tests {
     /// label's `end_lsn`, replacing whatever history the destination held.
     ///
     /// Mutants: `take_with_history` copies without draining (record 2 is missing); the restore keeps
-    /// records past `end_lsn` (record 3 arrives); the restore merges into the destination's own file
-    /// (record 9 survives).
+    /// records past `end_lsn` (record 3 arrives); the restore declares an incarnation other than the
+    /// restored store's (the declared value differs). Not covered, stated: the label's removal when
+    /// the history write fails (no seam fails `capture` here).
     #[test]
     fn a_restore_keeps_only_the_history_committed_before_the_backups_end() {
         use crate::wal::history::{HistoryRecord, HistoryStore};
@@ -638,15 +649,16 @@ mod tests {
             reopened.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
             reopened.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
         );
-        let mut declared = 0;
+        let mut declared = Vec::new();
         while lsn < end {
             let (r, next) = reopened.read_record(lsn).unwrap();
-            if matches!(r.kind, RecKind::IncarnationDecl { .. }) {
-                declared += 1;
+            if let RecKind::IncarnationDecl { incarnation } = r.kind {
+                declared.push(incarnation);
             }
             lsn = next;
         }
-        assert_eq!(declared, 1, "the restored log does not declare the restored history's incarnation");
+        let restored_incarnation = HistoryStore::open(&dest_history, 8).unwrap().incarnation();
+        assert_eq!(declared, [restored_incarnation], "the restored log does not declare the restored history's incarnation");
 
         // F8: a backup whose history is missing is refused, not restored as "no history".
         std::fs::remove_file(out.join(HISTORY_IMAGE)).unwrap();

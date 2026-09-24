@@ -127,6 +127,12 @@ pub struct TxnManager {
     /// the moment its `Commit` is durable and dropped by its abort. See
     /// [`TxnManager::bind_history`].
     history_bindings: Mutex<HashMap<u64, Vec<HistoryRecord>>>,
+    /// **D212 (a') AMENDED 3, item 10a — whether the retained log already declares the history's
+    /// incarnation**: set when `recover` finds a declaration the store matches, and when
+    /// [`TxnManager::declare_history`] writes one; cleared by every truncation, which discards it. The
+    /// open declares only when it is clear, so an open that changes nothing appends nothing (review
+    /// of `0d3fbb9`, N4).
+    history_declared: std::sync::atomic::AtomicBool,
     /// Open transaction -> every primary-index entry it moved, oldest first. D202.
     ///
     /// Index pages are not logged, so the heap undo in [`TxnManager::abort`] cannot reach them,
@@ -486,7 +492,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), history_declared: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
@@ -933,11 +939,32 @@ impl TxnManager {
     /// image or declaration). The open reads the last one back and refuses a store that names another
     /// (`HistoryStore::adopt_or_check`). Nothing without a store. Cost: one fixed-size record (a
     /// u64 payload) and one flush per truncation.
+    ///
+    /// **Only for a store that holds history** (review of `0d3fbb9`, N2): an empty store has nothing
+    /// to protect, and a declaration would leave a log that is otherwise empty with a record.
     pub(crate) fn declare_history(&self) -> Result<(), FerroError> {
         let Some(store) = self.history.get() else { return Ok(()) };
+        if !store.holds_history() {
+            return Ok(());
+        }
         let incarnation = store.incarnation();
         self.wal.append(0, 0, &RecKind::IncarnationDecl { incarnation })?;
-        self.wal.flush()
+        self.wal.flush()?;
+        self.history_declared.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// [`TxnManager::declare_history`], unless the retained log already declares it. The open's call.
+    pub(crate) fn declare_history_if_missing(&self) -> Result<(), FerroError> {
+        if self.history_declared.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.declare_history()
+    }
+
+    /// `recover` found a declaration the store matches.
+    pub(crate) fn note_history_declared(&self) {
+        self.history_declared.store(true, Ordering::SeqCst);
     }
 
     /// Re-declare every known run at the head of the log, after a truncation discarded them.
@@ -2027,7 +2054,8 @@ impl TxnManager {
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
         // And the REVERT history's incarnation (AMENDED 3, item 10a), so the next open can tell this
-        // database's history from another's.
+        // database's history from another's. The truncation discarded any earlier declaration.
+        self.history_declared.store(false, Ordering::SeqCst);
         self.declare_history()?;
         Ok(CheckpointOutcome::Truncated)
     }
