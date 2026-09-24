@@ -457,3 +457,60 @@ primary heap, so the open panics, and every later one does too.
   PATTERNS_ONLY at `650bf70` finds one site per expression (rc 0, 28 expressions). The fire check at `18c647e` refuses
   M24 (0 sites, rc 1), as it must.
 - **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M24, SKIPm, LSNm, TTm and CLRm. M3, M7 and M12 survive.
+
+**Amendment 15 (the D250 re-merge `5a77973`, d250 @ `867d3bc`).** `5a77973` merges D250 review 2's fix (`dd939ab`, `4bc4317`) and its lane §3.12 (`867d3bc`):
+- only the LAST `DropTable` per heap root is completed;
+- any non-`DropTable` DDL record at that root after the DROP (`AlterColumn` included) keeps the table;
+- `attach_runtime` forgets the private `dropped_tables`, every retained `DropTable` whose table the catalog does not name;
+- the open re-declares each such DROP it truncated past (`TxnManager::declare_drop_again`);
+- `completed_drops` becomes `#[cfg(test)]`.
+
+**The one conflict** was in `open_recovered`, resolved as follows:
+- D229's comment on the completion stays. D250's said that D229 does not reclaim a completed DROP's pages, which is
+  false on this tree, where the intent written before the record frees them.
+- D250's new `(logged_drops, completed_drops)` call is taken.
+- D229's `free_pending_frees()` runs first, then D250's re-declarations and its struct literal.
+
+Two D250-side DROP calls now pass `table_pages("t")` as the pages, as the executor does; no assertion changed:
+- test 14, `a_table_dropped_twice_at_one_root_is_completed_once_and_the_database_opens`;
+- `tests/integration_cli_row_authorship_durability.rs::a_drop_completed_at_an_open_that_never_attached_a_runtime_still_forgets_the_tables_authors`.
+
+**D250 test 10, the lead's decision.** Amendment 12 predicted it red here as a ⚖. The lead has since rescoped it
+UPSTREAM (D250 lane §3.12), and D229 did not edit it.
+- **What changed upstream:** the "never hands out any of its three roots" probe pinned the F2 residual LEAK, so it is
+  now two assertions:
+  - a safety property that holds on both trees: no page handed out after the open is named by a live catalog entry,
+    and a live `keep` table with an index gives that property something to alias;
+  - a per-tree leak count, `LEAKED_ROOTS`.
+- **The reason, as amendment 12 gives it:** D229's open-time index reset frees the forgotten table's empty
+  primary-root leaf, a page that nothing names and whose bytes are a B+tree node. That is safe, because every tree is
+  rebuilt at that open.
+- **On this tree `LEAKED_ROOTS` is 2**, the heap and time-travel directory roots. D250 set 3 for its own tree, and 2
+  for this merge was pre-registered by the lead's decision. Setting it is the one line D229 changes in that test.
+- Predicted GREEN here.
+  - The primary root is either handed out by the drain or taken by the rebuild of `keep`'s trees, and so is live. It is
+    not leaked either way.
+  - The two directory roots are type-1 pages that `flush_all` wrote before the failed sync. The reset keeps them.
+
+**D250's re-declared `DropTable` at open does not disturb D229's intent replay** (INFERRED from source):
+- Every intent is decided from the catalog before the re-declaration. It is decided before the open's checkpoint, and
+  the re-declaration comes after it.
+- The re-declared record carries no pages and writes no intent.
+- It names roots whose older records the checkpoint has just truncated, so its recovery skip at a later open covers
+  nothing still logged. A table later created at such a root logs above it and is replayed.
+- At a later open, `logged_drops_the_catalog_missed` completes nothing for it. Its name is not in the catalog, or a
+  re-created table sits at another root, or its DDL follows the record.
+- **Its one effect on D229:** the log is non-empty, so the next open runs the reset and the rebuild. That is D250's
+  stated D216 cost, and safe by the reset's design.
+
+**Mutants.** D250's ALIASm (`lane_d250_drop_logged_run.sh` @ artie-research `7924796`) joins the runner. Its anchor,
+`let kept = txn.checkpoint_after_frees()?;`, has one site here. It is predicted killed by D250's rescoped test 10 and
+by D229's structure checks: a live root freed after the open is reached while its bit is clear. SKIPm is also registered
+against D229's `a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation` as a second candidate killer (D250 lane
+§3.12). That test is already in the `wal::recovery::` target the runner gives SKIPm.
+
+**The GREEN phase and mutant base is `5a77973`:**
+- `wal::recovery::tests_crash_frees::`: 23 run, 23 passed. `wal::recovery::tests::`: all pass (test 10 included).
+  Both predicted.
+- `lane_d229_run.sh` carries **28 mutants**, one site per expression at `5a77973` (PATTERNS_ONLY rc 0, 29 expressions).
+- **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M24, SKIPm, LSNm, TTm, CLRm and ALIASm. M3, M7 and M12 survive.
