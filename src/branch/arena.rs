@@ -2525,6 +2525,8 @@ impl PageStore for ArenaPageStore {
         };
 
         let (arena, start) = self.space.reserve(pages)?;
+        // MUTANT (fire-check only, never land): the catalog is written before the claim record.
+        self.catalog.add_arena(branch, arena)?;
 
         // **D232 — THE MAP'S RECORD FIRST, THEN THE CATALOG, THEN PUBLISH.** A claim makes two
         // things durable: the claim record in `<db>.arena`, which carries the raised arena-id and
