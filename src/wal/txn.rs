@@ -3088,6 +3088,118 @@ use super::*;
         assert!(!owned.contains(&next), "the refused DROP freed page {next} of `t`, which still names it");
     }
 
+    /// A committed delete whose retired slot was rewritten LIVE in the pool before its COMMIT, so the
+    /// release at COMMIT is a page/log mismatch (review 2's Q3). With `block_quarantine`, a directory
+    /// holds the quarantine file's path (`<wal>.release-quarantine`, spelled out here), so the mismatch
+    /// cannot be recorded and stays owed. Returns the committing transaction, its retired slot and
+    /// that path.
+    fn committed_mismatch(block_quarantine: bool) -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, u64, RetiredSlot, PathBuf, tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let quarantine = PathBuf::from(format!("{}.release-quarantine", wal.path.display()));
+        if block_quarantine {
+            std::fs::create_dir(&quarantine).unwrap();
+        }
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t1 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![7; 40])).unwrap();
+        txn.commit(t1).unwrap();
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.delete(rid).unwrap();
+        let retired = txn.retired.lock().unwrap().get(&t2).cloned().unwrap_or_default();
+        assert_eq!(retired.len(), 1, "premise: the delete retired no slot");
+        let r = retired[0];
+        let frame_i = bp.fetch_page(r.page_id).unwrap();
+        {
+            let mut frame = bp.frame_write(frame_i);
+            let mut page = Page::deserialize(frame.data).unwrap();
+            let slot = &mut page.slot_arr[r.slot as usize];
+            assert!(slot.is_retired(), "premise: the deleted slot is not retired");
+            slot.length &= !crate::storage::heap_page::RETIRED;
+            frame.data = page.serialize().unwrap();
+        }
+        bp.unpin_page(r.page_id, true);
+        txn.commit(t2).expect("a commit whose release is a mismatch was reported as failed");
+        (bp, wal, txn, t2, r, quarantine, dir)
+    }
+
+    /// **Review 4's finding 3: a mismatch is recorded once, however often it is found.** A dropped
+    /// mismatch writes no `HeapRelease`, so every open before the log truncates re-derives the release
+    /// and finds it again (`finish_releases`). At `8d492bf` each of those appended another line, so
+    /// the file grew by one per open while anything kept the log.
+    #[test]
+    fn a_mismatch_found_again_is_recorded_once() {
+        let (_bp, _wal, txn, t2, r, quarantine, _dir) = committed_mismatch(false);
+        let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+        let lines = |q: &Path| {
+            std::fs::read_to_string(q)
+                .expect("the mismatch was not recorded")
+                .lines()
+                .filter(|l| l.starts_with(&key))
+                .count()
+        };
+        assert_eq!(lines(&quarantine), 1, "premise: the COMMIT's mismatch was not recorded once");
+        txn.finish_releases(t2, &[r]);
+        assert_eq!(
+            lines(&quarantine),
+            1,
+            "the same mismatch was recorded twice, so the file grows by one line per open until the log truncates"
+        );
+    }
+
+    /// **Review 4's finding 4: a DROP must not discard a mismatch it could not record.** The DROP
+    /// discards the releases owed on the heaps it frees, and then truncates: for a mismatch whose
+    /// quarantine write failed, that truncation removes the only record of it (review 3's decision 6).
+    /// So the DROP retries first, and is refused while such a mismatch is still unrecorded.
+    #[test]
+    fn a_drop_refuses_to_discard_a_mismatch_it_could_not_record() {
+        let (_bp, _wal, txn, t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        let ran = std::cell::Cell::new(false);
+        let e = match txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        }) {
+            Err(e) => e,
+            Ok(()) => panic!("the DROP discarded a mismatch it could not record, and truncated the log that held the only record of it"),
+        };
+        assert!(!ran.get(), "the DROP ran its mutation before it was refused: {e}");
+        assert!(e.to_string().contains("quarantine"), "the DROP was refused, but not for the unrecorded mismatch: {e}");
+
+        std::fs::remove_dir(&quarantine).unwrap();
+        txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("the DROP was refused once the mismatch could be recorded: {e}"));
+        assert!(ran.get(), "the DROP answered Ok without running its mutation");
+        let recorded = std::fs::read_to_string(&quarantine).expect("the DROP's retry did not record the mismatch");
+        let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+        assert!(recorded.lines().any(|l| l.starts_with(&key)), "the quarantine does not record `{key}`:\n{recorded}");
+    }
+
+    /// **Review 4's finding 5: a truncation a pin cancelled is not a truncation.** `WalManager::truncate`
+    /// keeps the log, and answers `Ok`, while a pin is below its end. At `8d492bf` the checkpoint then
+    /// behaved as if it had truncated: it counted no deferral, and it re-appended the schema into the
+    /// kept log, a second copy of every declaration.
+    #[test]
+    fn a_checkpoint_that_a_pin_kept_is_counted_and_replays_nothing() {
+        fn ddl_records(w: &WalManager) -> usize {
+            walk_log(w).iter().filter(|r| matches!(r.kind, RecKind::Ddl { .. })).count()
+        }
+        let (_bp, wal, txn, _catalog, _owned, _dir) = table_to_drop();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let _pin = wal.pin(base).expect("pin the log at its base");
+        let before = ddl_records(&wal);
+        assert!(before >= 1, "premise: the log holds no declaration a truncation would replay");
+        let deferred = deferred_checkpoints();
+        txn.checkpoint().expect("a checkpoint under a pin failed");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+        assert_eq!(ddl_records(&wal), before, "a checkpoint the pin kept replayed the schema into the log, as if it had truncated it");
+        assert!(deferred_checkpoints() > deferred, "a checkpoint the pin kept was not counted as a deferral");
+    }
+
     /// A page file that counts its syncs. Only a checkpoint syncs the page file
     /// (`bp.disk_manager.sync()`), so on one database this counts checkpoint flushes.
     struct SyncCountingFile {
