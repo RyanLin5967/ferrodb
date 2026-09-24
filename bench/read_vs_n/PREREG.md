@@ -625,3 +625,67 @@ fix descriptions:
 | the D216 control smoke (e2) and rebuild pair | A7.1 | no | **yes**: the AFTER half | yes: step (i) |
 
 The lane report's FAN-QUEUE row carries this as its re-run instruction.
+
+**A9, 2026-09-24, before any build or run. The re-review of `7a68d8b..c2d87ac` (artie-research
+`frontier/read_vs_n_rereview.md` @ `70b9237`) returned SOUND-WITH-CAVEATS. Each caveat, and what changes:**
+
+1. **Bands (C1, C3, C4, C9).**
+   * **`boot.rebuild` has ONE band.**
+     * A6's inclusion of `boot.rebuild` in R7's "flat, each ≤ 50 ms" is WITHDRAWN.
+     * A7.1's band stands, with its unit: **0.5–200 ms per RESTART row (one child open)**, `merge` on, BEFORE D216.
+       "Per row" means per child open, not per heap row.
+     * The AFTER half, and the merge-off control, are judged by STATE: `recovered = 0` and `wal B = 24`, the
+       header-only log (`HEADER_SIZE`, `wal/log.rs`). The timer is secondary: `rebuild_us < 1,000`.
+   * **"files-scale" is now a number.** After D216, `recover_us ≤ 5,000` (5 ms) per restart (INFERRED: a stat and a
+     24-byte header read). The BEFORE half is judged by state too: `recovered = 1` and `wal B > 24` in every
+     merge-on row.
+   * **The auto-checkpointing merge's own cost is printed (C1).**
+     * Each MERGE row prints `ckpt ns`, the mean ns of the block's APPLIED, checkpointed merges ("-" when there is
+       none), and `ckpt fsync`.
+     * Pre-registered: **`ckpt ns − ns median` is linear in M**, the retained runs replayed. Its log-log slope over
+       M ∈ [1024, 16384] is in [0.5, 1.2] (INFERRED: the replay appends M records before the flush and the fsyncs).
+     * **Q10's median verdict is about the typical merge, not the amortized cost.** The amortized cost per merge is
+       the median plus (`ckpt ns` − median)/256, which is arithmetic from printed fields. The summary prints it
+       beside the median.
+   * **§3's "parent reopen ≪ child open means process warmth" is RESTATED (C3).** Before D216, with `merge` on, only
+     the child recovers and rebuilds; the child's own checkpoint empties the log, so the parent's reopen cannot.
+     Warmth is therefore judged on `child total − boot.recover − boot.rebuild` against `parent total`, which the
+     summary prints as `child net ms`. After D216 the raw totals compare.
+   * **A7.3's "M5 and H2 hold them flat" is replaced by R1 (C9).** R1's printed `open visits` = N + 1 is the judge.
+     H2 compares that count with the parent's own count; M5 compares live branches, not arenas.
+2. **`orphan-extent` asserts its premise (C6).**
+   * A restored extent's fill is unknown (`arena.rs` `load_state`). The open sweep's `resolve_fill` probes the
+     extent's pages from `next_free` = 0, and stops at the first one that fails to read.
+   * The fire therefore asserts, right after its claim, that the claimed extent's FIRST page does not read through
+     `read_page`: the same probe, the same page. If it reads, the fire panics ("did not inject") rather than
+     passing silently.
+   * **The harness also REFUSES `CURVE_FIRECHECK=orphan-extent` with `merge` on.** Merges free extents, and a
+     recycled extent can hold a stale checksummed page. The restriction was only in the lane doc; it is now in the
+     code.
+3. **The D216 pair and the control are judged by state (C8).** The child prints `recovered` (a new, observing
+   `OpenDatabase::recovered`, copied from `OpenedDatabase::recovered`), and every RESTART row carries it.
+   * control: `recovered = 0` and `wal B = 24`;
+   * before D216, merge on: `recovered = 1` and `wal B > 24`;
+   * after D216: `recovered = 0`.
+4. **The checkpoint flag is cross-checked against state (C7).**
+   * `ckpts` counts APPLIED merges only.
+   * New guard **M6**: on every applied merge, the counter-derived `checkpointed` must equal "`wal.base_lsn`
+     moved". `base_lsn` moves only on truncation, which only a checkpoint performs, and an applied merge's commit
+     guarantees there is something to truncate. A mismatch is NOT A RESULT.
+   * Its fire mode, `wrong-ckpt-flag`, inverts the flag in the comparison. It is a comparison check only.
+5. **The test is independent (C2).** In `tests/read_vs_n_lease_census.rs`:
+   * `open_sweep_visits` is compared with the arenas the TEST claimed (the distinct `ArenaId`s `arena_for` returned)
+     plus trunk's arenas as the CATALOG records them (`get(TRUNK).arenas`). Both are independent of the store's
+     `live_arenas()` list, which the sweep iterates.
+   * `finished` is pinned to AFTER the sweep: when it is first seen ≥ 1, `sweep_visits() == 2 × expected`. The
+     interval is a day, so no third sweep can have begun. This is R3's BEFORE-D209 shape, which the harness's R3 read
+     relies on.
+   * **D209's fix changes it to `1 × expected`** (the first pass sweeps nothing). That change belongs to D209's red
+     test, and the lane report says so.
+   * A7.5's "independently counted" was false for the previous version, and is now true.
+6. **Minor (C10).**
+   * `no-cluster-time` prints NOT A RESULT when it was requested but never injected (the run stopped before the last
+     checkpoint).
+   * The `Fire` enum doc no longer says every mode injects at the call site.
+   * `LeaseStats::finished`'s doc says the pass REACHED the end of `scan_once`, the orphan sweep ATTEMPTED: a sweep
+     that failed is reported and still counts.
