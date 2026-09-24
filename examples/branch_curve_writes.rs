@@ -219,6 +219,10 @@ fn main() {
     // Two handles to ONE catalog, deliberately: `root_page_id` is on the concrete type and not on
     // the `BranchCatalog` trait, and D65's reopen needs the CURRENT root rather than the 1 this
     // was opened with — reopening at a stale root would time the wrong thing.
+    // ⛔ CORRECTED 2026-09-24 (D65 run 4 adversary, `artie-research frontier/d65_run4_adversary.md` §3; lead-verified in
+    // `TableBranchCatalog::open_sidecar` at 9aa6968): `trunk_root` is used ONLY when the file is fresh (`create_with_header`).
+    // A populated sidecar reopens from its header page, so no reopen can time a stale root. The concern above cannot arise,
+    // and the error, if any, was in the measurement's favour. Comment only; the timed code is unchanged.
     let cat_concrete = Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("open catalog"));
     let cat: Arc<dyn BranchCatalog> = cat_concrete.clone();
     let base = pool.disk_manager.high_water().unwrap();
