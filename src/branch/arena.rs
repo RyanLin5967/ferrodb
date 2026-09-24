@@ -1765,7 +1765,7 @@ impl ArenaPageStore {
                         arena,
                         ArenaExtent { arena_id: arena, owner, start_page, page_count, next_free: 0 },
                     );
-                    st.live_order.insert(arena);
+                    // MUTANT (fire-check only, never land): a replayed claim skips the index.
                     st.recycled.insert(arena, Vec::new());
                     // **D85, and for the same reason `load_state` marks every restored extent.**
                     // `next_free` is recorded as 0 here and pages handed out afterwards never
