@@ -423,3 +423,50 @@ Consequences for arm 3, and none changes a prediction's class or band:
    `kill -9` the parent instead of closing it; it is not built.
 3. The per-target suite now contains that branch's tests: 2611 run, passed=2609 failed=2 at `d7891d5` by its own
    report, plus this lane's 5.
+
+**A5, 2026-09-24, before any build or run. The lead's consolidation, applied in full. A4's "`open_database` keeps
+the second half" is WITHDRAWN.**
+
+`cli::open_database` no longer exists (`61ddba9`). `read-vs-n` contains `rollback-index-orphan` at its tip
+`00f4c39` (merged at `b054ad5`). The open path is the shipped one:
+
+* `run_cli` → `open_recovered` (D204), then `run_cli`'s own branch catalog, arena, `.tel`, runtime, `.provenance`,
+  reaper and lease start.
+
+*Arm 3's protocol, as it now stands:*
+
+1. **The measured open is `run_cli` itself.** The restart child calls it on the database, with stdin held by the
+   parent.
+   * Timings are observing-only, taken where each step runs. `open_recovered`'s steps are timed inside it
+     (`BootTimings`: `files`, `recover`, `catalog`, `rebuild`). The rest are timed inside `run_cli`
+     (`cli::OpenTimings`), which leaves a `cli::last_open_report()` behind.
+   * The only code shape changed in `run_cli`: the runtime builder chain is split so that `.provenance` can be
+     timed on its own.
+2. **The first lease pass (R3, now ledger D209) is inside the run by construction.**
+   * A helper thread in the child watches the process-wide `lease_thread::PASSES_FINISHED` and says so on stderr.
+     `LeaseStats::finished` is withdrawn in its favour, because `run_cli`'s lease thread is private to it.
+   * Only then does the parent send `.exit`, and `run_cli` shuts down as it does for a user.
+   * `sweep_visits_at_close` therefore holds both sweeps, and R3's first-pass visits are
+     `sweep_visits_at_close − open_sweep_visits`.
+   * `first_pass_us` is the time from the call into `run_cli` to the end of that pass, less the open's `total`.
+3. **R7, amended (the step names change).** The flat steps are:
+   * `lock`;
+   * `boot.files`, `boot.recover`, `boot.catalog` and `boot.rebuild`. Recovery and the rebuild are now ONE
+     function's steps. `rebuild` is 0 on every clean restart, and covers the rebuild whether it came from the log
+     or from the stale-index marker;
+   * `branch_catalog`, `effect_log`, `runtime`, `provenance`.
+
+   Each is ≤ 50 ms at every N. `arena` (R6) and `lease_start` (R5) keep their linear predictions.
+4. **The parent's own opens are setup, not results.**
+   * The database is CREATED by `run_cli` in a child, so its layout is the binary's. The parent then reopens it
+     with a copy of `run_cli`'s reopen half over `open_recovered`, because `run_cli` hands out no handles and arms
+     1 and 2 need them.
+   * That copy is never timed as a result. Its drift blind spot is written on it: `HarnessDb` in the harness.
+   * A drift cannot mismeasure the restart, which is always `run_cli`. It could make arms 1 and 2 run on a runtime
+     wired differently from the binary's.
+5. H3's live count is read after `run_cli` has returned and released the lock, from a read-only
+   `open_sidecar` of `{db}.branchcat`. It is untimed and O(N).
+
+*Paper-facing scope (F4 is ledger D212).* `State` is rebuilt empty at every open, so walls #12, #17 and #18's Θ(M²)
+over M merges is **per process lifetime**, not per database. M in arm 2 counts merges since the last open, and every
+axis-(ii) number is read that way. Separately, REVERT refuses a merge from before a restart (D212), which is safe.
