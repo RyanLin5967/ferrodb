@@ -10,19 +10,21 @@
 #            must FAIL exactly Ra, Rb, Rc and G6T (the F3 red run, split per case, review 2 G4).
 # - base-G:  f03e25d's src/ with this tip's index.rs and table_catalog.rs test modules spliced in;
 #            index + catalog must FAIL exactly G6T, G2T, G9a, G9b.
-# - control: SUBJECT_SHA, all three selections: zero FAILED lines, a result line and rc=0 in every
+# - base-L:  2b9d2c0's src/, --test lock_order_allowlist: exactly
+#            every_pool_method_that_locks_opens_a_pool_section FAILS (amendment 5).
+# - control: SUBJECT_SHA, all four selections (index, catalog, collateral, lockorder): zero FAILED lines, a result line and rc=0 in every
 #            file, or the run is VOID (exit 2).
 # - mutants: KILLED-AS-REGISTERED when every required killer FAILED and nothing outside
 #            required + optional failed; the pre-registered survivors (U8, V4, V5) are
 #            SURVIVED-AS-REGISTERED when nothing outside their optional set failed. Anything else
 #            (MISMATCH, SURVIVED, COMPILE-FAIL) counts against the run.
 #
-# Blind spots, stated: three selections, not the whole suite. CC (the concurrent arm) is optional
+# Blind spots, stated: four selections, not the whole suite. CC (the concurrent arm) is optional
 # wherever it appears, because it sees a mutant only when the scheduler hits the window.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=f6aa116
+SUBJECT_SHA=f6909db
 OUT=bench/d233/firecheck
 mkdir -p "$OUT"
 
@@ -92,6 +94,7 @@ run_target() { # $1 = label, $2 = index | catalog | collateral
     index)      timeout 1800 cargo test --lib storage::index > "$OUT/$1.index.txt" 2>&1 ;;
     catalog)    timeout 1800 cargo test --lib branch::table_catalog > "$OUT/$1.catalog.txt" 2>&1 ;;
     collateral) timeout 1800 cargo test --test d58_latch_free_descent --test d126_atomic_upsert --test integration_btree_concurrency > "$OUT/$1.collateral.txt" 2>&1 ;;
+    lockorder)  timeout 1800 cargo test --test lock_order_allowlist > "$OUT/$1.lockorder.txt" 2>&1 ;;
   esac
   echo "rc=$?" >> "$OUT/$1.$2.txt"
 }
@@ -136,10 +139,10 @@ verdict() { # $1 label, $2 kill|survivor, $3 required, $4 optional
 ok_verdict() { case "$1" in KILLED-AS-REGISTERED*|SURVIVED-AS-REGISTERED*) return 0 ;; *) return 1 ;; esac; }
 
 # Splice SUBJECT_SHA's test module of $1 into the working copy of $1 (which holds an older src/).
-splice_tests() { # $1 = file
-  timeout 60 python3 - "$1" "$SUBJECT_SHA" <<'EOF'
+splice_tests() { # $1 = file, $2 = "old-counter" to read the pre-amendment-5 counter
+  timeout 60 python3 - "$1" "$SUBJECT_SHA" "${2:-}" <<'EOF'
 import subprocess, sys
-path, sha = sys.argv[1], sys.argv[2]
+path, sha, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 tip = subprocess.run(["git", "show", f"{sha}:{path}"], capture_output=True, text=True, check=True).stdout
 old = open(path).read()
 if path.endswith("index.rs"):
@@ -158,6 +161,10 @@ else:
         return t[:i], t[i:j], t[j:]
 head, _, tail = cut(old)
 _, module, _ = cut(tip)
+if mode == "old-counter":
+    new_name, old_name = "crate::buffer::page_reads::on_this_thread()", "crate::buffer::buffer_pool::page_reads_on_this_thread()"
+    assert module.count(new_name) >= 1, "the counter call to rename is missing"
+    module = module.replace(new_name, old_name)
 open(path, "w").write(head + module + tail)
 EOF
 }
@@ -179,7 +186,10 @@ ok_verdict "$v" || bad=$((bad + 1))
 
 echo "== base-G: f03e25d src/ + this tip's index.rs and table_catalog.rs tests"
 git checkout f03e25d -- src/
-{ splice_tests "$I" && splice_tests "$C"; } || { echo "ABORT: splice failed (base-G)" >&2; restore base-G; exit 3; }
+# This tip's table_catalog tests read the page-read counter as `buffer::page_reads::on_this_thread()`
+# (amendment 5); f03e25d has the same counter as `buffer::buffer_pool::page_reads_on_this_thread()`.
+# The splice renames the call so the spliced tests read the counter f03e25d actually increments.
+{ splice_tests "$I" && splice_tests "$C" old-counter; } || { echo "ABORT: splice failed (base-G)" >&2; restore base-G; exit 3; }
 run_target base-G index
 run_target base-G catalog
 restore base-G
@@ -187,8 +197,16 @@ v=$(verdict base-G kill "a_chain_whose_prev_is_its_next_is_refused_not_waited_on
 echo "base-G: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
+echo "== base-L: src/ at 2b9d2c0 (amendment 5: the page-read counter broke the lock-order scanner)"
+git checkout 2b9d2c0 -- src/
+run_target base-L lockorder
+restore base-L
+v=$(verdict base-L kill "every_pool_method_that_locks_opens_a_pool_section" "")
+echo "base-L: $v" | tee -a "$OUT/summary.txt"
+ok_verdict "$v" || bad=$((bad + 1))
+
 echo "== control: $SUBJECT_SHA"
-for t in index catalog collateral; do run_target control "$t"; done
+for t in index catalog collateral lockorder; do run_target control "$t"; done
 if ! all_ran control || ! all_rc0 control || [ -n "$(failed_names control)" ]; then
   echo "control: VOID (failed: $(failed_names control | tr '\n' ' '); every file needs a result line and rc=0)" | tee -a "$OUT/summary.txt"
   exit 2
@@ -217,8 +235,9 @@ EOF
     bad=$((bad + 1))
     continue
   fi
-  git diff --stat -- "$FILE" > "$OUT/$name.diffstat.txt"
-  for t in index catalog collateral; do run_target "$name" "$t"; done
+  # Not *.txt: the judge globs "$OUT/<label>.*.txt" for target outputs (D237 review 2, N2).
+  git diff --stat -- "$FILE" > "$OUT/$name.diffstat"
+  for t in index catalog collateral lockorder; do run_target "$name" "$t"; done
   git checkout "$SUBJECT_SHA" -- "$FILE"
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: restore of $FILE after $name left a difference" >&2; exit 3; }
   v=$(verdict "$name" "$kind" "$req" "$opt")
