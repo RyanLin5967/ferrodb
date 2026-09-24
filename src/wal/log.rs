@@ -603,12 +603,21 @@ impl WalManager {
         Self::with_storage(Arc::new(file), path)
     }
 
-    /// Open the log on any [`Storage`]. `path` is still carried because callers report it and
-    /// `WalManager::path` is public; nothing here opens it.
+    /// Open the log on any [`Storage`]. `path` is carried because callers report it and
+    /// `WalManager::path` is public. The log itself is never opened through it, but a FRESH log (length
+    /// 0) moves the release quarantine beside `path` aside first (`txn::start_fresh_quarantine`), so
+    /// even a log on simulated storage does real filesystem I/O next to `path`, and a failed move fails
+    /// the log's creation.
     pub fn with_storage(file: Arc<dyn Storage>, path: PathBuf) -> Result<Self, FerroError> {
         let len = file.len().map_err(|e| FerroError::Wal(e.to_string()))?;
 
         let (base_lsn, header_txn_id, format) = if len == 0 {
+            // A fresh log is a new database at this path: its quarantine starts fresh too (review 5's
+            // F6). BEFORE the header (review 6's caveat 2): until the move succeeds the log stays
+            // empty, so every later open retries it rather than taking the old file as current.
+            crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
+                FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
+            })?;
             let mut header = [0u8; HEADER_SIZE];
             header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
@@ -616,10 +625,6 @@ impl WalManager {
             header[16..24].copy_from_slice(&1u64.to_be_bytes());
             pwrite_all(&*file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
-            // A fresh log is a new database at this path: its quarantine starts fresh too (review 5's F6).
-            crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
-                FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
-            })?;
             (INITIAL_LSN, 1u64, VERSION)
         } else {
             let mut header = [0u8; HEADER_SIZE];
