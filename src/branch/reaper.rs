@@ -174,8 +174,10 @@ impl TwoTierReaper {
     /// in `collect_orphans_if_due`. Until D209 that gate was still at `ORPHAN_SWEEP_NEVER`, because
     /// the open sweep calls [`Self::collect_orphaned_extents`] directly, so a second full sweep
     /// began while the caller of `start` was reading the counter. `start` now stamps the gate
-    /// ([`Self::orphan_sweep_finished_at`]), and the first pass adds nothing to `sweep_visits`
-    /// unless the node could not read the lease clock at open. This one is taken inside
+    /// (`orphan_sweep_finished_at`), so the first pass runs no full sweep unless the node could
+    /// not read the lease clock at open. It can still add visits: a reap's narrowed sweep counts
+    /// its own, so a pass that reaps branches whose leases ran out while the node was down is not
+    /// zero. This one is taken inside
     /// [`Self::resume_interrupted_reaps`], before that thread exists, so nothing else can be
     /// sweeping. Observing only: nothing reads it to decide anything.
     pub fn open_sweep_visits(&self) -> u64 {

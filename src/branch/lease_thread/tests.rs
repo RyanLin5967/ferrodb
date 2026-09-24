@@ -1197,8 +1197,9 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
 /// It refuses to pass vacuously in both directions. The open must have visited arenas, because a
 /// sweep over nothing repeats nothing. And the first pass must have FINISHED: `finished` is raised
 /// after `collect_orphans_if_due` returns, so a thread that has not reached its sweep yet cannot
-/// read as one that skipped it. `NEVER` as the interval makes that first pass the only one, which
-/// `stop`'s `finished == 1` then confirms.
+/// read as one that skipped it. Nothing may expire, because a reap's narrowed sweep adds visits of
+/// its own. A second pass, which `NEVER` leaves only a spurious condvar wakeup to cause, cannot
+/// move the count: it lands inside the interval whichever pass or open stamped it, so it skips.
 #[test]
 fn d209_an_open_sweeps_the_live_arenas_once_not_twice() {
     let f = fixture();
@@ -1225,7 +1226,6 @@ fn d209_an_open_sweeps_the_live_arenas_once_not_twice() {
         "the open swept {at_open} arenas over three live branches with pages, so there was no \
          sweep for the first pass to repeat and this test proves nothing"
     );
-    assert_eq!(stats.finished, 1, "exactly one pass must have run under a {NEVER:?} interval");
     assert_eq!(stats.reaped, 0, "fixture: nothing had expired, so no reap may add visits");
     assert_eq!(
         first_pass, 0,
@@ -1277,9 +1277,11 @@ impl RuntimeLock for StandOffGate {
 /// finished. A due-check one millisecond short of an interval from `entered` must NOT sweep; one a
 /// full interval after `after` MUST, and must visit every live arena again.
 ///
-/// Blind spot, stated: a stamp read inside the resume but before its sweep also lands after
-/// `entered`, and on a sweep this small no test can separate it from one read after the sweep.
-/// `start` reads the clock after `with_lock` returns; this pins everything short of that.
+/// Blind spots, stated. A MISSING stamp passes here: the first pass then sweeps and stamps its own
+/// `now`, which lands inside the bracket. The red test above is what catches that. And a stamp
+/// read inside the resume but before its sweep also lands after `entered`; on a sweep this small
+/// no test can separate it from one read after the sweep. `start` reads the clock after
+/// `with_lock` returns, and this pins everything short of that.
 #[test]
 fn d209_the_open_stamp_holds_the_cadence_one_interval_from_the_sweep_and_no_longer() {
     use crate::branch::reaper::ORPHAN_SWEEP_INTERVAL_MS;
@@ -1322,7 +1324,7 @@ fn d209_the_open_stamp_holds_the_cadence_one_interval_from_the_sweep_and_no_long
         held,
         "a due-check one millisecond short of an interval after the open took its lock swept \
          anyway: the stamp predates the open's sweep (read before the resume, at least \
-         {STAND_OFF:?} early here), or is missing. At 10^6 arenas that is the second sweep again."
+         {STAND_OFF:?} early here). At 10^6 arenas that is the second sweep again."
     );
 
     f.reaper.collect_orphans_if_due(after + ORPHAN_SWEEP_INTERVAL_MS).unwrap();

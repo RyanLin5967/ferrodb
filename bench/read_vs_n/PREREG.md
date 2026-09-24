@@ -505,8 +505,9 @@ R3 predicts the double sweep, and for `7a68d8b` it stands: that run is D209's BE
 sweep's cadence when the open's sweep finishes (`LeaseThread::start` → `TwoTierReaper::orphan_sweep_finished_at`,
 read on `scan_once`'s clock after `resume_interrupted_reaps` returns). On any tree that contains it:
 
-* **R3 becomes: first-pass visits = 0 at every N, exactly.** §3's line for that outcome ("the gate IS stamped by the
-  open sweep, and R3 is wrong") then describes the fix, not an error in R3.
+* **R3 becomes: first-pass visits = 0 at every N, exactly**, because this harness's leases are `LeaseDeadline(u64::MAX)`
+  and the first pass reaps nothing. A pass that reaps still adds its reaps' narrowed-sweep visits. §3's line for that
+  outcome ("the gate IS stamped by the open sweep, and R3 is wrong") then describes the fix, not an error in R3.
 * **R9 no longer holds.** The first pass does no O(N) work, so `1st-pass ms` does not grow with N.
 * **Unchanged:** R1, R4–R8 and R10, because the open's own sweep is untouched; R2 as A1 checks it
   (`descents_total = visits_total`), now over one sweep; H5, because the pass still finishes and only skips the sweep.
