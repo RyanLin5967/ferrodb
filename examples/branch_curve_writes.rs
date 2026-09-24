@@ -2500,6 +2500,16 @@ fn read_vs_n_summary(
         // A15.3: which rows L2 can vouch for, and which it cannot.
         let (mut flagged, mut unavailable, mut partly) = (Vec::new(), Vec::new(), Vec::new());
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
+            // A17.2: an H6 row is excluded from every arm-3 value here, for real: it prints only its
+            // N, and the slope anchor `prev` skips it, so no later row's slope is taken from it.
+            if is_h6(r) {
+                println!(
+                    "  {:>8}  H6: NOT A RESULT (stale-index marker at open); its values are in its RESTART and \
+                     RESTART-RAW lines",
+                    r.n
+                );
+                continue;
+            }
             let total = r.get("total_us") as f64 / 1000.0;
             let lease = r.get("lease_start_us") as f64 / 1000.0;
             let (st, sl) = match prev {
@@ -2513,7 +2523,6 @@ fn read_vs_n_summary(
             let hi = [l0, l1].into_iter().filter(|&l| l != u64::MAX).max();
             let readings = [l0, l1].into_iter().filter(|&l| l != u64::MAX).count();
             let l2 = match (hi, load_median) {
-                _ if is_h6(r) => "H6",
                 (Some(h), Some(m)) => {
                     if readings < 2 {
                         partly.push(r.n);
@@ -2551,18 +2560,18 @@ fn read_vs_n_summary(
             prev = Some((r.n, total, lease));
         }
         println!(
-            "  arm 3: the `total` and `lease_start` slopes span the previous row to this one (N {}); both are \
-             REPORTED (A14.2), as are R6 and R8-share (A15.1).",
+            "  arm 3: the `total` and `lease_start` slopes span the previous non-H6 row to this one (N {}); both \
+             are REPORTED (A14.2), as are R6 and R8-share (A15.1).",
             restart_rows
                 .iter()
-                .filter(|r| !r.child.is_empty())
+                .filter(|r| !r.child.is_empty() && !is_h6(*r))
                 .map(|r| r.n.to_string())
                 .collect::<Vec<_>>()
                 .join(" -> ")
         );
         println!(
             "  arm 3: load0/load1 = the child's 1-min load at its start and end; L2 = 1 when the row's larger \
-             reading exceeds 1.5 x the run's median reading ({}), H6 rows left out of the median and printed `H6` \
+             reading exceeds 1.5 x the run's median reading ({}), H6 rows left out of the median and the table \
              (A15.6, the verdict script's rule). The time slopes and R5's magnitude are REPORTED \
              (A14.2); O(N) is judged on R1-R3's integers.",
             load_median.map(|m| format!("{:.2}", m as f64 / 100.0)).unwrap_or_else(|| "-".into())
