@@ -77,7 +77,7 @@ use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
-use crate::storage::index_page::{admit_entry, LEGACY_ENTRY_REMEDY};
+use crate::storage::index_page::{entry_over_bound, entry_too_large, OPEN_TABLE_REMEDY};
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
 
@@ -577,7 +577,23 @@ impl Catalog {
         // `Integer(5)` to `Decimal("5")`, through the same [`Widening`] table.
         let carried = carried_stats(&old_schema, &new_schema, self.stats.get(table))?;
 
-        let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
+        // **D225, review 6 H1: the secondary indexes whose entries the chain widens.** A retype
+        // changes the bytes of every entry in an index on that column, and nothing else rewrites
+        // those entries until crash recovery rebuilds them from the heap, which asks the entry
+        // bound. So `prepare_rewrite` asks it first. Positions are stable through a chain (ADD
+        // COLUMN appends and there is no DROP COLUMN), so a column is retyped exactly when its type
+        // differs between the first shape and the last.
+        let widened: Vec<(String, usize)> = entry
+            .indexes
+            .iter()
+            .filter_map(|i| {
+                let p = old_schema.columns.iter().position(|c| c.name == i.column_name)?;
+                (old_schema.columns[p].data_type != new_schema.columns[p].data_type)
+                    .then(|| (i.column_name.clone(), p))
+            })
+            .collect();
+
+        let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov, &widened)?;
 
         Ok(AlterPlan {
             table: table.to_string(),
@@ -923,6 +939,7 @@ fn prepare_rewrite(
     shapes: &[Schema],
     actions: &[AlterAction],
     prov: Option<&Arc<dyn ProvenanceStore>>,
+    widened: &[(String, usize)],
 ) -> Result<Vec<Prepared>, FerroError> {
     // **A chain that cannot change a single byte of a single row does no heap work at all.**
     //
@@ -960,6 +977,7 @@ fn prepare_rewrite(
         let mut header = [0u8; VERSION_HEADER_SIZE];
         header.copy_from_slice(&tuple.data[..VERSION_HEADER_SIZE]);
         let was = tuple.data.len();
+        let deleted = tuple.version_header()?.end_ts != 0;
         let mut values = tuple.deserialize(&shapes[0])?;
         let key = values.first().cloned();
         // **D225 — every key's primary entry is asked the entry bound here, while nothing has been
@@ -968,15 +986,16 @@ fn prepare_rewrite(
         // known until the heap is written, so every key is asked, and a refusal leaves the table
         // exactly as it was. This build cannot write such a key; an earlier build could.
         if let Some(k) = &key {
-            admit_entry(k, &RecordId::new(0, 0)).map_err(|e| {
+            if let Some(len) = entry_over_bound(k, &RecordId::new(0, 0)) {
                 let shown: String = format!("{k:?}").chars().take(60).collect();
-                FerroError::Constraint(format!(
+                return Err(FerroError::Constraint(format!(
                     "this ALTER would re-point the primary-index entry of the row whose first \
-                     column is {shown}, and that entry is over the B+tree entry bound ({e}). A \
-                     build before D225 could store such a key; this one cannot re-point it. \
-                     Nothing has been written. {LEGACY_ENTRY_REMEDY} Then run the ALTER again."
-                ))
-            })?;
+                     column is {shown}: {}. A build before D225 could store such a key; this one \
+                     cannot re-point it. Nothing has been written. {OPEN_TABLE_REMEDY} Then run \
+                     the ALTER again.",
+                    entry_too_large(len)
+                )));
+            }
         }
 
         let mut converted: Option<Tuple> = None;
@@ -998,6 +1017,25 @@ fn prepare_rewrite(
         }
         if over {
             continue;
+        }
+        // **D225, review 6 H1 — every entry the chain widens is asked the bound here, while
+        // nothing has been written.** Crash recovery rebuilds each secondary index from the heap in
+        // the new shape and refuses an entry over `MAX_ENTRY_BYTES`, so a widening that pushed one
+        // over would leave a database this build wrote and its own recovery will not open. Every
+        // tuple is asked, deleted ones too, because the rebuild indexes every tuple the heap holds.
+        if let Some(k) = &key {
+            for (column, p) in widened {
+                if let Some(len) = entry_over_bound(&(values[*p].clone(), k.clone()), &()) {
+                    let shown: String = format!("{k:?}").chars().take(60).collect();
+                    let state = if deleted { "a deleted row, whose tuple stays" } else { "a live row" };
+                    return Err(FerroError::Constraint(format!(
+                        "this ALTER would widen the entry of the row whose first column is {shown} \
+                         ({state}) in the index on '{table}.{column}': {}. Nothing has been \
+                         written. {OPEN_TABLE_REMEDY} Then run the ALTER again.",
+                        entry_too_large(len)
+                    )));
+                }
+            }
         }
         let mut converted = converted.ok_or_else(|| {
             FerroError::Internal(format!("a rewrite of '{table}' converted a row through no shape"))

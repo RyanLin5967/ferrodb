@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::{admit_entry, LEGACY_ENTRY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::{entry_over_bound, entry_too_large, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -179,6 +179,10 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
 ///
 /// Every write path refuses an entry over `MAX_ENTRY_BYTES`, so this build cannot commit such a
 /// row, but a build before D225 could: its count split admitted any entry that happened to fit.
+/// "Every write path" includes an ALTER that widens an indexed column, whose rewrite writes no
+/// index entry at all and would otherwise leave the heap holding values the rebuild widens: its
+/// `prepare_rewrite` asks the bound of every widened secondary entry first (review 6 H1; before
+/// that, this premise was false).
 /// The rebuild below frees each old tree before refilling a fresh one, table by table, and the
 /// catalog is persisted only at the end. A refusal part-way would leave the in-memory catalog
 /// naming new trees, the persisted one naming freed pages, and the next open freeing them again.
@@ -186,9 +190,11 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
 /// refusal leaves the database exactly as recovery found it. The cost is a second heap scan, at
 /// recovery only.
 ///
-/// The database then does not open until the row is shortened or deleted, which has to happen
-/// through the build that wrote it. That is deliberate: the alternative is admitting an entry for
-/// which a leaf split is not guaranteed to exist.
+/// The database then does not open in this build until the table is repaired with a build that
+/// can still open it, `index_page::RECOVERY_REMEDY`. Deleting the row is not a repair: a deleted
+/// tuple is never purged, and this check reads every tuple the heap holds, as the rebuild does.
+/// That is deliberate: the alternative is admitting an entry for which a leaf split is not
+/// guaranteed to exist.
 fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolManager>, names: &[String]) -> Result<(), FerroError> {
     for name in names {
         let entry = catalog.tables.get(name).expect("name came from this map");
@@ -201,25 +207,32 @@ fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolMana
         for r in hfm.scan() {
             let (_, tuple) = r?;
             let vals = tuple.deserialize(&entry.schema)?;
-            let refuse = |what: &str, e: FerroError| {
+            let refuse = |what: &str, len: usize| {
                 let pk: String = format!("{:?}", vals[0]).chars().take(60).collect();
                 FerroError::Constraint(format!(
                     "cannot rebuild the indexes of '{name}' after recovery: the row with primary key \
-                     {pk} makes {what} that no rebuilt tree admits ({e}). A build before D225 could \
-                     store it. Nothing has been freed or rewritten. {LEGACY_ENTRY_REMEDY} Then \
-                     reopen."
+                     {pk} makes {what} that no rebuilt tree admits: {}. A build before D225 could \
+                     store it. Nothing has been freed or rewritten. {RECOVERY_REMEDY} Then reopen.",
+                    entry_too_large(len)
                 ))
             };
-            admit_entry(&vals[0], &RecordId::new(0, 0)).map_err(|e| refuse("its primary entry", e))?;
+            if let Some(len) = entry_over_bound(&vals[0], &RecordId::new(0, 0)) {
+                return Err(refuse("its primary entry", len));
+            }
             for &col in &secondary {
-                admit_entry(&(vals[col].clone(), vals[0].clone()), &())
-                    .map_err(|e| refuse(&format!("its entry in the index on '{}'", entry.schema.columns[col].name), e))?;
+                if let Some(len) = entry_over_bound(&(vals[col].clone(), vals[0].clone()), &()) {
+                    return Err(refuse(&format!("its entry in the index on '{}'", entry.schema.columns[col].name), len));
+                }
             }
             for &col in &fulltext {
                 if let Some(text) = indexed_text(&vals[col])? {
                     for token in distinct_tokens(text) {
-                        admit_entry(&posting_key(&token, &vals[0]), &())
-                            .map_err(|e| refuse(&format!("a posting in the full-text index on '{}'", entry.schema.columns[col].name), e))?;
+                        if let Some(len) = entry_over_bound(&posting_key(&token, &vals[0]), &()) {
+                            return Err(refuse(
+                                &format!("a posting in the full-text index on '{}'", entry.schema.columns[col].name),
+                                len,
+                            ));
+                        }
                     }
                 }
             }

@@ -128,6 +128,14 @@ impl Db {
         ids
     }
 
+    /// Every row a SELECT returns.
+    fn rows(&mut self, sql: &str) -> Vec<Vec<Value>> {
+        match self.sql(sql) {
+            Outcome::Rows(r) => r,
+            other => panic!("expected rows from `{}`, got {:?}", abbreviate(sql), std::mem::discriminant(&other)),
+        }
+    }
+
     /// The plan text `EXPLAIN` gives for `sql`.
     fn plan(&mut self, sql: &str) -> String {
         match self.sql(&format!("EXPLAIN {sql}")) {
@@ -479,10 +487,13 @@ fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
     let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
     assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
-    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
-    // refusal the first row is relocated to a new heap page and its old version goes to the
-    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
-    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    // Review 5 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row's write begins with its old version going to the time-travel heap,
+    // whose first data page is allocated then, before and independently of the relocation, which
+    // allocates a second page. The abort gives neither page back, and D202's undo frees none, so
+    // the file's high-water mark rises on d225 alone and on main alike (INFERRED; review 6 §3).
+    // Blind spot: allocation is first-fit, so a free hole below the mark would take one allocation
+    // unseen. These fixtures free no page before the probe, so they have none.
     let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err(&format!("UPDATE u SET v = '{}' WHERE n < 3;", "z".repeat(2020)));
     assert!(e.contains("index entry too large: 2046 bytes"), "not the named refusal: {}", abbreviate(&e));
@@ -514,10 +525,13 @@ fn a_multi_row_update_refused_for_not_null_writes_no_row_first() {
     let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
     assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
-    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
-    // refusal the first row is relocated to a new heap page and its old version goes to the
-    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
-    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    // Review 5 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row's write begins with its old version going to the time-travel heap,
+    // whose first data page is allocated then, before and independently of the relocation, which
+    // allocates a second page. The abort gives neither page back, and D202's undo frees none, so
+    // the file's high-water mark rises on d225 alone and on main alike (INFERRED; review 6 §3).
+    // Blind spot: allocation is first-fit, so a free hole below the mark would take one allocation
+    // unseen. These fixtures free no page before the probe, so they have none.
     let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err("UPDATE u SET a = b WHERE n < 3;");
     assert!(e.contains("is declared NOT NULL"), "not the NOT NULL refusal: {}", abbreviate(&e));
@@ -647,6 +661,8 @@ fn an_alter_that_would_repoint_a_legacy_oversized_key_is_refused_before_any_row_
     );
     // Review 5: the one remedy that works, also for a deleted row.
     assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
+    // Review 6 F1: and no in-place advice, which a legacy key cannot take.
+    assert!(!e.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {e}");
     assert_eq!(
         d.catalog.get_table("k").unwrap().schema.columns[1].data_type,
         DataType::Integer,
@@ -672,7 +688,11 @@ fn an_update_of_a_row_under_a_legacy_oversized_key_is_refused_before_it_is_writt
     // Review 5: a key cannot be UPDATEd, and DELETE then INSERT would leave the deleted tuple
     // under the key for good, so the message names the one remedy and never suggests that.
     assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
+    // Case-sensitive on purpose (review 6 F8): the remedy itself says a "deleted" row's tuple is
+    // never purged. What must not appear is the statement DELETE offered as advice. A lowercase
+    // "delete the row" suggestion would pass this guard; the text is one constant, reviewed.
     assert!(!e.contains("DELETE"), "the refusal suggests DELETE, which creates the problem for a key: {e}");
+    assert!(!e.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {e}");
     assert_eq!(d.ids("SELECT n FROM k;"), vec![1, 2], "the refused UPDATE changed a row");
 }
 
@@ -761,10 +781,13 @@ fn an_update_whose_new_posting_is_over_the_bound_is_refused_before_the_row_moves
     let plan = d.plan(&format!("SELECT n FROM g WHERE id = '{pk}';"));
     assert!(plan.contains("Index scan on g (col 0"), "premise failed: the key lookup is not a primary index scan: {}", abbreviate(&plan));
 
-    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
-    // refusal the first row is relocated to a new heap page and its old version goes to the
-    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
-    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    // Review 5 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row's write begins with its old version going to the time-travel heap,
+    // whose first data page is allocated then, before and independently of the relocation, which
+    // allocates a second page. The abort gives neither page back, and D202's undo frees none, so
+    // the file's high-water mark rises on d225 alone and on main alike (INFERRED; review 6 §3).
+    // Blind spot: allocation is first-fit, so a free hole below the mark would take one allocation
+    // unseen. These fixtures free no page before the probe, so they have none.
     let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err(&format!("UPDATE g SET body = '{}' WHERE n = 1;", "y".repeat(255)));
     assert!(e.contains("index entry too large: 2061 bytes"), "not the named refusal: {}", abbreviate(&e));
@@ -796,6 +819,7 @@ fn a_rebuild_over_a_legacy_oversized_primary_key_is_refused_before_anything_is_f
         abbreviate(&msg)
     );
     assert!(msg.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {msg}");
+    assert!(!msg.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {msg}");
     assert_eq!(d.catalog.get_table("k").unwrap().primary_index_root, root, "the primary tree was rebuilt");
     let primary = BPlusTreeManager::<Value, RecordId>::open(root, d.bp.clone());
     assert!(primary.search(&Value::Varchar("a".into())).unwrap().is_some(), "the old primary tree lost key 'a'");
@@ -838,4 +862,105 @@ fn a_rebuild_over_a_legacy_oversized_posting_is_refused_before_anything_is_freed
     );
     let next = d.bp.new_page().unwrap();
     assert!(next != primary_root && next != posting_root, "page {next}, an old root, came back from the allocator");
+}
+
+// ---- Review 6 (PREREG amendment 3): an ALTER that widens an indexed column; a backfill over a
+// ---- deleted row ----------------------------------------------------------------------------------
+
+/// **H1 — an ALTER that widens an indexed column past the bound is refused before any row moves.**
+///
+/// `n INTEGER` is indexed and the key is 2023 characters. INSERT admits every entry: the primary
+/// is (3 + 2023) + 6 = 2032 and the secondary 5 + 2026 = 2031. `TYPE BIGINT` turns the secondary
+/// entry into 9 + 2026 = 2035. The rewrite itself writes no index entry, so before the fix it was
+/// accepted, and the next crash recovery rebuilt the index from the heap, refused 2035, and did not
+/// open: a database this build wrote. Red at `ef64ffd`: "was accepted; it must be refused".
+#[test]
+fn an_alter_that_widens_an_indexed_column_past_the_bound_is_refused_before_any_row_moves() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("CREATE INDEX i ON t (n);");
+    d.sql(&format!("INSERT INTO t VALUES ('{}', 7);", "p".repeat(2023)));
+
+    let e = d.err("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;");
+    assert!(
+        e.contains("this ALTER would widen") && e.contains("index entry too large: 2035 bytes"),
+        "not the named refusal: {}",
+        abbreviate(&e)
+    );
+    assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
+    assert!(!e.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {e}");
+    assert_eq!(d.catalog.get_table("t").unwrap().schema.columns[1].data_type, DataType::Integer, "the refused ALTER installed the new shape");
+    assert_eq!(d.ids("SELECT n FROM t;"), vec![7], "the refused ALTER changed the row");
+}
+
+/// **H1's control — widening to exactly the bound is accepted, and the database it writes reopens.**
+/// The key is 2022 characters: 9 + 2025 = 2034. The ALTER goes through, and the crash-recovery
+/// rebuild, which widens the secondary entry from the heap, admits it.
+#[test]
+fn an_alter_that_widens_an_indexed_column_to_exactly_the_bound_is_accepted_and_recovers() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("CREATE INDEX i ON t (n);");
+    d.sql(&format!("INSERT INTO t VALUES ('{}', 7);", "p".repeat(2022)));
+
+    d.sql("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;");
+    assert_eq!(d.catalog.get_table("t").unwrap().schema.columns[1].data_type, DataType::BigInt);
+    assert_eq!(d.rows("SELECT n FROM t;"), vec![vec![Value::BigInt(7)]]);
+    rebuild_indexes(&mut d.catalog, &d.bp).expect("the database this build wrote must reopen");
+}
+
+/// **F2 — CREATE INDEX over a deleted row whose value is too long names the table copy, and the
+/// copy works in this build.**
+///
+/// `v` is unindexed, so INSERT admits no entry for it. `(1, 'x' x 2100)` is inserted and deleted;
+/// DELETE stamps the tuple and leaves it, and nothing purges it. The backfill must index every
+/// tuple the heap holds, because an older snapshot may need a deleted one, so `('x' x 2100, 1)`,
+/// (3 + 2100) + 5 = 2108 bytes, refuses the index, on every retry. The refusal says the row is
+/// deleted and names the copy. Then the copy is carried out, as the refusal words it, with this
+/// build: SELECT the live rows, INSERT each into a new table, DROP the old one, CREATE it again,
+/// copy back. After that the index builds. Red at `ef64ffd` on the message (the tree's own text).
+#[test]
+fn a_create_index_over_a_deleted_long_row_names_the_table_copy_and_the_copy_works() {
+    let mut d = db();
+    let shape = "(id INTEGER NOT NULL, v VARCHAR(3000))";
+    d.sql(&format!("CREATE TABLE t {shape};"));
+    d.sql(&format!("INSERT INTO t VALUES (1, '{}');", "x".repeat(2100)));
+    d.sql("INSERT INTO t VALUES (2, 'kept');");
+    d.sql("DELETE FROM t WHERE id = 1;");
+
+    let e = d.err("CREATE INDEX iv ON t (v);");
+    assert!(
+        e.contains("index entry too large: 2108 bytes")
+            && e.contains("deleted")
+            && e.contains("copy the table's live rows into a new table")
+            && !e.to_lowercase().contains("shorten"),
+        "not the named backfill refusal: {}",
+        abbreviate(&e)
+    );
+    let again = d.err("CREATE INDEX iv ON t (v);");
+    assert!(again.contains("index entry too large: 2108 bytes"), "the tombstone stopped refusing: {}", abbreviate(&again));
+
+    // The remedy, step by step, in this build.
+    let live = d.rows("SELECT id, v FROM t;");
+    assert_eq!(live, vec![vec![Value::Integer(2), Value::Varchar("kept".into())]], "premise: one live row");
+    let insert_all = |d: &mut Db, table: &str, rows: &[Vec<Value>]| {
+        for r in rows {
+            match (&r[0], &r[1]) {
+                (Value::Integer(id), Value::Varchar(v)) => {
+                    d.sql(&format!("INSERT INTO {table} VALUES ({id}, '{v}');"));
+                }
+                other => panic!("unexpected row shape {other:?}"),
+            }
+        }
+    };
+    d.sql(&format!("CREATE TABLE t_copy {shape};"));
+    insert_all(&mut d, "t_copy", &live);
+    d.sql("DROP TABLE t;");
+    d.sql(&format!("CREATE TABLE t {shape};"));
+    let copied = d.rows("SELECT id, v FROM t_copy;");
+    insert_all(&mut d, "t", &copied);
+    d.sql("DROP TABLE t_copy;");
+
+    d.sql("CREATE INDEX iv ON t (v);");
+    assert_eq!(d.ids("SELECT id FROM t WHERE v = 'kept';"), vec![2], "the rebuilt table lost its row");
 }

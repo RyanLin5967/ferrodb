@@ -95,11 +95,12 @@ const LEAF_HEADER_SIZE: usize = 27;
 ///   pre-pass), because either may have to re-point the key's entry;
 /// - a branch whose stored capability envelope is over the bound: rewrites of its record that
 ///   leave the envelope unchanged go through (`TableBranchCatalog::envelope_write`), so its lease
-///   can be renewed and it can be reaped; a CHANGED envelope is refused, which includes
-///   `charge_row_writes` and `restrict_envelope`;
+///   can be renewed and it can be reaped; a CHANGED envelope over the bound is refused, which
+///   includes `charge_row_writes` and a `restrict_envelope` that leaves it over the bound;
 /// - such a branch cannot be **forked**: the child inherits the envelope at the same encoded size
 ///   (`CapabilityEnvelope::inherited` changes only fixed-width counters), so `write_record_new`
-///   refuses it, and on a recycled id `envelope_write` does;
+///   refuses it, and on a recycled id `envelope_write` does, unless the reaped occupant's bytes
+///   happen to equal the child's, when the fork succeeds harmlessly;
 /// - a branch-catalog leaf left exactly full around an over-bound entry refuses **mid-record**:
 ///   `write_record` removes the branch's old state and deadline keys before it upserts the new
 ///   ones, so a no-cut refusal there leaves the branch in neither span. D202's undo does not cover
@@ -108,22 +109,44 @@ const LEAF_HEADER_SIZE: usize = 27;
 ///   through `migrate_from`, whose `write_record` puts the envelope into a fresh tree and is
 ///   refused.
 ///
-/// **The remedy, for the rows of a table: [`LEGACY_ENTRY_REMEDY`].** It is the only one that
-/// works. A deleted row cannot take any other: DELETE stamps the tuple and leaves it, nothing in
-/// this build purges it, and a deleted row can be neither updated nor deleted again, so it is
-/// scanned, and refused, until its table is dropped. That makes DELETE followed by INSERT a
-/// remedy that CREATES the problem for a key. The branch-catalog cases above have no remedy in
-/// this build.
+/// **The remedies.** For the rows of a table on a database this build has open, [`OPEN_TABLE_REMEDY`];
+/// for one crash recovery refuses to open, [`RECOVERY_REMEDY`]. There is no other, because a
+/// deleted row can take nothing in place: DELETE stamps the tuple and leaves it, nothing in this
+/// build purges it (there is no VACUUM), and a deleted row can be neither updated nor deleted
+/// again, so it is scanned, and refused, until its table is dropped. DELETE followed by INSERT
+/// therefore CREATES the problem for a key. For the envelope cases the remedy is
+/// `restrict_envelope` to an envelope below the bound, which is admitted; after it, charges and
+/// forks work again. The mid-record and migration cases have none in this build.
+///
+/// **This build writes nothing over the bound itself**, and that includes an ALTER that widens an
+/// indexed column: `catalog::alter::prepare_rewrite` asks the bound of every widened secondary
+/// entry (review 6 H1). **One residual is not a bound failure but its root cause:** a deleted
+/// tuple is never purged, so a deleted row whose value is too long for an index entry refuses
+/// every CREATE INDEX on that column, and every retype of an indexed column it sits in, until the
+/// table is copied and dropped. The refusals name that; they cannot cure it.
 pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
 
-/// What a refusal of a legacy entry over [`MAX_ENTRY_BYTES`] tells the user to do. D225, review 5.
+/// What a refusal of an entry over [`MAX_ENTRY_BYTES`] tells the user to do on a database THIS
+/// build has open: the ALTER, UPDATE and CREATE INDEX refusals. D225, reviews 5 and 6.
 ///
-/// One text, so the ALTER, UPDATE and crash-recovery refusals cannot drift apart, and none of them
-/// can suggest the DELETE + INSERT that leaves a permanent tuple under the key.
-pub const LEGACY_ENTRY_REMEDY: &str = "The one remedy is to use the build that wrote it: copy the \
-    table's live rows into a new table, shortening any key or indexed value over the bound as they \
-    are copied, and DROP the old table. This build has no in-place remedy: a deleted row's tuple is \
-    never purged, so deleting the row leaves its entry behind for good, and a primary key cannot be \
+/// Every step is one this build can take. SELECT reads the rows, an INSERT under a key and values
+/// that fit is admitted, and `drop_table` frees the trees without asking the bound. It spells out
+/// the two steps this SQL surface lacks (INSERT … SELECT and RENAME TABLE). It never suggests
+/// DELETE followed by INSERT, which leaves the deleted tuple behind for good.
+pub const OPEN_TABLE_REMEDY: &str = "With this build: copy the table's live rows into a new table, \
+    each under a key and values whose index entries fit the bound (there is no INSERT ... SELECT, \
+    so SELECT the rows and INSERT each one), DROP the old table, then CREATE it again under its old \
+    name and copy the rows back (there is no RENAME TABLE). There is no in-place remedy: a deleted \
+    row's tuple is never purged (there is no VACUUM), so it keeps its entries until its table is \
+    dropped, and a primary key cannot be updated.";
+
+/// What the crash-recovery refusal tells the user to do: the same steps, with a build that can
+/// still open the database, because this one refuses to. D225, reviews 5 and 6.
+pub const RECOVERY_REMEDY: &str = "This build cannot open the database until that is repaired. \
+    With a build before D225: copy the table's live rows into a new table, each under a key and \
+    values whose index entries fit the bound, DROP the old table, then CREATE it again under its \
+    old name and copy the rows back. There is no in-place remedy: a deleted row's tuple is never \
+    purged, so it keeps its entries until its table is dropped, and a primary key cannot be \
     updated.";
 
 /// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry
@@ -132,6 +155,23 @@ pub fn serialized_len<T: BTreeSerialize>(t: &T) -> usize {
     let mut buf = Vec::new();
     t.serialize(&mut buf);
     buf.len()
+}
+
+/// The size of an entry that is over [`MAX_ENTRY_BYTES`], or `None` when it is admitted. The
+/// measurement behind [`admit_entry`], for refusals that give their own remedy. D225, review 6.
+pub fn entry_over_bound<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Option<usize> {
+    let len = serialized_len(key) + serialized_len(value);
+    (len > MAX_ENTRY_BYTES).then_some(len)
+}
+
+/// The named part of every entry-bound refusal, and no remedy: the wrappers that carry
+/// [`OPEN_TABLE_REMEDY`] or [`RECOVERY_REMEDY`] must not also say "shorten the indexed value",
+/// which [`admit_entry`]'s own message does. D225, review 6.
+pub fn entry_too_large(len: usize) -> String {
+    format!(
+        "index entry too large: {len} bytes (key and value as stored), over the B+tree entry \
+         limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}"
+    )
 }
 
 /// Refuse an entry larger than [`MAX_ENTRY_BYTES`], naming the limit. D225.
@@ -145,8 +185,7 @@ pub fn serialized_len<T: BTreeSerialize>(t: &T) -> usize {
 /// exceeds maximum". It reaches a client as a statement error (`23000` in `pgwire::sqlstate_of`),
 /// not as an internal one, because the fix is to shorten the value.
 pub fn admit_entry<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Result<(), FerroError> {
-    let len = serialized_len(key) + serialized_len(value);
-    if len > MAX_ENTRY_BYTES {
+    if let Some(len) = entry_over_bound(key, value) {
         return Err(FerroError::Constraint(format!(
             "index entry too large: {len} bytes (key and value as stored) does not fit under the \
              B+tree entry limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}, the largest size for which \

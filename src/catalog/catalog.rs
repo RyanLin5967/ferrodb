@@ -8,7 +8,8 @@ use crate::storage::heap_file_manager::HeapFileManager;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::{DataType, Value};
-use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
+use crate::storage::index_page::{entry_over_bound, entry_too_large, OPEN_TABLE_REMEDY};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
@@ -208,6 +209,33 @@ impl Catalog {
         self.get_table(name).ok_or_else(|| self.unknown_table(name))
     }
 
+    /// The refusal of an index whose backfill meets an entry over `MAX_ENTRY_BYTES`. D225, review 6 F2.
+    ///
+    /// It names the row and says whether its tuple is deleted, because that decides the remedy. A
+    /// live row whose value is the cause can be UPDATEd to fit. A deleted one cannot be touched: its
+    /// tuple is never purged (there is no VACUUM), so the refusal repeats until the table is copied
+    /// and dropped, `index_page::OPEN_TABLE_REMEDY`. That residual is the no-purge root cause, and
+    /// no index-side change removes it.
+    fn backfill_refusal(table: &str, column: &str, key: &Value, deleted: bool, len: usize) -> FerroError {
+        let shown: String = format!("{key:?}").chars().take(60).collect();
+        let advice = if deleted {
+            format!(
+                "The row is deleted and its tuple stays: nothing purges a deleted row, so this \
+                 refusal repeats. {OPEN_TABLE_REMEDY}"
+            )
+        } else {
+            format!(
+                "The row is live. If its indexed value is the cause, UPDATE it to fit; if its key \
+                 is: {OPEN_TABLE_REMEDY}"
+            )
+        };
+        FerroError::Constraint(format!(
+            "cannot build the index on '{table}.{column}': the row whose first column is {shown} \
+             makes {}. {advice}",
+            entry_too_large(len)
+        ))
+    }
+
     /// Free an index tree whose backfill failed, and return the failure. D225.
     ///
     /// The tree is not in the catalog yet, so nothing else can hold a handle on it. If freeing it
@@ -250,10 +278,18 @@ impl Catalog {
         let backfill = (|| -> Result<(), FerroError> {
             for item in hfm.scan() {
                 let (_, tuple) = item?;
+                let deleted = tuple.version_header()?.end_ts != 0;
                 let values = tuple.deserialize(&schema)?;
                 let sec_value = values[col_index].clone();
                 let primary_key = values[0].clone();   // first column = primary key
-                sec_tree.insert((sec_value, primary_key), ())?;
+                // D225, review 6 F2: asked here, so the refusal can say which row and whether it
+                // is deleted, which the tree's own refusal cannot. Dead tuples are NOT skipped: an
+                // older snapshot or AS OF may still need their entries.
+                let entry = (sec_value, primary_key);
+                if let Some(len) = entry_over_bound(&entry, &()) {
+                    return Err(Self::backfill_refusal(table, column, &entry.1, deleted, len));
+                }
+                sec_tree.insert(entry, ())?;
             }
             Ok(())
         })();
@@ -329,9 +365,16 @@ impl Catalog {
         let backfill = (|| -> Result<(), FerroError> {
             for item in hfm.scan() {
                 let (_, tuple) = item?;
+                let deleted = tuple.version_header()?.end_ts != 0;
                 let values = tuple.deserialize(&schema)?;
                 let primary_key = values[0].clone();   // first column = primary key
                 if let Some(text) = indexed_text(&values[col_index])? {
+                    // D225, review 6 F2: every posting asked first, as in `create_index`.
+                    for token in distinct_tokens(text) {
+                        if let Some(len) = entry_over_bound(&posting_key(&token, &primary_key), &()) {
+                            return Err(Self::backfill_refusal(table, column, &primary_key, deleted, len));
+                        }
+                    }
                     post_tokens(&ft_tree, text, &primary_key)?;
                 }
             }

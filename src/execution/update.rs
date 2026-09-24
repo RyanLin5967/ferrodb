@@ -13,7 +13,7 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
-use crate::storage::index_page::{admit_entry, LEGACY_ENTRY_REMEDY};
+use crate::storage::index_page::{admit_entry, entry_over_bound, entry_too_large, OPEN_TABLE_REMEDY};
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -50,7 +50,12 @@ impl Modify for Update {
         // vacated and the new one being claimed - and this executor does neither. Refusing is the
         // correct trade. Refusing without saying what to do instead is not, especially now that
         // there IS something to do: as of E63 a deleted key can be used again, so DELETE-then-INSERT
-        // is a real remedy rather than advice that would have failed.
+        // works rather than being advice that would have failed.
+        //
+        // **With one caveat (D225, review 6):** the deleted tuple is never purged. Every entry an
+        // index over its values would need, including a CREATE INDEX added later, is still asked of
+        // it, so a row whose value is too long for an index entry leaves a tuple that refuses that
+        // index for good. The remedy then is the table copy, `index_page::OPEN_TABLE_REMEDY`.
         if let Some((col, _)) = self.assignments.iter().find(|(col, _)| *col == 0) {
             return Err(FerroError::Constraint(format!(
                 "column '{}' of '{}' is the primary key and cannot be updated: moving a key means \
@@ -102,15 +107,15 @@ impl Modify for Update {
             // cannot write a key over the bound; an earlier build could. The refusal names the one
             // remedy that works for a key (review 5): a primary key cannot be UPDATEd, and DELETE
             // then INSERT would leave the deleted tuple under the key for good.
-            admit_entry(pk, &RecordId::new(0, 0)).map_err(|e| {
+            if let Some(len) = entry_over_bound(pk, &RecordId::new(0, 0)) {
                 let shown: String = format!("{pk:?}").chars().take(60).collect();
-                FerroError::Constraint(format!(
+                return Err(FerroError::Constraint(format!(
                     "this UPDATE would re-point the primary-index entry of the row whose key is \
-                     {shown}, and that entry is over the B+tree entry bound ({e}). A build before \
-                     D225 could store such a key; this one cannot re-point it. Nothing has been \
-                     written. {LEGACY_ENTRY_REMEDY}"
-                ))
-            })?;
+                     {shown}: {}. A build before D225 could store such a key; this one cannot \
+                     re-point it. Nothing has been written. {OPEN_TABLE_REMEDY}",
+                    entry_too_large(len)
+                )));
+            }
             for handle in &self.secondary_indexes {
                 let new_v = &new_values[handle.col_index];
                 if &old_values[handle.col_index] != new_v {

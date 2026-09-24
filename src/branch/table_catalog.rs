@@ -1838,6 +1838,12 @@ mod d225_envelope_bound {
         CapabilityEnvelope::new(Verb::ALL, max_row_writes).allow(1, (0..columns).map(ColumnCapability::open).collect())
     }
 
+    /// 153 open columns numbered from 1 instead of 0: the same count, so the same length and the
+    /// same 21-byte header as `envelope_of(153)`, but different column ids.
+    fn envelope_shifted_153() -> CapabilityEnvelope {
+        CapabilityEnvelope::new(Verb::ALL, 10).allow(1, (1..=153).map(ColumnCapability::open).collect())
+    }
+
     /// **An envelope too large for a B+tree entry refuses the whole record, before any key of it
     /// is written.** 153 columns is 21 + 8 + 153·13 = 2018 bytes of envelope. Under the 9-byte
     /// envelope key the entry is 4 + 9 + 4 + 2018 = 2035 bytes, one over the bound; 152 columns
@@ -1927,9 +1933,11 @@ mod d225_envelope_bound {
         );
         assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused write changed the envelope");
 
-        // M26b (review 5): a change of the SAME length is still a change. `fork_staged`'s
-        // recycled-id path hands `write_record` exactly this: the child's envelope is `inherited()`,
-        // which keeps the tables and changes only fixed-width counters. Only the budget differs.
+        // M26b (review 5): a change of the SAME length is still a change. Only the budget differs
+        // here. The production shape this guards is `fork_staged`'s recycled-id path (review 6
+        // F4): the stored bytes there are the REAPED occupant's envelope and the child's are
+        // `parent.inherited()`, so they can differ in their counters, or in their tables at the
+        // same length (M26c below).
         let same_length = envelope_with_budget(153, 11).serialize();
         assert_eq!(same_length.len(), legacy.len(), "premise: the same encoded length");
         assert_ne!(same_length, legacy, "premise: different bytes");
@@ -1944,6 +1952,27 @@ mod d225_envelope_bound {
             "the refused same-length write stored its record"
         );
         assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused same-length write changed the envelope");
+
+        // M26c (review 6): the same length AND the same 21-byte header (verbs, budget, row-writes,
+        // table count), with different column ids. A comparison of length plus header would call
+        // this unchanged and leave the stored grants in place.
+        let shifted = envelope_shifted_153().serialize();
+        assert_eq!(shifted.len(), legacy.len(), "premise: the same encoded length");
+        assert_eq!(shifted[..21], legacy[..21], "premise: the same 21-byte header");
+        assert_ne!(shifted, legacy, "premise: different bytes");
+        let mut regranted = cat.get_raw(id).unwrap();
+        regranted.envelope = Some(envelope_shifted_153());
+        regranted.lease_deadline = LeaseDeadline(9);
+        let e = cat
+            .write_record(&regranted, Some(&old))
+            .expect_err("a same-length, same-header changed over-bound envelope must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(
+            cat.core(id).unwrap().unwrap().lease_deadline(),
+            LeaseDeadline(1_000_000),
+            "the refused same-header write stored its record"
+        );
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused same-header write changed the envelope");
 
         cat.set_state(child.branch_id, BranchState::Live, BranchState::Reaping).expect("Live -> Reaping");
         cat.set_state(child.branch_id, BranchState::Reaping, BranchState::Reaped).expect("Reaping -> Reaped");
