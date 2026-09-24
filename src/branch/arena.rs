@@ -334,6 +334,22 @@ struct StoreState {
     /// Changed at exactly the four sites that insert into or remove from `extents` (a claim, a
     /// free, and their two replays) and rebuilt wholesale by `load_state`.
     /// [`ArenaPageStore::live_arenas_between`] checks the two agree.
+    ///
+    /// **Its cost, stated** (the lead's new-wall audit of D221):
+    ///
+    /// * **Memory.** A second resident copy of the live key set: a B-tree of `u32`, several bytes
+    ///   per key plus node overhead, on the order of 10 MB at 10^6 extents (INFERRED, unmeasured).
+    /// * **Upkeep.** O(log L) per claim or free and per replayed tail record. Nothing on the page
+    ///   path.
+    /// * **Every open, and every consensus snapshot install** (`load_state` both times). It is
+    ///   built from the image's own order, which `state_bytes` writes sorted by arena id (pinned by
+    ///   `the_checkpoint_image_lists_extents_and_current_arenas_in_key_order`). As I recall std's
+    ///   `BTreeSet: FromIterator`, it sorts its input and then bulk-builds, and a sort of an
+    ///   already-sorted run is linear, so this is O(L). That is std's implementation, not a
+    ///   documented guarantee, and it is unverified here (no std source is installed). An image
+    ///   not in id order still builds a correct set, in O(L log L). The first version built it
+    ///   from `extents.keys()`, which is hash order and always O(L log L). Either way the open
+    ///   itself is O(L), because it reads L extents, so the worst this adds is a log factor.
     live_order: BTreeSet<ArenaId>,
 }
 
@@ -1337,8 +1353,13 @@ impl ArenaPageStore {
         let n = c.u32()? as usize;
         let mut extents = HashMap::with_capacity(n);
         let mut recycled = HashMap::with_capacity(n);
+        // **D221.** The ids in the order the image lists them, which `state_bytes` makes id order,
+        // so `live_order` is built from a sorted run rather than from the hash map's order. See
+        // the field for what that buys and what it depends on.
+        let mut in_image_order: Vec<ArenaId> = Vec::with_capacity(n);
         for _ in 0..n {
             let arena = ArenaId(c.u32()?);
+            in_image_order.push(arena);
             let owner = BranchId::new(c.u64()?, c.u32()?);
             let ext = ArenaExtent {
                 arena_id: arena,
@@ -1432,7 +1453,7 @@ impl ArenaPageStore {
             // it empty, so nothing can free an extent that may still hold a live child's pages.
             StoreState {
                 fill_unknown: extents.keys().copied().collect(),
-                live_order: extents.keys().copied().collect(),
+                live_order: in_image_order.into_iter().collect(),
                 extents,
                 recycled,
                 current,
