@@ -370,10 +370,11 @@ pub struct AlterPlan {
     prov: Option<Arc<dyn ProvenanceStore>>,
     dir_root: u32,
     primary_root: u32,
-    /// The entry the catalog encoder was asked about: the table's entry as the plan read it, with the
-    /// final shape and the renamed indexes. [`Catalog::apply_plan`] refuses the plan if the live
-    /// entry, with the same changes applied, is not this one (D249 review, F7).
-    checked: TableEntry,
+    /// The table's catalog entry exactly as the plan read it, before any change. Everything the plan
+    /// decided, the encoder's answer included, was decided against this entry, so
+    /// [`Catalog::apply_plan`] refuses the plan unless the live entry is still this one (D249 reviews,
+    /// F7 and G2-G3).
+    read: TableEntry,
 }
 
 impl AlterPlan {
@@ -612,7 +613,7 @@ impl Catalog {
             prov: prov.cloned(),
             dir_root,
             primary_root,
-            checked: installed,
+            read: entry.clone(),
         })
     }
 
@@ -620,11 +621,23 @@ impl Catalog {
     /// a caller can log one DDL record per action carrying the shape that action produced.
     ///
     /// Everything the data could refuse was refused by [`Catalog::plan_alters`] while the heap was
-    /// still untouched. What is left here is the writing pass and the catalog install, and the
-    /// failures it can still meet are environmental — a buffer pool with no evictable frame, a
-    /// disk write that fails, a B+tree page that cannot be read. See [`prepare_rewrite`] for what
-    /// that boundary is and why the answer to crossing it is to log the rewrite rather than to
-    /// pretend it cannot happen.
+    /// still untouched. What is left here is the writing pass and the catalog install. Two refusals
+    /// remain, and both come before anything is written:
+    ///
+    /// - **the quiesce re-check**: a transaction in flight while tuples move;
+    /// - **the staleness check**: the table's catalog entry is no longer the one the plan read
+    ///   (D249). A plan can be held across a statement, and the plan's decisions, the encoder's
+    ///   answer included, hold only for the entry they were made against.
+    ///
+    /// Neither fires inside `AgentRuntime::merge`. A merge holds no transaction open, and it applies
+    /// each table's plan with no statement in between that touches that table's entry:
+    /// `apply_plan` for one table changes only that table's entry. That is what keeps a merge atomic
+    /// in its refusals.
+    ///
+    /// Past those two, the failures it can still meet are environmental — a buffer pool with no
+    /// evictable frame, a disk write that fails, a B+tree page that cannot be read. See
+    /// [`prepare_rewrite`] for what that boundary is and why the answer to crossing it is to log the
+    /// rewrite rather than to pretend it cannot happen.
     pub fn apply_plan(
         &mut self,
         plan: AlterPlan,
@@ -643,29 +656,27 @@ impl Catalog {
             prov,
             dir_root,
             primary_root,
-            checked,
+            read,
         } = plan;
 
-        // **The plan still describes this table** (D249 review, F7). `plan_alters` asked the catalog
-        // encoder about one entry: the table's as it read it, with the final shape and the renamed
-        // indexes. A plan can be held across a statement, and if the same table changed in between
-        // (an index created, say), installing the renames now would persist an entry nobody asked
-        // about. So the live entry, with the same changes applied, must BE the entry that was
-        // checked. A staleness check, not a second encoder guard: it compares, and asks the encoder
-        // nothing.
-        {
-            let mut now = self.require_table(&table)?.clone();
-            now.schema = shapes
-                .last()
-                .cloned()
-                .ok_or_else(|| FerroError::Internal(format!("a plan for '{table}' held no shape")))?;
-            rename_indexed_columns(&mut now, &actions);
-            if now != checked {
-                return Err(FerroError::Constraint(format!(
-                    "the alteration of '{table}' was planned against the table as it was, and the \
-                     table has changed since; nothing was written. Plan it again."
-                )));
-            }
+        // **The table's catalog entry is still the one the plan read** (D249 reviews, F7 and
+        // G2-G3). Every decision `plan_alters` made was made against that entry: its shapes, its
+        // renames, and the catalog encoder's answer about the entry `finish` will install. A plan can
+        // be held across a statement, and if the entry changed in between (an index created, another
+        // ALTER, a root moved), installing now would persist an entry nobody asked about, over a
+        // shape the plan did not start from. So the live entry must equal it, compared as it is, with
+        // nothing overwritten first. A staleness check, not a second encoder guard: it compares, and
+        // asks the encoder nothing.
+        //
+        // **Its blind spot, stated.** A committed INSERT, UPDATE or DELETE that moves no root changes
+        // the heap and not the entry, and this does not see it. The plan's `prepared` rows would then
+        // not describe the heap. That stays with the caller's discipline, as `AgentRuntime::merge`'s
+        // ordering comment already says: a plan's decision is only valid for the heap it read.
+        if self.require_table(&table)? != &read {
+            return Err(FerroError::Constraint(format!(
+                "the alteration of '{table}' was planned against its catalog entry as it was then, \
+                 and that entry has changed since; nothing was written. Plan it again."
+            )));
         }
 
         // Reserve the space the relocations will need, before the first one happens.
