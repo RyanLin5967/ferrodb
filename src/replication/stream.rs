@@ -1818,4 +1818,142 @@ mod tests {
             .expect("a sound cursor failed after an unsound one had been tried on the same decoder");
         assert_eq!(p.emitted, 1, "{p:?}");
     }
+
+    /// **D276: a transaction larger than `max_bytes` is delivered whole, and the drain does not read
+    /// the wedge as caught up.**
+    ///
+    /// The read window was fixed at `cursor + max_bytes`, and the cursor never passes an open
+    /// transaction's first row. So a transaction whose rows span more than one window never had its
+    /// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
+    /// rule (`examples/cdc_server.rs`: nothing emitted AND the cursor did not move) took for the end
+    /// of the feed. The drain below is that rule.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the first assertion after the drain
+    /// (it stops below the frontier).
+    #[test]
+    fn a_transaction_larger_than_max_bytes_is_delivered_whole() {
+        const MAX: u64 = 200;
+        let (_d, w) = wal("oversized");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 101) })
+            .unwrap();
+        for id in 2..=10 {
+            insert(&w, 1, id, 100 + id);
+        }
+        let commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 11, 111);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(commit - first > MAX, "premise failed: the transaction fits in one window, so nothing is at stake");
+
+        let s = streamer().with_max_bytes(MAX);
+        let (mut cursor, mut through, mut feed, mut emitted) = (start, 0u64, Vec::new(), 0usize);
+        for _ in 0..100 {
+            let p = s.pump(&w, cursor, through, &mut feed).unwrap();
+            let moved = p.cursor != cursor;
+            cursor = p.cursor;
+            through = p.emitted_through;
+            emitted += p.emitted;
+            if p.emitted == 0 && !moved {
+                break;
+            }
+        }
+        let frontier = w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            cursor, frontier,
+            "the drain stopped at {cursor}, below the frontier {frontier}: a transaction larger than one \
+             window wedged the feed, and the caught-up rule read the wedge as the end"
+        );
+        assert_eq!(emitted, 11, "not every row arrived");
+        let feed = String::from_utf8(feed).unwrap();
+        for qty in 101..=111 {
+            assert_eq!(feed.matches(&format!("\"qty\":{qty}")).count(), 1, "row with qty {qty} did not arrive exactly once: {feed}");
+        }
+    }
+
+    /// **D276: past the window's cap the pump refuses, naming the transaction; it never answers
+    /// "nothing to do".**
+    ///
+    /// The window grows to at most `MAX_WINDOW_BATCHES` times `max_bytes`. A transaction whose rows
+    /// span more would need the whole of it held to deliver it whole, and an `Ok` with nothing
+    /// emitted is the silent wedge.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `expect_err`.
+    #[test]
+    fn a_transaction_beyond_the_window_cap_is_refused_by_name() {
+        const MAX: u64 = 10;
+        let (_d, w) = wal("over_cap");
+        w.append(7, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(7, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 1) })
+            .unwrap();
+        for id in 2..=10 {
+            insert(&w, 7, id, id);
+        }
+        let commit = w.append(7, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(commit - first > 64 * MAX, "premise failed: the transaction fits under the cap");
+
+        let err = streamer()
+            .with_max_bytes(MAX)
+            .pump(&w, first, 0, &mut Vec::new())
+            .expect_err("a transaction larger than the window's cap was answered Ok, which a consumer reads as a quiet feed");
+        let text = err.to_string();
+        assert!(text.contains(&format!("lsn {first}")), "the refusal does not say where the feed is stuck: {text}");
+        assert!(text.contains("{7}"), "the refusal does not name the transaction: {text}");
+    }
+
+    /// **D276: a refusal inside an oversized transaction is reported as the refusal, not grown past
+    /// into a size error.** A refusal stalls the feed until the publication is amended and says so;
+    /// growing the window over it would turn that into "transaction too large".
+    ///
+    /// Passes at `00f4c39` (nothing grows there) and must keep passing. M37 is what it is for.
+    #[test]
+    fn a_refusal_inside_an_oversized_transaction_is_reported_not_grown_past() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+        const MAX: u64 = 300;
+
+        let (_d, w) = wal("refusal_in_oversized");
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        // X, on the published table, opens; R writes the undecided one and commits inside X, within
+        // one window; X runs on past the cap.
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 10) })
+            .unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        w.append(2, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(5, 50) })
+            .unwrap();
+        let r_commit = w.append(2, 0, &RecKind::Commit).unwrap();
+        for id in 2..=260 {
+            insert(&w, 1, id, id);
+        }
+        let x_commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(r_commit - first < MAX, "premise failed: R's commit is not inside the first window");
+        assert!(x_commit - first > 64 * MAX, "premise failed: X fits under the cap, so growing past the refusal would not show");
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]).with_max_bytes(MAX);
+        let p = narrow
+            .pump(&w, first, 0, &mut Vec::new())
+            .expect("a refusal inside an oversized transaction was turned into an error");
+        assert!(p.refused >= 1, "the refusal was not reported: {p:?}");
+        assert_eq!(p.cursor, first, "the cursor passed the open transaction's first row: {p:?}");
+    }
 }
