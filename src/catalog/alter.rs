@@ -578,6 +578,24 @@ impl Catalog {
 
         let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
 
+        // **D219 (PREREG A1) — a rewrite that may re-stamp attributed rows is refused HERE when the
+        // provenance store is refusing writes, before the first heap byte moves.** The rows it
+        // moves are re-stamped after `finish` (see `apply_plan`); a store poisoned by an earlier
+        // failed append refuses that, and the ALTER was then installed and returning `Err`, which
+        // both callers answer by NOT logging its DDL record — a schema change the log never hears
+        // of. Asked here, the refusal is E82's: made while nothing has changed.
+        //
+        // Conditioned on an attributed row, because a rewrite that will stamp nothing has no
+        // business failing on the store's state (`an_alter_that_stamps_nothing_is_not_refused_by_
+        // a_poisoned_provenance_store`). Every attributed row, not only the ones that will move,
+        // because which rows move is decided while writing; refusing a rewrite that would have moved
+        // none of them is the conservative direction on a store refusing every write anyway.
+        if let Some(store) = prov {
+            if prepared.iter().any(|p| p.prov.is_some()) {
+                store.check_writable()?;
+            }
+        }
+
         Ok(AlterPlan {
             table: table.to_string(),
             shapes,
@@ -704,7 +722,8 @@ impl Catalog {
         // catalog — the I19 state `finish` exists to rule out. Here a refusal, or a failed sync,
         // returns with the catalog and the heap agreeing on the new shape. What it does NOT
         // restore is the caller's DDL record: both callers log it only after this returns `Ok`,
-        // so the change feed never hears of this ALTER (see "Not closed here" below).
+        // so the change feed never hears of this ALTER — which is why a store already refusing
+        // writes is refused in `plan_alters` instead (below).
         //
         // **One sync for all of them, before any later table is touched.** They are queued with
         // `stamp_pending` and made durable with one `flush`: this table's rewritten pages, and the
@@ -727,10 +746,11 @@ impl Catalog {
         // rewrite. And a `persist` failure inside `finish` (itself the I19 state) now returns
         // before any moved row is re-stamped.
         //
-        // Not closed here: a refusal after the install leaves the ALTER applied and its DDL record
-        // unlogged (both callers log only on `Ok`). Refusing the ALTER in `plan_alters`, before the
-        // heap moves, whenever its rewrite would stamp and the store is refusing writes would
-        // close it; that is lane D219's proposal, not this change.
+        // A store ALREADY refusing writes never gets here with attributed rows: `plan_alters`
+        // refused the ALTER before the heap moved (`check_writable`, PREREG A1). What can still
+        // fail here is a store that was healthy when planned and whose sync fails NOW — an I/O
+        // failure — and that returns with the ALTER applied and its DDL record unlogged (both
+        // callers log only on `Ok`), the environmental class of the heap flush that follows.
         if let Some(store) = &prov {
             if !moved.is_empty() {
                 for (rid, who) in &moved {
@@ -1170,6 +1190,7 @@ mod tests {
         catalog: Catalog,
         bp: Arc<BufferPoolManager>,
         txn: Arc<TxnManager>,
+        wal: Arc<WalManager>,
         durable: Arc<DurableProvenanceStore>,
         run: ProvId,
         _dir: tempfile::TempDir,
@@ -1187,7 +1208,7 @@ mod tests {
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let wal = Arc::new(WalManager::new(dir.path().join("alter.wal")).unwrap());
         let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-        bp.attach_wal(wal);
+        bp.attach_wal(wal.clone());
         let mut catalog = Catalog::create(bp.clone()).unwrap();
         let mut session = Session::new();
         let pad = "y".repeat(60);
@@ -1212,7 +1233,7 @@ mod tests {
         let run_id = durable
             .intern(&RunEntity::new(ProvId::NONE, "a", "r", "m", "v", [0u8; 32], 1, BranchId::new(1, 0)))
             .unwrap();
-        Fixture { catalog, bp, txn, durable, run: run_id, _dir: dir }
+        Fixture { catalog, bp, txn, wal, durable, run: run_id, _dir: dir }
     }
 
     fn add_column(f: &mut Fixture, prov: &Arc<dyn ProvenanceStore>) -> Result<Vec<ColumnShape>, FerroError> {
@@ -1308,11 +1329,13 @@ mod tests {
             .unwrap()
     }
 
-    /// **D219 (review 5 F1): a provenance refusal during a plain ALTER leaves the table
-    /// consistently altered, not the I19 state.** A store poisoned by an earlier failed append
-    /// refuses every stamp. The rewrite used to stamp each moved row INSIDE its loop, before
-    /// `finish`, so on a poisoned store a plain `ALTER TABLE` of an attributed table failed with
-    /// every tuple converted under the old catalog. The stamps are written after `finish` instead.
+    /// **D219 (review 5 F1, PREREG A1): an ALTER whose rewrite would re-stamp attributed rows is
+    /// REFUSED on a store that is refusing writes, before the heap moves.** A store poisoned by an
+    /// earlier failed append refuses every stamp. The rewrite used to stamp each moved row inside
+    /// its loop, before `finish`, so such an ALTER failed with every tuple converted under the old
+    /// catalog (I19). Moving the stamps after `finish` (`7999830`) left it installed but returning
+    /// `Err`, so its DDL record was never logged. `plan_alters` now asks the store first, and the
+    /// ALTER changes nothing at all: `bench/d219/PREREG.md` A1 quotes the expectation this replaced.
     #[test]
     fn a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered() {
         let mut f = packed();
@@ -1323,13 +1346,21 @@ mod tests {
         f.durable.fail_next_append.store(true, Ordering::SeqCst);
         assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
         let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        let logged_before = f.wal.next_lsn.load(Ordering::SeqCst);
 
-        let err = add_column(&mut f, &prov).expect_err("a poisoned store accepted the rewrite's stamps");
-        assert!(format!("{err}").contains("refusing further writes"), "it failed, but not at a stamp: {err}");
+        let err = add_column(&mut f, &prov)
+            .expect_err("an ALTER of attributed rows was accepted by a store refusing writes");
+        assert!(format!("{err}").contains("refusing further writes"), "it failed, but not at the probe: {err}");
         assert_eq!(
             f.catalog.require_table("p").unwrap().schema.columns.len(),
-            3,
-            "a refused stamp left the rewritten rows under the OLD catalog: the I19 state"
+            2,
+            "the refused ALTER installed its schema anyway: a DDL change with no record in the log"
+        );
+        assert_eq!(rids_of(&f), before, "the refused ALTER moved rows: the heap was touched before it refused");
+        assert_eq!(
+            f.wal.next_lsn.load(Ordering::SeqCst),
+            logged_before,
+            "the refused ALTER wrote to the log"
         );
         let mut session = Session::new();
         match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
@@ -1337,15 +1368,10 @@ mod tests {
         {
             Outcome::Rows(rows) => {
                 assert_eq!(rows.len(), 41, "rows were lost");
-                assert!(rows.iter().all(|r| r.len() == 3), "a row did not read in the new shape");
+                assert!(rows.iter().all(|r| r.len() == 2), "a row does not read in the OLD shape");
             }
             _ => panic!("SELECT did not return rows"),
         }
-        let after = rids_of(&f);
-        assert!(
-            after.iter().any(|r| !before.contains(r)),
-            "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
-        );
     }
 
     /// **D219: a plain ALTER makes its rewrite's stamps durable with ONE sync, and each moved row

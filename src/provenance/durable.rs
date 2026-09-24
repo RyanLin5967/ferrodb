@@ -892,6 +892,19 @@ impl ProvenanceStore for DurableProvenanceStore {
     fn sync_counts(&self) -> SyncCounts {
         self.syncs.snapshot()
     }
+
+    /// Refused exactly when every write would be: a store poisoned by a failed append, or a file
+    /// lock poisoned by a panicking writer. Read without taking the lock — the trait says why the
+    /// probe is advisory.
+    fn check_writable(&self) -> Result<(), FerroError> {
+        if self.file.is_poisoned() {
+            return Err(FerroError::Provenance(format!(
+                "{}: the provenance lock was poisoned by a panicking writer; refusing further writes",
+                self.path.display()
+            )));
+        }
+        self.refuse_if_poisoned()
+    }
 }
 
 impl Drop for DurableProvenanceStore {

@@ -204,6 +204,20 @@ MUTANTS = {
         "            if !moved.is_empty() {\n",
         "            if moved.len() > 1 {\n",
     ),
+    # ---- PREREG A1 (50e175b) ------------------------------------------------------------------------
+    # The writable probe deleted: a poisoned store's ALTER is installed, then refused (test 3 red).
+    "M28_no_writable_probe": (
+        ALTER,
+        "                store.check_writable()?;\n",
+        "",
+    ),
+    # The probe asked even when no row is attributed: an ALTER that stamps nothing is refused by a
+    # store poisoned by someone else (test 1 red).
+    "M29_probe_without_attribution": (
+        ALTER,
+        "            if prepared.iter().any(|p| p.prov.is_some()) {\n",
+        "            if true {\n",
+    ),
     # The epoch bump AFTER the provenance block: a failed flush leaves readers on the old shape.
     "M27_epoch_bump_after_provenance": (
         ALTER,
