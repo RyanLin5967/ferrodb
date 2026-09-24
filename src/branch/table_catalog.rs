@@ -24,7 +24,7 @@
 //! See `SCALE-DESIGN.md` D2b.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::branch::group_commit::CommitGroup;
@@ -38,7 +38,9 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::error::FerroError;
 use crate::storage::index::BPlusTreeManager;
 
-use self::stored::{AliveState, OffsetCell, StoredCore, StoredDeadline, StoredRecord, Writable};
+use self::stored::{
+    AliveState, FirstStartCredit, OffsetCell, StoredCore, StoredDeadline, StoredRecord, Writable,
+};
 
 /// **What this catalog's tree holds, as types that are not what it hands out — D198.**
 ///
@@ -55,9 +57,12 @@ use self::stored::{AliveState, OffsetCell, StoredCore, StoredDeadline, StoredRec
 /// file, for `CoreRecord`'s own reason (`record.rs`): a newtype declared next to its consumer is
 /// honour-system, because `.0` is in scope. There is no `Deref` and no raw accessor.
 ///
-/// The one door left is deliberate and visible: `StoredRecord::inward` accepts a `BranchRecord`,
-/// because a `BranchRecord` in this file can only ever be on the lease clock — every value that
-/// came from the tree is one of these types until it goes out.
+/// The one production door from a `BranchRecord` in is `StoredRecord::inward_at_zero`, and it
+/// REFUSES unless `D = 0`, where a lease and its stored value coincide. Its callers are `create`
+/// and `migrate_from`, both over a brand-new catalog (D198 re-review, R2). The general translation,
+/// `StoredRecord::inward`, and the `Writable` impl for `BranchRecord` that uses it are
+/// `#[cfg(test)]`: a record decoded raw from the tree is stored-scale while typed as a lease, and
+/// in production it cannot be written back through a translation.
 mod stored {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,11 +91,30 @@ mod stored {
             LeaseOffset(LeaseDeadline::saturating_deadline(self.0, downtime))
         }
 
+        /// Whether no downtime has ever been credited — the one offset at which stored time IS
+        /// lease time, so the one at which a pre-D198 binary reads this catalog's leases right
+        /// (SCALE-DESIGN "D198 addendum 2").
+        pub(super) fn is_zero(self) -> bool {
+            self.0 == 0
+        }
+
         /// The value in milliseconds, for tests that compare it with a literal.
         #[cfg(test)]
         pub(super) fn millis(self) -> u64 {
             self.0
         }
+    }
+
+    /// What a first start with evidence credits: computed by the catalog from its evidence
+    /// (`TableBranchCatalog::first_start_credit`), and reported as given.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct FirstStartCredit {
+        /// The wall-clock stamp the credit's time term runs from, if a file time is evidence.
+        pub(super) file_mtime: Option<u64>,
+        /// Downtime an earlier unresumed writer recorded in `[0x09]`.
+        pub(super) recorded_millis: u64,
+        /// `recorded_millis` plus the wall-clock age of `file_mtime`.
+        pub(super) credited_millis: u64,
     }
 
     /// The catalog's in-memory copy of `D`, which every read and write translates through.
@@ -152,30 +176,30 @@ mod stored {
         /// **A resume at `now`**: the outcome to report and the record to write, whose offset is
         /// published once it is durable.
         ///
-        /// No record means a first start. **The FirstStart policy (lead, SCALE-DESIGN "D198
-        /// addendum — the FirstStart policy"):** when the caller hands a `file_mtime` — which it does
-        /// only for a catalog holding a live lease — `D` starts at `now − file_mtime` instead of 0.
-        /// The file's last modification happened while its last writer was still alive, so
-        /// `mtime <= last_alive`, and crediting `now − mtime` can only OVER-credit the outage:
-        /// longer leases, never an early reap. A later write by something else makes `mtime` late
-        /// and the credit short, but never below the 0 a first start gave before.
+        /// No record means a first start. **The FirstStart policy** (lead, SCALE-DESIGN "D198
+        /// addendum — the FirstStart policy", corrected after review 3): when the caller hands a
+        /// credit — which it does only for a catalog holding a live lease and some evidence of the
+        /// outage before this start — `D` starts at it instead of 0. What the credit is, and where
+        /// it falls short of the true outage (never below 0), is the doc of
+        /// `LeaseResume::FirstStartFromFileTime`; it is NOT "never an early reap".
         pub(super) fn resume(
             prev: Option<AliveState>,
             now: u64,
-            file_mtime: Option<u64>,
+            first_start: Option<FirstStartCredit>,
         ) -> (LeaseResume, AliveState) {
             match prev {
-                None => match file_mtime {
+                None => match first_start {
                     None => (
                         LeaseResume::FirstStart { now_millis: now },
                         AliveState { mark: now, offset: LeaseOffset(0) },
                     ),
-                    Some(mtime) => {
-                        let offset = LeaseOffset(0).credit(now.saturating_sub(mtime));
+                    Some(c) => {
+                        let offset = LeaseOffset(0).credit(c.credited_millis);
                         (
                             LeaseResume::FirstStartFromFileTime {
                                 now_millis: now,
-                                file_mtime: mtime,
+                                file_mtime: c.file_mtime,
+                                recorded_millis: c.recorded_millis,
                                 credited_millis: offset.0,
                             },
                             AliveState { mark: now, offset },
@@ -496,30 +520,114 @@ pub struct TableBranchCatalog {
     /// expiry question until it has: the downtime since the mark is not credited yet, and every
     /// answer would charge it. See [`TableBranchCatalog::refuse_unresumed`].
     resumed: AtomicBool,
-    /// **The FirstStart policy's evidence**: when this catalog's file was last written before this
-    /// process opened it, in unix milliseconds — or, for a catalog migrated from a legacy
-    /// `.branches` log, when that SOURCE was. `None` for a fresh file, a catalog built over a
-    /// caller's pool (`create` / `open`), or an unreadable mtime; a first start then credits
-    /// nothing, as before the policy. Read only by `resume_leases`, and only when no mark exists.
-    file_mtime: Option<u64>,
+    /// **The FirstStart policy's evidence** (review 3, C4–C6): the outage before this process,
+    /// for a catalog with no mark. `None` for a marked or fresh catalog, a catalog built over a
+    /// caller's pool (`create` / `open`), or one with nothing to go on; a first start then credits
+    /// nothing. Set at open, never changed; read only by `resume_leases`, and only when no mark
+    /// exists. See [`FirstStartEvidence`].
+    first_start: Option<FirstStartEvidence>,
+    /// What this process's first commit writes into `[0x09]`, if anything: the downtime owed before
+    /// this process opened the catalog, so that a process that writes and then never resumes —
+    /// an embedder, a failed first start — cannot erase the evidence by replacing the file's mtime
+    /// with its own (review 3, C4). Set at open, never changed.
+    first_start_record: Option<u64>,
+    /// Whether `first_start_record` is already in the tree, or superseded by a mark. Written only
+    /// under `logical`.
+    first_start_written: AtomicBool,
+    /// **The header page's magic, as this catalog last wrote it** (SCALE-DESIGN "D198 addendum
+    /// 2"): [`HEADER_PAGE_MAGIC`] while `D` has never left 0, [`HEADER_PAGE_MAGIC_OFFSET`] from
+    /// before the first record that holds `D > 0`. `publish_root` writes this, never a constant: a
+    /// root split that wrote the old magic back would reopen the catalog to a binary that reads its
+    /// leases `D` early.
+    header_magic: AtomicU32,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
-/// rather than a plausible-looking root taken from whatever was there.
+/// rather than a plausible-looking root taken from whatever was there — **for a catalog whose lease
+/// offset `D` has never left 0.** At `D = 0` stored time IS lease time, so a binary that knows
+/// nothing of `D` (every build before D198; `main` refuses any other magic, `table_catalog.rs:133`
+/// at `9aa6968`) reads this catalog's leases correctly, and may open it.
 const HEADER_PAGE_MAGIC: u32 = 0xFE44_0B01;
+
+/// **The magic of a catalog that may hold `D > 0`** (SCALE-DESIGN "D198 addendum 2", review 3 C2).
+/// Its deadlines are stored as `lease − D`; a binary that ignores the `[0x08]` key would read every
+/// one of them `D` early and reap live branches, silently. So before the first record holding
+/// `D > 0` is written, the header page takes this magic, durably, and such a binary refuses the
+/// catalog at open instead. Pre-registered as a literal in `bench/lease_grace/PREREG.md` amendment
+/// 10. A one-way step: `D` never returns to 0.
+const HEADER_PAGE_MAGIC_OFFSET: u32 = 0xFE44_0B02;
 
 /// Where the header lives in a dedicated catalog file: the first page after the bitmap, which is
 /// what `BufferPoolManager::new_page` hands out first on a fresh file. Fixed rather than recorded
 /// elsewhere, because a file holding only the catalog needs no second place to look.
 pub const SIDECAR_HEADER_PAGE: u32 = 1;
 
-/// A file's last modification, in unix milliseconds, or `None` if it cannot be read. The
-/// FirstStart policy's evidence (see `TableBranchCatalog::file_mtime`); `None` means no credit,
-/// which is how every first start behaved before the policy.
+/// A file's last modification, in unix milliseconds on the WALL clock, or `None` if it cannot be
+/// read. The FirstStart policy's evidence (see [`FirstStartEvidence`]); `None` is no evidence.
 fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     u64::try_from(since.as_millis()).ok()
+}
+
+/// **How long ago a file time was — review 3, C1.** `stamp` is a WALL-clock time (an mtime);
+/// `lease_now` is on the lease clock, which lags the wall clock by host sleep (F2). `lease_now −
+/// stamp` mixes the two and falls short of the outage by up to the lag of the lease clock that
+/// wrote the file. The lead's corrected rule is the wall age, `W(now) − stamp`, which falls short
+/// only by that lag minus this process's own. The rule assumes the lease clock never runs faster
+/// than the wall clock, which a BACKWARD wall step after this process anchored its lease clock
+/// breaks — F2 exists because NTP steps it — and then the wall age is short by the step while the
+/// lease age is not. So the larger of the two, each saturating at 0: never below either, and never
+/// below what `1ec2deb` credited.
+///
+/// Neither term can see how far the file's LAST writer's lease clock lagged: a D198 writer with no
+/// mark whose host slept is under-credited by that sleep. Derivation and the fix not taken:
+/// `bench/lease_grace/PREREG.md` amendment 10.
+fn file_age_millis(stamp: u64, lease_now: Option<u64>) -> u64 {
+    let wall = crate::cluster::wall_millis_since(stamp);
+    lease_now.map_or(wall, |now| wall.max(now.saturating_sub(stamp)))
+}
+
+/// **The FirstStart policy's evidence for a catalog with no mark** (review 3, C4–C6): downtime
+/// already recorded, plus a file time the rest is measured from.
+///
+/// An ACCRUAL, not a frozen stamp. A process that writes an unmarked catalog and never resumes it
+/// replaces the file's mtime with its own; its first commit therefore records, in `[0x09]`, the
+/// downtime owed before it opened the catalog, and the next first start credits that plus the time
+/// since the file's last write. The writer's own run is credited as neither: a frozen original
+/// stamp would credit an embedder's whole uptime as downtime, and revive for that long every lease
+/// it saw expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirstStartEvidence {
+    /// `[0x09]`: downtime an earlier unresumed writer recorded, or 0.
+    recorded: u64,
+    /// The wall-clock stamp the rest of the outage runs from, if a file time is evidence.
+    since: Option<u64>,
+}
+
+impl FirstStartEvidence {
+    /// The credit owed at lease-clock `lease_now`: `recorded` plus the age of `since`, clamped by
+    /// D206's rule.
+    fn credit(&self, lease_now: Option<u64>) -> u64 {
+        let age = self.since.map_or(0, |m| file_age_millis(m, lease_now));
+        LeaseDeadline::saturating_deadline(self.recorded, age)
+    }
+}
+
+/// Which file times are evidence of the outage before an open of an existing sidecar.
+enum FileTimes {
+    /// The catalog's own mtime: an ordinary open.
+    Own,
+    /// A legacy `{db}.branches` log was found beside a finished catalog — a crash between the
+    /// switchover's two renames, or a rollback to a pre-table build that recreated it. With no
+    /// `[0x09]` record, the earlier of the two mtimes: either file may be the later, and the
+    /// earlier is the larger, conservative credit (review 3, C6). With a record, the catalog's own:
+    /// the record already measured the source when this build migrated it.
+    OwnOrLegacy(Option<u64>),
+    /// Only the SOURCE log's mtime: THIS process just wrote the catalog by migrating it, so its own
+    /// mtime says nothing about the outage. An unreadable source is no evidence at all — never a
+    /// fallback to the catalog's own mtime (review 3, C5).
+    Source(Option<u64>),
 }
 
 impl TableBranchCatalog {
@@ -577,16 +685,28 @@ impl TableBranchCatalog {
             )
         };
         pool.unpin_page(header_page, false);
-        if magic != HEADER_PAGE_MAGIC {
+        if magic != HEADER_PAGE_MAGIC && magic != HEADER_PAGE_MAGIC_OFFSET {
             return Err(FerroError::Branch(format!(
-                "page {header_page} is not a branch-catalog header (magic {magic:#010x}, expected \
-                 {HEADER_PAGE_MAGIC:#010x}); refusing to read a root page id out of whatever this \
-                 page actually holds"
+                "page {header_page} is not a branch-catalog header (magic {magic:#010x}, \
+                 expected {HEADER_PAGE_MAGIC:#010x} or {HEADER_PAGE_MAGIC_OFFSET:#010x}); refusing \
+                 to read a root page id out of whatever this page actually holds"
             )));
         }
         let cat = Self::open(pool, root)?;
         cat.header_page.store(header_page, Ordering::SeqCst);
         cat.published_root.store(root, Ordering::SeqCst);
+        cat.header_magic.store(magic, Ordering::SeqCst);
+        // Addendum 2, the torn case: a record holding `D > 0` beside the old magic — written by a
+        // build of this branch before the magic existed, or a header page that did not reach the
+        // disk. Nothing has been stored against that `D` by THIS process yet, and nothing will be
+        // before the new magic is durable: it is switched here, before the catalog is handed out.
+        if !cat.offset().is_zero() && !cat.header_admits_offset() {
+            let _g = cat.logical.lock().unwrap();
+            cat.switch_header_magic()?;
+            let seq = cat.stage()?;
+            drop(_g);
+            cat.durable(seq)?;
+        }
         Ok(cat)
     }
 
@@ -607,21 +727,21 @@ impl TableBranchCatalog {
     /// The second buffer pool is the honest cost: a second frame budget, real memory. It is also
     /// what keeps the residency win — a bounded pool is bounded whichever file it is over.
     pub fn open_sidecar(path: &std::path::Path, trunk_root: PageId) -> Result<Self, FerroError> {
-        Self::open_sidecar_at(path, trunk_root, None)
+        Self::open_sidecar_at(path, trunk_root, FileTimes::Own)
     }
 
-    /// [`Self::open_sidecar`], with the FirstStart policy's evidence (`file_mtime`) either read
-    /// from `path` itself or, for a migration, handed in as the SOURCE log's.
+    /// [`Self::open_sidecar`], saying which file times are the FirstStart policy's evidence.
     fn open_sidecar_at(
         path: &std::path::Path,
         trunk_root: PageId,
-        source_mtime: Option<u64>,
+        times: FileTimes,
     ) -> Result<Self, FerroError> {
         // Decided BEFORE the file is touched: `DiskManager::new` writes the bitmap into an empty
         // file, so afterwards the length no longer distinguishes a new catalog from an existing
         // one, and a fresh `create` over a populated file would silently orphan every branch.
         let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
-        // Read before anything below can write it: after the open, the mtime is this process's.
+        // Read before the open: `open_from_header` WRITES the file when it switches a torn
+        // header's magic (addendum 2), and every write after that is this process's own.
         let own_mtime = if fresh { None } else { file_mtime_millis(path) };
 
         let file = std::fs::OpenOptions::new()
@@ -651,8 +771,66 @@ impl TableBranchCatalog {
             Ok(cat)
         } else {
             let mut cat = Self::open_from_header(pool, SIDECAR_HEADER_PAGE)?;
-            cat.file_mtime = source_mtime.or(own_mtime);
+            if !cat.marked.load(Ordering::SeqCst) {
+                cat.take_first_start_evidence(own_mtime, times)?;
+            }
             Ok(cat)
+        }
+    }
+
+    /// **The FirstStart policy's evidence, at the open of an existing sidecar with no mark**
+    /// (review 3, C4–C6). Sets `first_start` from the `[0x09]` record and the file times `times`
+    /// names, and `first_start_record`, which this process's first commit writes so that the
+    /// evidence survives it: the downtime owed before this open when the catalog holds a live
+    /// lease, or 0 to reset a record that no live lease is owed any more.
+    fn take_first_start_evidence(
+        &mut self,
+        own_mtime: Option<u64>,
+        times: FileTimes,
+    ) -> Result<(), FerroError> {
+        let recorded = self.first_start_recorded()?;
+        let (since, measured_here) = match times {
+            FileTimes::Own => (own_mtime, true),
+            FileTimes::OwnOrLegacy(legacy) => match (recorded, own_mtime, legacy) {
+                // A record measured the source when this build migrated it.
+                (Some(_), own, _) => (own, true),
+                (None, Some(own), Some(legacy)) => (Some(own.min(legacy)), true),
+                (None, own, legacy) => (own.or(legacy), true),
+            },
+            // The migration recorded the source's age itself, before its rename; this process's
+            // own write is not evidence, and its first commit has nothing to add.
+            FileTimes::Source(source) => (source, false),
+        };
+        let recorded = if measured_here { recorded } else { None };
+        let evidence = (recorded.is_some() || since.is_some())
+            .then(|| FirstStartEvidence { recorded: recorded.unwrap_or(0), since });
+        self.first_start = evidence;
+        if measured_here {
+            let lease_now = LeaseDeadline::try_now_millis().ok();
+            self.first_start_record = if self.holds_a_live_lease()? {
+                evidence.map(|e| e.credit(lease_now))
+            } else {
+                recorded.map(|_| 0)
+            };
+        }
+        Ok(())
+    }
+
+    /// The `[0x09]` record, if any. A value of the wrong length is refused rather than read as
+    /// "nothing recorded", which would drop evidence silently.
+    fn first_start_recorded(&self) -> Result<Option<u64>, FerroError> {
+        match self.tree.search(&keys::first_start())? {
+            None => Ok(None),
+            Some(b) => {
+                let bytes: [u8; 8] = b.as_slice().try_into().map_err(|_| {
+                    BranchError::Corrupt(format!(
+                        "the first-start record must be 8 bytes, got {}; refusing to decide any \
+                         lease's first-start credit from it",
+                        b.len()
+                    ))
+                })?;
+                Ok(Some(u64::from_be_bytes(bytes)))
+            }
         }
     }
 
@@ -681,14 +859,18 @@ impl TableBranchCatalog {
         if has(&cat_path) {
             // Finished, whatever else is lying around. If a crash landed between the two renames
             // the legacy log is still here and is now stale; retire it rather than leave two
-            // catalogs where a later reader might pick the wrong one. Its mtime is still the
-            // SOURCE's, which is the FirstStart policy's evidence, so it is read first.
-            let mut source_mtime = None;
+            // catalogs where a later reader might pick the wrong one. Its mtime is read first: it
+            // is FirstStart evidence beside the catalog's own (`FileTimes::OwnOrLegacy`, C6).
+            let mut legacy_mtime = None;
             if has(&legacy_path) {
-                source_mtime = file_mtime_millis(Path::new(&legacy_path));
+                legacy_mtime = file_mtime_millis(Path::new(&legacy_path));
                 let _ = std::fs::rename(&legacy_path, &retired_path);
             }
-            return Self::open_sidecar_at(Path::new(&cat_path), trunk_root, source_mtime);
+            return Self::open_sidecar_at(
+                Path::new(&cat_path),
+                trunk_root,
+                FileTimes::OwnOrLegacy(legacy_mtime),
+            );
         }
 
         if has(&legacy_path) {
@@ -719,6 +901,18 @@ impl TableBranchCatalog {
                          {SIDECAR_HEADER_PAGE}; refusing to rename it into place"
                     )));
                 }
+                // Review 3, C4: the source's evidence goes INTO the catalog, inside the unit the
+                // rename publishes, so a start that fails after this migration cannot lose it.
+                // Reading the retired log's mtime at a later open instead would be wrong: `main`
+                // migrates and retires to the same name, and a catalog beside an old `.pre-table`
+                // may have been served for months since, all of which its mtime would credit.
+                if let Some(m) = source_mtime {
+                    if cat.holds_a_live_lease()? {
+                        let age = file_age_millis(m, LeaseDeadline::try_now_millis().ok());
+                        cat.upsert(keys::first_start(), age.to_be_bytes().to_vec())?;
+                        cat.publish_root()?;
+                    }
+                }
                 // Everything must be on disk BEFORE the rename publishes it.
                 cat.pool.flush_all()?;
             }
@@ -727,7 +921,11 @@ impl TableBranchCatalog {
             // Only now is the log redundant.
             std::fs::rename(&legacy_path, &retired_path)
                 .map_err(|e| FerroError::Io(format!("retire {legacy_path}: {e}")))?;
-            return Self::open_sidecar_at(Path::new(&cat_path), trunk_root, source_mtime);
+            return Self::open_sidecar_at(
+                Path::new(&cat_path),
+                trunk_root,
+                FileTimes::Source(source_mtime),
+            );
         }
 
         Self::open_sidecar(Path::new(&cat_path), trunk_root)
@@ -771,9 +969,9 @@ impl TableBranchCatalog {
                 }
             }
             let old = cat.core(full.branch_id.id)?;
-            // `full` came out of the source on ITS lease clock, so it goes in through `inward` —
-            // an identity here, because `cat` is brand new and its offset is 0, but a translation
-            // by type rather than by that argument.
+            // `full` came out of the source on ITS lease clock, and goes in through
+            // `inward_at_zero`, which refuses unless the offset is 0: `cat` is brand new, so it is,
+            // and at `D = 0` a lease and its stored value coincide — no translation is needed.
             cat.write_record(&StoredRecord::inward_at_zero(full, cat.offset())?, old.as_ref())?;
         }
         for (parent, epoch, child) in children {
@@ -843,8 +1041,27 @@ impl TableBranchCatalog {
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
     fn stage(&self) -> Result<u64, FerroError> {
+        self.record_first_start_evidence()?;
         self.publish_root()?;
         Ok(self.commit_group.ticket())
+    }
+
+    /// **Review 3, C4: the first commit of a process over an unmarked catalog records the downtime
+    /// owed before it opened the catalog** (`first_start_record`, into `[0x09]`), in the same
+    /// stage and the same fsync as whatever it is committing — no extra sync. Its commit replaces
+    /// the file's mtime with its own, and without this a start that then failed before its resume
+    /// would leave the next one to credit only the time since that write.
+    ///
+    /// Once per process, and never after a mark: `resume_leases` and `record_lease_alive` set
+    /// `first_start_written` before writing the mark, which supersedes it.
+    fn record_first_start_evidence(&self) -> Result<(), FerroError> {
+        if let Some(owed) = self.first_start_record {
+            if !self.first_start_written.load(Ordering::SeqCst) {
+                self.upsert(keys::first_start(), owed.to_be_bytes().to_vec())?;
+                self.first_start_written.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(())
     }
 
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
@@ -896,15 +1113,45 @@ impl TableBranchCatalog {
         if self.published_root.swap(root, Ordering::SeqCst) == root {
             return Ok(());
         }
+        self.write_header_page(header_page, root)
+    }
+
+    /// The header page: this catalog's CURRENT magic (`header_magic`), then the root.
+    fn write_header_page(&self, header_page: u32, root: u32) -> Result<(), FerroError> {
         let frame_i = self.pool.fetch_page(header_page)?;
         {
             let mut f = self.pool.frame_write(frame_i);
             f.data = [0u8; crate::storage::disk_manager::PAGE_SIZE];
-            f.data[0..4].copy_from_slice(&HEADER_PAGE_MAGIC.to_be_bytes());
+            f.data[0..4].copy_from_slice(&self.header_magic.load(Ordering::SeqCst).to_be_bytes());
             f.data[4..8].copy_from_slice(&root.to_be_bytes());
         }
         self.pool.unpin_page(header_page, true);
         Ok(())
+    }
+
+    /// Whether the header page already refuses a binary that knows nothing of `D`.
+    fn header_admits_offset(&self) -> bool {
+        self.header_magic.load(Ordering::SeqCst) == HEADER_PAGE_MAGIC_OFFSET
+    }
+
+    /// **SCALE-DESIGN "D198 addendum 2": the header page takes [`HEADER_PAGE_MAGIC_OFFSET`].**
+    /// Call under `logical`, then stage and wait `durable` BEFORE writing any record that holds
+    /// `D > 0`. The order is the whole point: a record holding `D > 0` that reached the disk ahead
+    /// of the magic is a catalog a pre-D198 binary would open, and read early once a deadline is
+    /// stored against that `D`.
+    ///
+    /// A catalog with no header page (`create` / `open` over a caller's pool) has nowhere to carry
+    /// a magic and so no gate; only the in-memory flag moves. Stated in PREREG amendment 10:
+    /// production opens only sidecars.
+    fn switch_header_magic(&self) -> Result<(), FerroError> {
+        self.header_magic.store(HEADER_PAGE_MAGIC_OFFSET, Ordering::SeqCst);
+        let header_page = self.header_page.load(Ordering::SeqCst);
+        if header_page == 0 {
+            return Ok(());
+        }
+        let root = self.tree.root_page_id.load(Ordering::SeqCst);
+        self.published_root.store(root, Ordering::SeqCst);
+        self.write_header_page(header_page, root)
     }
 
     /// Create an empty catalog containing only trunk, and return it with the tree's root page id.
@@ -931,10 +1178,13 @@ impl TableBranchCatalog {
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
-            file_mtime: None,
+            first_start: None,
+            first_start_record: None,
+            first_start_written: AtomicBool::new(false),
+            header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
-        // Through `inward` like every other write, although the offset of a new catalog is 0 and
-        // `TRUNK_LEASE` is the sentinel, a fixed point either way.
+        // Through `inward_at_zero`, the production door from a `BranchRecord`, which opens only at
+        // `D = 0` — and a new catalog's offset is 0. `TRUNK_LEASE` is the sentinel besides.
         let trunk = StoredRecord::inward_at_zero(
             BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE),
             cat.offset(),
@@ -965,7 +1215,10 @@ impl TableBranchCatalog {
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
-            file_mtime: None,
+            first_start: None,
+            first_start_record: None,
+            first_start_written: AtomicBool::new(false),
+            header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -1410,11 +1663,15 @@ impl TableBranchCatalog {
     /// F1's defect, back through any process that opens the catalog and asks without running a
     /// `LeaseThread`. Both shipped binaries resume before they serve.
     ///
-    /// A catalog with NO record answers as before D198: no authority ever ran, so there is no
-    /// downtime it could be charging. That narrowness is deliberate and is not the adversary's
-    /// strict form (refuse every unresumed catalog), which would turn a large part of the existing
-    /// suite red; that choice is a ⚖ for Ryan, recorded in `bench/lease_grace/PREREG.md`
-    /// amendment 6.
+    /// A catalog with NO record answers as before D198, at `D = 0`. **That is not because it has no
+    /// downtime it could be charging** — this said so until review 3 (C3), and since the FirstStart
+    /// policy it is false: an unmarked catalog holding a live lease has an outage its resume WILL
+    /// credit (its file time, its `[0x09]` record), and until that resume every expiry answer
+    /// charges it. Early answers, then, reachable by a process that asks before resuming: an
+    /// embedder with no `LeaseThread`; neither shipped binary asks before it resumes. The
+    /// narrowness is kept because the strict form (refuse every unresumed catalog) would turn a
+    /// large part of the existing suite red; that choice is a ⚖ for Ryan, recorded in
+    /// `bench/lease_grace/PREREG.md` amendments 6 and 10.
     ///
     /// Reads that decide nothing (`get`, `get_raw`, `scan`, …) are not refused: an inspector must be
     /// able to look. Residual, stated: a process that resumes and then never heartbeats has its
@@ -1440,6 +1697,16 @@ impl TableBranchCatalog {
     fn holds_a_live_lease(&self) -> Result<bool, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::DEADLINE);
         Ok(self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?.next().transpose()?.is_some())
+    }
+
+    /// The FirstStart credit at lease-clock `now_millis`, from the evidence this open took
+    /// (`first_start`), or `None` if it took none. See [`FirstStartEvidence`].
+    fn first_start_credit(&self, now_millis: u64) -> Option<FirstStartCredit> {
+        self.first_start.map(|e| FirstStartCredit {
+            file_mtime: e.since,
+            recorded_millis: e.recorded,
+            credited_millis: e.credit(Some(now_millis)),
+        })
     }
 
     /// `D`, the virtual lease clock's offset. See [`TableBranchCatalog::lease_offset`].
@@ -2078,29 +2345,50 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // Deadlines that had already run out before the mark are shifted too, and stay expired:
         // `v + D_old <= mark` gives `v + D_old + (now − mark) <= now`.
-        let _g = self.logical.lock().unwrap();
-        // The arithmetic, D206's clamp on the offset included, is `AliveState::resume`'s. The
-        // FirstStart policy's evidence goes in only when there is no mark AND a live lease to
-        // protect: a catalog with nothing to reap must not have its `D` moved at all.
-        let prev = self.alive_record()?;
-        let file_mtime =
-            if prev.is_none() && self.holds_a_live_lease()? { self.file_mtime } else { None };
-        let (outcome, next) = AliveState::resume(prev, now_millis, file_mtime);
-        // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
-        // leaves the old mark beside the new offset, and the next start credits the same outage
-        // a second time.
-        self.upsert(keys::alive(), next.encode())?;
-        let seq = self.stage()?;
-        drop(_g);
-        self.durable(seq)?;
-        // Published only once durable. If the write fails, `LeaseThread::start` refuses to start,
-        // so nothing ever reads a `D` the disk does not hold. A heartbeat that lands before this
-        // line carries the NEW `D` anyway, because it reads the record, not this cell (C3).
-        self.lease_offset.publish(next.offset());
-        self.marked.store(true, Ordering::SeqCst);
-        // Last, so that a failed resume leaves a marked catalog refusing expiry questions (C2).
-        self.resumed.store(true, Ordering::SeqCst);
-        Ok(outcome)
+        loop {
+            let _g = self.logical.lock().unwrap();
+            // The arithmetic, D206's clamp on the offset included, is `AliveState::resume`'s. The
+            // FirstStart credit goes in only when there is no mark AND a live lease to protect: a
+            // catalog with nothing to reap must not have its `D` moved at all.
+            let prev = self.alive_record()?;
+            let first_start = if prev.is_none() && self.holds_a_live_lease()? {
+                self.first_start_credit(now_millis)
+            } else {
+                None
+            };
+            let (outcome, next) = AliveState::resume(prev, now_millis, first_start);
+            // SCALE-DESIGN "D198 addendum 2": the first record holding `D > 0` is written only
+            // over a header that already refuses a binary that knows nothing of `D` — the magic is
+            // switched and made durable ALONE first, then the lock is retaken and everything above
+            // recomputed. One extra fsync, once in a catalog's life. The first-start evidence, if
+            // this process owes it, rides this stage: the switch is a write, and it replaces the
+            // file's mtime.
+            if !next.offset().is_zero() && !self.header_admits_offset() {
+                self.switch_header_magic()?;
+                let seq = self.stage()?;
+                drop(_g);
+                self.durable(seq)?;
+                continue;
+            }
+            // The mark supersedes the first-start evidence; nothing writes `[0x09]` after it.
+            self.first_start_written.store(true, Ordering::SeqCst);
+            // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
+            // leaves the old mark beside the new offset, and the next start credits the same outage
+            // a second time.
+            self.upsert(keys::alive(), next.encode())?;
+            let seq = self.stage()?;
+            drop(_g);
+            self.durable(seq)?;
+            // Published only once durable. If the write fails, `LeaseThread::start` refuses to
+            // start, so nothing ever reads a `D` the disk does not hold. A heartbeat that lands
+            // before this line carries the NEW `D` anyway, because it reads the record, not this
+            // cell (C3).
+            self.lease_offset.publish(next.offset());
+            self.marked.store(true, Ordering::SeqCst);
+            // Last, so that a failed resume leaves a marked catalog refusing expiry questions (C2).
+            self.resumed.store(true, Ordering::SeqCst);
+            return Ok(outcome);
+        }
     }
 
     fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
@@ -2116,6 +2404,8 @@ impl BranchCatalog for TableBranchCatalog {
         // early after the next restart.
         let _g = self.logical.lock().unwrap();
         let next = AliveState::heartbeat(self.alive_record()?, now_millis);
+        // A mark supersedes the first-start evidence (review 3, C4); nothing writes `[0x09]` after.
+        self.first_start_written.store(true, Ordering::SeqCst);
         self.upsert(keys::alive(), next.encode())?;
         let seq = self.stage()?;
         drop(_g);
@@ -3810,8 +4100,9 @@ mod f1_lease_grace {
     /// The mark says a lease authority ran here and stopped. Until a resume credits the time since,
     /// every answer charges that downtime to the lease — F1's defect, back through any process that
     /// opens the catalog and asks without running a `LeaseThread`. Reads that decide nothing still
-    /// answer, so an inspector can look. A catalog that has never had a mark answers as before D198:
-    /// there is no downtime it could be charging.
+    /// answer, so an inspector can look. A catalog that has never had a mark answers as before
+    /// D198, at `D = 0` — which, since the FirstStart policy, charges the outage its resume would
+    /// credit (review 3, C3; see `refuse_unresumed`).
     #[test]
     fn a_catalog_with_a_last_alive_mark_refuses_expiry_questions_until_it_resumes() {
         let path = sidecar("unresumed");

@@ -76,6 +76,17 @@ pub mod tag {
     /// with no length check to relax, where a wider header would need the two-lengths tolerant read
     /// `deserialize_core` already carries for D60.
     pub const ALIVE: u8 = 0x08;
+    /// `[0x09]` → **downtime recorded before an unresumed writer**, one big-endian `u64` of
+    /// milliseconds on the wall clock. The FirstStart policy's evidence made durable (D198 review
+    /// 3, C4): a process that writes a catalog with no `ALIVE` record and never resumes it — an
+    /// embedder, or a first start that fails before its resume — replaces the file's mtime, the
+    /// only other evidence of the outage before it, with its own. So its first commit records that
+    /// outage here, and the next first start credits this plus the time since the file's last
+    /// write. Read and written only while `ALIVE` is absent; once a mark exists it is never read.
+    ///
+    /// A key of its own for `ALIVE`'s reasons, and absent from every catalog written before it
+    /// existed, which reads as "nothing recorded".
+    pub const FIRST_START: u8 = 0x09;
     /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
     ///
     /// In the tree rather than in the header on purpose: a free-id *list* in a fixed header is
@@ -179,6 +190,11 @@ pub fn header() -> Vec<u8> {
 /// `[0x08]` — the single last-alive key.
 pub fn alive() -> Vec<u8> {
     vec![tag::ALIVE]
+}
+
+/// `[0x09]` — the single first-start key.
+pub fn first_start() -> Vec<u8> {
+    vec![tag::FIRST_START]
 }
 
 /// The half-open span `[lo, hi)` covering an entire tag group.
@@ -524,5 +540,40 @@ mod tests {
         }
         let (lo, hi) = expired_at_or_before(u64::MAX);
         assert!(!(alive() >= lo && alive() < hi), "the expiry span reached the ALIVE key");
+    }
+
+    /// The same for `[0x09]`, with `ALIVE` among the neighbours it must not share a span with.
+    #[test]
+    fn the_first_start_key_is_its_own_group_and_no_other_span_reaches_it() {
+        let (lo, hi) = whole_group(tag::FIRST_START);
+        assert!(first_start() >= lo && first_start() < hi);
+        for (name, k) in [
+            ("record", record(u64::MAX)),
+            ("deadline", deadline(u64::MAX, u64::MAX)),
+            ("state", state(0xFF, u64::MAX)),
+            ("child", child(u64::MAX, u64::MAX)),
+            ("free_id", free_id(0)),
+            ("envelope", envelope(u64::MAX)),
+            ("arena", arena(u64::MAX, u32::MAX)),
+            ("header", header()),
+            ("alive", alive()),
+        ] {
+            assert!(!(k >= lo && k < hi), "a {name} key fell inside the FIRST_START group");
+        }
+        for t in [
+            tag::RECORD, tag::DEADLINE, tag::STATE, tag::CHILD, tag::FREE_ID, tag::ENVELOPE,
+            tag::ARENA, tag::HEADER, tag::ALIVE,
+        ] {
+            let (lo, hi) = whole_group(t);
+            assert!(
+                !(first_start() >= lo && first_start() < hi),
+                "the FIRST_START key fell inside tag {t:#04x}"
+            );
+        }
+        let (lo, hi) = expired_at_or_before(u64::MAX);
+        assert!(
+            !(first_start() >= lo && first_start() < hi),
+            "the expiry span reached the FIRST_START key"
+        );
     }
 }

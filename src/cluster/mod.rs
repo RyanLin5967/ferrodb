@@ -393,6 +393,19 @@ fn local_wall_millis() -> u64 {
     real
 }
 
+/// **How long ago a WALL-clock stamp was, on the wall clock**, saturating at 0 for a stamp in the
+/// future. The FirstStart policy's measure of a file's age (D198 review 3, C1): a file's mtime is a
+/// wall stamp, and subtracting it from the LEASE clock, which lags the wall clock by host sleep,
+/// mixes two clocks and can under-credit the outage.
+///
+/// A duration, never a reading: nothing it returns is on the scale of a lease deadline, so it does
+/// not reopen the door [`local_wall_millis`]'s privacy closes — a lease DECISION still reads only
+/// [`local_lease_millis`]. It goes through `local_wall_millis`, the one `SystemTime::now()` reader,
+/// so a test's `wall_step` moves it as it moves everything else.
+pub(crate) fn wall_millis_since(stamp_millis: u64) -> u64 {
+    local_wall_millis().saturating_sub(stamp_millis)
+}
+
 /// **A test's hand on the wall clock — THIS THREAD's view of it only, and only in `cfg(test)`.**
 ///
 /// F2's claim is that no step of the wall clock inside a process moves a lease decision, and a

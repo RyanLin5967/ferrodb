@@ -936,11 +936,23 @@ fn lease_resume_report(r: LeaseResume) -> String {
              downtime credited in total, no record rewritten), so a lease that lapsed only while \
              nothing was running is kept for what it had left (Chubby §2.9)"
         ),
-        LeaseResume::FirstStartFromFileTime { now_millis, file_mtime, credited_millis } => format!(
-            "lease: no last-alive mark in this catalog yet, but it holds live leases and its file \
-             was last written at {file_mtime}; crediting {credited_millis}ms since then as downtime \
-             (now {now_millis}), so a lease that lapsed only while nothing was running is kept for \
-             what it had left. The file time can only over-credit, never charge"
+        LeaseResume::FirstStartFromFileTime {
+            now_millis,
+            file_mtime,
+            recorded_millis,
+            credited_millis,
+        } => format!(
+            "lease: no last-alive mark in this catalog yet, but it holds live leases; crediting \
+             {credited_millis}ms as downtime (now {now_millis}): {recorded_millis}ms recorded by \
+             an earlier start that never resumed, plus the wall-clock time since {}. So a lease \
+             that lapsed only while nothing was running is kept for what it had left. The credit \
+             falls short if something else wrote the file later, or if its last writer's lease \
+             clock lagged the wall clock (a D198 process with no mark whose host slept); it is \
+             never below zero",
+            match file_mtime {
+                Some(m) => format!("the file's last write at {m}"),
+                None => "no file time (none is evidence here)".to_string(),
+            }
         ),
         LeaseResume::FirstStart { now_millis } => format!(
             "lease: no last-alive mark in this catalog yet, so the downtime before this start \
