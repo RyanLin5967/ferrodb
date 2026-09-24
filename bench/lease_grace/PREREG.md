@@ -1393,3 +1393,64 @@ which had no RUSTFLAGS, is superseded.
 ### Counts
 
 Unchanged: `f1_lease_grace` **41**, the lib filter **52**, **base + 58**. Review 6 confirmed them.
+
+## Amendment 15 — review 7 (`frontier/lease_review7.md` @ `12cedc2`, SOUND-WITH-CAVEATS at `efd3fe7`). Records only.
+
+Nothing here has been run (quiet mode), and no code changes except one doc comment (W3).
+
+- **W1: amendment 14's list is a subset.** Its "the pass, over EVERY item the branch added or stopped
+  calling" named only part of what the pass covered. The full enumeration is **review 7's Q1 table**,
+  which is authoritative for this record. It names the omitted items, every one of them live:
+  - the tc methods `alive_record`, `refuse_unresumed`, `holds_a_live_lease`, `first_start_credit`,
+    `offset`, `to_lease_clock`, `to_stored`, `outward`, `outward_core`, `open_sidecar_at`;
+  - `FirstStartEvidence::{owed_at_open, resume_credit, accrued}` and `SoftMark::{encode, decode}`;
+  - `FirstStartCredit` and its four fields;
+  - `Writable::stored`, `HEADER_PAGE_MAGIC_OFFSET`, `TwoTierReaper::record_lease_alive`;
+  - every new field: tc's eight, `lease_marks`, and `LeaseThread.{lease_resume, reaper}`.
+  
+  Amendment 14's conclusion stands: `StoredCore::serialize_core` was the only dead item.
+- **W2: step (0) is the candidate worktree's OWN `tools/prepush.sh`.** It is a strict superset of
+  amendment 14's `RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo check --lib --tests --examples`:
+  - it also links the examples (`cargo build --examples`);
+  - it checks the non-test bins and benches (`check --all-targets`);
+  - it checks the `x86_64-pc-windows-msvc` cfg arms, which CI's `windows-latest` runner builds under
+    the same RUSTFLAGS.
+  
+  Run it from THIS worktree (memory `run-land-gate-from-the-candidate`: the script builds the checkout
+  its own file lives in). Amendment 14's "either one is enough" was true for this branch only, whose
+  added `cfg` attributes are all `cfg(test)`, and is withdrawn as a general statement.
+- **W3: C1's R2 exception runs in EITHER direction.** For a file or log last written by a cluster
+  member, the file-time credit is off by `T(last) − W(last)`: the tick's offset from the wall clock at
+  that writer's last write.
+  - It OVER-credits when the tick runs ahead of the wall.
+  - It UNDER-credits when the tick runs behind; the credit still saturates, so never below `D = 0`.
+  - It is unreachable today, because nothing proposes a `LeaseTick`.
+  - It is added to `FirstStartEvidence`'s doc: the R2 bullet, and a new "either direction" residual
+    beside the under and over lists. It is also added to the FAN-QUEUE row's residuals.
+- **D244 lands first; this branch adapts at its merge.** `d244-publish-root` (under review at
+  `6c3f874`) changes `table_catalog.rs` in two places this branch also touches:
+  1. `publish_root` compares with `load`, and stores `published_root` only AFTER page 1 is written (it
+     used to `swap` first).
+  2. Every mutator runs through `mutate(|| body)`, which publishes the root on every exit and then
+     takes the ticket. `stage()` is gone.
+  
+  At the merge, this branch must:
+  - **(a)** Take D244's `publish_root`: load, compare, `write_header_page`, then store.
+  - **(b)** Change `switch_header_magic` the same way. Today it stores `header_magic` and
+    `published_root` BEFORE `write_header_page`, so a failed fetch of page 1 would leave memory
+    claiming the new magic is on disk: D244's defect class, in this branch's code. `write_header_page`
+    should take the magic as an argument, and both atomics should be stored only after it returns
+    `Ok`.
+  - **(c)** Move `record_soft_mark` into `mutate`: `out = body(); if out.is_ok() { soft = record_soft_mark() };`
+    then `publish_root()` (after the soft mark, since its upsert can split the root), then return the
+    first error.
+  - **(d)** Give the mark's own commits (`resume_leases`, `record_lease_alive`) a `mutate` variant that
+    writes no soft mark, which is what `stage_mark` is now.
+  - **(e)** Run the magic switch's own commit, and the open-time torn-magic repair, through `mutate` as
+    well.
+  
+  The merge is then re-reviewed as its own range, with a type pass and step (0).
+
+### Counts
+
+Unchanged: `f1_lease_grace` **41**, the lib filter **52**, **base + 58**.
