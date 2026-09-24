@@ -30,16 +30,17 @@
 //! [`TwoTierReaper::resume_interrupted_reaps`] on the **calling** thread, before it spawns
 //! anything, and returns a catalog-wide error to the caller rather than letting it disappear into
 //! a background thread nobody is reading. One reap or slot whose READ fails is NOT such an error
-//! when the read is the resume's own record read or one of the six mapped read sites that
+//! when the read is the resume's own record read or one of the eight mapped read sites that
 //! `reaper::one_slot_read` lists (D127; C2a and W3 of the wall21 review audits; A1 of audit 4;
-//! audit 6 E1 added the slow path's two). It is declined, printed here with its reason, and asked
-//! again at every open, so one bad record or leaf there cannot stop the database from opening. A
-//! WRITE error inside a reap or a swept slot IS such an error and fails the open (audit 5: an
-//! absorbed write error is not the state a crash leaves), and so does a non-`Branch` failure of an
-//! unmapped read (`set_state`'s, the drain's), which fails one open only. A fault that persists is
-//! refused at every open until what it names is repaired. For a missing or undecodable record
-//! nothing in the engine repairs it (audit 4 A2); a stale `Reaping` key is removed by its branch's
-//! own next reap (audit 5 B4). (This rule said "returns its error" until audit 3 W6.)
+//! audit 6 E1 added the slow path's two, lane §8.22 the drain's two). It is declined, printed here
+//! with its reason, and asked again at every open, so one bad record or leaf there cannot stop the
+//! database from opening. A WRITE error inside a reap or a swept slot IS such an error and fails
+//! the open (audit 5: an absorbed write error is not the state a crash leaves), and so does a
+//! non-`Branch` failure of an unmapped read (`set_state`'s), which fails one open only. A fault
+//! that persists is refused at every open until what it names is repaired. For a missing or
+//! undecodable record nothing in the engine repairs it (audit 4 A2); a stale `Reaping` key is
+//! removed by its branch's own next reap (audit 5 B4). (This rule said "returns its error" until
+//! audit 3 W6.)
 //!
 //! **2. Never reap inside a merge.** A merge is an optimistic read of a branch followed by a
 //! publication into its parent (`DESIGN.md` §4). Reaping the branch in that window frees its

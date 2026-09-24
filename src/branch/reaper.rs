@@ -80,10 +80,10 @@ const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 /// reclamation, and a reaper that stopped on the first oddity would be strictly worse than the bug
 /// this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the caller
 /// records it and moves to the next candidate. Only a non-`Branch` error still aborts. Since
-/// wall21 review audits 5 and 6, a failed READ at one of the six mapped read sites inside a reap
-/// is a `Branch` error whatever its cause (`one_slot_read` lists them). What still aborts is a
-/// WRITE error, or an unmapped read that fails with a non-`Branch` error (`set_state`'s own reads,
-/// the drain's). At open, either fails the open (`resume_interrupted_reaps`).
+/// wall21 review audits 5 and 6 and lane §8.22, a failed READ at one of the eight mapped read sites
+/// inside a reap is a `Branch` error whatever its cause (`one_slot_read` lists them). What still
+/// aborts is a WRITE error, or an unmapped read that fails with a non-`Branch` error (`set_state`'s
+/// own reads). At open, either fails the open (`resume_interrupted_reaps`).
 ///
 /// ⚠ **Absorbing is not excusing.** Now that every refusal is an I/O error or a corrupt catalog,
 /// the sweep continuing is exactly why the count and the reason have to reach a reader — the
@@ -216,12 +216,11 @@ impl TwoTierReaper {
     /// refusal ([`Self::refused_reaps`], reasons in [`Self::open_slot_refusals`]), and the open
     /// goes on:
     /// - a resumed reap that fails on a `Branch` error: a check, or a failed READ at one of the
-    ///   six mapped read sites, which `one_slot_read` makes `Branch` whatever its cause (C2a; A1
-    ///   of audit 4, narrowed to reads by audit 5, the slow path's two added by audit 6 E1). A
-    ///   non-`Branch` failure of an unmapped read (`set_state`'s, the drain's) fails the open, as
-    ///   at `0e3c36a`. Each fails ONE open only: a persistent fault there is met first by a mapped
-    ///   read of the same data, and the drain runs after the flip, so no later resume asks again
-    ///   (audit 6 E1);
+    ///   eight mapped read sites, which `one_slot_read` makes `Branch` whatever its cause (C2a; A1
+    ///   of audit 4, narrowed to reads by audit 5, the slow path's two added by audit 6 E1, the
+    ///   drain's two by lane §8.22). A non-`Branch` failure of an unmapped read (`set_state`'s)
+    ///   fails the open, as at `0e3c36a`. It fails ONE open only, because a persistent fault there
+    ///   is met first by a mapped read of the same data;
     /// - a `Reaping` id whose record cannot be read, of any error type (W3, A1);
     /// - a `Reaping` STATE key whose record is in another state, which is never reaped (A3).
     ///
@@ -780,17 +779,24 @@ impl TwoTierReaper {
             let mut still_pinned = Vec::new();
             let mut moved = false;
             for (i, pf) in entries.iter().copied().enumerate() {
-                let pinned = match self.catalog.get_raw(pf.owner.id) {
+                // **Lane §8.22 (2): both reads below are about ONE slot, the parked page's owner,
+                // and go through `one_slot_read`.** Every reap drains the WHOLE log, so one bad
+                // leaf under one owner used to fail every reap after it: each open that resumed an
+                // interrupted reap, and every lease scan after its first reap. That is E1's hazard
+                // by a second exit. A mapped failure still refuses below, and the entries are put
+                // back before the refusal, so the map in memory is the map on disk when it is taken.
+                let owner = pf.owner.id;
+                let pinned = match one_slot_read(owner, "the record", self.catalog.get_raw(owner)) {
                     // **D18, second site.** This read `rec.live_children` too, and on the table
                     // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
                     // TRUE, so `pinned` was always false and EVERY parked page was released. The
                     // slow path above parks exactly the pages a live child can see, and this
                     // handed them straight back. Ask the index instead, which is the same
                     // predicate asked of a structure that can actually answer it.
-                    Ok(_) => self.catalog.live_child_in_epoch_range(
-                        pf.owner.id,
-                        pf.birth_epoch,
-                        pf.free_epoch,
+                    Ok(_) => one_slot_read(
+                        owner,
+                        "the live children in a parked page's epoch window",
+                        self.catalog.live_child_in_epoch_range(owner, pf.birth_epoch, pf.free_epoch),
                     ),
                     // ⛔ **D124 — this was `Err(_) => false`, i.e. RELEASE THE PAGE.** The comment
                     // it replaces said "no record at all: nothing can be forked off it, so
@@ -879,23 +885,27 @@ impl TwoTierReaper {
 /// of these calls is wrapped into a `Branch` error that names the slot and keeps the cause at the
 /// END of its text, and a `Branch` error passes through unchanged. Writes are never wrapped.
 ///
-/// **Applied at exactly six sites**, and nowhere else:
+/// **Applied at exactly eight sites**, and nowhere else:
 /// - `reap`'s liveness question;
 /// - `reclaim_slot`'s;
 /// - `detach_cascade`'s liveness question;
 /// - `detach_cascade`'s parent-record read;
-/// - the slow path's two reads in `ArenaPageStore::retire_arenas_by_rule`: `page_birth` and the
+/// - the slow path's two reads in `ArenaPageStore::retire_arenas_by_rule`, `page_birth` and the
 ///   per-page `live_child_in_epoch_range` (audit 6 E1). Unmapped, one bad leaf there failed EVERY
 ///   open, because the reap stopped before its flip and the record stayed `Reaping`.
+/// - `drain_pending_seeded`'s two reads about a parked page's owner, `get_raw` and
+///   `live_child_in_epoch_range` (lane §8.22, a second exit of E1's hazard). Audit 6 left them
+///   unmapped, on the argument that the drain runs after the flip, so no later resume asks again.
+///   But every reap drains the WHOLE log. Unmapped, one bad leaf under one parked page's owner
+///   failed each open that resumed an interrupted reap, ended every lease scan after its first
+///   reap, and kept every parked page parked for good.
 ///
-/// **Not mapped, and why each fails at most ONE open (audit 6 E1):**
+/// **Not mapped, and why:**
 /// - `reap`'s own first `get_raw`: the resume reads the same record just before, so a persistent
 ///   fault is refused there, and a mapping behind it could not be tested.
 /// - `set_state`'s reads: a persistent fault is met first by a mapped read of the same data.
-/// - The drain's reads: the drain runs after the flip and the release, so no later resume asks
-///   again.
 ///
-/// A transient fault at any of these fails the open, the conservative direction.
+/// A transient fault at either fails the open, the conservative direction.
 ///
 /// **The steady-state lease scan changes too, and not only in its report** (audit 6 corrected
 /// "only the report changes"). A mapped failure is `reap_if_still_expired` → `Refused`, after
