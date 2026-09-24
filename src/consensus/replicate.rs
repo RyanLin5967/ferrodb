@@ -210,9 +210,15 @@ impl LogTail {
     /// as the wire encodes them (`transport::entry_wire_len`).
     ///
     /// **Always at least one**, even if it alone would exceed `max_bytes`. An empty batch would
-    /// read as a heartbeat and the peer would never advance; sending the entry at least puts the
-    /// refusal, if there is one, where the encoder names it. For an entry the log admitted, it never
-    /// binds: `MAX_ENTRY_BYTES` leaves the `Append` envelope and the MAC about 4 KiB of room.
+    /// read as a heartbeat, and the peer would never advance.
+    ///
+    /// **When the rule binds.** It never binds on an entry that came through proposal: D223's
+    /// admission check (`transport::admit_entry`) refuses anything that does not fit one frame
+    /// alone. It can bind on an entry placed some other way. Before D223 that included a proposal
+    /// the wire could not encode at all, such as a configuration over `MAX_CONFIG_NODES`; its
+    /// `entry_wire_len` is `usize::MAX`. Such an entry is sent alone, and the encoder refuses it;
+    /// `Transport::send` counts that refusal in `unencodable()`. Correcting an earlier claim here, that
+    /// it never binds on an entry the log admitted: before D223 it did, and a test pins the rule now.
     fn slice_from(&self, round: Round, limit: usize, max_bytes: usize) -> Vec<Entry> {
         if round <= self.base || round > self.last_round() {
             return Vec::new();
@@ -671,6 +677,10 @@ impl Consensus {
     /// The **only** sanctioned way to move `last_round` upward. Everything else — the leader's
     /// `NoOp` on election included — must come through here, or the log and the scalars that
     /// describe it part company and [`Consensus::ensure_log`] fires.
+    ///
+    /// It does not check that the wire can carry `command`; its callers do. `on_propose` runs D223's
+    /// admission check (`transport::admit_entry`) before calling this, and the election `NoOp` is one
+    /// byte, which is always admissible. A new caller appending anything else must admit it first.
     pub(crate) fn append_own_entry(&mut self, command: Command, out: &mut Vec<Action>) -> Round {
         self.ensure_log();
         let e = Entry { term: self.hard.term, round: self.last_round + 1, command };
@@ -1317,7 +1327,16 @@ impl Consensus {
             return;
         }
         self.ensure_log();
-        self.append_own_entry(c, out);
+        // **Admitted before the log sees it** (D223). A round the wire cannot carry is a round no
+        // follower can ever receive: it never commits, and it blocks every round after it. The check
+        // is the encoder's own (`transport::admit_entry`), and it runs before `append_own_entry`, so
+        // a refusal leaves neither the in-memory tail nor the disk holding the round.
+        let candidate = Entry { term: self.hard.term, round: self.last_round + 1, command: c };
+        if let Err(why) = super::transport::admit_entry(&candidate) {
+            out.push(Action::Refuse { why });
+            return;
+        }
+        self.append_own_entry(candidate.command, out);
         self.bcast_append(out);
         // No commit advance here. This leader holds the round but has not made it durable, and a
         // round counted into a quorum before its own node fsynced it is the failure rule 4 names.

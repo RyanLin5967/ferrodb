@@ -45,8 +45,11 @@
 //! [`Transport::dropped`] means a peer is too slow to keep up,
 //! [`Transport::lost_in_flight`] means a connection broke mid-frame, and
 //! [`Transport::inbound_dropped`] means *this* node is not draining its own inbox. A send after
-//! shutdown is **refused** rather than counted, because a caller still producing `Action::Send`
-//! after stopping its transport has a bug rather than a slow peer.
+//! shutdown is **refused** rather than dropped, because a caller still producing `Action::Send`
+//! after stopping its transport has a bug rather than a slow peer. Every refused send is counted too
+//! (D223): after shutdown, misaddressed, or unencodable, in [`Transport::refused_after_stop`],
+//! [`Transport::unaddressable`] and [`Transport::unencodable`]. The caller in `node.rs` discards the
+//! error, so the count is the only trace a refusal leaves.
 //!
 //! # The wire format
 //!
@@ -242,6 +245,34 @@ pub(crate) fn entry_wire_len(e: &Entry) -> usize {
         Ok(()) => b.len(),
         Err(_) => usize::MAX,
     }
+}
+
+/// **The one admission check** (D223): whether an entry can ever be carried, decided before it
+/// reaches the leader's log, in memory or on disk.
+///
+/// Every limit here is the encoder's own, applied by running it rather than restated. An entry the
+/// encoder cannot write at all — a configuration over [`MAX_CONFIG_NODES`], a name longer than its
+/// u16 prefix — is refused with the encoder's own error. An entry it can write, but longer than
+/// [`append_entries_budget`], is refused because it would not fit one signed `Append` alone.
+///
+/// Why at proposal. A round the wire cannot carry is a round no follower can ever receive, so it
+/// never commits, and it blocks every round after it. Before this, `on_propose` appended any command,
+/// and the only refusals came later and silently: from the disk, after the in-memory tail already
+/// held the round, or from the encoder on every heartbeat, discarded by `node.rs`.
+pub(crate) fn admit_entry(e: &Entry) -> Result<(), FerroError> {
+    let mut b = Vec::new();
+    encode_entry(&mut b, e)?;
+    let budget = append_entries_budget();
+    if b.len() > budget {
+        return Err(FerroError::Wal(format!(
+            "an entry of {} bytes on the wire cannot fit one Append frame, which carries at most \
+             {budget} bytes of entries once its envelope and a signature are paid for. Refused at \
+             proposal, before it reached the log: a round no frame can carry is a round no follower \
+             can ever receive, and it would block every round after it",
+            b.len()
+        )));
+    }
+    Ok(())
 }
 
 fn too_big(n: usize) -> FerroError {
@@ -1152,6 +1183,13 @@ struct Counters {
     idle_closed: AtomicU64,
     /// Outbound messages refused because the transport is stopped.
     refused_after_stop: AtomicU64,
+    /// Outbound messages refused because the encoder cannot frame them (D223). After admission at
+    /// proposal, a leader's own traffic should never land here, so a climbing number is a bug that
+    /// this is the only meter able to show: `node.rs` discards the error by design.
+    unencodable: AtomicU64,
+    /// Outbound messages refused because they were addressed to this node itself, or to a node this
+    /// transport holds no address for: configuration mistakes that are otherwise a silent partition.
+    unaddressable: AtomicU64,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1543,6 +1581,10 @@ impl Transport {
     /// network conditions: a message to this node itself, and a message to a node with no address.
     /// Both are silent partitions if they are dropped, and a silent partition is the failure this
     /// whole layer exists to make impossible.
+    ///
+    /// **Every refusal is also counted** (D223): [`Transport::refused_after_stop`],
+    /// [`Transport::unaddressable`] and [`Transport::unencodable`]. The caller in `node.rs` discards
+    /// the error by design, so the count is the only trace a refused send leaves.
     pub fn send(&self, m: &Message) -> Result<(), FerroError> {
         // A stopped transport discards, and a discard with no error and no counter is the silent
         // loss this module claims not to have. Refused, because a caller still stepping its state
@@ -1557,6 +1599,7 @@ impl Transport {
             )));
         }
         if m.to == self.self_id {
+            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
             return Err(FerroError::Internal(format!(
                 "{} tried to send a consensus message to itself; the state machine addresses peers \
                  only, and a self-addressed message means a handler used the wrong id",
@@ -1564,16 +1607,21 @@ impl Transport {
             )));
         }
         let ob = self.outboxes.get(&m.to).ok_or_else(|| {
+            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
             FerroError::Internal(format!(
                 "no address is configured for {}, so a message to it cannot be sent. This node \
                  holds addresses for {:?}. A configuration that names a node the transport cannot \
-                 reach is a node permanently unreachable while every meter reads healthy — add it \
-                 to the peer map",
+                 reach is a node permanently unreachable, whose only meter is `unaddressable` — add \
+                 it to the peer map",
                 m.to,
                 self.outboxes.keys().collect::<Vec<_>>()
             ))
         })?;
-        let frame = encode_signed(m, self.key.as_deref())?;
+        // Counted as well as returned: `node.rs` discards this error by design, so without the count
+        // a message the encoder refuses vanishes with no number attached (D223).
+        let frame = encode_signed(m, self.key.as_deref()).inspect_err(|_| {
+            self.counters.unencodable.fetch_add(1, Ordering::SeqCst);
+        })?;
         ob.push(frame);
         self.counters.sent.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1696,6 +1744,14 @@ impl Transport {
     pub fn refused_after_stop(&self) -> u64 {
         self.counters.refused_after_stop.load(Ordering::SeqCst)
     }
+    /// Sends refused because the encoder could not frame the message. See `Counters::unencodable`.
+    pub fn unencodable(&self) -> u64 {
+        self.counters.unencodable.load(Ordering::SeqCst)
+    }
+    /// Sends refused because they were addressed to this node or to a node with no address.
+    pub fn unaddressable(&self) -> u64 {
+        self.counters.unaddressable.load(Ordering::SeqCst)
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -1788,6 +1844,8 @@ impl std::fmt::Debug for Transport {
             .field("inbound_dropped", &self.inbound_dropped())
             .field("lost_in_flight", &self.lost_in_flight())
             .field("connect_failures", &self.connect_failures())
+            .field("unencodable", &self.unencodable())
+            .field("unaddressable", &self.unaddressable())
             // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
             // reports only whether there is one.
             .field("signed", &self.signs_its_traffic())

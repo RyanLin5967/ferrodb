@@ -739,6 +739,12 @@ impl<A: Applier> Node<A> {
                 // A send that cannot be delivered is dropped and counted by the transport, not an
                 // error here: consensus is designed for a lossy network, and treating one
                 // undeliverable heartbeat as a node failure would take a healthy node down.
+                //
+                // "Counted" is literal, and was not always (D223). Every `Err` this discards has a
+                // meter: `refused_after_stop`, `unaddressable` and `unencodable`. A frame dropped
+                // after it was queued has one too: `dropped` or `lost_in_flight`. A leader's own
+                // entries are admitted at proposal by the encoder's own measure, so `unencodable`
+                // climbing means a bug, not a load.
                 let _ = self.net.send(&m);
             }
 

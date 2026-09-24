@@ -94,15 +94,28 @@ const HEADER_SIZE: usize = 36;
 /// `total_len | term | round | at least one payload byte | crc32`.
 const MIN_FRAME: usize = 4 + 8 + 8 + 1 + 4;
 
-/// The largest entry this log will store, **derived from what the transport can carry** rather than
-/// picked.
+/// The largest frame this log will write, set so that **it never refuses anything the wire can
+/// carry**.
 ///
-/// An entry larger than one replication frame is an entry no follower can ever be sent, so a log
-/// that accepted it would hold a round that can never reach a quorum — a write that is durable,
-/// unreplicable, and undetectable until a follower falls behind. Refusing at `append` is the only
-/// point where the caller still has somewhere to put the error. The headroom is for the `Append`
-/// envelope around the entry (from, to, term, prev_round, prev_term, commit, and F7's MAC).
-pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES - 4096;
+/// It used to be the admission limit: `MAX_FRAME_BYTES − 4096`, with the headroom meant for the
+/// `Append` envelope. That was about 4 KiB below what one frame actually carries, and it was checked
+/// only here, after the leader's in-memory tail already held the round. So an entry in between was
+/// carried by the wire and refused by every disk, and the tail kept a round nothing could store
+/// (D223). Admission now happens once, at proposal, by the encoder's own measure
+/// (`transport::admit_entry`), and the disk must accept everything that check admits, and everything
+/// a peer's frame can deliver.
+///
+/// So this is `MAX_FRAME_BYTES`, and that is enough (READ, re-review R3). A disk frame is 24 bytes
+/// plus the command's payload, and a wire entry is 16 plus its command. The command is the payload
+/// for every kind but `Catalog`, whose wire form is 13 bytes longer, so a disk frame is at most its
+/// wire entry + 8. The largest wire entry any frame can hold, even unsigned, is `MAX_FRAME_BYTES − 45`,
+/// which leaves a disk frame of at most `MAX_FRAME_BYTES − 37`.
+///
+/// **What the check below still guards:** the log format's own pairing, for any caller of `append`.
+/// A frame this log writes must be one its own scan reads back (`MAX_FRAME`). It is a different
+/// condition from admission, strictly looser than anything a frame carries, so neither masks the
+/// other's failures; each is tested at its own layer.
+pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES;
 
 /// The largest frame a scan will read from disk. A corrupt length field is a request to allocate,
 /// and an unbounded one is a denial of service triggered by four bad bytes.
@@ -135,7 +148,8 @@ pub enum LogError {
     TermWentBackwards { last: Term, got: Term },
     /// A caller's claim about the term at a round disagrees with what the log holds.
     TermMismatch { round: Round, held: Term, claimed: Term },
-    /// An entry too large for the transport to ever carry. See [`MAX_ENTRY_BYTES`].
+    /// A frame larger than this log will read back. Since D223 nothing admitted at proposal, and
+    /// nothing a peer's frame can deliver, is that large. See [`MAX_ENTRY_BYTES`].
     TooLarge { bytes: usize, limit: usize },
     /// A value the encoding's length fields cannot express.
     ///
