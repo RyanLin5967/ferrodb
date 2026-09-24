@@ -1239,3 +1239,58 @@ The name is kept: renaming it would break every earlier amendment's reference.
 - `f1_lease_grace` → **41** (+2 at `1dad3a6`).
 - **base + 58**.
 - The lib filter → **52** (41 + 5 + 3 + 1 + 1 + 1).
+
+### Amendment 13, addendum: the type and visibility pass (review 5, B1), recorded after `d6d5fb5` and `b561b48`
+
+This is a READ pass, not a build, over `git diff 012f65c..b561b48 -- src examples`. Each added
+production line was checked against the definition it uses. The same pass was also run over the
+test code added since `012f65c`.
+
+**What was checked:**
+- **Changed struct and variant definitions, and every constructor and consumer of each** (found with
+  `grep -rn --include='*.rs' -F` over `src tests examples`):
+  - `LeaseResume::FirstStartFromFileTime` (5 fields): 1 constructor (`AliveState::resume`), which
+    names all 5 with matching types, and 1 matcher (`lease_thread.rs:939`), which binds all 5. No
+    test names it.
+  - `stored::FirstStartCredit` (4 fields): 1 constructor (`first_start_credit`). `file_mtime` is
+    `e.file.map(FileWallStamp::millis)`, which is `Option<u64>`: this was B1. `writer_mark` is
+    `Option<u64>`. `recorded_millis` and `credited_millis` are `u64`.
+  - `SoftMark` (2 fields): 3 constructors (`decode`, the migration, `record_soft_mark`), all `u64`.
+  - `FirstStartEvidence { soft: Option<SoftMark>, file: Option<FileWallStamp> }`: 1 constructor.
+    `FileTimes`' three variants all carry `Option<FileWallStamp>`, fed from `FileWallStamp::of` (3
+    sites).
+  - `TableBranchCatalog`'s two struct literals (`create`, `open`) list `first_start`,
+    `first_start_owed` and `header_magic`, and neither lists a removed field. `file_mtime`,
+    `first_start_record`, `first_start_written` and `soft_mark_superseded` have 0 hits in
+    `src tests examples`.
+  - `AliveState::resume` has 1 caller and `open_sidecar_at` 3, all with the current signatures.
+- **Visibility:**
+  - `cluster` is `pub mod` (`lib.rs:23`) and `FileWallStamp`/`standalone_lease_millis` are
+    `pub(crate)`.
+  - `FileWallStamp`'s field is private, and is constructed only inside `cluster`.
+  - `storage::atomic_file` is `pub mod`, with `pub trait FileOps`, `pub struct OsFileOps` and
+    `pub fn parent_dir`.
+  - `BufferPoolManager::disk_manager` is `pub` (`buffer_pool.rs:391`).
+  - `stored::LeaseOffset::is_zero` and `FirstStartCredit`'s fields are `pub(super)`.
+- **The example:**
+  - `LeaseDeadline(pub u64)` (`types.rs:138`) and `BranchId::TRUNK` are public.
+  - `branch::table_catalog` and `branch::types` are `pub mod`.
+  - `fork_staged`, `set_root`, `resume_leases` and `record_lease_alive` are `BranchCatalog` trait
+    methods (`branch/mod.rs:80`, `:228`, `:448`, `:464`), imported with the trait.
+  - `key_rewrites` is `pub fn`.
+- **Copy and moves:**
+  - `Option<SoftMark>` and `Option<FileWallStamp>` are `Copy` (both derive `Copy`), so `self.soft` /
+    `self.file` behind `&self` and the reuse of `source_mtime` after the `if let` tuple are legal.
+  - `Authority` is `Copy`, since `authority()` already returns `lock().authority`.
+- **CI's `-D dead_code`** (`.github/workflows/tests.yml:67`). Every new production item has a
+  production use:
+  - `FileWallStamp::{of, millis, lease_scale_age_millis, wall_age_millis}`;
+  - `standalone_lease_millis`, `sync_dir_of`, `stage_mark`, `soft_mark`;
+  - `SoftMark::{encode, decode}`, `FirstStartEvidence::{owed_at_open, resume_credit, accrued}`;
+  - `FileTimes`' three variants, `LeaseOffset::is_zero`, `HEADER_PAGE_MAGIC_OFFSET`.
+  
+  Every `#[cfg(test)]` helper has a test use: `file_mtime_millis`, `as_written_before_d198`,
+  `assert_no_d198_keys`, `legacy_log`, `MAIN_MAGIC`, `magic_on_disk`, `write_magic_on_disk`,
+  `wall_now_millis`, `credited`.
+
+**Found:** no second error. The first `cargo check --lib --tests --examples` settles it; a read cannot.
