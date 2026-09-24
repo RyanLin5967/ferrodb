@@ -2140,12 +2140,13 @@ fn sender_loop(
 /// this fully needs the acceptor to send a verdict, which is a protocol change.
 ///
 /// **What bounds every one of these losses is consensus retransmission, not this transport.** A
-/// pre-candidate re-campaigns each time its countdown reaches `election_timeout` while it may
-/// campaign, and a campaign restarts the countdown (`election.rs`, `voter_tick` and
-/// `start_precampaign`). When it may not, no campaign was due, so no lost campaign frame goes
-/// unresent. A leader re-sends
-/// from each peer's `next` on every heartbeat (`leader_tick`, then `bcast_append` in
-/// `replicate.rs`). So a lost frame costs one retransmission interval, never a round.
+/// pre-candidate re-campaigns each time its countdown reaches `election_timeout`, **but only while
+/// `may_campaign()` holds** (not behind, not unjoined, a voter in its own configuration), and a
+/// campaign restarts the countdown (`election.rs`, `voter_tick` and `start_precampaign`). When
+/// `may_campaign()` is false the countdown restarts and nothing is sent: no campaign was due, so no
+/// lost campaign frame goes unresent. A leader re-sends from each peer's `next` on every heartbeat
+/// (`leader_tick`, then `bcast_append` in `replicate.rs`). So a lost frame costs one retransmission
+/// interval, never a round.
 ///
 /// **A restarted peer is caught only across a gap of at least this**, which in practice means an idle
 /// follower-to-follower link. It is not caught on a busy link, where it costs two heartbeats, nor
