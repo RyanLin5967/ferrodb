@@ -208,6 +208,16 @@ impl Pumped {
 /// from exactly one starting cursor — so that lives on [`Subscription::following`], which takes the
 /// cursor from the boundary instead of from the caller. See [`SnapshotBoundary`] for why pairing a
 /// boundary with a cursor of one's own choosing loses data silently.
+/// **D276: how far one pump may grow its window, in multiples of `max_bytes`.**
+///
+/// A pump reads at most `max_bytes` past its cursor, and the cursor never passes an open
+/// transaction's first row. So a transaction whose rows span more than one window never had its
+/// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
+/// rule took for the end of the feed. Now a pump that cannot advance for an open transaction
+/// re-reads with its window doubled, up to this many batches (64 MiB at the default `max_bytes`),
+/// and past that refuses by name. Bound to `max_bytes` so that raising one raises the other.
+const MAX_WINDOW_BATCHES: u64 = 64;
+
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
@@ -239,6 +249,10 @@ impl FeedStreamer {
 
     /// Bound how much log one pump will decode. A consumer that has been away for a long time
     /// should not cause one unbounded allocation.
+    ///
+    /// A single transaction larger than this is still read whole: the window grows until its
+    /// `Commit` or `Abort` is in reach, up to `MAX_WINDOW_BATCHES` times this bound, and a pump that
+    /// would need more refuses with an error naming it (D276).
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes.max(1);
         self
@@ -292,6 +306,21 @@ impl FeedStreamer {
         emitted_through: u64,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
+        self.pump_window(wal, cursor, emitted_through, w, self.max_bytes)
+    }
+
+    /// The pump, reading at most `window` bytes past `cursor`. It recurses with the window doubled
+    /// while an open transaction holds the cursor where it started (D276, `MAX_WINDOW_BATCHES`),
+    /// and it writes nothing before the read it keeps: the decoder's history merges a re-read of
+    /// a superset range idempotently, and nothing else is changed before the write.
+    fn pump_window<W: Write>(
+        &self,
+        wal: &WalManager,
+        cursor: u64,
+        emitted_through: u64,
+        w: &mut W,
+        window: u64,
+    ) -> Result<Pumped, FerroError> {
         use std::sync::atomic::Ordering;
 
         // Durable only. Reading to `next_lsn` would let a consumer act on work a crash erases.
@@ -321,7 +350,7 @@ impl FeedStreamer {
             });
         }
 
-        let to = frontier.min(cursor.saturating_add(self.max_bytes));
+        let to = frontier.min(cursor.saturating_add(window));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
         // **The cursor rule**, and it has FIVE parts now. Three of them have cost real data, and the
@@ -458,6 +487,33 @@ impl FeedStreamer {
         let refused_from = refused_commit
             .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());
         let next = refused_from.map_or(next, |first| next.min(first));
+
+        // **D276: a transaction larger than the window.** The cursor cannot pass an open
+        // transaction's first row, so if one holds it where it started and its `Commit` or `Abort`
+        // lies past this window, every later pump would read the same window and return the same
+        // nothing: a wedge a caught-up consumer cannot tell from the end of the feed. So read again
+        // with the window doubled, until that transaction resolves inside it (the cursor then
+        // moves), the window reaches the durable frontier (the transaction is really still in
+        // flight, which is caught up, not wedged), or the window reaches its cap, where the pump
+        // refuses by name rather than answer a quiet `Ok`. Never over a refusal: a refused commit
+        // stalls the feed on purpose and says so, and growing past it would report the wrong reason.
+        // The bytes held for one pump are bounded by the cap; an in-flight transaction already
+        // larger than it is refused too, since delivering it whole would need more.
+        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {
+            let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);
+            if window >= cap {
+                return Err(FerroError::Wal(format!(
+                    "the change feed cannot advance past lsn {}: transaction(s) {:?} open there span \
+                     more than {cap} bytes of log ({MAX_WINDOW_BATCHES} times max_bytes {}) with no \
+                     Commit or Abort in reach, and delivering one needs it read whole. Nothing is \
+                     skipped: raise max_bytes (FeedStreamer::with_max_bytes) to deliver it.",
+                    decoded.open_from.unwrap_or(cursor),
+                    decoded.open,
+                    self.max_bytes
+                )));
+            }
+            return self.pump_window(wal, cursor, emitted_through, w, window.saturating_mul(2).min(cap));
+        }
 
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
         // does, it errors rather than writing a denied column, which is the right way round.
