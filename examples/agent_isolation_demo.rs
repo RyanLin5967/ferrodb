@@ -514,22 +514,14 @@ impl Db {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.db");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("open db");
-        let bp = Arc::new(BufferPoolManager::new(Arc::new(
-            DiskManager::new(file).expect("disk manager"),
-        )));
-        let catalog = Catalog::create(bp.clone()).expect("catalog");
-        let wal = Arc::new(
-            ferrodb::wal::log::WalManager::new(dir.path().join("agent.wal")).expect("wal"),
-        );
-        let txn = Arc::new(ferrodb::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
-        bp.attach_wal(wal);
+        // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+        // carries REVERT's history store and pays for it as production does; a runtime on
+        // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+        // (forgotten below), and its file goes with this scratch directory.
+        let db_path = (&path).to_path_buf();
+        let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+        let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+        let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
 
         // **Storage-backed, exactly as `src/cli/cli.rs` builds it.** Until the CLI was wired to the
         // branch engine this could not be done here either, and Act II ran on `AgentRuntime::new()`
@@ -550,7 +542,7 @@ impl Db {
             ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base)
                 .expect("arena"),
         );
-        let runtime = Arc::new(
+        let runtime = opened.attach_runtime(
             AgentRuntime::with_storage(
                 branches as Arc<dyn ferrodb::branch::BranchCatalog>,
                 Arc::new(ferrodb::tel::MemEffectLog::new()),
@@ -558,6 +550,8 @@ impl Db {
             )
             .expect("storage-backed runtime"),
         );
+        let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+        std::mem::forget(lock);
         Db { catalog, bp, txn, runtime, _dir: dir }
     }
 

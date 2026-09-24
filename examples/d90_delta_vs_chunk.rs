@@ -251,6 +251,18 @@ fn build(dir: &Path, nrows: i64) -> Server {
     let wal = Arc::new(WalManager::new(dir.join("main.wal")).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
+    // D212 (a') AMENDED 3, item 4: this harness counts page I/O through a `CountingStorage` under its
+    // `DiskManager`, which `open_recovered` cannot take, so it registers REVERT's history store itself,
+    // as `open_recovered` does before `recover` (the database is fresh, so there is nothing to
+    // recover). Merges then pay the history's cost here as they do in production.
+    txn.attach_history_store(
+        ferrodb::wal::history::HistoryStore::open(
+            dir.join("main.db.history"),
+            ferrodb::wal::history::retention_from_env().unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let cat = Arc::new(TableBranchCatalog::open_sidecar(&dir.join("b.branchcat"), 1).unwrap());
     let branches: Arc<dyn BranchCatalog> = cat.clone();
     // The arena floor must sit ABOVE where the ordinary table will grow to, or the table runs out
