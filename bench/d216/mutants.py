@@ -3,16 +3,16 @@
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,...] [--skip M26,...]
 
-At `d216-clean-restart`, run with
-`--skip M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound`:
-those four mutate D252-branch code or tests.
+At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows`:
+those two mutate code only `d252-caught-up-pin` has, under a test target (the lib) both tips have.
 
 A mutant whose `--test` target the tip does not have is reported NOT-AT-TIP and left out of
 everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else. A pattern
 that matches anything but once, where the targets exist, is a PATTERN-MISMATCH, never an absence.
+Mutants left out by `--only` or `--skip` are listed in the summary as SKIPPED.
 
 `--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
-`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound`
+`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound,M30_refusal_passes_its_rows`
 until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
 buffered `TxnEnd` two D216 gate negative controls use as their premise, so they fail there, a full
 CONTROL is not clean, and every verdict would be VOID.
@@ -183,6 +183,12 @@ MUTANTS = [
      "            history.covered_through = history.covered_through.max(to_lsn);\n",
      [STREAM], [S + "a_bound_inside_a_commit_does_not_break_the_next_pump",
                 S + "a_large_backlog_is_delivered_in_bounded_batches"], "KILL"),
+    # Found under D252: a refusal's cursor passed the refused transaction's rows when another
+    # transaction committed inside it.
+    ("M30_refusal_passes_its_rows", "src/replication/stream.rs",
+     "        let next = refused_from.map_or(next, |first| next.min(first));\n",
+     "        let next = refused_from.map_or(next, |_first| next);\n",
+     [STREAM], [S + "a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
@@ -246,13 +252,18 @@ def main():
         sys.exit(__doc__)
     tip = sys.argv[1]
     mutants = MUTANTS
+    skipped = []
     for flag in ("--only", "--skip"):
         if flag in sys.argv:
-            named = sys.argv[sys.argv.index(flag) + 1].split(",")
+            at = sys.argv.index(flag) + 1
+            if at >= len(sys.argv):
+                sys.exit(f"refusing: {flag} needs a comma-separated list of mutant names")
+            named = sys.argv[at].split(",")
             unknown = [w for w in named if w not in {m[0] for m in MUTANTS}]
             if unknown or not named:
                 sys.exit(f"refusing: {flag} names no mutant or unknown ones: {unknown}")
             keep = flag == "--only"
+            skipped += [m[0] for m in mutants if (m[0] in named) != keep]
             mutants = [m for m in mutants if (m[0] in named) == keep]
     env = dict(os.environ)
     if "--target-dir" in sys.argv:
@@ -261,12 +272,12 @@ def main():
         sys.exit(f"refusing: {TREE} already exists; remove it deliberately or pick another path")
     os.makedirs(OUT, exist_ok=True)
     git("worktree", "add", "--detach", TREE, tip, cwd=REPO)
-    summary = []
+    summary = [f"{name} SKIPPED (by --only/--skip)" for name in skipped]
     try:
-        # NOT-AT-TIP: a mutant whose subject or test target the tip does not have is reported and left
-        # out, CONTROL included, so one script serves `d216-clean-restart` (no D252 test, no D252
-        # code) and `d252-caught-up-pin`. Reported, never silent: the pre-registration names which
-        # mutants each tip must list here.
+        # NOT-AT-TIP: a mutant whose test target the tip does not have is reported and left out,
+        # CONTROL included, so one script serves `d216-clean-restart` (no D252 test) and
+        # `d252-caught-up-pin`. Reported, never silent: the pre-registration names which mutants each
+        # tip must list here.
         present = []
         for m in mutants:
             name, path, old = m[0], m[1], m[2]
