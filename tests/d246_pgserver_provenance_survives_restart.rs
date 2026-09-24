@@ -6,10 +6,16 @@
 //!
 //! * `who_wrote_row` — `ferro_row_authors` over the wire — answers NOTHING for a row an agent merged
 //!   before the restart. Never a wrong actor: the map is simply empty.
-//! * pgserver's open runs `recover` and no checkpoint, so the old process's `RunIdentity` record
-//!   stays in the log beside the new process's, both under slot 1 for two different actors, and
-//!   `LogicalDecoder::decode` refuses any range holding both ("declares provenance slot 1 twice with
-//!   different actors"). A cold decode from `base_lsn` can never get past those bytes.
+//! * The reissued slot itself: the second process's run is given slot 1, the slot the first
+//!   process's run already held.
+//! * At this branch's base pgserver's open runs `recover` and no checkpoint, so the old process's
+//!   `RunIdentity` record stays in the log beside the new process's, both under slot 1 for two
+//!   different actors, and `LogicalDecoder::decode` refuses any range holding both ("declares
+//!   provenance slot 1 twice with different actors"). A cold decode from `base_lsn` can never get
+//!   past those bytes. (`d216-clean-restart` makes the open checkpoint a non-empty log, and since the
+//!   lead's 09:44Z D227 decision no longer re-declares old runs, so on that tree the old record
+//!   leaves the retained log; an archive spanning the restart still holds both. The slot claim
+//!   catches reuse on both trees.)
 //!
 //! This drives the REAL `pgserver` binary over the wire rather than a copy of its open sequence: the
 //! defect is that one entry point's construction differs from the other's, and a test that rebuilt
@@ -24,6 +30,7 @@
 //! | premise: second process names `agent-b` for row 2 | holds | holds |
 //! | second process names `agent-a` for row 1 | **fails**: the view has no row 1 | holds |
 //! | cold decode `[base_lsn, next_lsn)` | **fails**: slot 1 declared for `agent-a` and `agent-b` | Ok, `agent-a` and `agent-b` under two slots |
+//! | `agent-b`'s slot in the second process differs from `agent-a`'s in the first | **fails**: both are slot 1 | holds (1 and 2) |
 //! | the runs are in `<db>.provenance`, the file the CLI opens | **fails**: no such store | holds |
 //!
 //! The claims are collected before anything is asserted, so a red run shows every symptom.
@@ -126,6 +133,9 @@ fn start(db: &Path) -> Server {
     let mut child = Command::new(example_bin("pgserver"))
         .arg(db)
         .arg("127.0.0.1:0")
+        // A caller's periodic-checkpoint setting would truncate the log between the two merges and
+        // change what the decode below can see; this fixture's log is the default one.
+        .env_remove("FERRODB_CHECKPOINT_INTERVAL")
         .stdout(Stdio::piped())
         .stderr(Stdio::from(std::fs::File::create(&stderr_path).expect("create stderr sink")))
         .spawn()
@@ -198,6 +208,20 @@ impl Server {
     }
 }
 
+impl Server {
+    /// `(table_name, row_id) -> prov_id` from `ferro_row_authors`: the slot each row's run holds in
+    /// THIS process's provenance store.
+    fn row_slots(&self) -> BTreeMap<(String, String), String> {
+        self.session(&["SELECT * FROM ferro_row_authors;"])
+            .into_iter()
+            .map(|cells| {
+                assert!(cells.len() >= 3, "ferro_row_authors changed shape: {cells:?}");
+                ((cells[0].clone(), cells[1].clone()), cells[2].clone())
+            })
+            .collect()
+    }
+}
+
 fn author(authors: &BTreeMap<(String, String), String>, row: &str) -> Option<String> {
     authors.get(&("t".to_string(), row.to_string())).cloned()
 }
@@ -221,6 +245,7 @@ fn pgserver_provenance_survives_a_restart_and_its_log_decodes_cold() {
         Some("agent-a"),
         "premise: A's merge was not attributed even inside the process that made it: {before:?}"
     );
+    let first_slots = first.row_slots();
     first.kill_and_unlock();
 
     // ---- second process on the same database: agent B publishes row 2 ----
@@ -231,6 +256,7 @@ fn pgserver_provenance_survives_a_restart_and_its_log_decodes_cold() {
         "MERGE;",
     ]);
     let after = second.row_authors();
+    let second_slots = second.row_slots();
     second.kill_and_unlock();
     assert_eq!(
         author(&after, "2").as_deref(),
@@ -263,6 +289,17 @@ fn pgserver_provenance_survives_a_restart_and_its_log_decodes_cold() {
                 )),
             }
         }
+    }
+    // The reissued slot, read from each process's own store: the claim that holds whether or not the
+    // log still carries the first process's declaration.
+    let a_slot = author(&first_slots, "1");
+    let b_slot = author(&second_slots, "2");
+    match (&a_slot, &b_slot) {
+        (Some(a), Some(b)) if a != b => {}
+        _ => failures.push(format!(
+            "the second process gave agent-b slot {b_slot:?}, the slot agent-a held in the first \
+             ({a_slot:?}): the provenance slot was reissued across the restart"
+        )),
     }
     // Where the CLI keeps it, `<db>.provenance`, so either binary reopening this database reads the
     // same attribution. A server that kept its runs in some other file would pass every check above

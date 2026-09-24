@@ -204,7 +204,9 @@ impl RuntimeLock for CountingLock {
 // fixture
 // ---------------------------------------------------------------------------------------------
 
-/// A whole database, wired exactly as `examples/pgserver.rs` wires one.
+/// A whole database, wired as `examples/pgserver.rs` wires one — except provenance: pgserver opens
+/// the durable store since D246, and this keeps the in-memory one, so no provenance fsync is in
+/// anything this measures.
 ///
 /// `TableBranchCatalog`, not `LogBranchCatalog`: the log catalog's `expired_before` is a documented
 /// O(N) walk over a `HashMap` and would manufacture the very slope this harness is looking for. The

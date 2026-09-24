@@ -42,7 +42,11 @@
 //! * ⚠ **What this does NOT license.** D159 amendment 4 predicts `f/sync` stays near 1.00 on this
 //!   harness anyway, because this harness gives every fork a **unique run id** (`r<thread>_<iter>`,
 //!   see `run_ids` below) and so pays `prov_store.intern`'s own fsync per fork, under `state`,
-//!   inside the catalog guard. **That is a second serialiser this change does not touch.** A flat
+//!   inside the catalog guard. **That is a second serialiser this change does not touch.**
+//!   ⚠ **Corrected by D246:** that intern fsync is paid only by a DURABLE provenance store, and
+//!   nothing in this harness opens one, so it has never paid it. `examples/pgserver.rs` has opened
+//!   the durable store since D246, so the real server does pay it, per new run, inside the catalog
+//!   guard — this harness does not measure that serialiser. A flat
 //!   arm P here is therefore the predicted reading, not evidence that the split did nothing — the
 //!   split's own evidence is `tests/d159_fork_sync_is_deferred.rs`, which is deterministic.
 //!
@@ -303,7 +307,8 @@ struct Rig {
     _dir: PathBuf,
 }
 
-/// Build one pgwire server, the shape `examples/pgserver.rs` ships, and start serving.
+/// Build one pgwire server, the shape `examples/pgserver.rs` ships, and start serving — except
+/// provenance: pgserver opens the durable store since D246, and this keeps the in-memory one.
 ///
 /// The `Arc<TableBranchCatalog>` is kept because `syncs_issued()` is an inherent method on the
 /// concrete catalog and not on the `BranchCatalog` trait the runtime holds — the server has no SQL
