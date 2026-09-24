@@ -58,10 +58,8 @@ fn main() {
     // `src/cli/cli.rs` does. This harness builds no page store, so it never writes `{db}.arena` and
     // the call registers nothing; it is here so no recovering entry point is an exception.
     let arena_path = format!("{path}.arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path)).unwrap_or_else(|e| {
-        eprintln!("crash_mid_merge: reserve the arena region: {e}");
-        std::process::exit(1);
-    });
+    // MUTANT (fire-check only, never land): crash_mid_merge never reserves the floor before recovery.
+    let _ = &arena_path;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{path}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
