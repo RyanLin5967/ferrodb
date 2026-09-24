@@ -31,7 +31,7 @@
 //! COMMITS, the space its relocation freed is reusable, and that survives a crash between the
 //! commit and the release.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ferrodb::catalog::column::Value;
 use ferrodb::error::FerroError;
@@ -42,7 +42,9 @@ use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::index::BPlusTreeManager;
+use ferrodb::wal::log::{RecKind, WalManager};
 use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
+use ferrodb::wal::txn::release_failures;
 
 /// Opened through the one open path, so a reopen is the real recovery. Field order is drop order:
 /// every handle goes before the lock.
@@ -173,6 +175,9 @@ fn shrink_then_fill(db: &mut Db, main: &mut Session) -> Session {
     db.ok("UPDATE notes SET note = 'a' WHERE id = 1;", &mut t1);
     assert_eq!(db.primary_rid(1), Some(one), "premise: the shrinking UPDATE was not in place");
     db.ok(&format!("INSERT INTO notes VALUES (3, '{}');", "f".repeat(600)), main);
+    // The adversary's F5: without this, T2's row could land elsewhere and both shrink tests would
+    // pass without ever reaching an undo that lacks room.
+    assert_eq!(db.page_of(3), one.page_id, "premise: T2's row did not land on row 1's page");
     t1
 }
 
@@ -351,8 +356,37 @@ fn a_crash_after_a_relocating_commit_still_frees_its_space() {
     let mut t1 = relocate_in_open_txn(&mut db, home);
     db.ok("COMMIT;", &mut t1);
     drop(main);
+    drop(t1);
+    drop(db);
 
-    let mut db = crash_and_reopen(db, t1, &path);
+    // The adversary's F5: the path this guards is reached only if the release was LOST with the
+    // log buffer. `FERRODB_CHECKPOINT_INTERVAL=1` would checkpoint at the commit and make this test
+    // pass without reaching it, so the premise is asserted, not assumed.
+    {
+        let mut wal_path = path.as_os_str().to_os_string();
+        wal_path.push(".wal");
+        let wal = WalManager::new(PathBuf::from(wal_path)).expect("the log does not open");
+        let (mut lsn, end) = (wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst), wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst));
+        let (mut deletes, mut releases) = (0, 0);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).expect("a durable record does not read");
+            match rec.kind {
+                RecKind::HeapDelete { .. } => deletes += 1,
+                RecKind::HeapRelease { .. } => releases += 1,
+                _ => {}
+            }
+            lsn = next;
+        }
+        assert_eq!(deletes, 1, "premise: the durable log does not hold the relocation's delete");
+        assert_eq!(releases, 0, "premise: the release reached the log, so recovery's finish_releases is not what is tested");
+    }
+
+    // F3: the recovery that finishes the release must not report a failure it did not have. The
+    // release used to be finished before recovery's directory repair, so the page directory did not
+    // yet list the page, and a failed DIRECTORY update was counted and printed as a failed release.
+    let failures = release_failures();
+    let mut db = Db::open(&path).unwrap_or_else(|e| panic!("the database did not reopen: {e}"));
+    assert_eq!(release_failures(), failures, "recovery counted a release failure for a release that succeeded");
     let mut main = Session::new();
     db.ok(&format!("INSERT INTO notes VALUES (3, '{}');", "z".repeat(80)), &mut main);
     assert_eq!(
