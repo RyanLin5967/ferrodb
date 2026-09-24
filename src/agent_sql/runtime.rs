@@ -944,41 +944,50 @@ pub struct DiffCost {
 
 /// **D194 new-wall audit, term 1 — what `State::version_history` may forget.**
 ///
-/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]).
-/// Every live pin is at or above the OLDEST one, so for each row everything older than the newest
-/// entry at or below that oldest pin is unreachable. With no live pin, everything older than the
-/// row's newest entry is: a pin taken from then on is at or above `apply_seq`, which no published
-/// `begin_ts` exceeds. The one pin that does NOT start at `apply_seq` is a child's, inherited from a
-/// live parent, and its value is already in `pins`.
+/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]),
+/// so the only entries a read can ask for are, for each LIVE pin, the one it reads. Two rules keep
+/// the history to those plus each row's newest entry:
 ///
-/// All three fields are derived from `workspaces` and `version_history`, and they change only
-/// through `State`'s own methods. None holds per-branch state that a statement can write.
+/// * **At supersession.** When a publish supersedes a row's newest entry `h` with `v`, `h` stays
+///   only if some live pin lies in `[h, v)`, since that pin is what reads it. A pin taken later is
+///   at or above every `begin_ts` already published, so if nobody reads `h` now, nobody ever
+///   will. The one pin that does not start there is a child's, and the child inherits a value that
+///   is already live.
+/// * **When the oldest pin leaves.** Everything older than the newest entry at or below the new
+///   oldest pin is unreachable, so it goes. That frees what a sealed or re-pinned pin DID read.
+///
+/// One thing is still held longer than it is needed. An entry kept for a pin that is then sealed
+/// while an OLDER pin lives stays until the oldest pin passes it. That is at most one entry per row
+/// per such pin.
+///
+/// Both fields are derived from `workspaces` and `version_history`, and they change only through
+/// `State`'s own methods. Neither holds per-branch state that a statement can write.
 #[derive(Default)]
 struct HistoryRetention {
-    /// `fork_seq` -> the number of LIVE workspaces pinned there (`fork_snapshot` is `Some`). The
-    /// oldest pin is the first key: O(log n) per publish. A scan of `workspaces` would do the same
-    /// job at O(open sessions) under the lock every statement takes.
+    /// `fork_seq` -> the number of LIVE workspaces pinned there (`fork_snapshot` is `Some`).
+    ///
+    /// The oldest pin is the first key, and "does any live pin lie in `[h, v)`" is one range probe.
+    /// Both cost O(log n) per publish. A scan of `workspaces` would answer the same questions at
+    /// O(open sessions), under the lock every statement takes. The keys are also the ONLY
+    /// `seen_through` values the history answers exactly. `record_read` checks membership here
+    /// before it asks.
     ///
     /// Maintained at every place a pin enters or leaves: `insert_workspace` (including its eviction
     /// of a recycled slot), `remove_workspace`, [`State::pin`] (a lazy pin) and [`State::repin`].
     /// Debug builds re-derive it by brute force at each of those places ([`State::audit_pins`]), as
     /// they do `txn_refs`.
     pins: BTreeMap<u64, u32>,
-    /// Every row whose history holds two or more entries, keyed `(second-oldest entry, tbl, row)`.
-    /// A row can lose its oldest entry exactly when that key is at or below the horizon. So when the
-    /// oldest pin leaves, draining this from the front finds every row that now holds something
-    /// unreachable, and no other row: O(log n) per entry freed, each entry freed once. Without it,
-    /// freeing would wait for each row's next publish, and a row nobody writes again would keep
-    /// everything published while the pin lived.
-    trimmable: BTreeSet<(u64, u32, u64)>,
-    /// The highest horizon any trim has used. It never decreases, and every live pin is at or above
-    /// it: a new pin starts at `apply_seq`, and an inherited one is already live.
+    /// Every row with an entry that the next rise of the horizon could free, keyed
+    /// `(the entry just after the row's oldest reachable one, tbl, row)`.
     ///
-    /// So a read whose `seen_through` is below it went through a pin that was released while the
-    /// read ran. That happens when the branch is re-pinned by `REBASE` or sealed from another
-    /// connection between `visible_rows_where` and `record_read`. The history may no longer hold the
-    /// version that read saw, so `record_read` refuses it rather than recording a wrong one.
-    exact_from: u64,
+    /// When the oldest pin leaves, draining this from the front finds every row that now holds
+    /// something unreachable, and no other row. Without it, freeing would wait for each row's next
+    /// publish, and a row nobody writes again would keep what the sealed pin read.
+    ///
+    /// A row's unreachable prefix is dropped only once it is at least half the row's vector
+    /// (`trim_history`). A drain therefore never moves more entries than it frees: amortised O(1)
+    /// moves per entry freed, plus O(log n) for the index.
+    trimmable: BTreeSet<(u64, u32, u64)>,
 }
 
 #[derive(Default)]
@@ -1067,10 +1076,10 @@ struct State {
     /// and the premise check at merge would then compare that version against itself and pass a
     /// branch whose read main had moved past. Written only by [`State::publish_version`].
     ///
-    /// **Bounded by the oldest live pin** (the D194 new-wall audit; `retention` says how). It held
-    /// every `begin_ts` ever published — one `u64` per applied op, never freed — while the only
-    /// entries a read can ask for are the newest at or below some live pin. A row keeps what the
-    /// oldest live pin reads and everything above it; with no live pin, its newest entry alone.
+    /// **Bounded by the live pins** (the D194 new-wall audit; [`HistoryRetention`] says how). It used
+    /// to hold every `begin_ts` ever published, one `u64` per applied op, never freed. Yet the only
+    /// entries a read can ask for are, for each live pin, the newest at or below it. A row now keeps
+    /// those plus its newest entry; with no live pin, its newest entry alone.
     version_history: std::collections::HashMap<(u32, u64), Vec<u64>>,
     /// What `version_history` may forget, found without scanning. See [`HistoryRetention`].
     retention: HistoryRetention,
@@ -1202,68 +1211,105 @@ impl State {
     /// either, so the two cannot disagree — the same reason `push_applied` is the only writer of
     /// `applied` and its index.
     ///
-    /// The row's history is trimmed against the current horizon on the way out, so a merge loop
-    /// with no live pin holds one entry per row. The work is O(log n) in the pins and the index,
-    /// plus O(log H) for the insert position. The insert is an append whenever versions arrive in
-    /// sequence order.
+    /// The superseded newest entry is kept only if a live pin reads it (see [`HistoryRetention`]),
+    /// and the row is trimmed against the current horizon on the way out. So a merge loop with no
+    /// live pin holds one entry per row. The work is O(log n) in the pins and the index. An
+    /// out-of-order publish costs O(log H) more to find its insert position. That cannot happen
+    /// with one catalog, because a merge holds `&mut Catalog` from reservation to record.
     fn publish_version(&mut self, v: VersionRef) {
         let key = (v.tbl.0, v.row.0);
         self.unindex_history(key);
+        let pins = &self.retention.pins;
         let history = self.version_history.entry(key).or_default();
-        let at = history.partition_point(|&s| s < v.begin_ts);
-        if history.get(at) != Some(&v.begin_ts) {
-            history.insert(at, v.begin_ts);
+        match history.last() {
+            Some(&newest) if newest < v.begin_ts => {
+                // `v` supersedes `newest`. A pin in `[newest, v)` reads it; any other pin, and
+                // every pin taken from now on, reads something else.
+                if pins.range(newest..v.begin_ts).next().is_none() {
+                    history.pop();
+                }
+                history.push(v.begin_ts);
+            }
+            _ => {
+                let at = history.partition_point(|&s| s < v.begin_ts);
+                if history.get(at) != Some(&v.begin_ts) {
+                    history.insert(at, v.begin_ts);
+                }
+            }
         }
         self.versions.insert(key, v);
         let horizon = self.history_horizon();
         self.trim_history(key, horizon);
     }
 
-    /// The horizon a trim may use, and `retention.exact_from` raised to match. The horizon is the
-    /// oldest live pin, or `u64::MAX` when there is none, which keeps each row's newest entry
-    /// only.
+    /// The horizon a trim may use: the oldest live pin, or `u64::MAX` when there is none. At
+    /// `u64::MAX` only each row's newest entry is kept. That answers every pin taken from then on,
+    /// because such a pin is at or above every `begin_ts` already published.
     ///
-    /// With no pin, the floor is `apply_seq`, not `u64::MAX`. Every pin taken from then on is at or
-    /// above it, and the newest entry, which is all such a trim keeps, answers that pin exactly.
-    fn history_horizon(&mut self) -> u64 {
-        let oldest = self.retention.pins.keys().next().copied();
-        let floor = oldest.unwrap_or(self.apply_seq);
-        self.retention.exact_from = self.retention.exact_from.max(floor);
-        oldest.unwrap_or(u64::MAX)
+    /// It only ever rises, except when it leaves `u64::MAX` for a first pin, and at `u64::MAX` no
+    /// row is indexed. A new pin is at or above every published `begin_ts`, so it cannot be older
+    /// than a live one; an inherited pin copies a live one.
+    fn history_horizon(&self) -> u64 {
+        self.retention.pins.keys().next().copied().unwrap_or(u64::MAX)
     }
 
-    /// Take one row out of `retention.trimmable`. It goes back in via `trim_history`, which is how
-    /// the index stays keyed by the row's CURRENT second-oldest entry.
+    /// Where a row's reachable part starts, at `horizon`. That is the index of the newest entry at
+    /// or below it, which is the oldest entry any live pin can read. It is 0 when every entry is
+    /// above it.
+    fn reachable_from(history: &[u64], horizon: u64) -> usize {
+        history.partition_point(|&s| s <= horizon).saturating_sub(1)
+    }
+
+    /// Take one row out of `retention.trimmable`, recomputing the key it was filed under at the
+    /// current horizon. The recomputation gives the same key because an indexed row's key was
+    /// computed at the horizon now in force. `reclaim_history` re-files every row whose key the
+    /// last rise passed, and a key it did not pass names the same entry at both horizons.
     fn unindex_history(&mut self, key: (u32, u64)) {
-        if let Some(&second) = self.version_history.get(&key).and_then(|h| h.get(1)) {
-            self.retention.trimmable.remove(&(second, key.0, key.1));
+        let horizon = self.history_horizon();
+        let next = self.version_history.get(&key).and_then(|h| {
+            h.get(Self::reachable_from(h, horizon) + 1).copied()
+        });
+        if let Some(next) = next {
+            self.retention.trimmable.remove(&(next, key.0, key.1));
         }
     }
 
-    /// Drop one row's entries that no pin at or above `horizon` can be answered from: everything
-    /// older than the newest entry at or below it. Then index the row again. The row must already
-    /// be out of `trimmable` (see `unindex_history`).
+    /// Drop one row's entries that no pin at or above `horizon` can read, meaning everything older
+    /// than the newest entry at or below it. Then file the row again. The row must already be out
+    /// of `trimmable` (see `unindex_history`).
     ///
-    /// After this the row's second-oldest entry, if any, is above `horizon`, which is what makes
+    /// The unreachable prefix is dropped only once it is at least half the vector. Draining from
+    /// the front moves every entry that stays, so dropping it eagerly would cost O(entries kept) on
+    /// every rise of the horizon. Waiting until the drain frees at least as many entries as it
+    /// moves makes the cost amortised O(1) per entry freed. The price is holding at most as many
+    /// dead entries as live ones. A dead entry is still a real version, so leaving it answers
+    /// nothing wrongly: every `seen_through` that `record_read` lets through is a live pin, at or
+    /// above the horizon.
+    ///
+    /// Afterwards the row's key, if any, is above `horizon`, which is what makes
     /// `reclaim_history`'s drain terminate.
     fn trim_history(&mut self, key: (u32, u64), horizon: u64) {
         let Some(history) = self.version_history.get_mut(&key) else { return };
-        let keep_from = history.partition_point(|&s| s <= horizon).saturating_sub(1);
-        history.drain(..keep_from);
-        if let Some(&second) = history.get(1) {
-            self.retention.trimmable.insert((second, key.0, key.1));
+        let mut from = Self::reachable_from(history, horizon);
+        if from > 0 && 2 * from >= history.len() {
+            history.drain(..from);
+            from = 0;
+        }
+        if let Some(&next) = history.get(from + 1) {
+            self.retention.trimmable.insert((next, key.0, key.1));
         }
     }
 
     /// Free every entry that only a departed pin could read. Called wherever the oldest pin can
     /// rise: a pinned workspace removed, or a pin moved.
     ///
-    /// Each drained row loses at least its oldest entry. So the cost is O(log n) per entry freed,
-    /// paid once per entry, and a seal that did not raise the horizon drains nothing.
+    /// Each row taken from the index has at least one more entry fall out of reach. So the cost is
+    /// O(log n) per entry freed, plus the amortised drain in `trim_history`. A seal that did not
+    /// raise the horizon takes nothing.
     fn reclaim_history(&mut self) {
         let horizon = self.history_horizon();
-        while let Some(&(second, tbl, row)) = self.retention.trimmable.first() {
-            if second > horizon {
+        while let Some(&(next, tbl, row)) = self.retention.trimmable.first() {
+            if next > horizon {
                 break;
             }
             self.retention.trimmable.pop_first();
@@ -1283,16 +1329,16 @@ impl State {
             Some(_) => {
                 self.retention.pins.remove(&seq);
             }
-            // Loud in debug, and a no-op in release. An over-count keeps history longer than
-            // needed. An under-count lets the horizon pass a live pin. Then `exact_from` passes it
-            // too, and every read through that pin is refused. That is loud, but it is still wrong.
+            // Loud in debug, and a no-op in release. An over-count keeps history longer than it
+            // is needed. An under-count removes a live pin's value from the index: the history can
+            // then drop what that pin reads, and `record_read` refuses every read through it.
+            // That is loud rather than wrong, but it is still a refusal nobody asked for.
             None => debug_assert!(false, "pin underflow at fork_seq {seq}"),
         }
     }
 
-    /// Re-derive `retention.pins` by brute force and compare, and check the invariant that the
-    /// `exact_from` refusal rests on: no live pin sits below it. Debug builds only. It is capped
-    /// like [`State::audit_txn_refs`], for the same reason, and with the same blind spot.
+    /// Re-derive `retention.pins` by brute force and compare. Debug builds only. It is capped like
+    /// [`State::audit_txn_refs`], for the same reason and with the same blind spot.
     #[cfg(debug_assertions)]
     fn audit_pins(&self) {
         if self.workspaces.len() > AUDIT_FULL_MAX {
@@ -1303,14 +1349,6 @@ impl State {
             *want.entry(ws.fork_seq).or_insert(0) += 1;
         }
         assert_eq!(self.retention.pins, want, "pins disagree with a scan of workspaces");
-        if let Some(&oldest) = want.keys().next() {
-            assert!(
-                oldest >= self.retention.exact_from,
-                "a live pin at {oldest} sits below the history floor {}: reads through it would be \
-                 refused",
-                self.retention.exact_from
-            );
-        }
     }
 
     #[cfg(not(debug_assertions))]
@@ -1323,10 +1361,12 @@ impl State {
     /// below that seq — so the newest of those — and `None` for a read of main as it stood, which
     /// saw the latest.
     ///
-    /// ⚠ Exact only for `seen_through >= retention.exact_from`. Below that, the history may have
-    /// dropped the version, and the answer comes back "none". Every live pin is at or above the
-    /// floor. [`AgentRuntime::record_read`] refuses a read whose pin was released while it ran
-    /// before calling this. `rebase_commit` passes `apply_seq` itself.
+    /// ⚠ The history answers exactly for two kinds of value only. One is a LIVE pin, a key of
+    /// `retention.pins`. The other is a value at or above every published `begin_ts`, which returns
+    /// `latest` before the history is consulted; `rebase_commit` passes `apply_seq`, which is one.
+    /// For any other value the version may have been dropped, and the answer would be wrong. That
+    /// is why [`AgentRuntime::record_read`] refuses a read whose pin was released while it ran,
+    /// before it calls this.
     fn version_seen(&self, tbl: TableId, row: RowId, seen_through: Option<u64>) -> Option<VersionRef> {
         let latest = self.versions.get(&(tbl.0, row.0)).copied()?;
         let Some(through) = seen_through else { return Some(latest) };
@@ -2927,27 +2967,38 @@ impl AgentRuntime {
         // **A read whose pin was released while it ran REFUSES. It does not record a version it
         // may not have seen.** (D194 new-wall audit.)
         //
-        // `seen_through` was taken with the pin, under an earlier acquisition of this lock. An agent's
-        // own-branch `SELECT` runs on the shared read path (`executor::try_run_read`), so a `REBASE`
-        // or an `ABANDON` of the branch it read, from another connection, can land between that
-        // acquisition and this one. Once that pin is gone, `version_history` may have trimmed the
-        // version this read saw. `version_seen` would then answer "none", and `begin_ts 0` would be
-        // recorded for a row the read did see. The premise check would still catch that row, because
-        // it moved. `REVERT` would not: the edge to the merge that published what the read saw would
-        // be gone. `retention.exact_from` is the resulting state that says so. Every live pin is at
-        // or above it, so a read below it went through a pin that no longer exists.
+        // `seen_through` was taken with the pin, under an earlier acquisition of this lock, and the
+        // scan ran between the two acquisitions with the lock released. Something that seals or
+        // re-pins the branch the read went through can land in that gap. Once that pin is gone,
+        // `version_history` may have dropped the version the read saw. `version_seen` would then
+        // answer "none", or name an older version, and that would be recorded for a row the read
+        // did see. The premise check would still catch the row, because it moved. `REVERT` would
+        // not: the edge to the merge that published what the read saw would be gone.
+        //
+        // The keys of `retention.pins` are exactly the values the history still answers for, so
+        // membership is the state that decides. A read whose own pin moved is still answered
+        // exactly if another live branch pins the same value, for example a child that inherited
+        // it.
+        //
+        // Where the gap can be reached, stated rather than assumed:
+        // * NOT over pgwire. A connection's shared-path `SELECT` holds its registered read pass
+        //   across all of `try_run_read`, and every exclusive statement's `ServerContext::catalog()`
+        //   drains registered readers before it runs (`drain_readers`).
+        // * In-process, yes. `abandon` and `forget_reaped_branches` take no `ExecCtx`, so a library
+        //   caller can seal the branch while another thread reads it through a catalog handle.
         //
         // Only an INSPECTION records versions. A row-targeting read records a region and its
         // `observed_at`, and neither needs the history.
-        let released = seen_through
-            .filter(|&f| purpose == ReadPurpose::Inspection && f < state.retention.exact_from);
+        let released = seen_through.filter(|f| {
+            purpose == ReadPurpose::Inspection && !state.retention.pins.contains_key(f)
+        });
         if let Some(f) = released {
             return Err(FerroError::Branch(format!(
                 "the snapshot this read went through (main as of apply-seq {f}) was released while \
                  this read ran: {reader}, or the branch it read AS OF, was re-pinned by REBASE or \
-                 sealed from another connection. The versions it saw can no longer be named, and a \
-                 read that retained the wrong ones would be worse than none. Nothing was retained. \
-                 Retry."
+                 sealed while the read was in flight. The versions it saw can no longer be named, \
+                 and a read that retained the wrong ones would be worse than none. Nothing was \
+                 retained. Retry."
             )));
         }
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
@@ -4012,12 +4063,17 @@ impl AgentRuntime {
     /// workspace's pin, staged set, ops or schema edits changed, or main's merge clock moved, in
     /// between. Over pgwire every statement that can change one of those — a write, a MERGE, a fork,
     /// ABANDON, an ALTER — holds the exclusive catalog for its whole run, as REBASE does, so the
-    /// server cannot interleave them. What CAN run beside a REBASE there is a SELECT on the shared
-    /// read path, and it changes none of the re-checked fields: it may add a read premise, which the
-    /// commit's premise check reads under its own lock, or pin a branch that was never pinned, which
-    /// only a fork without a transaction manager produces and pgwire never does. The split is also
-    /// the seam the race test drives (`tests::rebase_is_refused_retryably_...`): it calls the two
-    /// phases itself and lands the change in between, with no timing involved.
+    /// server cannot interleave them.
+    ///
+    /// A shared-path SELECT cannot run beside a REBASE there either. This sentence used to say it
+    /// could; the D194 audit review corrected it. `ServerContext::catalog()` drains every
+    /// registered reader before the exclusive statement starts, and a reader that finds a writer
+    /// announced stands down to the exclusive path.
+    ///
+    /// The interleavings the re-check exists for are in-process. The library API has doors that
+    /// take no `ExecCtx`: `abandon`, `forget_reaped_branches` and `begin_session_pinned`. The split
+    /// is also the seam the race test drives (`tests::rebase_is_refused_retryably_...`): it calls
+    /// the two phases itself and lands the change in between, with no timing involved.
     pub fn rebase(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<RebaseReport, FerroError> {
         let validated = self.rebase_validate(ctx, branch)?;
         self.rebase_commit(validated)
@@ -8554,8 +8610,9 @@ mod tests {
     ///
     /// The interleaving is forced on one thread, the way the REBASE race test above forces its own:
     /// the branch is pinned at 3, main publishes 4 and 5, and the branch is re-pinned to 5 (what a
-    /// `REBASE` from another connection does) — and only then does the read that went through the
-    /// pin at 3 reach `record_read`. The version it saw is 3, from the fixture.
+    /// `REBASE` on another thread does in-process; pgwire excludes it) — and only then does the
+    /// read that went through the pin at 3 reach `record_read`. The version it saw is 3, from the
+    /// fixture.
     ///
     /// ⚠ No red state: at `0570fe8` nothing is pruned, so the history still names 3 and this passes.
     /// It exists for the retention bound, which CAN drop 3 once no live pin is at or below it; the

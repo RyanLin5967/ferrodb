@@ -2,7 +2,8 @@
 //! (term 2), and what the live branches' pinned snapshots retain (term 3).
 //!
 //! PRE-REGISTERED in `bench/d194_fork_snapshot/rebase_prereg.md`, Amendment 4, before this file
-//! was written.
+//! was written. Amendment 5 item 5 made each connection carry its own catalog cache and registered
+//! read slot, as the server's do. The hop integers never depended on that; the latencies did.
 //!
 //! # Part 1: read cost against merges since the pin
 //!
@@ -72,10 +73,27 @@ struct Server {
     txn: Arc<TxnManager>,
 }
 
+/// One connection, as pgwire gives it one: its own session, its own cached catalog snapshot,
+/// and a busy slot REGISTERED with the server (`ServerContext::register_reader`). The registration
+/// is what makes the shared read path the path a `SELECT` takes. An unregistered slot with a
+/// fresh cache per statement, which this harness's first draft used, sends every statement to the
+/// exclusive path and clones the catalog, so it times a path the server does not run.
+struct Conn {
+    sess: Session,
+    cache: Option<(u64, Arc<Catalog>)>,
+    slot: Arc<AtomicBool>,
+}
+
+fn connect(s: &Server) -> Conn {
+    let slot = Arc::new(AtomicBool::new(false));
+    s.ctx.register_reader(Arc::clone(&slot));
+    Conn { sess: s.ctx.session(), cache: None, slot }
+}
+
 /// One statement through the server's own dispatch: the shared read path first, and the
-/// exclusive lock only for what `try_run_read` refuses. This is `d55_agent_read_scaling`'s `exec`.
-/// A branch's own `SELECT` must take the path the server takes, which is the shared one.
-fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<usize, String> {
+/// exclusive lock only for what `try_run_read` refuses. This is `d55_agent_read_scaling`'s `exec`,
+/// with the connection's own cache and registered slot.
+fn exec(s: &Server, sql: &str, c: &mut Conn) -> Result<usize, String> {
     let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
     let mut parser = Parser::new(tokens);
     let mut stmts = parser.parse();
@@ -83,19 +101,17 @@ fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<usize, String> {
         return Err(format!("parse failed for {sql}: {:?}", parser.errors));
     }
     let stmt = stmts.remove(0);
-    let mut cache = None;
-    let slot = AtomicBool::new(false);
     let outcome = {
-        let shared = s.ctx.read_catalog(&mut cache);
-        let attempted = match s.ctx.begin_read(&slot) {
-            Some(_pass) => try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), sess),
+        let shared = s.ctx.read_catalog(&mut c.cache);
+        let attempted = match s.ctx.begin_read(&c.slot) {
+            Some(_pass) => try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), &mut c.sess),
             None => None,
         };
         match attempted {
             Some(read) => read,
             None => {
                 let mut cat = s.ctx.catalog();
-                let o = run(stmt, &mut cat, s.bp.clone(), s.txn.clone(), sess);
+                let o = run(stmt, &mut cat, s.bp.clone(), s.txn.clone(), &mut c.sess);
                 drop(cat);
                 o
             }
@@ -142,7 +158,7 @@ fn build(dir: &std::path::Path, name: &str, rows: u64) -> Result<Server, String>
     );
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
-    let mut main = s.ctx.session();
+    let mut main = connect(&s);
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut main)?;
     for i in 1..=rows {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, 0);"), &mut main)?;
@@ -150,17 +166,17 @@ fn build(dir: &std::path::Path, name: &str, rows: u64) -> Result<Server, String>
     Ok(s)
 }
 
-/// One read on `sess`, REPS times: `(hops, sequentially scanned tuples, median µs)`. Hops and tuples
-/// must be the same on every repetition, because control flow fixes them. A difference means
-/// something other than the read moved the counters, and the run is refused.
-fn measure(s: &Server, sess: &mut Session, sql: &str, rows: usize) -> Result<(u64, u64, f64), String> {
+/// One read on connection `c`, REPS times: `(hops, sequentially scanned tuples, median µs)`.
+/// Hops and tuples must be the same on every repetition, because control flow fixes them. A
+/// difference means something other than the read moved the counters, and the run is refused.
+fn measure(s: &Server, c: &mut Conn, sql: &str, rows: usize) -> Result<(u64, u64, f64), String> {
     let mut counts: Option<(u64, u64)> = None;
     let mut us: Vec<f64> = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let hops0 = VISIBILITY_HOPS.load(Ordering::Relaxed);
         let (_, tuples0) = seq_scan_counters();
         let t0 = Instant::now();
-        let got = exec(s, sql, sess)?;
+        let got = exec(s, sql, c)?;
         let elapsed = t0.elapsed();
         let hops = VISIBILITY_HOPS.load(Ordering::Relaxed) - hops0;
         let tuples = seq_scan_counters().1 - tuples0;
@@ -169,8 +185,8 @@ fn measure(s: &Server, sess: &mut Session, sql: &str, rows: usize) -> Result<(u6
         }
         match counts {
             None => counts = Some((hops, tuples)),
-            Some(c) if c != (hops, tuples) => {
-                return Err(format!("{sql}: (hops, tuples) moved between repetitions: {c:?} then {:?}", (hops, tuples)))
+            Some(prev) if prev != (hops, tuples) => {
+                return Err(format!("{sql}: (hops, tuples) moved between repetitions: {prev:?} then {:?}", (hops, tuples)))
             }
             Some(_) => {}
         }
@@ -182,7 +198,7 @@ fn measure(s: &Server, sess: &mut Session, sql: &str, rows: usize) -> Result<(u6
 }
 
 fn one_merge(s: &Server, i: u64) -> Result<(), String> {
-    let mut w = s.ctx.session();
+    let mut w = connect(s);
     exec(s, &format!("BEGIN AGENT SESSION AS 'w' RUN 'w{i}';"), &mut w)?;
     exec(s, "UPDATE t SET v = v + 1 WHERE id >= 1;", &mut w)?;
     exec(s, "MERGE;", &mut w)?;
@@ -191,12 +207,12 @@ fn one_merge(s: &Server, i: u64) -> Result<(), String> {
 
 fn part1(dir: &std::path::Path) -> Result<(), String> {
     let s = build(dir, "part1", ROWS)?;
-    let mut old = s.ctx.session();
+    let mut old = connect(&s);
     exec(&s, "BEGIN AGENT SESSION AS 'old' RUN 'old';", &mut old)?;
     let scan = "SELECT id, v FROM t;";
     let point = "SELECT id, v FROM t WHERE id = 1;";
     println!("# part 1: rows={ROWS} reps={REPS} (latency = median of reps, reported not certified)");
-    println!("k\told_scan_hops\told_scan_us\tfresh_scan_hops\tfresh_scan_us\told_point_hops\told_point_path\told_point_us\tfresh_point_hops\tfresh_point_us");
+    println!("k\told_scan_hops\told_scan_us\tfresh_scan_hops\tfresh_scan_us\told_point_hops\told_point_seq_tuples\told_point_path\told_point_us\tfresh_point_hops\tfresh_point_us");
     let mut merged = 0u64;
     for &k in &CHECKPOINTS {
         while merged < k {
@@ -205,7 +221,7 @@ fn part1(dir: &std::path::Path) -> Result<(), String> {
         }
         let (os_h, _, os_us) = measure(&s, &mut old, scan, ROWS as usize)?;
         let (op_h, op_t, op_us) = measure(&s, &mut old, point, 1)?;
-        let mut fresh = s.ctx.session();
+        let mut fresh = connect(&s);
         exec(&s, &format!("BEGIN AGENT SESSION AS 'fresh' RUN 'fresh{k}';"), &mut fresh)?;
         let (fs_h, _, fs_us) = measure(&s, &mut fresh, scan, ROWS as usize)?;
         let (fp_h, _, fp_us) = measure(&s, &mut fresh, point, 1)?;
@@ -218,11 +234,17 @@ fn part1(dir: &std::path::Path) -> Result<(), String> {
             return Err(format!("k={k}: FRESH reads made {fs_h} (scan) and {fp_h} (point) hops, pre-registered 0"));
         }
         let path = if op_t == 0 { "index" } else { "seqscan" };
+        if op_t != 0 && op_t != ROWS {
+            return Err(format!(
+                "k={k}: OLD point read pulled {op_t} tuples by sequential scan, neither 0 (index) nor \
+                 {ROWS} (a full scan), so its hop count has no pre-registered value"
+            ));
+        }
         let want_point = if op_t == 0 { k } else { ROWS * k };
         if op_h != want_point {
             return Err(format!("k={k}: OLD point read made {op_h} hops on the {path} path, pre-registered {want_point}"));
         }
-        println!("{k}\t{os_h}\t{os_us:.1}\t{fs_h}\t{fs_us:.1}\t{op_h}\t{path}\t{op_us:.1}\t{fp_h}\t{fp_us:.1}");
+        println!("{k}\t{os_h}\t{os_us:.1}\t{fs_h}\t{fs_us:.1}\t{op_h}\t{op_t}\t{path}\t{op_us:.1}\t{fp_h}\t{fp_us:.1}");
     }
     Ok(())
 }
@@ -230,15 +252,15 @@ fn part1(dir: &std::path::Path) -> Result<(), String> {
 fn part2(dir: &std::path::Path) -> Result<(), String> {
     let s = build(dir, "part2", 1)?;
     let rt = s.ctx.runtime.clone();
-    let mut holders: Vec<Session> = (0..OPEN_TXNS).map(|_| s.ctx.session()).collect();
+    let mut holders: Vec<Conn> = (0..OPEN_TXNS).map(|_| connect(&s)).collect();
     for h in &mut holders {
         exec(&s, "BEGIN;", h)?;
     }
     println!("# part 2: open_txns={OPEN_TXNS} forks={FORKS}; census = (pinned live branches, distinct snapshots, active ids retained)");
 
-    let mut forks: Vec<Session> = Vec::with_capacity(FORKS);
+    let mut forks: Vec<Conn> = Vec::with_capacity(FORKS);
     for i in 0..FORKS {
-        let mut f = s.ctx.session();
+        let mut f = connect(&s);
         exec(&s, &format!("BEGIN AGENT SESSION AS 'c' RUN 'shared{i}';"), &mut f)?;
         forks.push(f);
     }
@@ -256,10 +278,10 @@ fn part2(dir: &std::path::Path) -> Result<(), String> {
         return Err(format!("census after abandoning every fork is {empty:?}, want (0, 0, 0)"));
     }
 
-    let mut main = s.ctx.session();
+    let mut main = connect(&s);
     for i in 0..FORKS {
         exec(&s, &format!("INSERT INTO t VALUES ({}, 0);", 1000 + i), &mut main)?;
-        let mut f = s.ctx.session();
+        let mut f = connect(&s);
         exec(&s, &format!("BEGIN AGENT SESSION AS 'c' RUN 'churn{i}';"), &mut f)?;
         forks.push(f);
     }
