@@ -10,6 +10,7 @@
 //! | `falsifier_3_...` | (3) single-threaded: after a checkpoint the log holds no history record, and the store holds every one | the hook drains nothing; or `commit` queues nothing |
 //! | `f5_...` | AMENDED 2 F5: an open with no store attached keeps the log | `checkpoint_locked` ignores the unstored count |
 //! | `falsifier_5_...` | AMENDED 2 F7: with an idle open transaction, queue bytes stay ≤ B, flat in M | `commit` skips the byte-bounded drain |
+//! | `falsifier_5b_...` | AMENDED 3 item 8: with an idle open transaction, the FILE's bytes stay ≤ (W + W/8)·max record, flat in M | `drain`'s prune forced off (the one routine the hook and the commit path share) |
 //!
 //! (2) — no buffer-pool page and no history byte read by a prune — holds by construction:
 //! `HistoryStore` has no buffer pool, and the window it rewrites is in memory
@@ -36,7 +37,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::history::{HistoryStore, QUEUE_DRAIN_BYTES};
+use ferrodb::wal::history::{HistoryStore, IMAGE_OVERHEAD, QUEUE_DRAIN_BYTES, RECORD_FRAME};
 use ferrodb::wal::log::{RecKind, WalManager};
 use ferrodb::wal::recovery::{rebuild_indexes, recover};
 use ferrodb::wal::txn::TxnManager;
@@ -236,9 +237,9 @@ fn falsifier_1_the_history_file_is_flat_in_the_merges_ever_made() {
         sizes.push(db.history_file_len());
     }
     let store = db.store.clone().unwrap();
-    let largest = store.records().iter().map(|r| 24 + r.body.len() as u64).max().unwrap();
+    let largest = store.records().iter().map(|r| (RECORD_FRAME + r.body.len()) as u64).max().unwrap();
     let one_prune = (W / 8).max(1) * largest;
-    let bound = 13 + (W + (W / 8).max(1)) * largest;
+    let bound = IMAGE_OVERHEAD as u64 + (W + (W / 8).max(1)) * largest;
     assert!(store.counters().prunes > 0, "the fixture never pruned, so it tests nothing");
     for (m, size) in [W, 4 * W, 16 * W].iter().zip(&sizes) {
         assert!(*size <= bound, "at M = {m} the file is {size} bytes, over {bound}: {sizes:?}");
@@ -299,7 +300,7 @@ fn falsifier_5_the_queue_stays_bounded_while_checkpoints_are_blocked() {
     // Every merge updates all 100 rows, so a record is tens of KiB and B is crossed within M.
     for i in 1..=120 {
         db.merge_one(&format!("t{i}"), "UPDATE inventory SET qty = qty + 1;");
-        largest = largest.max(store.records().last().map_or(0, |r| 24 + r.body.len()));
+        largest = largest.max(store.records().last().map_or(0, |r| RECORD_FRAME + r.body.len()));
         peak = peak.max(store.queued_bytes());
     }
     let c = store.counters();
@@ -309,5 +310,40 @@ fn falsifier_5_the_queue_stays_bounded_while_checkpoints_are_blocked() {
         "the queue reached {peak} bytes with checkpoints blocked; the bound is {} + one record",
         QUEUE_DRAIN_BYTES
     );
+    db.ok("ROLLBACK;", &mut idle);
+}
+
+/// **AMENDED 3, item 8 — falsifier (5b).** With an idle open transaction every checkpoint is refused,
+/// so only the commit path's drain writes the store. It is the SAME routine as the checkpoint hook's
+/// (`HistoryStore::drain`), which prunes, so the FILE stays within `(W + W/8)` publishes whatever
+/// M is, and not only the queue.
+#[test]
+fn falsifier_5b_store_bytes_stay_flat_with_an_idle_transaction() {
+    const W: u64 = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path(), Some(W));
+    db.seed(100);
+    let mut idle = Session::with_runtime(db.runtime.clone());
+    db.ok("BEGIN;", &mut idle);
+    let store = db.store.clone().unwrap();
+    let mut largest = 0u64;
+    let mut sizes = Vec::new();
+    let mut made = 0;
+    for m in [60, 120] {
+        while made < m {
+            made += 1;
+            db.merge_one(&format!("t{made}"), "UPDATE inventory SET qty = qty + 1;");
+            let last = store.records().last().map_or(0, |r| (RECORD_FRAME + r.body.len()) as u64);
+            largest = largest.max(last);
+        }
+        sizes.push(db.history_file_len());
+    }
+    let c = store.counters();
+    assert!(c.drains >= 2, "the commit path drained fewer than twice, so M never crossed B twice: {c:?}");
+    assert!(c.prunes > 0, "nothing pruned, so the bound tests nothing: {c:?}");
+    let bound = IMAGE_OVERHEAD as u64 + (W + (W / 8).max(1)) * largest;
+    for (m, size) in [60, 120].iter().zip(&sizes) {
+        assert!(*size <= bound, "at M = {m} with checkpoints blocked the file is {size} bytes, over {bound}: {sizes:?}");
+    }
     db.ok("ROLLBACK;", &mut idle);
 }
