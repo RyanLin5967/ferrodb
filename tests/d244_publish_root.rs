@@ -34,7 +34,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use ferrodb::branch::table_catalog::SIDECAR_HEADER_PAGE;
-use ferrodb::branch::{BranchCatalog, BranchId, LeaseDeadline, TableBranchCatalog};
+use ferrodb::branch::{BranchCatalog, BranchId, BranchState, LeaseDeadline, TableBranchCatalog};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
@@ -246,11 +246,11 @@ fn a_failed_read_of_page_one_at_a_root_splits_publish_is_retried_by_the_next_mut
     assert_reopens_with(&storage, &ids);
 }
 
-/// Free bytes in the leaf an insert of `key` would land in, found the way the tree finds it: down
-/// from the root through `BPlusTreeInternalPage::find_child`. A leaf splits on an insert of `E` bytes
-/// once `27 + keys + values + E >= PAGE_SIZE` (`index_page.rs`, `BPlusTreeLeafPage::is_full`), and
-/// every key and value here is a `Vec<u8>` serialized behind a 4-byte length.
-fn leaf_room(cat: &TableBranchCatalog, key: &[u8]) -> usize {
+/// The leaf an insert of `key` would land in, and its free bytes, found the way the tree finds it:
+/// down from the root through `BPlusTreeInternalPage::find_child`. A leaf splits on an insert of `E`
+/// bytes once `27 + keys + values + E >= PAGE_SIZE` (`index_page.rs`, `BPlusTreeLeafPage::is_full`),
+/// and every key and value here is a `Vec<u8>` serialized behind a 4-byte length.
+fn leaf_of(cat: &TableBranchCatalog, key: &[u8]) -> (u32, usize) {
     let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::open(cat.root_page_id(), cat.pool_handle().clone());
     let key = key.to_vec();
     let mut page = cat.root_page_id();
@@ -261,7 +261,7 @@ fn leaf_room(cat: &TableBranchCatalog, key: &[u8]) -> usize {
                 let used = 27
                     + l.key_arr.iter().map(|k| 4 + k.len()).sum::<usize>()
                     + l.vals.iter().map(|v| 4 + v.len()).sum::<usize>();
-                return PAGE_SIZE.saturating_sub(used);
+                return (page, PAGE_SIZE.saturating_sub(used));
             }
         }
     }
@@ -279,12 +279,15 @@ const DEADLINE_ENTRY: usize = 4 + 17 + 4;
 /// A fork writes, in order: its record key, its Live state key, its deadline key, its child key in
 /// the parent's live set, and the header key. The first two always append to the tails of their
 /// groups (ids only grow). The next two are steered, by the parent and the lease each fork is
-/// given, into leaves with room, so they never split. The header rewrite is the same size. So a root
-/// split in a fork can only come from the record or the state append, and each is followed by a
-/// write this fork has not yet touched: the state tail after the record, the steered deadline leaf
-/// after the state. On a cold pool that write must read from storage, and the injector fails that
-/// read. Its first reads (the parent's record, the parent's envelope, the free-id span) are made
-/// before anything is appended, so the rule cannot fire on them.
+/// given, into leaves with room, so they never split. Those leaves must also not BE the record-tail
+/// or state-tail leaf: the record group (tag 0) and the deadline group (tag 1) are neighbours, so the
+/// record-tail leaf also holds deadline keys. A deadline key steered into it would land in a leaf the
+/// fork has just read and grown. The header rewrite is the same size. So a root split in a fork can
+/// only come from the record or the state append, and each is followed by a write this fork has not
+/// yet touched: the state tail after the record, the steered deadline leaf after the state. On a cold
+/// pool that write must read from storage, and the injector fails that read. Its first reads (the
+/// parent's record, the parent's envelope, the free-id span) are made before anything is appended,
+/// so the rule cannot fire on them.
 ///
 /// Phases:
 /// 1. **Grow.** 200 parents forked from trunk, then forks round-robin across them, every fork with
@@ -338,8 +341,9 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
                 "premise failed: the internal root split while growing, so the tree is three levels \
                  deep and a leaf split can no longer reach its root"
             );
-            // Fewer than ~6 separators of up to 25 bytes left, and one fork adds at most two (its
-            // two tails), so the root is not full yet and a few tail splits will fill it.
+            // Under 150 bytes left. One fork adds at most four separators of up to 25 bytes (its
+            // record, deadline, state and child inserts can each split a leaf, while the leases
+            // still rise), so the root is not full yet, and a few tail splits will fill it.
             if room < 150 {
                 vehicle = seq;
                 break;
@@ -355,14 +359,23 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
     for attempt in 0..5_000usize {
         let epoch = cat.current_epoch().0 + 1;
         let id = ids.last().copied().expect("ids") + 1;
+        // The two leaves this fork appends to, which a steered write must not share.
+        let tails = [
+            leaf_of(&cat, &ferrodb::branch::tree_keys::record(id)).0,
+            leaf_of(&cat, &ferrodb::branch::tree_keys::state(BranchState::Live.as_u8(), id)).0,
+        ];
+        let steered = |key: Vec<u8>, entry: usize| {
+            let (page, room) = leaf_of(&cat, &key);
+            room > entry && !tails.contains(&page)
+        };
         let parent = (0..parents.len())
             .map(|k| parents[(attempt + k) % parents.len()])
-            .find(|p| leaf_room(&cat, &ferrodb::branch::tree_keys::child(p.id, epoch)) > CHILD_ENTRY)
-            .expect("premise failed: no parent's live set has a leaf with room for one more child");
+            .find(|p| steered(ferrodb::branch::tree_keys::child(p.id, epoch), CHILD_ENTRY))
+            .expect("premise failed: no parent's live set has a leaf with room, apart from the tails");
         let deadline = (0..leases.len())
             .map(|k| leases[(attempt * 97 + k) % leases.len()] + 1)
-            .find(|l| leaf_room(&cat, &ferrodb::branch::tree_keys::deadline(*l, id)) > DEADLINE_ENTRY)
-            .expect("premise failed: no deadline leaf has room for one more key");
+            .find(|l| steered(ferrodb::branch::tree_keys::deadline(*l, id), DEADLINE_ENTRY))
+            .expect("premise failed: no deadline leaf has room, apart from the tails");
 
         cold(&cat);
         storage.arm(Rule::ReadAfterAppends { appends_needed: 3, appended: HashSet::new() });
