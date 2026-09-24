@@ -3629,6 +3629,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A `TwoTierReaper` over `c`, with a fresh main file of its own, as an open builds one. Returns
+    /// the main file's path too, for the caller to remove.
+    fn reaper_over(
+        c: &Arc<TableBranchCatalog>,
+        tag: &str,
+    ) -> (crate::branch::reaper::TwoTierReaper, std::path::PathBuf) {
+        let main =
+            std::env::temp_dir().join(format!("ferro-w21-{tag}-main-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&main);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&main).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+        let base = pool.disk_manager.high_water().unwrap();
+        let catalog: Arc<dyn BranchCatalog> = c.clone();
+        let store = Arc::new(
+            crate::branch::arena::ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base)
+                .unwrap(),
+        );
+        (crate::branch::reaper::TwoTierReaper::new(catalog, store), main)
+    }
+
+    /// T → A → B, both flipped `Reaped` while nothing below them lives (so both are keyed), then a
+    /// stale CHILD entry under B naming A: a cycle. Planted AFTER the flips, because before A5 a
+    /// liveness question over a cycle need not terminate. Returns (A, B).
+    fn cycle_of_two(c: &TableBranchCatalog) -> (u64, u64) {
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        for x in [&b, &a] {
+            c.set_state(x.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(x.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        c.upsert(keys::child(b.branch_id.id, c.next_epoch().0), a.branch_id.id.to_be_bytes().to_vec())
+            .unwrap();
+        (a.branch_id.id, b.branch_id.id)
+    }
+
+    /// **A3 (wall21 review audit 4): a `Reaping` state key whose record is not `Reaping` is
+    /// refused, never reaped.** The resume took every record a `Reaping` STATE key named, and
+    /// `reap` compare-and-sets from the state it READ, so a stale key on a `Live` record flipped
+    /// and freed a live branch. The producers are corruption-class (a torn flush; a record-less key
+    /// whose id is later minted), and the answer must still never be the destructive one.
+    /// PRE-REGISTERED (lane §8.16): fails at "A3: … reaped a Live branch" at `0e3c36a`; M50's
+    /// killer.
+    #[test]
+    fn a_stale_reaping_key_on_a_live_record_is_refused_not_reaped() {
+        let path = sidecar("a3-stale");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        let lid = l.branch_id.id;
+        c.upsert(keys::state(BranchState::Reaping.as_u8(), lid), Vec::new()).unwrap();
+        assert_eq!(
+            c.ids_in_state(BranchState::Reaping).unwrap(),
+            vec![lid],
+            "fixture: exactly L's stale key must be in the Reaping index"
+        );
+
+        let (reaper, main) = reaper_over(&c, "a3-stale");
+        let resumed = reaper.resume_interrupted_reaps().expect("a stale key must not fail the open");
+        assert_eq!(
+            c.get_raw(lid).unwrap().state,
+            BranchState::Live,
+            "A3: a stale Reaping key made the open reap a Live branch"
+        );
+        assert!(resumed.is_empty(), "a refused record was reported as resumed: {resumed:?}");
+        assert_eq!(reaper.refused_reaps(), 1, "the refusal was not counted");
+        let why = reaper.open_slot_refusals();
+        let tag = format!("interrupted reap of slot {lid}");
+        assert!(
+            why.iter().any(|w| w.starts_with(&tag) && w.contains("Live")),
+            "the refusal does not name L and the state its record is in: {why:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **A4 (wall21 review audit 4): the build keys a cycle member with nothing below it.** The pass
+    /// counts a back-edge as nothing below. Counting it as a pin (M51) leaves both members keyless:
+    /// the LEAK direction, since nothing else would ever lead a sweep to them. PRE-REGISTERED (lane
+    /// §8.16): passes at `0e3c36a`; it exists to kill M51.
+    #[test]
+    fn the_build_keys_a_cycle_member_with_nothing_below() {
+        let path = sidecar("a4-cycle");
+        let (a, b) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let (a, b) = cycle_of_two(&c);
+            // The pre-D200 state: no key and no marker, written to the file.
+            let _g = c.logical.lock().unwrap();
+            for id in [a, b] {
+                assert!(
+                    c.remove_if_present(&keys::unreleased(id)).unwrap(),
+                    "fixture: slot {id} was flipped releasable, so it was keyed"
+                );
+            }
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            (a, b)
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, a) && keyed(&c, b),
+            "A4: the build left a cycle member with nothing below it keyless (M51, the leak direction)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked
     /// `has_live_children` for every unreleased `Reaped` slot. Over a DEAD chain that is still
     /// attached, each question walks everything below the slot, and a NO files no witness, so the

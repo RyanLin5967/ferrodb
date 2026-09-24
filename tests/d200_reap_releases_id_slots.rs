@@ -297,6 +297,15 @@ struct Faulty {
     /// releases, because nothing after it in the reap runs.
     panic_release_at: u64,
     releases: AtomicU64,
+    /// PERSISTENT `Io` errors, by id (audit 4 A1): every `get_raw` of these ids fails, and so does
+    /// every `has_live_children` of the ids in `io_liveness`. Not `Branch` errors on purpose: a
+    /// B-tree page failure is `Corruption` or `Io`, so this is what one bad leaf looks like.
+    io_get_raw: Vec<u64>,
+    io_liveness: Vec<u64>,
+}
+
+fn injected_io(what: &str, id: u64) -> FerroError {
+    FerroError::Io(format!("injected persistent I/O error: {what} of slot {id}"))
 }
 
 fn injected(what: &str) -> FerroError {
@@ -305,6 +314,9 @@ fn injected(what: &str) -> FerroError {
 
 impl BranchCatalog for Faulty {
     fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        if self.io_get_raw.contains(&id) {
+            return Err(injected_io("get_raw", id));
+        }
         if self
             .fail_get_raw_of
             .compare_exchange(id, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
@@ -386,6 +398,9 @@ impl BranchCatalog for Faulty {
         self.inner.live_child_in_epoch_range(parent_id, lo, hi)
     }
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        if self.io_liveness.contains(&parent_id) {
+            return Err(injected_io("has_live_children", parent_id));
+        }
         self.inner.has_live_children(parent_id)
     }
     fn live_count(&self) -> usize {
@@ -428,6 +443,22 @@ fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
         fail_get_raw_of: AtomicU64::new(u64::MAX),
         panic_release_at: 0,
         releases: AtomicU64::new(0),
+        io_get_raw: Vec::new(),
+        io_liveness: Vec::new(),
+    })
+}
+
+/// A `Faulty` whose only faults are persistent `Io` errors on these ids (audit 4 A1).
+fn faulty_with_io(f: &Fixture, io_get_raw: Vec<u64>, io_liveness: Vec<u64>) -> Arc<Faulty> {
+    Arc::new(Faulty {
+        inner: Arc::clone(&f.catalog),
+        fail_detach_at: 0,
+        detaches: AtomicU64::new(0),
+        fail_get_raw_of: AtomicU64::new(u64::MAX),
+        panic_release_at: 0,
+        releases: AtomicU64::new(0),
+        io_get_raw,
+        io_liveness,
     })
 }
 
@@ -557,6 +588,8 @@ fn a_crash_between_two_releases_strands_no_ancestor() {
         fail_get_raw_of: AtomicU64::new(u64::MAX),
         panic_release_at: 3,
         releases: AtomicU64::new(0),
+        io_get_raw: Vec::new(),
+        io_liveness: Vec::new(),
     });
     let through = reaper_through(&f, &faulty);
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| through.reap(l)));
@@ -643,4 +676,64 @@ fn a_resumed_reap_that_errs_does_not_fail_the_open() {
     let mut want = vec![q.id, p.id, l.id];
     want.sort_unstable();
     assert_eq!(recycled_among(c, Vec::new(), 3), want, "the open left part of the chain unreleased");
+}
+
+/// **A1 (wall21 review audit 4): at open, one slot's failure, of ANY error type, is that slot's
+/// refusal.** A B-tree page failure is `Corruption` or `Io`, never `Branch`, so W3's `Branch`-only
+/// rule let one bad leaf fail every open. One slot per per-slot site at open, each with a
+/// PERSISTENT `Io` fault:
+/// - R1, `Reaping`: its record read fails (the resume's read);
+/// - R2, `Reaping`: its liveness fails inside the resumed reap;
+/// - S1, `Reaped` and keyed: its record read fails (the sweep's `get_raw`);
+/// - S2, `Reaped` and keyed: its liveness fails (`reclaim_slot`).
+///
+/// PRE-REGISTERED (lane §8.16): fails at the open's `expect` at `0e3c36a`, because R1's `Io`
+/// propagates from the resume's read. Kills M44–M47.
+#[test]
+fn a_non_branch_error_at_open_is_that_slots_refusal() {
+    let f = fixture();
+    let c = &*f.catalog;
+    let fork = || c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let (r1, r2, s1, s2) = (fork(), fork(), fork(), fork());
+    for r in [r1, r2] {
+        c.set_state(r, BranchState::Live, BranchState::Reaping).unwrap();
+    }
+    for s in [s1, s2] {
+        mark_reaped(c, s);
+    }
+    let keyed = c.unreleased_reaped_candidates().unwrap();
+    assert!(
+        keyed.contains(&s1.id) && keyed.contains(&s2.id),
+        "fixture: S1 and S2 were flipped releasable, so both must be keyed: {keyed:?}"
+    );
+
+    let faulty = faulty_with_io(&f, vec![r1.id, s1.id], vec![r2.id, s2.id]);
+    let opener = reaper_through(&f, &faulty);
+    let resumed = opener
+        .resume_interrupted_reaps()
+        .expect("A1: one slot's I/O error failed the whole open; it must be that slot's refusal");
+    assert!(resumed.is_empty(), "a refused reap was reported as resumed: {resumed:?}");
+    assert_eq!(opener.refused_reaps(), 2, "R1's and R2's declined resumes were not both counted");
+    let why = opener.open_slot_refusals();
+    assert_eq!(why.len(), 4, "one refusal per faulty slot was expected: {why:?}");
+    // Each slot's refusal names the slot in its prefix AND carries that slot's own injected error.
+    let named = |prefix: String, id: u64| {
+        let own = "injected persistent I/O error: ";
+        why.iter().any(|w| {
+            w.starts_with(&prefix) && w.contains(own) && w.ends_with(&format!(" of slot {id}"))
+        })
+    };
+    assert!(named(format!("interrupted reap of slot {}", r1.id), r1.id), "R1 has no refusal: {why:?}");
+    assert!(named(format!("resumed reap of b{}@", r2.id), r2.id), "R2 has no refusal: {why:?}");
+    assert!(named(format!("slot {}:", s1.id), s1.id), "S1 has no refusal: {why:?}");
+    assert!(named(format!("slot {}:", s2.id), s2.id), "S2 has no refusal: {why:?}");
+    assert!(
+        why.iter().all(|w| w.contains("injected persistent I/O error")),
+        "a refusal lost the error that caused it: {why:?}"
+    );
+    let keyed = c.unreleased_reaped_candidates().unwrap();
+    assert!(
+        keyed.contains(&s1.id) && keyed.contains(&s2.id),
+        "a refused slot lost its key, so no later open would ask again: {keyed:?}"
+    );
 }
