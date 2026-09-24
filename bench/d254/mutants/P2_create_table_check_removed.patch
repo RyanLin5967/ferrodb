@@ -1,0 +1,11 @@
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -172,7 +172,7 @@
+             indexes: Vec::new(),
+             fulltext_indexes: Vec::new()
+         };
+-        refuse_unless_encodable(&entry)?;
++        if false { refuse_unless_encodable(&entry)?; }
+         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
+         let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
+         let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;

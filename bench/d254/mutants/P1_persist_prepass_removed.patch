@@ -1,0 +1,11 @@
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -511,7 +511,7 @@
+         // on a later page likewise left the earlier pages rewritten. Asking first means `persist`
+         // refuses with every page as it was, and `persist_or_undo` undoes cleanly.
+         for entry in &sorted {
+-            refuse_unless_encodable(entry)?;
++            if false { refuse_unless_encodable(entry)?; }
+         }
+         let mut iter = sorted.into_iter().peekable();
+ 

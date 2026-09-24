@@ -1,0 +1,11 @@
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -243,7 +243,7 @@
+             // exist, and the undo below pops the record, not the pages.
+             let mut with_index = entry.clone();
+             with_index.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: 0 });
+-            refuse_unless_encodable(&with_index)?;
++            if false { refuse_unless_encodable(&with_index)?; }
+ 
+             (entry.schema.clone(), entry.first_directory_page_id, col_index)
+         };
