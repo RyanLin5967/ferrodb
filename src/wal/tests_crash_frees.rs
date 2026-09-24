@@ -61,7 +61,7 @@ use crate::storage::tuple::Tuple;
 use crate::storage::sim::{Durability, FaultPlan, OpKind, SimFabric, WriteShape};
 use crate::storage::storage::Storage;
 use crate::wal::free_intent::{self, FreeIntent};
-use crate::wal::log::DdlOp;
+use crate::wal::log::{DdlOp, RecKind, WalManager};
 use crate::wal::txn::DdlRecord;
 
 thread_local! {
@@ -2059,4 +2059,81 @@ fn a_drop_of_a_table_a_pending_intent_already_names_is_refused_before_anything_h
     let freed: Vec<u32> = pages.iter().copied().filter(|p| !bits.contains(p)).collect();
     assert!(freed.is_empty(), "the refused DROP freed page(s) {freed:?}");
     check_rows(&mut d.o, "t", &[1, 2, 3]).unwrap_or_else(|e| panic!("t after the refused DROP: {e}"));
+}
+
+/// Every page a heap record in the durable log names (a CLR by the record it redoes), read from the
+/// crash image `s` without opening the database.
+fn logged_pages(s: &Snapshot) -> BTreeSet<u32> {
+    let m = Machine::boot(s, None);
+    let wal = WalManager::with_storage(m.fabric.open(FAB_WAL), m.dir.path().join(format!("{DB_NAME}.wal")))
+        .expect("read the crash image's log");
+    let mut out = BTreeSet::new();
+    let end = wal.next_lsn.load(Ordering::SeqCst);
+    let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+    while lsn < end {
+        let (rec, next) = wal.read_record(lsn).expect("a record of the crash image's log");
+        let kind = match &rec.kind {
+            RecKind::Clr { redo, .. } => redo.as_ref(),
+            other => other,
+        };
+        match kind {
+            RecKind::HeapInsert { page_id, .. }
+            | RecKind::HeapDelete { page_id, .. }
+            | RecKind::HeapUpdate { page_id, .. }
+            | RecKind::HeapRelease { page_id, .. } => {
+                out.insert(*page_id);
+            }
+            _ => {}
+        }
+        lsn = next;
+    }
+    out
+}
+
+/// **A page its heap lists before its own image reached the disk opens as an empty page** (D256
+/// review 1's R4, added to D229's exit by the lead; PREREG amendment 12). `add_empty_page` writes a
+/// zero page, then lists it. Directory entries are not logged and a directory page carries no LSN, so
+/// the directory can reach the disk (evicted, or first in `flush_all`'s ascending order) while the
+/// page's own image does not, and when no log record names the page, redo does not initialise it.
+/// Every scan of the heap then reads zeros as a heap page and `Page::deserialize` panics, and the
+/// open's rebuild scans every primary heap. Here `notes`' directory is flushed alone, as an eviction
+/// writes it, while the transaction whose INSERT took the page is still open.
+///
+/// RED at `60481bf` (INFERRED): the first open panics. Mutant-only red after the fix: M24.
+#[test]
+fn a_page_its_heap_lists_before_its_own_image_reached_the_disk_opens_as_an_empty_page() {
+    let m = Machine::boot(fixture(), None);
+    let (listed, dir_id);
+    {
+        let mut d = m.open().expect("open the fixture");
+        let s = &mut Session::new();
+        must(&mut d.o, s, "CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));");
+        must(&mut d.o, s, &note_sql(0));
+        let before = pages_of(&d.o, "notes").expect("walk notes");
+        must(&mut d.o, s, "BEGIN;");
+        must(&mut d.o, s, &note_sql(1));
+        let new: Vec<u32> = pages_of(&d.o, "notes").expect("walk notes again").difference(&before).copied().collect();
+        assert_eq!(new.len(), 1, "premise: the second note did not take exactly one new page: {new:?}");
+        listed = new[0];
+        dir_id = d.o.catalog.get_table("notes").expect("notes").first_directory_page_id;
+        d.o.bp.flush_page(dir_id).expect("write notes' directory, as an eviction would");
+        // The crash, with the INSERT's transaction still open.
+    }
+    let crash = m.snapshot();
+    let db = &crash.images[FAB_DB];
+    let at = dir_id as usize * PAGE_SIZE;
+    let dir = PageDirectory::deserialize(db[at..at + PAGE_SIZE].try_into().unwrap());
+    assert!(
+        dir.entries.iter().any(|e| e.page_id == listed),
+        "premise: notes' directory on disk does not list page {listed}, so no scan reaches it"
+    );
+    assert!(
+        !logged_pages(&crash).contains(&listed),
+        "premise: a durable log record names page {listed}, so redo would initialise it"
+    );
+    let mut want = fixture_want();
+    want.present.insert("notes".to_string(), vec![0]);
+    if let Err(e) = two_good_opens(&crash, &want) {
+        panic!("a heap page its directory lists on disk before the page's own image: {e}");
+    }
 }
