@@ -8463,6 +8463,56 @@ mod tests {
         );
     }
 
+    /// **A row holds only the versions some live pin reads, plus its newest** (Amendment 5, item 2).
+    ///
+    /// Keeping everything above the oldest pin is not enough. A pin reads ONE version of each row,
+    /// the newest at or below it, so the versions published between that one and the newest are
+    /// read by nobody. A pin taken later starts above all of them. Row 2 is the harness's case: a
+    /// pin taken before a row's first publish reads no version of it at all, yet under the
+    /// oldest-pin rule alone it would keep every version published after it.
+    ///
+    /// Red at `0570fe8` (row 1 holds 103) and at `7c92d8d`, which carries the oldest-pin rule alone
+    /// (row 1 holds 101).
+    #[test]
+    fn version_history_holds_only_the_versions_live_pins_read() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        for _ in 0..100 {
+            publish_next(&mut st, 2);
+        }
+        // Row 1: the pin at 3 reads version 3, the fixture's last publish before the pin.
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(at)).map(|v| v.begin_ts),
+            Some(3),
+            "the pin at 3 must still name the version it reads"
+        );
+        let row1 = st.version_history[&(1, 1)].len();
+        assert!(
+            row1 <= 2,
+            "row 1 holds {row1} history entries. The only live pin reads version 3; versions 4..=102 \
+             are read by no pin, live or future, so at most 2 (3 and the newest) may be held"
+        );
+        // Row 2: first published after the pin, so the pin reads no version of it.
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(2), Some(at)),
+            None,
+            "the pin at 3 predates every version of row 2"
+        );
+        let row2 = st.version_history[&(1, 2)].len();
+        assert!(
+            row2 <= 1,
+            "row 2 holds {row2} history entries; no live pin reads any of them, so only the newest \
+             may be held"
+        );
+    }
+
     /// **Sealing the oldest pin frees what only it held — without waiting for the row to be written
     /// again.** Trimming only at publish would strand the history of every row nobody publishes
     /// after the pin goes, which is O(ops published while the pin lived) that is never returned.
