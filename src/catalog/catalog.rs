@@ -231,7 +231,6 @@ impl Catalog {
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
         let sec_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
-        let new_root_id = sec_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
         for item in hfm.scan() {
@@ -241,6 +240,11 @@ impl Catalog {
             let primary_key = values[0].clone();   // first column = primary key
             sec_tree.insert((sec_value, primary_key), ())?;
         }
+        // D222 — the root is read AFTER the backfill. A backfill that splits the root moves it to a
+        // new page, and the page `create` returned is left as the leftmost leaf: recording that
+        // seeded the shared cell with one leaf, so a lookup past the leaf walk's 64 hops missed and
+        // an INSERT landed in that leaf whatever its key (`tests/d222_index_root_after_backfill.rs`).
+        let new_root_id = sec_tree.root_page_id.load(Ordering::Relaxed);
 
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
@@ -301,7 +305,6 @@ impl Catalog {
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
         let ft_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
-        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
         for item in hfm.scan() {
@@ -312,6 +315,8 @@ impl Catalog {
                 post_tokens(&ft_tree, text, &primary_key)?;
             }
         }
+        // D222 — after the backfill, for the reason `create_index` gives.
+        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
 
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
