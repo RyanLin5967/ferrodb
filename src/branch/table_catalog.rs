@@ -315,6 +315,9 @@ mod stored {
         pub(super) fn deadline(&self) -> StoredDeadline {
             StoredDeadline(self.0.lease_deadline().0)
         }
+        /// Test-only (review 6, B2): every production write serializes a `StoredRecord`, so outside
+        /// `cfg(test)` this is dead, which CI's `-D dead_code` refuses.
+        #[cfg(test)]
         pub(super) fn serialize_core(&self) -> Vec<u8> {
             self.0.serialize_core()
         }
@@ -652,7 +655,10 @@ impl SoftMark {
 ///   `.branches` log a pre-D198 build wrote — has `lag = 0`. **Not** a `.branches` log a D198 build
 ///   wrote (`LogBranchCatalog::open`, the embedder path; it writes no soft mark): the migration's
 ///   credit is then short by that writer's lag at its last append, never below 0 (review 5, C1b; a
-///   stated residual — the log catalog has no restart grace at all).
+///   stated residual — the log catalog has no restart grace at all). **Nor** a file or log last
+///   written by a cluster member (`main`'s members included): its leases are on the replicated-tick
+///   scale, not a lag-0 wall clock (review 6, C1; unreachable today — nothing proposes a
+///   `LeaseTick`).
 /// - **R3** `m ≤ W(last moment its writer was alive)`, and every soft mark is written in a commit,
 ///   so the file is never older, on `W`, than its last soft mark.
 /// - **R4** `s.mark ≤ L_w(last moment w was alive)`.
