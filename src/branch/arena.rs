@@ -2867,8 +2867,11 @@ use pending_replay::PendingReplay;
 /// already made, so it holds each key once, the first, whatever the records said.** Every removal
 /// (DRAINED, EXTENT_FREED, REPLACED) removes all copies of a key, so the first copy always sits where the
 /// correct entry would. That makes PARKED's `contains` a bound on transient slots and no longer what
-/// keeps the result duplicate-free: mutant MC1 (`contains` always false) is EQUIVALENT from the de-dup
-/// fix on (lane AMENDMENT 2). The type owns de-dup, and a second guard in front of it could not be tested.
+/// keeps the result duplicate-free: mutant MC1 (`contains` always false) is equivalent in the log's
+/// CONTENTS from the de-dup fix on. Its cost role, no slot per re-park, is pinned by
+/// `a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot`, which kills MC1 at 98 visits
+/// against 34 (lane AMENDMENTS 3-4). For the same reason no key ever has two live slots here, so
+/// `remove_key`'s every-copy loop never meets a second copy (mutant MC2 is equivalent).
 ///
 /// Cost: indexing and `finish` are one pass each over the log, and only if some record touched it.
 /// Every other method is O(1) plus the entries it actually removes; `remove_arena` also walks that
@@ -5636,6 +5639,8 @@ mod tests {
         let v0 = target.replay_pending_visits();
         assert!(target.restore(&armed).unwrap());
         let visits = target.replay_pending_visits() - v0;
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 count test: replay visits = {visits}");
         assert_eq!(target.pending_len(), P0, "the replayed log is not the log the tail describes");
 
         // Anti-vacuity: every carried entry is visited at least once, so a counter that is not
@@ -5711,7 +5716,9 @@ mod tests {
     /// * PARKED skips a key already in the log (first wins), a key repeated inside the same record,
     ///   and an entry naming a freed arena;
     /// * a key removed and parked again goes to the END;
-    /// * REPLACED keeps duplicates and drops dead arenas;
+    /// * REPLACED drops dead arenas. Since de-dup at push it also keeps only the FIRST entry for a
+    ///   key it carries twice, so no key reaches the log twice (`replace` is first-wins, and T6,
+    ///   `a_replaced_record_carrying_duplicates_replays_to_the_first_of_each`, pins it);
     /// * DRAINED removes EVERY entry with a key, and a key that is absent is a no-op;
     /// * EXTENT_FREED removes every entry of its arena, and later parks into it are skipped.
     ///
@@ -5802,9 +5809,9 @@ mod tests {
         );
 
         let mut second = Vec::new();
-        // wholesale: duplicates kept, dead arena dropped -> [x3 x3 w]
+        // wholesale: dead arena dropped, and x3's second copy dropped first-wins -> [x3 w]
         second.extend(with_entries(replaced, &[x3, x3, w, e(902, dead)]));
-        // one key, two entries: both go -> [w]
+        // x3 goes -> [w]. (Before de-dup at push the log held x3 twice here, and both went.)
         second.extend(drained(&[key(&x3)]));
         // -> [w v1 v2]
         second.extend(with_entries(parked, &[v1, v2]));
@@ -5892,6 +5899,8 @@ mod tests {
         let v0 = target.replay_pending_visits();
         assert!(target.restore(&armed).unwrap());
         assert_eq!(target.pending_len(), 16, "the image's pending log did not come back");
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 clean open: replay visits = {}", target.replay_pending_visits() - v0);
         assert_eq!(
             target.replay_pending_visits() - v0,
             0,
@@ -6266,6 +6275,8 @@ mod tests {
         let v0 = h.store.replay_pending_visits();
         let applied = h.store.replay_tail(&tail).unwrap();
         let visits = h.store.replay_pending_visits() - v0;
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 T8: replay visits = {visits}");
         assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
         assert_eq!(pending_of(&h.store), vec![k], "a re-park of a key already pending changed the log");
         assert!(visits >= N as u64, "the counter saw {visits} visits for {N} re-parks: it is not wired");
