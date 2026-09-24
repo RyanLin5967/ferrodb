@@ -5957,7 +5957,9 @@ impl AgentRuntime {
         let durable = revert_store::read_meta(ctx)?;
         let ours = self.state.lock().unwrap().revert.cursor.as_ref().and_then(|c| c.meta);
         let (d, o) = (durable.unwrap_or_default(), ours.unwrap_or_default());
-        if Meta { merge_ceiling: 0, ..d } == Meta { merge_ceiling: 0, ..o } {
+        // The ceiling is compared out: another runtime's reservation moves it and nothing else.
+        let unmoved = Meta { merge_ceiling: 0, ..d } == Meta { merge_ceiling: 0, ..o };
+        if unmoved {
             return Ok(durable);
         }
         Err(FerroError::Merge(format!(
