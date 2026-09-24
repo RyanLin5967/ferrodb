@@ -6,12 +6,17 @@
 //! the next persist of any table would put it right. But a process can exit before one happens. The
 //! clean exit used to only checkpoint, which flushes the stale page and truncates the log, so the
 //! next open found an empty log, did not rebuild, and read the pre-split root. The exit now goes
-//! through `catalog::clean_exit::checkpoint_for_exit`, the function `cli::run_cli` calls:
+//! through `cli::exit_sequence`, the function `cli::run_cli` calls, which runs
+//! `catalog::clean_exit::checkpoint_for_exit` and then the arena's checkpoint. These tests call
+//! `exit_sequence` itself, so a mutant of the CLI's exit wiring changes code they run (D230 review
+//! 3, F3(b)). Its arena is a scratch one in its own files (`scratch_arena`):
 //!
 //! - **T4:** the fault that failed the statement's persist has cleared by the exit. The exit writes
 //!   the new root, then checkpoints. The next open does not rebuild and reads the real root.
-//! - **T5:** the fault is still there at the exit. The exit refuses, names the root the page does not
-//!   record, and flushes the log without truncating it. The next open recovers and rebuilds.
+//! - **T5:** the fault is still there at the exit. The exit refuses, names the tree's root, and
+//!   flushes the log without truncating it. The next open recovers and rebuilds. (Its injection makes
+//!   the read-back unreadable too, so it reaches the branch that names every in-memory root; the
+//!   comparison branch is pinned by the lib unit test. D230 review 3, F7.)
 //!
 //! # How the persist is made to fail
 //!
@@ -21,7 +26,7 @@
 //!
 //! # Red evidence
 //!
-//! These tests call `checkpoint_for_exit`, which does not exist at `9aa6968`, so this file cannot
+//! These tests call `exit_sequence`, which does not exist at `9aa6968`, so this file cannot
 //! compile there. It lives apart from `d230_root_sync_on_every_exit.rs` so that file's red tree
 //! still builds. Its red is shown by mutants that remove each half of the exit (the lane report
 //! lists them).
@@ -32,14 +37,15 @@
 //! Row 370 splits the root, keeping keys 1..=185 on the left.
 
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ferrodb::binder::binder::Binder;
+use ferrodb::branch::{ArenaPageStore, BranchCatalog, TableBranchCatalog};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::clean_exit::checkpoint_for_exit;
 use ferrodb::catalog::column::Value;
+use ferrodb::cli::cli::exit_sequence;
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -90,9 +96,29 @@ fn open(dir: &Path) -> (Db, bool) {
     (Db { catalog, bp, txn, session: Session::new() }, recovered)
 }
 
+/// The arena `exit_sequence` checkpoints last: a scratch one, in its own files, over its own branch
+/// catalog. T4 and T5 are about the catalog and the log. The arena step runs only because it is
+/// part of the sequence the CLI runs, and a scratch arena keeps it off this fixture's pages.
+fn scratch_arena() -> (tempfile::TempDir, ArenaPageStore, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = OpenOptions::new().read(true).write(true).create(true).open(dir.path().join("arena.db")).unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let branches = TableBranchCatalog::create(pool.clone(), 7).expect("a scratch branch catalog");
+    let base = pool.disk_manager.high_water().expect("high water") + 64;
+    let store = ArenaPageStore::new(pool, Arc::new(branches) as Arc<dyn BranchCatalog>, base).expect("a scratch arena");
+    let path = dir.path().join("scratch.arena");
+    (dir, store, path)
+}
+
+/// The clean exit, through `cli::exit_sequence`, the function `cli::run_cli` calls.
+fn exit_through_the_cli_sequence(d: &Db) -> Result<(), FerroError> {
+    let (_dir, arena, arena_path) = scratch_arena();
+    exit_sequence(&d.catalog, &d.txn, &arena, &arena_path)
+}
+
 /// A clean exit through the function the CLI's exit calls, then every handle dropped.
 fn exit_cleanly(d: Db) {
-    checkpoint_for_exit(&d.catalog, &d.txn).expect("the clean exit");
+    exit_through_the_cli_sequence(&d).expect("the clean exit");
     drop(d);
 }
 
@@ -293,8 +319,8 @@ fn a_clean_exit_writes_a_root_whose_persist_failed_before_it_checkpoints() {
     assert_record_is_the_root(&d);
 }
 
-/// The fault is still there at the exit: the exit refuses and names the root the page does not
-/// record, and it leaves the log flushed and untruncated, so the next open recovers and rebuilds.
+/// The fault is still there at the exit: the exit refuses and names the tree's root, and it leaves
+/// the log flushed and untruncated, so the next open recovers and rebuilds.
 ///
 /// Mutants: an exit that only checkpoints (M6) returns `Ok`; one that checkpoints anyway after the
 /// failure (M7), or returns without flushing the log (M8), leaves the next open nothing to recover.
@@ -305,13 +331,13 @@ fn a_clean_exit_that_cannot_persist_the_catalog_fails_loudly_and_leaves_the_log_
 
     let mut c = open_without_rebuild(dir.path(), "C");
     let (page_one, root_now) = split_the_root_with_persist_failing(&mut c);
-    let refusal = checkpoint_for_exit(&c.catalog, &c.txn)
+    let refusal = exit_through_the_cli_sequence(&c)
         .err()
         .expect("an exit that cannot persist the catalog must fail, not report a clean exit")
         .to_string();
     assert!(
         refusal.contains(&format!("t (primary index): page {root_now}")),
-        "the exit's error must name the root the catalog page does not record: {refusal}"
+        "the exit's error must name the tree's root: {refusal}"
     );
     assert!(
         refusal.contains("NOT truncated"),

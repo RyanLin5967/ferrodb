@@ -217,17 +217,46 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    // D230: persist the catalog from its in-memory records, then checkpoint. A `sync_roots` whose
-    // persist failed this session left the catalog page behind the trees, and a checkpoint alone
-    // would flush that page and truncate the log, so the next open would not rebuild and would read
-    // it. On failure the log is kept for the next open to rebuild from, and the error names the
-    // roots. See `catalog::clean_exit`.
-    crate::catalog::clean_exit::checkpoint_for_exit(&catalog.lock(), &txn)?;
-    // Persist where the arena starts and what it has allocated. Without this the next open finds
-    // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    store.checkpoint(Path::new(&arena_path))?;
+    // The catalog guard lives for the whole call, the arena checkpoint included. That is the
+    // existing order (the catalog before the arena, as the lease thread takes them), and the lease
+    // thread has stopped, so nothing waits on it.
+    exit_sequence(&catalog.lock(), &txn, &store, Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
+}
+
+/// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
+/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs
+/// (D230 review 3, F3(b)).
+///
+/// 1. **D230:** persist the catalog from its in-memory records, then checkpoint the log
+///    (`catalog::clean_exit::checkpoint_for_exit`). A `sync_roots` whose persist failed this session
+///    left the catalog page behind the trees, and a checkpoint alone would flush that page and
+///    truncate the log, so the next open would not rebuild and would read it. On failure the log is
+///    kept for the next open to rebuild from, and the error names the roots.
+/// 2. Persist where the arena starts and what it has allocated. Without this the next open finds no
+///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
+///
+/// The arena step runs whatever the first returned, and the first error is returned and any later
+/// one printed. A refused catalog persist must not also cost the arena its checkpoint (review 3,
+/// F4). This is the shape `rollback-index-orphan` gives its two checkpoints.
+pub fn exit_sequence(
+    catalog: &Catalog,
+    txn: &TxnManager,
+    store: &ArenaPageStore,
+    arena_path: &Path,
+) -> Result<(), FerroError> {
+    let wal_checkpoint = crate::catalog::clean_exit::checkpoint_for_exit(catalog, txn);
+    let arena_checkpoint = store.checkpoint(arena_path);
+    let mut errors = [wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
+    let first = errors.next();
+    for later in errors {
+        eprintln!("ferrodb: a later exit step failed as well ({later})");
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {
