@@ -1020,8 +1020,18 @@ impl WalManager {
         Ok(())
     }
 
+    /// Make the record that BEGINS at `lsn` durable. A record's LSN is its start, and `flushed_lsn` is
+    /// the end of what was flushed, so the record at `lsn` is durable exactly when `flushed_lsn > lsn`:
+    /// a flush writes whole records, so the flushed end is always a record boundary.
+    ///
+    /// This was `>=`, and the first record appended after any flush or truncation begins exactly at
+    /// `flushed_lsn`, so it was reported durable while still in memory. COMMIT (`TxnManager::commit`)
+    /// then returned `Ok` for a `Commit` record that a crash could lose, whenever something flushed the
+    /// log after the transaction's last record: another session's COMMIT, or an eviction's WAL gate.
+    /// And `BufferPoolManager::wal_gate` let a page whose last record was that first one reach disk
+    /// before it.
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
-        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
+        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {
             return Ok(());
         }
         self.flush()
