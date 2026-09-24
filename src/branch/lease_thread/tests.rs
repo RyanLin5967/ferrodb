@@ -398,8 +398,45 @@ fn a_lease_expiry_reap_is_attested_exactly_once() {
     scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
     assert_eq!(f.runtime.forget_reaped_branches(), 0, "a workspace outlived the scan's forget");
     assert_eq!(f.runtime.forget_branches(&[branch]), 0, "a forgotten branch was forgotten again");
+    // And a later `seal` of the reaped branch (a client ABANDON arriving after the lease took it)
+    // must not append a second Reap. This runtime has no reaper, so `seal` takes its fallback
+    // arm, whose `get` refuses a reaped id before anything is attested.
+    assert!(f.runtime.abandon(branch).is_err(), "abandoning a reaped branch succeeded");
     assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
     assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// ⛔ **D199 rules 1 and 3, WRITTEN TO FAIL FIRST against `a5e9423`.** `get` refuses a `Reaping`
+/// branch as well as a `Reaped` one, so the reconciliation sweep forgets a branch whose reap is
+/// still in flight. `scan_once`'s error arm runs that sweep right after a reap that failed half
+/// way. Rule 1: the reap must not be attested before `Reaped` lands. Rule 3: once it lands it
+/// must still be attested, although the branch's workspace is already gone and no sweep will
+/// visit it again. `a5e9423` keyed the attestation on "this call removed the workspace", which
+/// breaks both.
+///
+/// Hand-worked: `[Fork]` after the sweep over the `Reaping` branch (one workspace forgotten);
+/// `[Fork, Reap]` once `Reaped` lands and the branch is reported to the forget path by id.
+#[test]
+fn a_reap_is_attested_once_it_lands_even_if_its_workspace_was_forgotten_first() {
+    use crate::branch::attest::BranchOp;
+
+    let f = fixture();
+    let session = f.runtime.begin_session("half-reaped", Some("r_3"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.h.catalog.set_state(branch, BranchState::Live, BranchState::Reaping).unwrap();
+    assert_eq!(f.runtime.forget_reaped_branches(), 1, "the sweep did not forget a Reaping branch");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested before Reaped landed");
+
+    f.h.catalog.set_state(branch, BranchState::Reaping, BranchState::Reaped).unwrap();
+    assert_eq!(f.runtime.forget_branches(&[branch]), 0, "its workspace was already gone");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a landed reap was missed because its workspace had been forgotten first"
+    );
+    assert_eq!(f.runtime.attestation_refusals(), 0, "an attestation was refused");
 }
 
 /// ⛔ **D199, the other door, WRITTEN TO FAIL FIRST.** A branch a reaper took with no forget call
