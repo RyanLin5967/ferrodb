@@ -574,6 +574,9 @@ mod tests {
             fn append(&self, _f: &TxnFrame) -> Result<(), FerroError> {
                 Ok(())
             }
+            fn check_append(&self, _f: &TxnFrame) -> Result<(), FerroError> {
+                Ok(())
+            }
             fn frames_for(&self, _b: BranchId, _s: u64) -> Result<Vec<TxnFrame>, FerroError> {
                 Ok(Vec::new())
             }

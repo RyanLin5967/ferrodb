@@ -53,7 +53,7 @@ use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::storage::Storage;
-use ferrodb::tel::ids::{ColId, RowId};
+use ferrodb::tel::ids::ColId;
 use ferrodb::tel::{DurableEffectLog, EffectLog, MemEffectLog};
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
