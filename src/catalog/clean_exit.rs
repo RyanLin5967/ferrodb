@@ -28,6 +28,7 @@ use crate::wal::txn::TxnManager;
 /// Blind spot, stated: if a checkpoint HAS truncated the log since the root moved and nothing has
 /// been written after it, the next open does not rebuild, and this error is the only signal.
 pub fn checkpoint_for_exit(catalog: &Catalog, txn: &TxnManager) -> Result<(), FerroError> {
+    txn.checkpoint()?; // D230 MUTANT M10: checkpoints BEFORE it persists
     if let Err(e) = catalog.persist() {
         let flushed = match txn.wal.flush() {
             Ok(()) => "The write-ahead log was flushed and NOT truncated, so the next open recovers \
@@ -42,7 +43,7 @@ pub fn checkpoint_for_exit(catalog: &Catalog, txn: &TxnManager) -> Result<(), Fe
             unpersisted_roots(catalog)
         )));
     }
-    txn.checkpoint()
+    Ok(()) // D230 MUTANT M10
 }
 
 /// Every tree's root as `entries` record it, keyed by a name an operator can read.
