@@ -567,13 +567,17 @@ impl TableBranchCatalog {
     /// writes a FREE_ID key, and `fork` asks it again before reusing one, because a FREE_ID can
     /// outlive the state it was written for (a torn flush, review 1 F5). Errors are the caller's to
     /// judge. Call with `logical` held.
-    fn reusable_slot(&self, id: u64) -> Result<Option<u32>, FerroError> {
+    ///
+    /// Returns the RECORD it read, not just its generation (amendment 4, wall21 audit 4 A8), so a
+    /// caller that goes on to remove the slot's keys already holds the record and never reads it
+    /// after a removal: a read that failed there left the slot keyless and not free.
+    fn reusable_slot(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
         match self.core(id)? {
             Some(rec) if rec.state() == BranchState::Reaped => {
                 if self.has_live_children(id)? {
                     Ok(None)
                 } else {
-                    Ok(Some(rec.generation()))
+                    Ok(Some(rec))
                 }
             }
             _ => Ok(None),
@@ -1010,8 +1014,8 @@ impl BranchCatalog for TableBranchCatalog {
                 continue;
             };
             match self.reusable_slot(id) {
-                Ok(Some(generation)) => {
-                    recycled = Some((id, generation));
+                Ok(Some(rec)) => {
+                    recycled = Some((id, rec));
                     break;
                 }
                 // Stale, or (review 2 G9 (a)) unreadable: skipped, counted and removed. Never a
@@ -1027,10 +1031,11 @@ impl BranchCatalog for TableBranchCatalog {
         // `reused` decides which writer runs below, and it is the whole safety condition for
         // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
         // deadline keys, so its keys are NOT new.
+        // The record was read and the decision made above; every key removal comes after (A8).
         let (child_num, generation, reused) = match recycled {
-            Some((id, slot_gen)) => {
+            Some((id, rec)) => {
                 self.remove_if_present(&keys::free_id(id))?;
-                (id, slot_gen, true)
+                (id, rec.generation(), true)
             }
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
         };
