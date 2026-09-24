@@ -6142,4 +6142,141 @@ mod tests {
         let _ = std::fs::remove_file(&good);
         let _ = std::fs::remove_file(&blocker);
     }
+
+    /// **D263 review 1 F2b: a quarantined range of a superseded authority is dropped, not reused.**
+    /// A range held under one authority may never have been this node's under the next, which is
+    /// why `give_back` and `recycled_start` discard the whole free list on a change; the fold keeps
+    /// only the current authority's ranges for the same reason. The entry's epoch is PLANTED one
+    /// below the authority in force: the epoch is process-global, and a lib test that moved it
+    /// would move it under every test running beside it.
+    #[test]
+    fn d263_a_quarantined_range_of_a_superseded_authority_is_dropped_not_reused() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-epoch-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+
+        let (blocker, target) = d232_blocked_path("d263-epoch");
+        h.store.checkpoint_to(target);
+        let r = h.store.space.extent_starts.issued_through() as PageId;
+        claim().expect_err("fixture: the claim's record must fail to persist");
+        {
+            let mut g = h.store.persist.lock().unwrap();
+            assert_eq!(
+                g.quarantine.len(),
+                1,
+                "fixture: the failed claim's range was not quarantined"
+            );
+            g.quarantine[0].epoch = crate::cluster::epoch().wrapping_sub(1);
+        }
+        h.store.checkpoint_to(good.clone());
+
+        claim().unwrap();
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (0, 0),
+            "D263 review 1 F7: a rewrite that succeeded left a superseded range in the quarantine"
+        );
+        let c = claim().unwrap();
+        assert_ne!(
+            h.store.extent_range(c).unwrap().0,
+            r,
+            "D263 review 1 F2b: a range quarantined under a superseded authority was handed to a \
+             claim under the current one"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D263 review 1 F2c: `load_state` empties the quarantine, so a range held against the map it
+    /// replaces is never folded free into the map it installs.** The installed map is the authority
+    /// over every range. Here it still charges the range to the extent whose free failed, so a
+    /// quarantine that survived the install would list the range free and live at once.
+    #[test]
+    fn d263_load_state_empties_the_quarantine_against_the_map_it_installs() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-load-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let (r, pages) = h.store.extent_range(a).unwrap();
+        let before = h.store.state_bytes();
+
+        let (blocker, target) = d232_blocked_path("d263-load");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (1, u64::from(pages)),
+            "D263 review 1 F7: the failed free was not counted as quarantined"
+        );
+
+        h.store.load_state(&before).unwrap();
+        assert_eq!(
+            h.store.extent_range(a),
+            Some((r, pages)),
+            "fixture: the installed map does not charge the range to its extent"
+        );
+        h.store.checkpoint_to(good.clone());
+        h.store.checkpoint(&good).unwrap();
+        assert!(
+            !d263_free_list_holds(&h.store, r, pages),
+            "D263 review 1 F2c: a range quarantined before load_state was folded free into the \
+             installed map, which still charges it to {a:?}"
+        );
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (0, 0),
+            "D263 review 1 F7: load_state left the quarantine holding ranges"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D263 review 1 F2d: a checkpoint of the ARMED file returns the quarantined ranges.** It
+    /// is a rewrite of the durable map they wait on, like any other. The CLI's exit checkpoint is
+    /// one (it arms and checkpoints the same path), so a clean exit after a failed free must write
+    /// the range free, or it leaks across the restart.
+    #[test]
+    fn d263_a_checkpoint_of_the_armed_file_returns_the_quarantined_ranges() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-armed-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        h.store.checkpoint_to(good.clone());
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let (r, pages) = h.store.extent_range(a).unwrap();
+
+        let (blocker, target) = d232_blocked_path("d263-armed");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (1, u64::from(pages)),
+            "D263 review 1 F7: the failed free was not counted as quarantined"
+        );
+        h.store.checkpoint_to(good.clone());
+        h.store.checkpoint(&good).unwrap();
+
+        let restored = h.fresh_store();
+        assert!(restored.restore(&good).unwrap(), "fixture: nothing was restored");
+        assert!(
+            d263_free_list_holds(&restored, r, pages),
+            "D263 review 1 F2d: the armed checkpoint after a failed free did not record its range \
+             as free"
+        );
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (0, 0),
+            "D263 review 1 F7: the armed checkpoint left the quarantine holding ranges"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
 }
