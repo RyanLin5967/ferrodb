@@ -849,7 +849,7 @@ mod tests {
             w.append(i, 0, &RecKind::Commit).unwrap();
         }
         w.flush().unwrap();
-        w.truncate(99).unwrap();
+        let _ = w.truncate(99).unwrap();
 
         assert_eq!(
             w.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
@@ -877,7 +877,7 @@ mod tests {
 
         // Dropping it releases the claim, so the log can be reclaimed again.
         drop(sub);
-        w.truncate(100).unwrap();
+        let _ = w.truncate(100).unwrap();
         assert!(
             w.base_lsn.load(std::sync::atomic::Ordering::SeqCst) > base_before,
             "the log was never reclaimed even after the subscription was dropped"
@@ -893,7 +893,7 @@ mod tests {
         insert(&w, 1, 1, 1);
         w.append(1, 0, &RecKind::Commit).unwrap();
         w.flush().unwrap();
-        w.truncate(7).unwrap();
+        let _ = w.truncate(7).unwrap();
         let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         assert!(base > 1);
 
@@ -1088,7 +1088,7 @@ mod tests {
         insert(&w, 1, 1, 1);
         w.append(1, 0, &RecKind::Commit).unwrap();
         w.flush().unwrap();
-        w.truncate(9).unwrap();
+        let _ = w.truncate(9).unwrap();
         let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         assert!(base > 1, "the log did not truncate, so there is nothing to have lost");
 
