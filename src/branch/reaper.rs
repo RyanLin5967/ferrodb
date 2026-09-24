@@ -658,7 +658,8 @@ impl TwoTierReaper {
         // slice skips every arena a guard holds and these are finished.
         guard.swept = true;
         drop(guard);
-        Ok(recovered + self.collect_orphaned_slice()?)
+        // MUTANT (fire-check only, never land): the full scan back in the cadence.
+        Ok(recovered + self.collect_orphaned_extents()?)
     }
 
     /// **D221.** Examine the next [`ORPHAN_SWEEP_SLICE`] live arenas of the current rotation, and
