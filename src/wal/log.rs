@@ -1135,6 +1135,30 @@ mod tests {
         assert_eq!(wal.flushed_lsn.load(Ordering::SeqCst), flushed);
     }
 
+    /// **D236 (found as the D216 adversary's F1): a record that STARTS exactly at the flushed point
+    /// is not durable yet, and `flush_up_to` of its LSN must write it.** An LSN is where a record
+    /// starts, and `flushed_lsn` is one past the last durable byte, so the record first in an empty
+    /// buffer has `lsn == flushed_lsn`. `>=` returned early for exactly that record.
+    ///
+    /// Ported verbatim from `d216-clean-restart` (`c528509`). `test_flush_up_to_stops_when_durable`
+    /// above asks about a record whose END is the flushed point, so it passes under `>=` and `>`
+    /// alike and cannot tell them apart; this one is the equality case.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `9aa6968` at the second assertion.
+    #[test]
+    fn flush_up_to_writes_a_record_that_starts_at_the_flushed_point() {
+        let (wal, _dir) = setup();
+        wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.flush().unwrap();
+        let l1 = wal.append(1, 0, &RecKind::Commit).unwrap();
+        assert_eq!(l1, wal.flushed_lsn.load(Ordering::SeqCst), "premise failed: the record does not start at the flushed point");
+        wal.flush_up_to(l1).unwrap();
+        assert!(
+            wal.flushed_lsn.load(Ordering::SeqCst) > l1,
+            "flush_up_to({l1}) returned with the record at {l1} still only in memory"
+        );
+    }
+
     #[test]
     fn test_read_buffer_before_flush() {
         let (wal, _dir) = setup();
