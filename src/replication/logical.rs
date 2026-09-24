@@ -100,9 +100,10 @@ pub enum ChangeOp {
     ///
     /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint that
     /// truncates the log, because the truncation discarded it and the schema has to be re-established
-    /// at the new base for the log to stay self-describing. (Since D234, not at a checkpoint a pin kept
-    /// from truncating: nothing was discarded there.) So a consumer will see the same `CREATE_TABLE` many times
-    /// for one table and must read it as "this table has this shape" rather than "a table was just
+    /// at the new base for the log to stay self-describing. A checkpoint that a pin kept from
+    /// truncating re-emits it only once a pin has passed its last declaration, so that a consumer
+    /// following the log still learns the shape (D234). So a consumer will see the same
+    /// `CREATE_TABLE` many times for one table and must read it as "this table has this shape" rather than "a table was just
     /// created" — anything counting them is counting checkpoints. Measured at
     /// `FERRODB_CHECKPOINT_INTERVAL=1`, where 30 commits produced 61 events: 30 rows and 31
     /// re-declarations.
@@ -672,8 +673,9 @@ impl LogicalDecoder {
     /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
     /// for every table after every truncation, and until D234 also at every checkpoint a pin kept
     /// from truncating, so a long-running database minted one entry per table per checkpoint, all
-    /// carrying the identical shape. Since D234 a held pin stops that at the source; identical runs
-    /// still arrive across real truncations and in archived logs
+    /// carrying the identical shape. Since D234 a checkpoint under a pin re-declares only when a pin
+    /// has passed the last declaration, so a pin held at the base stops that at the source. Identical
+    /// runs still arrive at real truncations, as a following pin advances, and in archived logs
     /// (`tests/d234_decoder_history_still_collapses.rs`).
     ///
     /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which

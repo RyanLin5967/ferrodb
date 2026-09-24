@@ -95,7 +95,7 @@ pub struct TxnManager {
     /// name the database's writers.
     ///
     /// **Stated cost:** this grows with the number of distinct runs and is never pruned, and every
-    /// checkpoint that truncates the log rewrites all of it (since D234, not one a pin kept) — the
+    /// checkpoint that truncates the log rewrites all of it (since D234, never one a pin kept) — the
     /// same unbounded shape `schema_log` has for tables, where the bound is the schema and here it
     /// is the runs this process has bound. A database with a very large
     /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a

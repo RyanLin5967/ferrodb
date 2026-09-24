@@ -168,8 +168,8 @@ func isSchema(op string) bool {
 // This is the distinction that matters to a consumer, and it is NOT the same as isSchema. A
 // CREATE_TABLE is a declaration — "this table has this shape" — re-sent at every checkpoint of the
 // source that truncates its log, because the truncation discarded it and the schema has to be
-// re-established at the new base (since D234, a checkpoint a pin kept from truncating re-sends
-// nothing). A DROP_TABLE likewise leaves the source's retained set. The column-level three are
+// re-established at the new base (since D234, a checkpoint a pin kept from truncating re-sends it
+// only once a pin has passed its last declaration). A DROP_TABLE likewise leaves the source's retained set. The column-level three are
 // **news**: each is delivered exactly once, at the position the DDL occupied, and a consumer that
 // applies one twice has renamed a column that no longer has the old name.
 //

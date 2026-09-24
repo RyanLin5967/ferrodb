@@ -5,9 +5,11 @@
 //! checkpoint. `collapse_repeats` exists to keep that from growing the decoder's history for the life
 //! of the process. The two tests that pinned it do it through checkpoints under a pin:
 //! `integration_alter_column::the_decoders_history_does_not_grow_with_every_checkpoint` and
-//! `adversarial_i20::a5_history_growth_under_a_live_subscription_pin`. Since D234 those checkpoints
-//! append nothing, so both tests pass whether or not `collapse_repeats` exists (the D234 adversary's
-//! F7). Identical declarations can still reach a decoder: every real truncation re-declares, and an
+//! `adversarial_i20::a5_history_growth_under_a_live_subscription_pin`. Since D234 a checkpoint under a
+//! pin re-declares only once a pin has passed the last declaration, and both tests hold their pin at
+//! the base, so those checkpoints append nothing and both tests pass whether or not
+//! `collapse_repeats` exists (the D234 adversary's F7). Identical declarations still reach a
+//! decoder: every real truncation re-declares, a following pin's advance re-declares, and an
 //! archived log holds whatever its writer wrote. So this test feeds the same run by hand.
 //!
 //! Passes at `00f4c39` and must keep passing. It fails when `collapse_repeats` drops nothing

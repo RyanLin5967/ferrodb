@@ -1444,7 +1444,8 @@ fn a_pump_after_an_alter_does_not_silently_truncate_the_row() {
 /// The pin is what makes this test not vacuous — a first version without one passed against the
 /// unfixed code, because an advancing base pruned the history for free.
 ///
-/// ⚠ Since D234 a checkpoint that the pin keeps from truncating re-appends nothing, so the repeats
+/// ⚠ Since D234 a checkpoint that the pin keeps from truncating re-declares only once a pin has
+/// passed the last declaration, and this pin sits at the base, so it re-appends nothing: the repeats
 /// this test was built to feed no longer arrive and it holds with or without `collapse_repeats`.
 /// `tests/d234_decoder_history_still_collapses.rs` feeds them by hand.
 #[test]

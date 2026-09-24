@@ -267,7 +267,8 @@ fn a4_drop_and_recreate_reusing_the_dir_root() {
 
 /// **A5. Does `forget_truncated` bound the history?** Measured, with a live subscription pin —
 /// which is the state a CDC server is in, and which makes `truncate` a no-op (`wal/log.rs:725`).
-/// ⚠ Since D234 such a checkpoint also re-appends nothing, so this no longer feeds the decoder the
+/// ⚠ Since D234 such a checkpoint re-declares only once a pin has passed the last declaration, and
+/// this pin sits at the base, so it re-appends nothing and no longer feeds the decoder the
 /// repeats `collapse_repeats` exists for; `tests/d234_decoder_history_still_collapses.rs` does.
 #[test]
 fn a5_history_growth_under_a_live_subscription_pin() {
