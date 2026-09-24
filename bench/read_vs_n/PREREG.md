@@ -1209,3 +1209,45 @@ verdict script's maintainer.**
    * The arm-3 comment's superseded "every reading in the run" sentence is corrected.
    * "UNAVAILABLE (unguarded)" reads "UNAVAILABLE (no load reading)", since a flag is not a guard.
 10. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
+
+**A17, 2026-09-24, before any build or run. Review 9 of `344cf33..38d97a2` (artie-research
+`frontier/read_vs_n_review9.md` @ `0e596f2`) returned SOUND-WITH-CAVEATS. No false verdict can print today: the verdict
+script refuses the un-repinned output. The lead's decisions on X1, X2 and X5 follow. X3 and X4 belong to the verdict
+script's maintainer. Item 4 is the lane's own.**
+
+1. **X1: A16.2's "the only NOT A RESULT that may appear below is A14.1's" is WITHDRAWN. It was false.**
+   * In the same mode, A13.9's refusal ("ckpt-ddl was requested but no axis-(ii) checkpoint truncated") prints below
+     that line, and so does a failed close.
+   * The `FIRECHECK CkptDdl` line now names every NOT A RESULT that may appear below it:
+     * A14.1's refusal of a moved base (A15.4);
+     * A13.9's refusal, which means the fire did not inject;
+     * a failed close (item 4).
+   * Any other NOT A RESULT is a finding.
+   * No harness guard reads the replay-bytes integer, and the replay-bytes line must carry the pre-registered
+     intercept. Both are unchanged.
+2. **X2: H6 rows are excluded from every arm-3 value in the summary, for real.**
+   * **Before**, the table updated its slope anchor (`prev`) for every row, H6 rows included. So the next row's
+     `total` and `lease_start` slopes were computed from the H6 open, and the span legend listed the H6 N, while the
+     line two below it said H6 rows were excluded.
+   * **Now:**
+     * an H6 row prints only its N and "H6: NOT A RESULT (stale-index marker at open); its values are in its RESTART
+       and RESTART-RAW lines";
+     * the anchor skips it, so no slope uses it;
+     * the span legend lists only non-H6 rows;
+     * the load median already left it out (A15.6).
+   * **Pre-registered against the (f) `stale-marker` fire** (H6 at N = 256 only, on the (e) command):
+     * the 256 row prints the H6 line;
+     * the 2048 row's slopes print "-", since there is no earlier non-H6 row;
+     * the span legend reads "N 2048";
+     * the H6 line names `N=[256]`;
+     * the load median is the 2048 row's readings;
+     * rc 2, with H6 as the only guard.
+3. **X5: the R7 line names `files` and states the join.**
+   * The line now lists `files`, which A5 folded into R7's recover and A6 lists as a flat step, alongside lock,
+     recover, sql_catalog, branch_catalog, effect_log, runtime and provenance.
+   * It says R7's step times are printed in the RESTART rows, not in the summary table. So "L2 and G7 beside them"
+     holds only by joining those rows to the summary on N.
+4. **The lane's own: a failed close now sets rc 2.** The harness fixed its exit code BEFORE the final close, so an
+   unclean close printed NOT A RESULT under rc 0. Review 9 §3 noted this as pre-existing, outside its delta. A close
+   failure is now a failure like any other.
+5. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
