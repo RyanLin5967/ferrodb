@@ -1137,3 +1137,75 @@ decisions on W1–W8, and what changes:**
    * W6: FAN-QUEUE #18's command cell is the lead's.
    * The lane's row, under `## FAN-QUEUE ROW (for the lead)`, is its source.
 8. **Counts.** Fire modes: 22, unchanged. New `#[test]`s over `9aa6968`: still 41.
+
+**A16, 2026-09-24, before any build or run. Review 8 of `347a0e6..344cf33` (artie-research
+`frontier/read_vs_n_review8.md` @ `e9d084c`) returned SOUND-WITH-CAVEATS. Every A15 decision is present, and the type
+pass is clean. The lead's decisions on V1–V8 and V10 follow. V9 and the script's side of V1 and V2 belong to the
+verdict script's maintainer.**
+
+1. **V1: KNEE is conjunctive, like SLOPE.**
+   * Two knees at T=1:
+     * the raw knee, branch ns(10^6) / branch ns(256);
+     * the ratio knee, ratio(10^6) / ratio(256).
+   * **HELD** when both lie in [4, 25]; **MISSED** when both lie outside it; **INCONCLUSIVE** when they disagree.
+   * **Why.** ln KNEE(ratio) = slope(ratio) × ln 3906, so the ratio knee carries A15.2's defect: a control slowed at 10^6
+     by the branch's traffic lowers it by up to 1.5× inside G7.
+   * **Fixtures for the script** (its maintainer's), mirroring A15.2's:
+     * (a) raw knee outside the band with the ratio knee inside → INCONCLUSIVE;
+     * (b) the mirror → INCONCLUSIVE;
+     * (c) agreement unchanged.
+   * The arm-1 legend names the rule.
+2. **V2: the `FIRECHECK CkptDdl` line and the comment at the fire are corrected.**
+   * Since `5607324` a harness check DOES read `base_moved` (A15.4). The line therefore now reads: no harness guard
+     reads the replay-bytes integer; the only NOT A RESULT that may appear below is A14.1's refusal of a moved base;
+     the replay-bytes line must carry the pre-registered intercept.
+   * The fire's comment no longer says the base's movement is "printed, not asserted".
+   * The A14.1 refusal now names what it measures: "records sat past the base at the DDL's checkpoint; A14.1 expects
+     none (D227)". It no longer names a cause the check cannot see.
+   * The script's regex and a fixture for the rc 2 output are its maintainer's.
+3. **V3 and V10: every G7 line says what it can see, what it cannot, and what exceeding the band voids.**
+   * **Can see:** arm 1's read phases only. The value is printed per T with its row count.
+   * **Cannot see:**
+     * axis (ii), which runs after arm 1's last read phase;
+     * arm 3's opens, which follow each N's read phases rather than coinciding with them;
+     * a shift common to every N, which a max/min across N cannot show.
+   * **Row counts:**
+     * one row prints "1 row, no across-N measure", never a bare `1.000x`;
+     * "arm 1 did not run" (the arm is off) and "arm 1 ran but left no row" are printed separately.
+   * **The void's scope matches PREREG G7 and the script: above 1.5, EVERY ns column at every T is NOT A RESULT.**
+     * The harness's G7 message now says so. Before, it said "at T={t}", which was narrower than the rule.
+     * Each "band 1.5" line says so too, and says that arm 3's and R7's values are not voided by it.
+4. **V4: R7 is REPORTED, not judged.**
+   * **Why.**
+     * Judged only on NOT HELD, a NOT HELD had no registered path to a finding: L2 and G7 cannot clear it.
+     * Its FLAT class was never judged: a step growing as O(N) under 50 ms at 10^6 read HELD.
+   * **No integer is available to judge FLAT on (READ).** The child prints per-step TIMERS only.
+     * Its census and visit counters span the whole open.
+     * The replayed files' byte sizes (`wal B`, `tel B`, `prov B`) are the replay's inputs, not a step's work, and grow
+       with the workload by design (A7.3).
+     * So no R7 step is judged, on time or on an integer.
+   * Each step's time is reported with L2 and G7 beside it.
+   * The harness names the H6 rows excluded from every arm-3 value on its own line. The script names them in its
+     verdicts.
+5. **V5: R7-recover's `recover_us > 0` (A7.1) is REPORTED.** It cannot fail: a µs timer around a function that at
+   least reads a header never reads 0. The same fact is judged as an integer by R7-state: `recovered = 1` and
+   `wal B > 24` before D216.
+6. **V6: authorship of two A15.1 bullets.** A15's header reads "the lead's decisions", but two A15.1 bullets were the
+   LANE's extensions, not the lead's:
+   * "A9.1's rebuild band is REPORTED": review 8 §3 found it sound, and it stands as the lane's;
+   * "R7's ≤ 50 ms bounds stay judged, only in the direction load cannot manufacture": superseded by item 4, the lead's.
+7. **V7: A15.2's claim is narrowed.** "Drift fails toward INCONCLUSIVE, never toward BOUNDED" holds for ONE drift
+   mechanism at a time.
+   * **Two mechanisms can cancel inside G7's own instrument:**
+     * a box that runs faster at large N lowers the raw slope;
+     * a control slowed at large N by the branch's traffic lowers the ratio slope.
+   * With control × box ≈ constant, G7 reads ≈ 1.0 while BOTH slopes drop, by 0.081 at a 1.4× effect.
+   * KNEE's conjunction (item 1) shares this residual.
+   * This is a stated blind spot, not a fix. An independent box instrument during the read phases would see it, but it
+     is not added.
+8. **V8: zero counted rows print "L2: no row was counted"**, never the vacuous "every counted row has both readings".
+9. **Nits.**
+   * The arm-1 legend reads "the raw knee, RESIDENT and T8DIR" where it read "raw ns".
+   * The arm-3 comment's superseded "every reading in the run" sentence is corrected.
+   * "UNAVAILABLE (unguarded)" reads "UNAVAILABLE (no load reading)", since a flag is not a guard.
+10. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
