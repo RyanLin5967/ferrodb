@@ -394,3 +394,32 @@ would be `build_scan`'s O(table) seq scan (D176/D178), a known wall on a differe
 `wrong-start`, `wrong-visits`, `wrong-delta` and `wrong-live-merge` offset the expected value, which tests the
 comparison. `merge-quarantined` is a real injection. The new statics get a forced fire of their own in
 `tests/read_vs_n_merge_census.rs`, a separate test binary, so no parallel test can move them.
+
+**A4, 2026-09-24, before any build or run. The consolidation the lead decided: D204's one open path.**
+
+`read-vs-n` now contains `rollback-index-orphan` @ `d7891d5` (merged at `003e50d`). The file, the pool, the WAL,
+`recover`, the catalog and the index rebuild run in exactly one function, `wal::recovery::open_recovered`, and
+`tests/open_path_allowlist.rs` fails if they run anywhere else. `cli::open_database` calls it and keeps only the
+half it does not cover:
+
+* the branch catalog;
+* the arena;
+* the `.tel` log;
+* the runtime;
+* the `.provenance` log;
+* the reaper;
+* the lease start.
+
+Consequences for arm 3, and none changes a prediction's class or band:
+
+1. Steps 1–4 are timed INSIDE `open_recovered` (`BootTimings`: `files`, `recover`, `catalog`, `rebuild`,
+   observing only) and handed back in `OpenedDatabase::timings`. R7's `recover` and `sql_catalog` are now
+   `boot.files + boot.recover` and `boot.catalog`, and the child prints all four. R7's flat prediction covers
+   all four.
+2. **`rebuild` = 0 at every checkpoint (READ).** `open_recovered` rebuilds only `if recovered`, and the parent
+   closes cleanly (`TxnManager::checkpoint`) before every child open, so the log has nothing to replay. The
+   rollback-index-orphan report says every restart with a non-empty log pays an O(rows) rebuild. **That is a
+   crash-restart cost, and this arm does not measure it.** It measures clean restarts only. A crash arm would
+   `kill -9` the parent instead of closing it; it is not built.
+3. The per-target suite now contains that branch's tests: 2611 run, passed=2609 failed=2 at `d7891d5` by its own
+   report, plus this lane's 5.
