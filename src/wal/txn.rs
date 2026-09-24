@@ -698,8 +698,9 @@ impl TxnManager {
         // every subscription pinned below it and kept the whole log. The flush still asks for the
         // `Commit`, which is what the caller is owed; it writes the whole buffer, so the `TxnEnd`
         // rides along at no extra fsync. Only a concurrent flush landing between the two appends
-        // leaves it buffered, which delays a truncation to the next flush and loses nothing. A
-        // failed append here still returns only after the `Commit` is durable, as before.
+        // leaves it buffered until some later flush, and a checkpoint before then keeps the log
+        // once more; nothing is lost. A failed append here still returns only after the `Commit`
+        // is durable, as before.
         let end = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.wal.flush_up_to(commit_lsn)?;
         let _ = end?;

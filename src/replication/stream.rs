@@ -5,7 +5,7 @@
 //! off after a restart. That is a loop around those two pieces plus **one cursor rule**, and the
 //! cursor rule is the whole of the difficulty.
 //!
-//! # The cursor may only advance past a commit
+//! # The cursor may only advance past what has been decided
 //!
 //! After emitting a batch, the obvious move is to set the cursor to the durable frontier — the
 //! decode covered everything up to there, so everything up to there is done. **That is wrong, and
@@ -279,8 +279,9 @@ impl FeedStreamer {
     /// Decode everything committed between `cursor` and the durable frontier, write it, and return
     /// the new cursor.
     ///
-    /// See the module docs: the returned cursor is the highest `commit_end_lsn` emitted, **not**
-    /// the frontier, and it is unchanged when nothing was emitted.
+    /// See the module docs: the returned cursor is **not** the frontier. While a transaction is open
+    /// or an event is refused it is the highest `commit_end_lsn` it may pass, unchanged when nothing
+    /// was emitted; otherwise it is where the read stopped (D252).
     pub fn pump<W: Write>(
         &self,
         wal: &WalManager,

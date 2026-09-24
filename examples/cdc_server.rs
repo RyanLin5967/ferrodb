@@ -221,6 +221,9 @@ fn main() {
                     break;
                 }
             };
+            // Whether the cursor moved, taken before it is overwritten: the caught-up test below needs
+            // it (the D252 review's m2).
+            let moved = pumped.cursor != cursor;
             cursor = pumped.cursor;
             emitted_through = pumped.emitted_through;
             // I20: a shape mismatch is not a refusal and not a silence. It means this pump held a
@@ -245,7 +248,7 @@ fn main() {
                 );
                 break;
             }
-            if pumped.emitted == 0 {
+            if pumped.emitted == 0 && !moved {
                 // Caught up. Finish only when the workload is finished too, so a consumer is not
                 // disconnected merely for being faster than the writer.
                 //
@@ -257,7 +260,10 @@ fn main() {
                 // for EOF waited for ever. Caught by the Go consumer, which reads until close
                 // rather than stopping at a client-side limit the way the earlier tests did. A
                 // caught-up cursor now passes that tail, but a transaction in flight still holds
-                // it below the frontier.
+                // it below the frontier. And "nothing to emit" alone is not enough either: a pump
+                // bounded by `max_bytes` over a stretch that yields no events (rolled-back work)
+                // emits nothing and still moves the cursor, so caught up means nothing emitted AND
+                // the cursor did not move, as `tests/integration_cdc_cutover.rs` already tests.
                 if finished_before_pump {
                     break;
                 }
