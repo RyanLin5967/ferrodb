@@ -250,3 +250,109 @@ The value is unset right after the build. Step 29's predictions are unchanged:
 * the tip stamps `at unknown +DIRTY`, with rerun yes;
 * the base FAILs with `at S0 +DIRTY`;
 * the N4 mutant FAILs the same way.
+
+## Amendment 3 (D231 review 5, U1-U3, M1, M2, R1; lead decisions 2026-09-24)
+
+Written before any of the code or steps it predicts exists, and before any run of them, stub model included. It
+supersedes amendment 2's totals, for the script at the commit that follows this amendment.
+
+### What changes in `build.rs` (the steps below pin each part)
+
+* **U1, untracked inputs.** An untracked file under the build inputs makes the stamp `+DIRTY`. That means an
+  untracked, not-ignored file, or an ignored file ending in `.rs`, which cargo's target auto-discovery would compile.
+  Review 5 measured the old premise false: 1 of the 72 worktrees has such a file, and it is a true positive. Ignored
+  files that are not `.rs` stay uncounted, for example `tests/pg/__pycache__`.
+* **U2, a byte comparison.** Every tracked input's bytes on disk (`git hash-object --no-filters`) are compared with
+  HEAD's blob ids (`git ls-tree -r HEAD`). Any difference, or a tracked input missing on disk, makes the stamp
+  `+DIRTY`. This is independent of the index, its stat cache, its bits, fsmonitor, clean filters and
+  `GIT_CONFIG_GLOBAL`. Review 5 measured the cost: 386 files, 9.8 MB, 0.162 s. `git status` is still asked, and its
+  answer is OR-ed in, so that tracked files that are not build inputs still count.
+* **Failures.** A byte-check question that fails, or a gitlink among the inputs (it has no bytes to compare), makes the
+  stamp `unknown`. N6's two sha reads now bracket the status AND the byte check.
+* **R1.** `.cargo`, `rust-toolchain` and `rust-toolchain.toml` at the package root join the inputs: watched when
+  present, and counted by U1 and U2. Such files in parent directories, and one that appears where none existed, are
+  seen only at the next re-stamp: the same limit as a new `benches/`.
+* **U3.** The doc's submodule sentence is corrected (review 5 measured it wrong both ways).
+
+### The instrument changes (M1, and one change U1 forces)
+
+* **The probe is no longer an example inside the package.** An untracked `examples/d231_stamp_probe.rs` is exactly
+  what U1 now counts, so every stamp would read `+DIRTY`.
+  * The probe becomes a separate crate outside the checkout (`$WORK/probe-<arm>`, and `$WORK/probe-<arm>-export` for
+    step 32).
+  * Its `Cargo.toml` depends on the package by path and has an empty `[workspace]`. Its `main` prints
+    `ferrodb::build_provenance()`.
+  * cargo builds ferrodb's lib as a path dependency. A path dependency is a local package, with mtime fingerprints and
+    its build script's cwd at its own root (INFERRED, from the Cargo book's build-script and path-dependency text).
+    The probe binary is `$tgt/debug/d231_probe`.
+  * ferrodb's dev-dependencies are no longer built.
+* **M1.** The stub cargo is pinned to the `build.rs` BLOB it transcribes. It refuses (exit 101, which the harness turns
+  into exit 2) unless the dependency's `build.rs` hashes to the tip blob or to `9aa6968`'s blob, and each `.out`
+  records the blobs. The tip blob is recorded, once committed, in the lane report and in `d231_model/`.
+
+### New steps, per arm (52 in all), and what each must show at the tip
+
+In these steps, "touch" means the index is touched with `touch_moved`, to force a re-run. The shim is a `git` placed
+first on `PATH` for that one build only, which passes every other call through to the real git.
+
+| n | change before the build | tip stamp | tip rerun | kills |
+|---|---|---|---|---|
+| 33 | `git reset --hard` (HEAD → link2 → link → `$first` at S0), sleep 2 | at S0 | yes | |
+| 34 | nothing (settle) | at S0 | no | `--no-optional-locks` |
+| 35 | an untracked, not-ignored `examples/d231_untracked.rs` created (premise: listed by `ls-files --others --exclude-standard`) | at S0 +DIRTY | yes | no untracked-file check (U1) |
+| 36 | it is removed; touch | at S0 | yes | |
+| 37 | `tests/d231_ignored.rs` created and excluded in `.git/info/exclude` (premise: `check-ignore` says ignored) | at S0 +DIRTY | yes | no ignored-`.rs` check |
+| 38 | it and the exclude line are removed; touch | at S0 | yes | |
+| 39 | a clean filter `sed '/d231 filter-hidden line/d'` on `src/lib.rs` (from `.git/info/attributes` and repo config), then that line appended. Premises: `git status` hides it, and the bytes differ from HEAD's blob | at S0 +DIRTY | yes | no byte comparison (U2) |
+| 40 | the filter and attribute removed, `src/lib.rs` restored; touch | at S0 | yes | |
+| 41 | `src/lib.rs` edited, then `update-index --skip-worktree` (premise: tag `S`, status hides it) | at unknown +DIRTY | yes | `noS` |
+| 42 | the bit cleared, the file restored; touch | at S0 | yes | |
+| 43 | `core.ignoreStat = true`; touch | at unknown +DIRTY | yes | `noignorestat` |
+| 44 | the key unset; touch | at S0 | yes | |
+| 45 | shim: `git ls-files` exits 1; touch | at unknown +DIRTY | yes | `lsfailopen` |
+| 46 | touch | at S0 | yes | |
+| 47 | shim: the first `git status` runs `update-ref $first Q0` before answering, so HEAD moves between build.rs's two sha reads (premise, checked after the build: `$first` resolves to Q0); touch | at unknown +DIRTY | yes | `non6` |
+| 48 | nothing. The ref moved during the last script run, so it is newer than `output` | at Q0 | yes | |
+| 49 | `git pack-refs --all`. Premises: `$first`'s loose file is gone, and `$first` still resolves Q0. A watched path went missing | at Q0 | yes | |
+| 50 | `update-ref $first S0`, which recreates the loose file | at S0 | yes | `existsonly` |
+| 51 | an untracked `.cargo/config.toml` created (outside the probe's config search path, so the build itself is unchanged); touch | at S0 +DIRTY | yes | `.cargo` not an input (R1) |
+| 52 | `.cargo` removed; touch | at S0 | yes | |
+
+### Predictions
+
+**At the D231 tip: 104 PASS / 0 FAIL, exit 0.** No step depends on timing.
+
+**At `9aa6968`: nominally 51 PASS / 53 FAIL, exit 1.** Steps 1-32 are as in amendment 2:
+* clone: 12 PASS / 20 FAIL;
+* linked: 20 PASS / 12 FAIL.
+
+Steps 33-52 at the base:
+
+| arm | PASS | FAIL | why each FAIL |
+|---|---|---|---|
+| clone | 33 36 38 40 42 44 46 52 | 34 35 37 39 41 43 45 47 48 49 50 51 | 34 is a settle, after the self-re-run from `reset --hard`'s racy index. 35, 37 and 39: nothing re-runs (examples/, tests/ and src/ are not watched), so the stamp stays clean. 41, 43, 45 and 47: the base stamps `at S0` clean where the tip says `unknown`. 48, 49 and 50: the ref is not watched, so there is no re-run. 51: plain status ignores untracked files, so the stamp is clean |
+| linked | 33 36 38 40 42 44 46 48 49 50 52 | 34 35 37 39 41 43 45 47 51 | 34: it re-runs on every build. The others are as in the clone arm, except that 48-50 re-run and PASS |
+
+So the base totals are clone 20 PASS / 32 FAIL and linked 31 PASS / 21 FAIL.
+
+**Timing-dependent base steps.** Amendment 2's allowed flips stand:
+* clone 2, 9, 12, 15 and 18, FAIL→PASS with `rerun=no`;
+* clone 5, 23, 24 and 28, FAIL→PASS with `rerun=yes`.
+
+Amendment 3 adds **clone 34, FAIL→PASS with `rerun=no`**. Every other new step is timing-independent: each restore or
+checkout is followed by a touch of the index, which leaves no racy entry. So a base run gives **PASS 51-61, FAIL
+43-53, exit 1**. Any other deviation is a MISMATCH.
+
+### Still not exercised
+
+* `rust-toolchain*`. A real file would make rustup switch or install toolchains.
+* `.cargo` or toolchain files in parent directories.
+* A gitlink among the inputs. ferrodb has none; it is refused as `unknown`.
+* An fsmonitor hook. Step 39's clean filter pins the byte comparison through the same mechanism: git's opinion versus
+  the bytes.
+
+The earlier lists stand: Cargo.lock, benches/, reftable, the `--no-recurse` fallback, the answer-shape refusal, the
+depth cap, and preferSymlinkRefs (N7).
+
+The exit condition becomes: exit 0 requires FAIL = 0 and PASS = 104, and a run that reaches anything other than 104
+verdicts exits 2.
