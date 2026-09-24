@@ -452,8 +452,8 @@ impl TableBranchCatalog {
     /// checkpoints (`cli::exit_sequence`). pgserver has no reachable exit: `serve` returns only on
     /// an error, which its `unwrap()` turns into a panic.
     pub fn publish_root_durably(&self) -> Result<(), FerroError> {
-        let ((), seq) = self.mutate(|| Ok(()))?;
-        self.durable(seq)
+        let ((), _seq) = self.mutate(|| Ok(()))?;
+        Ok(()) // D244 MUTANT MD: published into the pool, never synced
     }
 
     // `commit()` (stage + durable in one call) was DELETED once every caller had been migrated.
