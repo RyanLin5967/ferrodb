@@ -686,3 +686,25 @@ plus this test. **D250 is now at `cd0914b`** (#16's lane §21.18-19, a TxnEnd af
 merged here. The lead has also announced that D250 replaces its open-time re-declaration, with the forget moving inside
 `open_recovered` before the truncation. At that re-merge, amendment 15's re-declaration argument becomes moot, and the
 new order (the forget before or after D229's `free_pending_frees`) is re-checked.
+
+**Amendment 20 (after `b87ae29`, `cc1d96e` and `6baf2eb`).**
+- `b87ae29` adds amendment 19's red test, as registered.
+- `cc1d96e` is the fix, as registered.
+- `6baf2eb` makes `start_fresh_database` call `start_fresh_quarantine` again. With the fix, `start_new_incarnation` no
+  longer does, which would have left #16's function without a caller under `-D dead_code`. The quarantine and the
+  intent now take two clock readings instead of one. Nothing depends on that: each aside name is checked free on its
+  own.
+
+**RED checkpoint `b87ae29`:** `wal::txn::tests::a_new_incarnation_moves_the_drop_intent_aside_and_forgets_the_pending_frees`,
+**1 FAILED**, predicted.
+
+**The GREEN phase and mutant base is `6baf2eb`:**
+- `wal::recovery::tests_crash_frees::` has 24 run, 24 passed.
+- `wal::txn::tests` passes whole. This includes #16 review 7's six tests and the new one.
+- `wal::free_intent::tests` passes (4). `integration_cluster_snapshot` passes whole.
+- All of the above are predicted.
+- `lane_d229_run.sh` carries **33 mutants**, with M27 re-aimed at the new `start_fresh_database` body.
+  - PATTERNS_ONLY at `6baf2eb` finds one site per expression (rc 0, 34 expressions).
+  - At `b87ae29` it refuses M27, M28 and M29 (0 sites each), as it must.
+- **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M29, SKIPm, LSNm, TTm, CLRm and ALIASm. The move-form M3, M7
+  and M12 survive.
