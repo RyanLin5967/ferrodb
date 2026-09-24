@@ -16,11 +16,14 @@
 //!   them again from under it.
 //!
 //! What each test pins, and the mutant it kills (`bench/d237/firecheck.sh`):
-//! - `a_read_that_fails_unpins_its_page`: the heap-level trigger, no SQL. Kills M1 (the hand-written
-//!   unpin back in `HeapFileManager::read`).
-//! - `a_failed_insert_leaves_no_page_pinned_and_drop_is_all_or_none`: the lead's SQL schedule.
-//!   Kills M1 too. Its trigger is D202, so its PREMISE goes false when D202's fix lands
-//!   (`rollback-index-orphan`, #16); see that test's premise message.
+//! - `a_read_that_fails_unpins_its_page`: the heap-level trigger, no SQL. **This is the mechanism's
+//!   killer**: it forces `HeapFileManager::read`'s error path directly, so it does not depend on any
+//!   other defect staying unfixed. Kills M1 (the hand-written unpin back in `HeapFileManager::read`).
+//! - `a_reinserted_rolled_back_key_leaves_no_page_pinned_and_drop_is_all_or_none`: the lead's SQL
+//!   schedule. It asserts only what must hold whether the re-INSERT fails or not. At `9aa6968` it
+//!   fails (D202), and the leak makes this test red. Once D202's fix lands (`rollback-index-orphan`,
+//!   #16), the re-INSERT succeeds, nothing takes the error path, and the test stays green without
+//!   measuring the leak. That is why the heap-level test above is the killer and this one is not.
 //! - `a_drop_refused_for_a_pinned_page_has_freed_nothing`: holds a pin by hand on the page freed
 //!   last, the primary root. Kills M2 (the batch free without its check) and M3 (`drop_table` back
 //!   to one free per structure).
@@ -210,8 +213,14 @@ fn a_read_that_fails_unpins_its_page() {
     );
 }
 
+/// `BEGIN; INSERT (5); ROLLBACK; INSERT (5)`, then: no page of `t` is pinned, and DROP frees every
+/// page or refuses having freed none. **Nothing is asserted about the re-INSERT's own outcome.** At
+/// `9aa6968` it fails through D202 and leaks a pin, which the no-pin assertion catches. After D202's
+/// fix it succeeds and leaks nothing, and both assertions still hold. A test whose premise were "the
+/// re-INSERT fails" would go red on main the day #16 lands, and fixing it then would be a test edit.
+/// This test is therefore not the mechanism's killer; `a_read_that_fails_unpins_its_page` is.
 #[test]
-fn a_failed_insert_leaves_no_page_pinned_and_drop_is_all_or_none() {
+fn a_reinserted_rolled_back_key_leaves_no_page_pinned_and_drop_is_all_or_none() {
     let mut db = Db::new();
     let mut s = Session::new();
     db.ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut s);
@@ -220,23 +229,17 @@ fn a_failed_insert_leaves_no_page_pinned_and_drop_is_all_or_none() {
     db.ok("INSERT INTO t VALUES (5, 50);", &mut s);
     db.ok("ROLLBACK;", &mut s);
 
-    // A match, not `expect_err`: that needs `Outcome: Debug`, and `Outcome` derives nothing.
-    let err = match db.exec("INSERT INTO t VALUES (5, 51);", &mut s) {
-        Err(e) => e,
-        Ok(_) => panic!(
-            "premise failed: re-inserting a key whose INSERT rolled back succeeded, so the statement \
-             never took HeapFileManager::read's error path and this test measures nothing. At 9aa6968 \
-             D202 makes it fail; D202's fix (#16, `rollback-index-orphan`) makes it succeed. If #16 has \
-             landed, this premise is false by design: route it to the lead as a test decision, do not \
-             edit it. `a_read_that_fails_unpins_its_page` still reaches the same path without SQL"
-        ),
+    // Recorded for the failure message only.
+    let outcome = match db.exec("INSERT INTO t VALUES (5, 51);", &mut s) {
+        Ok(_) => "succeeded".to_string(),
+        Err(e) => format!("failed with `{e}`"),
     };
 
     let pages = table_pages(&db, "t");
     let pinned: Vec<(u32, u16)> = pages.iter().map(|&p| (p, pins(&db.bp, p))).filter(|&(_, n)| n > 0).collect();
     assert!(
         pinned.is_empty(),
-        "the INSERT failed with `{err}` and left these pages of t pinned (page, pins): {pinned:?}"
+        "the re-INSERT of a rolled-back key {outcome} and left these pages of t pinned (page, pins): {pinned:?}"
     );
 
     let _ = drop_is_all_or_none(&mut db, &mut s, "t", &pages);
