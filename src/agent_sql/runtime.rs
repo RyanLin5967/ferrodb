@@ -760,6 +760,103 @@ struct SiblingSide {
     base_shapes: PersistentMap<String, Schema>,
 }
 
+/// What `REBASE` did (D194 step 4), or exactly why it did nothing.
+///
+/// A refusal changes nothing at all — pin, `fork_seq`, staged rows and premises are as they were —
+/// and every list below names one thing that moved on main since the branch's pin and that the
+/// branch depends on. A client that ignores `rebased` and reads the lists still cannot mistake a
+/// refusal for a success: a success has all three lists empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RebaseReport {
+    pub branch: BranchId,
+    /// True when the branch now reads main as of `fork_seq_after`.
+    pub rebased: bool,
+    pub fork_seq_before: u64,
+    /// Equal to `fork_seq_before` on a refusal. Equal to it on a success too when main published
+    /// nothing through a merge in between: `fork_seq` is the merge clock, and plain SQL writes to
+    /// main move the snapshot without moving it.
+    pub fork_seq_after: u64,
+    /// Staged rows whose base image differs at the new instant, by table name and row id. A staged
+    /// row whose key could not be recovered, or whose table is gone, is listed here too: its base
+    /// cannot be shown to hold.
+    pub moved_rows: Vec<(String, RowId)>,
+    /// Exact read premises that moved: `(table, row, version read, version now)`.
+    pub moved_premises: Vec<(TableId, RowId, u64, u64)>,
+    /// Tables whose shape is not the one the branch forked from.
+    pub moved_shapes: Vec<String>,
+}
+
+impl RebaseReport {
+    /// Why nothing changed, as one sentence a person reads; `None` when the branch was rebased.
+    pub fn detail(&self) -> Option<String> {
+        if self.rebased {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !self.moved_rows.is_empty() {
+            let rows: Vec<String> =
+                self.moved_rows.iter().map(|(t, r)| format!("{t}:{r}")).collect();
+            parts.push(format!(
+                "{} staged row(s) whose base changed on main since the pin: {} (REBASE never \
+                 rewrites a staged row; MERGE composes it three-way against main)",
+                self.moved_rows.len(),
+                rows.join(", ")
+            ));
+        }
+        if !self.moved_premises.is_empty() {
+            let reads: Vec<String> = self
+                .moved_premises
+                .iter()
+                .map(|(t, r, was, now)| format!("t{}:r{} (read version {was}, now {now})", t.0, r.0))
+                .collect();
+            parts.push(format!(
+                "{} read premise(s) that moved: {} (what this branch concluded from them cannot be \
+                 carried into a view where they are false; ABANDON it and fork anew)",
+                self.moved_premises.len(),
+                reads.join(", ")
+            ));
+        }
+        if !self.moved_shapes.is_empty() {
+            parts.push(format!(
+                "table shape(s) changed since the pin: {}",
+                self.moved_shapes.join(", ")
+            ));
+        }
+        Some(format!("REBASE of {} refused, nothing changed: {}", self.branch, parts.join("; ")))
+    }
+}
+
+/// **D194 step 4.** The primary-key value to look a staged row up by at a new instant.
+///
+/// The row id is a one-way hash of the key, so the key has to come from an image: the base image
+/// first (what the row held at the pin), then this branch's own `RowCreate` for a row it inserted,
+/// then the staged image itself — but only when that image still hashes to the row's id, because an
+/// UPDATE on a branch may assign column 0 (`Workspace::unprobeable_rows`). `None` when no image
+/// names the key, e.g. an insert-then-delete this branch inherited from its parent; the caller
+/// treats that as "cannot be shown to hold".
+fn rebase_key(
+    base: Option<&Vec<Value>>,
+    staged: &RowState,
+    ops: &[Op],
+    tbl: TableId,
+    row: RowId,
+) -> Option<Value> {
+    if let Some(b) = base {
+        return b.first().cloned();
+    }
+    let created = ops.iter().rev().find_map(|o| match &o.kind {
+        OpKind::RowCreate(img) if o.tbl == tbl && o.row == row => img.first().cloned(),
+        _ => None,
+    });
+    if created.is_some() {
+        return created;
+    }
+    match staged {
+        RowState::Present(v) if row_id_of(v) == row => v.first().cloned(),
+        _ => None,
+    }
+}
+
 /// The fork point of two branches, and what finding it cost.
 ///
 /// **`hops` and `walk_hops` are the instrument the complexity claim is stated in**, and they are
@@ -999,6 +1096,26 @@ impl State {
         let ws = self.workspaces.get_mut(&branch)?;
         let at = ws.pin(apply_seq, txn);
         Some((at, ws.fork_seq))
+    }
+
+    /// **D194 step 4 — the one door that MOVES a pin (`REBASE`).** Sets `fork_snapshot` and
+    /// `fork_seq` to a later instant, together, and writes nothing else: no row, no base image, no
+    /// schema edit, nothing the envelope governs. `false` when the branch has no live workspace.
+    ///
+    /// Only [`AgentRuntime::rebase`] calls it, and only after showing that every staged row's base
+    /// image, every exact read premise and every base shape is the same at `(at, seq)` as it was at
+    /// the pin being replaced — which is what keeps `base_rows` the fork-point image by construction
+    /// across the move. It is the second workspace mutator D194 adds beside [`State::pin`], and
+    /// `integration_capability_envelope` counts it.
+    fn repin(&mut self, branch: BranchId, at: Arc<Snapshot>, seq: u64) -> bool {
+        match self.workspaces.get_mut(&branch) {
+            Some(ws) => {
+                ws.fork_snapshot = Some(at);
+                ws.fork_seq = seq;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record a published row version: in `versions`, which the premise check reads as "now", and
@@ -3576,6 +3693,177 @@ impl AgentRuntime {
         self.branches.set_state(branch, BranchState::Quarantined, BranchState::Live)?;
         self.state.lock().unwrap().quarantine_reasons.remove(&branch.id);
         Ok(())
+    }
+
+    /// **D194 step 4 — `REBASE`: move a branch's view of main to NOW, or say exactly why not.**
+    ///
+    /// A branch reads main as of its pin. This re-pins it — `fork_snapshot` and `fork_seq`, together,
+    /// through `State::repin` — to main as it stands, **only if nothing the branch depends on moved
+    /// between the old pin and now**:
+    ///
+    /// 1. every staged row's base image equals the row's image at the new instant (a point lookup
+    ///    through the new snapshot, as `evaluate_merge` does it, so the cost is O(staged · log N));
+    /// 2. every exact read premise names the version visible at the new instant — the comparison
+    ///    the read-premise gate makes at MERGE, over the same `captures` read-sets. Scan premises are
+    ///    approximate there and are not checked here either;
+    /// 3. every shape in `base_shapes` is the catalog's current shape.
+    ///
+    /// Otherwise it changes nothing and the [`RebaseReport`] names what moved.
+    ///
+    /// # A staged row whose base moved is REFUSED, not rebased three-way — and why
+    ///
+    /// * **A staged image lives in more than `ws.rows`.** `stage_all` also writes it into the
+    ///   branch's copy-on-write page tree (which `page_changeset` and the production DIFF read),
+    ///   appends its ops and guards to the frame, and takes escrow reservations. Rewriting it here
+    ///   would need a second staging door that keeps all four in step, and `stage_all` cannot be
+    ///   that door: it appends ops (a rebase would double them) and records `base_rows` with
+    ///   `insert_if_absent` (it cannot move a base). A second door into branch write state is also
+    ///   exactly what `integration_capability_envelope` exists to catch.
+    /// * **Nothing is lost by refusing.** `MERGE` already composes a moved row three-way —
+    ///   `resolve_cell` over base, target, ours and theirs — against main at publication, which is
+    ///   later and therefore fresher than any rebase could be.
+    /// * **Kept this way, `base_rows` stays true by construction**: the re-pin happens only when
+    ///   every base image already equals its image at the new pin.
+    ///
+    /// # A read premise that moved is REFUSED too
+    ///
+    /// The gate cannot tell which staged write was derived from which read, so re-pinning past a
+    /// moved premise would put writes computed from a view that no longer exists under a view that
+    /// says otherwise — and the premise would keep failing at MERGE anyway, because read-sets are
+    /// append-only. For a branch with no staged writes, ABANDON and a fresh fork lose nothing; for
+    /// one with writes, those writes have to be redone against fresh data whatever REBASE does.
+    ///
+    /// # Refused outright
+    ///
+    /// A quarantined branch: the hold keeps the branch's view as the gate judged it so an operator
+    /// can inspect it, and REBASE would move that view. And a branch with no live workspace.
+    ///
+    /// # Atomicity
+    ///
+    /// The new instant is taken under the state lock with `apply_seq`, like a fork. Validation reads
+    /// the tables outside that lock; the commit re-takes it and refuses (an `Err`, retryable) if the
+    /// workspace's pin, staged set, ops or schema edits changed, or main published a merge, in
+    /// between. Over pgwire the statement-wide catalog lock already serialises all of those, so the
+    /// check covers the embedded API rather than a path the server can reach.
+    pub fn rebase(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<RebaseReport, FerroError> {
+        if self.branches.get(branch)?.state == BranchState::Quarantined {
+            return Err(FerroError::Branch(format!(
+                "{branch} is quarantined and cannot be rebased: {}. A hold keeps the branch's view as \
+                 the gate judged it and REBASE would move that view; release the branch first.",
+                self.quarantine_reason(branch).unwrap_or_else(|| "no reason recorded".into())
+            )));
+        }
+
+        // ---- the new instant, and everything the branch depends on, in one lock section -------
+        let (old_at, old_seq, new_at, new_seq, rows, base_rows, tables, base_shapes, ops, edits) = {
+            let state = self.state.lock().unwrap();
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {branch}"))
+            })?;
+            (
+                ws.fork_snapshot.clone(),
+                ws.fork_seq,
+                ctx.txn.read_snapshot_cached(),
+                state.apply_seq,
+                ws.rows.clone(),
+                ws.base_rows.clone(),
+                ws.tables.clone(),
+                ws.base_shapes.clone(),
+                ws.frame.ops.clone(),
+                ws.schema_edits.len(),
+            )
+        };
+
+        // ---- 3. shapes ---------------------------------------------------------------------------
+        let mut moved_shapes: Vec<String> = Vec::new();
+        for (name, shape) in base_shapes.iter() {
+            match ctx.catalog.get_table(name) {
+                Some(entry) if &entry.schema == shape => {}
+                _ => moved_shapes.push(name.clone()),
+            }
+        }
+
+        // ---- 1. staged rows' base images, at the new instant ------------------------------------
+        let mut moved_rows: Vec<(String, RowId)> = Vec::new();
+        {
+            let read = ctx.read();
+            for ((t, r), staged) in rows.iter() {
+                let (tbl, row) = (TableId(*t), RowId(*r));
+                let name = tables.get(t).cloned().unwrap_or_default();
+                let base: Option<Vec<Value>> = base_rows.get(&(*t, *r)).cloned().flatten();
+                let key = rebase_key(base.as_ref(), staged, &ops, tbl, row);
+                let holds = match (key, read.catalog.get_table(&name)) {
+                    (Some(k), Some(_)) => {
+                        self.row_at(&read, &name, (*t, *r), &k, Arc::clone(&new_at))? == base
+                    }
+                    // No key to look it up by, or its table is gone: the base cannot be shown to
+                    // hold, and refusing is the direction that cannot lie.
+                    _ => false,
+                };
+                if !holds {
+                    moved_rows.push((name, row));
+                }
+            }
+        }
+
+        // ---- commit: re-check, 2. premises, re-pin — under one lock ----------------------------
+        let mut state = self.state.lock().unwrap();
+        let (txn, unchanged) = {
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
+                FerroError::Branch(format!(
+                    "{branch} was sealed while REBASE was validating it; nothing was changed"
+                ))
+            })?;
+            let same_pin = match (&ws.fork_snapshot, &old_at) {
+                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            };
+            (
+                ws.txn,
+                same_pin
+                    && ws.fork_seq == old_seq
+                    && ws.rows.len() == rows.len()
+                    && ws.frame.ops.len() == ops.len()
+                    && ws.schema_edits.len() == edits,
+            )
+        };
+        if !unchanged || state.apply_seq != new_seq {
+            return Err(FerroError::Branch(format!(
+                "{branch} or main moved while REBASE was validating it; nothing was changed. Retry."
+            )));
+        }
+        let mut moved_premises: Vec<(TableId, RowId, u64, u64)> = Vec::new();
+        let reads = state.captures.get(&txn.0).map(|c| c.read_sets()).unwrap_or_default();
+        for rs in &reads {
+            if let crate::provenance::readset::ReadSet::ExactVersions(versions) = rs {
+                for v in versions {
+                    let now = state
+                        .version_seen(v.tbl, v.row, Some(new_seq))
+                        .map(|s| s.begin_ts)
+                        .unwrap_or(0);
+                    if now != v.begin_ts {
+                        moved_premises.push((v.tbl, v.row, v.begin_ts, now));
+                    }
+                }
+            }
+        }
+
+        let rebased = moved_rows.is_empty() && moved_premises.is_empty() && moved_shapes.is_empty();
+        if rebased {
+            let repinned = state.repin(branch, new_at, new_seq);
+            debug_assert!(repinned, "the workspace was present under this same lock a moment ago");
+        }
+        drop(state);
+        Ok(RebaseReport {
+            branch,
+            rebased,
+            fork_seq_before: old_seq,
+            fork_seq_after: if rebased { new_seq } else { old_seq },
+            moved_rows,
+            moved_premises,
+            moved_shapes,
+        })
     }
 
     /// Three-way merge of a branch into its parent, published if the gate admits it. Exit
