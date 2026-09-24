@@ -67,6 +67,18 @@ pub struct TableBranchCatalog {
     /// Keys REWRITTEN or REMOVED: every call to [`Self::upsert`] and [`Self::remove_if_present`].
     /// See [`TableBranchCatalog::key_rewrites`].
     key_rewrites: AtomicU64,
+    /// **D198 — the virtual lease clock's offset `D`: cumulative downtime credited, in ms.**
+    ///
+    /// Stored deadlines are VIRTUAL, `v = lease − D`; everything this catalog hands out is on the
+    /// lease clock, `v + D` (both saturating). So one `D += downtime` at a restart extends every
+    /// lease there is, with no record rewritten — Chubby's stopped timer done as arithmetic. See
+    /// [`TableBranchCatalog::to_lease_clock`] for where the translation happens and why every
+    /// outward path must go through it.
+    ///
+    /// Durable in the `[0x08]` key beside the last-alive mark, and loaded at `open`. A catalog that
+    /// has never had one reads `D = 0`, which makes every stored deadline mean exactly what it meant
+    /// before D198. Written only by `resume_leases`, at startup, before anything is served.
+    lease_offset: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -306,6 +318,8 @@ impl TableBranchCatalog {
                 }
             }
             let old = cat.core(full.branch_id.id)?;
+            // Verbatim, and correct only because `cat` is brand new: its virtual lease clock's
+            // offset is 0, so a deadline's stored value IS its value (D198, `to_stored`).
             cat.write_record(&full, old.as_ref())?;
         }
         for (parent, epoch, child) in children {
@@ -446,6 +460,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             key_rewrites: AtomicU64::new(0),
+            lease_offset: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -470,6 +485,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             key_rewrites: AtomicU64::new(0),
+            lease_offset: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -484,6 +500,12 @@ impl TableBranchCatalog {
         }
         cat.next_id.store(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), Ordering::SeqCst);
         cat.epoch.store(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), Ordering::SeqCst);
+        // D198. Refused rather than defaulted if the key is damaged: `D = 0` on a catalog whose
+        // deadlines were stored against a positive `D` reads every one of them too EARLY, and the
+        // first scan reaps branches whose leases are live.
+        if let Some((_, offset)) = cat.alive_state()? {
+            cat.lease_offset.store(offset, Ordering::SeqCst);
+        }
         Ok(cat)
     }
 
@@ -871,83 +893,72 @@ impl TableBranchCatalog {
         Ok(out)
     }
 
-    /// The durable last-alive mark, or `None` if none was ever recorded. See
-    /// [`crate::branch::LeaseResume`].
-    fn alive_mark(&self) -> Result<Option<u64>, FerroError> {
+    /// The durable `(last-alive mark, lease offset D)`, or `None` if neither was ever recorded.
+    /// See [`crate::branch::LeaseResume`] and [`TableBranchCatalog::lease_offset`].
+    fn alive_state(&self) -> Result<Option<(u64, u64)>, FerroError> {
         match self.tree.search(&keys::alive())? {
             None => Ok(None),
-            Some(b) if b.len() == 8 => Ok(Some(u64::from_be_bytes(b[..].try_into().unwrap()))),
-            // Refused rather than read as "no mark": that reading would skip the grace for this
-            // restart, and whatever lapsed during the outage would be reaped on a guess.
+            Some(b) if b.len() == 16 => Ok(Some((
+                u64::from_be_bytes(b[0..8].try_into().unwrap()),
+                u64::from_be_bytes(b[8..16].try_into().unwrap()),
+            ))),
+            // Refused rather than read as "never recorded": that reading would skip the grace
+            // for this restart AND read every stored deadline with `D = 0`, i.e. early.
             Some(b) => Err(BranchError::Corrupt(format!(
-                "the last-alive mark must be 8 bytes, got {}; refusing to measure downtime from it",
+                "the last-alive record must be 16 bytes (mark, lease offset), got {}; refusing to \
+                 decide any lease from it",
                 b.len()
             ))
             .into()),
         }
     }
 
-    /// Move every `Live` non-trunk deadline strictly after `mark` later by `by`. Returns how many
-    /// moved. **Call under `logical`**, inside the one write [`BranchCatalog::resume_leases`] makes.
+    /// Write `(mark, offset)` to the `[0x08]` key. Not durable by itself; the caller stages.
+    fn put_alive_state(&self, mark: u64, offset: u64) -> Result<(), FerroError> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&mark.to_be_bytes());
+        v.extend_from_slice(&offset.to_be_bytes());
+        self.upsert(keys::alive(), v)
+    }
+
+    /// A STORED (virtual) deadline on the lease clock: `v + D`, saturating.
     ///
-    /// # Why not `renew_lease` per branch
+    /// # The rule this whole scheme stands on
     ///
-    /// Each `renew_lease` is its own durable write — one fsync apiece, and one caller here, so
-    /// group commit has nothing to batch. `lease_thread.rs`'s `REAP_CHUNK` note records ~58 ms per
-    /// reap on this machine, fsync-bound; if a lone durable write costs even a tenth of that, 10⁶
-    /// live branches is well over an hour of startup (INFERRED, not measured). This moves them all
-    /// inside ONE stage/durable, which is also what makes the extension and the new mark a single
-    /// atomic step.
+    /// **Every path that hands a deadline OUT of this catalog goes through here, and every path
+    /// that takes one IN goes through [`Self::to_stored`].** Internal read-modify-writes (`set_root`,
+    /// `set_state`, `reparent`, `restrict_envelope`, `charge_row_writes`) read the stored value and
+    /// write it back untouched, so they translate nothing — which is also why `hydrate` and `core`
+    /// do not translate: they feed those writes.
     ///
-    /// # Why not `write_record`
+    /// A path that forgets the outward half returns `v`, which is SMALLER than the lease by `D`, and
+    /// whoever compares it with the lease clock sees the lease expire `D` early. That is the
+    /// destructive direction, and it is silent: the value is plausible. The outward paths are
+    /// `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `expired_before`, `enforced_lease`,
+    /// `reparent`'s return and `fork_staged`'s child; `f1_lease_grace` asserts through each of them
+    /// but `reparent` (no production caller since D63). A method added later that returns a record
+    /// must call [`Self::outward`].
     ///
-    /// `write_record` rewrites the state key, the envelope key and every arena key, and range-scans
-    /// the arena span to reconcile it — O(arenas) per branch to change one fixed-width field. This
-    /// writes exactly the two things a deadline lives in: the RECORD core (via
-    /// [`CoreRecord::with_lease_deadline`], so no hydration and no arena span is touched) and the
-    /// branch's one DEADLINE key, moved. The state, envelope and arena keys are not part of a
-    /// deadline and are not rewritten.
+    /// Saturating at `u64::MAX`, the "never" of `TRUNK_LEASE` and `FAR_FUTURE`: wrapping would put
+    /// it in 1970.
+    fn to_lease_clock(&self, stored: LeaseDeadline) -> LeaseDeadline {
+        LeaseDeadline(stored.0.saturating_add(self.lease_offset.load(Ordering::SeqCst)))
+    }
+
+    /// A lease-clock deadline as it is STORED: `lease − D`, saturating at 0.
     ///
-    /// # Cost, stated rather than hidden
-    ///
-    /// **O(live branches) at startup** — every lease running at the mark is a real write, and at
-    /// steady state that is every live branch. UNMEASURED here (no compute in this lane). It is the
-    /// same complexity class as the open-time orphan sweep `resume_interrupted_reaps` already runs
-    /// (`collect_orphaned_extents`, O(live arenas)); it is NOT the "one descent" `open` itself is.
-    /// The O(1) alternative is a durable downtime credit added to every deadline at the catalog
-    /// boundary; it was not taken because every read path of every catalog would have to apply it,
-    /// and one that did not would make a lease decision on the wrong scale.
-    ///
-    /// The DEADLINE index is a hint, as it is for `expired_before`: an entry is acted on only if the
-    /// record it names is `Live`, non-trunk, and still carries exactly the deadline the entry was
-    /// filed under. Collected first and rewritten after, because the rewrite moves keys forward
-    /// inside the very span being scanned.
-    fn extend_leases_after(&self, mark: u64, by: u64) -> Result<u64, FerroError> {
-        let (lo, hi) = keys::deadlines_after(mark);
-        let mut running: Vec<(u64, u64)> = Vec::new();
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
-            let (k, _) = entry?;
-            if let Some(pair) = keys::deadline_from_key(&k) {
-                running.push(pair);
-            }
-        }
-        let mut moved = 0u64;
-        for (deadline, id) in running {
-            let Some(core) = self.core(id)? else { continue };
-            if !Self::in_deadline_index(core.state(), core.branch_id())
-                || core.lease_deadline().0 != deadline
-            {
-                continue;
-            }
-            // Saturating: a deadline that would pass `u64::MAX` is already "never", and wrapping
-            // it would be a deadline in 1970.
-            let later = LeaseDeadline(deadline.saturating_add(by));
-            self.upsert(keys::record(id), core.with_lease_deadline(later).serialize_core())?;
-            self.remove_if_present(&keys::deadline(deadline, id))?;
-            self.upsert(keys::deadline(later.0, id), Vec::new())?;
-            moved += 1;
-        }
-        Ok(moved)
+    /// Saturating at 0 is the one lossy case, and it loses in the harmless direction: a deadline
+    /// earlier than `D` — `expire_lease`'s offline 0, or a test's `LeaseDeadline(1)` — is stored as
+    /// 0 and reads back as `D`, a moment long past on any real lease clock, so it is still expired.
+    fn to_stored(&self, lease: LeaseDeadline) -> LeaseDeadline {
+        LeaseDeadline(lease.0.saturating_sub(self.lease_offset.load(Ordering::SeqCst)))
+    }
+
+    /// A record read from the tree, with its deadline put on the lease clock. See
+    /// [`Self::to_lease_clock`].
+    fn outward(&self, mut rec: BranchRecord) -> BranchRecord {
+        rec.lease_deadline = self.to_lease_clock(rec.lease_deadline);
+        rec
     }
 
     /// Live branches, for parity with `LogBranchCatalog::live_count`.
@@ -971,7 +982,10 @@ impl TableBranchCatalog {
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         let old = self.core(record.branch_id.id)?;
-        self.write_record(record, old.as_ref())?;
+        // The caller's record came from `get`, on the lease clock; the tree holds virtual time.
+        let mut stored = record.clone();
+        stored.lease_deadline = self.to_stored(record.lease_deadline);
+        self.write_record(&stored, old.as_ref())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -1068,12 +1082,13 @@ impl BranchCatalog for TableBranchCatalog {
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
         };
         let child_id = BranchId::new(child_num, generation);
+            // Stored in virtual time (D198); handed back on the lease clock, below.
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
                 child_id,
                 fork_epoch,
-                lease,
+                self.to_stored(lease),
             )?;
 
             if reused {
@@ -1090,7 +1105,7 @@ impl BranchCatalog for TableBranchCatalog {
             self.write_header()?;
             // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
             // point necessarily covers this fork.
-            (child, self.stage()?)
+            (self.outward(child), self.stage()?)
         };
         // ⛔ NOT durable yet. The sync that covers `seq` is the caller's to await, and the whole
         // point of handing it back rather than doing it here is that the caller may be holding a
@@ -1105,7 +1120,7 @@ impl BranchCatalog for TableBranchCatalog {
     fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
         let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         rec.check_readable(branch)?;
-        self.hydrate(rec)
+        Ok(self.outward(self.hydrate(rec)?))
     }
 
     fn reparent(
@@ -1144,7 +1159,7 @@ impl BranchCatalog for TableBranchCatalog {
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)?;
-        Ok(rec)
+        Ok(self.outward(rec))
     }
 
     fn restrict_envelope(
@@ -1248,20 +1263,35 @@ impl BranchCatalog for TableBranchCatalog {
     }
 
     fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
-        let (lo, hi) = keys::expired_at_or_before(now_millis);
+        // **D198: the question is asked in virtual time.** A stored `v` is expired at `now` iff
+        // `v + D <= now` (saturating), which is `v <= now − D` — so the DEADLINE index, keyed by
+        // `v`, answers it with one range and no per-branch rewrite ever having happened.
+        // `now < D` expires nothing (every `v + D >= D > now`); `now == u64::MAX` expires
+        // everything, including a `v` whose `v + D` saturated there.
+        let d = self.lease_offset.load(Ordering::SeqCst);
+        let stored_now = if now_millis == u64::MAX {
+            u64::MAX
+        } else {
+            match now_millis.checked_sub(d) {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            }
+        };
+        let (lo, hi) = keys::expired_at_or_before(stored_now);
         let mut out = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if let Some(rec) = self.core(id)? {
                 // The index holds only Live non-trunk branches, so this re-check is belt and
                 // braces against an index entry that outlived its record rather than a filter the
-                // query depends on.
+                // query depends on. On the lease clock, like the answer.
+                let lease = self.to_lease_clock(rec.lease_deadline());
                 if Self::in_deadline_index(rec.state(), rec.branch_id())
-                    && rec.lease_deadline().is_expired_at(now_millis)
+                    && lease.is_expired_at(now_millis)
                 {
                     // NOT hydrated. The reaper reads branch_id, depth and fork_epoch -- all core.
                     // Hydrating here cost an arena range-scan plus an envelope lookup PER ANSWER
                     // ROW, both discarded: 24.3 us/row measured, against ~5 us for this descent.
-                    out.push(rec);
+                    out.push(rec.with_lease_deadline(lease));
                 }
             }
         }
@@ -1274,7 +1304,7 @@ impl BranchCatalog for TableBranchCatalog {
         let mut out = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if let Some(rec) = self.core(id)? {
-                out.push(self.hydrate(rec)?);
+                out.push(self.outward(self.hydrate(rec)?));
             }
         }
         out.sort_unstable_by_key(|r| r.branch_id.id);
@@ -1300,7 +1330,7 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(Box::new(it.map(move |e| {
             let (_, v) = e?;
             let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
-            self.hydrate(rec)
+            Ok(self.outward(self.hydrate(rec)?))
         })))
     }
 
@@ -1327,7 +1357,7 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(Box::new(it.map(move |e| {
             let (_, v) = e?;
             let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
-            self.hydrate(rec)
+            Ok(self.outward(self.hydrate(rec)?))
         })))
     }
 
@@ -1406,7 +1436,7 @@ impl BranchCatalog for TableBranchCatalog {
         // No `check_readable`: that is the whole point. A branch mid-reap or already reaped still
         // owns the children that decide the fate of its pages.
         let rec = self.core(id)?.ok_or(BranchError::NotFound(BranchId::new(id, 0)))?;
-        self.hydrate(rec)
+        Ok(self.outward(self.hydrate(rec)?))
     }
 
     fn release_id(&self, id: u64) {
@@ -1516,7 +1546,8 @@ impl BranchCatalog for TableBranchCatalog {
         core.check_readable(branch)?;
         let old = core.clone();
         let mut rec = self.hydrate(core)?;
-        rec.lease_deadline = lease;
+        // D198: stored in virtual time. See `to_stored`.
+        rec.lease_deadline = self.to_stored(lease);
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1532,42 +1563,55 @@ impl BranchCatalog for TableBranchCatalog {
         // here" and "reapable there" cannot drift apart.
         let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         rec.check_readable(branch)?;
-        Ok(Self::in_deadline_index(rec.state(), rec.branch_id()).then_some(rec.lease_deadline()))
+        Ok(Self::in_deadline_index(rec.state(), rec.branch_id())
+            .then_some(self.to_lease_clock(rec.lease_deadline())))
     }
 
     fn resume_leases(&self, now_millis: u64) -> Result<crate::branch::LeaseResume, FerroError> {
         use crate::branch::LeaseResume;
-        // Under `logical` for the whole read-modify-write, like every mutator here: the mark read,
-        // the deadlines moved and the new mark are one step, and nothing may renew or fork between.
+        // **D198 — O(1), whatever the number of live branches.** The downtime is added to the
+        // virtual clock's offset `D`, and that one addition is every lease's extension: each
+        // stored deadline reads `downtime` later from now on. No record and no DEADLINE key is
+        // rewritten — the earlier design rewrote every live one, a per-restart write wall at 10⁶
+        // branches, and `a_resume_writes_the_same_number_of_keys_…` counts it.
+        //
+        // Deadlines that had already run out before the mark are shifted too, and stay expired:
+        // `v + D_old <= mark` gives `v + D_old + (now − mark) <= now`.
         let _g = self.logical.lock().unwrap();
-        let outcome = match self.alive_mark()? {
-            None => LeaseResume::FirstStart { now_millis },
-            Some(last_alive) => {
+        let (outcome, offset) = match self.alive_state()? {
+            None => (
+                LeaseResume::FirstStart { now_millis },
+                self.lease_offset.load(Ordering::SeqCst),
+            ),
+            Some((last_alive, offset)) => {
                 let downtime_millis = now_millis.saturating_sub(last_alive);
-                let extended = if downtime_millis == 0 {
-                    0
-                } else {
-                    self.extend_leases_after(last_alive, downtime_millis)?
-                };
-                LeaseResume::Resumed { last_alive, now_millis, downtime_millis, extended }
+                let offset_millis = offset.saturating_add(downtime_millis);
+                (
+                    LeaseResume::Resumed { last_alive, now_millis, downtime_millis, offset_millis },
+                    offset_millis,
+                )
             }
         };
-        // The new mark goes in the SAME write as the extension. Written separately, a crash
-        // between the two leaves extended deadlines beside the old mark, and the next start
-        // measures the same outage again and extends every lease twice.
-        self.upsert(keys::alive(), now_millis.to_be_bytes().to_vec())?;
+        // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
+        // leaves the old mark beside the new offset, and the next start credits the same outage
+        // a second time.
+        self.put_alive_state(now_millis, offset)?;
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)?;
+        // Published only once durable. If the write fails, `LeaseThread::start` refuses to start,
+        // so nothing ever reads a `D` the disk does not hold.
+        self.lease_offset.store(offset, Ordering::SeqCst);
         Ok(outcome)
     }
 
     fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
         // One key. Under `logical` because `resume_leases` reads and writes this key under it, and
         // durable because a mark that never reaches the disk is a restart that credits the whole
-        // uptime since the last one that did as downtime.
+        // uptime since the last one that did as downtime. The offset is carried unchanged: only a
+        // resume moves it.
         let _g = self.logical.lock().unwrap();
-        self.upsert(keys::alive(), now_millis.to_be_bytes().to_vec())?;
+        self.put_alive_state(now_millis, self.lease_offset.load(Ordering::SeqCst))?;
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)
@@ -2885,10 +2929,11 @@ enum ChildLiveness {
 }
 
 
-/// **F1 — the restart grace, at the catalog.** `resume_leases` is Chubby's stopped timer: every
-/// lease still running at the last-alive mark moves later by exactly the downtime, in one write
-/// with the new mark. The end-to-end claim is pinned through `pgserver` in
-/// `tests/integration_server_reaps.rs`; these pin the edges that test cannot reach.
+/// **F1 — the restart grace, at the catalog.** `resume_leases` is Chubby's stopped timer done as
+/// arithmetic (D198): every lease reads later by exactly the downtime, through ONE durable offset
+/// written with the new mark, and no record is rewritten. The end-to-end claim is pinned through
+/// `pgserver` in `tests/integration_server_reaps.rs`; these pin the edges that test cannot reach —
+/// above all, each outward path's translation, because a path that forgets it expires leases early.
 #[cfg(test)]
 mod f1_lease_grace {
     use super::*;
@@ -2915,68 +2960,135 @@ mod f1_lease_grace {
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
         let a = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap().branch_id;
         let b = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
-        assert_eq!(c.alive_mark().unwrap(), None, "a new catalog has no mark");
+        assert_eq!(c.alive_state().unwrap(), None, "a new catalog has no mark");
 
         assert_eq!(c.resume_leases(5_000).unwrap(), LeaseResume::FirstStart { now_millis: 5_000 });
         assert_eq!((lease(&c, a), lease(&c, b)), (1_000, 9_000), "nothing to measure from");
-        assert_eq!(c.alive_mark().unwrap(), Some(5_000));
+        assert_eq!(c.alive_state().unwrap(), Some((5_000, 0)), "mark recorded, no offset");
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The stopped timer, on every path a deadline leaves this catalog by — and not one record
+    /// rewritten to achieve it.
     #[test]
-    fn a_resume_moves_exactly_the_leases_running_at_the_mark_by_exactly_the_downtime() {
-        let path = sidecar("exact");
+    fn a_resume_shifts_every_deadline_by_exactly_the_downtime_and_rewrites_no_record() {
+        let path = sidecar("shift");
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
         let before_mark = c.fork(BranchId::TRUNK, LeaseDeadline(900)).unwrap().branch_id;
-        // Expired AT the mark: `is_expired_at` is inclusive, so this lease had run out while the
-        // database was still up. The boundary a strict/non-strict slip would move.
+        // Expired AT the mark: `is_expired_at` is inclusive, so this lease ran out while the
+        // database was still up, and it must still be expired after the restart.
         let at_mark = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap().branch_id;
         let running = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
         let never = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 5)).unwrap().branch_id;
         let held = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
         c.set_state(held, BranchState::Live, BranchState::Quarantined).unwrap();
-        // The narrow write must leave the unbounded fields alone: `write_record` handed a core
-        // record would have emptied the arena span, which is the leak `CoreRecord` exists to stop.
         c.add_arena(running, ArenaId(77)).unwrap();
         c.restrict_envelope(running, CapabilityEnvelope::new(0b111, 10)).unwrap();
+        let stored_before = c.core(running.id).unwrap().unwrap().serialize_core();
 
         c.record_lease_alive(1_000).unwrap();
-        let resumed = c.resume_leases(4_000).unwrap();
         assert_eq!(
-            resumed,
+            c.resume_leases(4_000).unwrap(),
             LeaseResume::Resumed {
                 last_alive: 1_000,
                 now_millis: 4_000,
                 downtime_millis: 3_000,
-                extended: 2
-            },
-            "exactly `running` and `never` were still running at the mark"
+                offset_millis: 3_000
+            }
         );
-        assert_eq!(lease(&c, before_mark), 900, "a lease that ran out before the mark was moved");
-        assert_eq!(lease(&c, at_mark), 1_000, "a lease that ran out AT the mark was moved");
-        assert_eq!(lease(&c, running), 4_500, "moved by other than the downtime");
+
+        // Every stored deadline reads `downtime` later. Trunk and `never` saturate at "never".
+        assert_eq!(lease(&c, before_mark), 3_900);
+        assert_eq!(lease(&c, at_mark), 4_000);
+        assert_eq!(lease(&c, running), 4_500, "shifted by other than the downtime");
         assert_eq!(lease(&c, never), u64::MAX, "saturates, never wraps to 1970");
-        assert_eq!(lease(&c, held), 1_500, "a quarantined branch is not Live and is not extended");
-        assert_eq!(lease(&c, BranchId::TRUNK), crate::branch::TRUNK_LEASE.0);
+        assert_eq!(lease(&c, held), 4_500, "the offset is the catalog's, not a Live-only rewrite");
+        assert_eq!(lease(&c, BranchId::TRUNK), u64::MAX);
 
-        let whole = c.get(running).unwrap();
-        assert_eq!(whole.arenas, vec![ArenaId(77)], "the extension dropped the branch's arenas");
-        assert!(whole.envelope.is_some(), "the extension dropped the branch's envelope");
+        // No record was rewritten: the stored core is byte-identical, still in virtual time.
+        assert_eq!(
+            c.core(running.id).unwrap().unwrap().serialize_core(),
+            stored_before,
+            "the resume rewrote a record; the offset exists so that it never has to"
+        );
+        assert_eq!(c.core(running.id).unwrap().unwrap().lease_deadline(), LeaseDeadline(1_500));
 
-        // The DEADLINE index moved WITH the records: what the reaper is asked agrees with what the
-        // records say, and no stale entry was left at the old deadline.
+        // The expiry question gets the same answers the per-branch rewrite gave, at the same
+        // instants: what ran out before the restart is still out, what was running is credited.
         assert_eq!(expired_ids(&c, 4_000), vec![before_mark.id, at_mark.id]);
         assert_eq!(expired_ids(&c, 4_499), vec![before_mark.id, at_mark.id]);
         assert_eq!(expired_ids(&c, 4_500), vec![before_mark.id, at_mark.id, running.id]);
-        assert_eq!(c.alive_mark().unwrap(), Some(4_000));
+        let answer = c.expired_before(4_500).unwrap();
+        assert!(
+            answer.iter().all(|r| r.lease_deadline().0 <= 4_500),
+            "expired_before handed out a deadline in virtual time: {answer:?}"
+        );
+
+        // Every other outward path agrees with `get_raw`. Each is a separate place the
+        // translation could be forgotten, and forgetting it expires leases early.
+        let whole = c.get(running).unwrap();
+        assert_eq!(whole.lease_deadline.0, 4_500, "get");
+        assert_eq!(whole.arenas, vec![ArenaId(77)], "arenas");
+        assert!(whole.envelope.is_some(), "envelope");
+        let scanned = c.scan().unwrap().map(|r| r.unwrap()).find(|r| r.branch_id == running);
+        assert_eq!(scanned.unwrap().lease_deadline.0, 4_500, "scan");
+        let narrowed: Vec<BranchRecord> =
+            c.scan_ids(running.id, running.id).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(narrowed[0].lease_deadline.0, 4_500, "scan_ids");
+        let live = c.in_state(BranchState::Live).unwrap();
+        let listed = live.iter().find(|r| r.branch_id == running).unwrap();
+        assert_eq!(listed.lease_deadline.0, 4_500, "in_state");
+        assert_eq!(c.enforced_lease(running).unwrap(), Some(LeaseDeadline(4_500)), "enforced_lease");
+        assert_eq!(c.alive_state().unwrap(), Some((4_000, 3_000)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The inward half. A lease given to this catalog after a restart must read back exactly as it
+    /// was given, and expire exactly then — or every lease a restarted server hands out is `D` too
+    /// long (a store that forgot to subtract) and the fork's own return value disagrees with `get`.
+    #[test]
+    fn a_lease_written_after_a_resume_reads_back_exactly_as_it_was_given() {
+        let path = sidecar("inward");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+
+        let forked = c.fork(BranchId::TRUNK, LeaseDeadline(10_000)).unwrap();
+        assert_eq!(forked.lease_deadline, LeaseDeadline(10_000), "fork's own return value");
+        let b = forked.branch_id;
+        assert_eq!(lease(&c, b), 10_000, "fork");
+        assert_eq!(expired_ids(&c, 9_999), Vec::<u64>::new());
+        assert_eq!(expired_ids(&c, 10_000), vec![b.id]);
+
+        c.renew_lease(b, LeaseDeadline(20_000)).unwrap();
+        assert_eq!(lease(&c, b), 20_000, "renew_lease");
+        assert!(expired_ids(&c, 19_999).is_empty());
+        assert_eq!(expired_ids(&c, 20_000), vec![b.id]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `tests/integration_server_reaps.rs`'s `expire_lease` writes deadline 0 offline, and `:540`
+    /// depends on it reading as expired. Stored `0 − D` saturates to 0 and reads back as `D`: a
+    /// moment long past on any real lease clock.
+    #[test]
+    fn an_offline_deadline_of_zero_still_reads_as_expired_after_downtime() {
+        let path = sidecar("zero");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap().branch_id;
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+        c.renew_lease(b, LeaseDeadline(0)).unwrap();
+        assert_eq!(lease(&c, b), 3_000, "0 is stored as 0 and read back as D");
+        let now = 1_700_000_000_000u64;
+        assert_eq!(expired_ids(&c, now), vec![b.id], "a deadline of 0 is not expired any more");
+        assert_eq!(c.enforced_lease(b).unwrap(), Some(LeaseDeadline(3_000)));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn resuming_twice_at_the_same_reading_extends_the_outage_once() {
-        // The extension and the new mark are one write, so the second resume measures from the
-        // mark the first one left and finds no downtime. Written as two writes, a crash between
-        // them would be this test with the second resume measuring from the OLD mark.
+        // The offset and the new mark are one key in one write, so the second resume measures
+        // from the mark the first one left and finds no downtime.
         let path = sidecar("twice");
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
         let b = c.fork(BranchId::TRUNK, LeaseDeadline(2_000)).unwrap().branch_id;
@@ -2989,7 +3101,7 @@ mod f1_lease_grace {
                 last_alive: 4_000,
                 now_millis: 4_000,
                 downtime_millis: 0,
-                extended: 0
+                offset_millis: 3_000
             }
         );
         assert_eq!(lease(&c, b), 5_000, "the same outage was credited twice");
@@ -3011,16 +3123,16 @@ mod f1_lease_grace {
                 last_alive: 5_000,
                 now_millis: 3_000,
                 downtime_millis: 0,
-                extended: 0
+                offset_millis: 0
             }
         );
         assert_eq!(lease(&c, b), 6_000, "a deadline moved backwards, or forwards for no outage");
-        assert_eq!(c.alive_mark().unwrap(), Some(3_000));
+        assert_eq!(c.alive_state().unwrap(), Some((3_000, 0)));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn the_mark_and_the_extension_survive_a_close_and_reopen_from_the_file_alone() {
+    fn the_mark_and_the_offset_survive_a_close_and_reopen_from_the_file_alone() {
         let path = sidecar("durable");
         let b = {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
@@ -3030,22 +3142,33 @@ mod f1_lease_grace {
             b
         };
         let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-        assert_eq!(re.alive_mark().unwrap(), Some(4_000), "the new mark was not durable");
-        assert_eq!(lease(&re, b), 4_500, "the extension was not durable");
-        assert!(expired_ids(&re, 4_499).is_empty(), "the old DEADLINE key survived the reopen");
+        assert_eq!(re.alive_state().unwrap(), Some((4_000, 3_000)), "not durable");
+        // `open` loaded the offset: without it every deadline reads 3000 early.
+        assert_eq!(lease(&re, b), 4_500, "the reopened catalog lost the offset");
+        assert!(expired_ids(&re, 4_499).is_empty(), "a lease expires early after a reopen");
         assert_eq!(expired_ids(&re, 4_500), vec![b.id]);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn a_mark_of_the_wrong_width_is_refused_rather_than_read_as_absent() {
-        // Absent means "first start: extend nothing". Reading a damaged mark that way would skip
-        // the grace for exactly the restart that needed it.
+    fn a_record_of_the_wrong_width_is_refused_at_resume_and_at_open() {
+        // Absent means "first start, D = 0". Reading a damaged record that way would skip the
+        // grace for exactly the restart that needed it, and read every stored deadline early.
         let path = sidecar("corrupt");
-        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-        c.upsert(keys::alive(), vec![1, 2, 3]).unwrap();
-        let err = c.resume_leases(4_000).unwrap_err().to_string();
-        assert!(err.contains("last-alive mark must be 8 bytes"), "{err}");
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.upsert(keys::alive(), vec![1, 2, 3]).unwrap();
+            let err = c.resume_leases(4_000).unwrap_err().to_string();
+            assert!(err.contains("last-alive record must be 16 bytes"), "{err}");
+            let seq = c.stage().unwrap();
+            c.durable(seq).unwrap();
+        }
+        let reopened = TableBranchCatalog::open_sidecar(&path, 1);
+        let err = match reopened {
+            Ok(_) => panic!("a catalog whose lease offset cannot be read was opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("last-alive record must be 16 bytes"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 

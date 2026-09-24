@@ -63,16 +63,18 @@ pub mod tag {
     /// value that must live outside the tree is the tree's own root page id, which the caller
     /// persists — that is the irreducible bootstrap, and it is one `u32`.
     pub const HEADER: u8 = 0x07;
-    /// `[0x08]` → the **last-alive mark**: the lease clock reading, big-endian `u64`, at which this
-    /// database last had its leases enforced. F1's restart grace; see
-    /// [`crate::branch::types::LeaseResume`].
+    /// `[0x08]` → the **virtual lease clock's state**, 16 bytes, both big-endian `u64`: the
+    /// last-alive mark (the lease clock reading at which this database last had its leases
+    /// enforced) and the offset `D` (cumulative downtime credited, which every stored deadline is
+    /// read back with). F1's restart grace, D198; see [`crate::branch::types::LeaseResume`] and
+    /// `TableBranchCatalog::to_lease_clock`.
     ///
-    /// A key of its own rather than eight more bytes in `HEADER`, for two reasons. `HEADER` is
-    /// rewritten on every fork (`write_header`), and the mark has one writer, the lease scan —
-    /// sharing a value would make every fork a write of the mark too. And a catalog written before
-    /// this key existed simply lacks it, which reads as "never recorded" with no length check to
-    /// relax, where a wider header would need the two-lengths tolerant read `deserialize_core`
-    /// already carries for D60.
+    /// A key of its own rather than more bytes in `HEADER`, for two reasons. `HEADER` is rewritten
+    /// on every fork (`write_header`), and this key has two writers, the lease scan and the startup
+    /// resume — sharing a value would make every fork a write of the mark too. And a catalog
+    /// written before this key existed simply lacks it, which reads as "never recorded, `D = 0`"
+    /// with no length check to relax, where a wider header would need the two-lengths tolerant read
+    /// `deserialize_core` already carries for D60.
     pub const ALIVE: u8 = 0x08;
     /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
     ///
@@ -177,42 +179,6 @@ pub fn header() -> Vec<u8> {
 /// `[0x08]` — the single last-alive key.
 pub fn alive() -> Vec<u8> {
     vec![tag::ALIVE]
-}
-
-/// Recover `(deadline, id)` from a `DEADLINE` key, or `None` for anything that is not one.
-///
-/// The sibling of [`child_epoch_from_key`]: `ids_in_span` keeps only the trailing id, and the
-/// restart grace needs the deadline the key was filed under too, to remove exactly that entry.
-pub fn deadline_from_key(key: &[u8]) -> Option<(u64, u64)> {
-    if key.len() != 17 || key[0] != tag::DEADLINE {
-        return None;
-    }
-    Some((
-        u64::from_be_bytes(key[1..9].try_into().ok()?),
-        u64::from_be_bytes(key[9..17].try_into().ok()?),
-    ))
-}
-
-/// The half-open span covering every `DEADLINE` key with a deadline **strictly after** `mark`.
-///
-/// The complement of [`expired_at_or_before`] at the same instant, and deliberately so: a lease is
-/// expired at `mark` exactly when `mark >= deadline`, so the leases still running at the mark are
-/// exactly the ones outside that span. Those are the ones a restart grace extends.
-///
-/// `mark == u64::MAX` has no deadline after it; the span returned is empty (`lo == hi`) rather
-/// than wrapping to `[DEADLINE][0]`, which would be every deadline there is.
-pub fn deadlines_after(mark: u64) -> (Vec<u8>, Vec<u8>) {
-    let hi = vec![tag::DEADLINE + 1];
-    let lo = match mark.checked_add(1) {
-        Some(next) => {
-            let mut l = Vec::with_capacity(9);
-            l.push(tag::DEADLINE);
-            l.extend_from_slice(&next.to_be_bytes());
-            l
-        }
-        None => hi.clone(),
-    };
-    (lo, hi)
 }
 
 /// The half-open span `[lo, hi)` covering an entire tag group.
@@ -529,46 +495,6 @@ mod tests {
         assert!(child(5, 0) >= lo && child(5, 0) <= hi, "epoch 0 must be inside [0, 3)");
         assert!(child(5, 2) >= lo && child(5, 2) <= hi);
         assert!(!(child(5, 3) >= lo), "epoch 3 is outside [0, 3)");
-    }
-
-    /// F1's grace extends exactly the leases still running at the mark, so its span must be the
-    /// exact complement of the expiry span at the same instant: a deadline in both would be
-    /// extended AND reaped, a deadline in neither would be neither — kept for ever by nothing.
-    #[test]
-    fn deadlines_after_a_mark_are_exactly_those_not_expired_at_it() {
-        for mark in [0u64, 1, 999, 1_000, 1_001, u64::MAX - 1] {
-            let (elo, ehi) = expired_at_or_before(mark);
-            let (alo, ahi) = deadlines_after(mark);
-            for d in [0u64, 1, 999, 1_000, 1_001, mark, mark.saturating_add(1), u64::MAX - 1, u64::MAX]
-            {
-                for id in [0u64, 7, u64::MAX] {
-                    let k = deadline(d, id);
-                    let expired = k >= elo && k < ehi;
-                    let after = k >= alo && k < ahi;
-                    assert_ne!(
-                        expired, after,
-                        "deadline {d} (id {id}) at mark {mark}: expired={expired} after={after}"
-                    );
-                    assert_eq!(after, d > mark, "deadline {d} at mark {mark}");
-                }
-            }
-            assert!(!(state(0, 0) >= alo && state(0, 0) < ahi), "the span reached the next group");
-            assert!(!(record(u64::MAX) >= alo && record(u64::MAX) < ahi), "reached below the group");
-        }
-        // No deadline is after u64::MAX, and the span must say so rather than wrap to all of them.
-        let (lo, hi) = deadlines_after(u64::MAX);
-        assert_eq!(lo, hi, "the span after u64::MAX must be empty");
-    }
-
-    #[test]
-    fn a_deadline_key_decodes_to_the_deadline_and_id_it_was_built_from() {
-        for (d, id) in [(0u64, 0u64), (1, u64::MAX), (1_700_000_000_000, 42), (u64::MAX, 1)] {
-            assert_eq!(deadline_from_key(&deadline(d, id)), Some((d, id)));
-        }
-        assert_eq!(deadline_from_key(&record(5)), None, "a record key is not a deadline key");
-        assert_eq!(deadline_from_key(&state(0, 5)), None);
-        assert_eq!(deadline_from_key(&child(5, 5)), None, "right length, wrong tag");
-        assert_eq!(deadline_from_key(&deadline(5, 5)[..16]), None, "a truncated key");
     }
 
     /// The mark is one key in a group of its own; every existing span must stay blind to it, and

@@ -981,12 +981,11 @@ fn a_lease_that_lapsed_only_while_the_server_was_down_survives_the_first_scan_af
          the restart — F1. The branch had {LEASE_LEFT_AT_SHUTDOWN_MILLIS}ms left when the \
          database stopped, and the agent never had a chance to act. Its stderr:\n{early}"
     );
-    assert!(
-        early.contains("1 live lease(s) extended"),
-        "the server did not report extending the fixture's one live lease. Without that line the \
-         survival above could be a scan that never ran rather than a lease that was kept. Its \
-         stderr:\n{early}"
-    );
+    // D198 removed an assertion here, `early.contains("1 live lease(s) extended")`: it pinned a
+    // count of rewritten leases, and the O(1) restart rewrites none and counts none (a count would
+    // be an O(live branches) walk at open). Its purpose — that the survival above is a lease that
+    // was kept and not a scan that never ran — is carried by `printed_downtime`, which panics
+    // without the resume line, and by the exact-deadline assertion below, which is unchanged.
     let downtime = printed_downtime(&early);
     assert!(
         downtime >= LEASE_LEFT_AT_SHUTDOWN_MILLIS + DOWN_PAST_DEADLINE_MILLIS,

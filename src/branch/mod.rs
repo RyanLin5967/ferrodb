@@ -422,11 +422,16 @@ pub trait BranchCatalog: Send + Sync {
 
     /// **F1 — resume the lease clock at startup, after a downtime this catalog measures itself.**
     ///
-    /// Reads the durable last-alive mark ([`Self::record_lease_alive`]), extends every `Live`
-    /// non-trunk lease whose deadline is **after** the mark by `now_millis - mark`, and records
-    /// `now_millis` as the new mark — **all in one durable write**, so a crash can leave either the
-    /// old deadlines with the old mark or the new deadlines with the new mark, and never extend the
-    /// same outage twice. See [`LeaseResume`] for the rule (Chubby §2.8–2.9) and each outcome.
+    /// Reads the durable last-alive mark ([`Self::record_lease_alive`]), extends every lease by
+    /// `now_millis - mark`, and records `now_millis` as the new mark — **all in one durable
+    /// write**, so a crash leaves either the old extension with the old mark or the new with the
+    /// new, and never credits the same outage twice. See [`LeaseResume`] for the rule (Chubby
+    /// §2.8–2.9) and each outcome.
+    ///
+    /// **The write must not grow with the number of branches (D198).** An implementation that
+    /// rewrites each deadline has put an O(live branches) write wall into every restart;
+    /// `TableBranchCatalog` keeps a virtual lease clock instead, so the extension is one addition
+    /// to a stored offset and every deadline it hands out is read through it.
     ///
     /// Call it once, at startup, before anything reaps and before anything is served — that is
     /// `LeaseThread::start`, under the runtime lock, beside `resume_interrupted_reaps`.

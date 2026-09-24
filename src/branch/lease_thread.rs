@@ -96,12 +96,13 @@
 //! spawned a loop whose first act was a scan — so a restart after an outage longer than a branch's
 //! remaining lease reaped that branch before its agent could do anything, and nothing could tell
 //! "abandoned before the outage" from "expired because of it". Now `start` also resumes the lease
-//! clock ([`TwoTierReaper::resume_lease_clock`]): every live lease that was still running at the
-//! catalog's durable last-alive mark is extended by exactly the measured downtime, in the same
-//! acquisition as the reap resume and before the first scan. Every scan then records the mark it
+//! clock ([`TwoTierReaper::resume_lease_clock`]): every lease is extended by exactly the measured
+//! downtime, in the same acquisition as the reap resume and before the first scan — as ONE write to
+//! the catalog's virtual lease clock (D198, `TableBranchCatalog::to_lease_clock`), not a rewrite of
+//! each deadline. Every scan then records the mark it
 //! read the clock at, and [`LeaseThread::stop`] records one more, so the next start measures the
 //! outage from the last moment leases were actually enforced. A lease that had run out before the
-//! mark is untouched and is reaped exactly as before — `tests/integration_server_reaps.rs` pins
+//! mark is still expired after the shift and is reaped exactly as before — `tests/integration_server_reaps.rs` pins
 //! both halves through `pgserver`. What `start` did is always printed ([`lease_resume_report`]),
 //! including when it did nothing and why.
 
@@ -924,15 +925,16 @@ fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
 /// outside, exactly like one that measured nothing to credit. A free function over the outcome for
 /// `refusal_report`'s reason — the operator-facing text is what a test can pin.
 ///
-/// ⚠ `tests/integration_server_reaps.rs` parses the `Resumed` line (`clock resumed after <n>ms`
-/// and `<n> live lease(s) extended`) and several tests there assert the ABSENCE of `lease: reaped`
-/// in startup output, so no line here may contain that phrase.
+/// ⚠ `tests/integration_server_reaps.rs` parses the `Resumed` line (`clock resumed after <n>ms`)
+/// and several tests there assert the ABSENCE of `lease: reaped` in startup output, so no line
+/// here may contain that phrase.
 fn lease_resume_report(r: LeaseResume) -> String {
     match r {
-        LeaseResume::Resumed { last_alive, now_millis, downtime_millis, extended } => format!(
+        LeaseResume::Resumed { last_alive, now_millis, downtime_millis, offset_millis } => format!(
             "lease: clock resumed after {downtime_millis}ms down (last alive at {last_alive}, now \
-             {now_millis}); {extended} live lease(s) extended by the downtime, so a lease that \
-             lapsed only while nothing was running is kept for what it had left (Chubby §2.9)"
+             {now_millis}); every lease now reads {downtime_millis}ms later ({offset_millis}ms of \
+             downtime credited in total, no record rewritten), so a lease that lapsed only while \
+             nothing was running is kept for what it had left (Chubby §2.9)"
         ),
         LeaseResume::FirstStart { now_millis } => format!(
             "lease: no last-alive mark in this catalog yet, so the downtime before this start \

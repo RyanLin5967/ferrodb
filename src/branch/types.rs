@@ -239,10 +239,16 @@ impl LeaseDeadline {
 /// lease reaped that branch on its first scan: the outage was charged to every lease, the agent
 /// never had a chance to act, and nothing could tell "abandoned before the outage" from "expired
 /// because of it". Now each catalog that can keeps a durable **last-alive mark** — the lease clock
-/// reading at which leases were last being enforced — and at startup every live lease that was
-/// still running at that mark is extended by the measured downtime. A lease that had already run
-/// out before the mark is left exactly as it was, and is reaped: extending by the downtime cannot
-/// bring a deadline at or before the mark back past the restart, so there is nothing to write.
+/// reading at which leases were last being enforced — and at startup extends every lease by the
+/// measured downtime.
+///
+/// **D198: the extension is O(1), not a rewrite.** The catalog keeps a durable cumulative
+/// downtime offset `D`, stores every deadline in virtual time `v = lease − D`, and reads it back as
+/// `v + D`; a restart does `D += downtime` in one write, and every lease is extended at once
+/// (`TableBranchCatalog::to_lease_clock`). A first version rewrote each live deadline instead —
+/// O(live branches) writes per restart, a wall at 10⁶ branches. A lease that had already run out
+/// before the mark reads `downtime` later too and is still expired: `v + D <= mark` gives
+/// `v + D + downtime <= now`.
 ///
 /// Every variant is an outcome to REPORT. Two of them mean the grace was not applied, and both
 /// say why rather than looking like a restart that happened to extend nothing.
@@ -264,8 +270,11 @@ pub enum LeaseResume {
     /// The clock was resumed. `downtime_millis` is `now_millis - last_alive`, saturating at zero
     /// when the lease clock reads earlier than the mark (the wall clock stepped back between
     /// processes: every deadline then already has more time than it had, and nothing moves
-    /// backwards). `extended` live leases were moved later by exactly `downtime_millis`.
-    Resumed { last_alive: u64, now_millis: u64, downtime_millis: u64, extended: u64 },
+    /// backwards). Every lease now reads `downtime_millis` later; `offset_millis` is the catalog's
+    /// cumulative downtime `D` after this resume, i.e. how much later than it was written each
+    /// deadline now reads. No count of leases is reported: producing one would be the O(live
+    /// branches) walk at open that D198 removed.
+    Resumed { last_alive: u64, now_millis: u64, downtime_millis: u64, offset_millis: u64 },
 }
 
 /// Lifecycle of a branch. `Reaping` is observable: the reaper marks before it frees, so a crash
