@@ -1547,6 +1547,86 @@ mod tests {
         assert_eq!(out2.events[0].op.name(), "UPDATE", "a live update was relabelled");
     }
 
+    /// **A `HeapUpdate` whose OLD image is dead and whose NEW image is live is an INSERT.**
+    ///
+    /// That is the record a reused primary key writes once the new row goes into the dead
+    /// version's slot, which is how an older snapshot's index lookup reaches the old version (the
+    /// reused-key gap, `tests/reused_key_old_snapshot.rs`). The consumer already received the
+    /// DELETE of the old row. Reported as an UPDATE, the feed tells it to modify a row it has
+    /// already deleted. `integration_cdc_key_reuse` pins the same thing end to end.
+    #[test]
+    fn a_heap_update_that_revives_a_dead_version_is_an_insert() {
+        let (_d, w) = wal("revive");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 0,
+                old: dead_tuple_bytes(3, 30),
+                new: tuple_bytes(3, Some(31)),
+            },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.events.len(), 1, "one reused key must be one event: {:?}", out.events);
+        assert_eq!(
+            out.events[0].op,
+            ChangeOp::Insert { new: vec![Value::Integer(3), Value::Integer(31)] },
+            "a dead version brought back under its key was reported as {} rather than an insert",
+            out.events[0].op.name()
+        );
+    }
+
+    /// **Relocating a dead version is bookkeeping, not a second DELETE.**
+    ///
+    /// When a reused key's new row does not fit in the dead version's slot,
+    /// `HeapFileManager::update` relocates it and logs a `HeapDelete` of the slot's current bytes,
+    /// then a `HeapInsert` of the new row. The current bytes are the dead version, which the
+    /// consumer already saw deleted.
+    ///
+    /// The second half is the anti-vacuity: a `HeapDelete` of a LIVE image (an ordinary UPDATE
+    /// that relocated) must still be emitted. It asserts only that it is emitted and not counted
+    /// as bookkeeping. It does not pin the kind it is emitted as.
+    #[test]
+    fn relocating_a_dead_version_is_bookkeeping_not_a_second_delete() {
+        let (_d, w) = wal("relocate_dead");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: dead_tuple_bytes(3, 30) })
+            .unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)) },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(
+            out.events.len(),
+            1,
+            "a relocated dead version leaked into the feed beside the insert: {:?}",
+            out.events
+        );
+        assert_eq!(out.events[0].op, ChangeOp::Insert { new: vec![Value::Integer(3), Value::Integer(31)] });
+        assert_eq!(out.internal, 1, "the relocated dead version was not counted as bookkeeping");
+        assert!(out.is_complete(), "bookkeeping made the decode look incomplete: {out:?}");
+
+        let (_d2, w2) = wal("relocate_live");
+        w2.append(1, 0, &RecKind::Begin).unwrap();
+        w2.append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: tuple_bytes(3, Some(30)) })
+            .unwrap();
+        w2.append(1, 0, &RecKind::Commit).unwrap();
+        let out2 = decode_all(&decoder(), &w2);
+        assert_eq!(out2.internal, 0, "a HeapDelete of a LIVE image was swallowed as bookkeeping");
+        assert_eq!(out2.events.len(), 1, "a HeapDelete of a LIVE image was not emitted: {out2:?}");
+    }
+
     /// Records against a table's time-travel heap are MVCC bookkeeping: not emitted, and not an
     /// error either. Counting them as unresolved would report normal operation as data loss.
     #[test]
