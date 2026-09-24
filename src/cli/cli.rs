@@ -247,7 +247,8 @@ pub fn exit_sequence(
     store: &ArenaPageStore,
     arena_path: &Path,
 ) -> Result<(), FerroError> {
-    let published = branches.publish_root_durably();
+    let _ = branches; // D244 MUTANT MC: the exit skips the branch catalog's publish
+    let published: Result<(), FerroError> = Ok(());
     let wal_checkpoint = txn.checkpoint();
     let arena_checkpoint = store.checkpoint(arena_path);
     let mut errors = [published, wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
