@@ -1294,13 +1294,26 @@ impl BufferPoolManager {
     /// page, take a pin with [`Self::pin`], which gives it back on drop.
     /// `tests/d260_new_page_is_returned_unpinned.rs` pins both halves: this call takes back its own
     /// pin and nobody else's, and none of the three callers takes another.
+    ///
+    /// **A page this cannot write or load is given back (D262).** `allocate` has already written
+    /// the page's bitmap bit to disk, and an `Err` from here carries no id, so no caller could free
+    /// it: it stayed allocated and owned by nothing for good. Every pinned frame (`NotEnoughSpace`
+    /// from the load) is the ordinary way in. [`Self::free_page`] refuses a page someone else has
+    /// pinned, which leaves it allocated rather than freed under them; a failed free leaves it
+    /// allocated too, and the caller gets the original error either way.
     pub fn new_page(&self) -> Result<u32, FerroError>{
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.
         let _pool = enter_pool();
         let page_id = self.disk_manager.allocate()?;
-        self.disk_manager.write(page_id, &[0u8; PAGE_SIZE])?;
-        self.fetch_page(page_id)?;
+        if let Err(e) = self
+            .disk_manager
+            .write(page_id, &[0u8; PAGE_SIZE])
+            .and_then(|()| self.fetch_page(page_id))
+        {
+            let _ = self.free_page(page_id);
+            return Err(e);
+        }
         self.unpin_page(page_id, false);
         Ok(page_id)
     }

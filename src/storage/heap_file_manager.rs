@@ -122,18 +122,41 @@ impl HeapFileManager {
     /// the page it added last time and adds nothing. That is not hypothetical — it hung
     /// `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`, a 200-row
     /// ALTER needing eleven pages, for eighteen minutes with no output.
+    ///
+    /// **A page it cannot list is given back (D262).** From `new_page` until the directory names
+    /// it, the page is allocated on disk and belongs to nothing: a failure in between used to
+    /// return with it that way for good, since no DROP frees a page no directory lists and
+    /// `DiskManager::allocate` never hands out an allocated one. Every step after the allocation is
+    /// in [`Self::list_empty_page`], so every such failure comes back through the one place below
+    /// that frees the page. Freeing is safe because on each of those failures NO directory names it:
+    /// `add_to_directory` writes the entry only in its two `Ok` arms.
+    ///
+    /// Best effort, stated: `free_page` refuses a page someone else has pinned (then it stays
+    /// allocated, the safe side), a failed free leaves it allocated too, and the caller gets the
+    /// ORIGINAL error either way. A crash between the allocation and the listing still strands it:
+    /// the allocation is not logged (D229's durable pending-free list is the answer to that).
     fn add_empty_page(&self) -> Result<u32, FerroError> {
         // `new_page` returns the page unpinned: there is no pin here to give back (D260).
         let new_page_id = self.buffer_pool_manager.new_page()?;
-        let pin = self.buffer_pool_manager.pin(new_page_id)?;
+        if let Err(e) = self.list_empty_page(new_page_id) {
+            let _ = self.buffer_pool_manager.free_page(new_page_id);
+            return Err(e);
+        }
+        Ok(new_page_id)
+    }
+
+    /// Lay an empty heap page into `page_id` and name it in the directory: everything
+    /// [`Self::add_empty_page`] does after the allocation, and nothing else, so it can give the
+    /// page back when any of it fails.
+    fn list_empty_page(&self, page_id: u32) -> Result<(), FerroError> {
+        let pin = self.buffer_pool_manager.pin(page_id)?;
         let mut frame = pin.write();
-        let empty_page = Page::empty(new_page_id);
+        let empty_page = Page::empty(page_id);
         frame.data = empty_page.serialize()?;
         drop(frame);
         pin.unpin(true);
         let free_space = (PAGE_SIZE - HEADER_SIZE) as u16;
-        self.add_to_directory(new_page_id, free_space)?;
-        Ok(new_page_id)
+        self.add_to_directory(page_id, free_space)
     }
 
     /// Free space this heap holds across every data page, as the page directory reports it.
