@@ -322,7 +322,10 @@ class held_signals:
 
 
 def git(*args):
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+    # Its own session, so a terminal Ctrl-C reaches only this script, whose handler decides what an
+    # interrupt means, and never kills a `git` mid-check (review 6).
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True,
+                          start_new_session=True).stdout.strip()
 
 
 def text(x):
@@ -649,11 +652,14 @@ def main():
             try:
                 restore()
             except Exception as e:
-                print(f"{label}: RESTORE FAILED ({e!r}); {path} may still hold the mutant. Stopping.",
-                      flush=True)
+                print(f"{label}: RESTORE FAILED ({e!r}); {path} may not hold HEAD's bytes. "
+                      f"Stopping.{foreign_note()}", flush=True)
+                FOREIGN_REPORTED = FOREIGN_REPORTED or FOREIGN_EDIT is not None
                 return 2
             if not at_head(path):
-                print(f"{label}: RESTORE FAILED, {path} does not match HEAD. Stopping.", flush=True)
+                print(f"{label}: RESTORE FAILED, {path} does not match HEAD. Stopping.{foreign_note()}",
+                      flush=True)
+                FOREIGN_REPORTED = FOREIGN_REPORTED or FOREIGN_EDIT is not None
                 return 2
             if FOREIGN_EDIT:
                 print(f"{label}: {path} was changed by another writer during this run. Their bytes "
@@ -711,15 +717,17 @@ def finish(code):
     try:
         restore()
     except Exception as e:
-        print(f"RESTORE FAILED ({e!r}); {LAST_PATH} may still hold a mutant. Exit 2.{interrupt_note()}")
+        print(f"RESTORE FAILED ({e!r}); {LAST_PATH} may not hold HEAD's bytes. Exit 2."
+              f"{foreign_note()}{interrupt_note()}")
         return 2
     try:
         verified = LAST_PATH is None or at_head(LAST_PATH)
     except Exception as e:
-        print(f"Could not verify {LAST_PATH} against HEAD ({e!r}). Exit 2.{interrupt_note()}")
+        print(f"Could not verify {LAST_PATH} against HEAD ({e!r}). Exit 2."
+              f"{foreign_note()}{interrupt_note()}")
         return 2
     if not verified:
-        print(f"{LAST_PATH} does NOT match HEAD. Exit 2.{interrupt_note()}")
+        print(f"{LAST_PATH} does NOT match HEAD. Exit 2.{foreign_note()}{interrupt_note()}")
         return 2
     if FOREIGN_EDIT:
         if not FOREIGN_REPORTED:
@@ -738,6 +746,14 @@ def finish(code):
 
 def interrupt_note():
     return f" An interrupt ({INTERRUPTED}) also arrived." if INTERRUPTED else ""
+
+
+def foreign_note():
+    """Name a foreign edit on EVERY exit that mentions the file, including the ones where the file
+    then also failed its HEAD check (review 6, R6-1)."""
+    if FOREIGN_EDIT is None:
+        return ""
+    return f" Another writer had changed it; their bytes are saved at {FOREIGN_EDIT}."
 
 
 if __name__ == "__main__":

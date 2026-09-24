@@ -530,3 +530,16 @@ Nothing compiled or run. There were no HIGH findings. Four MEDIUM ones change A5
 - **A stated trade-off.** A stall inside the restore can only be ended with SIGKILL, which would
   strand the mutant. No trigger for such a stall is known. The next run's dirty-tree refusal catches
   it.
+
+---
+
+## Amendment 7 — 2026-09-24, after a sixth fresh-context review (of `3fc76c2..c4226f1`)
+
+Nothing compiled or run. The review found N1, N2 and N4 fixed, no HIGH findings, and one MEDIUM:
+- **R6-1.** A6's "any foreign edit is named, whenever it was found" was false on one route: a
+  foreign edit found by the restore, after which the file ALSO failed its HEAD check. Every exit
+  message that names the file now appends the foreign-edit evidence path.
+- **A6's trade-off was placed wrongly.** The SIGKILL-only window is a stall anywhere in the unwind
+  after the first signal, e.g. `run_group`'s wait after `killpg`, not only inside the restore.
+- **LOW, fixed anyway.** `git` subprocesses run in their own session, so a second terminal Ctrl-C
+  cannot kill a `git` that is mid-check and turn exit 3 into exit 1.
