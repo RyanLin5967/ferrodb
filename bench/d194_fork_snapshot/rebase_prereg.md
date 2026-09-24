@@ -72,3 +72,91 @@ above assumed `-b`. Both, so neither can be picked after the fact:
 Arithmetic: 2135 passed at `2eeed40` (run of record, under `-b`) + 1 (`sync.rs:402`, default QoS only)
 + 1 (`a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it`) + 7
 (`d194_rebase`) + 3 (parser, binder and dispatch unit tests) = 2147.
+
+## Amendment 2 (append-only, written BEFORE the tests it describes): the three cases §8.5 listed as untested
+
+Still quiet mode: every commit below is UNBUILT. Order: this amendment, then the seam, then each test,
+then the one behaviour change (C2), each its own commit.
+
+### A. The retryable error when the branch or main moves between validation and commit
+
+**Seam: a function split, not a hook.** `AgentRuntime::rebase` becomes `rebase_validate` (quarantine
+check, the first lock section, shapes, staged rows) followed by `rebase_commit` (the re-check, the
+premises, the re-pin), both private, with `rebase` calling one then the other. That split is
+PRODUCTION code, so no test-only code sits in the production path and nothing there needs compiling
+out. The only test-only code is the new unit test, inside runtime.rs's existing `#[cfg(test)] mod
+tests`. It calls the two phases directly and lands the change in between on the same thread, with no
+timing.
+
+New lib unit test `rebase_is_refused_retryably_when_the_branch_or_main_moves_between_its_phases`, three
+cases plus a control, all in one test:
+
+| between the phases | expected from `rebase_commit` |
+|---|---|
+| nothing (the control) | `Ok`, `rebased = true` |
+| main's merge clock advances (`apply_seq += 1`, which is exactly what a publish's reservation does) | `Err` containing `moved while REBASE was validating`; the pin, `fork_seq` and staged set are unchanged |
+| the branch stages a write (`AgentRuntime::write`, an UPDATE matching one row) | `Err` containing `moved while REBASE was validating`; unchanged |
+| the branch is abandoned (`AgentRuntime::abandon`) | `Err` containing `was sealed while REBASE was validating` |
+
+- **At the commit that adds it: PASSES.** The re-check exists since `be26d5f`, so there is no honest
+  red state. The discriminating run is the fire-check instead: with the re-check's `unchanged` forced
+  to `true`, the two `moved while` cases FAIL (commit returns `Ok`) and the `sealed` case still PASSES,
+  because that one is the workspace-existence check, a separate line.
+- **"Compiled out of release":** the test is under `#[cfg(test)]`, which only `cargo test --lib`
+  sets. To confirm once fans are allowed:
+  - `nm -a target/debug/deps/ferrodb-<hash> | grep -c rebase_is_refused_retryably` → ≥ 1 (the
+    positive control, from the lib test binary);
+  - after `cargo build --release`, `nm -a target/release/ferrodb | grep -c rebase_is_refused_retryably`
+    → 0.
+
+### B. `rebase_key`'s no-key path: an inherited insert-then-delete
+
+`tests/d194_rebase_unkeyed.rs` (new file). The parent INSERTs `(7, 70)` and then DELETEs it, which
+stages `(base None, Deleted)` with a `RowCreate` in the parent's frame. The child forked from the
+parent inherits that row with an EMPTY frame, so no image names key 7: this is the no-key path.
+
+- `a_child_that_inherited_an_insert_then_delete_rebases_when_main_left_the_key_alone`: main changes
+  only row 2. Expected after C2: the child REBASEs (`rebased`), and so does the parent (through its own
+  `RowCreate`).
+- `a_child_that_inherited_an_insert_then_delete_is_refused_when_main_took_the_key`: main INSERTs
+  `(7, 77)`. Child and parent are both refused with `moved_rows = 1`, and neither view changes. This is
+  the control that stops C2 from becoming "a keyless row always holds".
+
+**C2, the behaviour change:** as of `be26d5f`, a row with no recoverable key is counted as moved, so a
+child holding an inherited insert-then-delete could NEVER rebase. After C2, such a row is looked up by
+row id in ONE full scan of its table at the new instant, cached per table per REBASE. It holds iff the
+row is absent there as well, and is moved iff present. This costs O(table) for this rare path only; the
+keyed path stays a point lookup.
+
+- **At the test commit (before C2):** the first test FAILS at the child's REBASE (`rebased = false`,
+  `moved_rows = 1`), and the second PASSES.
+- **After C2:** both PASS.
+
+### C. `REBASE` over pgwire: extended protocol (Parse/Bind/Describe/Execute/Sync), next to simple query
+
+`tests/d194_rebase_pgwire.rs` (new file), driving `pgwire::extended::dispatch` with real message bodies
+and `Statement::parse_batch` + `execute` for the simple-query path, the harness `d54_as_of_in_session`
+uses.
+
+- `rebase_over_the_extended_protocol_describes_and_returns_one_row`:
+  - Messages in order: ParseComplete, BindComplete, `RowDescription(branch, rebased, fork_seq_before,
+    fork_seq_after, moved_rows, moved_premises, moved_shapes, detail)`, one DataRow, `CommandComplete(SELECT 1)`,
+    ReadyForQuery.
+  - The DataRow's text values from `rebased` on: `t, 0, 0, 0, 0, 0, NULL`.
+  - Then the simple-query path returns the same 8-column row, with `rebased = true`, and the rebased view.
+- `a_refused_rebase_over_the_extended_protocol_is_a_row_not_an_error`: a staged row whose base moved
+  gives DataRow `f, 0, 0, 1, 0, 0, <detail naming inventory>` and `CommandComplete(SELECT 1)`, with no
+  ErrorResponse.
+- **At the commit that adds it: both PASS.** The describe arm exists since `be26d5f`, so again no red
+  state. Fire-check: with `| Stmt::Rebase { .. }` removed from `describe_stmt`, Describe answers NoData
+  and Execute returns `ErrorResponse(XX000 … described the statement as returning no rows and then
+  produced some)`. Both tests FAIL.
+
+### Counts, replacing Amendment 1's
+
+| QoS | result lines | passed | failed | ignored |
+|---|---|---|---|---|
+| default | 58 (56 + the two new files, which match the agent grep) | **2152** (2147 + 1 unit + 2 + 2) | **1** (envelope tripwire, `get_mut(` count **5**) | 2 |
+| `taskpolicy -b` | 58 | 2151 | 2 (+ `sync.rs:402`) | 2 |
+
+The seam adds no `workspaces.get_mut(`, so the tripwire's count stays 5.
