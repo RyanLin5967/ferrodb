@@ -861,9 +861,10 @@ fn scan_once(
              for that reason or because its extent was already gone, counts as one too. That is \
              an aliased catalog key: a claim whose catalog write outlived a crash that lost its \
              map record, before D232 put the map record first, after which a restart issued the \
-             same arena id again. A parked page whose extent is gone is instead left over from a \
-             drain an earlier catalog read error refused. Every other extent's data is intact \
-             because of this refusal.",
+             same arena id again. A parked page whose extent is gone has no serial cause: it \
+             takes an extent free or a snapshot install landing while a drain had the pending \
+             log out, which the statement lock rules out, so it is a concurrency or install \
+             anomaly. Every other extent's data is intact because of this refusal.",
             foreign - seen
         ));
     }

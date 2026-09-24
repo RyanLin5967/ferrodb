@@ -335,10 +335,13 @@ impl TwoTierReaper {
     /// log is older than the reap's owner filter, so a slow-path reap over an aliased key before
     /// D232 left durable entries naming another branch's extent, and a drain now drops them
     /// instead of releasing them. One more case counts, and it needs no alias: an entry whose
-    /// extent no longer exists, which a drain that a catalog read error refused leaves behind if
-    /// the extent is then freed whole. Its page went back with the extent. The units differ (an
-    /// arena, a page); both mean "not this entry's to free", and both are zero on a healthy
-    /// database.
+    /// extent no longer exists. **No serial path leaves one** (review 3 A1): every path that
+    /// removes an extent also prunes the pending entries naming it (`free_arena_locked`, and the
+    /// replay of a free record). It takes a free, or a snapshot install, landing while a drain has
+    /// the log out between `take_pending` and `put_pending`, which `RuntimeLock` rules out today.
+    /// A non-zero count of this kind is a concurrency or install anomaly, not a past read error.
+    /// The units differ (an arena, a page); both mean "not this entry's to free", and both are
+    /// zero on a healthy database.
     pub fn foreign_arenas_skipped(&self) -> u64 {
         self.foreign_arenas_skipped.load(Ordering::Relaxed)
     }
@@ -850,23 +853,31 @@ impl TwoTierReaper {
             let mut moved = false;
             for (i, pf) in entries.iter().copied().enumerate() {
                 // **D232, review 2 F3 — the reap's owner filter, applied to this log.** A parked
-                // page is released only into an extent the store charges to the branch that
-                // parked it. `reap` filters `record.arenas` the same way, but this log is older
-                // than that filter: a slow-path reap that once ran over an aliased catalog key
-                // (before D232 put the map record first) parked Y's pages under X, those entries
-                // are durable, and the first drain after X's pinning children died put a page Y's
-                // tree still points at onto Y's recycled list. An extent that no longer exists is
-                // refused as well. Its page went back with it, and `release_page` changed no count
-                // for it, but it still evicted the id from the pool: once the range is reissued,
-                // that is another extent's page, and an unflushed write goes with the frame.
+                // page is released only into an extent the store charges to the branch that parked
+                // it. `reap` filters `record.arenas` the same way, but this log is older than that
+                // filter: a slow-path reap that once ran over an aliased catalog key (before D232
+                // put the map record first) parked Y's pages under X, those entries are durable,
+                // and the first drain after X's pinning children died put a page Y's tree still
+                // points at onto Y's recycled list. An extent that no longer exists is refused as
+                // well. Its page went back with it, and `release_page` changed no count for it, but
+                // it still evicted the id from the pool: once the range is reissued, that is
+                // another extent's page, and an unflushed write goes with the frame.
                 //
                 // Dropped, not kept, because no later answer could make the release right: a
                 // foreign or freed extent never becomes the parking branch's, and an id issued
                 // again (only a pre-D232 map can do that) names a new extent whose pages are not
                 // this entry's. Asked before the catalog, so the drop does not depend on the
-                // parking branch's record being readable. Nothing moves the answer before the
-                // release below: the extent holding a parked page is not empty, so no sweep
-                // collects it, and the drain touches it before releasing into it (D221).
+                // parking branch's record being readable.
+                //
+                // **Not re-asked before the release below, and what makes that safe is that reaps
+                // are serialised, not that the extent is non-empty** (review 3 A2). Emptiness keeps
+                // the SWEEPS off it, since they free only empty extents. But the owner's own
+                // fast-path reap frees an extent whole, empty or not, and a snapshot install
+                // replaces the map; either landing between this check and `release_page` sends the
+                // release into a gone extent. The drain runs only inside `reap`, and `RuntimeLock`
+                // serialises reaps and claims today. W4 removes that lock and must close this
+                // window too; it is on W4's list. The same window sat between `get_raw` and the
+                // release before this check existed, so it is not new.
                 if self.store.arena_owner(pf.arena_id) != Some(pf.owner) {
                     self.foreign_arenas_skipped.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -3600,11 +3611,14 @@ mod tests {
     }
 
     /// **D232, review 2 F3, the absent half: a drain never touches a page whose extent is gone.**
-    /// An entry can outlive its extent: a drain that a catalog read error refused leaves it
-    /// parked, and a later fast-path reap of its branch frees the extent whole. That free already
-    /// evicted the range from the pool, and the page went back with the extent. Releasing the
-    /// entry evicted the id a second time, and once the range had been handed to another extent
-    /// that was the new tenant's page: its unflushed write went with the frame.
+    /// This test PLANTS the state: no serial path produces it, because every path that removes an
+    /// extent also prunes the pending entries naming it (review 3 A1). It takes a free or a
+    /// snapshot install landing while a drain has the log out between `take_pending` and
+    /// `put_pending`. The free here runs first and the entry is put back after it, which is that
+    /// interleaving laid out in sequence. The free already evicted the range from the pool, and
+    /// the page went back with the extent. Releasing the entry evicted the id a second time, and
+    /// once the range had been handed to another extent that was the new tenant's page: its
+    /// unflushed write went with the frame.
     #[test]
     fn d232_a_drain_leaves_alone_a_page_whose_extent_is_gone() {
         use crate::branch::record::PendingFree;

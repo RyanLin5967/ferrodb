@@ -1644,6 +1644,15 @@ impl ArenaPageStore {
 
         let mut st = self.state.lock().unwrap();
         let ext = st.extents.remove(&arena);
+        // **Review 3 A4: the counts leave with the extent, in the same `state` hold.**
+        // `state_bytes` reads both counters while holding only `state`, and the consensus snapshot
+        // capture calls it without `persist` (review 2 F4). Subtracted after `drop(st)`, as they
+        // were, such a reader could serialise a map without this extent that still charged its
+        // pages. The claim's add sits inside its insert block for the same reason.
+        if ext.is_some() {
+            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
+            self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
+        }
         st.live_order.remove(&arena);
         st.recycled.remove(&arena);
         st.pending.retain(|p| p.arena_id != arena);
@@ -1702,8 +1711,6 @@ impl ArenaPageStore {
         drop(st);
 
         if ext.is_some() {
-            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
-            self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
             // Persist the shrunk map, for the same reason `alloc_arena` persists the grown one.
             // Without this only *claims* were durable and frees never were, so a crash after a reap
             // left an image still charging the extent to a branch that no longer exists — and the
@@ -1848,6 +1855,14 @@ impl ArenaPageStore {
             // corruption: the "next open" every failure path here leans on would not happen.
             // Forgetting the image makes the next persist an atomic rewrite, which replaces the
             // torn tail along with everything else.
+            //
+            // **The cost, stated (new-wall audit round 2).** From here EVERY persist is a
+            // full-image rewrite, O(extents + current + pending + free list) bytes plus an fsync,
+            // until one rewrite succeeds: a rewrite that fails leaves `image_bytes` at 0 (and puts
+            // the reuse flag back, D248), so the next persist tries again. The first rewrite that
+            // succeeds sets `image_bytes` and appends resume. A failure-mode retry, bounded by the
+            // storage fault that caused it, not a steady-state cost. Pinned end to end by
+            // `d232_a_failed_append_rewrites_until_one_succeeds_then_appends_again`.
             g.image_bytes = 0;
             return Err(FerroError::Io(e.to_string()));
         }
@@ -2576,13 +2591,15 @@ impl PageStore for ArenaPageStore {
             );
             st.live_order.insert(arena);
             st.recycled.insert(arena, Vec::new());
+            // Counted with the extent, inside the same `state` hold and BEFORE the persist. A
+            // persist that turns out to be a full rewrite serialises this counter from live memory,
+            // and a count added afterwards is missing from an image that holds the extent (review 2
+            // F1: the restore came back short by the claim's pages). Inside the hold because
+            // `state_bytes` reads the counter while holding only `state`, and one caller, the
+            // consensus snapshot capture, does not hold `persist` (review 3 A4, review 2 F4). An
+            // appended claim record carries no count; its replay adds `page_count`.
+            self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
         }
-        // Counted with the extent and BEFORE the persist, for the reason the extent is in the map
-        // by then: a persist that turns out to be a full rewrite serialises this counter from live
-        // memory, and a count added afterwards is missing from an image that holds the extent
-        // (review 2 F1: the restore came back short by the claim's pages). An appended claim
-        // record carries no count; its replay adds `page_count`.
-        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
 
         // Persist the map now that the region has grown. This is the write that makes
         // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
@@ -5702,5 +5719,54 @@ mod tests {
         );
         let _ = std::fs::remove_file(&armed);
         let _ = std::fs::remove_file(&control);
+    }
+
+    /// **New-wall audit round 2: after a failed append, every persist is a full rewrite until one
+    /// succeeds, and then appends resume.** Both ends of that ladder are the claim. The retry
+    /// must not stop early: an append behind a torn record makes `replay_tail` refuse the file.
+    /// And it must not run forever: a store that never appends again pays the whole image per
+    /// claim, which is the O(N^2) D81 removed. The middle rung, a rewrite that itself fails, keeps
+    /// it going: its rename cannot put a file where a directory stands.
+    #[test]
+    fn d232_a_failed_append_rewrites_until_one_succeeds_then_appends_again() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-ladder-{}.bin", std::process::id()));
+        let staging = crate::storage::atomic_file::temp_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(&staging);
+        h.store.checkpoint_to(path.clone());
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+        claim().unwrap();
+        assert_eq!(h.store.persist_counters(), (1, 0), "fixture: the first claim did not rewrite");
+
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        claim().expect_err("fixture: the append must fail");
+        assert_eq!(h.store.persist_counters(), (1, 0), "a failed append was counted");
+        claim().expect_err("fixture: the rewrite after it must fail while the directory stands");
+        assert_eq!(h.store.persist_counters(), (1, 0), "a failed rewrite was counted");
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &saved).unwrap();
+        claim().unwrap();
+        assert_eq!(
+            h.store.persist_counters(),
+            (2, 0),
+            "audit r2: after a failed append and a failed rewrite, the next persist did not rewrite"
+        );
+        claim().unwrap();
+        assert_eq!(
+            h.store.persist_counters(),
+            (2, 1),
+            "audit r2: the retry never ended; after a successful rewrite the next claim rewrote"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&staging);
     }
 }
