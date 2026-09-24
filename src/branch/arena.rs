@@ -1468,7 +1468,8 @@ impl ArenaPageStore {
             ))
             .into());
         }
-        let reserved = pages_reserved_by(&extents);
+        // MUTANT (fire-check only, never land): load_state trusts the image's field again.
+        let reserved = _reserved_as_written;
 
         // **Never resume filling a restored extent.** The image records `next_free` as of the last
         // checkpoint, but a session that died after it may have handed out pages beyond that mark,
