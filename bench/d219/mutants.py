@@ -24,6 +24,7 @@ DURABLE = "src/provenance/durable.rs"
 DEFERRED = "src/provenance/deferred.rs"
 STORE = "src/provenance/store.rs"
 RUNTIME = "src/agent_sql/runtime.rs"
+ALTER = "src/catalog/alter.rs"
 
 MUTANTS = {
     # One sync per record again: the batch is appended body by body.
@@ -151,10 +152,11 @@ MUTANTS = {
         "        if file.pending.is_empty() {\n            return Ok(());\n        }\n        self.refuse_if_poisoned()?;\n",
         "        self.refuse_if_poisoned()?;\n        if file.pending.is_empty() {\n            return Ok(());\n        }\n",
     ),
-    # The rewrite's stamps wait for the merge's final sync again (review F1).
-    "M19_no_schema_phase_flush": (
-        RUNTIME,
-        "            provenance.flush_so_far()?;\n",
+    # A rewrite returns with its stamps still pending, so they wait for the merge's final sync
+    # (review 2 F1) and one table's wait for the next table's rewrite (review 3 F1).
+    "M19_rewrite_does_not_flush": (
+        ALTER,
+        "    if let Some(store) = prov {\n        store.flush()?;\n    }\n",
         "",
     ),
 }
