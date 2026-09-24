@@ -279,11 +279,12 @@ fn a_healthy_open_reads_no_released_and_no_pinned_slot() {
 }
 
 /// A catalog that fails ONE operation on purpose, so a cascade is left in the state a crash or an
-/// I/O error leaves it in. Everything else is delegated untouched, including
-/// `unreleased_reaped_candidates` (W5, wall21 review audit 3): before, the trait's DEFAULT
-/// answered through this wrapper (every `Reaped` record), so a sweep run through it used a
-/// different candidate list from production's UNRELEASED span. Not forwarded: the defaults the
-/// reaper and the page store never call (`await_fork_durable`, `scan_ids`, `envelope_of`).
+/// I/O error leaves it in. Everything else is delegated untouched, including the two defaulted
+/// methods the open reads: `ids_in_state` (W3) and `unreleased_reaped_candidates` (W5, wall21
+/// review audit 3). Before W5 the trait's DEFAULT candidate list answered through this wrapper
+/// (every `Reaped` record), so a sweep run through it used a different list from production's
+/// UNRELEASED span. Not forwarded: the defaults the reaper and the page store never call
+/// (`await_fork_durable`, `scan_ids`, `envelope_of`).
 struct Faulty {
     inner: Arc<dyn BranchCatalog>,
     /// Fail the Nth `detach_child` (1-based); 0 = never.
@@ -364,6 +365,9 @@ impl BranchCatalog for Faulty {
     }
     fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
         self.inner.in_state(state)
+    }
+    fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
+        self.inner.ids_in_state(state)
     }
     fn scan(
         &self,

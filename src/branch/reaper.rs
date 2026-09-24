@@ -93,9 +93,14 @@ pub enum ReapOutcome {
     /// re-read inside the lock. Routine, and deliberately reported nowhere — the branch is
     /// healthy and there is nothing for an operator to do.
     NotExpired,
-    /// **The reaper declined to decide, and this is why.** Nothing was freed, so nothing is lost;
-    /// the branch keeps its pages and the next sweep asks again — but since D126 there is no
-    /// benign producer left, so a retry that keeps refusing is the normal case, not the odd one.
+    /// **The reaper declined to decide, and this is why.** Usually nothing was freed, so nothing is
+    /// lost; the branch keeps its pages and the next sweep asks again. ⚠ Not always (found under
+    /// wall21 review audit 3 W6): `reap` frees the extents and flips the record `Reaped` BEFORE
+    /// its cascade, and a `Branch` error in the cascade (a failed detach, or since F1 a parent
+    /// that cannot be read) is a refusal too. Then the pages ARE back, and what is left undone is
+    /// the unlinking and the id slot, which the slot's UNRELEASED key keeps for the open sweep
+    /// (`reclaim_unreleased_slots`), not the lease sweep. And since D126 there is no benign
+    /// producer left, so a retry that keeps refusing is the normal case, not the odd one.
     /// Carrying the error rather than a bare marker is the whole point: every refusal is an I/O
     /// error or a corrupt catalog, and the text is the only thing that says WHICH — a failing disk
     /// and a dangling CHILD entry need different people — so a caller handed only a count has a
@@ -142,7 +147,9 @@ pub struct TwoTierReaper {
     /// **D200.** Slots that sweep declined to decide, with the reason each one carried. D127's rule
     /// applied here: a refusal is absorbed so one bad slot cannot stop an open, and it is kept
     /// WITH its text, because a count alone is a number nobody can act on. Since C2a it also holds
-    /// the resumed reaps the open declined (`resume_interrupted_reaps`).
+    /// the resumed reaps the open declined (`resume_interrupted_reaps`), and since W3 the
+    /// interrupted reaps whose record could not be read. Each entry's prefix names its source:
+    /// `slot N:` (this sweep), `resumed reap of ...`, or `interrupted reap of slot N ...`.
     open_slot_refusals: Mutex<Vec<String>>,
 }
 
@@ -192,7 +199,15 @@ impl TwoTierReaper {
         self.deferred.lock().unwrap().len()
     }
 
-    /// Finish every reap that a crash interrupted.
+    /// Finish every reap that a crash interrupted **that the catalog can answer for**; decline the
+    /// rest, each with its reason.
+    ///
+    /// ⚠ **W6 (wall21 review audit 3): "every" was false since C2a.** A resumed reap that meets a
+    /// `Branch` error, and (W3) a `Reaping` record that cannot be read, are counted refusals
+    /// ([`Self::refused_reaps`], reasons in [`Self::open_slot_refusals`]), and the open goes on.
+    /// So an `Ok` does NOT mean no half-reaped branch is left: a declined one stays `Reaping`,
+    /// unreadable, charged with its extents, and is asked again at the next open. A non-`Branch`
+    /// error still fails the whole call.
     ///
     /// `reap` marks the record `Reaping` durably *before* it frees anything, precisely so that a
     /// crash in the middle leaves evidence rather than a leak. Without this call that evidence is
@@ -209,12 +224,29 @@ impl TwoTierReaper {
     /// and [`Self::open_slot_refusals`]). They are NOT in the returned list, which stays "reaps
     /// resumed".
     pub fn resume_interrupted_reaps(&self) -> Result<Vec<BranchId>, FerroError> {
-        let mut interrupted: Vec<BranchRecord> = self
-            .catalog
-            .in_state(BranchState::Reaping)?
-            .into_iter()
-            .filter(|r| !r.branch_id.is_trunk())
-            .collect();
+        // **W3 (wall21 review audit 3): D127's rule reaches the READ of the interrupted set.**
+        // This was `in_state(Reaping)?`, which decodes every `Reaping` record, so one record that
+        // could not be decoded failed every open before any per-reap handling ran. The ids come
+        // from the state index now, and each record is read here: a `Branch` error is a counted
+        // refusal with its reason, like a resumed reap's own error below, and the record is asked
+        // again at the next open. That includes a state key with no record, which `in_state`
+        // skipped in silence. A non-`Branch` error (the tree itself) still fails the open.
+        let mut resume_refusals: Vec<String> = Vec::new();
+        let mut interrupted: Vec<BranchRecord> = Vec::new();
+        for id in self.catalog.ids_in_state(BranchState::Reaping)? {
+            if id == BranchId::TRUNK.id {
+                continue;
+            }
+            match self.catalog.get_raw(id) {
+                Ok(rec) => interrupted.push(rec),
+                Err(e @ FerroError::Branch(_)) => {
+                    let why = format!("interrupted reap of slot {id} (its record cannot be read)");
+                    resume_refusals.push(format!("{why}: {e}"));
+                    let _ = self.refuse(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // Deepest first — the same key `reap_expired` uses, for the same reason plus one more.
         //
         // Reaping a child removes its epoch from the parent's live-children array, which is what
@@ -223,10 +255,11 @@ impl TwoTierReaper {
         // does not clear that array, so nothing ever calls it for that slot again. Walked
         // parent-first, the parent's slot is leaked for the lifetime of the database.
         //
-        // `in_state` is ordered by branch id and a parent's id is normally below its child's, so
-        // unordered-by-depth here means *reliably* parent-first. Before this the hash order made it
-        // a coin flip; the ordering that made the durable sweep reproducible made the losing side
-        // of that flip certain, which is why the key belongs here rather than at the source.
+        // `ids_in_state` (like `in_state`) is ordered by branch id and a parent's id is normally
+        // below its child's, so unordered-by-depth here means *reliably* parent-first. Before this
+        // the hash order made it a coin flip; the ordering that made the durable sweep reproducible
+        // made the losing side of that flip certain, which is why the key belongs here rather than
+        // at the source.
         interrupted.sort_by(|a, b| b.depth.cmp(&a.depth).then(b.fork_epoch.cmp(&a.fork_epoch)));
         let interrupted: Vec<BranchId> = interrupted
             .into_iter()
@@ -240,7 +273,6 @@ impl TwoTierReaper {
         // It is now a counted refusal (`refused_reaps`) with its reason, kept next to the sweep's.
         // The sweep below finishes whatever of it the flip left releasable, and a record still
         // `Reaping` is asked again at the next open. A non-`Branch` error still fails the open.
-        let mut resume_refusals: Vec<String> = Vec::new();
         for b in interrupted {
             match self.reap(b) {
                 Ok(_) => done.push(b),
@@ -261,9 +293,14 @@ impl TwoTierReaper {
         //
         // A crash is the only producer of an extent charged to a branch that no longer exists at
         // that generation, and this is the one moment that can be sure it has seen all of them:
-        // the durable image has just been loaded, every interrupted reap above has finished, and
-        // nothing has run since. Resuming a `Reaping` record does not cover it — the record whose
-        // extent leaked is the one already marked `Reaped`, which `in_state(Reaping)` cannot see
+        // the durable image has just been loaded, every interrupted reap above has finished or
+        // been declined, and nothing has run since. ⚠ W6 (wall21 review audit 3): this said
+        // "finished"; since C2a and W3 some are DECLINED. A declined reap whose record reads is
+        // still `Reaping` at its generation, so its extents are not orphans and wait for the next
+        // open's resume. One whose record cannot be read counts as gone to
+        // `extent_is_collectable` (as before W3), so its EMPTY extents are freed here and the rest
+        // wait. Resuming a `Reaping` record does not cover a crash orphan — the record whose
+        // extent leaked is the one already marked `Reaped`, which the `Reaping` index cannot see
         // and which nothing else will ever name again. Freeing it here is what returns the
         // reserved page count to baseline after a crash (`arena.rs`, `free_arena`'s note on the
         // durable map; exit criterion 8 is stated in reserved pages).
@@ -283,7 +320,9 @@ impl TwoTierReaper {
     /// Before D200 the cascade in [`Self::detach_from_parent`] released no ancestor, so every
     /// pruned interior branch kept its slot for good. Since D200 it does, and what can still leave
     /// one is a crash inside a reap's tail: after the `Reaped` flip, before the detach and release
-    /// that follow it. The record is not `Reaping` by then, so resuming cannot see it.
+    /// that follow it. The record is not `Reaping` by then, so resuming cannot see it. Also a
+    /// release whose read or write failed, which keys its slot (C1, W1, W2), and a resumed reap
+    /// the open declined (C2a, W3).
     ///
     /// # What it does per slot
     ///
@@ -298,10 +337,13 @@ impl TwoTierReaper {
     /// - The candidate query is one range scan of the catalog's UNRELEASED span
     ///   (`TableBranchCatalog::unreleased_reaped_candidates`), which holds a slot only while it may
     ///   be RELEASABLE: mid-reap, or `Reaped` with nothing alive below it and not yet released. A
-    ///   pinned interior is off it until its last pin goes. **On a catalog only ever reaped by a
-    ///   reaper, the span is empty**, so this is one empty-span probe, and that matters because
-    ///   `LeaseThread::start` runs it inside `with_lock`, the statement lock. A crash can leave the
-    ///   slots it interrupted. ⚠ **F6 (review audit): not empty after reaper-less use.** The
+    ///   pinned interior is off it until its last pin goes, except one whose liveness read failed
+    ///   at its release (W7, wall21 review audit 3: C1 keys it, and it stays keyed while pinned).
+    ///   **On a catalog only ever reaped by a reaper, with no failed read or write, the span is
+    ///   empty**, so this is one empty-span probe, and that matters because `LeaseThread::start`
+    ///   runs it inside `with_lock`, the statement lock. A crash can leave the slots it
+    ///   interrupted, and a slot whose record cannot be read stays on it, refused at every open.
+    ///   ⚠ **F6 (review audit): not empty after reaper-less use.** The
     ///   reaper-less `seal` arm keys every releasable branch it seals and releases none, so the
     ///   first open WITH a reaper reads O(branches sealed without one), once, under that lock, and
     ///   re-walks an ancestor shared by several such originators once per originator. Pinned by
@@ -772,10 +814,14 @@ pub(crate) fn detach_cascade(
     // re-checks both. AFTER every detach, never before: a slot recycled while its old CHILD entry
     // still named it would pin the old parent through the new branch.
     //
-    // ⚠ Residual, stated (lane §8.7): `release_id` swallows its own errors, so an ancestor whose
-    // release FAILS here is left keyless once its originator is released. That is an error-only
-    // leak, never a free. The trait's `release_id` returns `()`, so the cascade cannot see the
-    // failure.
+    // Residual (lane §8.7), NARROWED by W1 and W2 (wall21 review audit 3): `release_id` swallows
+    // its own errors, and the trait's `()` hides them from this loop. An ancestor here holds no
+    // key (it lost it at its pinned flip), so a release that failed and wrote nothing left it
+    // keyless once the originator was released. `TableBranchCatalog::release_id` now KEYS the
+    // slot on every error it sees (a FREE_ID write, a liveness read, the record read), so the
+    // sweep finds it. What is left is a failure of that key write or of the sync itself: a slot
+    // leak, error-only, never a free. §8.11 of the lane called this residual retired after C1;
+    // that was wrong until W1.
     let mut released = Vec::new();
     if release_ancestors {
         for id in ancestors.into_iter().rev() {

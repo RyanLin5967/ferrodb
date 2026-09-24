@@ -77,13 +77,19 @@ pub mod tag {
     ///   if something is (a PINNED interior is not releasable);
     /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
     ///   frees it runs for an originator whose own key covers it until that originator's release);
-    /// - taken off by `release_id`.
+    /// - taken off by `release_id`, and only once the slot IS on the free list;
+    /// - put here by `release_id` on every error it swallows (the FREE_ID write, the liveness
+    ///   read, the record read), whatever the slot held before: C1, W1 and W2 of the wall21
+    ///   review audits. A key frees nothing: the sweep and `release_id` re-read before acting;
+    /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read
+    ///   (W3).
     ///
     /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
     /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
     /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
-    /// interiors number up to live branches × chain depth under MCTS pruning; neither is here. On
-    /// a catalog only ever reaped by a reaper the span is empty; after reaper-less use it holds
+    /// interiors number up to live branches × chain depth under MCTS pruning; neither is here,
+    /// except a pinned slot a failed liveness read keyed (W7). On a catalog only ever reaped by a
+    /// reaper, with no failed read or write, the span is empty; after reaper-less use it holds
     /// every branch sealed without one until the first open with a reaper releases them (F6 of the
     /// wall21 review audit). The one-byte key `[0x08]` alone is not a slot: it
     /// marks the span as complete for this catalog (see `unreleased_index_built`).

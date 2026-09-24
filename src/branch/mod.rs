@@ -256,6 +256,17 @@ pub trait BranchCatalog: Send + Sync {
     /// filtered out — the two callers disagree about whether they want it, so each says.
     fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError>;
 
+    /// The ids of [`Self::in_state`], in branch-id order, **without decoding a record**.
+    ///
+    /// **W3 (wall21 review audit 3).** `in_state` decodes every record in the span, so one record
+    /// that cannot be decoded fails the whole question. The open's resume asks this instead and
+    /// reads each record itself, so that record costs a counted refusal and not the open (D127).
+    /// The default is `in_state`'s ids, which decodes; a catalog that indexes state by key should
+    /// answer from the index alone, as `TableBranchCatalog` does.
+    fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
+        Ok(self.in_state(state)?.into_iter().map(|r| r.branch_id.id).collect())
+    }
+
     /// Every record the catalog holds, whatever its state, **streamed in branch-id order**.
     ///
     /// This one is genuinely O(N) and no index changes that: its callers are a full system view

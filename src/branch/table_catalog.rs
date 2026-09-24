@@ -1164,16 +1164,23 @@ impl TableBranchCatalog {
         free.sort_unstable();
         let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
         let mut reaped = Vec::new();
+        let mut unreadable = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if id == 0 || free.binary_search(&id).is_ok() {
                 continue;
             }
             // Re-read: a STATE key that outlived its state (pre-F4 recycling) names a live slot.
-            if let Some(rec) = self.core(id)? {
-                if rec.state() == BranchState::Reaped {
-                    reaped.push(id);
-                }
+            match self.core(id) {
+                Ok(Some(rec)) if rec.state() == BranchState::Reaped => reaped.push(id),
+                Ok(_) => {}
+                // W3 (wall21 review audit 3): keyed, not a failed open, as `release_id` keys a slot
+                // whose record it cannot read. The sweep records the refusal.
+                Err(FerroError::Branch(_)) => unreadable.push(id),
+                Err(e) => return Err(e),
             }
+        }
+        for id in unreadable {
+            self.upsert(keys::unreleased(id), Vec::new())?;
         }
         // Only a RELEASABLE slot: a pinned one stays off until its last pin goes. **New-wall audit
         // round 2:** this asked `has_live_children` per slot, a DFS over everything reaped below it,
@@ -1571,6 +1578,15 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(out)
     }
 
+    /// The STATE span's ids alone (W3): no record is decoded, so an undecodable one is left for
+    /// the caller to meet, per slot.
+    fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
+        let (lo, hi) = keys::whole_state(state.as_u8());
+        let mut ids = self.ids_in_span(lo, hi)?;
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     fn scan(&self)
         -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::RECORD);
@@ -1755,15 +1771,23 @@ impl BranchCatalog for TableBranchCatalog {
         let core = self.core(id);
         let live = self.has_live_children(id);
         let reaped = matches!(&core, Ok(Some(rec)) if rec.state() == BranchState::Reaped);
-        // **C1 (wall21 review audit 2): a swallowed error must still leave the slot where the open
-        // sweep looks.** Errors are swallowed because the trait returns `()`. Before C1 that
-        // could end a slot keyless and not free, stranded silently, in two ways. Both are closed
-        // here, under `logical` and in this call's one sync, with no trait change:
-        // - WRITE side: the UNRELEASED key came off whatever the FREE_ID upsert returned. Now it
-        //   comes off only once the slot IS on the free list.
-        // - READ side: a `Reaped` slot whose liveness read ERRED got nothing written. Now it goes
-        //   on the span, so the sweep retries it and records a D127 refusal with its reason. This
-        //   never happens on `Ok(true)`: a pinned slot stays keyless (the lead audit of 17cbd4c).
+        // **C1 (wall21 review audit 2), completed by W1 and W2 (audit 3): a swallowed error must
+        // still leave the slot where the open sweep looks.** Errors are swallowed because the
+        // trait returns `()`, so an error that writes no key ends the slot keyless and not free:
+        // stranded, silently. The rule, under `logical` and in this call's one sync, with no trait
+        // change: **every error KEYS the slot, whatever it held before**; only a successful
+        // FREE_ID write takes the key off.
+        // - WRITE side: the FREE_ID upsert failed. C1 only skipped the key's removal, which is not
+        //   enough for a slot that holds NO key: a cascade ancestor lost its key at its pinned
+        //   flip, and the originator's release then removed the last key a sweep could follow to
+        //   it (W1). So the failure WRITES the key.
+        // - READ side, liveness: a `Reaped` slot whose liveness read ERRED is keyed, so the sweep
+        //   retries it and records a D127 refusal with its reason.
+        // - READ side, the record itself (W2): its state is unknown, so it is keyed the same way.
+        //   A key frees nothing by itself: the sweep and this method both re-read before acting.
+        // None of these fires on `Ok(true)`: a readable, pinned slot stays keyless (the lead audit
+        // of 17cbd4c). What is left is a failure of the key write or the sync itself, which no
+        // write in this method can cover.
         let wrote = if reaped && matches!(live, Ok(false)) {
             #[cfg(test)]
             let freed = if self.fail_next_free_id_upsert.swap(false, Ordering::SeqCst) {
@@ -1777,9 +1801,12 @@ impl BranchCatalog for TableBranchCatalog {
                 // D200: off the UNRELEASED span, under the same lock and in the same sync as the
                 // free-list entry.
                 let _ = self.remove_if_present(&keys::unreleased(id));
+            } else {
+                // W1: ON it, whether or not it was before.
+                let _ = self.upsert(keys::unreleased(id), Vec::new());
             }
             true
-        } else if reaped && live.is_err() {
+        } else if (reaped && live.is_err()) || core.is_err() {
             let _ = self.upsert(keys::unreleased(id), Vec::new());
             true
         } else {
@@ -1796,8 +1823,10 @@ impl BranchCatalog for TableBranchCatalog {
         }
     }
 
-    /// **D200.** One range scan of the UNRELEASED span: O(releasable), never O(ever reaped) and
-    /// never O(pinned).
+    /// **D200.** One range scan of the UNRELEASED span: O(releasable), never O(ever reaped), and
+    /// O(pinned) only in the slots a failed read left keyed (W7, wall21 review audit 3: a slot
+    /// whose liveness read failed at its release is keyed even if it later proves pinned, and one
+    /// whose record cannot be read stays keyed, and refused, at every open).
     ///
     /// History, both versions found by review:
     /// - The first merged the whole `Reaped` STATE span against the whole FREE_ID span at every
@@ -1807,12 +1836,13 @@ impl BranchCatalog for TableBranchCatalog {
     ///   under the statement lock at every start.
     ///
     /// Now the span of a catalog only ever reaped by a reaper is EMPTY (`tag::UNRELEASED` says who
-    /// puts a slot on it and who takes it off), and a crash can leave the slots it interrupted.
-    /// After reaper-less use it holds every branch sealed without a reaper, until the first open
-    /// with one (F6 of the wall21 review audit). Pinned by
+    /// puts a slot on it and who takes it off). A crash can leave the slots it interrupted, and a
+    /// release whose read or write failed leaves its slot (`release_id`). After reaper-less use it
+    /// holds every branch sealed without a reaper, until the first open with one (F6 of the
+    /// wall21 review audit). Pinned by
     /// `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`. Each
-    /// entry's record is re-read, so only a `Reaped` slot is offered; `Reaping` ones belong to
-    /// the resume, which runs first.
+    /// entry's record is re-read, so a readable slot is offered only if `Reaped`; `Reaping` ones
+    /// belong to the resume, which runs first. An unreadable one is offered (W3).
     fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::UNRELEASED);
         let mut out = Vec::new();
@@ -1821,10 +1851,16 @@ impl BranchCatalog for TableBranchCatalog {
             // The marker is not a slot.
             let Some(id) = keys::unreleased_id_from_key(&k) else { continue };
             self.candidate_keys.fetch_add(1, Ordering::Relaxed);
-            if let Some(rec) = self.core(id)? {
-                if rec.state() == BranchState::Reaped {
-                    out.push(id);
-                }
+            match self.core(id) {
+                Ok(Some(rec)) if rec.state() == BranchState::Reaped => out.push(id),
+                Ok(_) => {}
+                // **W3 (wall21 review audit 3): offered, not propagated.** This was `core(id)?`, so
+                // one undecodable keyed record failed every open. A candidate list may be a
+                // superset: the sweep's own `get_raw` meets the same error per slot and records it
+                // as a refusal with its reason (D127). An error reading the TREE is not one slot's,
+                // and still fails the query, as it does the sweep.
+                Err(FerroError::Branch(_)) => out.push(id),
+                Err(e) => return Err(e),
             }
         }
         Ok(out)

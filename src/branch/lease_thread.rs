@@ -28,8 +28,11 @@
 //! (`check_readable` rejects it) while its extents are still charged to it, so the space is lost
 //! for the life of the file. [`LeaseThread::start`] therefore runs
 //! [`TwoTierReaper::resume_interrupted_reaps`] on the **calling** thread, before it spawns
-//! anything, and returns its error to the caller rather than letting it disappear into a
-//! background thread nobody is reading.
+//! anything, and returns a catalog-wide error to the caller rather than letting it disappear into
+//! a background thread nobody is reading. One reap or slot the catalog cannot answer for is NOT
+//! such an error (D127; C2a and W3 of the wall21 review audits): it is declined, printed here
+//! with its reason, and asked again at the next open, so one bad record cannot stop the database
+//! from opening. (This rule said "returns its error" until audit 3 W6.)
 //!
 //! **2. Never reap inside a merge.** A merge is an optimistic read of a branch followed by a
 //! publication into its parent (`DESIGN.md` §4). Reaping the branch in that window frees its
@@ -379,12 +382,18 @@ pub struct LeaseThread {
 }
 
 impl LeaseThread {
-    /// Finish any interrupted reap, then scan every `interval` until stopped.
+    /// Finish the interrupted reaps the catalog can answer for (declining the rest, each with its
+    /// reason), then scan every `interval` until stopped.
     ///
-    /// The resume runs **here**, on the caller's thread and under the runtime lock, so that a
-    /// caller holding an `Ok` knows the database has no half-reaped branch left in it, and so that
-    /// a failure is returned rather than printed into a background thread's stderr. Callers should
-    /// therefore call this before they begin serving.
+    /// The resume runs **here**, on the caller's thread and under the runtime lock, so that its
+    /// outcome is settled before the caller serves: a catalog-wide failure is returned rather than
+    /// printed into a background thread's stderr, and each reap or slot it declined is printed
+    /// below with its reason. Callers should therefore call this before they begin serving.
+    ///
+    /// ⚠ **W6 (wall21 review audit 3): an `Ok` does NOT mean no half-reaped branch is left.**
+    /// This said it did, which has been false since C2a: a resumed reap the catalog cannot answer
+    /// for, or (W3) a `Reaping` record that cannot be read, is declined and counted
+    /// (`TwoTierReaper::refused_reaps`), and the open goes on.
     ///
     /// `reaper` is a concrete [`TwoTierReaper`] rather than a `dyn Reaper` because
     /// `resume_interrupted_reaps` is an inherent method: the trait carries only the steady-state
@@ -416,12 +425,21 @@ impl LeaseThread {
                  released (D200)"
             ));
         }
-        // C2a: this list also carries the resumed reaps the open declined.
+        // C2a: this list also carries the resumed reaps the open declined. Worded per source (W6,
+        // wall21 review audit 3). The one line this printed for all of them said "the slot keeps
+        // its pages": false for a swept slot, which is `Reaped` and whose extents its reap already
+        // freed, and false for a resumed reap that failed after its flip.
         for why in reaper.open_slot_refusals() {
-            report(format!(
-                "lease: at open, declined to decide (the slot keeps its pages and its id, and the \
-                 next open asks again): {why}"
-            ));
+            let what = if why.starts_with("slot ") {
+                "did not give back an id slot (it stays reserved, and the next open asks again)"
+            } else if why.starts_with("interrupted reap of slot ") {
+                "did not resume an interrupted reap, because its record cannot be read (the next \
+                 open asks again)"
+            } else {
+                "a resumed reap stopped part-way (what it finished stays done; the slot sweep or \
+                 the next open retries the rest)"
+            };
+            report(format!("lease: at open, {what}: {why}"));
         }
 
         let counters = Arc::new(Counters::default());
