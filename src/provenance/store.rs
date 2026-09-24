@@ -280,22 +280,40 @@ impl ProvenanceStore for MemProvenanceStore {
         inner.pages.entry(rid.page_id).or_default().stamp(rid.slot_num, id)
     }
 
+    /// A batch of one. There is ONE implementation of the row-attribution guards, in `stamp_rows`,
+    /// so the single and batched paths cannot drift apart.
     fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+        self.stamp_rows(&[(table, row)], id)
+    }
+
+    fn stamp_rows(&self, rows: &[(u32, u64)], id: ProvId) -> Result<(), FerroError> {
+        let Some(&(table, row)) = rows.first() else {
+            return Ok(());
+        };
         let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
         // `ProvId::NONE` clears rather than refusing; see the trait for why the two stamps differ.
         if id.is_none() {
-            inner.row_author.remove(&(table, row));
+            for key in rows {
+                inner.row_author.remove(key);
+            }
             return Ok(());
         }
         // The same "not interned" guard `stamp` applies, for the same reason: an id the store
         // cannot resolve would make `who_wrote_row` answer `None` for a row it had been told about,
-        // which is indistinguishable from a row nobody wrote.
+        // which is indistinguishable from a row nobody wrote. Checked ONCE, before any row is
+        // touched: every row carries the same id, so the batch is refused whole or applied whole.
         if inner.runs.get(id.0 as usize - 1).is_none() {
-            return Err(FerroError::Provenance(format!(
-                "cannot attribute row {row} of table {table} to {id}: not interned"
-            )));
+            return Err(FerroError::Provenance(match rows.len() {
+                1 => format!("cannot attribute row {row} of table {table} to {id}: not interned"),
+                n => format!(
+                    "cannot attribute row {row} of table {table} (and {} more) to {id}: not interned",
+                    n - 1
+                ),
+            }));
         }
-        inner.row_author.insert((table, row), id);
+        for key in rows {
+            inner.row_author.insert(*key, id);
+        }
         Ok(())
     }
 
@@ -428,6 +446,25 @@ mod tests {
         let a = s.intern(&run("restock", "run-1")).unwrap();
         assert_eq!(a, ProvId(1));
         s.stamp_row(7, 1, ProvId(1)).expect("a real run was refused");
+    }
+
+    /// A batch lands exactly as the same rows stamped one call at a time, clears included — and an
+    /// uninterned id is refused before ANY row of the batch is attributed.
+    #[test]
+    fn a_batch_of_rows_is_refused_whole_or_applied_whole() {
+        let s = MemProvenanceStore::new();
+        let err = s
+            .stamp_rows(&[(7, 1), (7, 2), (7, 3)], ProvId(1))
+            .expect_err("a batch naming an uninterned run was accepted");
+        assert!(format!("{err}").contains("(and 2 more)"), "refused, but not by this guard: {err}");
+        assert!(s.attributed_rows(7).unwrap().is_empty(), "a refused batch attributed a prefix");
+
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp_rows(&[(7, 1), (7, 2), (7, 3)], a).unwrap();
+        assert_eq!(s.attributed_rows(7).unwrap(), vec![(1, a), (2, a), (3, a)]);
+        s.stamp_rows(&[(7, 1), (7, 3)], ProvId::NONE).unwrap();
+        assert_eq!(s.attributed_rows(7).unwrap(), vec![(2, a)], "a batched clear took the wrong rows");
+        s.stamp_rows(&[], ProvId(99)).expect("an empty batch attributes nothing and cannot be refused");
     }
 
     #[test]

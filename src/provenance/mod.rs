@@ -210,6 +210,22 @@ pub trait ProvenanceStore: Send + Sync {
     /// is a confident wrong answer where `None` was available.
     fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError>;
 
+    /// Record that the run `id` published every row in `rows`, in order, as ONE durable unit.
+    ///
+    /// **D219.** `AgentRuntime::record_applied` called `stamp_row` once per applied op while
+    /// holding the runtime's `state` lock, and a durable store syncs once per call, so a merge of δ
+    /// ops held that lock across δ fsyncs. One merge's authorship is one decision, so it is
+    /// recorded as one batch: a durable store makes it one append and one fsync, whatever δ is.
+    ///
+    /// The same outcome as calling `stamp_row` for each entry in order — the same guards, the same
+    /// final state, `ProvId::NONE` clearing — and the same records in a durable file, repeats
+    /// included. The one difference is the point of a batch: a refusal happens before ANY row is
+    /// attributed, never after some of them.
+    ///
+    /// An empty `rows` records nothing and is not a write, so it succeeds even on a store that is
+    /// refusing writes — exactly as making no `stamp_row` call at all would.
+    fn stamp_rows(&self, rows: &[(u32, u64)], id: ProvId) -> Result<(), FerroError>;
+
     /// Which run last published the logical row. `ProvId::NONE` when nobody is on record — never a
     /// guess, and never the author of a neighbouring row.
     fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError>;
@@ -240,15 +256,17 @@ pub trait ProvenanceStore: Send + Sync {
 /// Split rather than totalled for the reason [`durable::RecoveryReport`] is: a total hides one
 /// write path behind another. D219 is the case that needed it. A `MERGE` against the durable store
 /// pays syncs on two paths — the executor's physical `stamp`, once per published VERSION, and
-/// `record_applied`'s logical `stamp_row`, once per applied OP — and only the second runs under
-/// `AgentRuntime`'s `state` lock. One number could not say which of the two moved.
+/// `record_applied`'s logical row authorship, under `AgentRuntime`'s `state` lock — and D219
+/// changed only the second, from one sync per applied OP (`stamp_row` in a loop) to one per merge
+/// (`stamp_rows`). One number could not say which of the two moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncCounts {
     /// Syncs that made a newly interned run durable. A repeat intern is a lookup and syncs nothing.
     pub runs: u64,
     /// Syncs that made a physical `(page, slot)` stamp durable.
     pub stamps: u64,
-    /// Syncs that made logical `(table, row)` authorship durable.
+    /// Syncs that made logical `(table, row)` authorship durable: one per `stamp_row` call, and
+    /// one per `stamp_rows` batch however many rows it carries.
     pub row_authors: u64,
     /// Syncs that made a `DROP TABLE`'s forget durable.
     pub forgets: u64,

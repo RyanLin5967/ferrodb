@@ -5371,6 +5371,9 @@ impl AgentRuntime {
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
         let mut written: Vec<WriteRecord> = Vec::new();
+        // The rows this merge published, one entry per applied op, attributed in one batch after
+        // the loop (D219).
+        let mut authored: Vec<(u32, u64)> = Vec::new();
         let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
@@ -5435,11 +5438,25 @@ impl AgentRuntime {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
                 // Authorship of the published row, kept past `seal` AND past the process
-                // (exit criterion 9). This is the write that makes `who_wrote_row` durable.
-                self.prov_store
-                    .stamp_row(op.tbl.0, op.row.0, snapshot.prov)?;
+                // (exit criterion 9). Recorded after the loop, all at once.
+                authored.push((op.tbl.0, op.row.0));
             }
         }
+        // **D219 — one append and one fsync for the whole merge's authorship.** This was one
+        // `stamp_row` per op inside the loop above, and a durable store syncs once per call, so a
+        // merge of δ ops held `state` — which every agent statement takes — across δ fsyncs. The
+        // records, their order and their bytes are unchanged; only the number of syncs they share
+        // went from δ to 1. This is still the write that makes `who_wrote_row` durable, and it
+        // still completes before this function returns, so before `merge` acknowledges anything.
+        //
+        // It stays under `state` deliberately. The sync could be awaited after releasing `state`
+        // (stage under the lock, wait outside it, as `begin_session_as_staged` does for a fork),
+        // but every shape that runs SQL holds the catalog lock for the whole MERGE statement —
+        // `cli.rs` per statement, and pgwire's `writer_active` stands every shared reader down —
+        // so no STATEMENT could observe the shorter hold. The one caller that takes `state`
+        // outside the catalog lock is the lease thread's `forget_reaped_branches` reconciliation
+        // (D98 moved it out), which is background housekeeping no client waits on.
+        self.prov_store.stamp_rows(&authored, snapshot.prov)?;
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
         // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
         // does not borrow-check.
