@@ -128,3 +128,32 @@ arm, although the brief or the refusal message claims them:
 
 Registered arm count for run 2: **14**. Run 2 writes to `bench/d196_gate_firecheck_run2.txt`, and
 run 1's file stays as it is.
+
+---
+
+## Results (appended after both runs; the raw files were committed first)
+
+| run | candidate | gate blob (C / pre-D196) | arms | predicates | failed | raw |
+|---|---|---|---|---|---|---|
+| 1 | `37d964b` | `b528856` / `a618eb8` | 10/10 | 77 | 0 | `bench/d196_gate_firecheck.txt` (`b4a5d48`) |
+| 2 | `ae5422c` | `b528856` / `a618eb8` | 14/14 | 100 | 0 | `bench/d196_gate_firecheck_run2.txt` (`2550b7d`) |
+
+Both runs used the same gate text (blob `b528856`). Every arm came out as predicted: none printed an
+unpredicted line, and none reached the fake `cargo`. The no-build detector fired on purpose before
+the arms, with exit 97 and the sentinel written. I read the raw output arm by arm rather than the
+PASS count:
+
+- **The step-0 refusal fires, and fires first.** A1, A2, A3 and D3 refuse before any summary line.
+  A2 does so on a dirty tree. **None of them built.**
+- **It does not fire spuriously.** B1–B4 pass step 0 with the landing given as a full sha, a short
+  sha, a branch name, and from a linked worktree. Each stops only at certify-head's empty verify dir.
+- **The old text does not fire.** C1 reaches `[1/3]`. C2 sends the operator to clean the tree, which
+  is the 00:37Z misdirection. D2 prints `OK` while its step 3 reports building `MS`, not the
+  certified `S`. That is D196 reproduced end to end. E2 prints `OK` after HEAD moved mid-gate.
+- **The closing check** fires on a clean checkout during step 3 (E1). The dirty-after check does not
+  fire there, so E1 shows the new check fired and not the old one.
+- **"Not your cwd" holds.** A3 ran from a checkout at the candidate and still refused, naming the
+  tree the script lives in.
+
+**Not shown here, and queued (FAN-QUEUE row 9):** the real `prepush.sh` building the candidate to OK,
+and the suite. See "What this fire-check CANNOT show" above.
