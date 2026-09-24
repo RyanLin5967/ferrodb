@@ -28,6 +28,28 @@
 //! errors either, so counting them as unresolved would be equally wrong. They are recognised and
 //! counted in [`Decoded::internal`].
 //!
+//! **3. An UPDATE that outgrows its page is logged as a delete and an insert (D203).** When the new
+//! tuple does not fit its page, `HeapFileManager::update` frees the slot and inserts the row on
+//! another page, and it logs exactly that: a `HeapDelete` of the live row, then, as the
+//! transaction's next record, a `HeapInsert` of the new one. Decoded record by record, a consumer is
+//! told the row was deleted and a new one appeared, for what was one UPDATE. Postgres logs such an
+//! update as one record whatever page the new version lands on, and its logical decoding emits one
+//! UPDATE; physical placement is not a logical change. So the two records are read back as one:
+//!
+//! - **What identifies the pair**: a `HeapDelete` whose image is LIVE (`end_ts == 0`), followed by the
+//!   SAME transaction's next record — time-travel records aside, since they are not changes — being a
+//!   `HeapInsert` into the same table with the same primary key (column 0, which an UPDATE may not
+//!   assign). It becomes one `Update { old, new }`, stamped with the `HeapDelete`'s LSN. "Next record
+//!   of the transaction", not "next record in the log": other transactions interleave.
+//! - **Why a live `HeapDelete` is enough to mark**: no other production writer logs one. A SQL
+//!   `DELETE` is a `HeapUpdate` stamping `end_ts` (point 1), same length, so it never relocates.
+//!   `HeapFileManager::delete` is called only from tests, and an abort's compensation is a `Clr`
+//!   record in a transaction this decoder discards.
+//! - **A DELETE and an unrelated INSERT adjacent in one transaction stay two events.** A SQL DELETE
+//!   never marks, so `DELETE k; INSERT k` in one transaction is still `DELETE` + `INSERT`. A marked
+//!   delete followed by any other record, or by an insert of another key or table, is left exactly
+//!   as it decodes without this rule.
+//!
 //! # The property that makes a feed usable
 //!
 //! **Only committed transactions are emitted, and they are emitted in commit order.**
@@ -813,6 +835,9 @@ impl LogicalDecoder {
         // from the log, not handed in: see `RecKind::RunIdentity`.
         let mut runs: HashMap<u32, Arc<RunEntity>> = HashMap::new();
         let mut bound: HashMap<u64, Arc<RunEntity>> = HashMap::new();
+        // Transactions whose previous record was a live `HeapDelete`: possibly the first half of a
+        // relocating UPDATE, decided by the transaction's next record. Point 3 of the module doc.
+        let mut relocating: BTreeSet<u64> = BTreeSet::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -838,14 +863,31 @@ impl LogicalDecoder {
                 lsn = next;
                 continue;
             }
+            // Taken AFTER the time-travel skip above, so bookkeeping between the two halves of a
+            // relocation does not separate them; any other record of this transaction does.
+            let relocation_half = relocating.remove(&txn);
 
             match &rec.kind {
                 RecKind::HeapInsert { dir_root, tuple, .. } => {
                     match Self::row_in(&tables, *dir_root, tuple) {
-                        RowResult::Row(table, columns, new) => staged
-                            .entry(txn)
-                            .or_default()
-                            .push((lsn, table, columns, ChangeOp::Insert { new })),
+                        RowResult::Row(table, columns, new) => {
+                            let changes = staged.entry(txn).or_default();
+                            // Point 3: if this completes a relocating UPDATE, its first half is this
+                            // transaction's last staged change, and the pair becomes one UPDATE at the
+                            // first half's LSN. Anything else is put back as it was.
+                            let event = match relocation_half.then(|| changes.pop()).flatten() {
+                                Some((at, t, cols, ChangeOp::Delete { old }))
+                                    if t == table && old.first() == new.first() =>
+                                {
+                                    (at, t, cols, ChangeOp::Update { old, new })
+                                }
+                                popped => {
+                                    changes.extend(popped);
+                                    (lsn, table, columns, ChangeOp::Insert { new })
+                                }
+                            };
+                            changes.push(event);
+                        }
                         RowResult::UnknownTable => {
                             *out.unresolved.entry(*dir_root).or_insert(0) += 1
                         }
@@ -855,10 +897,17 @@ impl LogicalDecoder {
                     }
                 }
                 RecKind::HeapDelete { dir_root, old, .. } => match Self::row_in(&tables, *dir_root, old) {
-                    RowResult::Row(table, columns, old) => staged
-                        .entry(txn)
-                        .or_default()
-                        .push((lsn, table, columns, ChangeOp::Delete { old })),
+                    RowResult::Row(table, columns, decoded) => {
+                        staged
+                            .entry(txn)
+                            .or_default()
+                            .push((lsn, table, columns, ChangeOp::Delete { old: decoded }));
+                        // Point 3: a LIVE row leaving its slot is the first half of a relocating
+                        // UPDATE; the transaction's next record decides whether it is paired.
+                        if !Self::is_dead(old) {
+                            relocating.insert(txn);
+                        }
+                    }
                     RowResult::UnknownTable => *out.unresolved.entry(*dir_root).or_insert(0) += 1,
                     RowResult::Undecodable => *out.undecodable.entry(*dir_root).or_insert(0) += 1,
                 },
