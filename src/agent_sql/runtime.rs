@@ -5774,6 +5774,7 @@ impl AgentRuntime {
         // is what scopes this to a parent that is still readable — the behaviour this path has
         // today. A reaped parent's stale entries are the reaper's business (`detach_from_parent`,
         // which cascades); this is the reaper-less fallback and does not take that on.
+        // ⛔ Superseded by D201's second step below: this arm now runs that same cascade.
         //
         // ⛔ **D201 — this used to detach FIRST and unconditionally**, which was wrong twice:
         // 1. **Detaching a branch that still has live children is D16's interior-prune loss.**
@@ -5787,7 +5788,19 @@ impl AgentRuntime {
         //    reverse.
         // So: mark, then detach only a branch with nothing alive below it. A branch that still
         // has live children stays attached as a reaped pin, exactly as a reaped interior does
-        // under the reaper, and its entry resolves to "not a pin" once they are gone.
+        // under the reaper.
+        //
+        // **D201, second step (lead audit of `17cbd4c`) — and the pin must come OFF when the
+        // subtree dies.** The first fix detached only under a READABLE parent, so a child sealed
+        // under an already-reaped parent was never detached: dead subtrees stayed in live
+        // ancestors' CHILD spans for good, and every liveness question from above walked them
+        // (`cow_page` → `max_live_child`, `free_page` → `live_child_in_epoch_range`, per page).
+        // This arm now runs the reaper's own cascade (`reaper::detach_cascade`): detach this
+        // branch if nothing below it is alive, then each reaped ancestor that became childless.
+        // It does not release ids (`release_ancestors = false`): this arm never has, and which ids
+        // a reaper-less runtime hands out is not this change. Those slots stay on the UNRELEASED
+        // span for the first open that has a reaper. Red test:
+        // `d201_reaperless_seal_keeps_the_pin::a_reaperless_runtime_unlinks_a_subtree_once_nothing_in_it_is_alive`.
         //
         // Not made unrepresentable, and why: `git grep` at `d04aeeb` finds 43 `with_storage` /
         // `reopen_with_storage` call lines in 29 files (tests and examples, mostly) against 7
@@ -5796,13 +5809,7 @@ impl AgentRuntime {
         // arm is made safe instead. Red test: `tests/d201_reaperless_seal_keeps_the_pin.rs`.
         let record = self.branches.get(branch)?;
         self.branches.set_state(branch, record.state, BranchState::Reaped)?;
-        if !self.branches.has_live_children(branch.id)? {
-            if let Some(parent) = record.parent_id {
-                if self.branches.get(parent).is_ok() {
-                    self.branches.detach_child(parent.id, record.fork_epoch)?;
-                }
-            }
-        }
+        crate::branch::reaper::detach_cascade(&*self.branches, &record, false)?;
         // **D103 — attested after the state change lands**, for the same reason the merge entry is
         // appended after its commit: a record of a reap that did not happen is worse than none.
         // The entry seals this branch's chain, and it carries whether the branch's writes were

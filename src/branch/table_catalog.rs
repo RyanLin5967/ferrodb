@@ -403,11 +403,9 @@ impl TableBranchCatalog {
         cat.next_id.store(max_id + 1, Ordering::SeqCst);
         cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
 
-        // D200: every reaped record goes on the UNRELEASED span first, as `set_state` would have
-        // put it; `release_id` below takes off each one it frees, leaving the pinned ones.
-        for id in &reaped {
-            cat.upsert(keys::unreleased(*id), Vec::new())?;
-        }
+        // D200: nothing goes on the UNRELEASED span here. `release_id` below frees every reaped
+        // slot with nothing alive below it; the rest are pinned, which the span does not hold, and
+        // `detach_child` puts each one back when its last pin goes.
         // Free ids last: `release_id` refuses while a slot still has live children, so it has to
         // see the child entries that were just attached.
         for id in reaped {
@@ -1028,15 +1026,18 @@ impl TableBranchCatalog {
         state == BranchState::Live && !branch_id.is_trunk()
     }
 
-    /// Ids of every entry in a span whose key ends with an 8-byte branch id.
     /// **D200.** Give a catalog written before the UNRELEASED span existed its span — once.
     ///
     /// Such a catalog can hold `Reaped` slots that were never released (the pre-D200 cascade left
     /// one per pruned interior) with no key naming them, and the open sweep reads only the span.
     /// So its first open finds them the expensive way: the `Reaped` STATE span merged against the
-    /// FREE_ID span, O(Reaped + free), plus the `Reaping` span, which `set_state` would also have
-    /// put on it. It writes one key per slot found, then the marker, in one sync. Every later
-    /// open reads the marker and returns. A catalog made by `create` has the marker from birth.
+    /// FREE_ID span, plus one liveness question for each slot in the first and not the second —
+    /// only a RELEASABLE one goes on the span, as `set_state` would have left it — plus the
+    /// `Reaping` span. It writes one key per slot found, then the marker, in one sync.
+    ///
+    /// **One-time cost: O(slots ever reaped and not recycled), plus those liveness questions,
+    /// once per catalog** — a migration, not a per-open cost. Every later open reads the marker and
+    /// returns; a catalog made by `create` has the marker from birth.
     fn build_unreleased_index_if_missing(&self) -> Result<(), FerroError> {
         if self.tree.search(&keys::unreleased_index_built())?.is_some() {
             return Ok(());
@@ -1057,8 +1058,11 @@ impl TableBranchCatalog {
                 continue;
             }
             // Re-read: a STATE key that outlived its state (pre-F4 recycling) names a live slot.
+            // And only a RELEASABLE slot: a pinned one stays off until its last pin goes.
             if let Some(rec) = self.core(id)? {
-                if rec.state() == BranchState::Reaped {
+                if rec.state() == BranchState::Reaped
+                    && !matches!(BranchCatalog::has_live_children(self, id), Ok(true))
+                {
                     self.upsert(keys::unreleased(id), Vec::new())?;
                 }
             }
@@ -1073,6 +1077,7 @@ impl TableBranchCatalog {
         self.durable(seq)
     }
 
+    /// Ids of every entry in a span whose key ends with an 8-byte branch id.
     fn ids_in_span(&self, lo: Vec<u8>, hi: Vec<u8>) -> Result<Vec<u64>, FerroError> {
         let mut out = Vec::new();
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
@@ -1344,6 +1349,12 @@ impl BranchCatalog for TableBranchCatalog {
             // generation twice.
             return Ok(());
         }
+        // D200: asked BEFORE any write, so an error here leaves nothing half-written.
+        let releasable = if to == BranchState::Reaped {
+            Some(!BranchCatalog::has_live_children(self, branch.id)?)
+        } else {
+            None
+        };
         let old = core.clone();
         // HYDRATED: `write_record` rewrites the arena span from the record it is handed, so a core
         // record would silently drop every extent this branch owns.
@@ -1357,12 +1368,22 @@ impl BranchCatalog for TableBranchCatalog {
             rec.state = to;
         }
         self.write_record(&rec, Some(&old))?;
-        // **D200.** On the way into `Reaping` — or straight into `Reaped`, which the runtime's
-        // reaper-less arm does — the slot goes on the UNRELEASED span; only `release_id` takes it
-        // off. On the reaper's path that makes the key durable one sync BEFORE the `Reaped` flip,
-        // so no crash can leave a reaped, unreleased slot the open sweep cannot see.
-        if to == BranchState::Reaping || (to == BranchState::Reaped && expect != BranchState::Reaping) {
-            self.upsert(keys::unreleased(branch.id), Vec::new())?;
+        // **D200 — the UNRELEASED span holds a slot only while it may be RELEASABLE.**
+        // - Into `Reaping`: on it. Nothing is settled yet, and a crash mid-reap must leave the slot
+        //   where the open sweep looks; the resumed reap's flip settles it.
+        // - Into `Reaped` with nothing alive below it: on it, until `release_id` takes it off.
+        // - Into `Reaped` while PINNED: OFF it. It cannot be released while anything below it
+        //   lives, and a span holding every pinned interior made every open pay for all of them,
+        //   under the statement lock (lead audit of `17cbd4c`). `detach_child` puts it back the
+        //   moment its last pin goes.
+        match (to, releasable) {
+            (BranchState::Reaping, _) | (BranchState::Reaped, Some(true)) => {
+                self.upsert(keys::unreleased(branch.id), Vec::new())?;
+            }
+            (BranchState::Reaped, Some(false)) => {
+                self.remove_if_present(&keys::unreleased(branch.id))?;
+            }
+            _ => {}
         }
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1631,14 +1652,21 @@ impl BranchCatalog for TableBranchCatalog {
         }
     }
 
-    /// **D200.** One range scan of the UNRELEASED span: O(unreleased), never O(ever reaped).
+    /// **D200.** One range scan of the UNRELEASED span: O(releasable), never O(ever reaped) and
+    /// never O(pinned).
     ///
-    /// The first version merged the whole `Reaped` STATE span against the whole FREE_ID span at
-    /// every open, and a released slot stays `Reaped` until recycled, so a healthy open paid one
-    /// key per branch ever reaped (`d200_reap_releases_id_slots::a_healthy_open_reads_no_released_slot`).
-    /// A healthy catalog's span holds only its pinned reaped interiors; a crash can add the slot
-    /// it interrupted. Each entry's record is re-read, so only a `Reaped` slot is offered —
-    /// `Reaping` ones are the resume's, which runs first.
+    /// History, both versions found by review:
+    /// - The first merged the whole `Reaped` STATE span against the whole FREE_ID span at every
+    ///   open. A released slot stays `Reaped` until recycled, so a healthy open paid one key per
+    ///   branch ever reaped.
+    /// - The second held every PINNED reaped interior, up to live branches × chain depth, read
+    ///   under the statement lock at every start.
+    ///
+    /// Now a healthy catalog's span is EMPTY (`tag::UNRELEASED` says who puts a slot on it and who
+    /// takes it off), and a crash can leave the slots it interrupted. Pinned by
+    /// `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`. Each
+    /// entry's record is re-read, so only a `Reaped` slot is offered; `Reaping` ones belong to
+    /// the resume, which runs first.
     fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::UNRELEASED);
         let mut out = Vec::new();
@@ -1692,6 +1720,20 @@ impl BranchCatalog for TableBranchCatalog {
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
+        // **D200.** A REAPED parent whose last pin this detach removed is releasable from now on:
+        // back on the UNRELEASED span, in the same sync as the detach, so a crash before the
+        // cascade releases it leaves it where the open sweep looks. Any liveness answer short of a
+        // clear YES marks it too: the sweep asks again, and a stray candidate costs one visit,
+        // never a release.
+        if removed {
+            if let Ok(Some(p)) = self.core(parent_id) {
+                if p.state() == BranchState::Reaped
+                    && !matches!(BranchCatalog::has_live_children(self, parent_id), Ok(true))
+                {
+                    self.upsert(keys::unreleased(parent_id), Vec::new())?;
+                }
+            }
+        }
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;

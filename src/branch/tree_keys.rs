@@ -70,15 +70,20 @@ pub mod tag {
     /// branches would need every released id in the header, and the header must stay O(1) or
     /// `open` is O(N) again by another route. "Lowest free id" is the first key in this span.
     pub const FREE_ID: u8 = 0x04;
-    /// `[0x08][branch id]` → empty. **D200.** Every slot whose record is `Reaping` or `Reaped`
-    /// and whose id has not been released: put here by `set_state` on the way into `Reaping`
-    /// (or straight into `Reaped`), taken off only by `release_id`.
+    /// `[0x08][branch id]` → empty. **D200.** Every slot that may be RELEASABLE and is not yet
+    /// released:
+    /// - put here by `set_state` on the way into `Reaping`;
+    /// - kept by the `Reaped` flip only if nothing is alive below it, and taken off by the flip
+    ///   if something is (a PINNED interior is not releasable);
+    /// - put back by `detach_child` when it removes a reaped parent's last pin;
+    /// - taken off by `release_id`.
     ///
-    /// It exists so the open-time sweep for leaked slots reads what is UNRELEASED — pinned reaped
-    /// interiors, plus whatever a crash left — and not every slot ever reaped: a released slot
-    /// stays a `Reaped` record until a fork recycles it, so the `Reaped` STATE span grows with
-    /// branches ever reaped. The one-byte key `[0x08]` alone is not a slot; it marks the span as
-    /// complete for this catalog (see `unreleased_index_built`).
+    /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
+    /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
+    /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
+    /// interiors number up to live branches × chain depth under MCTS pruning; neither is here. On
+    /// a healthy catalog the span is empty. The one-byte key `[0x08]` alone is not a slot: it
+    /// marks the span as complete for this catalog (see `unreleased_index_built`).
     pub const UNRELEASED: u8 = 0x08;
 }
 

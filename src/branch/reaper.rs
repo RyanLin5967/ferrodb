@@ -280,15 +280,17 @@ impl TwoTierReaper {
     /// # Cost at open — O(unreleased), never O(ever reaped)
     ///
     /// - The candidate query is one range scan of the catalog's UNRELEASED span
-    ///   (`TableBranchCatalog::unreleased_reaped_candidates`), which holds a slot from its entry
-    ///   into `Reaping` until `release_id`. On a healthy catalog that is its pinned reaped
-    ///   interiors and nothing else; a crash can add the slot it interrupted. Pinned by
-    ///   `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_slot`: 1 key with 8 or 64
-    ///   released slots. (The first version merged the whole `Reaped` and FREE_ID spans at every
-    ///   open, one key per branch ever reaped, because a released slot stays `Reaped` until
-    ///   recycled.)
-    /// - Per candidate: one record read and one liveness question. The witness cache answers the
-    ///   pinned interiors' questions after the first walk under each chain.
+    ///   (`TableBranchCatalog::unreleased_reaped_candidates`), which holds a slot only while it may
+    ///   be RELEASABLE: mid-reap, or `Reaped` with nothing alive below it and not yet released. A
+    ///   pinned interior is off it until its last pin goes. **On a healthy catalog the span is
+    ///   empty**, so this is one empty-span probe, and that matters because `LeaseThread::start`
+    ///   runs it inside `with_lock`, the statement lock. A crash can leave the slots it
+    ///   interrupted. Pinned by
+    ///   `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`: 0 keys
+    ///   read at every (released, pinned) cell. History: the first version merged the whole
+    ///   `Reaped` and FREE_ID spans (one key per branch ever reaped); the second held every pinned
+    ///   interior (up to live branches × chain depth under MCTS pruning).
+    /// - Per candidate: one record read and one liveness question.
     /// - Writes: none on a healthy catalog. Per leaked slot, one detach and one release, each a
     ///   group-committed sync, once.
     /// - Once per catalog written before the span existed: the one-time build at its first open,
@@ -385,35 +387,7 @@ impl TwoTierReaper {
         // the whole reaped chain down to the live leaf, deepest-first reap after deepest-first
         // reap. A witness now answers them in one lookup; see
         // `TableBranchCatalog::has_live_children`.
-        let mut cur = rec.clone();
-        let mut released = Vec::new();
-        loop {
-            if self.catalog.has_live_children(cur.branch_id.id)? {
-                return Ok(released);
-            }
-            let Some(parent) = cur.parent_id else { return Ok(released) };
-            // One call rather than get/mutate/put. The old shape silently did nothing against any
-            // catalog that keeps the live set in an index instead of inside the record - see
-            // `BranchCatalog::detach_child`.
-            self.catalog.detach_child(parent.id, cur.fork_epoch)?;
-
-            // **D200 — an ancestor the cascade detaches gets its id slot back HERE, or never.**
-            // Its own reap asked `release_id` while it was still pinned, and that refused; nothing
-            // else ever asks again (`release_id` has no other production caller, and the only
-            // other reaped-id sweep was `migrate_from`). So every pruned interior kept its slot for
-            // good. It is `Reaped` with nothing alive below it at this point, and `release_id`
-            // re-checks both. AFTER the detach, not before: a slot recycled while its old CHILD
-            // entry still named it would pin the old parent through the new branch.
-            if cur.branch_id.id != rec.branch_id.id {
-                self.catalog.release_id(cur.branch_id.id);
-                released.push(cur.branch_id.id);
-            }
-
-            match self.catalog.get_raw(parent.id) {
-                Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
-                _ => return Ok(released),
-            }
-        }
+        detach_cascade(&*self.catalog, rec, true)
     }
 
     /// Catalog descents the extent sweep has made since this reaper was built.
@@ -717,6 +691,52 @@ impl TwoTierReaper {
         // Disarmed only here, only after the sweep returned Ok.
         guard.swept = true;
         Ok(released)
+    }
+}
+
+/// **The cascade of [`TwoTierReaper::detach_from_parent`], shared.** D201's second step: the
+/// runtime's reaper-less `seal` arm walks the same cascade, so a subtree in which nothing is alive
+/// is unlinked from its live ancestors whether or not a reaper is attached — otherwise it stays in
+/// their CHILD spans for good and every liveness question from above walks it (`cow_page` →
+/// `max_live_child`, `free_page` → `live_child_in_epoch_range`, per page).
+///
+/// `release_ancestors` is the reaper's D200 step. The reaper-less arm passes `false`: it has never
+/// released an id, not even the sealed branch's own, and changing which ids a runtime without a
+/// reaper hands out is not this change. Those slots stay on the UNRELEASED span, and the first
+/// open WITH a reaper gives them back.
+pub(crate) fn detach_cascade(
+    catalog: &dyn BranchCatalog,
+    rec: &BranchRecord,
+    release_ancestors: bool,
+) -> Result<Vec<u64>, FerroError> {
+    let mut cur = rec.clone();
+    let mut released = Vec::new();
+    loop {
+        if catalog.has_live_children(cur.branch_id.id)? {
+            return Ok(released);
+        }
+        let Some(parent) = cur.parent_id else { return Ok(released) };
+        // One call rather than get/mutate/put. The old shape silently did nothing against any
+        // catalog that keeps the live set in an index instead of inside the record - see
+        // `BranchCatalog::detach_child`.
+        catalog.detach_child(parent.id, cur.fork_epoch)?;
+
+        // **D200 — an ancestor the cascade detaches gets its id slot back HERE, or never.**
+        // Its own reap asked `release_id` while it was still pinned, and that refused; nothing
+        // else ever asks again (`release_id` has no other production caller, and the only
+        // other reaped-id sweep was `migrate_from`). So every pruned interior kept its slot for
+        // good. It is `Reaped` with nothing alive below it at this point, and `release_id`
+        // re-checks both. AFTER the detach, not before: a slot recycled while its old CHILD
+        // entry still named it would pin the old parent through the new branch.
+        if release_ancestors && cur.branch_id.id != rec.branch_id.id {
+            catalog.release_id(cur.branch_id.id);
+            released.push(cur.branch_id.id);
+        }
+
+        match catalog.get_raw(parent.id) {
+            Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
+            _ => return Ok(released),
+        }
     }
 }
 
