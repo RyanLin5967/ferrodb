@@ -34,7 +34,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use ferrodb::branch::table_catalog::SIDECAR_HEADER_PAGE;
-use ferrodb::branch::{BranchCatalog, BranchId, BranchState, LeaseDeadline, TableBranchCatalog};
+use ferrodb::branch::{BranchCatalog, BranchId, LeaseDeadline, TableBranchCatalog};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
@@ -57,12 +57,16 @@ enum Rule {
     Off,
     /// The next read at this offset.
     ReadAt { offset: u64 },
-    /// The first read of a page that existed before the rule was armed, other than page 1, once at
-    /// least `appends_needed` pages have been appended since. A root split of a two-level tree
-    /// appends exactly three pages (the new leaf, the root's new sibling, the new root), and the
-    /// new root is published into the tree's cell right after the third. So this fires only after
-    /// the root has moved. The new pages' own reads are skipped: `new_page` reads back the page it
-    /// has just written.
+    /// The first read of a TREE page that existed before the rule was armed, once at least
+    /// `appends_needed` pages have been appended since. Page 1 (the header) and page 0 (the
+    /// allocator's bitmap, which every `new_page` reads) are never it, and neither are the new
+    /// pages' own reads (`new_page` reads back the page it has just written).
+    ///
+    /// A root split of a two-level tree appends three pages (the leaf, the root's sibling, then
+    /// the new root, published into the tree's cell right after it is written). One earlier leaf
+    /// split in the same call can make it four, and then the third append is the sibling. Between
+    /// that append and the new root's publication the only reads are page 0 and the new root's own,
+    /// both skipped, so this fires only after the root has moved.
     ReadAfterAppends { appends_needed: usize, appended: HashSet<u64> },
 }
 
@@ -114,7 +118,10 @@ impl Storage for FlakyStorage {
                 Rule::Off => false,
                 Rule::ReadAt { offset: at } => *at == offset,
                 Rule::ReadAfterAppends { appends_needed, appended } => {
-                    appended.len() >= *appends_needed && !appended.contains(&offset) && offset != PAGE_ONE
+                    appended.len() >= *appends_needed
+                        && !appended.contains(&offset)
+                        && offset != PAGE_ONE
+                        && offset != 0
                 }
             };
             if fire {
@@ -239,80 +246,155 @@ fn a_failed_read_of_page_one_at_a_root_splits_publish_is_retried_by_the_next_mut
     assert_reopens_with(&storage, &ids);
 }
 
-/// A1: a mutation that faults AFTER it split the root, with no successful mutation afterwards.
+/// Free bytes in the leaf an insert of `key` would land in, found the way the tree finds it: down
+/// from the root through `BPlusTreeInternalPage::find_child`. A leaf splits on an insert of `E` bytes
+/// once `27 + keys + values + E >= PAGE_SIZE` (`index_page.rs`, `BPlusTreeLeafPage::is_full`), and
+/// every key and value here is a `Vec<u8>` serialized behind a 4-byte length.
+fn leaf_room(cat: &TableBranchCatalog, key: &[u8]) -> usize {
+    let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::open(cat.root_page_id(), cat.pool_handle().clone());
+    let key = key.to_vec();
+    let mut page = cat.root_page_id();
+    loop {
+        match tree.read_node(page).expect("read a tree page") {
+            BPlusTreePage::Internal(n) => page = n.find_child(&key),
+            BPlusTreePage::Leaf(l) => {
+                let used = 27
+                    + l.key_arr.iter().map(|k| 4 + k.len()).sum::<usize>()
+                    + l.vals.iter().map(|v| 4 + v.len()).sum::<usize>();
+                return PAGE_SIZE.saturating_sub(used);
+            }
+        }
+    }
+}
+
+/// Bytes a fork's child entry and deadline entry take in a leaf: key and value, each behind a
+/// 4-byte length (`tree_keys.rs`: a child key is 17 bytes with an 8-byte id value, a deadline key
+/// 17 bytes with an empty value).
+const CHILD_ENTRY: usize = 4 + 17 + 4 + 8;
+const DEADLINE_ENTRY: usize = 4 + 17 + 4;
+
+/// A1: a fork that faults AFTER it split the root, flushed by an earlier staged fork's `durable()`,
+/// then a reopen with no further mutation.
 ///
-/// `set_state(Live -> Reaping)` grows the tree in exactly one place: it appends the branch's new
-/// state key to the Reaping group's tail. So a root split can only happen there. Its later steps,
-/// the envelope removal and the arena scan, descend into a region nothing earlier in the call
-/// touched, so on a cold pool they must read from storage. The injector fails the first such read
-/// after the new root exists.
+/// A fork writes, in order: its record key, its Live state key, its deadline key, its child key in
+/// the parent's live set, and the header key. The first two always append to the tails of their
+/// groups (ids only grow). The next two are steered, by the parent and the lease each fork is
+/// given, into leaves with room, so they never split. The header rewrite is the same size. So a root
+/// split in a fork can only come from the record or the state append, and each is followed by a
+/// write this fork has not yet touched: the state tail after the record, the steered deadline leaf
+/// after the state. On a cold pool that write must read from storage, and the injector fails that
+/// read. Its first reads (the parent's record, the parent's envelope, the free-id span) are made
+/// before anything is appended, so the rule cannot fire on them.
 ///
-/// Two phases:
-/// 1. Fork until the root is an internal node with room for only a few more separators.
-/// 2. Move children to Reaping, one per cold pool, until one splits the root.
+/// Phases:
+/// 1. **Grow.** 200 parents forked from trunk, then forks round-robin across them, every fork with
+///    its own lease, until the root is an internal node with under 150 bytes of room. The last of
+///    these is staged and never awaited: its ticket is the vehicle.
+/// 2. **Steer.** Staged forks on a cold pool with the rule armed, until one faults. None is
+///    awaited, so the previous one's ticket is still unsynced when the failure comes.
 ///
-/// Then the pool is flushed, as an eviction or another writer's `durable()` would flush it, and the
-/// catalog is reopened with no further mutation. At `9aa6968` the fault returned before `stage()`,
-/// page 1 still names the old root, and the reopen refuses. With the fix the error exit published
-/// the new root, and the reopen finds every branch.
+/// Then that earlier ticket is awaited: its `durable()` flushes every dirty page, the split ones
+/// included. At `9aa6968` the failed fork returned before `stage()`, page 1 still names the old
+/// root, and the reopen refuses. With the fix the error exit published the new root, and the reopen
+/// finds every branch.
 #[test]
-fn a_mutation_that_faults_after_splitting_the_root_still_publishes_it() {
+fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
+    const PARENTS: u64 = 200;
+    const LEASE_STEP: u64 = 1_000;
     let storage = FlakyStorage::new();
     let cat = create(&storage);
+    let mut next_lease = 4_000_000_000_000u64;
+    let mut lease = || {
+        next_lease += LEASE_STEP;
+        next_lease
+    };
 
-    // ---- 1. Grow a two-level tree whose root is nearly full --------------------------------------
-    let mut children: Vec<BranchId> = Vec::new();
+    // ---- 1. Grow a two-level tree whose root is nearly full -----------------------------------
+    let mut ids: Vec<u64> = Vec::new();
+    let mut leases: Vec<u64> = Vec::new();
+    let mut parents: Vec<BranchId> = Vec::new();
+    for _ in 0..PARENTS {
+        let l = lease();
+        let rec = cat.fork(BranchId::TRUNK, LeaseDeadline(l)).expect("fork a parent");
+        ids.push(rec.branch_id.id);
+        leases.push(l);
+        parents.push(rec.branch_id);
+    }
     let mut first_internal_root = None;
-    loop {
-        assert!(children.len() < 20_000, "premise failed: {} forks never filled the root", children.len());
-        let rec = cat.fork(BranchId::TRUNK, LEASE).expect("fork");
-        children.push(rec.branch_id);
+    let mut vehicle = None;
+    for i in 0.. {
+        assert!(i < 30_000, "premise failed: {i} forks never filled the root");
+        let l = lease();
+        let (rec, seq) = cat
+            .fork_staged(parents[i % parents.len()], LeaseDeadline(l))
+            .expect("fork a child");
+        ids.push(rec.branch_id.id);
+        leases.push(l);
         if let Some(room) = internal_root_room(&cat) {
             let root = *first_internal_root.get_or_insert(cat.root_page_id());
             assert_eq!(
                 cat.root_page_id(),
                 root,
                 "premise failed: the internal root split while growing, so the tree is three levels \
-                 deep and a Reaping split can no longer reach its root"
+                 deep and a leaf split can no longer reach its root"
             );
-            // Fewer than ~8 separators of 18 bytes left, and one fork adds at most a few, so the
-            // root is not full yet and a few Reaping-tail splits will fill it.
+            // Fewer than ~6 separators of up to 25 bytes left, and one fork adds at most two (its
+            // two tails), so the root is not full yet and a few tail splits will fill it.
             if room < 150 {
+                vehicle = seq;
                 break;
             }
         }
+        cat.await_fork_durable(seq).expect("sync a growing fork");
     }
+    let mut vehicle = vehicle.expect("premise failed: the last growing fork handed back no ticket");
 
-    // ---- 2. Move children to Reaping until one splits the root --------------------------------
+    // ---- 2. Staged forks, steered, on a cold pool, until one faults ---------------------------
     let root_before = cat.root_page_id();
     let mut failure = None;
-    for child in &children {
+    for attempt in 0..5_000usize {
+        let epoch = cat.current_epoch().0 + 1;
+        let id = ids.last().copied().expect("ids") + 1;
+        let parent = (0..parents.len())
+            .map(|k| parents[(attempt + k) % parents.len()])
+            .find(|p| leaf_room(&cat, &ferrodb::branch::tree_keys::child(p.id, epoch)) > CHILD_ENTRY)
+            .expect("premise failed: no parent's live set has a leaf with room for one more child");
+        let deadline = (0..leases.len())
+            .map(|k| leases[(attempt * 97 + k) % leases.len()] + 1)
+            .find(|l| leaf_room(&cat, &ferrodb::branch::tree_keys::deadline(*l, id)) > DEADLINE_ENTRY)
+            .expect("premise failed: no deadline leaf has room for one more key");
+
         cold(&cat);
         storage.arm(Rule::ReadAfterAppends { appends_needed: 3, appended: HashSet::new() });
-        let result = cat.set_state(*child, BranchState::Live, BranchState::Reaping);
+        let result = cat.fork_staged(parent, LeaseDeadline(deadline));
         let fired = storage.fired();
         storage.disarm();
         match (result, fired.is_empty()) {
-            (Ok(()), true) => assert_eq!(
-                cat.root_page_id(),
-                root_before,
-                "premise failed: a set_state split the root and read nothing from storage after the split"
-            ),
+            (Ok((rec, seq)), true) => {
+                assert_eq!(rec.branch_id.id, id, "premise failed: the fork did not take the id its deadline key was steered for");
+                assert_eq!(
+                    cat.root_page_id(),
+                    root_before,
+                    "premise failed: a fork split the root and read nothing from storage after the split"
+                );
+                ids.push(id);
+                vehicle = seq.expect("a staged fork hands back its ticket");
+            }
             (Err(e), false) => {
                 failure = Some(e.to_string());
                 break;
             }
-            (Ok(()), false) => panic!("premise failed: the fault fired ({fired:?}) and set_state still succeeded"),
-            (Err(e), true) => panic!("set_state failed without the injected fault: {e}"),
+            (Ok(_), false) => panic!("premise failed: the fault fired ({fired:?}) and the fork still succeeded"),
+            (Err(e), true) => panic!("the fork failed without the injected fault: {e}"),
         }
     }
-    let failure = failure.expect("premise failed: no set_state split the root");
-    assert!(failure.contains(INJECTED), "premise failed: set_state failed for another reason: {failure}");
+    let failure = failure.expect("premise failed: no fork split the root");
+    assert!(failure.contains(INJECTED), "premise failed: the fork failed for another reason: {failure}");
     assert_ne!(cat.root_page_id(), root_before, "premise failed: the fault fired before the root moved");
 
-    cat.pool_handle().flush_all().expect("flush the split pages, as eviction would");
+    // The earlier staged fork's durable(): no sync has run since it was staged, so this one flushes.
+    cat.await_fork_durable(Some(vehicle)).expect("the earlier fork's sync");
     drop(cat);
 
-    let ids: Vec<u64> = children.iter().map(|b| b.id).collect();
     assert_reopens_with(&storage, &ids);
 }
