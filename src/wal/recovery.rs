@@ -182,6 +182,9 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // be compared with the other, which is what a crash sweep has to do.
     let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
     names.sort_unstable();
+    // Every tree this rebuilds, with its fresh root: the shared cells are repointed from this at
+    // the end (D205), once the `&mut` borrow of each entry has ended.
+    let mut rebuilt: Vec<(String, Option<String>, u32)> = Vec::new();
     for name in names {
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
@@ -238,6 +241,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             fresh.insert(pk.clone(), *rid)?;
         }
         entry.primary_index_root = fresh.root_page_id.load(Ordering::SeqCst);
+        rebuilt.push((name.clone(), None, entry.primary_index_root));
 
         // secondary indexes
         for info in entry.indexes.iter_mut() {
@@ -249,6 +253,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
         }
 
         // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
@@ -275,6 +280,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
         }
     }
     // **D205: the records above are the only copy that moved.** Every loop in this function
@@ -285,12 +291,27 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // freed tree, and the fresh-context adversary's schedule (a DROP below the table, then a crash)
     // turned that into a committed row missing by key and a duplicate admitted.
     //
+    // **Stored INTO the existing cell, not by re-creating the map.** `b9a0a75` (W4(c), never merged)
+    // closed the same hole with `reseed_root_cells`: clear every cell and re-create it. That is
+    // correct only while nothing holds a clone of a cell. A holder keeps an `Arc` nobody updates
+    // again, giving two root pointers for one tree, which is the D53 defect. Storing into the cell
+    // has no such precondition: every holder sees the new root, and there stays one cell per tree
+    // (`a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them`). `sync_root_cells` then
+    // creates a cell for any tree that has none, and it never overwrites the ones just repointed.
+    //
+    // ⚠ Pre-existing, and not changed here: a cell is keyed by `(table, column)` with no index kind,
+    // so a secondary index and a full-text index on ONE column share a cell, and the full-text root
+    // is stored last. See `frontier/lane_rollback_index_orphan.md` §14.
+    //
     // Here, and not only in `open_recovered`, because this is the function that makes the cells
     // wrong. A caller that rebuilds and then queries, as the full-text and recovery tests do, gets
-    // cells that match what it built. `reseed_root_cells` and not `sync_root_cells`, and that
-    // difference is the whole bug: `sync_root_cells` never overwrites an existing cell. Ported from
-    // `b9a0a75` (W4(c), never merged); see the precondition on `Catalog::reseed_root_cells`.
-    catalog.reseed_root_cells();
+    // cells that match what it built.
+    for (table, column, root) in &rebuilt {
+        if let Some(cell) = catalog.root_cell(table, column.as_deref()) {
+            cell.store(*root, Ordering::SeqCst);
+        }
+    }
+    catalog.sync_root_cells();
     catalog.persist()
 }
 
@@ -316,8 +337,11 @@ pub struct OpenedDatabase {
 /// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
 /// 3. open the catalog, or create it for a new file;
 /// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
-///    The rebuild ends by reseeding the shared root cells (D205). Without that, every statement
-///    after recovery descends the trees the rebuild freed.
+///    The rebuild ends by repointing the shared root cells at the trees it built (D205). Without
+///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
+///    there because the rebuilt trees and the catalog page are then on disk, so the log that
+///    produced them has nothing left to say; without it, the next open would replay the same
+///    records and rebuild every tree again (reasoning from `b9a0a75`).
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
@@ -524,7 +548,7 @@ use super::*;
     /// `Catalog::open` seeds one shared cell per tree (D53) from the pre-crash roots on the catalog
     /// page. `rebuild_indexes` frees each old tree and writes the fresh root into the `TableEntry`
     /// only, and `sync_root_cells` never overwrites an existing cell. `plan::open_table` and the
-    /// optimizer prefer the cell, so without a reseed every statement after recovery descends a
+    /// optimizer prefer the cell, so unless the rebuild repoints the cells, every statement after recovery descends a
     /// FREED tree (the fresh-context adversary, `frontier/d202_adversary.md` §2).
     ///
     /// The DROP is load-bearing. The fixture needs a free page BELOW `t`'s root, so that the
