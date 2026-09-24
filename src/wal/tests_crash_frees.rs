@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::{open_recovered, OpenedDatabase};
@@ -49,7 +49,9 @@ use crate::storage::disk_manager::PAGE_SIZE;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::index_page::BPlusTreePage;
-use crate::storage::page_directory::PageDirectory;
+use crate::storage::heap_page::{Page, MAX_TUPLE_SIZE};
+use crate::storage::page_directory::{PageDirectory, MAX_ENTRIES};
+use crate::storage::tuple::Tuple;
 use crate::storage::sim::{Durability, FaultPlan, OpKind, SimFabric, WriteShape};
 use crate::storage::storage::Storage;
 
@@ -1063,4 +1065,242 @@ fn the_oracle_fires_on_a_planted_alias_a_planted_free_and_a_missing_key() {
         .expect("plant a missing key");
     let e = check_rows(&mut d3.o, "u", &(0..ROWS).collect::<Vec<_>>()).err().expect("the oracle missed a row missing by key");
     assert!(e.contains("missing by key"), "the oracle fired, but not for the missing key: {e}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fix's own guards: each is red only under the mutant named in it (added with the fix)
+// ---------------------------------------------------------------------------------------------
+
+/// A page file that fails ONE sync: once armed, the first sync after a write at offset 0, the
+/// allocation bitmap's first page. Inside a DROP that is the sync its frees end with: nothing else a
+/// DROP does writes the bitmap.
+struct FailSyncAfterBitmap {
+    inner: Arc<dyn Storage>,
+    armed: AtomicBool,
+    bitmap_written: AtomicBool,
+    fired: AtomicBool,
+}
+
+impl Storage for FailSyncAfterBitmap {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        if self.armed.load(Ordering::SeqCst) && offset == 0 {
+            self.bitmap_written.store(true, Ordering::SeqCst);
+        }
+        self.inner.pwrite(buf, offset)
+    }
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.pread(buf, offset)
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        if self.armed.load(Ordering::SeqCst) && self.bitmap_written.load(Ordering::SeqCst) && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected: the sync after a DROP's frees fails, once"));
+        }
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// A page file whose every read of one page fails.
+struct FailReadsOf {
+    inner: Arc<dyn Storage>,
+    page: u32,
+}
+
+impl Storage for FailReadsOf {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.pwrite(buf, offset)
+    }
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if offset / PAGE_SIZE as u64 == self.page as u64 {
+            return Err(std::io::Error::other(format!("injected: page {} does not read", self.page)));
+        }
+        self.inner.pread(buf, offset)
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// One `notes` row per heap page: a 3900-byte note leaves no room for a second.
+fn note_sql(id: i32) -> String {
+    format!("INSERT INTO notes VALUES ({id}, '{}');", "n".repeat(3900))
+}
+
+/// **Review §3.3 with the bits already clear: a DROP whose frees cleared their bits and then failed,
+/// more writes that grow a heap's directory, then a crash.** Recovery must take none of the dropped
+/// table's pages.
+///
+/// The frees fail at their sync, after the bitmap was written, so `t`'s bits are clear on disk and
+/// the intent is still there. `notes` has exactly one directory page's worth of heap pages when the
+/// DROP runs, and one more row after it, so the next open's directory repair must allocate a
+/// directory page, and `allocate` hands out the lowest clear bit, which is one of `t`'s: `t` was
+/// created first. Only the quarantine taken BEFORE `recover` (the review's A1) keeps it from
+/// becoming `notes`' directory page, which the intent then frees under it.
+///
+/// Mutant-only red: M5 adopts the intents after `recover`.
+#[test]
+fn a_drop_whose_frees_failed_after_clearing_bits_lets_recovery_take_none_of_its_pages() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let flaky = Arc::new(FailSyncAfterBitmap {
+        inner: m.fabric.open(FAB_DB),
+        armed: AtomicBool::new(false),
+        bitmap_written: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
+    });
+    let (pages, notes_dir);
+    {
+        let mut d = m.open_on(flaky.clone()).expect("open a new database");
+        let s = &mut Session::new();
+        must(&mut d.o, s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
+        for id in 0..3 {
+            must(&mut d.o, s, &format!("INSERT INTO t VALUES ({id}, {id});"));
+        }
+        must(&mut d.o, s, "CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));");
+        must(&mut d.o, s, "BEGIN;");
+        for id in 0..MAX_ENTRIES as i32 {
+            must(&mut d.o, s, &note_sql(id));
+        }
+        must(&mut d.o, s, "COMMIT;");
+        d.o.txn.checkpoint().expect("the checkpoint before the DROP");
+        notes_dir = d.o.catalog.get_table("notes").expect("notes").first_directory_page_id;
+        pages = pages_of(&d.o, "t").expect("walk t");
+        flaky.armed.store(true, Ordering::SeqCst);
+        must(&mut d.o, s, "DROP TABLE t;");
+        assert!(flaky.fired.load(Ordering::SeqCst), "premise: the sync after the DROP's frees never failed, so the intent was carried out");
+        must(&mut d.o, s, &note_sql(MAX_ENTRIES as i32));
+        // The crash: no checkpoint.
+    }
+    let crash = m.snapshot();
+    assert!(crash.side.keys().any(|n| n.ends_with(".drop-intent")), "premise: no intent survived the crash, so the open had nothing to protect");
+    let db = &crash.images[FAB_DB];
+    let bit = |p: u32| db[(p / 8) as usize + 4] & (1 << (p % 8)) != 0;
+    assert!(pages.iter().any(|p| !bit(*p)), "premise: every page of t is still allocated on disk, so recovery could not take one");
+    let at = notes_dir as usize * PAGE_SIZE;
+    let dir = PageDirectory::deserialize(db[at..at + PAGE_SIZE].try_into().unwrap());
+    assert!(
+        dir.entries.len() == MAX_ENTRIES && dir.next_page_directory == 0,
+        "premise: notes' directory on disk holds {} entries and links page {}, so recovery allocates no directory page",
+        dir.entries.len(),
+        dir.next_page_directory
+    );
+    let mut want = Want::default();
+    want.present.insert("notes".to_string(), (0..=MAX_ENTRIES as i32).collect());
+    want.either = Some(("t".to_string(), (0..3).collect(), pages));
+    if let Err(e) = two_good_opens(&crash, &want) {
+        panic!("frees that failed after clearing their bits, a directory that grew, then a crash: {e}");
+    }
+}
+
+/// A page taken from the allocator and given a heap page's bytes, then linked from nothing: what
+/// a table the catalog lost would leave, or a leak. Flushed, then rows go into `u` so the next open
+/// owes a rebuild. Returns the page and its bytes.
+fn plant_unnamed_heap_page(m: &Machine) -> (u32, [u8; PAGE_SIZE]) {
+    let mut d = m.open().expect("open the fixture");
+    let planted = d.o.bp.new_page().expect("take a page");
+    let mut heap_page = Page::empty(planted);
+    heap_page.insert(Tuple::new(vec![0xAB; 64])).expect("a tuple on the page");
+    let image = heap_page.serialize().expect("serialize the page");
+    let frame_i = d.o.bp.fetch_page(planted).expect("fetch the page");
+    d.o.bp.frame_write(frame_i).data = image;
+    d.o.bp.unpin_page(planted, true);
+    d.o.bp.flush_all().expect("flush");
+    insert_rows(&mut d.o, &mut Session::new(), "u", ROWS..ROWS + EXTRA).expect("rows, so the next open owes a rebuild");
+    (planted, image)
+}
+
+/// **The reset keeps an allocated page nothing names when it holds a heap page, not an index**
+/// (D229 (b)'s identity filter). Freeing every unnamed page is reachability alone, which frees
+/// whatever a torn catalog forgets (the design's §5.3, rejected by the decision).
+///
+/// Mutant-only red: M1 frees every unnamed page it can read.
+#[test]
+fn the_reset_keeps_an_unnamed_page_that_holds_no_index() {
+    let m = Machine::boot(fixture(), None);
+    let (planted, image) = plant_unnamed_heap_page(&m);
+    let m2 = Machine::boot(&m.snapshot(), None);
+    let d = m2.open().expect("the rebuilding open");
+    assert!(d.o.recovered, "premise: the open replayed nothing, so no reset ran");
+    assert!(allocated(&d.o.bp).expect("read the bitmap").contains(&planted), "the reset freed page {planted}, which holds a heap page");
+    assert_eq!(page(&d.o.bp, planted).expect("read the page"), image, "the reset changed page {planted}");
+}
+
+/// **The reset keeps a page it cannot read** (the D228 lesson: a read error is not evidence that
+/// nothing lives there).
+///
+/// Mutant-only red: M6 frees a candidate whose read fails.
+#[test]
+fn the_reset_keeps_a_page_it_cannot_read() {
+    let m = Machine::boot(fixture(), None);
+    let (planted, _) = plant_unnamed_heap_page(&m);
+    let m2 = Machine::boot(&m.snapshot(), None);
+    let failing = Arc::new(FailReadsOf { inner: m2.fabric.open(FAB_DB), page: planted });
+    let d = m2.open_on(failing).expect("the rebuilding open");
+    assert!(d.o.recovered, "premise: the open replayed nothing, so no reset ran");
+    assert!(allocated(&d.o.bp).expect("read the bitmap").contains(&planted), "the reset freed page {planted}, which it could not read");
+}
+
+/// **The reset keeps a page a directory lists even when its bytes are zeros** (D229 (b)'s keep
+/// set). A heap page listed before its own image reached the disk is one: `new_page` zero-writes
+/// it, the directory naming it is flushed, the page is not.
+///
+/// It is put on `u`'s TIME-TRAVEL heap: on a primary heap an all-zero listed page makes the
+/// rebuild's heap scan panic in `Page::deserialize` (a separate hazard, not this lane's), and the
+/// rebuild never scans a time-travel heap.
+///
+/// Mutant-only red: M2 frees an index-shaped or zero page whether or not something names it.
+#[test]
+fn the_reset_keeps_a_page_a_directory_lists_whose_bytes_are_zeros() {
+    let m = Machine::boot(fixture(), None);
+    let listed;
+    {
+        let mut d = m.open().expect("open the fixture");
+        let tt = d.o.catalog.get_table("u").expect("u").time_travel_root;
+        listed = HeapFileManager::open(tt, d.o.bp.clone())
+            .find_or_make_page(MAX_TUPLE_SIZE)
+            .expect("a new page on u's time-travel heap");
+        let mut dir_id = tt;
+        loop {
+            let dir = PageDirectory::deserialize(page(&d.o.bp, dir_id).expect("read the directory"));
+            if dir.entries.iter().any(|e| e.page_id == listed) {
+                break;
+            }
+            assert_ne!(dir.next_page_directory, 0, "premise: no directory page of u's time-travel heap lists page {listed}");
+            dir_id = dir.next_page_directory;
+        }
+        d.o.bp.flush_page(dir_id).expect("flush the directory page alone");
+        insert_rows(&mut d.o, &mut Session::new(), "t", ROWS..ROWS + EXTRA).expect("rows, so the next open owes a rebuild");
+    }
+    let crash = m.snapshot();
+    let db = &crash.images[FAB_DB];
+    let at = listed as usize * PAGE_SIZE;
+    assert!(
+        db.len() >= at + PAGE_SIZE && db[at..at + PAGE_SIZE].iter().all(|b| *b == 0),
+        "premise: page {listed}'s own image reached the disk, so it is not a zero page"
+    );
+    let m2 = Machine::boot(&crash, None);
+    let d = m2.open().expect("the rebuilding open");
+    assert!(d.o.recovered, "premise: the open replayed nothing, so no reset ran");
+    let r = structure(&d.o).unwrap_or_else(|e| panic!("after the rebuilding open: {e}"));
+    assert_eq!(
+        r.owner.get(&listed).map(String::as_str),
+        Some("u's time-travel heap"),
+        "page {listed}, listed by u's time-travel heap, is not that heap's page any more"
+    );
 }
