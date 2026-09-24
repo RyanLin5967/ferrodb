@@ -516,3 +516,34 @@ merge's own transactions.
   - the unit filter: the catalog-page test module's count at `9aa6968` plus 2.
 
   The run is scored against the list, and a disagreement is reported as a registration miss.
+
+---
+
+## Amendment 7 — amendment 6's changes recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `0bd9802` | amendment 6 |
+| `005e1b2` | H2 and H3: the blind spot stated by its condition, with both routes; `apply_plan`'s doc names the exclusive catalog borrow every `begin` needs, and its three sources. **Comments only** |
+| `e6f8775` | ST2 (additions only, `38 0`) |
+| `d9e42d1` | E7 added; E1–E7 cut from `e6f8775`, each passing `git apply --check`. E1, E3 and E4 are byte-identical re-cuts; E2 and E5 moved context only |
+
+- **No code line in `src/` changed since `9b291ac`.** Instrument: `git diff 9b291ac d9e42d1 -- src/`, keeping `^[-+]`
+  lines and dropping comment lines, leaves 0.
+- **Counts:**
+  - `d249_alter_encodable` has **7** `#[test]`;
+  - `catalog_page.rs` has **13**: 11 at `9aa6968` plus U1 and U2;
+  - `git diff 9aa6968 d9e42d1` adds 9 `#[test]` and removes 0.
+- **Per-target: 2579 + 9 = 2588.**
+- **The run's authority is the `-- --list` of each named target** (amendment 6). Predicted: the target lists 7, and
+  `catalog::catalog_page::tests::` lists 13.
+- **The mutant tree is this branch's tip.** Its `src/` and `tests/` equal `e6f8775`'s, and it has no D254 fix.
+
+| mutant | fails |
+|---|---|
+| E1 | AR, AA, A9, A33; and AI at its error assertion |
+| E2 | A33 (row); AI ("holds the renamed column or index") |
+| E3 | U1 (a panic), on the unit filter |
+| E4 | AI, at its error assertion |
+| E5 | **ST and ST2** |
+| E7 | **ST2 only**, at its `Ok(_)` arm |
