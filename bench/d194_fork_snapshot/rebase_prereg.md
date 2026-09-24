@@ -885,3 +885,76 @@ released tests unchanged).
   k = 0 and 256 at k ∈ {8, 32, 128}, with capacity ≤ 2·entries + 4·256 at every k.
 - **The "Prediction for the tests-only commit" line.** It names four filters in one command line. It
   means: each of W1, W2, W3 and C2, run by its own name, FAILS at `24a3961`.
+
+## Amendment 11 (append-only; written BEFORE the tests and code it describes): an unpinned read names what its scan saw
+
+The cost review's Q7 (`frontier/d194_cost_review.md` §7 @ `a713506`) confirms, in-process only, at
+`9aa6968` and at `4436e7f`, the item I had left unfixed.
+- **The mechanism.** An UNPINNED read scans with no lock held. `record_read` then relocks and names
+  each row's LATEST version, with `observed_at = apply_seq + 1` taken at record time rather than at
+  the scan's snapshot.
+- **Forward window** (a merge records between the scan and the record):
+  - a missed premise conflict: the premise names the new version;
+  - a false REVERT block: the predicate clock is too late;
+  - a missed REVERT dependency: the exact edge goes to the wrong merge.
+- **Reverse window** (the scan contains a merge that commits before it records): a false conflict,
+  and a missed edge.
+- **Reached at `4436e7f` by** a branch with no live workspace: a library `select` of TRUNK or of a
+  sealed branch, or `AS OF BRANCH` sealing between bind and select. pgwire drains readers, so not
+  over pgwire.
+
+The lead's decision: an unpinned read takes a `pin_seq`-paired `seen_through` under the lock.
+
+### The change
+
+1. **`visible_rows_where`.** Its unpinned arms (a branch with no live workspace, and `branch = None`)
+   now take the snapshot and `seen_through = Some(pin_seq(publishing, apply_seq, recorded, &snap))`
+   under ONE lock acquisition. The seq and the snapshot then describe one instant, as a pin's do.
+   Its signature is unchanged.
+
+2. **`record_read`.** The rule for an exact-version read with `seen_through = Some(F)` is unified, so
+   that it no longer matters whether `F` came from a pin:
+   - **A matched row whose latest version is at or below `F`:** the scan saw that latest version, and
+     it is named. No history is needed.
+   - **A matched row whose latest version is above `F`:**
+     - If `F` is a live pin, the history holds the version it read, and `version_seen` names it.
+     - Otherwise the history may have dropped that version: this covers both a pin released
+       mid-read and an unpinned read overtaken by a merge. The read is REFUSED, retryably. The
+       message still says the snapshot "was released while this read ran, or was never a pin".
+   - **Unchanged:** a read above an unrecorded merge refuses (Amendment 7), and a predicate or
+     row-targeting read is never refused (Amendment 8).
+
+   This relaxes Amendment 5's membership refusal: a released pin whose matched rows did not move is
+   now answered exactly instead of refused. The released-pin test still refuses, because its row
+   moved from 3 to 5.
+
+3. **`observed_at = F + 1`** for every read that carries `Some(F)`, so an unpinned predicate read's
+   clock is its scan's, not the record's.
+
+Single-threaded behaviour is unchanged. With no interleaving, `F = apply_seq`, every latest version
+is at or below `F`, and `observed_at = apply_seq + 1`, as before.
+
+### Red tests, all in `runtime.rs` `mod tests`
+
+These drive `visible_rows_where` on TRUNK, then commit a merge (or register an unrecorded one), then
+call `record_read`, using the current signatures. So they compile at the current tip `b4cfce3`.
+
+| test | at the tests-only commit | at the fix |
+|---|---|---|
+| `an_unpinned_read_never_names_a_version_published_after_its_scan`: rows 1 and 2, merge m0 on both, reader R; R scans TRUNK, merge W updates row 1, R's exact read of row 1 is recorded | **FAILS**: `Ok`, naming W's version | passes: `Err` ("was released while this read ran, or was never a pin"). An `Ok` naming m0's version would also pass. |
+| `an_unpinned_read_whose_snapshot_holds_an_unrecorded_merge_refuses`: a committed txn registered as publishing with `apply_seq` moved past it, R scans TRUNK, then records an exact read | **FAILS**: `Ok` | passes: `Err` ("has not recorded its versions yet") |
+| `an_unpinned_scan_is_not_a_dependent_of_a_merge_published_after_it`: R full-scans TRUNK, W merges, R's scan is recorded, then `REVERT MERGE <W> HALT`. Positive control: R2 scans and records AFTER W, and the same revert is blocked by R2 | **FAILS**: `blocked_by` names R | passes: `blocked_by` names R2 and not R |
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M31 | the unpinned arm returns `None` again | all three FAIL |
+| M32 | the per-row refusal is removed (`F` not a live pin → never refuse) | the forward test FAILS (`Ok`, naming `begin_ts 0`); `version_history_never_names_...` FAILS |
+| M33 | the unrecorded refusal is removed | the reverse test FAILS |
+
+### Counts, replacing Amendment 10's
+
+Run of record at default QoS: **59 result lines, 2173 passed (2170 + 3), 2 failed** (the envelope
+tripwire, and `a_pinned_index_read_...` until #16), **2 ignored**. Under `-b`: 2172 / 3.
+`cargo test --lib version_history`: 13. `cargo test --lib an_unpinned`: 3.
