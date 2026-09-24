@@ -1871,7 +1871,8 @@ impl ArenaPageStore {
         path: &std::path::Path,
     ) -> Result<usize, FerroError> {
         let epoch = crate::cluster::epoch();
-        g.quarantine.retain(|q| q.epoch == epoch);
+        // MUTANT (fire-check only, never land): the fold keeps every authority's ranges.
+        let _ = epoch;
         let held: Vec<(PageId, u32)> = g.quarantine.iter().map(|q| (q.start, q.pages)).collect();
         let bytes = self.state_bytes_with_free(&held);
         replace_atomically(&OsFileOps, path, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
