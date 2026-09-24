@@ -837,6 +837,10 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // D250's re-declared DROP records (below) carry no page intent: every intent was decided above,
     // from the catalog, and a record appended now names only roots whose older records the
     // checkpoint has just truncated, so its skip at a later open covers nothing that is still logged.
+    // A later open can still complete it in one case, D250's accepted residual: an EMPTY same-name
+    // table re-created at the freed root by a CREATE whose sync failed is forgotten. No intent names that
+    // table, so D229 frees nothing of it; the reset frees its empty primary leaf, and its directory roots
+    // leak (D229 review 2's F14).
     // D250 review 2's R2-4 (the lead's decision): every table the log records as dropped and the
     // catalog now does not name has its provenance forgotten by `attach_runtime`, at this open and at
     // every later one until a runtime has been attached. A table re-created under the name is named

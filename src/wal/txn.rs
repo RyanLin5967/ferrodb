@@ -1767,8 +1767,10 @@ impl TxnManager {
     /// Write `intent` into the durable intent file beside the other pending ones, then quarantine
     /// its pages and hold it, undecided. Before the DROP's `DropTable` record (D229 (a)).
     ///
-    /// **Refused, before anything is written, when a pending intent already names one of its pages**
-    /// (the D229 merge review's §4.3, the lead's decision). A live table's page in a pending intent is
+    /// **Refused, before the intent, the quarantine and the DROP's record are written, when a pending
+    /// intent already names one of its pages** (the D229 merge review's §4.3, the lead's decision). Not
+    /// before everything: `ddl_unit` has already retried the owed releases, which can write pages and
+    /// append their records (D229 review 2's F3). A live table's page in a pending intent is
     /// a state this build never makes: an intent's pages are quarantined until it is gone (A4), so no
     /// table created meanwhile holds one, and a DROP whose record or mutation fails poisons the log
     /// (D250), and a poisoned log refuses the next DROP before this runs. So a shared page means the

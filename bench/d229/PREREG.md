@@ -603,3 +603,33 @@ record's LSN), and nothing of it is built here.
   expressions). The fire check at `41281b8` refuses M27 (0 sites, rc 1), as it must.
 - **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M27, SKIPm, LSNm, TTm, CLRm and ALIASm. The move-form M3, M7
   and M12 survive.
+
+**Amendment 18 (D229 review 2's item 2 and its extension to `408515a` @ `d23edee`, F13-F15; the lead's decisions;
+text only).** The lead asked for these in amendment 16. That amendment was already committed and cited (`d77cfc4`), so
+they are appended here, and no test or code behaviour changes.
+- **4.3's wording is scoped (review 2's F3).** Amendment 10 (4.3) and 11 say the refusal comes "before anything is
+  written". It comes before the intent, the quarantine and the DROP's `DropTable` record. It does not come before
+  everything: `ddl_unit` retries the owed releases first, which can write pages and append their records. That is
+  pre-existing and legitimate. `record_free_intent`'s doc now says so. M22 and its test are unchanged: they assert
+  the intent file, the log's poison state and the pages, which the retry does not touch.
+- **Amendment 15's re-declaration claim is scoped (F14).** "At a later open, `logged_drops_the_catalog_missed`
+  completes nothing for it" holds except in D250's accepted residual:
+  - an EMPTY same-name table re-created at the freed root by a CREATE whose sync failed is forgotten, by the re-declared
+    record exactly as by an in-process DROP's own post-truncation re-append;
+  - for D229 that is harmless: no intent names that table, so nothing is freed of it, the reset frees its empty
+    primary leaf, and its directory roots leak (`LEAKED_ROOTS`).
+
+  The comment in `open_recovered` says so. The rest of amendment 15's argument holds (F14: order, truncation only,
+  quarantined roots), and F13 finds the `5a77973` resolution coherent.
+- **Recorded (F15): D254 review R6's FREEING half is CLOSED for D229.** On this tree `Catalog::drop_table` frees
+  nothing.
+  - Before it runs, the intent and the `DropTable` record are durable and the pages quarantined.
+  - If it fails, in `persist` or anywhere else, `ddl_unit` poisons the log. The intent then stays undecided, and a
+    poisoned log refuses the checkpoint whose frees are the only in-process path. So no page of the table is freed in
+    that process.
+  - The next open completes the DROP from the log and frees the pages once, after the unlink is durable.
+
+  What survives is R6's memory half: the running catalog has lost the table while the log is poisoned, so every write
+  is refused until a reopen. That is D250's fail-stop, not a free.
+- F1 (M3) stays the one blocker named by the review. It is answered by amendment 16's move-form M3, whose survival the
+  run measures.
