@@ -146,7 +146,8 @@ pub struct Pumped {
     ///
     /// Counts the offending event, every sibling of it in the same commit, and everything the batch
     /// held after it. All of them are replayed by the next pump — the cursor is deliberately left
-    /// behind the refused commit — so this is a *stall*, not a loss, and the two must not be
+    /// below the first row of every commit held back, the refused one included — so this is a
+    /// *stall*, not a loss, and the two must not be
     /// confused: a stalled feed is fixed by amending the publication, a lost row is not fixed by
     /// anything.
     pub refused: usize,
@@ -281,9 +282,9 @@ impl FeedStreamer {
     /// the new cursor.
     ///
     /// See the module docs: the returned cursor is **not** the frontier. It never passes the first
-    /// record of a transaction still open, nor the start of a refused commit, and while either holds
-    /// it passes only the commits the batch decided about. With neither, it is where the read
-    /// stopped (D252).
+    /// record of a transaction still open, nor the first row of any commit a refusal holds back, and
+    /// while either holds it passes only the commits the batch decided about. With neither, it is
+    /// where the read stopped (D252).
     pub fn pump<W: Write>(
         &self,
         wal: &WalManager,
@@ -437,13 +438,15 @@ impl FeedStreamer {
             (None, Some(_)) => emitted_max,
             (None, None) => decoded.walked_to.max(emitted_max),
         };
-        // The fourth part's other half (found under D252): never past a refused transaction's first
-        // row, exactly as never past an open one's. With transactions interleaved, a commit below the
-        // refused one can END above the refused one's rows; a cursor there replays the refused
-        // `Commit` with nothing staged, and the row is lost under a clean report
-        // (`a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it`).
+        // The fourth part's other half (found under D252): never past the first row of ANY commit the
+        // refusal holds back, which is the refused one and every one after it, exactly as never past
+        // an open transaction's. With transactions interleaved, a commit below the refused one can END
+        // above those rows; a cursor there replays their `Commit`s with nothing staged, and the rows
+        // are lost under a clean report
+        // (`a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it`,
+        // `every_commit_a_refusal_holds_back_keeps_its_rows`).
         let refused_from = refused_commit
-            .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn == c).map(|e| e.lsn).min());
+            .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());
         let next = refused_from.map_or(next, |first| next.min(first));
 
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
