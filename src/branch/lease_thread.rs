@@ -405,6 +405,8 @@ impl LeaseThread {
         lock: Arc<dyn RuntimeLock>,
         interval: Duration,
     ) -> Result<LeaseThread, FerroError> {
+        // MUTANT (fire-check only, never land): the clock read BEFORE the open's sweep.
+        let read_before_the_sweep = LeaseDeadline::try_now_millis();
         let resumed = with_lock(&*lock, || reaper.resume_interrupted_reaps())?;
         // **D209 — the open's orphan sweep is a collection, so the cadence counts from it.**
         //
@@ -425,7 +427,7 @@ impl LeaseThread {
         // behaviour: its first scan that knows the time sweeps again. That is the safe direction.
         // An interval has to start at a reading of the clock it is measured in, and the only cost
         // is the repeat this row removes everywhere else.
-        if let Ok(now) = LeaseDeadline::try_now_millis() {
+        if let Ok(now) = read_before_the_sweep {
             reaper.orphan_sweep_finished_at(now);
         }
         if !resumed.is_empty() {
