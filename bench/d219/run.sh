@@ -25,7 +25,8 @@ DEFERALL=882e475 # every stamp deferred to the final sync (86e1762) + the schema
 ONEFLUSH=b875ab3 # ONE flush after all the rewrites (eff03e8) + the two-table red test
 ALTERRED=789d1da # catalog::alter tests 1-2 on 6f22427's code (flush before finish, unconditional)
 POISONRED=33e3d67 # catalog::alter test 3 on 77bddcb's code (stamps still written inside the rewrite loop)
-FIX=f513a37      # the whole fix: a rewrite's stamps written after finish with one flush, + review-6 tests
+A1RED=e60c5be    # PREREG A1's red: test 3 expects the poisoned-store ALTER refused (on f513a37's code)
+FIX=50e175b      # the whole fix, + PREREG A1: plan_alters probes check_writable
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -80,6 +81,10 @@ git -C "$FIRE" checkout --detach -q "$ALTERRED" || exit 3
 step b5_red_$ALTERRED timeout 3600 cargo test --lib catalog::alter::tests
 git -C "$FIRE" checkout --detach -q "$POISONRED" || exit 3
 step b6_red_$POISONRED timeout 3600 cargo test --lib catalog::alter::tests
+
+# ---- (b7) PREREG A1's red: test 3 on the code that refuses only after the install -----------------
+git -C "$FIRE" checkout --detach -q "$A1RED" || exit 3
+step b7_red_$A1RED timeout 3600 cargo test --lib catalog::alter::tests
 
 # ---- (c) AFTER: the fix --------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -q "$FIX" || exit 3
@@ -136,6 +141,8 @@ mutant M24_rewrite_stamps_eagerly catalog::alter::tests::a_plain_alter_stamps_ev
 mutant M25_stamp_the_old_rid catalog::alter::tests::a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync
 mutant M26_more_than_one_moved_row catalog::alter::tests::a_rewrite_that_moves_one_attributed_row_still_stamps_it
 mutant M27_epoch_bump_after_provenance catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
+mutant M28_no_writable_probe catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered
+mutant M29_probe_without_attribution catalog::alter::tests::an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"
