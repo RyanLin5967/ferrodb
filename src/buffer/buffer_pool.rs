@@ -295,8 +295,16 @@ pub struct Frame {
     /// with the label left as it is, and cleared either in the same frame-lock hold that resets the
     /// frame to free (pass 3) or by a refusal. A freeing frame is not free (`claim_free_frame` takes
     /// only an unlabelled frame) and not pinnable (`pin_if_labelled` refuses it), and an eviction
-    /// treats it as gone. Unlabelling it instead, as pass 1 first did, made it look free, and a
-    /// concurrent fault of another page claimed it.
+    /// leaves its verdict to phase 2, which waits for the call. Unlabelling it instead, as pass 1
+    /// first did, made it look free, and a concurrent fault of another page claimed it.
+    ///
+    /// **Invariant: true only while a `free_pages` call holds `in_transit`, the ARC cache and
+    /// `page_table` write.** So a frame is never unlabelled and still being freed. That state is
+    /// representable (this is a separate field, not one label enum), because `page_id` is written
+    /// outside this file (`branch::arena`'s `evict`) and read directly by integration tests; one
+    /// enum would rewrite both, and the tests' part is a test edit (D237 review 3, R2). So the
+    /// invariant is checked instead, by a `debug_assert!` at every other writer that unlabels a
+    /// frame: `release_frame`, `delete_page`, `free_page`, `invalidate_all` and `arena::evict`.
     pub freeing: bool,
 }
 
@@ -1153,6 +1161,9 @@ impl BufferPoolManager {
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
         let mut frame = self.frame_write(frame_i);
+        // This fault claimed the frame, and its page is in `in_transit`, so no `free_pages` call can
+        // hold it: the call refuses a set with a page in transit (`Frame::freeing`'s invariant).
+        debug_assert!(!frame.freeing, "release_frame: frame {frame_i} is being freed");
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -1201,15 +1212,20 @@ impl BufferPoolManager {
         // else.
         {
             let frame = self.frames[frame_i].read().unwrap();
-            // A victim `free_pages` is freeing is gone: its bytes must not be written back over a
-            // slot pass 2 is about to give away, and its frame must not be relabelled (D237 N1).
-            if frame.page_id != Some(victim) || frame.freeing {
+            if frame.page_id != Some(victim) {
                 return Ok(Evicted::Gone);
             }
             if frame.pin_counter.load(Ordering::Relaxed) > 0 {
                 return Ok(Evicted::Declined);
             }
-            if frame.dirty_flag.load(Ordering::Relaxed) {
+            // A victim `free_pages` is freeing is NOT gone yet: the call may still refuse and leave
+            // it resident, and a `Gone` would not be handed back to the policy, which dropped it
+            // from its resident lists when it named it (D237 review 3, R1). Its bytes must not be
+            // written back over a slot pass 2 may give away, so the write-back is skipped and the
+            // verdict is left to phase 2. Phase 2's `page_table` write waits for the call, which
+            // holds it throughout, and then sees the outcome: freed (label `None`: `Gone`) or
+            // refused (label kept: `Took`, or `Declined` while the skipped write-back left it dirty).
+            if frame.dirty_flag.load(Ordering::Relaxed) && !frame.freeing {
                 self.wal_gate(&frame.data)?;
                 self.disk_manager.write(victim, &frame.data)?;
                 frame.dirty_flag.store(false, Ordering::Relaxed);
@@ -1222,7 +1238,10 @@ impl BufferPoolManager {
         crate::buffer::fault_hooks::before_evict_phase_2(self, victim);
         let mut pt = self.page_table.write().unwrap();
         let mut frame = self.frame_write(frame_i);
-        if frame.page_id != Some(victim) || frame.freeing {
+        // No mark can be seen here: a mark exists only while a `free_pages` call holds
+        // `page_table` write, and this thread holds it now (D237 review 3, R1).
+        debug_assert!(!frame.freeing, "frame {frame_i} is being freed under a held page_table write lock");
+        if frame.page_id != Some(victim) {
             return Ok(Evicted::Gone);
         }
         if frame.pin_counter.load(Ordering::Relaxed) > 0
@@ -1433,6 +1452,9 @@ impl BufferPoolManager {
         drop(pt);
 
         let mut frame = self.frame_write(frame_i);
+        // `page_table` write was held until the entry was removed, so no `free_pages` call held it,
+        // and none can mark this frame now: its pass 1 finds frames through the table.
+        debug_assert!(!frame.freeing, "delete_page: frame {frame_i} is being freed");
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -1466,6 +1488,8 @@ impl BufferPoolManager {
             pt.remove(&page_id);
             drop(pt);
             let mut frame = self.frame_write(frame_i);
+            // As in `delete_page`: the entry left the table under its write lock, so no call marks it.
+            debug_assert!(!frame.freeing, "free_page: frame {frame_i} is being freed");
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
@@ -1660,6 +1684,8 @@ impl BufferPoolManager {
         pt.clear();
         for (page_id, frame_i) in resident {
             let mut frame = self.frame_write(frame_i);
+            // `in_transit` is held, which a `free_pages` call holds for its whole run.
+            debug_assert!(!frame.freeing, "invalidate_all: frame {frame_i} is being freed");
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
