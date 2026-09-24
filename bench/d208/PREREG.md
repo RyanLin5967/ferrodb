@@ -176,3 +176,101 @@ no B-tree index on `body`:
 - K3 to K7 and K9 to K14 leave T9 passing, as amendment 2 says. K3 and K7 were re-checked specifically: under each, the full-text cell still ends at the current root (K3 through `update_fulltext_root`'s store into the true key; K7 through the handle's own split into the shared cell).
 
 Corrected expected kills: K2 fails T1 T2 T3 T5 T6 T7 T8 **T9**. K8 fails T2 T5 T6 T7 T8 **T9**. K16 and K17 fail T9. K15 fails U1.
+
+---
+
+## Amendment 4 (appended before any run; nothing above is edited): the fresh-context review
+
+The review is `frontier/d208_review.md` @ artie-research `4608802`. Its verdict is SOUND-WITH-CAVEATS, with two blockers:
+- **F1:** D214's store regresses a cell that is ahead of a lagging record.
+- **F2:** T9 cannot go red.
+
+Its other items:
+- **F3** is pre-existing on main and is now ledger row D222. It is NOT this branch's: lane `d222-index-root-after-backfill` fixes it, and that branch has no commits yet (it still sits at `9aa6968`), so there is nothing to merge.
+- **F4** is hardening.
+- **F5** is re-cutting the #16 resolution branch.
+
+Nothing has been built or run. Every expectation here is INFERRED.
+
+| sha | what |
+|---|---|
+| `5f19277` | **RED**: U2 (F1, a UNIT test), T9 re-cut (F2), and the three F4 tests; all compile against `f612ba8` |
+| `0214c64` | the fixes: `finish` moves the primary cell by `compare_exchange(planned, now)` (F1); `install_fresh_cell` in each CREATE (F4); D215's comment names the 64-hop right walk (F2) |
+| this commit | this amendment. `src/` and `tests/` are identical to `0214c64` |
+
+### Withdrawals (logged here, where the claims were logged)
+- **Amendment 2's T9 RED at `f83c082` is WITHDRAWN.** T9 as written there stopped at the first split, one hop from the recorded page. D58's `read_leaf_for` walks right up to 64 hops (`index.rs` `RIGHT_WALK`) and repairs that, so T9 would have PASSED at `f83c082` (the review, INFERRED). Amendment 3's T9 kills of K2 and K8, and amendment 2's T9 kills of K16 and K17, fall with it. All four are re-registered below for the re-cut T9.
+- **Amendment 2's D214 contract is replaced.** It said the cell and the record "must agree afterwards". The contract is now: the cell follows a root the rewrite moved, but only if the cell still names the root the rewrite started from. A cell that is ahead of a lagging record is left alone.
+
+### New and changed tests
+- **U2**, `catalog::alter::tests::finish_leaves_a_primary_cell_that_is_already_ahead_of_the_record`. A UNIT test: it sets the cell ahead of the record directly.
+- **T9, re-cut.**
+  - `body VARCHAR(2000)`; one `zulu` row; then rows of 200 ascending `aNNNNNNN` tokens each.
+  - It grows the tree until `hops_from(recorded -> zulu's leaf) > 64`, with `hops_from` using `descend_optimistic`'s own stopping rule, and bounds that at 400 rows.
+  - It asserts that as a premise, beside the earlier four.
+  - Its red phase is a MUTANT run (K16, K17), because the fix predates the fixture.
+- **F4a/F4b/F4c**: `a_create_index_` / `a_create_fulltext_index_` / `a_create_table_never_inherits_a_cell_left_under_its_key`. Each drops a record from `tables` without a sync, creates the same key again, and asserts the cell is not the dead `Arc` and names the new record.
+- The count of runnable tests the branch adds over `d7891d5`: T2–T9 (8) + F4a–c (3) + U1 + U2 = **13** (`#[test]` counted per file, no macros; `root_cell_is_per_index` 12 against 1 at `d7891d5`; `alter.rs` 2 against 0).
+
+### RED at `5f19277`
+- `--test root_cell_is_per_index`: **12 run, 3 FAILED.** F4a, F4b and F4c each fail at "inherited the dead tree's cell". T1–T9 pass: D208 and D215 are fixed here, and T9's premises hold.
+- `--lib -- catalog::alter::tests`: **2 run, 1 FAILED.** U2 fails at "finish regressed the shared primary cell to a stale record". U1 passes.
+- Falsifiers: any F4 premise "landed on the dead tree's root page"; U2 passing here; T9's 400-row premise failing.
+
+### T9's red, as mutants K16 and K17 at `0214c64`
+T9 fails at its last assertion, `[]` against `[0]`, with every premise passing. The mechanism:
+1. The drift is over 64 hops, so the optimistic descent returns `Ok(None)`.
+2. After 16 restarts it falls back to the latched descent from the stale leaf, which does not walk right.
+3. The scan starts past the recorded leaf's end and reads the next leaf.
+4. That leaf's first token, `aNNNNNNN`, is not `zulu`, so the scan breaks.
+
+If T9 PASSES under K16 or K17, that mechanism is wrong.
+
+### GREEN at `0214c64` (or at this commit)
+- `root_cell_is_per_index` **12/12**, and `--lib -- catalog::alter::tests` **2/2**.
+- The rest of the GREEN section and amendment 2 still hold.
+
+### Per-target suite
+- **2624 run, passed=2623, failed=1** (D197's premise test). That is `d7891d5`'s 2611 (quoted from #16 §14) plus 13.
+
+### Mutants: the table in force from here (base `0214c64`)
+
+`install_fresh_cell` changes several kill sets. That is a property of the new code, not a correction of a derivation; each was re-derived against it (INFERRED). The effects:
+- The index created LAST now owns a collided key, so under K1 and K2 T1 passes.
+- Under K8 the FullText cell `install_fresh_cell` seeds is retired again by the same CREATE's sync.
+- The fresh install independently stops the renamed tree being inherited, so T4 no longer kills K12. T8 still does.
+
+| mutant | target | expected FAILED |
+|---|---|---|
+| K1 | integration | T2 T3 T5 T6 T7 T8 |
+| K2 | integration | T2 T3 T5 T6 T7 T8 F4b |
+| K3 | integration | T1 T2 T3 |
+| K4 | integration | T2 T3 |
+| K5 | integration | T2 T3 |
+| K6 | integration | T5 |
+| K7 | integration | T5 |
+| K8 | integration | T5 T6 T7 T8 T9 F4b |
+| K9 | integration | T3 T6 |
+| K10 | integration | T6 (T3 undetermined) |
+| K11 | integration | T7 |
+| K12 | integration | T8 |
+| K13 | integration | T8 |
+| K14 | integration | T8 |
+| K15 (re-cut: `finish`'s compare-exchange removed) | lib `catalog::alter::` | U1 |
+| K16 | integration | T9 |
+| K17 | integration | T9 |
+| K18 (compare-exchange replaced by an unconditional store: the first D214) | lib `catalog::alter::` | U2 |
+| K19 (`install_fresh_cell` inserts only if absent: inheritance restored) | integration | F4a F4b F4c |
+| K20 (`create_table`'s install removed) | integration | F4c |
+| K21 (`create_index`'s install removed) | integration | F4a |
+| K22 (`create_fulltext_index`'s install removed) | integration | F4b |
+
+Every mutant has at least one killing test. Any mutant that survives is reported as a survivor, and no test is changed afterwards to kill it.
+
+### F5: the resolution branch on #16's head `115f0b7`
+- `git merge-tree --write-tree 0214c64 115f0b7` gives rc=1, with a content conflict in `src/wal/recovery.rs` on the `use` line: `IndexTree` against `RetiredSlot` (RUN).
+- The resolution takes both imports, plus amendment 1's two-line adaptation of D205's cells test (`root_cell(name, column.as_deref())`).
+- A grep of the merged tree finds no other old-style `root_cell(` call (RUN).
+- `run`, `sync_roots` and `sync_fulltext_roots` keep their signatures at `115f0b7` (RUN, grep).
+- It is built with plumbing onto a new branch, `d208-root-cell-per-index-on-115f0b7`. Its sha is in the lane report, because a body cannot name its own commit.
+- `d208-root-cell-per-index-on-00f4c39` (`1877e03`) is SUPERSEDED: it sits on `00f4c39`, which #16 has moved past.
