@@ -11,6 +11,12 @@
 //! The lead's decision: once the transaction has ended, the session drops the id, even if the
 //! checkpoint then fails. The error still says the transaction COMMITTED.
 //!
+//! **PREREG amendment (review 2's C4, lead decision; lane §20).** `commit` now returns `Ok` once
+//! `TxnEnd` is written, and a failed automatic checkpoint is a counted deferral. The fix belongs at
+//! the source, not in each caller: the implicit commit of an autocommit statement and MERGE's publish
+//! both read `Err` as "not committed". So COMMIT is asserted to SUCCEED here, where `368d0e1`
+//! asserted an error saying COMMITTED. The autocommit case has a test of its own.
+//!
 //! This binary sets `FERRODB_CHECKPOINT_INTERVAL=1`, so every commit checkpoints. The variable is
 //! read once per process (`wal::txn::checkpoint_interval`), which is why this test has a binary of
 //! its own. The WAL's second write after arming fails: the first is the commit's own flush, the
@@ -121,9 +127,10 @@ fn a_commit_whose_checkpoint_fails_after_the_transaction_ended_releases_the_sess
     // The commit's own flush passes; the checkpoint's flush, after `TxnEnd`, fails.
     store.passes.store(1, Ordering::SeqCst);
     store.armed.store(true, Ordering::SeqCst);
-    let e = db.exec("COMMIT;", &mut s).err().expect("premise: the automatic checkpoint did not fail");
+    if let Err(e) = db.exec("COMMIT;", &mut s) {
+        panic!("a COMMIT whose transaction had ended was reported as failed, because the checkpoint after it failed: {e}");
+    }
     assert!(!store.armed.load(Ordering::SeqCst), "premise: the injected failure never fired");
-    assert!(e.to_string().contains("COMMITTED"), "the error does not say the transaction committed: {e}");
     assert_eq!(s.current, None, "the session kept a transaction that had ended");
 
     db.ok("BEGIN;", &mut s);
@@ -131,6 +138,41 @@ fn a_commit_whose_checkpoint_fails_after_the_transaction_ended_releases_the_sess
     db.ok("COMMIT;", &mut s);
     match db.ok("SELECT id FROM t;", &mut s) {
         Outcome::Rows(rows) => assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]], "a committed row is missing"),
+        _ => panic!("SELECT did not return rows"),
+    }
+}
+
+/// **C4 of review 2: the caller that is not COMMIT.** An autocommit statement's implicit commit read
+/// `commit`'s `Err` as "the statement failed", so a row that had committed was reported as not
+/// written. FAILS at `368d0e1`: the INSERT returns the checkpoint's error.
+#[test]
+fn an_autocommit_statement_whose_checkpoint_fails_after_its_commit_reports_success() {
+    // SAFETY: as in the test above; both set the same value before any commit in this binary.
+    unsafe { std::env::set_var("FERRODB_CHECKPOINT_INTERVAL", "1") };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("autocommit.db");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let wal_file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(wal_path(&path)).unwrap();
+    let store = Arc::new(OneFailure { file: wal_file, armed: AtomicBool::new(false), passes: AtomicU64::new(0) });
+    let wal = Arc::new(WalManager::with_storage(store.clone() as Arc<dyn Storage>, wal_path(&path)).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal);
+    let catalog = Catalog::create(bp.clone()).unwrap();
+    let mut db = Db { catalog, bp, txn };
+
+    let mut s = Session::new();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL);", &mut s);
+    // The implicit commit's own flush passes; the checkpoint's flush, after `TxnEnd`, fails.
+    store.passes.store(1, Ordering::SeqCst);
+    store.armed.store(true, Ordering::SeqCst);
+    if let Err(e) = db.exec("INSERT INTO t VALUES (1);", &mut s) {
+        panic!("an autocommit INSERT that committed was reported as failed, because the checkpoint after it failed: {e}");
+    }
+    assert!(!store.armed.load(Ordering::SeqCst), "premise: the injected failure never fired");
+    match db.ok("SELECT id FROM t;", &mut s) {
+        Outcome::Rows(rows) => assert_eq!(rows, vec![vec![Value::Integer(1)]], "the committed row is missing"),
         _ => panic!("SELECT did not return rows"),
     }
 }

@@ -1,18 +1,19 @@
-//! F2 of the adversary on `993145c..115f0b7` (`frontier/rollback_adversary.md` @ `4902c75`): a release
-//! that fails at commit must not be lost at the next checkpoint.
+//! Q3 of review 2 on `56f6752..368d0e1` (`frontier/rollback_review2.md` @ artie-research `5f6b821`): a
+//! release that can NEVER succeed must not hold the log for ever.
 //!
-//! A committed transaction frees the slots its deletes retired, one logged `HeapRelease` each. When one
-//! fails (an I/O error, or a page that disagrees with the log), it used to be counted and forgotten,
-//! and the next checkpoint truncated the log that recovery would have re-derived it from, so the slot
-//! stayed retired for good.
+//! **This replaces `tests/failed_release_is_kept.rs`, retired by PREREG amendment (lane §20).** That
+//! test made a release fail by editing the retired slot to read LIVE, and asserted that the checkpoint
+//! kept the log. But a LIVE or out-of-range slot is a deterministic mismatch between the page and the
+//! log. Retrying it is futile, so it kept the log growing for ever, and every restart replayed and
+//! rebuilt it all (review 2, Q3).
 //!
-//! The lead's decision: a failed release waits in a pending list. The checkpoint retries it BEFORE
-//! truncating, and refuses to truncate while it still fails, so the log remains the durable record of
-//! what is owed. There is no sweep of pages at open, because that would be a restart wall.
+//! The lead's decision: `release_one` classifies its errors. A mismatch leaves the pending list: it is
+//! counted apart, and its page and slot are printed. I/O and poison stay pending and are retried. The
+//! pending path, which needs an I/O failure an integration test cannot inject, is now tested in the
+//! crate's own unit tests (`wal::txn`, `wal::recovery`).
 //!
-//! The failure is staged by editing the page so the retired slot reads as LIVE, which the release
-//! refuses, and then repaired. This binary holds one test, because it reads
-//! `wal::txn::release_failures`, a process-wide counter. INFERRED from source and never run.
+//! This binary holds one test, because it reads `wal::txn::release_failures`, a process-wide counter.
+//! INFERRED from source and never run.
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -85,9 +86,9 @@ impl Db {
 }
 
 #[test]
-fn a_release_that_fails_at_commit_holds_the_log_until_a_checkpoint_retries_it() {
+fn a_release_that_can_never_succeed_does_not_hold_the_log() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::open(&dir.path().join("pending.db"));
+    let mut db = Db::open(&dir.path().join("mismatch.db"));
     let mut main = Session::new();
     // Row 2 (3934 B) first, then row 1 (35 B), the lowest tuple; 96 B stay free.
     db.ok("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));", &mut main);
@@ -101,23 +102,19 @@ fn a_release_that_fails_at_commit_holds_the_log_until_a_checkpoint_retries_it() 
     assert_ne!(db.primary_rid(1), Some(home), "premise: the UPDATE did not relocate row 1");
     assert_eq!(db.slot(home).1, 35 | RETIRED, "premise: the relocation did not retire row 1's 35 B slot");
 
-    // The page disagrees with the log: the retired slot now reads as live, so the release is refused.
+    // The page disagrees with the log: the retired slot now reads as live, so the release is refused,
+    // and would be at every retry.
     db.set_slot_length(home, 35);
     let failures = release_failures();
     db.ok("COMMIT;", &mut t1);
-    assert_eq!(release_failures(), failures + 1, "premise: the release did not fail");
+    assert_eq!(
+        release_failures(),
+        failures,
+        "a release that can never succeed was counted as a retryable failure, so it is still pending"
+    );
 
     let base = db.o.wal.base_lsn.load(Ordering::SeqCst);
-    assert!(
-        db.o.txn.checkpoint().is_err(),
-        "the checkpoint truncated the log past a release that still fails, so the slot is retired for good"
-    );
-    assert_eq!(db.o.wal.base_lsn.load(Ordering::SeqCst), base, "a refused checkpoint truncated the log anyway");
-
-    // Repaired: the next checkpoint's retry releases the slot, then truncates.
-    db.set_slot_length(home, 35 | RETIRED);
-    db.o.txn.checkpoint().expect("the checkpoint was refused after the release could succeed");
-    assert_eq!(db.slot(home), (0, 0), "the checkpoint's retry did not release the slot");
-    assert!(db.o.wal.base_lsn.load(Ordering::SeqCst) > base, "the checkpoint did not truncate once nothing was owed");
-    assert_eq!(release_failures(), failures + 1, "a retry that succeeded was counted as a failure");
+    db.o.txn.checkpoint().expect("the checkpoint was refused for a release that can never succeed");
+    assert!(db.o.wal.base_lsn.load(Ordering::SeqCst) > base, "the checkpoint did not truncate the log");
+    assert_eq!(db.slot(home), (4096 - 3934 - 35, 35), "premise: the page still holds the edited, live slot");
 }

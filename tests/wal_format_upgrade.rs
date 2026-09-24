@@ -203,3 +203,73 @@ fn an_empty_version_2_log_is_upgraded_at_open_so_writes_work() {
     drop(db);
     assert_eq!(wal_version(&wal_path(&path)), 3, "the open did not rewrite the empty log as version 3");
 }
+
+/// **Q5 of review 2: the log itself refuses the two records whose meaning changed**, while it is
+/// version 2. `begin` already refuses a transaction on such a log, but that guard cannot see a
+/// direct `WalManager::append`. A top-level `HeapDelete` (it RETIRES now, and FREED then) and a
+/// `HeapRelease` (it did not exist) are refused. Everything that means the same in both formats is
+/// accepted: `Begin`, `Abort`, a `Clr` (even one carrying a `HeapDelete`), `TxnEnd`. FAILS at
+/// `368d0e1` at the first refusal: `append` checked only the poison.
+#[test]
+fn a_version_2_log_refuses_the_records_whose_meaning_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_file = dir.path().join("legacy_append.wal");
+    drop(WalManager::new(wal_file.clone()).unwrap());
+    label_as_version_2(&wal_file);
+    let wal = WalManager::new(wal_file).unwrap();
+
+    let delete = RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 0, old: vec![0; 24] };
+    let release = RecKind::HeapRelease { dir_root: 1, page_id: 2, slot: 0 };
+    assert!(wal.append(1, 0, &RecKind::Begin).is_ok(), "a version-2 log refused a Begin");
+    assert!(wal.append(1, 0, &delete).is_err(), "a version-2 log accepted a forward HeapDelete, which means something else in it");
+    assert!(wal.append(1, 0, &release).is_err(), "a version-2 log accepted a HeapRelease, which it cannot contain");
+    assert!(wal.append(1, 0, &RecKind::Abort).is_ok(), "a version-2 log refused an Abort");
+    let clr = RecKind::Clr { undone_lsn: 1, undo_next: 0, redo: Box::new(delete) };
+    assert!(wal.append(1, 0, &clr).is_ok(), "a version-2 log refused a CLR, which recovery's undo of its losers writes");
+    assert!(wal.append(1, 0, &RecKind::TxnEnd).is_ok(), "a version-2 log refused a TxnEnd");
+}
+
+/// **C6 of review 2: the state a crash during the upgrade actually leaves.** `truncate` writes the
+/// version-3 header, with its base set to the log's end, BEFORE it shortens the file. A crash in
+/// between leaves a version-3 header over version-2 frames. The frames' embedded LSNs no longer match
+/// the new base, so `scan_valid_end` drops them all, and the open must see an empty version-3 log
+/// that accepts a transaction. A guard: it passes at `368d0e1` too, because that path does not
+/// depend on the version.
+#[test]
+fn a_crash_between_the_upgrade_header_and_the_truncation_leaves_an_empty_version_3_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_file = dir.path().join("half_upgraded.wal");
+    let end = {
+        let wal = WalManager::new(wal_file.clone()).unwrap();
+        wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.append(1, 0, &RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 0, old: vec![0; 24] }).unwrap();
+        wal.append(1, 0, &RecKind::Commit).unwrap();
+        wal.flush().unwrap();
+        wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    label_as_version_2(&wal_file);
+    // The new header, exactly as `truncate` writes it: magic, version 3, base = the old end, and a
+    // transaction high-water. The file is NOT shortened.
+    {
+        let mut header = [0u8; 24];
+        header[0..4].copy_from_slice(&0xF3_EE_DB_01u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3u32.to_be_bytes());
+        header[8..16].copy_from_slice(&end.to_be_bytes());
+        header[16..24].copy_from_slice(&2u64.to_be_bytes());
+        let mut f = std::fs::OpenOptions::new().write(true).open(&wal_file).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&header).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert!(std::fs::metadata(&wal_file).unwrap().len() > 24, "premise: the old frames are not still in the file");
+
+    let wal = Arc::new(WalManager::new(wal_file.clone()).unwrap());
+    assert_eq!(wal_version(&wal_file), 3, "premise: the header is not version 3");
+    assert_eq!(wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst), end, "the old version-2 frames were read as part of the version-3 log");
+    assert_eq!(std::fs::metadata(&wal_file).unwrap().len(), 24, "the open did not trim the dropped version-2 frames");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.path().join("half_upgraded.db")).unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let txn = TxnManager::new(wal.clone(), bp.clone());
+    bp.attach_wal(wal);
+    txn.begin().expect("the half-upgraded log, now an empty version-3 log, refused a transaction");
+}

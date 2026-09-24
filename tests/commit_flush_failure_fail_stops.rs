@@ -145,3 +145,55 @@ fn a_commit_whose_flush_fails_poisons_the_log_and_cannot_be_rolled_back() {
     };
     assert_eq!(rows, vec![vec![Value::Integer(1)]], "after the reopen, the table is not exactly row 1");
 }
+
+/// **C3 and C6(a) of review 2** (`frontier/rollback_review2.md` @ artie-research `5f6b821`).
+///
+/// C3: poisoning must also mark the indexes stale. The reopen is the poison's whole contract, and
+/// index pages are not logged: if the undecided transaction's records never reached disk and the log
+/// holds nothing else, the reopen replays nothing and would not rebuild, so an index page flushed
+/// with that transaction's entries would name slots the heap never got. The marker makes the reopen
+/// rebuild. FAILS at `368d0e1` at "left no stale-indexes marker".
+///
+/// C6(a): once the disk works again, `flush` itself must still refuse. The first test's checkpoint
+/// assertion is refused by the active-transaction table before the poison is consulted, so it cannot
+/// tell whether `flush` checks the poison. Here the flush is called directly with bytes waiting in
+/// the buffer, so only the poison check can refuse it.
+#[test]
+fn a_poisoned_log_marks_the_indexes_stale_and_refuses_a_direct_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("poison_marker.db");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let wal_file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(wal_path(&path)).unwrap();
+    let store = Arc::new(FailableFile { file: wal_file, fail: AtomicBool::new(false) });
+    let wal = Arc::new(WalManager::with_storage(store.clone() as Arc<dyn Storage>, wal_path(&path)).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    let catalog = Catalog::create(bp.clone()).unwrap();
+    let mut db = Db { catalog, bp, txn };
+
+    let mut main = Session::new();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(8));", &mut main);
+    let mut t1 = Session::new();
+    db.ok("BEGIN;", &mut t1);
+    db.ok("INSERT INTO t VALUES (1, 'a');", &mut t1);
+
+    let marker = ferrodb::wal::txn::stale_indexes_marker(&wal_path(&path));
+    assert!(!marker.exists(), "premise: a stale-indexes marker exists before anything failed");
+    store.fail.store(true, Ordering::SeqCst);
+    assert!(db.exec("COMMIT;", &mut t1).is_err(), "premise: the COMMIT succeeded although its Commit record could not be flushed");
+    store.fail.store(false, Ordering::SeqCst);
+
+    assert!(marker.exists(), "the poisoned log left no stale-indexes marker, so a reopen that replays nothing would not rebuild");
+    assert!(
+        wal.flush().is_err(),
+        "a direct flush of the poisoned log succeeded once the disk worked again: the undecided Commit reached disk"
+    );
+
+    drop(db);
+    drop(wal);
+    drop(store);
+    let lock = DbLock::acquire(&path).unwrap();
+    open_recovered(&path, &lock).expect("the database did not reopen after the poisoned log");
+    assert!(!marker.exists(), "the reopen rebuilt, but did not consume the stale-indexes marker");
+}
