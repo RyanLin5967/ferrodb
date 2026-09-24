@@ -194,8 +194,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// remove a node only when it is empty and never rebalance at half; a queue-shaped key
     /// space drains every leaf completely, so free-at-empty reclaims every one of them.
     ///
-    /// The unlinked page is **not freed** ([`Self::delete_unlinking`] says why), so it stays on
-    /// disk exactly as it does today; what changes is that no descent and no chain reaches it.
+    /// The unlinked page is **not freed** ([`Self::delete_unlinking`] says why, and what that costs
+    /// in a key range that refills). It stays allocated, as a drained leaf did before D233; what
+    /// changes is that no descent and no chain reaches it.
     pub fn delete(&self, key: &K) -> Result<(), FerroError> {
         {
             let (page_id, _latch) = self.latch_leaf_for_write(key)?;
@@ -405,10 +406,10 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     //
                     // The empty case is not hypothetical and `is_some_and` got it wrong: it is
                     // false for an empty leaf, so the walk stopped there and returned it, and the
-                    // key read as absent. `BPlusTreeManager::delete` removes an entry and writes
-                    // the page back with no rebalance (`handle_underflow` is an honest refusal),
-                    // and `execution::insert`'s key reuse did exactly `delete(key)` then
-                    // `insert(key, rid)` — so a leaf holding one key was empty between those two
+                    // key read as absent. Before D233, `BPlusTreeManager::delete` removed an entry
+                    // and wrote the page back with no rebalance (`handle_underflow` is an honest
+                    // refusal), and `execution::insert`'s key reuse did exactly `delete(key)` then
+                    // `insert(key, rid)`, so a leaf holding one key was empty between those two
                     // writes, and a concurrent optimistic reader walking past it saw the gap.
                     // Found by a fresh-context review; `no_workload_drives_a_leaf_underfull` pins
                     // occupancy for the SQL paths and says nothing about this window.
@@ -677,10 +678,19 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// it empty, and walks right, which is the walk the empty case already took. A reader that
     /// descends afterwards never reaches it.
     ///
-    /// **Each unlink leaks the leaf page, plus each internal page the cascade empties.** That is no
-    /// more disk than before D233, where the same pages stayed allocated in the chain. Returning
+    /// **Each unlink leaks the leaf page, plus each internal page the cascade empties.** Returning
     /// them waits on D229's reclamation mechanism (a durable pending-free list, or a reachability
     /// sweep at open when no reader exists), which this change does not pre-empt.
+    ///
+    /// **What that costs depends on whether the drained key range refills** (D233 review F4):
+    /// - A range that never refills, such as the catalog's DEADLINE span (deadlines only grow),
+    ///   uses no more disk than before D233, where the same drained pages stayed allocated in the
+    ///   chain.
+    /// - A range that refills does use more. The catalog's FREE_ID span (fork pops its head) and the
+    ///   STATE span of recycled ids are like this. Before D233 a drained leaf there took the refill
+    ///   in place. Now the drained leaf is leaked and the refill splits a neighbour into a new page,
+    ///   so such a span grows from O(max live) pages to O(splits), without bound, until D229 frees
+    ///   unlinked pages.
     fn delete_unlinking(&self, key: &K) -> Result<(), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
@@ -701,7 +711,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     }
                 }
             };
-            let result = self.remove_and_unlink(leaf_id, &mut stack, key);
+            let result = self.remove_and_unlink(leaf_id, &stack, key);
             drop(guards);
             return result;
         }
@@ -719,52 +729,100 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// 3. The parent drops its pointer and one separator ([`Self::unlink_from_parent`]): from here
     ///    no descent reaches the leaf.
     ///
+    /// # Everything is read and checked before anything is written
+    ///
+    /// An unlink touches up to four pages, and a refusal after the first write would leave a leaf
+    /// that is out of the chain but still routed (D233 review F3). So, under latches this thread
+    /// already holds or takes here, every page is read and every link is checked first: `prev.next`
+    /// and `next.prev` must name this leaf, and [`Self::unlink_from_parent`] must find where the
+    /// cascade stops. Every new image is serialised too. Only then are the pages written, in the
+    /// order above. What is left to fail after the first write is the pool's own I/O.
+    ///
     /// # The one LEFTWARD latch in this file, and why it cannot deadlock
     ///
     /// The splice write-latches `prev`, which is leftward along the chain, against this file's
-    /// acquisition order (down, then rightward). It is safe because of who can hold a leaf latch
+    /// acquisition order (down, then rightward). It then takes `next` while still holding `prev`,
+    /// and holds both until the splice is written. It is safe because of who can hold a leaf latch
     /// while this thread waits for it:
     ///
     /// - a reader (`load_leaf`, or a latched descent's last step) copies the leaf and releases it,
-    ///   and waits on nothing while holding it;
-    /// - a fast-path writer (`latch_leaf_for_write`) holds the leaf write latch and waits on nothing
-    ///   while holding it: it either writes and releases, or releases and restarts;
+    ///   and waits on no page latch while holding it;
+    /// - a fast-path writer (`latch_leaf_for_write`) holds the leaf write latch and waits on no page
+    ///   latch while holding it: it either writes and releases, or releases and restarts;
     /// - a pessimistic writer (a split, or another unlink) would need the ROOT's write latch first,
     ///   and this thread holds it for the whole operation, so no such writer is running.
     ///
-    /// So every holder of `prev`'s latch releases it without waiting on anything this thread holds,
-    /// and the wait cannot close a cycle. The branch catalog also serialises every writer under
-    /// `TableBranchCatalog::logical`, but this argument does not rely on that.
-    fn remove_and_unlink(&self, leaf_id: u32, stack: &mut Vec<u32>, key: &K) -> Result<(), FerroError> {
+    /// "Waits on no page latch" is the whole claim: a holder may wait inside the buffer pool (its
+    /// `write_page` goes through `fetch_page`), and the pool never takes a page latch
+    /// (`page_latch.rs`, enforced by `enter_pool`). So every holder of `prev`'s or `next`'s latch
+    /// releases it without waiting on anything this thread holds, and the wait cannot close a
+    /// cycle. The branch catalog also serialises every writer under `TableBranchCatalog::logical`,
+    /// but this argument does not rely on that.
+    fn remove_and_unlink(&self, leaf_id: u32, stack: &[u32], key: &K) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
         leaf.remove_entry(key)?;
         // Decided again under the path's write latches: a writer may have refilled the leaf between
         // the fast path letting go of it and this thread taking the path.
         let unlink = Self::would_unlink(&leaf);
-        self.write_page(leaf_id, leaf.serialize()?)?;
         if !unlink {
-            return Ok(());
+            return self.write_page(leaf_id, leaf.serialize()?);
         }
-        // The splice. `prev`/`next` are stable here: they change only in a split or an unlink, and
-        // both hold the root's write latch, which this thread holds.
-        if let Some(prev_id) = leaf.prev {
-            let _left = self.latches().write(prev_id);
-            let mut left = self.read_leaf_raw(prev_id)?;
-            left.next = leaf.next;
-            self.write_page(prev_id, left.serialize()?)?;
+        // `prev`/`next` are stable here: they change only in a split or an unlink, and both hold
+        // the root's write latch, which this thread holds. Their KEYS may still change under a
+        // fast-path writer until their latches are taken, which is why each image is read under its
+        // latch and the latch is kept until that image is written.
+        let _left_latch = leaf.prev.map(|id| self.latches().write(id));
+        let left = match leaf.prev {
+            Some(prev_id) => {
+                let mut left = self.read_leaf_raw(prev_id)?;
+                if left.next != Some(leaf_id) {
+                    return Err(FerroError::Io(format!(
+                        "page {leaf_id}'s prev is page {prev_id}, whose next is {:?}; the leaf chain is \
+                         inconsistent, so the unlink is refused and nothing is written",
+                        left.next
+                    )));
+                }
+                left.next = leaf.next;
+                Some((prev_id, left.serialize()?))
+            }
+            None => None,
+        };
+        let _right_latch = leaf.next.map(|id| self.latches().write(id));
+        let right = match leaf.next {
+            Some(next_id) => {
+                let mut right = self.read_leaf_raw(next_id)?;
+                if right.prev != Some(leaf_id) {
+                    return Err(FerroError::Io(format!(
+                        "page {leaf_id}'s next is page {next_id}, whose prev is {:?}; the leaf chain is \
+                         inconsistent, so the unlink is refused and nothing is written",
+                        right.prev
+                    )));
+                }
+                right.prev = leaf.prev;
+                Some((next_id, right.serialize()?))
+            }
+            None => None,
+        };
+        let (parent_id, parent) = self.unlink_from_parent(stack, leaf_id)?;
+        let parent = parent.serialize()?;
+        let leaf = leaf.serialize()?;
+
+        // The writes, in the order a latch-free reader may see them (above).
+        self.write_page(leaf_id, leaf)?;
+        if let Some((prev_id, image)) = left {
+            self.write_page(prev_id, image)?;
         }
-        if let Some(next_id) = leaf.next {
-            let _right = self.latches().write(next_id);
-            let mut right = self.read_leaf_raw(next_id)?;
-            right.prev = leaf.prev;
-            self.write_page(next_id, right.serialize()?)?;
+        if let Some((next_id, image)) = right {
+            self.write_page(next_id, image)?;
         }
-        self.unlink_from_parent(stack, leaf_id)
+        self.write_page(parent_id, parent)
     }
 
-    /// Drop `doomed` from its parent, cascading while a parent is left with no child.
+    /// Plan dropping `doomed` from its parent, cascading while a parent would be left with no
+    /// child. **Writes nothing**: returns the page where the cascade stops and that page's new
+    /// image, which [`Self::remove_and_unlink`] writes only once every check has passed.
     /// **The caller must hold write latches on every page in `stack`**, which is the path from the
-    /// root down to `doomed`'s parent.
+    /// root down to `doomed`'s parent, so the image is still current when it is written.
     ///
     /// The separator rule is `cow::btree::unlink_up`'s (D104), the in-repo precedent: removing a
     /// child that is not the leftmost removes the separator to its LEFT, so its key range joins its
@@ -779,10 +837,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// as a broken invariant rather than turned into an empty tree. The root is also never
     /// collapsed onto a single child; like `unlink_up`, this keeps a level a shrunken tree no
     /// longer needs.
-    fn unlink_from_parent(&self, stack: &mut Vec<u32>, doomed: u32) -> Result<(), FerroError> {
+    fn unlink_from_parent(&self, stack: &[u32], doomed: u32) -> Result<(u32, BPlusTreeInternalPage<K>), FerroError> {
         let mut doomed = doomed;
+        let mut above = stack.iter().rev();
         loop {
-            let Some(parent_id) = stack.pop() else {
+            let Some(&parent_id) = above.next() else {
                 return Err(FerroError::Io(format!(
                     "unlinking page {doomed} would leave the B+tree with no leaf; only a leaf with a \
                      neighbour is unlinked, so the tree's links are inconsistent"
@@ -810,7 +869,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             }
             parent.child_ptrs.remove(slot);
             parent.num_keys = parent.key_arr.len() as u16;
-            return self.write_page(parent_id, parent.serialize()?);
+            return Ok((parent_id, parent));
         }
     }
 
