@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::execution::executor::{run, Outcome};
@@ -53,6 +54,14 @@ fn main() {
         .open(&path)
         .unwrap();
     let dm = Arc::new(DiskManager::new(file).unwrap());
+    // **D239.** Every entry point that recovers reserves the persisted arena region first, as
+    // `src/cli/cli.rs` does. This harness builds no page store, so it never writes `{db}.arena` and
+    // the call registers nothing; it is here so no recovering entry point is an exception.
+    let arena_path = format!("{path}.arena");
+    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path)).unwrap_or_else(|e| {
+        eprintln!("crash_mid_merge: reserve the arena region: {e}");
+        std::process::exit(1);
+    });
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{path}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
