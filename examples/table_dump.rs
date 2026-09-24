@@ -100,10 +100,8 @@ fn main() {
     // never attaches the arena store at all, so without this no region is ever registered, and a
     // page recovery allocates (a directory repair) could be one of the arena's.
     let arena_path = format!("{db}.arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path)).unwrap_or_else(|e| {
-        eprintln!("table_dump: reserve the arena region: {e}");
-        std::process::exit(1);
-    });
+    // MUTANT (fire-check only, never land): table_dump never reserves the floor before recovery.
+    let _ = &arena_path;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
