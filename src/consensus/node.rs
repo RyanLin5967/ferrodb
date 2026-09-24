@@ -107,6 +107,62 @@ impl Applier for RecordingApplier {
     }
 }
 
+/// Where this node's [`Event::Tick`]s come from.
+///
+/// The state machine counts ticks and knows nothing about seconds; this is the one decision about
+/// what a tick *is*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clock {
+    /// One tick per [`NodeOptions::tick`] of wall time, caught up whole when the driver falls
+    /// behind. **A server's clock, and the default.**
+    Wall,
+    /// **A test harness's clock: one tick per [`Node::poll`], and no read of the wall on the way.**
+    ///
+    /// D73. A harness that turns every node of a cluster from one loop, on the wall clock, makes an
+    /// election a function of how long the loop took: an SQL statement, an fsync or a descheduled
+    /// thread between two turns is time to the state machine, and on a loaded machine it is enough
+    /// time to lapse the leader's lease and elect somebody else. Under this clock only a turn is
+    /// time, so nothing the loop does between turns reaches a timeout in `config.rs`.
+    ///
+    /// **The socket is not read in `poll` either**, and that half matters as much as the first.
+    /// Messages are moved into the event queue by `Node::collect`, which the harness calls for
+    /// every node *between* turns, once `Node::frames` summed over the fleet says nothing is in
+    /// flight. Read inside `poll`, a message from a node turned earlier in the same turn would land
+    /// in this turn or the next according to whether TCP beat the loop to the next node — the same
+    /// dependence on scheduling, moved from the clock to the network. Collected between turns,
+    /// every message takes exactly one turn.
+    ///
+    /// ⛔ **Never a server's clock.** The objection in
+    /// `a_tick_is_delivered_on_the_clock_and_missed_ticks_are_caught_up` still holds for any
+    /// process that polls its own node: a driver that ticks once per poll makes every timeout a
+    /// function of how often the caller polls, so a busy node's leader is declared dead by everyone
+    /// else while it believes it is fine. It does not hold for a harness only because one caller
+    /// turns *every* node, once each, per turn — so no node can be busier than another.
+    Pumped,
+}
+
+/// One node's count of consensus frames, for a harness that must know a fleet has gone quiet.
+///
+/// Summed over every node of a fleet, `sent == received + lost` says every frame sent has come off
+/// its socket and been counted: received, or lost by a route the transport counts. `lost` is every
+/// such route, at either end: a queue that overflowed or a write that broke (the sender's), and a
+/// frame refused for want of inbox space, for naming another addressee, or for failing to
+/// authenticate (the receiver's). A received frame can still be a few instructions short of the
+/// inbox — the counter moves just before the channel send — which is why `Node::collect` waits for
+/// the count rather than draining whatever the channel holds.
+///
+/// **What it cannot see, stated rather than left to be found:** a frame written whole and then
+/// lost with its connection, and a frame the reader closed its connection over (an unknown tag, a
+/// decode failure). Neither is counted anywhere, so a fleet that suffers one never balances. That
+/// is the direction to fail in: a harness waiting for the balance refuses by name, where one that
+/// took the turn anyway would run it with a message missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Frames {
+    pub sent: u64,
+    pub received: u64,
+    pub lost: u64,
+}
+
 /// How this node is reachable, and how fast its clock runs.
 pub struct NodeOptions {
     /// Directory for the round log and the hard-state record. Created if absent.
@@ -119,7 +175,11 @@ pub struct NodeOptions {
     /// The state machine counts ticks and knows nothing about seconds; every timeout in
     /// `config.rs` is a tick count. This is the only place the two meet, so it is the only knob
     /// that turns a correct-but-slow cluster into a correct-and-fast one.
+    ///
+    /// Unused under [`Clock::Pumped`], where a tick is a poll and not a duration.
     pub tick: Duration,
+    /// Where ticks come from. [`Clock::Wall`] unless a test harness asks otherwise.
+    pub clock: Clock,
     /// Seed for the election-timeout jitter. Two nodes with the same seed draw the same timeout and
     /// split the vote every term, so a cluster must give each node a different one.
     pub seed: u64,
@@ -155,6 +215,7 @@ impl NodeOptions {
             dir: dir.into(),
             peers,
             tick: Duration::from_millis(50),
+            clock: Clock::Wall,
             seed,
             transport: TransportOptions::default(),
             signing_key: None,
@@ -196,6 +257,14 @@ impl NodeOptions {
         self.tick = d;
         self
     }
+
+    /// Tick once per [`Node::poll`] instead of once per [`NodeOptions::tick`] of wall time. **A
+    /// test harness's setting and never a server's** — see [`Clock::Pumped`] for both halves.
+    #[doc(hidden)]
+    pub fn pumped(mut self) -> Self {
+        self.clock = Clock::Pumped;
+        self
+    }
 }
 
 /// A running node: the state machine, its durable log, its socket, and the clock that drives them.
@@ -207,6 +276,11 @@ pub struct Node<A: Applier> {
     dir: PathBuf,
     tick: Duration,
     next_tick: Instant,
+    /// Where ticks come from. Under [`Clock::Pumped`], `tick` and `next_tick` are never read.
+    clock: Clock,
+    /// Messages [`Node::collect`] has taken from the transport, over this node's life. Compared
+    /// with the transport's own `received`, which is how `collect` knows it holds the whole turn.
+    pulled: u64,
     /// Highest round handed to the applier. Distinct from the state machine's own `applied`, which
     /// is what it has *asked* for; this is what actually reached the engine.
     applied: Round,
@@ -367,6 +441,8 @@ impl<A: Applier> Node<A> {
             dir: opts.dir,
             tick: opts.tick,
             next_tick: now + opts.tick,
+            clock: opts.clock,
+            pulled: 0,
             // **Seeded from the floor, not from zero.** Rounds at or below it were applied by
             // whoever produced the snapshot that created it, and they no longer exist anywhere on
             // this node — walking up from 0 would ask the log for the first of them and be refused.
@@ -433,7 +509,16 @@ impl<A: Applier> Node<A> {
     /// Blocks at most `budget`, and never past the next tick — a driver that sleeps through a tick
     /// makes the election timeout a function of message arrival, so a silent cluster never notices
     /// its leader died.
+    ///
+    /// Under [`Clock::Pumped`] it never blocks, `budget` is unused, and one call is exactly one
+    /// tick: what arrived was queued by [`Node::collect`] before this turn began.
     pub fn poll(&mut self, budget: Duration) -> Result<(), FerroError> {
+        if self.clock == Clock::Pumped {
+            // No clock and no socket on this path — both are the scheduling dependence the pumped
+            // clock removes, and `Clock::Pumped` says why the socket counts as much as the clock.
+            self.pending.push_back(Event::Tick);
+            return self.drain();
+        }
         let now = Instant::now();
         let until_tick = self.next_tick.saturating_duration_since(now);
         let wait = budget.min(until_tick);
@@ -459,6 +544,71 @@ impl<A: Applier> Node<A> {
         }
 
         self.drain()
+    }
+
+    /// **The pumped clock's delivery step:** move every message this node's transport has counted
+    /// as received into the event queue, ordered by sender. Returns how many.
+    ///
+    /// A harness calls it for every node *between* turns, once [`Node::frames`] summed over the
+    /// fleet says nothing is in flight; [`Clock::Pumped`] says why it is not part of `poll`.
+    ///
+    /// **Ordered by sender, stably.** Two peers' frames reach the inbox on two socket threads, and
+    /// which one gets there first is the scheduler's choice. The state machine accepts any order —
+    /// the network is allowed to reorder — but a fleet that is to replay one election from one set
+    /// of seeds needs an order that is not the scheduler's. Stable, so each sender's frames keep
+    /// the order its one connection delivered them in.
+    ///
+    /// `within` bounds the wait for a frame the transport has counted but not yet handed over — its
+    /// counter moves just before the channel send. A failure bound, not a measurement: running out
+    /// is refused by name and never read as "nothing arrived".
+    ///
+    /// Refused on a [`Clock::Wall`] node, whose `poll` reads the socket itself: two readers of one
+    /// inbox would each hold part of a turn.
+    #[doc(hidden)]
+    pub fn collect(&mut self, within: Duration) -> Result<usize, FerroError> {
+        if self.clock != Clock::Pumped {
+            return Err(FerroError::Internal(format!(
+                "node {:?} runs on the wall clock, whose `poll` reads the socket itself. `collect` \
+                 is the pumped clock's delivery step, and two readers of one inbox would each hold \
+                 part of a turn",
+                self.sm.id()
+            )));
+        }
+        let mut arrived = Vec::new();
+        while self.pulled < self.net.received() {
+            let Some(m) = self.net.recv_timeout(within) else {
+                return Err(FerroError::Internal(format!(
+                    "node {:?}'s transport counted {} frames received and had handed over {} when \
+                     it went {within:?} without producing another. A counted frame that never \
+                     reaches the inbox is a transport defect, and taking the turn without it \
+                     would make the turn depend on when it turned up",
+                    self.sm.id(),
+                    self.net.received(),
+                    self.pulled
+                )));
+            };
+            self.pulled += 1;
+            arrived.push(m);
+        }
+        arrived.sort_by_key(|m| m.from);
+        let n = arrived.len();
+        self.pending.extend(arrived.into_iter().map(Event::Recv));
+        Ok(n)
+    }
+
+    /// This node's side of a fleet's delivery ledger. See [`Frames`] for what the sum means, and
+    /// for the two losses it cannot see.
+    #[doc(hidden)]
+    pub fn frames(&self) -> Frames {
+        Frames {
+            sent: self.net.sent(),
+            received: self.net.received(),
+            lost: self.net.dropped()
+                + self.net.lost_in_flight()
+                + self.net.inbound_dropped()
+                + self.net.misrouted()
+                + self.net.unauthenticated(),
+        }
     }
 
     fn drain(&mut self) -> Result<(), FerroError> {

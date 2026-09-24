@@ -1275,6 +1275,13 @@ fn a_merge_that_loses_the_leadership_mid_flight_refuses_and_publishes_nothing() 
 /// costs, and that is a question about counts on the coordinator, which needs the coordinator and
 /// the cluster in one address space to be asked at all. The consensus underneath is entirely real —
 /// real elections, real appends over TCP, real fsyncs.
+///
+/// **Its clock is the turn, not the wall (D73).** Every node runs `Clock::Pumped` and
+/// `Fleet::turn` is the only thing that advances it, so an election here is a function of how
+/// many turns were taken and of nothing the test did between them. On the 20 ms wall tick this
+/// harness used before, an SQL statement or an fsync between two turns was time to every node, and
+/// under load it was enough to lapse the leader's lease — the family of flakes `hold_leader` and
+/// the `NotLeader` retry arms below were each written to survive one member of.
 struct Fleet {
     reps: Vec<Arc<NodeReplicator>>,
     ledgers: Vec<Arc<Mutex<BranchLedger>>>,
@@ -1284,6 +1291,11 @@ struct Fleet {
     tallies: Vec<Arc<Mutex<Vec<Command>>>>,
     _dirs: Vec<tempfile::TempDir>,
 }
+
+/// How long `Fleet::deliver` waits for the transport before it refuses the turn. Generous on
+/// purpose: only a frame lost without being counted, or a machine starved for seconds, ever
+/// reaches it, and a deadline that is only a failure bound costs nothing while it is not reached.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Records what a node committed, so "an agent's rows never reached a quorum" can be *read* off a
 /// follower rather than inferred from a counter on the leader.
@@ -1346,8 +1358,9 @@ impl Fleet {
             let ledger = Arc::new(Mutex::new(BranchLedger::new()));
             let tally = Arc::new(Mutex::new(Vec::new()));
             // Distinct seeds: two nodes drawing the same election timeout split every vote.
+            // Pumped: one tick per turn, and no tick from the wall. See the struct's doc.
             let opts = NodeOptions::new(dir.path(), peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9))
-                .tick_of(Duration::from_millis(20));
+                .pumped();
             let applier = BranchApplier::chained(ledger.clone(), Box::new(Tally(tally.clone())));
             let node = Node::start(id, cfg.clone(), l, opts, applier).unwrap();
             reps.push(Arc::new(NodeReplicator::new(node, Duration::from_millis(1))));
@@ -1361,14 +1374,67 @@ impl Fleet {
     /// One turn of every node's driver loop.
     ///
     /// In a real server this is a thread of its own and nothing an agent does drives it. Here it
-    /// is called explicitly so the whole test stays deterministic — but it must be called *while*
-    /// an agent works, not only around it: a leader whose driver is starved of ticks for longer
-    /// than an election timeout is deposed by its own peers, which is correct behaviour and has
-    /// nothing to do with what is on trial.
+    /// is called explicitly so the whole test stays deterministic. It must still be called *while*
+    /// an agent works and not only around it, but since D73 the reason is replication rather than
+    /// the lease: a turn not taken is time that did not pass, so nothing is deposed by the wait —
+    /// and nothing commits during it either.
     fn pump_all(&self) {
+        self.turn().expect("a node's driver failed");
+    }
+
+    /// **The whole of the pumped clock, and the order is the point.** Deliver everything the last
+    /// turn sent, then give every node exactly one tick.
+    ///
+    /// Every path by which this harness advances a timeout comes through here: `pump_all` (and so
+    /// `elect`, `settle_to`, `hold_leader` and every test loop), and `FleetSeam::pump` (and so
+    /// `ClusterAgents::pump_until`, which is the merge's and the fork's wait). `Node::poll` is the
+    /// only producer of `Event::Tick`, it is reached only through `NodeReplicator::pump`, and the
+    /// two loops below are the only callers of that in this file.
+    fn turn(&self) -> Result<(), FerroError> {
+        self.deliver()?;
         for r in &self.reps {
-            r.pump().expect("a node's driver failed");
+            r.pump()?;
         }
+        Ok(())
+    }
+
+    /// Wait until no frame is in flight anywhere in the fleet, then hand each node what it
+    /// received — so every message takes exactly one turn, whatever TCP and the scheduler did.
+    ///
+    /// Without the wait, a frame sent in one turn arrives in the next or the one after according
+    /// to how fast the socket threads ran, and the election is a function of the machine again —
+    /// by way of the network rather than the clock.
+    ///
+    /// **Its one wall-clock read is a failure bound, and it cannot choose an outcome:** running
+    /// out returns an error naming the unbalanced counts, and the turn is not taken. A frame lost
+    /// without being counted is the case that reaches it — see `Frames` for the two such losses.
+    fn deliver(&self) -> Result<(), FerroError> {
+        let t0 = std::time::Instant::now();
+        loop {
+            let (mut sent, mut settled) = (0u64, 0u64);
+            for r in &self.reps {
+                let f = r.with_node(|n| n.frames());
+                sent += f.sent;
+                settled += f.received + f.lost;
+            }
+            if sent == settled {
+                break;
+            }
+            if t0.elapsed() > DELIVERY_DEADLINE {
+                return Err(FerroError::Internal(format!(
+                    "the fleet sent {sent} frames and has accounted for {settled} (received or \
+                     counted lost) after {} ms. Taking the next turn without the rest would make \
+                     it depend on when they arrive, which is the dependence the pumped clock \
+                     exists to remove, so the turn is refused instead",
+                    t0.elapsed().as_millis()
+                )));
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        for r in &self.reps {
+            r.with_node(|n| n.collect(DELIVERY_DEADLINE))?;
+        }
+        Ok(())
     }
 
     /// Drive until one node holds office, **every** node agrees it does, it has committed its own
@@ -1457,6 +1523,12 @@ impl Fleet {
     /// **Reports its ITERATION COUNT on both exits.** See `settle_to` for why: the bound here is a
     /// turn count, not a deadline, so "six minutes" is ambiguous between a slow `pump()` and a
     /// non-converging election until an integer says which.
+    ///
+    /// **Since D73 the premise of the first paragraph no longer holds, and this is kept as a
+    /// tripwire.** Under the pumped clock the write loop's statements are not time, so the lease
+    /// cannot lapse between them and this returns at `turns=0`. A `LOOPCOUNT hold_leader` line
+    /// with `turns>0` is therefore no longer weather on a slow machine: it is a leadership change
+    /// this harness does not explain, and it is a finding.
     fn hold_leader(&self, want: usize, site: &str) {
         let l = NodeId(want as u32 + 1);
         let t0 = std::time::Instant::now();
@@ -1502,10 +1574,9 @@ impl Replicated for FleetSeam {
         self.fleet.reps[self.me].committed_head()
     }
     fn pump(&self) -> Result<(), FerroError> {
-        for r in &self.fleet.reps {
-            r.pump()?;
-        }
-        Ok(())
+        // A turn of the whole fleet, pumped clock and delivery barrier included — NOT a bare
+        // `pump` of each node, which would tick every clock and deliver nothing.
+        self.fleet.turn()
     }
     fn leader(&self) -> Option<NodeId> {
         self.fleet.reps[self.me].leader()
@@ -1674,6 +1745,9 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     // NOT a weakening of the assertion: the claim is still that the merge succeeds and publishes.
     // The retry only re-establishes the precondition the merge was always entitled to assume; any
     // OTHER error fails immediately, and running out of attempts fails loudly with the last one.
+    //
+    // D73: under the pumped clock the gap described above is not time, so this arm should never
+    // run. A `NOTLEADER site=followers-log/retry-arm` line is now a finding, not a slow machine.
     let mut attempt = 0;
     let report = loop {
         // D173 instrument and assertion -- see the identical note in the neighbouring test.
@@ -1783,6 +1857,9 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
         //
         // The retry path was FIRE-CHECKED by forcing the first attempt to return NotLeader: the
         // test still passed, so the recovery works rather than merely compiling.
+        //
+        // D73: under the pumped clock the gap described above is not time, so this arm should
+        // never run. A `NOTLEADER site=hundred-writes/retry-arm` line is now a finding.
         let mut attempt = 0;
         let r = loop {
             // D173 instrument, now an assertion. `proposals` increments inside `merge` only after
@@ -1914,9 +1991,9 @@ fn election_trace(
 ///
 /// Two fleets from the same seeds, driven through the same number of turns, one of them paused
 /// between some of them. If ticks come from the turns and every message takes a fixed number of
-/// turns to arrive, the two replay one election turn for turn — same roles, same terms, same leader,
-/// same commit round, at every turn. If anything the machine did between turns can reach a
-/// timeout, they part company.
+/// turns to arrive, the two replay one election turn for turn — same roles, same terms, same
+/// leader, same commit round, at every turn. If anything the machine did between turns can reach
+/// a timeout, they part company.
 ///
 /// Red on the wall-clock `Fleet`: the paused fleet sees 25 ms as more than a tick, the other does
 /// not, so they campaign at different turns. **That is also this equality's negative control** —
@@ -1957,4 +2034,38 @@ fn the_same_turns_elect_the_same_leader_at_the_same_turn_whatever_the_machine_do
         "after {TURNS} turns the fleet had not settled on one leader with a committed round: \
          {last:?}"
     );
+}
+
+/// **FORCED FIRE for the delivery barrier in `Fleet::deliver`.** A frame queued an instant before
+/// a turn is delivered in that turn, every time: the leader's `Append` for a proposal is on every
+/// follower's disk after one turn, and their acknowledgements commit it on the leader after one
+/// more.
+///
+/// This catches what the replay equality above mostly cannot. Without the barrier, `collect` runs
+/// microseconds after the proposal queued its frames — well inside a localhost round trip — so a
+/// follower would take the turn without the `Append` and the round would reach its disk a turn
+/// late. Twenty proposals, so a missing barrier cannot pass on one lucky race.
+#[test]
+fn a_frame_queued_before_a_turn_is_delivered_in_that_turn() {
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    for k in 0..20u64 {
+        let round = fleet.reps[leader].propose(wal(k)).expect("the leader refused a proposal");
+        fleet.pump_all();
+        let logs: Vec<Round> =
+            fleet.reps.iter().map(|r| r.with_node(|n| n.last_round())).collect();
+        assert!(
+            logs.iter().all(|&l| l >= round),
+            "proposal {k} (round {round}) was not on every node's disk after one turn: last rounds \
+             {logs:?}. A frame queued before a turn missed that turn, so delivery is timing again"
+        );
+        fleet.pump_all();
+        let committed = fleet.reps[leader].committed_head();
+        assert!(
+            committed >= round,
+            "proposal {k} (round {round}) was not committed on the leader after two turns: commit \
+             {committed}. The followers' acknowledgements missed the turn after they were sent"
+        );
+    }
+    fleet.shutdown();
 }
