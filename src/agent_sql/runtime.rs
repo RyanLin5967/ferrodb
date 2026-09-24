@@ -3643,7 +3643,10 @@ impl AgentRuntime {
         h.entries().iter().filter(|e| e.branch == branch).copied().collect()
     }
 
-    /// The branch's current chain head, or `None` if nothing has been attested for it.
+    /// The branch's current chain head, or `None` if nothing has been attested for it **or its
+    /// chain was sealed by a reap** (wall #19: a reaped branch leaves the per-branch index). A
+    /// reaped branch's history is still in [`Self::attested_entries`], and its last entry's
+    /// attestation is the sealed head.
     pub fn attestation_of(&self, branch: BranchId) -> Option<Attestation> {
         self.attested.lock().unwrap().head_of(branch)
     }

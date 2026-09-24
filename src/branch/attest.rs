@@ -129,6 +129,12 @@
 //!    deliberately no `ContentId::from_page_id`.
 //! 4. **Nothing here is durable.** [`AttestedHistory`] is in-memory. Persisting it, and deciding
 //!    who publishes roots and where, is not in this module and is not claimed by it.
+//!    **Resident cost (wall #19, D192): the log is Θ(lifecycle events) and that is the contract**
+//!    — every entry stays provable, so an append-only Merkle log cannot drop one (CT and Trillian
+//!    never do; git prunes only objects nothing reaches, and every leaf here is reached by the
+//!    current head). What is O(live branches) is the per-branch index, since a reap removes its
+//!    branch from it. Moving the log itself off the heap means tiles on storage (tlog-tiles,
+//!    Trillian's subtree storage), which needs the persistence decision this item leaves open.
 //! 5. **No signatures.** A root proves *what* the log said, never *who* said it. CT logs sign
 //!    their tree heads; this does not. [`crate::consensus::signing`] has the HMAC that would.
 
@@ -725,17 +731,28 @@ pub fn verify_consistency(
 /// this ground and the table is the reason it was right to.
 pub struct AttestedHistory {
     entries: Vec<HistoryEntry>,
-    /// Entry indices per branch, ascending.
+    /// Latest attestation per **live** branch: one whose most recent entry is not a
+    /// [`BranchOp::Reap`]. Derived from `entries` by [`Self::push`] and nothing else.
     ///
-    /// ⛔ **Keyed by the whole [`BranchId`], generation included, and an earlier draft keyed it by
-    /// the raw `u64` slot.** That draft's stated reason — "a reader asking what happened under id
-    /// 7 wants both generations" — is a fine answer to a *reporting* question and the wrong key
-    /// for a *linkage* one. With the slot as the key, a generation-1 branch inherited generation
-    /// 0's head and chained straight onto the reaped branch's last attestation, which is the
-    /// exact inverse of the property this module's header claims. The digest had the generation
-    /// in it; the structure did not, and only the structure decides what links to what.
-    by_branch: HashMap<BranchId, Vec<usize>>,
-    /// Latest attestation per branch.
+    /// ⛔ **Keyed by the whole [`BranchId`], generation included, and an earlier draft keyed the
+    /// per-branch index by the raw `u64` slot.** That draft's stated reason — "a reader asking
+    /// what happened under id 7 wants both generations" — is a fine answer to a *reporting*
+    /// question and the wrong key for a *linkage* one. With the slot as the key, a generation-1
+    /// branch inherited generation 0's head and chained straight onto the reaped branch's last
+    /// attestation, which is the exact inverse of the property this module's header claims. The
+    /// digest had the generation in it; the structure did not, and only the structure decides
+    /// what links to what.
+    ///
+    /// ⛔ **Wall #19 (D192): a reap REMOVES the branch from this map.** It used to keep a head for
+    /// every branch ever seen, beside a `by_branch: HashMap<BranchId, Vec<usize>>` holding the
+    /// position of every entry of every branch, so this struct's per-branch part grew with
+    /// branches ever forked and with every event, not with branches alive. Nothing needs either
+    /// after a reap. A reaped branch is never again written to (the catalog makes its id a hard
+    /// error, and `LogBranchCatalog::fork` refuses it as a parent through `check_readable`).
+    /// Every reader of its history goes through `entries`: the chain walks, both proofs,
+    /// `verify_against`, and the runtime's `attested_entries`. The only reader of `by_branch` was
+    /// `verify_branch`, which used one element per key and now finds it with a reverse scan
+    /// inside a walk that is already O(n). Size: O(live branches), including trunk.
     heads: HashMap<BranchId, Attestation>,
     /// Merkle levels; `levels[0]` is the leaf hashes. Maintained incrementally so that `append` is
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
@@ -751,12 +768,7 @@ impl Default for AttestedHistory {
 
 impl AttestedHistory {
     pub fn new() -> Self {
-        AttestedHistory {
-            entries: Vec::new(),
-            by_branch: HashMap::new(),
-            heads: HashMap::new(),
-            levels: Vec::new(),
-        }
+        AttestedHistory { entries: Vec::new(), heads: HashMap::new(), levels: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -771,10 +783,14 @@ impl AttestedHistory {
         &self.entries
     }
 
-    /// The latest attestation for a branch, if it has any history.
+    /// The latest attestation for a **live** branch.
+    ///
+    /// `None` for a branch with no history, **and for one whose history a
+    /// [`BranchOp::Reap`] sealed** (wall #19). A sealed branch's terminal attestation is its reap
+    /// entry's, read from [`Self::entries`]; it is not kept here, because nothing may extend it.
     ///
     /// Takes a whole [`BranchId`]: a reaped slot and its recycled successor are different
-    /// branches and must not share a head. See [`Self::by_branch`]'s note.
+    /// branches and must not share a head. See the note on the `heads` field.
     pub fn head_of(&self, branch: BranchId) -> Option<Attestation> {
         self.heads.get(&branch).copied()
     }
@@ -804,6 +820,15 @@ impl AttestedHistory {
     ///
     /// If the parent has no history yet, its genesis is used — a log that begins mid-life is a real
     /// situation and refusing it here would only push the caller into faking an entry.
+    ///
+    /// ⚠ **Precondition, enforced by the caller's catalog and not here: `parent` is not reaped.**
+    /// Since wall #19 a reaped branch has no head, so a fork from one would take the genesis
+    /// branch above and name no ancestry, and [`Self::verify_chain`] cannot tell that from a log
+    /// that began mid-life, because a `Fork` entry does not carry its parent's id. **Blind spot,
+    /// stated rather than hidden:** this struct cannot see the catalog, so it cannot refuse. The
+    /// one production caller, `AgentRuntime::attest_fork`, runs only after
+    /// `BranchCatalog::fork_staged` accepted the parent, and `LogBranchCatalog::fork` refuses a
+    /// reaped parent through `BranchRecord::check_readable`.
     pub fn append_fork(
         &mut self,
         child: BranchId,
@@ -816,6 +841,11 @@ impl AttestedHistory {
     }
 
     /// Record any non-fork operation on `branch`, linked to that branch's own head.
+    ///
+    /// ⚠ **`branch` must not be reaped** (wall #19). A reaped branch has no head, so an entry
+    /// appended to it after its `Reap` links to genesis. Unlike a fork from a reaped parent, that
+    /// one is not silent: [`Self::verify_chain`] rebuilds each branch's head from the entries and
+    /// reports a [`TamperFinding::BrokenLink`] at the new entry.
     pub fn append(
         &mut self,
         branch: BranchId,
@@ -835,9 +865,16 @@ impl AttestedHistory {
     /// one standing in for the production path inside a test.
     fn push(&mut self, e: HistoryEntry) -> Attestation {
         let att = e.attestation();
-        let idx = self.entries.len();
-        self.by_branch.entry(e.branch).or_default().push(idx);
-        self.heads.insert(e.branch, att);
+        // Wall #19: a reap seals the branch, so it leaves the index here, the single append path.
+        // The entry itself stays in the log and in the tree like every other one: every proof
+        // about it survives, and only the pointer to a head nothing may extend is dropped. Keyed
+        // on the op rather than told by a caller, so `load_untrusted` derives the same index from
+        // the same entries.
+        if e.op == BranchOp::Reap {
+            self.heads.remove(&e.branch);
+        } else {
+            self.heads.insert(e.branch, att);
+        }
         self.extend_tree(e.leaf_hash());
         self.entries.push(e);
         att
@@ -921,7 +958,7 @@ impl AttestedHistory {
         produced.insert(genesis.0);
 
         // Keyed by the whole BranchId. Keying this by the id slot let a recycled slot chain onto
-        // the reaped branch's head — see the note on `AttestedHistory::by_branch`.
+        // the reaped branch's head — see the note on `AttestedHistory::heads`.
         let mut branch_head: HashMap<BranchId, Attestation> = HashMap::new();
 
         for (i, e) in self.entries.iter().enumerate() {
@@ -1040,8 +1077,12 @@ impl AttestedHistory {
         for (i, e) in self.entries.iter().enumerate() {
             produced.insert(e.attestation().0, i);
         }
-        let last = match self.by_branch.get(&branch).and_then(|idxs| idxs.last()) {
-            Some(&last) => last,
+        // The branch's last entry, found by a reverse scan rather than an index (wall #19): a
+        // reaped branch has no head, and a per-branch index of positions grew with every event
+        // for the sake of this one lookup. The loop above already hashes every entry, so a scan
+        // that only compares ids does not change this function's O(n).
+        let last = match self.entries.iter().rposition(|e| e.branch == branch) {
+            Some(last) => last,
             None => return Err(TamperFinding::NoSuchBranch { branch }),
         };
 
@@ -1162,8 +1203,8 @@ impl AttestedHistory {
     /// reads this cannot silently stop seeing a new per-branch collection.
     #[cfg(test)]
     fn per_branch_elements(&self) -> usize {
-        let AttestedHistory { entries: _, by_branch, heads, levels: _ } = self;
-        by_branch.len() + by_branch.values().map(Vec::len).sum::<usize>() + heads.len()
+        let AttestedHistory { entries: _, heads, levels: _ } = self;
+        heads.len()
     }
 }
 
