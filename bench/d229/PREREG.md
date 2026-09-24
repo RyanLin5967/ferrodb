@@ -578,3 +578,28 @@ record's LSN), and nothing of it is built here.
 
   Both are RED at the base (INFERRED: nothing moves the intent). Mutant **M27**: `start_fresh_database` skips the
   intent's move.
+
+**Amendment 17 (after `41281b8` and `82ca43c`).**
+- `41281b8` adds amendment 16's three tests, as registered.
+- `82ca43c` is the code:
+  - `start_fresh_database`, with `move_aside` factored out of `start_fresh_quarantine`, whose behaviour is unchanged;
+    both fresh-database callers go through it;
+  - `table_pages`' cross-table blind spot, in its doc;
+  - the M15 test's corrected doc.
+- The re-expressed M3 sits just before the DROP's own checkpoint call. Only `discard_releases_on` lies between it
+  and `decide_recorded`, and that touches owed releases only, so it is the point amendment 16 names in the DROP's
+  order.
+
+**RED checkpoint `41281b8`:**
+- `wal::free_intent::tests::a_fresh_log_moves_an_earlier_databases_drop_intent_aside` and
+  `integration_cluster_snapshot::an_install_moves_the_replaced_databases_drop_intent_aside`: **2 FAILED**, predicted
+  (nothing moves the intent).
+- The filled-table alias test is a guard, **passed**, predicted.
+
+**The GREEN phase and mutant base is `82ca43c`:**
+- `wal::recovery::tests_crash_frees::` has **24 run, 24 passed**, and `wal::free_intent::tests::` 4 passed.
+  `integration_cluster_snapshot` passes whole. All predicted.
+- `lane_d229_run.sh` carries **31 mutants**. PATTERNS_ONLY at `82ca43c` finds one site per expression (rc 0, 32
+  expressions). The fire check at `41281b8` refuses M27 (0 sites, rc 1), as it must.
+- **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M27, SKIPm, LSNm, TTm, CLRm and ALIASm. The move-form M3, M7
+  and M12 survive.
