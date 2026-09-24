@@ -25,7 +25,7 @@
 
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::reaper::TwoTierReaper;
@@ -309,8 +309,10 @@ struct Faulty {
     io_flip_of: Vec<u64>,
     io_detach_under: Vec<u64>,
     /// PERSISTENT `Io` on `live_child_in_epoch_range` for these parents (audit 6 E1): the slow
-    /// path's per-page window read.
-    io_window_of: Vec<u64>,
+    /// path's per-page window read, when the page STORE reads through this `Faulty`
+    /// (`fixture_through_faulty`), and the drain's read, which the reaper makes through it. A
+    /// `Mutex` so a test arms it AFTER its setup, which then cannot meet the fault (lane §8.22).
+    io_window_of: Mutex<Vec<u64>>,
 }
 
 fn injected_io(what: &str, id: u64) -> FerroError {
@@ -412,7 +414,7 @@ impl BranchCatalog for Faulty {
         lo: Epoch,
         hi: Epoch,
     ) -> Result<bool, FerroError> {
-        if self.io_window_of.contains(&parent_id) {
+        if self.io_window_of.lock().unwrap().contains(&parent_id) {
             return Err(injected_io("live_child_in_epoch_range", parent_id));
         }
         self.inner.live_child_in_epoch_range(parent_id, lo, hi)
@@ -467,7 +469,7 @@ fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
         io_liveness: Vec::new(),
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
-        io_window_of: Vec::new(),
+        io_window_of: Mutex::new(Vec::new()),
     })
 }
 
@@ -484,7 +486,7 @@ fn faulty_with_io(f: &Fixture, io_get_raw: Vec<u64>, io_liveness: Vec<u64>) -> A
         io_liveness,
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
-        io_window_of: Vec::new(),
+        io_window_of: Mutex::new(Vec::new()),
     })
 }
 
@@ -502,15 +504,25 @@ fn faulty_with_io_writes(f: &Fixture, flip_of: Vec<u64>, detach_under: Vec<u64>)
         io_liveness: Vec::new(),
         io_flip_of: flip_of,
         io_detach_under: detach_under,
-        io_window_of: Vec::new(),
+        io_window_of: Mutex::new(Vec::new()),
     })
 }
 
-/// A `Faulty` whose only fault is a persistent `Io` on the slow path's window read for these
-/// parents (audit 6 E1).
-fn faulty_with_io_window(f: &Fixture, window_of: Vec<u64>) -> Arc<Faulty> {
-    Arc::new(Faulty {
-        inner: Arc::clone(&f.catalog),
+/// A fixture whose page STORE and reaper both read the catalog through one `Faulty`, with no
+/// fault armed. `fixture()`'s store reads the INNER catalog, so a fault in `Faulty` can never reach
+/// a read the store makes, such as the slow path's per-page window read in
+/// `retire_arenas_by_rule`. The E1 test's R7 half used `fixture()` and so exercised the DRAIN's read
+/// instead (lane §8.22). `f.catalog` stays the inner catalog, for the test's own setup.
+fn fixture_through_faulty() -> (Fixture, Arc<Faulty>) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
+        .open(dir.path().join("d200.db")).unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let concrete =
+        Arc::new(TableBranchCatalog::open_sidecar(&dir.path().join("d200.branchcat"), 1).unwrap());
+    let catalog: Arc<dyn BranchCatalog> = concrete.clone();
+    let faulty = Arc::new(Faulty {
+        inner: Arc::clone(&catalog),
         fail_detach_at: 0,
         detaches: AtomicU64::new(0),
         fail_get_raw_of: AtomicU64::new(u64::MAX),
@@ -520,8 +532,13 @@ fn faulty_with_io_window(f: &Fixture, window_of: Vec<u64>) -> Arc<Faulty> {
         io_liveness: Vec::new(),
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
-        io_window_of: window_of,
-    })
+        io_window_of: Mutex::new(Vec::new()),
+    });
+    let through: Arc<dyn BranchCatalog> = Arc::clone(&faulty) as Arc<dyn BranchCatalog>;
+    let base = pool.disk_manager.high_water().unwrap();
+    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&through), base).unwrap());
+    let reaper = TwoTierReaper::new(through, Arc::clone(&store));
+    (Fixture { concrete, catalog, store, reaper, _dir: dir }, faulty)
 }
 
 fn reaper_through(f: &Fixture, faulty: &Arc<Faulty>) -> TwoTierReaper {
@@ -654,7 +671,7 @@ fn a_crash_between_two_releases_strands_no_ancestor() {
         io_liveness: Vec::new(),
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
-        io_window_of: Vec::new(),
+        io_window_of: Mutex::new(Vec::new()),
     });
     let through = reaper_through(&f, &faulty);
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| through.reap(l)));
@@ -907,7 +924,8 @@ fn a_non_branch_read_inside_a_cascade_is_the_slots_refusal() {
 /// `expect` at `04aab74`; kills M64 (R6) and M65 (R7).
 #[test]
 fn a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal() {
-    let f = fixture();
+    // The store must read through `Faulty`, or R7's window read never faults (lane §8.22).
+    let (f, faulty) = fixture_through_faulty();
     let c = &*f.catalog;
     let mut slow = Vec::new();
     for _ in 0..2 {
@@ -932,7 +950,8 @@ fn a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal() {
     }
     assert!(f.store.read_page(bad_page).is_err(), "fixture: R6's page must fail its checksum");
 
-    let faulty = faulty_with_io_window(&f, vec![r7.id]);
+    // Armed only now, after every setup step.
+    faulty.io_window_of.lock().unwrap().push(r7.id);
     let opener = reaper_through(&f, &faulty);
     let resumed = opener.resume_interrupted_reaps().expect(
         "E1: a failed read on a resumed reap's slow path failed the whole open; it must be that reap's refusal",
