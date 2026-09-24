@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::error::FerroError;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceStore, RunEntity, SyncCounts};
 use crate::storage::heap_file_manager::RecordId;
 
 /// Maximum distinct runs whose versions may live on one page. Beyond this the per-version slot
@@ -317,6 +317,11 @@ impl ProvenanceStore for MemProvenanceStore {
         let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
         inner.row_author.retain(|(t, _), _| *t != table);
         Ok(())
+    }
+
+    /// Zero, always: this store has no file, so it has never synced one.
+    fn sync_counts(&self) -> SyncCounts {
+        SyncCounts::default()
     }
 }
 

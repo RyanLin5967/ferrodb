@@ -78,13 +78,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::branch::types::BranchId;
 use crate::error::FerroError;
 use crate::provenance::store::MemProvenanceStore;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceStore, RunEntity, SyncCounts};
 use crate::storage::heap_file_manager::RecordId;
 use crate::wal::log::{
     crc32, pread_all, pwrite_all, take_array, take_str, take_u16, take_u32, take_u64, take_u8,
@@ -155,6 +155,8 @@ pub struct DurableProvenanceStore {
     /// rather than continuing to look healthy while building a file that cannot be reopened. Reads
     /// keep working — what is already known is still true.
     poisoned: AtomicBool,
+    /// fsyncs issued, by record kind: the instrument behind [`ProvenanceStore::sync_counts`].
+    syncs: SyncCounters,
     /// **Test-only: make the next append fail once.**
     ///
     /// `append_locked` cannot fail on its own in any test — it writes a few dozen bytes to a temp
@@ -205,6 +207,7 @@ impl DurableProvenanceStore {
             path,
             recovery,
             poisoned: AtomicBool::new(false),
+            syncs: SyncCounters::default(),
             #[cfg(test)]
             fail_next_append: AtomicBool::new(false),
         })
@@ -465,6 +468,9 @@ impl DurableProvenanceStore {
         if self.fail_next_append.swap(false, Ordering::SeqCst) {
             return Err(FerroError::Provenance("injected provenance append failure".into()));
         }
+        // Resolved BEFORE the write, so a body this file's reader could not decode is refused
+        // rather than appended: replay stops the whole open on an unknown tag.
+        let counter = self.syncs.for_tag(body.first().copied())?;
         let end = file
             .metadata()
             .map_err(|e| FerroError::Provenance(e.to_string()))?
@@ -479,6 +485,8 @@ impl DurableProvenanceStore {
             .map_err(|e| FerroError::Provenance(format!("append to {}: {e}", self.path.display())))?;
         file.sync_data()
             .map_err(|e| FerroError::Provenance(e.to_string()))?;
+        // Counted only once the sync has RETURNED OK: a failed sync made nothing durable.
+        counter.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -554,6 +562,40 @@ enum Frame {
     Stamp(RecordId, ProvId),
     RowAuthor { table: u32, row: u64, id: ProvId },
     ForgetTable(u32),
+}
+
+/// One counter per record kind, keyed by the frame's own tag byte so the kind is read from the
+/// bytes being made durable rather than restated at each call site.
+#[derive(Debug, Default)]
+struct SyncCounters {
+    runs: AtomicU64,
+    stamps: AtomicU64,
+    row_authors: AtomicU64,
+    forgets: AtomicU64,
+}
+
+impl SyncCounters {
+    fn for_tag(&self, tag: Option<u8>) -> Result<&AtomicU64, FerroError> {
+        match tag {
+            Some(TAG_RUN) => Ok(&self.runs),
+            Some(TAG_STAMP) => Ok(&self.stamps),
+            Some(TAG_ROW_AUTHOR) => Ok(&self.row_authors),
+            Some(TAG_FORGET_TABLE) => Ok(&self.forgets),
+            other => Err(FerroError::Provenance(format!(
+                "refusing to append a provenance record with tag {other:?}: replay would stop the \
+                 whole file at it"
+            ))),
+        }
+    }
+
+    fn snapshot(&self) -> SyncCounts {
+        SyncCounts {
+            runs: self.runs.load(Ordering::Relaxed),
+            stamps: self.stamps.load(Ordering::Relaxed),
+            row_authors: self.row_authors.load(Ordering::Relaxed),
+            forgets: self.forgets.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl ProvenanceStore for DurableProvenanceStore {
@@ -702,6 +744,10 @@ impl ProvenanceStore for DurableProvenanceStore {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn sync_counts(&self) -> SyncCounts {
+        self.syncs.snapshot()
     }
 }
 
@@ -1143,6 +1189,42 @@ mod tests {
         // And the stamps still resolve to the runs that made them, which is the point.
         assert_eq!(s.who_wrote(rid(1, 1)).unwrap().agent_id, "aaa");
         assert_eq!(s.who_wrote(rid(1, 2)).unwrap().agent_id, "bbb");
+    }
+
+    /// **The sync counter counts one sync per append, under the kind the append carried, and
+    /// nothing for an append that failed.**
+    ///
+    /// D219's red test reads this instrument through a whole `MERGE`, so the instrument is proven
+    /// here first, one write path at a time: every kind is forced to fire, a repeat intern (a
+    /// lookup, which writes nothing) is shown NOT to fire, and an injected append failure is shown
+    /// not to count as a durable sync.
+    #[test]
+    fn the_sync_counter_fires_once_per_append_by_kind_and_not_for_a_failed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert_eq!(s.sync_counts(), SyncCounts::default(), "a fresh store has synced nothing");
+
+        let id = s.intern(&run("restock", "run-1")).unwrap();
+        s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp(rid(1, 0), id).unwrap();
+        s.stamp_row(7, 1, id).unwrap();
+        s.stamp_row(7, 2, id).unwrap();
+        s.forget_table(8).unwrap();
+        assert_eq!(
+            s.sync_counts(),
+            SyncCounts { runs: 1, stamps: 1, row_authors: 2, forgets: 1 },
+            "one sync per append, by kind; the repeat intern is a lookup and must not count"
+        );
+        assert_eq!(s.sync_counts().total(), 5);
+
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(7, 3, id).is_err(), "the injected failure was swallowed");
+        assert_eq!(
+            s.sync_counts().row_authors,
+            2,
+            "a failed append was counted as a durable sync"
+        );
     }
 
     /// **The density claim, measured with the instrument that already exists for it.**

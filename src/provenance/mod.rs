@@ -224,6 +224,42 @@ pub trait ProvenanceStore: Send + Sync {
     /// different question, because `table_id` hashes the table's NAME and that name can come back
     /// attached to entirely different data.
     fn forget_table(&self, table: u32) -> Result<(), FerroError>;
+
+    /// fsyncs this store has issued so far, by the kind of record each one made durable.
+    ///
+    /// An observing instrument: reading it changes nothing it counts. **Required, with no
+    /// default**, for the reason `page_dictionary_lens` is: a default of zero would let a store
+    /// that does fsync report that it never does, which is the one wrong answer that reads exactly
+    /// like a right one for an in-memory store. `MemProvenanceStore` answers zero because it has no
+    /// file, and that is a fact about it rather than a default.
+    fn sync_counts(&self) -> SyncCounts;
+}
+
+/// fsyncs a provenance store has issued, split by the kind of record each one made durable.
+///
+/// Split rather than totalled for the reason [`durable::RecoveryReport`] is: a total hides one
+/// write path behind another. D219 is the case that needed it. A `MERGE` against the durable store
+/// pays syncs on two paths — the executor's physical `stamp`, once per published VERSION, and
+/// `record_applied`'s logical `stamp_row`, once per applied OP — and only the second runs under
+/// `AgentRuntime`'s `state` lock. One number could not say which of the two moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncCounts {
+    /// Syncs that made a newly interned run durable. A repeat intern is a lookup and syncs nothing.
+    pub runs: u64,
+    /// Syncs that made a physical `(page, slot)` stamp durable.
+    pub stamps: u64,
+    /// Syncs that made logical `(table, row)` authorship durable.
+    pub row_authors: u64,
+    /// Syncs that made a `DROP TABLE`'s forget durable.
+    pub forgets: u64,
+}
+
+impl SyncCounts {
+    /// Every sync, whatever it carried. For reporting only: a question about one write path is
+    /// answered by that path's field, never by this.
+    pub fn total(&self) -> u64 {
+        self.runs + self.stamps + self.row_authors + self.forgets
+    }
 }
 
 #[cfg(test)]
