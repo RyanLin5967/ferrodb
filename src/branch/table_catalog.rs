@@ -5015,6 +5015,54 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **Review 4, C1: one clock per expression.** A writer that opens an unmarked catalog records,
+    /// in its soft marks, the downtime owed before it (`accrued`); the next start adds the time
+    /// since its last commit on ITS lease clock. If `accrued` is taken as a WALL age, the writer's
+    /// own lease-clock lag at its open is counted twice: once in the wall age, and again because
+    /// the soft term reads leases on the lagging clock. Here a catalog no D198 build wrote was last
+    /// written an hour ago; a writer whose wall clock runs `S` ahead of its lease clock (its host
+    /// slept) opens it and commits; the next start resumes at once. It is owed about an hour, not an
+    /// hour plus `S`. Red against `012f65c`, whose `accrued` is the wall age.
+    #[test]
+    fn an_unresumed_writer_whose_lease_clock_lagged_at_open_carries_no_lag_into_the_next_credit() {
+        use crate::cluster::wall_step;
+        const S: u64 = 2 * HOUR;
+        let path = sidecar("lag-at-open");
+        let t = LeaseDeadline::now_millis();
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+            c.as_written_before_d198().unwrap();
+        }
+        let m = t - HOUR;
+        age_file(&path, m);
+        {
+            // The writer: its host slept `S` since it anchored its lease clock.
+            let _slept = wall_step::by(S as i64);
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            assert_no_d198_keys(&c);
+            c.set_root(BranchId::TRUNK, 1).unwrap();
+        }
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let (_, credited) = c.alive_state().unwrap().expect("the resume recorded a mark");
+        assert!(
+            credited <= now - m + 2_000,
+            "credited {credited} ms, but only {} ms of lease time have passed since the catalog's \
+             last authority wrote it: the writer's {S} ms lag at its open was counted twice \
+             (review 4, C1)",
+            now - m
+        );
+        assert!(
+            credited + 60_000 >= now - m,
+            "credited {credited} ms; about {} ms were owed",
+            now - m
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
