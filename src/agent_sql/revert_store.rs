@@ -673,6 +673,7 @@ mod tests {
         let rec = |hseq, ordinal, seq_op: AppliedOp, txn_high, apply_seq| HistoryRecord {
             hseq,
             ordinal,
+            commit_lsn: 0,
             body: encode_publish(&PublishRecord {
                 merge_id: format_merge_id(1, ordinal),
                 txn: TxnId(txn_high),
@@ -687,6 +688,7 @@ mod tests {
         let marker = HistoryRecord {
             hseq: 3,
             ordinal: 0,
+            commit_lsn: 0,
             body: encode_reverted(&format_merge_id(1, 1), &[TxnId(2)]).unwrap(),
         };
         let v = attach_view(&[rec(1, 1, first, 2, 5), rec(2, 2, second, 4, 8), marker]).unwrap();

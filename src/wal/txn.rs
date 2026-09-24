@@ -985,7 +985,11 @@ impl TxnManager {
         // Taken out first, so no other transaction's commit or abort waits on this map while a
         // bounded drain below fsyncs.
         let bound = self.history_bindings.lock().unwrap().remove(&txn_id);
-        if let Some(records) = bound {
+        if let Some(mut records) = bound {
+            // AMENDED 3, item 2: each carries its `Commit`'s LSN, which only exists now.
+            for r in &mut records {
+                r.commit_lsn = commit_lsn;
+            }
             if let Some(store) = self.history.get() {
                 store.enqueue(records);
                 // AMENDED 2, F7: an idle open transaction blocks every checkpoint, so the queue is
@@ -3820,7 +3824,7 @@ use super::*;
     fn history_parts_are_written_from_the_binding_just_before_the_commit() {
         let (_bp, wal, txn, _store, _dir) = with_history();
         let t = txn.begin().unwrap();
-        let record = HistoryRecord { hseq: 1, ordinal: 1, body: b"a publish".to_vec() };
+        let record = HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() };
         txn.bind_history(t, record).unwrap();
         // A record the transaction writes AFTER binding its history.
         txn.append_chained(t, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![7; 8] })
@@ -3845,6 +3849,45 @@ use super::*;
             ),
             other => unreachable!("{other:?}"),
         }
+    }
+
+    /// **D212 (a') AMENDED 3, item 2: a committed history record carries the LSN of its
+    /// transaction's `Commit` record**, when `commit` queues it and when the open's catch-up takes it
+    /// back from the log after a crash. That LSN is what an install or a restore compares with an
+    /// image's `end_lsn`. The expected value is read from the log, never from the store.
+    ///
+    /// Mutants: `commit` does not stamp it (the queued record carries 0); `recover` does not (the
+    /// re-queued one carries 0).
+    #[test]
+    fn a_committed_history_record_carries_its_commit_records_lsn() {
+        let (bp, wal, txn, store, dir) = with_history();
+        let t = txn.begin().unwrap();
+        txn.bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .unwrap();
+        txn.commit(t).unwrap();
+        let commit_lsn = walk_log(&wal)
+            .into_iter()
+            .find(|r| r.txn_id == t && matches!(r.kind, RecKind::Commit))
+            .expect("fixture: the Commit is in the log")
+            .lsn;
+        assert!(commit_lsn > 0, "premise: a real LSN, not the unstamped 0");
+        let held = store.records();
+        assert_eq!(held.len(), 1, "fixture: the committed record is queued");
+        assert_eq!(held[0].commit_lsn, commit_lsn, "the queued record does not carry its Commit's LSN");
+
+        // The crash: nothing drained the queue, so the log is the record's only copy.
+        drop((bp, wal, txn, store));
+        let file = OpenOptions::new().read(true).write(true).open(dir.path().join("txn.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp.clone());
+        bp.attach_wal(wal);
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        assert!(crate::wal::recovery::recover(&txn).unwrap(), "premise: the log held records to recover");
+        let held = store.records();
+        assert_eq!(held.len(), 1, "the open's catch-up did not take the committed record back");
+        assert_eq!(held[0].commit_lsn, commit_lsn, "the re-queued record does not carry its Commit's LSN");
     }
 }
 

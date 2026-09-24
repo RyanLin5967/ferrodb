@@ -73,7 +73,7 @@ fn an_install_carries_the_senders_revert_history() {
     let src = tempfile::tempdir().unwrap();
     let mut from = engine_at(src.path(), "src");
     let sent = HistoryStore::open(src.path().join("src.db.history"), 8).unwrap();
-    sent.enqueue(vec![HistoryRecord { hseq: 1, ordinal: 1, body: b"a publish".to_vec() }]);
+    sent.enqueue(vec![HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 1, body: b"a publish".to_vec() }]);
     sent.drain().unwrap();
 
     let dst = tempfile::tempdir().unwrap();
