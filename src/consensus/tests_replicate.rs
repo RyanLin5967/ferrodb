@@ -1574,3 +1574,146 @@ fn adopting_a_new_leader_retracts_everything_established_with_the_last_one() {
     );
     assert_eq!(digest, 0, "and a claim of nothing carries no digest");
 }
+
+// -------------------------------------------------------------------------------------------
+// D220 — an Append capped by entry count and not by bytes. Found by the D207 lane, ledger row
+// D220. Written red against de1fa99, and compiling against 9aa6968.
+// -------------------------------------------------------------------------------------------
+
+/// The key every D220 frame is signed with. Signed because it is the stricter framing: the MAC
+/// spends `MAC_LEN` of the same frame limit, so an `Append` that fits signed fits unsigned too.
+fn d220_key() -> crate::consensus::signing::Key {
+    crate::consensus::signing::Key::from_bytes_for_test(vec![0x5a; 32])
+        .expect("32 bytes is the minimum")
+}
+
+/// What `node.rs` does with a send, reduced to what the peer sees. Frame it with the real codec;
+/// drop it if the codec refuses, because `node.rs` discards that error by design; otherwise hand
+/// the peer what its own codec reads back. `[5..]` skips the tag byte and the u32 length, which is
+/// `encode_signed`'s own header.
+fn over_the_wire(m: Message, key: &crate::consensus::signing::Key) -> Option<Message> {
+    let frame = crate::consensus::transport::encode_signed(&m, Some(key)).ok()?;
+    Some(
+        crate::consensus::transport::decode_verified(&frame[5..], Some(key))
+            .expect("a frame this codec produced must read back"),
+    )
+}
+
+#[test]
+fn a_follower_far_behind_on_large_entries_catches_up_over_the_real_wire() {
+    // **D220.** An `Append` is capped at `MAX_ENTRIES_PER_APPEND` entries and at nothing else, while
+    // one entry may be up to `MAX_ENTRY_BYTES`. So 64 entries of 1 MiB make a 64 MiB `Append`. The
+    // encoder refuses it, because the frame limit is 8 MiB; `node.rs` discards the refusal; and
+    // every later heartbeat rebuilds the same batch. The follower never catches up and no meter
+    // moves.
+    //
+    // `catch_up` above hands `Message`s across without encoding them, which is why nothing here saw
+    // this. This harness routes every message the way `node.rs` does.
+    const ENTRIES: u8 = 64;
+    let big = |mark: u8| Command::WalBatch { start_lsn: 100 + mark as u64, bytes: vec![mark; 1 << 20] };
+    let key = d220_key();
+
+    let mut leader = Consensus::new(N1, cfg3(), 61);
+    seed(&mut leader, &(0..ENTRIES).map(|i| (1u64, big(i))).collect::<Vec<_>>());
+    promote_bare(&mut leader, 1);
+    leader.progress.entry(N2).or_default().next = 1;
+    let mut f = Consensus::new(N2, cfg3(), 62);
+    follower_of(&mut f, 1, N1);
+
+    let mut refused = 0usize;
+    let mut delivered = 0usize;
+    // One pass per heartbeat: the leader offers N2 an `Append`, and the exchange runs until it goes
+    // quiet. N3 is down, so what is addressed to it is lost.
+    for _heartbeat in 0..20 {
+        if f.last_round == leader.last_round {
+            break;
+        }
+        let mut out = Vec::new();
+        leader.send_append_to(N2, &mut out);
+        let mut pending: VecDeque<Message> = sends(&out).into();
+        while let Some(m) = pending.pop_front() {
+            if m.to != N1 && m.to != N2 {
+                continue;
+            }
+            let Some(m) = over_the_wire(m, &key) else {
+                refused += 1;
+                continue;
+            };
+            delivered += 1;
+            let node: &mut Consensus = if m.to == N1 { &mut leader } else { &mut f };
+            let acts = node.step(Event::Recv(m));
+            pending.extend(sends(&acts));
+            for a in &acts {
+                if let Action::Persist { entries } = a {
+                    let round = entries.last().map(|e| e.round).unwrap_or(0);
+                    let term = node.term();
+                    pending.extend(sends(&node.step(Event::Persisted { term, round })));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        refused, 0,
+        "{refused} message(s) the leader built were refused by the wire codec. node.rs drops each \
+         one, so this follower is offered the same unsendable batch on every heartbeat"
+    );
+    assert_eq!(
+        f.last_round, leader.last_round,
+        "after 20 heartbeats the follower holds round {} of {} ({delivered} messages delivered)",
+        f.last_round, leader.last_round
+    );
+}
+
+#[test]
+fn an_append_is_cut_where_a_signed_frame_would_overflow_and_not_a_byte_before() {
+    // D220's bound, at its edge. The state machine cannot know whether its transport signs, so a
+    // batch must fit a SIGNED frame: the MAC's `MAC_LEN` bytes come out of the same limit. Two
+    // entries are sized, by the encoder itself, to fill a signed frame exactly, and then to overrun
+    // it by one byte. At the exact fit both must go; one byte over, only the first may.
+    let key = d220_key();
+    let first = Command::WalBatch { start_lsn: 1, bytes: vec![1; 4 << 20] };
+    // The signed body of an `Append` carrying `first` and an EMPTY second batch. Each byte of the
+    // second payload adds exactly one to it, because its length prefix is fixed-width.
+    let probe = append_msg(
+        N1,
+        N2,
+        1,
+        0,
+        0,
+        vec![
+            Entry { term: 1, round: 1, command: first.clone() },
+            Entry { term: 1, round: 2, command: Command::WalBatch { start_lsn: 2, bytes: Vec::new() } },
+        ],
+        0,
+    );
+    let probe_body = crate::consensus::transport::encode_signed(&probe, Some(&key))
+        .expect("the probe fits a frame")
+        .len()
+        - 5;
+    let exact = crate::replication::MAX_FRAME_BYTES - probe_body;
+
+    for (second, want) in [(exact, 2usize), (exact + 1, 1)] {
+        let mut c = Consensus::new(N1, cfg3(), 63);
+        seed(
+            &mut c,
+            &[(1, first.clone()), (1, Command::WalBatch { start_lsn: 2, bytes: vec![2; second] })],
+        );
+        promote_bare(&mut c, 1);
+        c.progress.entry(N2).or_default().next = 1;
+        let mut out = Vec::new();
+        c.send_append_to(N2, &mut out);
+        let m = only_send(&out);
+        let Body::Append { entries, .. } = &m.body else { panic!("expected an Append, got {m:?}") };
+        assert_eq!(
+            entries.len(),
+            want,
+            "with a second entry of {second} bytes ({exact} fills a signed frame exactly), the \
+             leader put {} entries in one Append",
+            entries.len()
+        );
+        assert!(
+            crate::consensus::transport::encode_signed(&m, Some(&key)).is_ok(),
+            "the Append the leader built with a {second}-byte second entry does not fit a signed frame"
+        );
+    }
+}
