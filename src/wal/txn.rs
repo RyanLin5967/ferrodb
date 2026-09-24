@@ -3183,6 +3183,61 @@ use super::*;
         (bp, wal, txn, t2, r, quarantine, dir)
     }
 
+    /// **Review 5's F3: a mismatch that is later released does not keep refusing the DROP of its
+    /// table.** An unrecorded mismatch stays owed and is retried at every checkpoint. If its slot
+    /// later becomes free (its live tuple deleted, committed and released), the retry releases it and
+    /// the `Ok` arm drops it. At `246f14f` the entry stayed in `unrecorded`, so every DROP of the table
+    /// was refused, for the rest of the process, with a message saying a mismatch could not be written.
+    #[test]
+    fn a_mismatch_that_later_releases_does_not_block_a_drop() {
+        let (bp, _wal, txn, _t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        let frame_i = bp.fetch_page(r.page_id).unwrap();
+        {
+            let mut frame = bp.frame_write(frame_i);
+            let mut page = Page::deserialize(frame.data).unwrap();
+            page.slot_arr[r.slot as usize] = crate::storage::heap_page::SlotEntry { offset: 0, length: 0 };
+            frame.data = page.serialize().unwrap();
+        }
+        bp.unpin_page(r.page_id, true);
+        assert_eq!(txn.retry_pending_releases(), 0, "premise: the retry did not release the slot, which is free now");
+        std::fs::remove_dir(&quarantine).unwrap();
+        let ran = std::cell::Cell::new(false);
+        txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("a mismatch that has since been released still refuses the DROP of its table: {e}"));
+        assert!(ran.get(), "the DROP answered Ok without running its mutation");
+    }
+
+    /// **Review 5's F6: a fresh log starts a fresh quarantine.** The dedupe key (`txn=`, `dir_root=`,
+    /// `page=`, `slot=`) has no database incarnation, and a database created again at the same path
+    /// reissues transaction ids. So a quarantine left by the earlier database would make a colliding
+    /// record of the new one look already recorded. The earlier file is moved aside, not deleted: it
+    /// is evidence.
+    #[test]
+    fn a_fresh_log_starts_a_fresh_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("fresh.wal");
+        let quarantine = dir.path().join("fresh.wal.release-quarantine");
+        let old = "txn=5 dir_root=3 page=7 slot=1 found=live error=an earlier database's mismatch\n";
+        std::fs::write(&quarantine, old).unwrap();
+        let _wal = WalManager::new(wal_path).unwrap();
+        assert!(
+            !quarantine.exists(),
+            "a fresh log kept an earlier database's quarantine at its path, so a colliding record of the new \
+             database would be taken as already recorded"
+        );
+        let aside: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("fresh.wal.release-quarantine.before-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the earlier quarantine was not moved aside once: {aside:?}");
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), old, "the earlier quarantine's evidence was not kept");
+    }
+
     /// **Review 4's finding 3: a mismatch is recorded once, however often it is found.** A dropped
     /// mismatch writes no `HeapRelease`, so every open before the log truncates re-derives the release
     /// and finds it again (`finish_releases`). At `8d492bf` each of those appended another line, so
