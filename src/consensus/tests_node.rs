@@ -263,6 +263,43 @@ fn a_proposal_to_a_follower_is_refused_rather_than_dropped() {
     n.shutdown();
 }
 
+#[test]
+fn the_transport_meters_are_readable_from_a_running_node() {
+    // **D223 review F3.** Every send the transport refuses is counted, and `perform` discards the
+    // error by design, so the count is the only trace such a send leaves. But `Node` kept its
+    // transport private, so nobody running a node could read it.
+    //
+    // This node's configuration names 2 and 3, and its peer map holds an address for neither. So
+    // when it campaigns, its pre-vote to each is refused as unaddressable, and that must be visible
+    // from the node itself.
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1).tick_of(Duration::from_millis(1)),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        n.transport_counters().unaddressable,
+        0,
+        "the node refused a send before it had anything to send"
+    );
+
+    // Past any election timeout (at most 20 ticks), in one poll: missed ticks are caught up.
+    n.next_tick = Instant::now() - Duration::from_millis(50);
+    n.poll(Duration::ZERO).unwrap();
+    let c = n.transport_counters();
+    assert!(
+        c.unaddressable >= 2,
+        "a campaign to two peers with no address left unaddressable at {}: {c:?}",
+        c.unaddressable
+    );
+    assert_eq!(c.unencodable, 0, "a pre-vote was refused as unencodable: {c:?}");
+    n.shutdown();
+}
+
 use crate::consensus::snapshot as snap6;
 use crate::consensus::{Body, Message};
 
