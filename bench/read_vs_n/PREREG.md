@@ -1335,3 +1335,67 @@ the lead's request; its report is artie-research `frontier/lane_d239_floor_befor
      lines still print `replay_bytes=-`.
    * Owed releases do not arise in this workload (INFERRED: nothing here fails a release).
 6. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
+
+**A20, 2026-09-24, before any build or run. Review 11 of `4513060..5ec8f47` (artie-research
+`frontier/read_vs_n_review11.md` @ `7e41bcd`) returned SOUND-WITH-CAVEATS. All of Z1–Z6 still stand at `edbe154`. The
+lead's decisions on Z1–Z6 follow, plus ledger D265, which is this lane's.**
+
+1. **Z1: the generic FIRECHECK line prints, by guard id, what this mode must fire and what it is allowed besides.**
+   * Before, it said "exactly the guard this mode breaks must appear below, and no other". That was false for four
+     modes the pre-registration allows extras on.
+   * `Fire::expects()` is an exhaustive `match`, like `needs()`, so a new mode cannot compile without declaring both
+     sets:
+     * `stale-marker`: H6, plus ARM3 (A18.1);
+     * `child-locked`: H1, plus ARM3;
+     * `control-cold`: G5, plus G7;
+     * `merge-quarantined`: M1, plus M5 and G1;
+     * every other mode: its one guard, and "none";
+     * `ckpt-ddl` keeps its own line (item 3).
+   * **The verdict script must CROSS-CHECK the printed ids against its own table and refuse on a mismatch**, so the
+     two copies cannot drift. Its `FIRECHECK_RE` takes this text.
+2. **Z2: the precedence under (f3), registered.** When A13.9's refusal ("A12.1: CURVE_FIRECHECK=ckpt-ddl was requested
+   but no axis-(ii) checkpoint truncated …") prints, the fire's verdict is DID_NOT_FIRE. EVERY co-printed A14.1
+   refusal, PARENT_PASS, failed close (CLOSE) or LEASE line (item 4) is ALSO a finding in the verdict class, not only
+   an info line.
+3. **Z3: the `FIRECHECK CkptDdl` line quotes each graded line's leading words**, rather than labels those lines do not
+   print. "Is GRADED" becomes "is to be graded", since the harness does not grade its own run. The quoted lines:
+   * `A14.1: ckpt-ddl's base MOVED …`;
+   * `A12.1: CURVE_FIRECHECK=ckpt-ddl was requested but no axis-(ii) checkpoint truncated …` (A13.9);
+   * `the parent's first lease pass did not finish …` (PARENT_PASS);
+   * `the production database did not close cleanly …` (CLOSE);
+   * `LEASE …` (item 4).
+4. **Z4: A18.2 extends to the lease thread's end state.**
+   * **The harness reads the `LeaseStats` at EVERY close:** the child's, the reopen before a merge batch, the parent's
+     before each restart, and the final one. A thread that ended with `panicked` (item 5), `failed > 0` or
+     `refused_branches > 0` pushes a `LEASE <where>: …` failure.
+   * **The child** prints `lease_panicked=`, `lease_failed=`, `lease_refused_branches=` and `close_ok=` on its
+     `RESTART_RESULT` line, and no longer panics on a failed close. The parent's `restart_guards` pushes `LEASE N=<n>
+     (the child's close): …` for the first three, and `CLOSE N=<n> (the child's close)` for `close_ok = 0`.
+   * A missing field reads as `u64::MAX`, so it fires.
+   * The mid-run closes still panic on a failed close, as before, but only after their LEASE line is pushed.
+5. **D265 (this lane's, ledger @ `e75426c`): a panicked lease scan thread says so, and the CLI fails.**
+   * **The engine change.**
+     * `LeaseStats` gains `panicked: bool`, set by a guard in the scan thread's body when the thread unwinds
+       (`std::thread::panicking()` in its `Drop`). `stats()` and `stop()` return it.
+     * `OpenDatabase::close` returns `Err` when it is set, after its checkpoints have run, so `run_cli` exits
+       non-zero.
+     * `run_cli` prints the stats line when it is set.
+     * `Drop` still only reports.
+   * **The test seam, compiled into unit tests only (`#[cfg(test)]`).** `scan_once` panics once, at its top, for a
+     reaper armed by address. So one test kills one lease thread and no other thread in the test binary.
+   * **Red first, on the base API.** The red commit adds the seam and two unit tests in
+     `src/branch/lease_thread/tests.rs`:
+     * (a) a scan thread that panicked says so in what `stop()` returns. This is read through `Debug`, so it compiles
+       before the field exists;
+     * (b) the shipped close (`cli::open_database`, then `close`) errs when its lease thread died.
+     * **Both FAIL at the red commit, and pass at the fix.**
+   * **The fix commit** adds (c), a negative control: a healthy thread's `stop()` reads `panicked = false`.
+   * **The mutant, pre-registered:** drop the flag (the guard's `Drop` does not store). (a) and (b) must FAIL, and (c)
+     still passes.
+6. **Z5: the ARM3 refusal reads "arm 3: N restart(s) counted (H6 rows left out); one point is not a curve".** A18.1's
+   "measured" text is withdrawn: "measured" was false beside H6 rows that were measured.
+7. **Z6: one binding.** `counted` is computed once, and both the L2 statement and the ARM3 refusal read it.
+8. **Counts.**
+   * Fire modes: 22.
+   * New `#[test]`s over `9aa6968`: **44**, the previous 41 plus (a), (b) and (c).
+   * The lib's own test count rises by 3.
