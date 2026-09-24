@@ -3999,6 +3999,26 @@ use super::*;
         let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
         assert_eq!(held, (1..=8).collect::<Vec<u64>>(), "a record went missing under the contention");
     }
+
+    /// **D212 (a') AMENDED 3, item 4: a history binding with no registered store REFUSES**, so a
+    /// publish fails before its `Commit` instead of writing history into a log whose next
+    /// checkpoint discards it. A GUARD (so since `669022e`).
+    ///
+    /// Mutant: `bind_history` skips the store check — the binding is accepted.
+    #[test]
+    fn a_history_binding_with_no_registered_store_is_refused() {
+        let (_bp, wal, txn, _dir) = setup();
+        let t = txn.begin().unwrap();
+        let err = txn
+            .bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .expect_err("a manager with no history store accepted a history binding");
+        assert!(err.to_string().contains("no history store"), "refused, but not for the store: {err}");
+        txn.abort(t).unwrap();
+        assert!(
+            !walk_log(&wal).iter().any(|r| r.txn_id == t && matches!(r.kind, RecKind::RevertHistory { .. } | RecKind::Commit)),
+            "the refused binding left history or a Commit in the log"
+        );
+    }
 }
 
 // **The seam's test half, BELOW the tests module on purpose.** `tests/d53_private_root_allowlist.rs`
