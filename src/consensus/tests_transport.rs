@@ -2683,3 +2683,58 @@ fn a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay() {
     );
     drop(held);
 }
+
+// ---------------------------------------------------------------------------------------------
+// D207 amendment 4 — from the fresh review of dd9d1e1 (artie-research frontier/d207_review.md, F1):
+// the per-frame config budget cut a follower off. Written red against dd9d1e1.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_leaders_full_catch_up_append_of_membership_entries_is_delivered() {
+    // **The stall the per-frame budget introduced.** A leader's `Append` carries up to
+    // `MAX_ENTRIES_PER_APPEND` entries, capped by count and nothing else (`replicate.rs`,
+    // `entries_from`), and `node.rs` discards a refused send by design. So a batch the codec refuses
+    // is rebuilt and refused on every turn: that follower receives nothing, and no meter moves.
+    //
+    // So any batch of legal entries must be deliverable. Here it is the largest Membership batch the
+    // per-configuration cap allows: 64 configurations of 1024 voters and 1024 learners, 131,072 ids
+    // in one frame of about 527 KB, far inside `MAX_FRAME_BYTES`.
+    let per = MAX_CONFIG_NODES as u32;
+    let cfg = Config::new((1..=per).map(NodeId), 1, 1)
+        .with_learners(((per + 1)..=(2 * per)).map(NodeId));
+    assert_eq!(
+        (cfg.members().len(), cfg.learners().len()),
+        (MAX_CONFIG_NODES, MAX_CONFIG_NODES),
+        "the fixture is not a maximal configuration"
+    );
+    let n = crate::consensus::replicate::MAX_ENTRIES_PER_APPEND as u64;
+    let m = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: (1..=n)
+                .map(|round| Entry {
+                    term: 1,
+                    round,
+                    command: Command::Membership { config: cfg.clone() },
+                })
+                .collect(),
+            commit: 0,
+        },
+    };
+
+    let (a, b) = pair(fast());
+    if let Err(e) = a.send(&m) {
+        panic!(
+            "a leader's full catch-up Append of {n} Membership entries was refused to its sender: \
+             {e}. node.rs discards that error, so this follower would receive nothing, every turn, \
+             while no meter moved"
+        );
+    }
+    // Compared without `assert_eq!`, whose failure message would print 131,072 node ids.
+    let got = expect_recv(&b, Duration::from_secs(30));
+    assert!(got == m, "the follower received a different Append from the one the leader sent");
+}
