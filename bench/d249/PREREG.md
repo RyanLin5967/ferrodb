@@ -296,3 +296,95 @@ The fix plan registered U1 as `Err(Unrepresentable { limit: PAGE_SIZE, .. })`. T
 | E3 | U1, and AI (a panic in `serialize`) |
 | E4 | AI |
 | E5 | ST |
+
+---
+
+## Amendment 4 — review 2's G1–G5, written BEFORE their code (nothing built)
+
+Source: `artie-research frontier/d249_review2.md` @ `4c2bf91`, a review of `98432bc..27dd0a1`, verdict
+SOUND-WITH-CAVEATS. These are the lead's decisions. An earlier amendment 4, recording `0369d88..27dd0a1`, was
+refused by the handoff gate before it was written. This is the first amendment 4 on record, and it covers both.
+
+### What `0369d88..27dd0a1` did (the record the refused amendment would have made)
+
+| commit | what |
+|---|---|
+| `0369d88` | tests A33, AI and ST (additions); A9's doc comment corrected; `Db::new` bounds the allocator (`reserve_region("test floor", 256, u32::MAX)`) |
+| `fa2e9a3` | F7: `AlterPlan.checked` and `apply_plan`'s staleness check. F4: two comments name the exception |
+| `27dd0a1` | E4 and E5; E1–E5 cut from `fa2e9a3` |
+
+### G2 and G3: the staleness check compares the entry AS READ, and does not overwrite the live schema
+
+- **What is wrong at `fa2e9a3`.** `checked` is the entry after the plan's shape and renames. The check rebuilt the
+  live entry by overwriting its schema with the plan's final shape, then compared.
+  - **It is blind to a schema change** (G3). Another ALTER between plan and apply would vanish from the catalog,
+    and rows converted from the pre-change heap would be installed.
+  - **It turned E4 into a test of the staleness check** (G2). E4 removes the renames from `installed`, which was
+    also `checked`, so E4 died by comparison and never reached the encoder.
+- **The fix.** `AlterPlan` stores `read: TableEntry`, the entry exactly as `plan_alters` read it, and `checked` is
+  removed. `apply_plan` refuses, before anything it writes, unless the LIVE entry equals `read`, with nothing
+  overwritten.
+  - `checked` was a deterministic function of `read`, the plan's shapes and its actions, so "live == read" implies
+    what the old comparison implied.
+  - It also covers the schema.
+- **Its blind spot, stated in the code.** A committed INSERT, UPDATE or DELETE that moves no root changes the heap
+  and not the entry, so the check does not see it. The plan's `prepared` rows would then not describe the heap.
+  That stays with the caller's discipline, as the merge's comment already says ("a plan's decision is only valid for
+  the heap it read", `agent_sql/runtime.rs:5003-5006`). The heading and message are narrowed to "the table's
+  catalog entry has changed since".
+- **ST is strengthened.** It now asserts the refusal is a `Constraint` whose message contains "changed since", not
+  any `Err`, so an unrelated refusal (a future quiesce change, say) cannot pass it. This is the review's note, and
+  it applies to this lane's own unrun test.
+- **E6 is not registered.** With `live == read`, E4 no longer passes through the staleness check (the live entry and
+  `read` are both untouched by the plan). So E4 measures what F2 asked for: whether the encoder is asked about the
+  entry with the renamed index.
+
+### G4: `apply_plan`'s doc
+
+"The failures it can still meet are environmental" is false. `apply_plan` has two non-environmental refusals, and
+the doc will name both, and why neither fires inside `AgentRuntime::merge`:
+
+- the quiesce re-check: a merge holds no transaction open;
+- the staleness check: a merge applies each table's plan with no statement in between that touches that table's
+  entry. `apply_plan(Y)` changes only Y's entry (review 2, §4).
+
+### G5: A9's name and message carry the retracted reason
+
+- **Renamed.** `an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten` becomes
+  **`an_added_ninth_column_the_catalog_cannot_hold_is_refused_and_wedges_nothing`**. It pins the wedge, and not the
+  placement.
+- **Its row-assertion message** loses "it was rewritten under nine, whose null bitmap is a byte wider (I19)".
+- **No assertion moves.** The key stays A9.
+
+### G1: the mutant table, re-registered against the tree it runs on
+
+**The tree.** The D249 mutant run applies each patch to **the D249 branch tip**, the commit amendment 5 will name.
+That tree does NOT contain D254's fix. On D254's child branch, `persist` refuses an oversized entry before placing
+anything, which moves E1's and E4's AI failure from the error assertion to the schema assertion. D254's own PREREG
+registers the mutants for that tree.
+
+| mutant | fails (on the D249 tip, no D254) |
+|---|---|
+| E1 `precheck_removed` | AR, AA, A9 and A33 (a wedge: the refused name is installed, then `persist` refuses on its length); **AI at its error assertion**. The staleness check passes, `finish` installs, and `persist` loops until the test floor refuses with `Io("no free page below … 256 …")`, which is not a `Constraint` |
+| E2 `precheck_in_finish` | **A33** at its row assertion (the review's MODEL: `16777216` first), **and AI** at its "holds the renamed column or index" assertion. `apply_plan` renames the live index to `w…` before `finish`, then E2's check refuses with the correct size error, which leaves an index naming a column that does not exist |
+| E3 `oversize_arm_removed` | U1 (run on `--lib catalog::catalog_page::tests::`). AI would also panic in `serialize`, but that command does not run AI |
+| E4 `index_renames_not_checked` | **AI only, at its error assertion.** The pre-check sees 3922 and passes. The staleness check passes too, because `live == read`. `finish` installs, and `persist` loops until the floor's `Io` refusal |
+| E5 `staleness_check_removed` | ST |
+
+**Under the check at `fa2e9a3`, E4 also failed three existing tests**, each by the staleness refusal on a rename of an
+indexed column (review 2, G1):
+
+- `integration_alter_column::renaming_an_indexed_column_leaves_the_table_queryable`;
+- `integration_merge_ddl_atomicity::an_index_follows_its_column_across_the_renames_a_merge_applies`;
+- `integration_merge_ddl_atomicity::a_rename_follows_its_column_into_the_fulltext_index_too`.
+
+**Under the `live == read` check, E4 no longer fails them** (INFERRED). Their entries are far below a page, so
+leaving the index renames out of the checked entry changes nothing the encoder answers. The staleness check no
+longer involves the renames either. These three are named so that a collateral run under E4, if one is ever made,
+has a registered prediction: **they pass**.
+
+### Counts (unchanged by this amendment)
+
+- `d249_alter_encodable` has **6** tests, and the lib gains U1 and U2. **Per-target: 2579 (measured) + 8 = 2587.**
+- **R2 at `0369d88`** (predicted): `d249_alter_encodable` **5 passed, 1 failed (ST)**. A33 and AI pass there,
+  because the pre-check is present.
