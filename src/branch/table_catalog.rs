@@ -1052,6 +1052,88 @@ impl TableBranchCatalog {
         state == BranchState::Live && !branch_id.is_trunk()
     }
 
+    /// **New-wall audit round 2.** Is anything alive below each of `roots`, all answered in ONE
+    /// memoised pass: an iterative post-order DFS in which each CHILD span is scanned at most once,
+    /// so O(slots reached + CHILD entries) however the roots nest. Only the one-time build calls it.
+    ///
+    /// Same question as `has_live_children`, with the precedence stated:
+    /// - `Pin` if any entry below resolves to a live branch, a pre-id entry included.
+    /// - `Unknown` if none does but resolving one ERRED (a dangling entry, D124). The caller keys
+    ///   such a slot, which is conservative: a stray candidate costs the sweep one visit.
+    /// - `Clear` otherwise.
+    ///
+    /// A pin found anywhere wins over an error. `has_live_children` could answer `Err` for a slot
+    /// whose live descendant sat after a dangling entry in scan order, and a genuinely pinned slot
+    /// must never be keyed. A back-edge, which only a cycle of stale entries through a recycled
+    /// slot can make, counts as nothing below; `has_live_children` has no visited set at all.
+    fn liveness_below(&self, roots: &[u64]) -> HashMap<u64, Below> {
+        let mut memo: HashMap<u64, Below> = HashMap::new();
+        // Nodes entered but not yet finished: exactly the current DFS path, so a kid found here is
+        // a back-edge.
+        let mut open: HashMap<u64, Frame> = HashMap::new();
+        let mut stack: Vec<(u64, bool)> = Vec::new();
+        for &root in roots {
+            stack.push((root, false));
+            while let Some((id, exiting)) = stack.pop() {
+                if !exiting {
+                    if memo.contains_key(&id) || open.contains_key(&id) {
+                        continue;
+                    }
+                    let mut frame = Frame { err: false, kids: Vec::new() };
+                    let mut pin = false;
+                    let (lo, hi) = keys::children_of(id);
+                    self.child_spans.fetch_add(1, Ordering::Relaxed);
+                    match self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi)) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                match entry.and_then(|(k, v)| self.child_liveness(&k, &v)) {
+                                    Ok(ChildLiveness::Live(_)) => {
+                                        pin = true;
+                                        break;
+                                    }
+                                    Ok(ChildLiveness::ReapedWithSubtree(at)) => frame.kids.push(at.id),
+                                    Err(_) => frame.err = true,
+                                }
+                            }
+                        }
+                        Err(_) => frame.err = true,
+                    }
+                    if pin {
+                        memo.insert(id, Below::Pin);
+                        continue;
+                    }
+                    stack.push((id, true));
+                    for &k in &frame.kids {
+                        if !memo.contains_key(&k) && !open.contains_key(&k) {
+                            stack.push((k, false));
+                        }
+                    }
+                    open.insert(id, frame);
+                } else if let Some(frame) = open.remove(&id) {
+                    let mut pin = false;
+                    let mut err = frame.err;
+                    for k in &frame.kids {
+                        match memo.get(k) {
+                            Some(Below::Pin) => pin = true,
+                            Some(Below::Unknown) => err = true,
+                            // `Clear`, or a back-edge that never finished: nothing below it here.
+                            _ => {}
+                        }
+                    }
+                    let verdict = if pin {
+                        Below::Pin
+                    } else if err {
+                        Below::Unknown
+                    } else {
+                        Below::Clear
+                    };
+                    memo.insert(id, verdict);
+                }
+            }
+        }
+        memo
+    }
+
     /// **D200.** Give a catalog written before the UNRELEASED span existed its span — once.
     ///
     /// Such a catalog can hold `Reaped` slots that were never released (the pre-D200 cascade left
@@ -1061,8 +1143,10 @@ impl TableBranchCatalog {
     /// only a RELEASABLE one goes on the span, as `set_state` would have left it — plus the
     /// `Reaping` span. It writes one key per slot found, then the marker, in one sync.
     ///
-    /// **One-time cost: O(slots ever reaped and not recycled), plus those liveness questions,
-    /// once per catalog** — a migration, not a per-open cost. Every later open reads the marker and
+    /// **One-time cost: O(slots ever reaped and not recycled + their CHILD entries), once per
+    /// catalog** — a migration, not a per-open cost. The liveness answers come from ONE memoised
+    /// pass (`liveness_below`). Before new-wall audit round 2 each slot asked its own
+    /// `has_live_children`, which is D(D+1)/2 over a dead chain. Every later open reads the marker and
     /// returns; a catalog made by `create` has the marker from birth.
     fn build_unreleased_index_if_missing(&self) -> Result<(), FerroError> {
         if self.tree.search(&keys::unreleased_index_built())?.is_some() {
@@ -1079,18 +1163,27 @@ impl TableBranchCatalog {
         }
         free.sort_unstable();
         let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
+        let mut reaped = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if id == 0 || free.binary_search(&id).is_ok() {
                 continue;
             }
             // Re-read: a STATE key that outlived its state (pre-F4 recycling) names a live slot.
-            // And only a RELEASABLE slot: a pinned one stays off until its last pin goes.
             if let Some(rec) = self.core(id)? {
-                if rec.state() == BranchState::Reaped
-                    && !matches!(BranchCatalog::has_live_children(self, id), Ok(true))
-                {
-                    self.upsert(keys::unreleased(id), Vec::new())?;
+                if rec.state() == BranchState::Reaped {
+                    reaped.push(id);
                 }
+            }
+        }
+        // Only a RELEASABLE slot: a pinned one stays off until its last pin goes. **New-wall audit
+        // round 2:** this asked `has_live_children` per slot, a DFS over everything reaped below it,
+        // and a NO files no witness. So a dead chain that is still attached cost D(D+1)/2 span
+        // scans, wall #21 again at the migration. `liveness_below` answers every slot in one
+        // memoised pass, scanning each CHILD span at most once.
+        let below = self.liveness_below(&reaped);
+        for id in reaped {
+            if below.get(&id) != Some(&Below::Pin) {
+                self.upsert(keys::unreleased(id), Vec::new())?;
             }
         }
         let (rlo, rhi) = keys::whole_state(BranchState::Reaping.as_u8());
@@ -3437,6 +3530,21 @@ struct BranchAt {
 struct Witness {
     of: Epoch,
     live: BranchAt,
+}
+
+/// What `liveness_below` found below one slot. See its precedence note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Below {
+    Pin,
+    Unknown,
+    Clear,
+}
+
+/// A slot `liveness_below` has entered and not finished: the reaped kids it still waits on, and
+/// whether resolving one of its own entries erred.
+struct Frame {
+    err: bool,
+    kids: Vec<u64>,
 }
 
 /// A node a `has_live_children` walk has reached: `fork_epoch` is `None` only for the root, which
