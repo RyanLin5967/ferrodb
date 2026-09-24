@@ -310,3 +310,82 @@ fn a_rollback_leaves_every_committed_key_where_it_was() {
         );
     }
 }
+
+/// **The premise the unconditional undo rests on: nobody else can move a key between a
+/// transaction's uncommitted write and its rollback.** (The lead's open question, D202 review.)
+///
+/// `TxnManager::undo_primary_writes` puts a key back without checking what the entry holds now.
+/// That is sound only if no other transaction can repoint the key while the writer is open. The
+/// source says three refusals exclude it (READ-FROM-SOURCE; this test measures it):
+/// - another INSERT of the key reads the writer's head, whose `end_ts` is 0: not deleted for the
+///   inserter, so it is refused as a duplicate (`Insert::execute`);
+/// - another UPDATE or DELETE either cannot see the writer's row at all (a new key: its only version
+///   is uncommitted, with no `prev`), so it moves nothing, or reaches it through the chain and is
+///   refused by `check_write_conflict`, because the head's `begin_ts` is uncommitted for it;
+/// - DDL that repoints entries (ALTER's rewrite) refuses while any transaction is active.
+///
+/// Both shapes of recorded write are covered: a relocated committed row, and a brand-new key. Each
+/// interloper is tried, and then the rollback must land exactly where the undo assumes.
+#[test]
+fn nobody_else_can_move_a_key_between_its_uncommitted_write_and_its_rollback() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    let home = packed_page(&mut db, &mut s);
+    db.assert_plan(NOTE_BY_KEY, "Index scan on notes (col 0", &mut s);
+
+    fn conflict(res: Result<Outcome, FerroError>, what: &str) {
+        match res {
+            Err(e @ FerroError::Txn(_)) => assert!(e.to_string().contains("conflict"), "{what}: refused, but not as a conflict: {e}"),
+            Err(e) => panic!("{what}: refused, but not as a transaction conflict: {e}"),
+            Ok(_) => panic!("{what}: went through while another transaction held the row uncommitted"),
+        }
+    }
+
+    // A relocated committed row.
+    let mut writer = db.session();
+    db.ok("BEGIN;", &mut writer);
+    db.ok(&format!("UPDATE notes SET note = '{}' WHERE id = 1;", "y".repeat(200)), &mut writer);
+    assert_ne!(db.primary_rid("notes", 1), Some(home), "premise failed: the UPDATE did not relocate row 1");
+    let moved_to = db.primary_rid("notes", 1);
+
+    let mut other = db.session();
+    db.ok("BEGIN;", &mut other);
+    conflict(db.exec("UPDATE notes SET note = 'z' WHERE id = 1;", &mut other), "a second UPDATE of row 1");
+    let mut other = db.session();
+    db.ok("BEGIN;", &mut other);
+    conflict(db.exec("DELETE FROM notes WHERE id = 1;", &mut other), "a DELETE of row 1");
+    assert_duplicate(db.exec("INSERT INTO notes VALUES (1, 'q');", &mut s), "an INSERT of key 1");
+    assert_eq!(db.primary_rid("notes", 1), moved_to, "an interloper moved key 1 while the writer held it");
+
+    db.ok("ROLLBACK;", &mut writer);
+    assert_eq!(db.primary_rid("notes", 1), Some(home), "the rollback did not put key 1 back where it started");
+    assert_eq!(db.rows(NOTE_BY_KEY, &mut s), vec![note(1, "a")], "row 1 is not its committed self by key");
+
+    // A brand-new key.
+    let mut writer = db.session();
+    db.ok("BEGIN;", &mut writer);
+    db.ok("INSERT INTO notes VALUES (7, 'n');", &mut writer);
+    let held = db.primary_rid("notes", 7);
+    assert!(held.is_some(), "premise failed: the INSERT did not index key 7");
+
+    let mut other = db.session();
+    db.ok("BEGIN;", &mut other);
+    match db.exec("UPDATE notes SET note = 'z' WHERE id = 7;", &mut other) {
+        Ok(Outcome::Affected(0)) => {}
+        Ok(Outcome::Affected(n)) => panic!("a second transaction updated {n} row(s) of an uncommitted INSERT"),
+        Ok(_) => panic!("an UPDATE returned something other than a count"),
+        Err(e) => panic!("an UPDATE of a row it cannot see failed instead of finding nothing: {e}"),
+    }
+    db.ok("COMMIT;", &mut other);
+    assert_duplicate(db.exec("INSERT INTO notes VALUES (7, 'm');", &mut s), "an INSERT of key 7");
+    assert_eq!(db.primary_rid("notes", 7), held, "an interloper moved key 7 while the writer held it");
+
+    db.ok("ROLLBACK;", &mut writer);
+    assert_eq!(db.primary_rid("notes", 7), None, "the rollback left key 7 in the index");
+    db.ok("INSERT INTO notes VALUES (7, 'm');", &mut s);
+    assert_eq!(
+        db.rows("SELECT id, note FROM notes WHERE id = 7;", &mut s),
+        vec![note(7, "m")],
+        "key 7 could not be used after the rollback"
+    );
+}
