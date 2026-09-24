@@ -2604,9 +2604,10 @@ fn read_vs_n_summary(
             if h6_rows.is_empty() { "none".to_string() } else { format!("N={h6_rows:?}") }
         );
         println!(
-            "  arm 3: R7's step times (lock, recover, sql_catalog, branch_catalog, effect_log, runtime, \
-             provenance; the RESTART rows above) are REPORTED, not judged, with L2 and G7 beside them (A16.4). \
-             recover_us is reported too; `recovered` judges its fact (A16.5)."
+            "  arm 3: R7's step times (files, lock, recover, sql_catalog, branch_catalog, effect_log, runtime, \
+             provenance) are REPORTED, not judged (A16.4). They are printed in the RESTART rows above, not in this \
+             table, so L2 (this table) and G7 (this section's head) sit beside them only by joining the rows on N \
+             (A17.3). recover_us is reported too; `recovered` judges its fact (A16.5)."
         );
         let measured = restart_rows.iter().filter(|r| !r.child.is_empty()).count();
         if measured < 2 {
