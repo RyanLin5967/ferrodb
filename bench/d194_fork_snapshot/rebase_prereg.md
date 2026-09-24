@@ -625,3 +625,10 @@ is corrected here.
 - `cargo test --lib rebase`: 5.
 - Run of record at default QoS: **58 result lines, 2162 passed (2152 + 10), 1 failed, 2 ignored**.
 - Under `-b`: 2161 / 2.
+
+**Amendment 7 correction to its own M18 row.** The row says both "UNKILLED" and "killed". The second
+is right, and here is the exact spelling. The guard leaves the reservation block in a tuple:
+`let (reserved, _publishing) = { .. }`. M18 replaces `_publishing` with `_`. The guard then drops at
+the end of that `let`, after the block's state lock has been released, so it removes the entry before
+`record_applied` runs. `record_applied`'s "never registered" assertion then fires in every merge test,
+in debug builds. In release, M18 goes unkilled, and it is harmless there, as item 1 argues.
