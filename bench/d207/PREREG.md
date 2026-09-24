@@ -728,3 +728,117 @@ pass `git apply --check`. Test counts are unchanged: transport 58, replicate 60,
 
 *Erratum to amendment 10, appended:* item 2 says "§3 names the options". It should say that the lane report
 (`lane_d207_transport.md` §6, "D73 observations") names the options for O-1.
+
+---
+
+## Amendment 11 — the D223 review's caveats F2–F6, written BEFORE their fixes (nothing built)
+
+Source: `artie-research frontier/d223_review.md` @ `67c547e`, verdict SOUND-WITH-CAVEATS.
+
+### Red tests at **`3083397`** (log module; they compile against `1b8d290`; additions only)
+
+| key | test | at `3083397` |
+|---|---|---|
+| **V1** | `a_frame_over_the_pre_d223_read_bound_makes_an_older_build_refuse_the_log` | **FAILS** at `!accepted_by_a_pre_d223_build(live)`: the header is still version 1 |
+| **V2** | `a_log_of_ordinary_frames_stays_readable_by_an_older_build` (the control) | passes |
+| **V3** | `a_checkpoint_keeps_the_mark_while_a_large_frame_survives` | **FAILS** at the same assertion, after the checkpoint |
+| **V4** | `no_crash_can_leave_a_large_frame_under_a_header_an_older_build_accepts` (sweep) | **FAILS** before the sweep, on the unfaulted run: `assert_no_frame_an_older_build_would_trim` names file `a` or `b` with an 8,388,539-byte frame under a version-1 header |
+| **U** | `the_largest_entry_an_unsigned_frame_carries_is_delivered_and_stored` (F6) | passes. Its red is the mutant `MAX_ENTRY_BYTES = MAX_FRAME_BYTES − 69`, **M35** below |
+
+The tests read the header's version straight from the file bytes, not from the log. They define "a pre-D223
+build accepts it" as magic, CRC and version 1. READ at `9aa6968`: `log.rs:311` refuses any other version with
+`Corrupt`. The pre-D223 read bound is the literal 8,384,576 (READ `9aa6968:log.rs:105`, `:109`).
+
+**Run R6 at `3083397`:** the log module has 54 tests: **51 passed, 3 failed** (V1, V3, V4).
+
+### The fix for F2, as it will be made
+
+**The version rule:**
+
+- `VERSION` becomes **2**, and a new `LEGACY_VERSION = 1` is added.
+- The header now carries its own version, and `decode` accepts 1 or 2.
+- A new log starts at 1.
+- **Before the first frame over `LEGACY_READ_BOUND` = 8,384,576 is written, the log switches to version 2.** It
+  uses the same two-file switch a checkpoint uses: every current frame is copied to the spare and fsynced, then the
+  version-2 header with `generation + 1` is written and fsynced, then the old file is retired. The large frame is
+  appended only after that.
+- A crash anywhere in the switch leaves either the old version-1 file (with no large frame) or the new version-2
+  one. That is what V4 sweeps.
+- A checkpoint keeps the version it finds; it is monotonic.
+- The switch code is extracted from `discard_prefix`, unchanged, into one function both callers use, so there is
+  one copy of the ordering.
+
+**`MAX_FRAME` becomes a format constant**, the literal 8,388,672 (= `MAX_FRAME_BYTES` + 64), with
+`const _: () = assert!(MAX_ENTRY_BYTES + 64 <= MAX_FRAME)`. Raising the write bound past it then fails the build,
+which forces the next format version instead of moving the read bound silently. This is the review's suggestion.
+
+**Why it refuses:**
+
+- A pre-D223 build's `Header::decode` returns `Err(Corrupt("… format version 2 …"))` on a version-2 header (READ).
+- `open` propagates that error, and a refused open is exactly what the module's header promises in place of a
+  silent reinitialisation.
+- A log that never held a large frame stays at version 1, so it can still be downgraded (V2).
+
+**The rolling-upgrade stall**, stated rather than fixed (INFERRED from the review's arithmetic; latent, because
+nothing in production proposes a `WalBatch`):
+
+- A post-D223 leader admits a `WalBatch` payload of up to 8,388,502 bytes.
+- A pre-D223 follower's disk refuses a disk frame over 8,384,512, which is a payload over 8,384,475.
+- So a batch of 8,384,476–8,388,502 bytes stalls every old follower. Its `Persist` fails, and it never
+  acknowledges.
+
+**Decision 10's `REPL_VERSION` bump (Ryan's)** would turn that stall into a loud refusal.
+
+- READ: `replication/mod.rs:73`, `REPL_VERSION = 2`.
+- `read_handshake` refuses any version other than its own (`:227`), and the consensus transport uses that
+  handshake in both `dial` and `recv_handshake`.
+- With REPL_VERSION at 3, a pre-bump and a post-bump node refuse each other at the handshake. That is counted in
+  `refused_handshakes` and names both versions.
+- So an old follower is not stalled by a large batch; it is refused, loudly, and so is every other mixed pair. There
+  is then no mixed-version cluster at all, which also rules out a rolling upgrade across that boundary.
+- Without decision 10, the constraint is operational: **upgrade every node before any proposal carries a
+  `WalBatch` payload over 8,384,475 bytes.**
+
+This lane does not bump REPL_VERSION: that is decision 10's test edit, and the decision is Ryan's.
+
+### The other caveats, as they will be fixed
+
+- **F3.** `transport::TransportCounters`, a plain snapshot of every counter, from `Transport::counters()` and exposed
+  as `Node::transport_counters()`.
+  - It is read-only by construction: it hands out a copy, not `&Transport`, whose `send` and `shutdown` take `&self`.
+  - Post-fix test **NC** (`tests_node.rs`): a node with configuration {1, 2, 3} and an EMPTY peer map is driven
+    past its election timeout. Its pre-vote to 2 and 3 has no address, so `transport_counters().unaddressable ≥ 2`
+    and `unencodable == 0`, read from the running node.
+- **F4.** Narrow the comment at `node.rs:744-745`: a frame dropped from the queue is `dropped`, and the one frame whose
+  write failed is `lost_in_flight`. Frames TCP loses after a successful write, frames cleared at shutdown, and a push
+  that races a shutdown are not counted.
+- **F5. `tel/log.rs` keeps its old limit.**
+  - `MAX_APPEND_BYTES` becomes `MAX_FRAME_BYTES − 4096` directly, which is the value it had.
+  - Its reason, "a delta larger than one replication frame is a delta that could never be shipped", needs a bound at
+    or below what ONE entry inside one `Append` can carry.
+  - `MAX_ENTRY_BYTES` is now the disk's bound, the whole frame, which is ABOVE that. Following it would admit TEL
+    records that could never be replicated, the opposite of its stated purpose.
+  - The TEL behaviour is unchanged, so no TEL test moves.
+- **F6.** Test U (above).
+
+### Predictions after the fix (Run G6)
+
+| module | tests | predicted |
+|---|---|---|
+| log | 54 | all pass |
+| node | 13 + NC = 14 | all pass (READ: 13 `#[test]` in `tests_node.rs` at `1b8d290`) |
+| transport | 58 | unchanged |
+| replicate | 60 | unchanged |
+
+**Per-target: 2598 + 5 + 1 = 2604** on macOS.
+
+### Mutants for these caveats
+
+| mutant | what it does | fails |
+|---|---|---|
+| **M35 `disk_bound_below_unsigned`** | `MAX_ENTRY_BYTES = MAX_FRAME_BYTES − 69` (the review's survivor) | U |
+| **M36 `no_version_raise`** | the raise before a large frame is skipped | V1, V3, V4 |
+| **M37 `raise_after_the_frame`** | the frame is written first, and the version raised after it | V4 only, at the points between |
+| **M38 `checkpoint_writes_legacy`** | a checkpoint always writes version 1 | V3 |
+| **M39 `always_raise`** | every log is born at version 2 | V2 |
+| **M40 `counters_not_wired`** | `Node::transport_counters` reports `unaddressable` 0 | NC |
