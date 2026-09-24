@@ -474,7 +474,7 @@ impl TableBranchCatalog {
             return Ok(());
         }
         let root = self.tree.root_page_id.load(Ordering::SeqCst);
-        if self.published_root.load(Ordering::SeqCst) == root {
+        if self.published_root.swap(root, Ordering::SeqCst) == root { // D244 MUTANT MA
             return Ok(());
         }
         let frame_i = self.pool.fetch_page(header_page)?;
@@ -488,8 +488,7 @@ impl TableBranchCatalog {
         // D244: recorded as published only once page 1 holds it. This was a `swap` before the
         // fetch, so one failed fetch of page 1 marked the root published without writing it, every
         // later call returned early, and the header stayed stale until the next root split.
-        self.published_root.store(root, Ordering::SeqCst);
-        Ok(())
+        Ok(()) // D244 MUTANT MA: no store after the write
     }
 
     /// Create an empty catalog containing only trunk, and return it with the tree's root page id.
