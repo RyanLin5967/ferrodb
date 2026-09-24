@@ -510,3 +510,23 @@ code. Amendment 4's restore description is refined as follows:
     precedence.
 - **Blind spot, stated.** A foreign write that lands between the restore's read of the file and its
   `os.replace` is overwritten and not saved.
+
+---
+
+## Amendment 6 — 2026-09-24, after a fifth fresh-context review (of `3fc76c2`); before the change
+
+Nothing compiled or run. There were no HIGH findings. Four MEDIUM ones change A5:
+
+- **A5's "HEAD's own bytes are not a foreign edit" opened a blind spot (N2).** A foreign `git
+  checkout`, `stash` or `reset` that reverts the file mid-run would build the unmutated engine, and
+  the run would call it "DIFFERED" (exit 1) instead of stopping (exit 2). Replaced by a flag that is
+  set, with signals held, only once the mutant has reached disk. After that, anything but the mutant's
+  bytes is a foreign edit. Before it, anything but the original's is.
+- **After the first signal, the handler RECORDS later signals instead of ignoring them. `finish` does
+  the same from its first line (N1).** Signals arriving while `finish` restores and verifies can then
+  neither escape with a traceback nor make `held_signals` skip a restore body.
+- **Any foreign edit is named, whenever it was found, and exits 2 (N3).** An interrupt, if one
+  arrived, is reported on every exit path, including every exit 2 (N4).
+- **A stated trade-off.** A stall inside the restore can only be ended with SIGKILL, which would
+  strand the mutant. No trigger for such a stall is known. The next run's dirty-tree refusal catches
+  it.
