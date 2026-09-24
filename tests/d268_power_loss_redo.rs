@@ -23,7 +23,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use ferrodb::storage::heap_file_manager::HeapFileManager;
 use ferrodb::storage::page_directory::PageDirectory;
-use ferrodb::storage::sim::{Durability, SimFabric};
+use ferrodb::storage::sim::{Durability, OpKind, SimFabric};
 use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::recovery::recover;
@@ -291,4 +291,81 @@ fn d268_an_init_record_keeps_a_page_holding_unlogged_rows_written_after_it() {
         vec![u],
         "redo reset page {p} and lost the row written unlogged after the page's init record"
     );
+}
+
+/// Test 12 (the lead's condition (b)). A directory frame that lists a new page never reaches the page
+/// file before the log holding that page's init record is synced, whichever write-back takes it:
+/// `flush_page`, as an eviction writes one frame, or `flush_all`, which goes in ascending page order
+/// and so reaches the directory before the page it lists. Both for a page an uncommitted insert took
+/// and for one an unlogged reservation added. Read off the fabric's trace: the order is the claim.
+#[test]
+fn d268_a_directory_frame_never_reaches_disk_before_its_init_record() {
+    for (logged, via_flush_all) in [(true, false), (true, true), (false, false), (false, true)] {
+        let arm = format!(
+            "{} page, {}",
+            if logged { "an uncommitted insert's" } else { "a reservation's" },
+            if via_flush_all { "flush_all" } else { "flush_page" }
+        );
+        let fabric = SimFabric::clean(Durability::SyncOnly);
+        let db = open(&fabric);
+        let mut b = HeapFileManager::new(db.bp.clone()).unwrap();
+        let b_dir = b.first_directory_page_id;
+        db.txn.checkpoint().unwrap();
+        if logged {
+            let t = db.txn.begin().unwrap();
+            b.set_transaction(db.txn.clone(), t);
+            b.insert(Tuple::new(vec![0xB0u8; 40])).unwrap();
+        } else {
+            HeapFileManager::open(b_dir, db.bp.clone()).reserve_free_space(1).unwrap();
+        }
+
+        let before = fabric.op_count();
+        if via_flush_all {
+            db.bp.flush_all().unwrap();
+        } else {
+            db.bp.flush_page(b_dir).unwrap();
+        }
+        let trace: Vec<_> = fabric.trace().into_iter().filter(|o| o.index >= before).collect();
+        let dir_write = trace
+            .iter()
+            .find(|o| o.file == DB && o.kind == OpKind::Pwrite && o.offset == b_dir as u64 * PAGE_SIZE as u64)
+            .unwrap_or_else(|| panic!("{arm}: premise: the directory page was not written"))
+            .index;
+        assert!(
+            trace
+                .iter()
+                .any(|o| o.file == WAL && matches!(o.kind, OpKind::SyncAll | OpKind::SyncData) && o.index < dir_write),
+            "{arm}: the directory reached the page file before any log sync, so its listing can outlive the \
+             page's init record"
+        );
+    }
+}
+
+/// Test 13. A COMMIT whose `Commit` record begins exactly where the flushed log ends is durable when
+/// COMMIT returns. `flush_up_to` took a record's start for its end: the first record after any flush
+/// begins at the flushed end, so it was reported durable while still in memory, and a crash rolled
+/// back a commit the client had been told of. Here the flush in between stands for another session's
+/// COMMIT or an eviction's WAL gate.
+#[test]
+fn a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let db = open(&fabric);
+    let mut b = HeapFileManager::new(db.bp.clone()).unwrap();
+    let b_dir = b.first_directory_page_id;
+    db.txn.checkpoint().unwrap();
+    let t = db.txn.begin().unwrap();
+    b.set_transaction(db.txn.clone(), t);
+    let c0 = vec![0xC0u8; 40];
+    b.insert(Tuple::new(c0.clone())).unwrap();
+    db.wal.flush().unwrap();
+    assert_eq!(
+        db.wal.next_lsn.load(Ordering::SeqCst),
+        db.wal.flushed_lsn.load(Ordering::SeqCst),
+        "premise: records remain unflushed, so the Commit would not begin at the flushed end"
+    );
+    db.txn.commit(t).expect("commit");
+
+    let db = open(&fabric.restart());
+    recover(&db.txn).expect("recover");
+    assert_eq!(rows(&db, b_dir), vec![c0], "COMMIT returned Ok, and the committed row did not survive the crash");
 }
