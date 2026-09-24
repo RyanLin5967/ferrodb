@@ -1170,12 +1170,17 @@ use super::*;
 
     /// One SQL statement through the executor, in a fresh session.
     fn run_sql(sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>) -> Result<crate::execution::executor::Outcome, FerroError> {
+        run_sql_in(sql, catalog, bp, txn, &mut Session::new())
+    }
+
+    /// One SQL statement through the executor, in `session`.
+    fn run_sql_in(sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>, session: &mut Session) -> Result<crate::execution::executor::Outcome, FerroError> {
         use crate::parser::{parser::Parser, scanner::Scanner};
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
         let mut stmts = p.parse();
         assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
-        crate::execution::executor::run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut Session::new())
+        crate::execution::executor::run(stmts.remove(0), catalog, bp.clone(), txn.clone(), session)
     }
 
     /// Every heap `(dir_root, page)` the retained log writes, looking through a CLR to what it redoes.
@@ -1199,6 +1204,20 @@ use super::*;
             lsn = next;
         }
         out
+    }
+
+    /// Whether the retained log holds a CLR.
+    fn has_clr(wal: &WalManager) -> bool {
+        let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+        let end = wal.next_lsn.load(Ordering::SeqCst);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).unwrap();
+            if matches!(rec.kind, RecKind::Clr { .. }) {
+                return true;
+            }
+            lsn = next;
+        }
+        false
     }
 
     /// Every page `table` owns as far as its catalog entry and the log say: its heap's directory root,
@@ -1248,6 +1267,15 @@ use super::*;
             for id in 1..=3 {
                 ok(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut o);
             }
+            // Lane §3.5 (TTm, CLRm): records on the time-travel heap, and CLRs, before the DROP.
+            ok("UPDATE t SET v = 11 WHERE id = 1;", &mut o);
+            let mut s = Session::new();
+            for sql in ["BEGIN;", "INSERT INTO t VALUES (7, 70);", "ROLLBACK;"] {
+                run_sql_in(sql, &mut o.catalog, &o.bp, &o.txn, &mut s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            let tt = o.catalog.get_table("t").unwrap().time_travel_root;
+            assert!(heap_writes(&o.wal).iter().any(|(d, _)| *d == tt), "premise: the UPDATE wrote nothing to the time-travel heap");
+            assert!(has_clr(&o.wal), "premise: the rolled-back INSERT left no CLR");
             let freed = pages_of(&o.catalog, &o.wal, "t");
             let heap = o.catalog.get_table("t").unwrap().first_directory_page_id;
             let base = o.wal.base_lsn.load(Ordering::SeqCst);
@@ -1323,6 +1351,7 @@ use super::*;
                 run_sql(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog, &bp, &txn).unwrap();
             }
             let freed = pages_of(&catalog, &wal, "t");
+            let heap = catalog.get_table("t").unwrap().first_directory_page_id;
             armed.store(true, Ordering::SeqCst);
             let e = match run_sql("DROP TABLE t;", &mut catalog, &bp, &txn) {
                 Err(e) => e,
@@ -1330,6 +1359,11 @@ use super::*;
             };
             assert!(e.to_string().contains("injected"), "premise failed: the DROP failed, but not at its checkpoint's sync: {e}");
             assert!(catalog.get_table("t").is_none(), "premise failed: the DROP failed before its mutation, so it freed nothing");
+            // Lane §3.5 (review 1's F6): the log still holds the dropped table's records.
+            assert!(
+                heap_writes(&wal).iter().any(|(d, _)| *d == heap),
+                "premise: the log no longer holds the dropped table's records, so redo has nothing to misapply"
+            );
             armed.store(false, Ordering::SeqCst);
             let before: Vec<Vec<u8>> = freed.iter().map(|p| bp.disk_manager.read(*p).unwrap().to_vec()).collect();
             (freed, before)
@@ -1381,5 +1415,208 @@ use super::*;
             o.catalog.get_table("t").is_none(),
             "the next open did not complete the logged DROP: recovery skipped the table's records and left it in the catalog"
         );
+    }
+
+    /// A database built by hand on the given page and log storage, at `db` (its log at `<db>.wal`), so
+    /// `open_recovered` can reopen it after the handles go.
+    fn manual_db(
+        db: &Path,
+        page_file: Arc<dyn crate::storage::storage::Storage>,
+        wal_file: Arc<dyn crate::storage::storage::Storage>,
+    ) -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, Catalog) {
+        let dm = DiskManager::with_storage(page_file).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(dm)));
+        let wal = Arc::new(WalManager::with_storage(wal_file, PathBuf::from(format!("{}.wal", db.display()))).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        (bp, wal, txn, catalog)
+    }
+
+    /// The `id` column of `t`, sorted, or the error that reading it gave.
+    fn ids_of_t(o: &mut OpenedDatabase) -> Result<Vec<i32>, FerroError> {
+        match run_sql("SELECT id FROM t;", &mut o.catalog, &o.bp, &o.txn)? {
+            crate::execution::executor::Outcome::Rows(rows) => {
+                let mut ids: Vec<i32> = rows
+                    .into_iter()
+                    .map(|r| match r.first() {
+                        Some(Value::Integer(id)) => *id,
+                        other => panic!("an id that is not an integer: {other:?}"),
+                    })
+                    .collect();
+                ids.sort_unstable();
+                Ok(ids)
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+    }
+
+    /// A log file whose next write fails once `armed` is set, writing nothing.
+    struct WalWriteFailsOnce {
+        file: std::fs::File,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::storage::storage::Storage for WalWriteFailsOnce {
+        fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: the log's write failed"));
+            }
+            crate::storage::storage::Storage::pwrite(&self.file, buf, offset)
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pread(&self.file, buf, offset)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            crate::storage::storage::Storage::sync_all(&self.file)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            crate::storage::storage::Storage::sync_data(&self.file)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            crate::storage::storage::Storage::set_len(&self.file, len)
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            crate::storage::storage::Storage::len(&self.file)
+        }
+    }
+
+    /// **D250 review 1's F1 (lane §3.5 test 6): a DROP whose record cannot be written leaves no later
+    /// write to lose.** The failed flush keeps the record in the log buffer, so the next commit's flush
+    /// would make the DROP durable after the client was told it failed, and the next open would then
+    /// complete it over rows committed since. The decision: that failure poisons the log, as a failed
+    /// Commit flush does. Red at `cb00606`, where the INSERT's commit flushed the DROP and the open
+    /// dropped `t` with both rows.
+    #[test]
+    fn a_drop_whose_record_cannot_be_written_leaves_no_later_write_to_lose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("unwritten_drop.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let insert_answered = {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(page_file), Arc::new(WalWriteFailsOnce { file: wal_file, armed: armed.clone() }));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("DROP TABLE t;", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the DROP failed, but not at its record's write: {e}"),
+                Ok(_) => panic!("premise failed: the DROP succeeded although its record could not be written"),
+            }
+            assert!(catalog.get_table("t").is_some(), "premise failed: the DROP ran its mutation although its record was not written");
+            run_sql("INSERT INTO t VALUES (9, 90);", &mut catalog, &bp, &txn).is_ok()
+            // The crash: every handle goes.
+        };
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("the open after a DROP whose record could not be written failed");
+        let ids = ids_of_t(&mut o).unwrap_or_else(|e| panic!("`t` is gone after the reopen, although its DROP was reported failed: {e}"));
+        assert!(ids.contains(&1), "`t` lost the row committed before the failed DROP: {ids:?}");
+        if insert_answered {
+            assert!(ids.contains(&9), "the INSERT after the failed DROP answered Ok, and its row is gone: {ids:?}");
+        }
+    }
+
+    /// **D250 review 1's F2 (lane §3.5 test 7): a table re-created at the dropped root, whose CREATE
+    /// failed to sync, keeps its committed row.** The CREATE's checkpoint wrote the catalog page and
+    /// then failed at the sync, so no `CreateTable` was logged, while the table is in the running
+    /// catalog and on disk at the root the DROP freed. A row committed into it follows the DROP's
+    /// record. The open's completion must not take the logged DROP for this table's. Red at `cb00606`,
+    /// where the completion forgot `t` and its row.
+    #[test]
+    fn a_table_recreated_at_the_dropped_root_whose_create_failed_to_sync_keeps_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            let root = catalog.get_table("t").unwrap().first_directory_page_id;
+            run_sql("DROP TABLE t;", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the CREATE failed, but not at its sync: {e}"),
+                Ok(_) => panic!("premise failed: the CREATE's checkpoint did not fail"),
+            }
+            armed.store(false, Ordering::SeqCst);
+            let again = catalog
+                .get_table("t")
+                .expect("premise failed: the failed CREATE left no table in the running catalog")
+                .first_directory_page_id;
+            assert_eq!(again, root, "premise failed: the re-created table did not land on the dropped root, so the completion could not mistake it");
+            run_sql("INSERT INTO t VALUES (2, 20);", &mut catalog, &bp, &txn).unwrap();
+            // The crash: every handle goes.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("the open after the re-create failed");
+        let ids = ids_of_t(&mut o).unwrap_or_else(|e| panic!("the re-created `t` was forgotten as if it were the dropped one: {e}"));
+        assert_eq!(ids, vec![2], "the re-created `t` does not hold exactly its committed row");
+    }
+
+    /// **D250 review 1's F3, CRm (lane §3.5 test 8): a table re-created at the dropped root under a pin
+    /// survives a crash.** Its `CreateTable` follows the DROP's record in the kept log; no row is
+    /// written, so only that exclusion keeps the completion off it. A guard at `cb00606`.
+    #[test]
+    fn a_table_recreated_at_the_dropped_root_under_a_pin_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated_pinned.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            ok("INSERT INTO t VALUES (1, 10);", &mut o);
+            let root = o.catalog.get_table("t").unwrap().first_directory_page_id;
+            let pin = o.wal.pin(o.wal.base_lsn.load(Ordering::SeqCst)).expect("pin the log at its base");
+            ok("DROP TABLE t;", &mut o);
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            assert_eq!(o.catalog.get_table("t").unwrap().first_directory_page_id, root, "premise failed: the re-created table did not land on the dropped root");
+            drop(pin);
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after the re-create failed");
+        assert!(o.catalog.get_table("t").is_some(), "the re-created `t` was forgotten as if it were the dropped one");
+    }
+
+    /// **D250 review 1's F3, NAMEm (lane §3.5 test 9): a table re-created elsewhere under the dropped
+    /// name survives a crash.** An index takes the dropped root, so no `CreateTable` and no heap record
+    /// names it after the DROP; the new `t` lands on another root. Only the catalog's root match keeps
+    /// the completion off the new `t`. A guard at `cb00606`.
+    #[test]
+    fn a_table_recreated_elsewhere_under_the_dropped_name_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated_elsewhere.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            ok("INSERT INTO keep VALUES (1, 10);", &mut o);
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            ok("INSERT INTO t VALUES (1, 10);", &mut o);
+            let root = o.catalog.get_table("t").unwrap().first_directory_page_id;
+            let pin = o.wal.pin(o.wal.base_lsn.load(Ordering::SeqCst)).expect("pin the log at its base");
+            ok("DROP TABLE t;", &mut o);
+            ok("CREATE INDEX ix ON keep (v);", &mut o);
+            let ix = o.catalog.get_table("keep").unwrap().indexes.first().expect("the index").root_page_id;
+            assert_eq!(ix, root, "premise failed: the index did not take the dropped root");
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            assert_ne!(o.catalog.get_table("t").unwrap().first_directory_page_id, root, "premise failed: the new `t` landed on the dropped root");
+            drop(pin);
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after the re-create failed");
+        assert!(o.catalog.get_table("t").is_some(), "the new `t`, on another root, was forgotten as if it were the dropped one");
+        assert!(o.catalog.get_table("keep").is_some(), "the table whose index took the dropped root is gone");
     }
 }
