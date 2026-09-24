@@ -1848,14 +1848,15 @@ impl ArenaPageStore {
     /// left was handed arena pages, wrote index nodes over live branch data, the checkpoint made
     /// that durable, and `reopen`'s bitmap check then refused that open and every later one. No
     /// crash was needed; a clean exit after any DDL makes the next open rebuild (D216).
-    /// `frontier/d229_candidates_adversary.md` E1. Registered first, the same allocation is
-    /// refused with the table-region-full message instead.
+    /// artie-research `frontier/d229_candidates_adversary.md` E1. Registered first, the same
+    /// allocation is refused with the table-region-full message instead.
     ///
     /// Only the base is read from `path`. A database with no arena checkpoint has no region to
     /// protect yet: its arena is created above the high-water mark after recovery. The later
     /// `reopen` registers the identical region again, which `reserve_region` accepts as a
     /// restart. A checkpoint that cannot be read, or whose image fails its checksum, is refused
-    /// here exactly as `reopen_from_checkpoint` would refuse it later.
+    /// here as `reopen_from_checkpoint` would refuse it later. An entry point that never attaches
+    /// the arena (`table_dump`) used to ignore such a file, and now refuses to open over it.
     ///
     /// ⚠ **What this does not fix.** The open that meets a full table region still fails part
     /// way through its rebuild, after it has freed old trees, and the next open re-walks them:
@@ -4854,6 +4855,61 @@ mod tests {
             "the registered region is not the one the checkpoint records"
         );
         for p in [&fresh_file, &written, &garbage] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// **D239: the floor is the checkpoint's, and a torn image is refused.** Two gaps the test
+    /// above leaves. Its store's base and a fresh file's high-water mark are both 1, so a helper that
+    /// registered `dm.high_water()` passed it; this store's base is far above anything the fresh
+    /// file has allocated. And its garbage file fails on the version byte, before any checksum is
+    /// read; here the version and the base are intact and only the image's checksum is wrong.
+    #[test]
+    fn d239_the_reserved_floor_is_the_checkpoints_and_a_torn_image_is_refused() {
+        fn rw(p: &std::path::Path) -> std::fs::File {
+            std::fs::OpenOptions::new().read(true).write(true).create(true).open(p).unwrap()
+        }
+        const FAR: u32 = 4_096;
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir();
+        let far_file = tmp.join(format!("ferro-arena-d239-far-{pid}.db"));
+        let fresh_file = tmp.join(format!("ferro-arena-d239-fresh2-{pid}.db"));
+        let other_file = tmp.join(format!("ferro-arena-d239-fresh3-{pid}.db"));
+        let image = tmp.join(format!("ferro-arena-d239-far-{pid}.bin"));
+        let torn = tmp.join(format!("ferro-arena-d239-torn-{pid}.bin"));
+        for p in [&far_file, &fresh_file, &other_file, &image, &torn] {
+            let _ = std::fs::remove_file(p);
+        }
+
+        let far_dm = Arc::new(DiskManager::new(rw(&far_file)).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(far_dm));
+        let catalog: Arc<dyn BranchCatalog> =
+            Arc::new(crate::branch::catalog::LogBranchCatalog::in_memory(1));
+        let far = ArenaPageStore::new(pool, catalog, FAR).unwrap();
+        far.checkpoint(&image).unwrap();
+
+        let dm = DiskManager::new(rw(&fresh_file)).unwrap();
+        assert!(dm.high_water().unwrap() < FAR, "fixture: the fresh file already reaches the base");
+        ArenaPageStore::reserve_persisted_floor(&dm, &image).unwrap();
+        assert_eq!(
+            dm.reserved_regions(),
+            vec![("branch arena", FAR, u32::MAX)],
+            "the registered floor is not the base the checkpoint records"
+        );
+
+        // The last four bytes of a bare image are its checksum: the version byte and the base
+        // before them still read correctly.
+        let mut bytes = std::fs::read(&image).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&torn, &bytes).unwrap();
+        let dm = DiskManager::new(rw(&other_file)).unwrap();
+        assert!(
+            ArenaPageStore::reserve_persisted_floor(&dm, &torn).is_err(),
+            "an image that fails its checksum was accepted, and its base trusted"
+        );
+        assert!(dm.reserved_regions().is_empty(), "a refused image registered a region");
+        for p in [&far_file, &fresh_file, &other_file, &image, &torn] {
             let _ = std::fs::remove_file(p);
         }
     }
