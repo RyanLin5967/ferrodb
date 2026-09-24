@@ -2454,7 +2454,7 @@ fn read_vs_n_summary(
         let is_h6 = |r: &RestartRow| r.get("stale") != 0;
         let mut loads: Vec<u64> = restart_rows
             .iter()
-            .filter(|r| !r.child.is_empty() && !is_h6(r))
+            .filter(|r| !r.child.is_empty() && !is_h6(*r))
             .flat_map(|r| [r.get("load_start_centi"), r.get("load_end_centi")])
             .filter(|&l| l != u64::MAX)
             .collect();
