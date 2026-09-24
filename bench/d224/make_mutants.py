@@ -33,6 +33,16 @@ MUTANTS = [
         "        Ok(_) => true,\n",
         "        Ok(_) => false,\n",
     )]),
+    # PREREG amendment 4 (the D207 merge): a field dropped from the node's snapshot, in the one form
+    # that compiles. Scored on the node module.
+    ("N7_counters_drop_idle_probes", [(
+        "            idle_probes: self.idle_probes(),\n",
+        "            idle_probes: 0,\n",
+    )]),
+    ("N8_counters_drop_idle_redials", [(
+        "            idle_redials: self.idle_redials(),\n",
+        "            idle_redials: 0,\n",
+    )]),
 ]
 
 

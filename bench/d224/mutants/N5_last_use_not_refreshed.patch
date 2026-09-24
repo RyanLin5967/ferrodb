@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2026,8 +2026,6 @@
+@@ -2081,8 +2081,6 @@
              }
              drop(st);
              conn = None;

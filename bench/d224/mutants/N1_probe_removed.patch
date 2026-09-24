@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1988,7 +1988,7 @@
+@@ -2043,7 +2043,7 @@
          // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
          // leader died. A link consensus keeps busy never reaches this gate, so all it pays is two clock
          // reads per frame: this one and the refresh after the write.

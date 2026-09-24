@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1915,7 +1915,7 @@
+             unauthenticated: self.unauthenticated(),
+             unencodable: self.unencodable(),
+             unaddressable: self.unaddressable(),
+-            idle_probes: self.idle_probes(),
++            idle_probes: 0,
+             idle_redials: self.idle_redials(),
+             live_inbound_conns: self.live_inbound_conns(),
+             inbox_bytes: self.inbox_bytes(),
