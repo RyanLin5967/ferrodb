@@ -3333,6 +3333,75 @@ mod tests {
         assert!(!keyed(&c), "a successful release left the key on");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked
+    /// `has_live_children` for every unreleased `Reaped` slot. Over a DEAD chain that is still
+    /// attached, each question walks everything below the slot, and a NO files no witness, so the
+    /// build costs D(D+1)/2 CHILD-span scans. A memoised bottom-up pass scans each span once.
+    /// PRE-REGISTERED (lane §8.12): 2087 at `7b96554`, which fails the bound; 68 after the fix.
+    #[test]
+    fn the_one_time_build_scans_each_child_span_once() {
+        const D: usize = 64;
+        const K: usize = 4;
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d200-buildcost-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (dead, pinned) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let reap = |b: BranchId| {
+                c.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+                c.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+            };
+            // A DEAD chain, still attached: every link Reaped, nothing alive below any of them.
+            let mut dead = Vec::with_capacity(D);
+            let mut parent = BranchId::TRUNK;
+            for _ in 0..D {
+                parent = c.fork(parent, LeaseDeadline(100)).unwrap().branch_id;
+                dead.push(parent);
+            }
+            for b in &dead {
+                reap(*b);
+            }
+            // A PINNED chain: K reaped interiors above a live leaf. None of them may be keyed.
+            let mut pinned = Vec::with_capacity(K);
+            let mut parent = BranchId::TRUNK;
+            for _ in 0..K {
+                parent = c.fork(parent, LeaseDeadline(100)).unwrap().branch_id;
+                pinned.push(parent);
+            }
+            let _leaf = c.fork(parent, LeaseDeadline(100)).unwrap();
+            for b in &pinned {
+                reap(*b);
+            }
+            // The pre-D200 state: no UNRELEASED key and no marker, durably.
+            let _g = c.logical.lock().unwrap();
+            for b in dead.iter().chain(pinned.iter()) {
+                let _ = c.remove_if_present(&keys::unreleased(b.id));
+            }
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            let ids = |v: &Vec<BranchId>| v.iter().map(|b| b.id).collect::<Vec<u64>>();
+            (ids(&dead), ids(&pinned))
+        };
+
+        // The build runs inside this open, on a fresh catalog, so the counter is its whole cost.
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let spans = c.child_spans_scanned();
+        let mut got = c.unreleased_reaped_candidates().unwrap();
+        got.sort_unstable();
+        let mut want = dead.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "the build must key every dead link and no pinned interior {pinned:?}");
+        assert!(
+            spans <= (2 * (D + K)) as u64,
+            "the one-time build scanned {spans} CHILD spans for {D} dead and {K} pinned reaped slots; \
+             a per-slot walk costs D(D+1)/2 = {} over the dead chain alone",
+            D * (D + 1) / 2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
