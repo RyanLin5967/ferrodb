@@ -3234,6 +3234,42 @@ mod tests {
         assert_eq!(c.syncs_issued(), syncs, "the build ran again on a catalog that already has it");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// **C1 (wall21 review audit 2), read side: a release that cannot read liveness must leave the
+    /// slot where the open sweep looks.** `release_id` swallows its errors. When the liveness read
+    /// ERRS on a `Reaped` slot with no key (a pinned interior loses its key at its flip), it wrote
+    /// nothing, so the slot ended keyless and not free: stranded, silently. Here the error is a
+    /// dangling CHILD entry (D124). PRE-REGISTERED (lane §8.10): fails at the final assertion at
+    /// `fd7b5e0`, passes after the fix.
+    #[test]
+    fn a_release_whose_liveness_read_fails_keeps_the_slot_keyed() {
+        let (c, p, _pool) = cat("c1-readfail");
+        let t = BranchId::TRUNK.id;
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let kid = c.fork(s.branch_id, LeaseDeadline(100)).unwrap();
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        // The kid's entry goes, and a dangling one takes its place: S's liveness now ERRS.
+        assert!(c.detach_child(s.branch_id.id, kid.fork_epoch).unwrap());
+        let ghost = 4242u64;
+        assert!(c.core(ghost).unwrap().is_none(), "fixture: the ghost must have no record");
+        c.upsert(keys::child(s.branch_id.id, c.next_epoch().0), ghost.to_be_bytes().to_vec())
+            .unwrap();
+        assert!(c.detach_child(t, s.fork_epoch).unwrap(), "fixture: S had no entry under trunk");
+        assert!(
+            !c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id),
+            "fixture: S was flipped while pinned, so it must hold no key"
+        );
+        assert!(c.has_live_children(s.branch_id.id).is_err(), "fixture: S's liveness must err");
+
+        c.release_id(s.branch_id.id);
+        assert!(
+            c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id),
+            "C1: a release whose liveness read failed left the slot keyless and not free, so no \
+             sweep will ever retry it"
+        );
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].

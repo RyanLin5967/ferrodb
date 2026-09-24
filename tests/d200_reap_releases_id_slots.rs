@@ -581,3 +581,42 @@ fn a_crash_between_two_releases_strands_no_ancestor() {
          key, above a released slot that a fork recycled before the sweep"
     );
 }
+
+/// **C2a (wall21 review audit 2): one resumed reap's error must not stop an open.**
+/// `resume_interrupted_reaps` ran `self.reap(b)?`, so a `Branch` error inside a resumed reap's
+/// cascade failed the whole open: the CLI returns it, and pgserver panics. D127's rule, which the
+/// open sweep already follows, is that one slot the catalog cannot answer for must not cost every
+/// other slot its reclamation. It is a counted refusal with its reason. PRE-REGISTERED (lane
+/// §8.10): fails at "the open is Ok" at `fd7b5e0`, passes after the fix.
+#[test]
+fn a_resumed_reap_that_errs_does_not_fail_the_open() {
+    let f = fixture();
+    let c = &*f.catalog;
+    let q = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let p = c.fork(q, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let l = c.fork(p, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    f.reaper.reap(p).unwrap();
+    f.reaper.reap(q).unwrap();
+    // What a crash mid-reap leaves: L durably `Reaping`.
+    c.set_state(l, BranchState::Live, BranchState::Reaping).unwrap();
+
+    let faulty = faulty_over(&f, 0);
+    faulty.fail_get_raw_of.store(p.id, Ordering::SeqCst);
+    let opener = reaper_through(&f, &faulty);
+    let opened = opener.resume_interrupted_reaps();
+    assert_eq!(
+        faulty.fail_get_raw_of.load(Ordering::SeqCst),
+        u64::MAX,
+        "fixture: the injected get_raw never fired"
+    );
+    let resumed = opened.expect(
+        "C2a: one resumed reap's catalog error failed the whole open; it must be a counted refusal",
+    );
+    assert!(resumed.is_empty(), "the refused reap was reported as resumed");
+    assert_eq!(opener.refused_reaps(), 1, "the refusal was not counted");
+
+    // The same open's sweep finishes what the refused reap started.
+    let mut want = vec![q.id, p.id, l.id];
+    want.sort_unstable();
+    assert_eq!(recycled_among(c, Vec::new(), 3), want, "the open left part of the chain unreleased");
+}
