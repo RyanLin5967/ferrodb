@@ -37,6 +37,7 @@ pub fn checkpoint_for_exit(catalog: &Catalog, txn: &TxnManager) -> Result<(), Fe
                 "The write-ahead log could not be flushed either ({f}), and it was NOT truncated."
             ),
         };
+        let _ = txn.checkpoint(); // D230 MUTANT M7: truncates the log although the persist failed
         return Err(FerroError::Io(format!(
             "the clean exit could not persist the catalog: {e}. {} {flushed}",
             unpersisted_roots(catalog)
