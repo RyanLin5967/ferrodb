@@ -523,7 +523,10 @@ fn attach_built_index(
     });
     match (unit, unattached) {
         (Ok(()), _) => Ok(Outcome::Ok),
-        (Err(e), Some(built)) => Err(catalog.discard_after(e, built)),
+        (Err(e), Some(built)) => {
+            drop(built); // D271 MUTANT MA: the refused unit keeps the tree it built
+            Err(e)
+        }
         (Err(e), None) => Err(e),
     }
 }
