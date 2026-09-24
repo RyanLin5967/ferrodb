@@ -2574,3 +2574,56 @@ fn a_leaders_full_catch_up_append_of_membership_entries_is_delivered() {
     let got = expect_recv(&b, Duration::from_secs(30));
     assert!(got == m, "the follower received a different Append from the one the leader sent");
 }
+
+#[test]
+fn removing_voters_from_a_learner_list_is_a_binary_search_per_learner() {
+    // The quadratic the per-frame budget only capped, now removed at its source. `with_learners`
+    // drops voters from the learner list of every configuration a frame carries, and it did so with a
+    // `Vec::contains` per learner: O(learners x members). The cost IS the defect, so it is pinned by
+    // counting comparisons — a count that no amount of load can move — through an `Ord` that counts.
+    use std::cell::Cell;
+    use std::cmp::Ordering as Cmp;
+    thread_local! {
+        static COMPARED: Cell<usize> = const { Cell::new(0) };
+    }
+    fn tick() {
+        COMPARED.with(|c| c.set(c.get() + 1));
+    }
+    struct Probe(u32);
+    impl PartialEq for Probe {
+        fn eq(&self, other: &Self) -> bool {
+            tick();
+            self.0 == other.0
+        }
+    }
+    impl Eq for Probe {}
+    impl PartialOrd for Probe {
+        fn partial_cmp(&self, other: &Self) -> Option<Cmp> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Probe {
+        fn cmp(&self, other: &Self) -> Cmp {
+            tick();
+            self.0.cmp(&other.0)
+        }
+    }
+
+    // 1024 learners against 512 voters, the evens: exactly the odd half must survive.
+    let voters: Vec<Probe> = (0..1024u32).step_by(2).map(Probe).collect();
+    let mut learners: Vec<Probe> = (0..1024u32).map(Probe).collect();
+    COMPARED.with(|c| c.set(0));
+    crate::consensus::config::retain_absent(&mut learners, &voters);
+    let compared = COMPARED.with(|c| c.get());
+
+    let kept: Vec<u32> = learners.iter().map(|p| p.0).collect();
+    assert_eq!(kept, (1..1024u32).step_by(2).collect::<Vec<u32>>(), "the wrong learners survived");
+    // A binary search over 512 makes at most 10 comparisons, and a debug build's ascending check
+    // makes 511 more: 1024 x 11 + 512 is a ceiling with room. A scan per learner makes ~393,000.
+    let ceiling = 1024 * 11 + 512;
+    assert!(
+        compared <= ceiling,
+        "dropping voters from 1024 learners took {compared} comparisons, over the {ceiling} a \
+         binary search per learner can use: this is a scan per learner again"
+    );
+}
