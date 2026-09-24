@@ -259,10 +259,16 @@ impl TwoTierReaper {
         //
         // **Terminates because each step moves strictly up the parent chain**, and a parent id is
         // written once at fork and never changed, so the chain cannot contain a cycle. The STEPS
-        // are now bounded by the chain's length rather than by a constant (D60 removed the cap);
-        // the WORK per step was never bounded -- each asks `has_live_children`, which scans a
-        // child span and explores reaped children. See the cost note in
-        // `table_catalog.rs::child_liveness`.
+        // are now bounded by the chain's length rather than by a constant (D60 removed the cap).
+        //
+        // **Wall #21 — what each step costs, corrected.** This said "the WORK per step was never
+        // bounded". For THIS loop it is one empty span per step: `detach_child` runs before the
+        // cursor moves up, so each ancestor is asked about after its only pinning child has gone.
+        // The unbounded work was the three questions a reap asks while its branch is still PINNED
+        // (this loop's first step, the fast/slow split in `reap`, and `release_id`), each walking
+        // the whole reaped chain down to the live leaf, deepest-first reap after deepest-first
+        // reap. A witness now answers them in one lookup; see
+        // `TableBranchCatalog::has_live_children`.
         let mut cur = rec.clone();
         loop {
             if self.catalog.has_live_children(cur.branch_id.id)? {

@@ -23,6 +23,7 @@
 //!
 //! See `SCALE-DESIGN.md` D2b.
 
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,6 +75,56 @@ pub struct TableBranchCatalog {
     /// the parked D166 branch (`3cc71be`), widened from `has_live_children` alone to every CHILD
     /// span reader, because the drain and the write path reach the walk through the other two.
     child_spans: AtomicU64,
+    /// **Wall #21.** For a branch whose liveness question once found something alive below it:
+    /// which live branch that was. A HINT — the same standing D3 gave the CHILD entries — and
+    /// deliberately in memory, not in the tree.
+    ///
+    /// # What it replaces
+    ///
+    /// A REAPED child is a pin iff anything below it is alive (D16), and nothing durable records
+    /// that, so `has_live_children` re-derived it by walking the reaped subtree on every question.
+    /// Under a reaped chain with a live leaf that is Θ(depth) per question, asked three times per
+    /// reap in deepest-first order and once per parked or shadowed page. A valid witness answers
+    /// the same question with one point lookup: the live branch's own record.
+    ///
+    /// # Why not a durable live-descendant counter (ZFS clone counts, btrfs backrefs)
+    ///
+    /// That is the standard shape, and there the count changes in the same transaction group or
+    /// transaction as the reference it counts (from memory; not re-checked here). **This catalog
+    /// has no such unit.** `durable()` is `flush_all` + one sync over pages updated in place,
+    /// `flush_all` writes dirty pages in ascending page id so a crash keeps a prefix, and there is
+    /// no log underneath (`create_with_header`'s note: the WAL gate is a no-op here). A counter
+    /// key and the CHILD or RECORD key it counts sit on different pages, so a crash can keep
+    /// either without the other. Trusted both ways, a count left too low reads as "not pinned"
+    /// and frees pages under a live branch. Trusted only as YES, with every zero re-walked, a
+    /// count left too high still pins a parent for ever, and ruling that out needs every increment
+    /// ordered after, and every decrement before, the change it counts: a second sync on the fork
+    /// path and on the reap flip. Every crash argument in
+    /// this file is an ORDERING argument between two `durable()` calls, which is why D3 made the
+    /// entries hints. SCALE-DESIGN D1's falsifier ("deleted in the same atomic unit that marks it
+    /// reaped") was never met — D3 routed around it — and this wall is the price of the route.
+    ///
+    /// # Why a witness needs no crash argument at all
+    ///
+    /// It is never durable, it is re-validated against the authority on every use
+    /// (`valid_witness`), and it is only ever allowed to answer YES. A restart empties it; the
+    /// first question under each chain then walks once and refills it.
+    ///
+    /// # What it can change, stated exactly
+    ///
+    /// Only two answers, both towards pinning, never towards freeing: (1) YES where the walk
+    /// would have met a dangling entry deeper down first and refused (D124) — the witnessed
+    /// branch is alive, so YES is true; (2) YES where the live branch is no longer reachable
+    /// through CHILD entries while its own record is unchanged. Nothing in `src/` removes a
+    /// pinning child's entry below a reaped node: `detach_from_parent` detaches only a child with
+    /// nothing alive below it, `AgentRuntime`'s reaper-less arm detaches only under a READABLE
+    /// parent, and `reparent` moves no CHILD entry at all. So (2) is reachable only by a caller
+    /// that edits entries directly, which today means a test.
+    ///
+    /// Bounded by the nodes currently pinned through a reaped subtree: a witness is dropped when
+    /// it fails validation, and when a walk from its node answers NO — which `detach_from_parent`
+    /// asks of every node before it detaches it.
+    witnesses: Mutex<HashMap<u64, Witness>>,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -447,6 +498,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             child_spans: AtomicU64::new(0),
+            witnesses: Mutex::new(HashMap::new()),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -471,6 +523,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             child_spans: AtomicU64::new(0),
+            witnesses: Mutex::new(HashMap::new()),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -774,14 +827,19 @@ impl TableBranchCatalog {
         if value.len() != 8 {
             // An entry written before the value carried an id. There is no id to resolve, so it
             // cannot be verified; treat it as LIVE, which is the parking (safe) direction.
-            return Ok(ChildLiveness::Live);
+            return Ok(ChildLiveness::Live(None));
         }
         let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
         Ok(match self.core(child_id)? {
-            Some(rec) if rec.state() != BranchState::Reaped => ChildLiveness::Live,
+            Some(rec) if rec.state() != BranchState::Reaped => {
+                ChildLiveness::Live(Some(BranchAt { id: child_id, fork_epoch: rec.fork_epoch() }))
+            }
             // **D16 — a reaped branch that still has live children is a PIN, not a stale hint.**
             // Its subtree is explored by the caller (see `has_live_children`), not from here.
-            Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
+            Some(rec) => ChildLiveness::ReapedWithSubtree(BranchAt {
+                id: child_id,
+                fork_epoch: rec.fork_epoch(),
+            }),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
             // `dangling_child` has the reason. It used to be "a concurrent `set_root` on this
@@ -816,21 +874,21 @@ impl TableBranchCatalog {
             // is the semantically correct one: a grandchild's root is the interior node's root at
             // fork time, which is the grandparent's root at *that* epoch.
             //
-            // ⛔ **COST, STATED CORRECTLY — an earlier version of this comment said "O(1) in N"
-            // and that was WRONG.** Recursion depth WAS bounded by the cap D60 removed, but the
-            // WORK is not: `has_live_children` scans a node's whole CHILD span and recurses into
-            // every REAPED child, so this explores the reaped subtree breadth-first with an early
-            // exit on the first live descendant. A parent with 10^6 reaped children and one live
-            // child at the end of the span scans all 10^6.
+            // ⛔ **COST — an earlier version of this comment said "O(1) in N" and that was
+            // WRONG.** Without a witness this explores the reaped subtree (`has_live_children`,
+            // iterative since D60) down to the first live descendant. Under a chain of reaped
+            // interior nodes with a live leaf that is every span down to the leaf, and this arm
+            // runs once per parked page (the drain, the slow path) and once per page shadowed
+            // (`cow_page` via `max_live_child`) — wall #21.
             //
-            // It is therefore O(explored reaped subtree), cheap in the common case (few reaped
-            // children, early exit) and NOT bounded by 8. It is still not the global reachability
-            // walk `mod.rs:13` forbids -- it never leaves this branch's own subtree -- but the
-            // honest bound is the subtree, not a constant.
-            // The subtree walk is `has_live_children`'s now (iterative, D60), and this arm asks it
-            // for the one entry it was handed — so a single-entry answer keeps the D16 rule while
-            // the depth-unbounded exploration happens on a heap stack, not the call stack.
-            Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
+            // **Wall #21: a valid witness answers first, in one point lookup** (see
+            // `reaped_child_pins` and the `witnesses` field). It can only say YES; every NO here
+            // still comes from the exact walk, so the answer in the direction that frees pages is
+            // unchanged. The walk is still not the global reachability walk `mod.rs:13` forbids
+            // -- it never leaves this branch's own subtree.
+            Some(rec)
+                if self.reaped_child_pins(BranchAt { id: child_id, fork_epoch: rec.fork_epoch() })? =>
+            {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
             // Reaped with nothing under it: a stale hint, and LEGITIMATELY not a live child. This
@@ -842,6 +900,74 @@ impl TableBranchCatalog {
             // together with "gone entirely", and answered the destructive way for both. "Gone
             // entirely" is not impossible, just unresolvable: see `dangling_child`.
             None => Err(Self::dangling_child(key, child_id)),
+        }
+    }
+
+    /// Does the REAPED branch `child` still pin its parent, i.e. is anything below it alive?
+    ///
+    /// **Wall #21.** A valid witness answers YES in one point lookup. Otherwise the exact walk
+    /// decides, and files a witness if it finds something, so the next question about this
+    /// subtree is one lookup again. Every NO comes from the walk.
+    fn reaped_child_pins(&self, child: BranchAt) -> Result<bool, FerroError> {
+        if self.valid_witness(child).is_some() {
+            return Ok(true);
+        }
+        BranchCatalog::has_live_children(self, child.id)
+    }
+
+    /// The live branch witnessed below `of`, if the witness still holds. A stale one is dropped.
+    ///
+    /// Valid means: filed under THIS incarnation of `of` (its fork epoch; a recycled id is forked
+    /// at a fresh one), and naming a branch whose own record, read now, is the same incarnation
+    /// (`reparent` rewrites the fork epoch too) and not `Reaped`. That record is the authority
+    /// `child_liveness` consults for a live child, so a valid witness is exactly the fact the
+    /// walk would have stopped on, read from the same place.
+    ///
+    /// A record that cannot be read makes the witness invalid rather than an error: the walk that
+    /// follows then runs exactly as it did before witnesses existed, so it reports whatever it
+    /// finds, and no question that used to be answered now fails.
+    fn valid_witness(&self, of: BranchAt) -> Option<BranchAt> {
+        let w = *self.witnesses.lock().unwrap().get(&of.id)?;
+        if w.of == of.fork_epoch {
+            if let Ok(Some(rec)) = self.core(w.live.id) {
+                if rec.state() != BranchState::Reaped && rec.fork_epoch() == w.live.fork_epoch {
+                    return Some(w.live);
+                }
+            }
+        }
+        // Stale. Remove only the entry that was judged: a concurrent walk may have filed a newer
+        // one under the same id while the record was being read.
+        let mut map = self.witnesses.lock().unwrap();
+        if map.get(&of.id) == Some(&w) {
+            map.remove(&of.id);
+        }
+        None
+    }
+
+    /// File `live` as the witness of every node on the walk's path from `visited[from]` back to
+    /// the root. Best effort, and never able to change the answer the walk is about to give.
+    fn file_witness(&self, visited: &[Visited], from: usize, live: BranchAt) {
+        let mut filed = Vec::new();
+        let mut i = from;
+        loop {
+            let v = visited[i];
+            // The root was named by id alone, so its fork epoch costs one lookup here; a root
+            // whose record cannot be read simply gets no witness.
+            let epoch = match v.fork_epoch {
+                Some(e) => Some(e),
+                None => self.core(v.id).ok().flatten().map(|r| r.fork_epoch()),
+            };
+            if let Some(of) = epoch {
+                filed.push((v.id, Witness { of, live }));
+            }
+            match v.up {
+                Some(up) => i = up,
+                None => break,
+            }
+        }
+        let mut map = self.witnesses.lock().unwrap();
+        for (id, w) in filed {
+            map.insert(id, w);
         }
     }
 
@@ -1298,26 +1424,62 @@ impl BranchCatalog for TableBranchCatalog {
     /// unbounded. MCTS prunes interior nodes, which is exactly how a long reaped chain forms, so
     /// the recursion had to go before the cap could.
     ///
-    /// The cost is unchanged and is still not O(1): `live_child_at` returns `None` for a reaped
-    /// node so that its own children are explored here instead, and the walk is breadth-first over
-    /// the reaped subtree with an early exit on the first live descendant.
+    /// # Wall #21 — the walk's cost, and the witness that ends it
+    ///
+    /// Without a witness this walk visits every reaped node down to the first live descendant.
+    /// Under a chain of reaped interior nodes whose leaf is live, a question about a node k levels
+    /// above the leaf costs k span scans — and the reaper asks it three times per reap, deepest
+    /// first (`expired_candidates`), so reaping the chain's interiors costs Θ(D²) scans, while the
+    /// drain and the write path pay Θ(k) per page through `live_child_at`.
+    /// `tests/wall21_reaped_chain_liveness.rs` counts all three.
+    ///
+    /// A REAPED child with a valid witness now ends the walk as a pin without being explored, and
+    /// a walk that finds something alive files a witness on every node of the path it came down.
+    /// Every other step is the walk above, in the same order. So the witness can only turn the
+    /// answer into YES earlier, never into NO: **every NO is still the exhaustive walk**, and
+    /// nothing that frees pages is decided by anything new.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
-        let mut pending = vec![parent_id];
-        while let Some(id) = pending.pop() {
-            let (lo, hi) = keys::children_of(id);
+        let mut visited: Vec<Visited> = Vec::new();
+        let mut pending = vec![Visited { id: parent_id, fork_epoch: None, up: None }];
+        while let Some(node) = pending.pop() {
+            let here = visited.len();
+            visited.push(node);
+            let (lo, hi) = keys::children_of(node.id);
             // One per node VISITED, i.e. one range scan issued: wall #21 asks how many spans a
             // liveness question touches, not how wide they are.
             self.child_spans.fetch_add(1, Ordering::Relaxed);
             for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
                 let (k, v) = entry?;
-                match self.child_liveness(&k, &v)? {
-                    ChildLiveness::Live => return Ok(true),
+                let found = match self.child_liveness(&k, &v)? {
+                    ChildLiveness::Live(child) => Some(child),
                     // A reaped child is not itself a pin, but anything live BELOW it is — D16.
-                    // Explored here rather than by recursing, so the stack cannot grow with depth.
-                    ChildLiveness::ReapedWithSubtree(child) => pending.push(child),
+                    // Explored here rather than by recursing, so the stack cannot grow with depth
+                    // — unless a witness already says what is alive below it.
+                    ChildLiveness::ReapedWithSubtree(child) => match self.valid_witness(child) {
+                        Some(live) => Some(Some(live)),
+                        None => {
+                            pending.push(Visited {
+                                id: child.id,
+                                fork_epoch: Some(child.fork_epoch),
+                                up: Some(here),
+                            });
+                            None
+                        }
+                    },
+                };
+                if let Some(live) = found {
+                    // A pre-id entry names no branch, so there is nothing to file.
+                    if let Some(live) = live {
+                        self.file_witness(&visited, here, live);
+                    }
+                    return Ok(true);
                 }
             }
         }
+        // Nothing below `parent_id` is alive. Every other node visited was pushed only because
+        // its witness was missing or stale, and `valid_witness` has already dropped a stale one;
+        // the root is the one node whose witness this walk never looked at.
+        self.witnesses.lock().unwrap().remove(&parent_id);
         Ok(false)
     }
 
@@ -2748,11 +2910,12 @@ mod tests {
 
 /// See [`TableBranchCatalog::child_liveness`].
 enum ChildLiveness {
-    /// A live child: its parent is pinned by it.
-    Live,
-    /// A reaped child that may still have live descendants (D16). Carries its id so the caller
-    /// can explore it without recursing.
-    ReapedWithSubtree(u64),
+    /// A live child: its parent is pinned by it. Carries the child, so a walk that stops here can
+    /// file it as a witness; `None` for an entry written before the value carried an id.
+    Live(Option<BranchAt>),
+    /// A reaped child that may still have live descendants (D16). Carries it so the caller can
+    /// check its witness or explore it without recursing.
+    ReapedWithSubtree(BranchAt),
     // There is deliberately no `Gone` variant. It existed until D124 and meant "no record at all
     // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a child whose
     // record could not be read let the parent be reclaimed. A missing record is now an ERROR
@@ -2761,3 +2924,30 @@ enum ChildLiveness {
     // variant unconstructed would only invite the next reader to resolve into it again.
 }
 
+
+/// One incarnation of a branch: its slot id and the epoch it was forked at. The pair outlives
+/// nothing it should not — a recycled slot is forked at a fresh epoch, and `reparent` rewrites
+/// the fork epoch — so a witness keyed by it cannot come to name a different branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BranchAt {
+    id: u64,
+    fork_epoch: Epoch,
+}
+
+/// **Wall #21.** "Below the incarnation of this slot forked at `of`, `live` was found alive." See
+/// [`TableBranchCatalog::valid_witness`] for when it may be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Witness {
+    of: Epoch,
+    live: BranchAt,
+}
+
+/// A node a `has_live_children` walk has reached: `fork_epoch` is `None` only for the root, which
+/// the caller names by id alone, and `up` is the index in the walk's `visited` of the node whose
+/// span it was found in, so a live find can be filed back up the path the walk came down.
+#[derive(Debug, Clone, Copy)]
+struct Visited {
+    id: u64,
+    fork_epoch: Option<Epoch>,
+    up: Option<usize>,
+}
