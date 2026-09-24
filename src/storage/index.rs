@@ -1563,6 +1563,23 @@ mod tests {
         tree.write_page(page, leaf.serialize().unwrap()).unwrap();
     }
 
+    /// Pages the allocator holds for this test's file: the set bits of its first bitmap page.
+    fn allocated_pages(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        let bitmap = tree.buffer_pool.disk_manager.read(0).unwrap();
+        bitmap[4..].iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    /// Every page reachable by descent from the root, internal pages included.
+    fn reachable_pages(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        fn walk(tree: &BPlusTreeManager<Value, Value>, page: u32) -> usize {
+            match tree.read_node(page).unwrap() {
+                BPlusTreePage::Leaf(_) => 1,
+                BPlusTreePage::Internal(n) => 1 + n.child_ptrs.iter().map(|&c| walk(tree, c)).sum::<usize>(),
+            }
+        }
+        walk(tree, tree.root_page_id.load(Ordering::Acquire))
+    }
+
     /// Every key still in the tree, by a full scan of the leaf chain.
     fn scan_all(tree: &BPlusTreeManager<Value, Value>) -> Vec<Value> {
         tree.range_scan(Bound::Unbounded, Bound::Unbounded).unwrap().map(|r| r.unwrap().0).collect()
@@ -1611,6 +1628,12 @@ mod tests {
     /// touched, and two optimistic readers assert on every pass that each of those is found: a key
     /// present for a reader's whole operation must never be missed. After the join every key is
     /// checked by descent and by chain, and the parents must agree with the chain.
+    ///
+    /// **Its premises (review 2 G5), so that it cannot pass without having raced anything:** the
+    /// writers start only after each reader has finished one pass, so both readers are running
+    /// while the writers work; each reader finishes at least one pass; and pages allocated minus
+    /// pages reachable by descent must GROW over the run. Nothing frees a tree page, so that growth
+    /// is exactly the pages the run unlinked.
     #[test]
     fn unlinks_racing_refills_and_readers_lose_no_key() {
         const KEYS: i32 = 240;
@@ -1622,12 +1645,18 @@ mod tests {
             tree.insert(wide(i), Value::Integer(i)).unwrap();
         }
         let done = std::sync::atomic::AtomicBool::new(false);
+        let first_passes = std::sync::atomic::AtomicUsize::new(0);
+        let passes = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+        let unreachable_before = allocated_pages(&tree) - reachable_pages(&tree);
 
         std::thread::scope(|s| {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|w| {
-                    let tree = &tree;
+                    let (tree, first_passes) = (&tree, &first_passes);
                     s.spawn(move || {
+                        while first_passes.load(Ordering::Acquire) < 2 {
+                            std::thread::yield_now();
+                        }
                         let mine: Vec<i32> = (0..KEYS).filter(|&i| !stable(i) && i % WRITERS == w).collect();
                         for r in 0..ROUNDS {
                             for &i in &mine {
@@ -1645,18 +1674,22 @@ mod tests {
                     })
                 })
                 .collect();
-            for _ in 0..2 {
-                let (tree, done) = (&tree, &done);
-                s.spawn(move || {
-                    while !done.load(Ordering::Acquire) {
-                        for i in 0..KEYS {
-                            let got = tree.search(&wide(i)).unwrap();
-                            if stable(i) {
-                                assert_eq!(got, Some(Value::Integer(i)), "untouched key {i} missed by a concurrent reader");
-                            } else if let Some(v) = got {
-                                assert_eq!(v, Value::Integer(i), "key {i} read the wrong value");
-                            }
+            for r in 0..2 {
+                let (tree, done, first_passes, passes) = (&tree, &done, &first_passes, &passes);
+                s.spawn(move || loop {
+                    for i in 0..KEYS {
+                        let got = tree.search(&wide(i)).unwrap();
+                        if stable(i) {
+                            assert_eq!(got, Some(Value::Integer(i)), "untouched key {i} missed by a concurrent reader");
+                        } else if let Some(v) = got {
+                            assert_eq!(v, Value::Integer(i), "key {i} read the wrong value");
                         }
+                    }
+                    if passes[r].fetch_add(1, Ordering::AcqRel) == 0 {
+                        first_passes.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if done.load(Ordering::Acquire) {
+                        break;
                     }
                 });
             }
@@ -1665,6 +1698,16 @@ mod tests {
             }
             done.store(true, Ordering::Release);
         });
+
+        for (r, n) in passes.iter().enumerate() {
+            assert!(n.load(Ordering::Acquire) >= 1, "premise: reader {r} finished no pass");
+        }
+        let unreachable_after = allocated_pages(&tree) - reachable_pages(&tree);
+        assert!(
+            unreachable_after > unreachable_before,
+            "premise: no page was unlinked ({unreachable_before} unreachable pages before, {unreachable_after} \
+             after), so the run raced nothing"
+        );
 
         let expected: Vec<i32> = (0..KEYS).filter(|&i| stable(i) || i % 2 == 0).collect();
         for i in 0..KEYS {
@@ -1765,46 +1808,57 @@ mod tests {
         assert_eq!(tree.search(&Value::Integer(2)).unwrap(), Some(Value::Integer(20)));
     }
 
-    /// **F3, red first against `0eda6ca`.** An unlink that is refused must have written nothing.
-    ///
-    /// `0eda6ca` wrote the emptied leaf and the splice before it looked at the parents, and never
-    /// checked `prev.next == leaf` or `next.prev == leaf` at all. So a broken link was either
-    /// overwritten silently or refused after half the unlink was on the page. Three broken states,
-    /// each on a fresh tree; for each, the delete that would unlink must return `Err` and the leaf,
-    /// its neighbours and its parent must be byte-identical to before it.
-    #[test]
-    fn a_refused_unlink_writes_nothing() {
-        // (a) and (b): a middle leaf whose left neighbour, or right neighbour, does not point back.
-        for broken in ["prev.next", "next.prev"] {
-            let (tree, _dir) = setup();
-            for i in 0..16 {
-                tree.insert(wide(i), Value::Integer(i)).unwrap();
-            }
-            let chain = leaves_by_chain(&tree);
-            assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
-            let (prev, mid, next) = (chain[0].page_id, chain[1].page_id, chain[2].page_id);
-            let keys = chain[1].key_arr.clone();
-            for k in &keys[..keys.len() - 1] {
-                tree.delete(k).unwrap();
-            }
-            match broken {
-                "prev.next" => rewrite_leaf(&tree, prev, |l| l.next = Some(next)),
-                _ => rewrite_leaf(&tree, next, |l| l.prev = Some(prev)),
-            }
-            let parent = parent_of(&tree, mid);
-            let pages = [mid, prev, next, parent];
-            let before: Vec<_> = pages.iter().map(|&p| page_bytes(&tree, p)).collect();
-
-            let last = keys.last().unwrap();
-            assert!(tree.delete(last).is_err(), "{broken} broken: the unlink was not refused");
-            for (&p, b) in pages.iter().zip(&before) {
-                assert!(page_bytes(&tree, p) == *b, "{broken} broken: the refused unlink rewrote page {p}");
-            }
+    /// A middle leaf emptied down to one key, with one of its neighbour links broken as `broken`
+    /// says, then its last key deleted. The delete must be refused, and the leaf, its neighbours and
+    /// its parent must be byte-identical to before it. Shared by the (a) and (b) tests below.
+    fn a_broken_neighbour_link_refuses_the_unlink(broken: &str) {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
         }
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let (prev, mid, next) = (chain[0].page_id, chain[1].page_id, chain[2].page_id);
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        match broken {
+            "prev.next" => rewrite_leaf(&tree, prev, |l| l.next = Some(next)),
+            _ => rewrite_leaf(&tree, next, |l| l.prev = Some(prev)),
+        }
+        let parent = parent_of(&tree, mid);
+        let pages = [mid, prev, next, parent];
+        let before: Vec<_> = pages.iter().map(|&p| page_bytes(&tree, p)).collect();
 
-        // (c): the cascade would empty the root. Two leaves; unlink the right one (the root is left
-        // with one child), then plant a stale `next` on the left one and empty it. Its neighbour
-        // still points back at it, so only the parents show the break, and only past the root.
+        let last = keys.last().unwrap();
+        assert!(tree.delete(last).is_err(), "{broken} broken: the unlink was not refused");
+        for (&p, b) in pages.iter().zip(&before) {
+            assert!(page_bytes(&tree, p) == *b, "{broken} broken: the refused unlink rewrote page {p}");
+        }
+    }
+
+    /// **F3 (a), red first against `0eda6ca`** (review 2 G4 split the one F3 test into three, so a
+    /// red run shows each case). The left neighbour's `next` skips the leaf. `0eda6ca` checked no
+    /// link: it spliced over the broken one and returned `Ok`.
+    #[test]
+    fn a_refused_unlink_with_a_broken_prev_link_writes_nothing() {
+        a_broken_neighbour_link_refuses_the_unlink("prev.next");
+    }
+
+    /// **F3 (b), red first against `0eda6ca`.** The right neighbour's `prev` skips the leaf.
+    #[test]
+    fn a_refused_unlink_with_a_broken_next_link_writes_nothing() {
+        a_broken_neighbour_link_refuses_the_unlink("next.prev");
+    }
+
+    /// **F3 (c), red first against `0eda6ca`: the cascade would empty the root.** Two leaves. The
+    /// right one is unlinked, which leaves the root one child. Then a stale `next` is planted on the
+    /// left one and it is emptied. Its neighbour still points back at it, so only the parents show
+    /// the break, and only past the root. `0eda6ca` wrote the leaf and the splice, THEN planned the
+    /// parents and refused. This is the one case that sees that order (mutant V6).
+    #[test]
+    fn a_refused_cascade_that_would_empty_the_root_writes_nothing() {
         let (tree, _dir) = setup();
         let mut i = 0;
         while height(&tree) < 2 {
@@ -1834,6 +1888,44 @@ mod tests {
         assert!(tree.delete(keys.last().unwrap()).is_err(), "an unlink that empties the root was not refused");
         for (&p, b) in pages.iter().zip(&before) {
             assert!(page_bytes(&tree, p) == *b, "the refused cascade rewrote page {p}");
+        }
+    }
+
+    /// **Review 2 G6, red first against `f03e25d`.** A chain whose `prev` and `next` name the same
+    /// page must be refused, not waited on. Page latches are not re-entrant, and `f03e25d` held
+    /// `prev`'s write latch while it took `next`'s, so when the two are one page the unlinker waited
+    /// on its own latch for ever, holding the root and stalling the whole tree.
+    ///
+    /// The broken leaf's `next` is set to its `prev`, which does point back at it, so the prev check
+    /// passes and only the latch order can go wrong. The delete runs on its own thread; a delete
+    /// that has not returned after 10 s is taken to be waiting on itself. On a red run that thread
+    /// stays blocked on a latch of this test's own tree.
+    #[test]
+    fn a_chain_whose_prev_is_its_next_is_refused_not_waited_on() {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let (prev, mid) = (chain[0].page_id, chain[1].page_id);
+        assert_eq!(chain[0].next, Some(mid), "premise: the left neighbour points at the leaf");
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        rewrite_leaf(&tree, mid, |l| l.next = Some(prev));
+        let last = keys.last().unwrap().clone();
+
+        let tree = Arc::new(tree);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.delete(&last).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(refused) => assert!(refused, "an unlink whose prev is its next was not refused"),
+            Err(_) => panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on its own latch"),
         }
     }
 }

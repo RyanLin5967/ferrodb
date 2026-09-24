@@ -2923,6 +2923,73 @@ mod tests {
         assert_eq!(c.stale_free_ids_skipped(), 1, "a removed FREE_ID was skipped again");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **Review 2 G2, red first against `f03e25d`: fork asks the same question `release_id` asks.**
+    /// `release_id` writes a FREE_ID only for a slot that is `Reaped` AND has no live child, because
+    /// a live child's CHILD entry sits under the parent's id with no generation
+    /// (`tree_keys::child`), so a new occupant of the slot would inherit it. `f03e25d`'s fork checked
+    /// `Reaped` only. Here X is reaped while its child Y is still live, and a FREE_ID for X is
+    /// planted (a phantom from a torn flush). The next fork must mint a fresh id, and Y's CHILD
+    /// entry under X must be untouched.
+    #[test]
+    fn fork_never_reuses_a_reaped_slot_that_still_has_a_live_child() {
+        let (c, p, _pool) = cat("free-id-live-child");
+        let x = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        let y = c.fork(x.branch_id, LeaseDeadline(9_000)).unwrap();
+        c.set_state(x.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        assert!(c.has_live_children(x.branch_id.id).unwrap(), "premise: the reaped slot still has a live child");
+        let child_key = keys::child(x.branch_id.id, y.fork_epoch.0);
+        let before = c.tree.search(&child_key).unwrap().expect("premise: the child's CHILD entry exists");
+        c.tree.upsert(keys::free_id(x.branch_id.id), Vec::new()).unwrap();
+
+        let z = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_ne!(
+            z.branch_id.id, x.branch_id.id,
+            "fork reused slot {} while its reaped record still has a live child",
+            x.branch_id.id
+        );
+        assert_eq!(c.tree.search(&child_key).unwrap(), Some(before), "the live child's CHILD entry changed");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 2 G9 (a), red first against `f03e25d`.** A FREE_ID whose record cannot be read is
+    /// skipped and counted like a stale one. `f03e25d` read it with `?` inside the scan, before any
+    /// removal, so every later fork failed on the same entry: the "would refuse every later fork"
+    /// outcome that skipping exists to avoid.
+    #[test]
+    fn a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal() {
+        let (c, p, _pool) = cat("free-id-unreadable");
+        const BAD: u64 = 99;
+        c.tree.upsert(keys::record(BAD), vec![0u8; 3]).unwrap();
+        assert!(c.core(BAD).is_err(), "premise: the planted record does not deserialize");
+        c.tree.upsert(keys::free_id(BAD), Vec::new()).unwrap();
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("a FREE_ID over an unreadable record failed the fork");
+
+        assert_ne!(child.branch_id.id, BAD, "fork reused a slot whose record it could not read");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the unreadable slot's FREE_ID was not counted");
+        assert_eq!(c.tree.search(&keys::free_id(BAD)).unwrap(), None, "the unreadable slot's FREE_ID was not removed");
+        assert_eq!(c.tree.search(&keys::record(BAD)).unwrap(), Some(vec![0u8; 3]), "the unreadable record was rewritten");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 2 G9 (b), red first against `f03e25d`.** A key in the FREE_ID span that does not
+    /// decode to an id is counted and removed. `f03e25d` skipped it with `continue`, uncounted, so it
+    /// stayed for ever and every fork stepped over it in silence.
+    #[test]
+    fn a_malformed_free_id_key_is_counted_and_removed() {
+        let (c, p, _pool) = cat("free-id-malformed");
+        let malformed = vec![keys::tag::FREE_ID, 1, 2, 3];
+        assert_eq!(keys::free_id_from_key(&malformed), None, "premise: the key does not decode");
+        c.tree.upsert(malformed.clone(), Vec::new()).unwrap();
+
+        c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the malformed FREE_ID key was not counted");
+        assert_eq!(c.tree.search(&malformed).unwrap(), None, "the malformed FREE_ID key was not removed");
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
