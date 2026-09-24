@@ -2277,7 +2277,8 @@ impl ArenaPageStore {
         // **D263.** Only a checkpoint of the ARMED file may return quarantined ranges: it is the
         // durable map they wait on. A copy written anywhere else frees nothing.
         let written = if armed {
-            self.write_image_folding_quarantine(&mut g, path)?
+            // MUTANT (fire-check only, never land): the armed checkpoint writes a plain image.
+            self.checkpoint_with(&OsFileOps, path)?
         } else {
             self.checkpoint_with(&OsFileOps, path)?
         };
