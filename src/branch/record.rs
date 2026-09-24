@@ -1305,10 +1305,18 @@ pub fn reclaimable(live_children: &[Epoch], birth: Epoch, freed: Epoch) -> bool 
 /// child's `parent_id` is its parent record's `branch_id` at fork. A reap bumps the record's
 /// `generation` and leaves `branch_id` alone, so a genuine reaped parent still matches. A recycled
 /// slot's new occupant is minted at the bumped generation, so it never matches. Without this check,
-/// a pinned node whose parent slot had been recycled would pin the unrelated new occupant and walk
-/// up that occupant's lineage. That direction only over-pins, but it is wrong. The running reaper
-/// cannot build that shape: `release_id` refuses a slot with live children. A pre-D16 legacy log
-/// migrated by `default_for_database`, or D201's seal fallback, can.
+/// the walk would mark the unrelated new occupant as a holder, file ITS entry under ITS parent, and
+/// carry on up a lineage the live descendant never forked from.
+///
+/// **What the check deliberately does NOT do is drop the child's own entry.** Both callers still
+/// file that under the parent's id slot, which the new occupant now holds, so the occupant is
+/// over-pinned (a leak). That is kept on purpose. A page the OLD incarnation parked is judged by
+/// `live_child_in_epoch_range(owner.id, ..)`, which is keyed by the slot id, so dropping the entry
+/// could release a page the live descendant still reads. `9aa6968` filed a live child's entry the
+/// same way.
+///
+/// The running reaper cannot build this shape: `release_id` refuses a slot with live children. A
+/// pre-D16 legacy log migrated by `default_for_database`, or D201's seal fallback, can.
 pub(crate) fn parent_entry_holders(
     nodes: &HashMap<u64, (BranchId, Option<BranchId>, BranchState)>,
 ) -> HashSet<u64> {
