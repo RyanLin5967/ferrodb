@@ -514,3 +514,67 @@ against D229's `a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation` as
   Both predicted.
 - `lane_d229_run.sh` carries **28 mutants**, one site per expression at `5a77973` (PATTERNS_ONLY rc 0, 29 expressions).
 - **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M24, SKIPm, LSNm, TTm, CLRm and ALIASm. M3, M7 and M12 survive.
+
+**Amendment 16 (D229 review 2, `frontier/d229_review2.md` @ `484906b`, through `d504a0f`; the lead's decisions F1, R6,
+F7, F11; registered BEFORE the code).** Q1 went to `d256-heap-page` (D268 must gate the directory page on the init
+record's LSN), and nothing of it is built here.
+
+- **F1: M3 as registered is WITHDRAWN.** It ADDED a `free_pending_frees()` after `decide_recorded` while the
+  checkpoint's own call stayed. So one DROP freed twice, and the first call consumed the one-shot faults of three
+  tests: M17's, M16's and M5's (M14's is likely). The second call then succeeded inside the same statement, so those
+  tests would go red through that artifact, not through the hazard M3 names. Its SURVIVOR prediction (amendment 10)
+  was therefore false for a reason that says nothing about the equivalence. **Re-expressed as a MOVE, DROP path only:**
+  - right after `decide_recorded`, `ddl_unit` calls `free_pending_frees()`;
+  - whatever that call leaves pending and decided is marked undecided for the DROP's own checkpoint, so the checkpoint
+    does not retry it inside the statement;
+  - it is then decided again. A failure is still retried at the NEXT checkpoint, as without the mutant.
+
+  So the frees run once, before the checkpoint flushes the unlink: amendment 3's "free before the checkpoint". It is
+  **predicted to SURVIVE every `wal::` test** (the equivalence is walked in amendment 3 and again in review 2's F1). A
+  kill falsifies that equivalence, and the amendment after the run names the test and the mechanism.
+- **R6: a heap-side alias test on a FILLED table.** New test
+  `table_pages_of_a_filled_table_is_what_the_oracle_walks_and_refuses_a_heap_side_alias`, on the fixture's `t`
+  (400 rows, trees one level deep over their leaves, and a time-travel heap given pages by an UPDATE first; premise).
+  It checks:
+  - `table_pages("t")` equals, as a set, what the oracle's independent walk names for `t`, and the walk reaches no
+    page twice;
+  - plant 1, `t`'s time-travel ROOT listed in `t`'s heap directory: `table_pages` must refuse. That is
+    `HeapFileManager::collect_pages`' first refusal, a directory page reached a second time. Mutant **M25** disables
+    it.
+  - plant 2, on a fresh boot, one of `t`'s heap data pages listed a second time: `table_pages` must refuse. That is
+    the second refusal, a listed page already named. Mutant **M26** disables it.
+
+  **Cross-table aliases are a stated blind spot, and no check fits within the DROP's O(table pages):** no page records
+  its owner. A heap page stores only its own id, and a tree node stores nothing about the table. So finding that a page
+  of `t` is also named by `u` needs every other table walked (O(database pages)) or an owner stamp in every page
+  header (a format change). `table_pages`' doc is corrected to say so; it read as if it covered them.
+- **F7: correction of amendment 11's first reason and lane §6 (a).** "A page past the durable end of the file cannot
+  be redone" is FALSE. Before redo, `recover` restores every page the log names whose read fails as
+  `Page::empty(page_id)` (ledger D267, RETRACTED at `23e974d`). The candidate that replaces it is being verified by
+  `d256-heap-page` (INFERRED there): no recovery step sets the allocator bit of a page the log rebuilt, so a power
+  loss that also drops the bitmap write lets a later `allocate()` hand out a live page. On this tree that schedule is
+  what D229's reset re-bit covers for the pages a directory lists after the repair (the design review's caveat 2).
+  The M15 test (`a_page_the_log_relinks_after_its_bit_was_lost_has_its_bit_set_again`) is it. The M15 test's doc
+  repeated the false reason; it is corrected, doc only. Finding (b), a reused page redone onto stale bytes, is not
+  affected.
+- **F11: a fresh database moves the drop intent aside with the release quarantine.** `wal::txn` gains
+  `start_fresh_database(wal_path)`, the one fresh-database transition:
+  - It moves aside `<wal>.release-quarantine`, as `start_fresh_quarantine` did (review 6's F6), THEN
+    `<wal>.drop-intent`. Both use the same never-replacing `.before-<nanos>` names, and it is idempotent on a retry.
+  - Its two callers are the fresh log (`WalManager::with_storage` at length 0) and the snapshot install. Both called
+    `start_fresh_quarantine` before.
+  - An intent left there names the REPLACED database's page ids. The next open would adopt it, decide it against the
+    new catalog (absent) and free those ids, which may be live pages of the new database.
+  - One shape with #16's F6, coordinated with `delete-insert-gap`.
+  - Stated: the in-memory `pending_frees` across an install is not reachable, because `PageStoreSnapshots` holds no
+    `TxnManager` (review 2's F11).
+
+  Red tests, compiling against the base:
+  - `wal::free_intent::tests::a_fresh_log_moves_an_earlier_databases_drop_intent_aside`: an intent file beside a
+    length-0 log, then `WalManager::new`. The file must be gone from its path and kept once as `.before-`, with the same
+    bytes.
+  - `tests/integration_cluster_snapshot.rs::an_install_moves_the_replaced_databases_drop_intent_aside`, the sibling
+    of #16's quarantine test.
+
+  Both are RED at the base (INFERRED: nothing moves the intent). Mutant **M27**: `start_fresh_database` skips the
+  intent's move.
