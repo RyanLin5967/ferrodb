@@ -497,3 +497,91 @@ The tip merge (`b054ad5`) stays.
 
 *The follow-up the lead recorded, unchanged here:* pgserver calls `open_recovered` but spells out the second half
 itself, so that half lives in two places. Making pgserver share `open_database`'s second half is a later lane.
+
+**A7, 2026-09-24, before any build or run. The fresh-context review of `7a68d8b`
+(`artie-research frontier/read_vs_n_review.md` @ `e9fee7b`) found run (h) unsound as configured. Each finding and what
+it changes:**
+
+1. **F1: every restart child in run (h) recovers and rebuilds.** Lead-verified; now ledger **D216**, and lane
+   `d216-clean-restart` fixes it in recovery. It is not fixed here. The mechanism, READ by the review:
+   * `TxnManager::checkpoint_locked` truncates the WAL, then re-appends `replay_schema()` and `replay_runs()`.
+   * So the parent's clean close (`txn.checkpoint`) leaves one `Ddl` per table and one `RunIdentity` per run declared
+     in that process.
+   * The child's `recover` returns `true`, and `open_recovered` rebuilds every index.
+
+   **A4 item 2 and A6's "rebuild = 0 on every clean restart" are WITHDRAWN.** They are false whenever arm 2 runs,
+   because arm 2's `CREATE TABLE m` and its one-run-per-session merges put those declarations in the log.
+
+   Pre-registered in their place, as a **before/after pair like D209**:
+
+   * **BEFORE D216** (this branch, `9aa6968` + `00f4c39`):
+     * `rebuild_us > 0` at EVERY checkpoint with `merge` on. It is O(rows): `rebuild_indexes` over every table's
+       heap, plus the checkpoint fsync. Table `m` holds K·(i−1) rows at checkpoint i, printed as `m_rows`. At K = 64
+       and 7 checkpoints that is at most 384 rows, so the fsync should dominate. Band (INFERRED): 0.5–200 ms per row.
+       The class claim is "nonzero at every checkpoint"; the magnitude is secondary.
+     * `recover_us > 0`: replay of the re-appended records. The count is printed as the child's WAL bytes.
+   * **AFTER D216:** `rebuild_us = 0` and `recover_us ≈ files-scale` on every clean restart. This harness re-run on
+     D216's fix is the after arm.
+   * With `merge` OFF (`CURVE_ARMS=read,restart`), `rebuild_us = 0` BEFORE D216 too: nothing declares a table or a
+     run (the review, INFERRED). That is the control for the pair.
+2. **F2: the parent dropped measured fields.**
+   * The parent now echoes the child's `RESTART_RESULT` line verbatim, as a `RESTART-RAW` line.
+   * The `RESTART` row adds `lock`, `files`, `sql_catalog`, `rebuild`, `runtime`, `descents_total`, `wal_bytes`,
+     `tel_bytes`, `prov_bytes` and `m_rows`.
+   * Nothing the child measured is dropped.
+   * The printed "recover ms" stays `boot.recover` alone. A4 item 1's `files + recover` is now two columns.
+3. **F3: §1 is AMENDED rather than splitting the run, and why.**
+   * Arm 2 writes `.tel` (one effect frame per staged statement) and `.provenance` (one interned run per session),
+     and arm 3 replays both.
+   * §1's "Nothing in this workload writes `.tel` or `.provenance` frames" is **false whenever `merge` is on**.
+   * The arms stay together in run (h), for two reasons:
+     * (a) D216's before/after pair needs the table and run declarations that only arm 2 produces;
+     * (b) each replay term can be attributed to its own input instead of to N. Every `RESTART` row prints the
+       `.tel`, `.provenance` and `.wal` byte sizes the child is about to replay.
+   * R7's `effect_log` and `provenance` predictions become: **linear in their file's bytes, and ≤ 50 ms at these
+     sizes**. The files grow by one batch of K sessions per checkpoint, so their dependence on checkpoint index is
+     the harness's own writing, and the row says so beside it.
+   * Arm 3's pure N-curve (`lease_start`, the sweep) is unaffected: it reads live arenas, which merges do not grow.
+     Merged branches are reaped, so M5 and H2 hold them flat.
+4. **F4: A3's enumeration missed one O(M) pass.** `TxnManager::commit` checkpoints automatically every
+   `FERRODB_CHECKPOINT_INTERVAL` (default 256) commits. The checkpoint re-appends every run declared in this
+   process, which on axis (ii) is one per merge, so it is O(M), plus a pool flush and fsyncs. It runs inside the
+   timed `MERGE;` of every 256th merge. The axis-(ii) targets are multiples of 256, so each block's last merge pays
+   it. Therefore:
+   * per merge, the harness records `db.txn.retained_runs()` before and after, and a `checkpointed` flag. The flag is
+     true when `commits_since_checkpoint` did not rise across the merge: a commit always raises it, and a checkpoint
+     resets it to 0;
+   * each `MERGE` row prints `retained runs` and `ckpts` (checkpointed merges in the block);
+   * **Q10 is judged on the MEDIAN ns/merge**, and the summary's axis-(ii) slope is computed from the median. The
+     mean is printed beside it, not judged.
+   * A3's enumeration now reads: one whole-log pass per merge (`highest_applied_seq`), plus an O(runs retained) pass
+     on every 256th merge (the auto-checkpoint). Predicted: `ckpts` = 1 per axis-(ii) block when 64 ≤ 256, `retained
+     runs` = M exactly (one run per cycle), and the median flat within noise.
+5. **F5: fire modes.** "Every guard has a forced-fire mode" was false for G1, H1, H4 and H5, and H2's mode injected
+   only at the comparison. Added, each IN PATH (a real state change the measured code sees):
+
+   | mode | guard | injection |
+   |---|---|---|
+   | `extra-branch` | G1 | a real fork at the first checkpoint that `branches` never records; live = N + 2 from then on |
+   | `child-locked` | H1 | the parent HOLDS `{db}.lock` while the child opens; the child's `DbLock::acquire` refuses and it exits non-zero |
+   | `wrong-sweep-read` | H2 | the child reports the reaper's REAL `sweep_visits()` read after the first pass (~2(N+1)) in place of `open_sweep_visits()` |
+   | `orphan-extent` | H4 | before each restart, a real fork claims an empty extent with `arena_for` and is then marked `Reaped` via `set_state` (the D40 crash-orphan shape); the child's open sweep frees it, so freed = 1 |
+   | `no-cluster-time` | H5 | at the LAST checkpoint only, the child joins a cluster with no applied `LeaseTick` (`ClusterScope::joined`); its first pass refuses before the orphan sweep, so `LeaseStats::finished` never rises |
+
+   Expected extras: `extra-branch` fires G1 at every checkpoint; `child-locked` also fires "arm 3: one point is not a
+   curve". The comparison-only modes (`wrong-page`, `census-off`, `wrong-height`, `wrong-arenas`, `wrong-live`,
+   `wrong-start`, `wrong-visits`, `wrong-delta`, `wrong-live-merge`) are kept and are labelled comparison checks:
+   they prove that the comparison and its NOT A RESULT line work, and nothing more.
+   `tests/read_vs_n_lease_census.rs` (its own binary, one test) tests `open_sweep_visits` and `LeaseStats::finished`:
+   * `open_sweep_visits` equals an independently counted `live_arenas()`, and stays unchanged when a later sweep
+     moves `sweep_visits`;
+   * `finished` stays 0 while a pass refuses (no cluster time), and rises once a standalone pass completes.
+6. **Scope notes from the review, recorded:**
+   * Arm 3 measures the **CLI's** restart. pgserver's second half differs: `MemEffectLog`, no durable provenance,
+     no `txn.checkpoint` at exit (review §1b).
+   * Arm 1's T=8 rows read without the statement lock, which the shipped CLI and pgwire always hold. **T=8 is
+     library concurrency and must never be quoted as production throughput.**
+   * A6's "no harness copy of production code exists" is overstated: `exec_sql` re-spells `cli::execute_sql` for
+     one statement.
+   * R2's `descents_total` counts `extent_is_collectable` calls, not B+tree descents. The census `c.desc/v` is the
+     real check.
