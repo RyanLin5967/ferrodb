@@ -3944,6 +3944,48 @@ use super::*;
         assert!(std::fs::symlink_metadata(&quarantine).is_err(), "the replaced database's quarantine is still at its path");
     }
 
+    /// **D229 review 2's F11 with a transaction manager wired: a new incarnation also moves the drop intent
+    /// aside and forgets the pending frees** (PREREG amendment 19). An intent pending at an install names
+    /// the REPLACED database's page ids. Kept in the file, the next open frees them under the installed
+    /// database; kept in memory, this manager's next checkpoint does. Their quarantine goes too: it held
+    /// those ids back from the allocator for the replaced database only.
+    #[test]
+    fn a_new_incarnation_moves_the_drop_intent_aside_and_forgets_the_pending_frees() {
+        let (bp, wal, txn, dir) = setup();
+        let pages = vec![bp.new_page().unwrap(), bp.new_page().unwrap()];
+        free_intent::store(&OsFileOps, &wal.path, &[FreeIntent { table: "replaced".into(), dir_root: pages[0], pages: pages.clone() }])
+            .unwrap();
+        assert_eq!(txn.adopt_free_intents().unwrap(), 1, "premise: the replaced database's intent was not adopted");
+        assert_eq!(bp.disk_manager.quarantined(), pages, "premise: the intent's pages are not quarantined");
+        let intent = free_intent::intent_path(&wal.path);
+        let old = std::fs::read(&intent).unwrap();
+        txn.start_new_incarnation().expect("the new incarnation failed");
+        assert!(
+            std::fs::symlink_metadata(&intent).is_err(),
+            "the replaced database's drop intent is still at its path, so the next open would free its pages under \
+             the new database"
+        );
+        let prefix = format!("{}.before-", intent.file_name().unwrap().to_string_lossy());
+        let aside: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(aside.len(), 1, "the replaced database's intent was not moved aside once: {aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), old, "the replaced database's intent was not kept as evidence");
+        assert_eq!(
+            txn.pending_free_pages(),
+            Vec::<u32>::new(),
+            "the replaced database's pending frees survived the new incarnation, so this manager's next checkpoint \
+             would free them under the new database"
+        );
+        assert_eq!(
+            bp.disk_manager.quarantined(),
+            Vec::<u32>::new(),
+            "the replaced database's quarantine still holds pages back from the new database's allocator"
+        );
+    }
+
     /// **Review 4's finding 4: a DROP must not discard a mismatch it could not record.** The DROP
     /// discards the releases owed on the heaps it frees, and then truncates: for a mismatch whose
     /// quarantine write failed, that truncation removes the only record of it (review 3's decision 6).
