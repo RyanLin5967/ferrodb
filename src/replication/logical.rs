@@ -398,10 +398,11 @@ struct Learned {
     /// with the warm one; a sequential pump loop has no gap to fill and scans nothing extra, so the
     /// performance reason the history exists is preserved.
     ///
-    /// Two invariants this must keep, both of which reopen a fixed defect if dropped: it is reset
-    /// to 0 whenever the log changes (an LSN means nothing across files — the A9 defect), and it is
-    /// clamped UP to `base_lsn` on truncation, because records below the floor are gone and can
-    /// never be scanned again.
+    /// Three invariants this must keep, each of which reopens a defect if dropped: it is reset to 0
+    /// whenever the log changes (an LSN means nothing across files — the A9 defect); it is clamped UP
+    /// to `base_lsn` on truncation, because records below the floor are gone and can never be
+    /// scanned again; and it is always a record boundary, because the gap fill starts reading there
+    /// (the D252 review's B1: a range's bound can fall inside a record).
     covered_through: u64,
 }
 
@@ -1148,10 +1149,16 @@ impl LogicalDecoder {
             let mut shapes = std::mem::take(&mut history.shapes);
             Self::merge_shapes(&mut shapes, learned);
             history.shapes = shapes;
-            // The walk reached `to_lsn`, so the history is now complete up to there — and this must
+            // The walk reached `walked_to`, so the history is now complete up to there — and this must
             // happen even when the range held NO DDL, or a pump over a quiet stretch would leave a
             // gap behind it and re-scan the same records on every later call.
-            history.covered_through = history.covered_through.max(to_lsn);
+            //
+            // `walked_to`, not `to_lsn` (the D252 review's B1). The last record read may start below
+            // `to_lsn` and end above it, so `to_lsn` can be a position INSIDE a record. A pump that
+            // then resumed past it (after a `Commit` straddling the bound at `00f4c39`, after any
+            // straddling record once the cursor passes a no-event tail) gap-filled from the middle of
+            // a record, failed, and failed again on every later pump of that decoder.
+            history.covered_through = history.covered_through.max(out.walked_to);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
