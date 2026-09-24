@@ -335,3 +335,22 @@ The lead's decision: take the review's PRINCIPLED F1 and REPLACE the compare-exc
 | K18c | `finish` stores the stale record INTO the cell (the first D214's regression) | lib and integration | U1, U2 and T10 FAIL |
 
 T10 is expected to pass under every other mutant: none of K1–K14 or K16–K22 touches the primary cell or ALTER.
+
+---
+
+## Amendment 6 (appended before any run; nothing above is edited): D222's rewritten tip
+
+The D222 branch was rewritten after `a7f5d1b` merged it. **`bd023f6` is SUPERSEDED**: it is no longer an ancestor of `d222-index-root-after-backfill`. The tip is now:
+- `f7f9022`;
+- `1f762f0`, a red-test amendment: DROP TABLE leaks a backfilled index's tree;
+- `05cbaae`, the same source fix re-committed. `git diff bd023f6 05cbaae -- src/` is empty (RUN).
+
+It is merged at `8e68568`:
+- `merge-tree` was clean (RUN).
+- Both sides made the identical `catalog.rs` change, so it resolves to ONE copy: `let new_root_id` appears exactly twice, at `create_index` and `create_fulltext_index`, each after its backfill loop (RUN, grep).
+- The merge's only delta is `tests/d222_index_root_after_backfill.rs`, +79/−2. Its `#[test]` count goes 4 → 5 (RUN), and it calls no `root_cell`.
+
+Changes to the expectations (INFERRED):
+- GREEN: `d222_index_root_after_backfill` **5/5**. That is its own lane's expectation, green here because this branch carries its fix.
+- Per-target suite: **2630 run, passed=2629, failed=1**. That is 2611 (quoted from #16 §14), plus this branch's 14, plus D222's 5.
+- Nothing else changes. No D208/D214/D215/F4 test, mutant or red phase touches the D222 test file.
