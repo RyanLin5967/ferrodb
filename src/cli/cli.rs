@@ -97,7 +97,10 @@ pub struct OpenDatabase {
     pub arena_path: String,
     pub timings: OpenTimings,
     /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
-    /// the lock file goes and another process may open the database.
+    /// the lock file goes and another process may open the database. That covers THIS struct's
+    /// handles only: an `Arc` cloned out of it and held elsewhere outlives the lock, so its holder
+    /// must drop it before letting another process open the files (the READ-VS-N harness does, before
+    /// it spawns its restart child).
     _lock: DbLock,
 }
 
