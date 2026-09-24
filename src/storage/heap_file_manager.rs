@@ -86,10 +86,14 @@ impl HeapFileManager {
     /// 65532..=65535 and truncated from 65536 on, where the small figure it produced was answered
     /// by any page. Pinned by `tests/d257_insert_bound.rs`.
     ///
-    /// `Constraint` rather than `NotEnoughSpace`: a row too wide is the statement's fault. That
-    /// is how every other row-width refusal reports it (`catalog::alter`), and it is the SQLSTATE
-    /// class a client should see (`pgwire::sqlstate_of`: 23000, where `NotEnoughSpace` is XX000,
-    /// a server fault).
+    /// `Constraint` rather than `NotEnoughSpace`: a row too wide is the statement's fault, not a
+    /// server fault, and that is how every other row-width refusal here reports it
+    /// (`catalog::alter`). So this build answers a client with SQLSTATE 23000
+    /// (`pgwire::sqlstate_of` maps `Constraint` there; `NotEnoughSpace` would be XX000, which a
+    /// pool may treat as a reason to drop the connection). **PostgreSQL itself reports an
+    /// over-size row as 54000, `program_limit_exceeded`.** Matching it would take a variant or a
+    /// mapping shared by every row-width refusal, `catalog::alter`'s included, so that is a change
+    /// to all of them together, not to this one.
     pub fn space_needed(tuple_len: usize) -> Result<u16, FerroError> {
         if tuple_len > MAX_TUPLE_SIZE {
             return Err(FerroError::Constraint(format!(
@@ -246,14 +250,14 @@ impl HeapFileManager {
                 return Ok(record_id)
             },
             Err(FerroError::NotEnoughSpace) => {
-                // **Decided before the delete below, while the row is still on its page.**
+                // **Decided before the delete below, while the row is still on its page — as far
+                // as the directory can be trusted.**
                 //
                 // The relocation deletes the slot and unpins the page DIRTY before the insert that
                 // is supposed to replace it, so past `page.delete` the row exists nowhere: if the
                 // insert then fails, the `?` unwinds with the row already gone and no caller can
-                // tell that from an update that simply did not happen. So every way that insert
-                // can fail is settled first, by `find_or_make_page`, which answers two different
-                // questions with different answers:
+                // tell that from an update that simply did not happen. `find_or_make_page` settles
+                // two of the ways that insert can fail before the delete:
                 //
                 // - **Can any page hold this tuple?** `space_needed` refuses one past
                 //   `MAX_TUPLE_SIZE` before touching anything. This used to be a guard of its own
@@ -269,8 +273,21 @@ impl HeapFileManager {
                 //   reported failure, and left the primary index pointing at the deleted slot —
                 //   durably, across checkpoint, flush and a reopen.
                 //
-                // With the destination in hand `insert_into` cannot fail for want of space: a
-                // fresh page holds any tuple up to `MAX_TUPLE_SIZE`.
+                // ⛔ **It does NOT settle the third, and the insert below CAN still fail after the
+                // delete (ledger D261, open).** When `find_or_make_page` hands back a FRESH page,
+                // `insert_into` cannot fail for want of space: a fresh page holds any tuple up to
+                // `MAX_TUPLE_SIZE`. When it hands back an EXISTING page, it chose it by the
+                // directory's free-space figure, and a rollback can leave that figure overstating
+                // the page: runtime undo never writes the directory, so an aborted relocation
+                // (`undo_delete` splices the old bytes back) or a rolled-back in-place shrink
+                // (`undo_update` regrows the slot) leaves the entry claiming space the page no
+                // longer has. `insert_into` then refuses with `NotEnoughSpace` after the delete.
+                // On a logged update the abort restores the row, and the client sees a refusal for
+                // a row that fits. On an unlogged one (`catalog::alter::commit_rewrite`, `txn:
+                // None`) the row is lost and the primary index points at the deleted slot. The fix
+                // (the insert's space checked on the real page, under its latch, before the
+                // delete) is D261's, not this change's; D257's refusal above never covered it and
+                // neither did the guard it replaced.
                 //
                 // This is not redundant with the callers' own checks. A logged update survives the
                 // old behaviour by accident: the delete is a WAL record, so the statement's abort

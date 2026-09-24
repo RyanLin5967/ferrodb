@@ -24,8 +24,9 @@
 //!   byte early. Kills MB.
 //! - T3 `two_thousand_refused_inserts_leave_the_pool_and_the_file_as_they_were`: the ledger's volume
 //!   claim. Kills MA, MF.
-//! - T4 `the_space_arithmetic_refuses_rather_than_wrapping_at_the_u16_boundary`: the u16 lengths.
-//!   Kills MA, MB (its control arm), MF.
+//! - T4 `the_space_arithmetic_refuses_rather_than_wrapping_at_the_u16_boundary`: the u16 lengths,
+//!   each refused as a `Constraint` (review 1 R6c: an `Internal` naming the limit is not the
+//!   refusal). Kills MA, MB (its control arm), MF, and MG (the refusal narrowed below 65532).
 //! - T5 `an_oversize_sql_insert_changes_no_page_of_the_table`: the same through SQL. Kills MA, MF.
 //! - T6 `an_oversize_sql_update_writes_nothing_to_the_time_travel_heap`: the time-travel sibling.
 //!   Kills MA, MD (the executor's check removed), MF.
@@ -139,6 +140,12 @@ fn tree_pages(bp: &Arc<BufferPoolManager>, root: u32) -> Vec<u32> {
 /// "too large" does not pass: the caller cannot act on a limit it is not told.
 fn names_the_limit(msg: &str, len: usize) -> bool {
     msg.contains(&MAX_TUPLE_SIZE.to_string()) && msg.contains(&len.to_string())
+}
+
+/// The refusal itself: a `Constraint` that names the limit and the length. An `Internal` naming
+/// both is NOT it: that reports the statement's fault as a fault in the server.
+fn is_the_refusal(e: &FerroError, len: usize) -> bool {
+    matches!(e, FerroError::Constraint(_)) && names_the_limit(&e.to_string(), len)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -316,17 +323,20 @@ fn the_space_arithmetic_refuses_rather_than_wrapping_at_the_u16_boundary() {
         match catch_unwind(AssertUnwindSafe(|| heap.find_or_make_page(len))) {
             Err(_) => wrong.push((len, "find_or_make_page PANICKED".into())),
             Ok(Ok(page)) => wrong.push((len, format!("find_or_make_page returned page {page}"))),
-            Ok(Err(e)) if names_the_limit(&e.to_string(), len) => {}
-            Ok(Err(e)) => wrong.push((len, format!("find_or_make_page refused without naming the limit: `{e}`"))),
+            Ok(Err(e)) if is_the_refusal(&e, len) => {}
+            Ok(Err(e)) => wrong.push((len, format!("find_or_make_page refused, but not with the refusal: {e:?}"))),
         }
     }
     let len = 65536;
     match heap.insert(Tuple::new(vec![5u8; len])) {
         Ok(rid) => wrong.push((len, format!("insert accepted it at {rid:?}"))),
-        Err(e) if names_the_limit(&e.to_string(), len) => {}
-        Err(e) => wrong.push((len, format!("insert refused without naming the limit: `{e}`"))),
+        Err(e) if is_the_refusal(&e, len) => {}
+        Err(e) => wrong.push((len, format!("insert refused, but not with the refusal: {e:?}"))),
     }
-    assert!(wrong.is_empty(), "every length past {MAX_TUPLE_SIZE} must be refused, naming the limit: {wrong:#?}");
+    assert!(
+        wrong.is_empty(),
+        "every length past {MAX_TUPLE_SIZE} must be refused with a Constraint naming the limit: {wrong:#?}"
+    );
 
     let after = heap_pages(&bp, heap.first_directory_page_id);
     assert_eq!(after, pages, "asking for space past the limit changed the heap's pages");
@@ -390,8 +400,9 @@ fn an_oversize_sql_insert_changes_no_page_of_the_table() {
     assert_eq!(pinned(&db.bp), pinned_before, "a refused INSERT (`{err}`) left a page pinned");
     assert!(
         matches!(err, FerroError::Constraint(_)),
-        "a row too wide is the statement's fault, so a client must see a constraint error \
-         (SQLSTATE class 23), not a server fault (XX000): `{err}`"
+        "a row too wide is the statement's fault, so it must be refused as a Constraint (this \
+         build's class for every row-width refusal, SQLSTATE 23000), not as a server fault \
+         (XX000): `{err}`"
     );
     assert!(err.to_string().contains(&MAX_TUPLE_SIZE.to_string()), "the refusal must name the limit ({MAX_TUPLE_SIZE}): `{err}`");
     assert_eq!(db.heap_tuples("t"), 1, "the refused row reached the heap");
@@ -426,7 +437,8 @@ fn an_oversize_sql_update_writes_nothing_to_the_time_travel_heap() {
     assert_eq!(pinned(&db.bp), pinned_before, "a refused UPDATE (`{err}`) left a page pinned");
     assert!(
         matches!(err, FerroError::Constraint(_)),
-        "a row too wide is the statement's fault, so a client must see a constraint error: `{err}`"
+        "a row too wide is the statement's fault, so it must be refused as a Constraint (this \
+         build's class for every row-width refusal), not as a server fault: `{err}`"
     );
     assert!(err.to_string().contains(&MAX_TUPLE_SIZE.to_string()), "the refusal must name the limit ({MAX_TUPLE_SIZE}): `{err}`");
     assert_eq!(
