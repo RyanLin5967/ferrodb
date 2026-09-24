@@ -2689,7 +2689,9 @@ fn read_vs_n_summary(
         );
         // A18.1: an H6 row is no point of the curve (A17.2), so it is not counted here either.
         if counted < 2 {
-            failures.push(format!("arm 3: {counted} restart(s) measured; one point is not a curve"));
+            failures.push(format!(
+                "arm 3: {counted} restart(s) counted (H6 rows left out); one point is not a curve"
+            ));
         }
     }
     println!();
