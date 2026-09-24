@@ -502,4 +502,85 @@ use super::*;
         assert!(!opened.recovered, "a brand-new database reported a recovery");
         assert!(a.exists(), "a.db was not created");
     }
+
+    /// **D205 — after a crash rebuild, every shared root cell names the tree the rebuild built.**
+    ///
+    /// `Catalog::open` seeds one shared cell per tree (D53) from the pre-crash roots on the catalog
+    /// page. `rebuild_indexes` frees each old tree and writes the fresh root into the `TableEntry`
+    /// only, and `sync_root_cells` never overwrites an existing cell. `plan::open_table` and the
+    /// optimizer prefer the cell, so without a reseed every statement after recovery descends a
+    /// FREED tree (the fresh-context adversary, `frontier/d202_adversary.md` §2).
+    ///
+    /// The DROP is load-bearing. The fixture needs a free page BELOW `t`'s root, so that the
+    /// rebuild's lowest-free allocation cannot hand `t` its old root back and hide the defect. The
+    /// shipped pgserver test (one table, no holes) is exactly that coincidence. `t`'s first row is
+    /// inserted BEFORE the DROP, so its heap page exists and the post-DROP insert allocates nothing.
+    ///
+    /// Structural first: record == cell for every table, both read from the system and neither
+    /// written into this test. Then the user-visible consequence, a lookup by key and a refused
+    /// duplicate.
+    #[test]
+    fn a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        fn exec(sql: &str, o: &mut OpenedDatabase) -> Result<Outcome, FerroError> {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("crash.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in [
+                "CREATE TABLE a (id INTEGER NOT NULL, v INTEGER);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (0, 0);",
+                "DROP TABLE a;",
+                "INSERT INTO t VALUES (1, 10);",
+            ] {
+                exec(sql, &mut o).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            // The crash: every handle is dropped with no checkpoint and no flush. `BufferPoolManager`
+            // has no `Drop`, so the last insert's pages die here and only its WAL records survive.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
+        let tables: Vec<String> = o.catalog.tables.keys().cloned().collect();
+        assert!(tables.contains(&"t".to_string()), "premise failed: table t did not survive: {tables:?}");
+        for name in &tables {
+            let record = o.catalog.get_table(name).unwrap().primary_index_root;
+            let cell = o
+                .catalog
+                .root_cell(name, None)
+                .expect("Catalog::open seeds a cell for every table it loads")
+                .load(Ordering::SeqCst);
+            assert_eq!(
+                cell, record,
+                "table '{name}': the shared root cell names page {cell}, the tree the rebuild FREED; \
+                 the rebuilt tree is at page {record}"
+            );
+        }
+
+        match exec("SELECT id, v FROM t WHERE id = 1;", &mut o).unwrap() {
+            Outcome::Rows(rows) => assert_eq!(
+                rows,
+                vec![vec![Value::Integer(1), Value::Integer(10)]],
+                "after the crash, a committed row is missing by key"
+            ),
+            _ => panic!("a SELECT did not return rows"),
+        }
+        match exec("INSERT INTO t VALUES (1, 99);", &mut o) {
+            Err(FerroError::Constraint(m)) if m.contains("duplicate primary key") => {}
+            Err(e) => panic!("a second row 1 was refused, but not as a duplicate: {e}"),
+            Ok(_) => panic!("after the crash, a second row 1 was ADMITTED"),
+        }
+    }
 }

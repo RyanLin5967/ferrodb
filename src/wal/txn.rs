@@ -1963,4 +1963,25 @@ use super::*;
             "a committed transaction's list was kept; an abort under a reissued id would undo committed work"
         );
     }
+
+    /// **D205 C1 — an index undo that fails must not fail an abort that ended the transaction.**
+    ///
+    /// Every caller reads `abort`'s `Err` as "the abort did not happen": `executor.rs` does
+    /// `txn.abort(id)?; session.current = None;`, so an `Err` skips the reset. At `c21eaff`, `abort`
+    /// returned the index-undo error AFTER writing `TxnEnd` and removing the transaction, so the
+    /// session kept a dead id and the statement's own error was replaced (the adversary's C1).
+    ///
+    /// Forced here with a recorded write whose tree root lies past the end of the file. Every read
+    /// of it fails in `DiskManager::read` ("eof before finished reading"), so the undo fails for
+    /// certain, with nothing timed.
+    #[test]
+    fn an_index_undo_failure_does_not_fail_an_abort_that_ended_the_transaction() {
+        use crate::catalog::column::Value;
+
+        let (_bp, _wal, txn, _dir) = setup();
+        let t = txn.begin().unwrap();
+        txn.record_primary_write(t, Arc::new(AtomicU32::new(1_000_000)), Value::Integer(5), None);
+        txn.abort(t).expect("the transaction ended, so its abort must report success");
+        assert!(txn.snapshot_of(t).is_err(), "premise failed: the transaction is still active after its abort");
+    }
 }

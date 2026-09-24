@@ -223,3 +223,58 @@ fn a_row_committed_before_a_crash_is_found_by_key_and_its_key_stays_taken() {
     );
     assert_eq!(after[3], "OK [[1, 10]]", "the table holds more than the one row 1: {after:?}");
 }
+
+/// **D205 — the same crash with a dropped table below `t`.** This is the fresh-context adversary's
+/// schedule (`frontier/d202_adversary.md` §2).
+///
+/// The test above passes after a rebuild for a reason that is a coincidence: in a one-table,
+/// hole-free database, freeing `t`'s old root and building a fresh tree hands out the very same
+/// page (allocation is lowest-free-first). The shared root cell that every statement descends
+/// (D53) was seeded from the pre-crash root, and it keeps naming that page. The DROP puts free
+/// pages below `t`, so the rebuilt tree lands elsewhere, and a server whose cells were never
+/// reseeded descends the freed tree. On disk that tree is `t`'s leaf as DROP's checkpoint left it:
+/// row 0 and not row 1.
+///
+/// Pre-registered at the tests commit (INFERRED): FAILS at the lookup of row 1 (`OK []`, or an
+/// error if the freed page was reused before the query). Passes once the rebuild reseeds the cells.
+#[test]
+fn a_crash_after_a_drop_still_finds_committed_rows_by_key() {
+    require_python_module("pg8000");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("crash_drop.db");
+
+    let first = start(&db, "first");
+    let setup = sql(
+        &first,
+        &[
+            "CREATE TABLE a (id INTEGER NOT NULL, v INTEGER)",
+            "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER)",
+            "INSERT INTO t VALUES (0, 0)",
+            "DROP TABLE a",
+            "INSERT INTO t VALUES (1, 10)",
+        ],
+    );
+    assert!(setup.iter().all(|l| l.starts_with("OK")), "setup failed: {setup:?}");
+    first.crash(&db);
+
+    let second = start(&db, "second");
+    let after = sql(
+        &second,
+        &[
+            "SELECT id, v FROM t",
+            "SELECT id, v FROM t WHERE id = 1",
+            "INSERT INTO t VALUES (1, 99)",
+            "SELECT id, v FROM t",
+        ],
+    );
+    assert_eq!(after[0], "OK [[0, 0], [1, 10]]", "the committed rows did not survive the crash at all: {after:?}");
+    assert_eq!(
+        after[1], "OK [[1, 10]]",
+        "after a crash with a dropped table below, the scan finds row 1 and the lookup by key does not: {after:?}"
+    );
+    assert!(
+        after[2].starts_with("ERR") && after[2].contains("duplicate primary key"),
+        "after the crash, a second row 1 was not refused as a duplicate: {after:?}"
+    );
+    assert_eq!(after[3], "OK [[0, 0], [1, 10]]", "the table holds a second row 1: {after:?}");
+}
