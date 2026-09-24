@@ -116,6 +116,11 @@ pub struct TxnManager {
     /// the moment its `Commit` is durable and dropped by its abort. See
     /// [`TxnManager::bind_history`].
     history_bindings: Mutex<HashMap<u64, Vec<HistoryRecord>>>,
+    /// **D212 (a') AMENDED 2, F5 — committed history records in the log that no store has taken**,
+    /// counted by `recover` when it finds them with no store attached. While it is non-zero and no
+    /// store is attached, a checkpoint keeps the log: truncating it would discard the only copy of
+    /// that history. O(1) per checkpoint; the count is taken during the scan `recover` makes anyway.
+    unstored_history: AtomicU64,
 }
 
 /// A retained DDL record, replayed into the log after every checkpoint.
@@ -242,16 +247,30 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), unstored_history: AtomicU64::new(0) }
     }
 
     /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
     /// or the open's catch-up has nowhere to put what the log holds. Refuses a second store: one
     /// database has one history.
     pub fn attach_history_store(&self, store: Arc<HistoryStore>) -> Result<(), FerroError> {
+        let unstored = self.unstored_history.load(Ordering::SeqCst);
+        if unstored > 0 {
+            // `recover` already ran without it and left these records out of any store; a store
+            // attached now would let the next checkpoint truncate them away.
+            return Err(FerroError::Internal(format!(
+                "attach the REVERT history store BEFORE recover: recovery already found {unstored} \
+                 committed history record(s) with no store to put them in"
+            )));
+        }
         self.history.set(store).map_err(|_| {
             FerroError::Internal("a REVERT history store is already attached to this log".into())
         })
+    }
+
+    /// Called by `recover` when it finds committed history records and no store is attached.
+    pub(crate) fn note_unstored_history(&self, records: u64) {
+        self.unstored_history.fetch_add(records, Ordering::SeqCst);
     }
 
     /// The attached REVERT history store, if any.
@@ -691,6 +710,14 @@ impl TxnManager {
         if let Some(records) = self.history_bindings.lock().unwrap().remove(&txn_id) {
             if let Some(store) = self.history.get() {
                 store.enqueue(records);
+                // AMENDED 2, F7: an idle open transaction blocks every checkpoint, so the queue is
+                // bounded here too — one drain, one fsync, per `QUEUE_DRAIN_BYTES`. A store ahead of
+                // the log is safe (the open keys on `hseq`). A failed drain leaves the queue for the
+                // checkpoint hook, which refuses its truncation until a write succeeds; it is not
+                // this committed transaction's failure.
+                if store.queued_bytes() > crate::wal::history::QUEUE_DRAIN_BYTES {
+                    let _ = store.drain();
+                }
             }
         }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
@@ -936,8 +963,14 @@ impl TxnManager {
         // **D212 (a'): REVERT's history is made durable in its store BEFORE the log that holds its
         // only other copy is truncated.** A failure returns here: the flushes above have run, and
         // the truncation is refused, so the log keeps every history record the store does not.
-        if let Some(store) = self.history.get() {
-            store.drain()?;
+        match self.history.get() {
+            Some(store) => store.drain()?,
+            // F5: history the log holds and no store has — keep the whole log, as a pin does.
+            None if self.unstored_history.load(Ordering::SeqCst) > 0 => {
+                self.commits_since_checkpoint.store(0, Ordering::SeqCst);
+                return Ok(());
+            }
+            None => {}
         }
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.

@@ -15,9 +15,13 @@
 //!    truncation, so the WAL keeps every record the file does not.
 //!
 //! Open reverses it: the file is loaded, then `recover` queues every tag-11 record of a
-//! transaction that has a `Commit` and whose `hseq` is above the file's last, and the first
-//! checkpoint drains them. Idempotency is keyed on `hseq`, never on the publish ordinal, because a
-//! REVERT's marker has an `hseq` and no ordinal.
+//! transaction that has a `Commit` and whose `hseq` the file does not hold — by membership, not by
+//! position (AMENDED 2, F9) — and the first checkpoint drains them. Idempotency is keyed on `hseq`,
+//! never on the publish ordinal, because a REVERT's marker has an `hseq` and no ordinal.
+//!
+//! Design authority: SCALE-DESIGN "D212 (a') DECIDED", "AMENDED" and "AMENDED 2", and "D253
+//! CORRECTED", whose checkpoint fence covers the window between a `Commit` and the queue push —
+//! this lane adds no second fence for it, and lands after D253 and after #16 (D213 item 4).
 //!
 //! # The file: the arena's `[image][tail record]*`, not a new shape
 //!
@@ -47,12 +51,12 @@
 //! Bodies are opaque here. What a record MEANS — a publish's ops and captures, a REVERT's marker —
 //! is `agent_sql::revert_store`'s, which is the only reader of a body.
 
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::FerroError;
-use crate::storage::atomic_file::{append_durably, replace_atomically, OsFileOps};
+use crate::storage::atomic_file::{append_durably, replace_atomically, FileOps, OsFileOps};
 use crate::wal::log::{crc32, take_u32, take_u64, take_u8};
 
 /// How many publishes back a REVERT reaches when `FERRODB_REVERT_RETENTION_MERGES` is not set.
@@ -121,32 +125,55 @@ pub struct HistoryCounters {
     pub drains: u64,
     /// [`append_durably`] calls: one fsync each.
     pub appends: u64,
-    /// [`replace_atomically`] calls: two fsyncs each.
+    /// [`replace_atomically`] calls: two fsyncs each (the temporary, then the directory).
     pub rewrites: u64,
     /// Rewrites that dropped records below the window.
     pub prunes: u64,
-    /// Bytes of the file read at open. Nothing reads it after.
+    /// Drains whose write failed. The records stayed queued and the next write is a full rewrite.
+    pub failed_drains: u64,
+    /// Bytes of the file read at open. Nothing reads it after: a prune rewrites the window from
+    /// memory.
     pub bytes_read_at_open: u64,
 }
+
+/// The queue bytes past which a commit drains the queue itself rather than wait for a checkpoint
+/// (SCALE-DESIGN "D212 (a') AMENDED 2" F7): an idle open transaction blocks every checkpoint, and
+/// the queue must not grow with merges while it does. One fsync per this many bytes.
+pub const QUEUE_DRAIN_BYTES: usize = 1 << 20;
 
 /// REVERT's durable history. See the module doc.
 pub struct HistoryStore {
     path: PathBuf,
     retention: u64,
+    /// The filesystem, as a seam: a unit test injects a write that fails.
+    ops: Box<dyn FileOps + Send + Sync>,
+    /// **The hook mutex** (AMENDED 2, F3): held from the drain, through the window computation, to
+    /// the durable write, so two checkpoints — two committing threads can each run the automatic
+    /// one — never interleave their writes. Taken before `atomic_file`'s `REPLACE_LOCK`, like the
+    /// arena's `PersistState`.
     state: Mutex<StoreState>,
 }
 
 struct StoreState {
-    /// Durable records, in `hseq` order.
-    window: VecDeque<HistoryRecord>,
-    /// Committed records not yet durable in the file, in `hseq` order.
+    /// Durable records, by `hseq`.
+    window: BTreeMap<u64, HistoryRecord>,
+    /// Committed records not yet durable in the file, in the order they were queued.
     queue: Vec<HistoryRecord>,
-    /// Whether THIS process wrote the image in the file. Until it has, it never appends: the tail
-    /// behind an image it did not write may end in a torn record.
+    /// Bytes of `queue`'s records as they will be written.
+    queued_bytes: usize,
+    /// Whether THIS process wrote the image in the file, and no write has failed since. Until then
+    /// it never appends: the tail behind an image it did not write may end in a torn record, and a
+    /// failed append may have left one (AMENDED 2, F1 and F2).
     image_written: bool,
     /// Publishes drained since the last prune (or held beyond `W` at open).
     publishes_since_prune: u64,
     counters: HistoryCounters,
+}
+
+impl StoreState {
+    fn holds(&self, hseq: u64) -> bool {
+        self.window.contains_key(&hseq) || self.queue.iter().any(|q| q.hseq == hseq)
+    }
 }
 
 impl HistoryStore {
@@ -167,6 +194,14 @@ impl HistoryStore {
     /// non-final record fails its checksum, is REFUSED rather than read as empty: an empty history
     /// would let a REVERT answer "no such merge" about one that was published.
     pub fn open(path: impl Into<PathBuf>, retention: u64) -> Result<Arc<HistoryStore>, FerroError> {
+        HistoryStore::open_with_ops(path, retention, Box::new(OsFileOps))
+    }
+
+    fn open_with_ops(
+        path: impl Into<PathBuf>,
+        retention: u64,
+        ops: Box<dyn FileOps + Send + Sync>,
+    ) -> Result<Arc<HistoryStore>, FerroError> {
         if retention == 0 {
             return Err(FerroError::Internal(
                 "a REVERT history store needs a retention window of at least one merge".into(),
@@ -175,20 +210,21 @@ impl HistoryStore {
         let path = path.into();
         let (window, read) = match std::fs::read(&path) {
             Ok(bytes) => (load(&bytes)?, bytes.len() as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (VecDeque::new(), 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => {
                 return Err(FerroError::Io(format!("reading {}: {e}", path.display())));
             }
         };
-        let held = window.iter().filter(|r| r.ordinal > 0).count() as u64;
+        let held = window.values().filter(|r| r.ordinal > 0).count() as u64;
         let state = StoreState {
             window,
             queue: Vec::new(),
+            queued_bytes: 0,
             image_written: false,
             publishes_since_prune: held.saturating_sub(retention),
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
-        Ok(Arc::new(HistoryStore { path, retention, state: Mutex::new(state) }))
+        Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
     }
 
     /// The window `W`, in publishes.
@@ -199,28 +235,39 @@ impl HistoryStore {
     /// The highest `hseq` held, durable or queued; 0 when there is none.
     pub fn last_hseq(&self) -> u64 {
         let s = self.state.lock().unwrap();
-        s.queue.last().or(s.window.back()).map_or(0, |r| r.hseq)
+        let durable = s.window.keys().next_back().copied().unwrap_or(0);
+        s.queue.iter().map(|r| r.hseq).fold(durable, u64::max)
     }
 
     /// Queue committed records for the next drain, skipping any whose `hseq` is already held.
     ///
-    /// Skipping is what makes the open's catch-up idempotent: the WAL a crash left may hold records
-    /// the file already has, and they are recognised by `hseq` alone.
+    /// By MEMBERSHIP, not by "above the tail" (AMENDED 2, F9): a committed record whose `hseq` is
+    /// absent is queued wherever it falls, so a record that missed the file for any reason is
+    /// recovered from the log rather than skipped for being older than a later one. Skipping what is
+    /// held is what makes the open's catch-up idempotent.
     pub fn enqueue(&self, records: Vec<HistoryRecord>) {
         let mut s = self.state.lock().unwrap();
         for r in records {
-            let last = s.queue.last().or(s.window.back()).map_or(0, |r| r.hseq);
-            if r.hseq > last {
+            if !s.holds(r.hseq) {
+                s.queued_bytes += RECORD_FRAME + r.body.len();
                 s.queue.push(r);
             }
         }
+    }
+
+    /// How many bytes are queued and not yet durable.
+    pub fn queued_bytes(&self) -> usize {
+        self.state.lock().unwrap().queued_bytes
     }
 
     /// Every record held, durable then queued, in `hseq` order. At most about `W + W/8` publishes
     /// and the markers among them, whatever the number of merges ever made.
     pub fn records(&self) -> Vec<HistoryRecord> {
         let s = self.state.lock().unwrap();
-        s.window.iter().chain(s.queue.iter()).cloned().collect()
+        let mut all: Vec<HistoryRecord> =
+            s.window.values().chain(s.queue.iter()).cloned().collect();
+        all.sort_by_key(|r| r.hseq);
+        all
     }
 
     pub fn counters(&self) -> HistoryCounters {
@@ -229,8 +276,12 @@ impl HistoryStore {
 
     /// **The checkpoint hook's body.** Make every queued record durable — one [`append_durably`],
     /// or one [`replace_atomically`] when a prune is due or this process has not yet written the
-    /// image — and only then report success. On failure nothing in memory changes, so the queue is
-    /// written by the next attempt, and the caller must not truncate the WAL.
+    /// image since it opened or since a write failed — and only then report success.
+    ///
+    /// On failure the queue keeps every record (AMENDED 2, F2: they were never taken off it), the
+    /// next write is forced to be a full rewrite, and the caller must not truncate the log. A retry
+    /// after an append whose fsync failed therefore rewrites the image rather than appending the same
+    /// records again behind possibly-written bytes; the reader keys on `hseq` either way.
     pub fn drain(&self) -> Result<(), FerroError> {
         let mut s = self.state.lock().unwrap();
         if s.queue.is_empty() {
@@ -238,44 +289,77 @@ impl HistoryStore {
         }
         let queued_publishes = s.queue.iter().filter(|r| r.ordinal > 0).count() as u64;
         let since = s.publishes_since_prune + queued_publishes;
-        let held = s.window.iter().chain(s.queue.iter()).filter(|r| r.ordinal > 0).count() as u64;
+        let held =
+            s.window.values().chain(s.queue.iter()).filter(|r| r.ordinal > 0).count() as u64;
         let prune = since >= (self.retention / 8).max(1) && held > self.retention;
-        if prune || !s.image_written {
+        let written = if prune || !s.image_written {
             let cut = if prune { window_start(&s, self.retention) } else { 0 };
-            let kept: Vec<HistoryRecord> =
-                s.window.iter().chain(s.queue.iter()).filter(|r| r.hseq >= cut).cloned().collect();
-            let image = encode_image(&kept)?;
-            replace_atomically(&OsFileOps, &self.path, &image)
-                .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))?;
-            s.window = kept.into();
-            s.queue.clear();
-            s.image_written = true;
-            s.publishes_since_prune = if prune { 0 } else { since };
-            s.counters.rewrites += 1;
-            if prune {
-                s.counters.prunes += 1;
-            }
+            let mut kept: Vec<HistoryRecord> = s
+                .window
+                .values()
+                .chain(s.queue.iter())
+                .filter(|r| r.hseq >= cut)
+                .cloned()
+                .collect();
+            kept.sort_by_key(|r| r.hseq);
+            encode_image(&kept).and_then(|image| {
+                replace_atomically(&*self.ops, &self.path, &image)
+                    .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))
+            })
+            .map(|()| Some(kept))
         } else {
             let mut tail = Vec::new();
-            for r in &s.queue {
-                r.encode_into(&mut tail)?;
+            s.queue.iter().try_for_each(|r| r.encode_into(&mut tail)).and_then(|()| {
+                append_durably(&*self.ops, &self.path, &tail).map_err(|e| {
+                    FerroError::Io(format!("appending to {}: {e}", self.path.display()))
+                })
+            })
+            .map(|()| None)
+        };
+        match written {
+            Err(e) => {
+                s.image_written = false;
+                s.counters.failed_drains += 1;
+                Err(e)
             }
-            append_durably(&OsFileOps, &self.path, &tail)
-                .map_err(|e| FerroError::Io(format!("appending to {}: {e}", self.path.display())))?;
-            let queued: Vec<HistoryRecord> = s.queue.drain(..).collect();
-            s.window.extend(queued);
-            s.publishes_since_prune = since;
-            s.counters.appends += 1;
+            Ok(Some(kept)) => {
+                s.window = kept.into_iter().map(|r| (r.hseq, r)).collect();
+                s.queue.clear();
+                s.queued_bytes = 0;
+                s.image_written = true;
+                s.publishes_since_prune = if prune { 0 } else { since };
+                s.counters.rewrites += 1;
+                if prune {
+                    s.counters.prunes += 1;
+                }
+                s.counters.drains += 1;
+                Ok(())
+            }
+            Ok(None) => {
+                let queued: Vec<HistoryRecord> = s.queue.drain(..).collect();
+                for r in queued {
+                    s.window.insert(r.hseq, r);
+                }
+                s.queued_bytes = 0;
+                s.publishes_since_prune = since;
+                s.counters.appends += 1;
+                s.counters.drains += 1;
+                Ok(())
+            }
         }
-        s.counters.drains += 1;
-        Ok(())
     }
 }
 
 /// The `hseq` of the oldest publish among the newest `retention`, or 0 when no more are held.
 fn window_start(s: &StoreState, retention: u64) -> u64 {
-    let publishes: Vec<u64> =
-        s.window.iter().chain(s.queue.iter()).filter(|r| r.ordinal > 0).map(|r| r.hseq).collect();
+    let mut publishes: Vec<u64> = s
+        .window
+        .values()
+        .chain(s.queue.iter())
+        .filter(|r| r.ordinal > 0)
+        .map(|r| r.hseq)
+        .collect();
+    publishes.sort_unstable();
     match usize::try_from(retention) {
         Ok(keep) if publishes.len() > keep => publishes[publishes.len() - keep],
         _ => 0,
@@ -329,7 +413,7 @@ fn take_record(bytes: &[u8], at: usize) -> Result<Option<(HistoryRecord, usize)>
 /// Load a whole `<db>.history`: the image, then every intact tail record behind it — the arena's
 /// rule (`ArenaPageStore::replay_tail`): a torn LAST record is dropped, a checksum failure with
 /// more bytes behind it is corruption and refused.
-fn load(bytes: &[u8]) -> Result<VecDeque<HistoryRecord>, FerroError> {
+fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
     let mut at = 0usize;
     let magic = take_u32(bytes, &mut at).map_err(|_| corrupt("too short for an image".into()))?;
     if magic != MAGIC {
@@ -342,11 +426,11 @@ fn load(bytes: &[u8]) -> Result<VecDeque<HistoryRecord>, FerroError> {
         )));
     }
     let count = take_u32(bytes, &mut at)? as usize;
-    let mut out: VecDeque<HistoryRecord> = VecDeque::new();
+    let mut out: Vec<HistoryRecord> = Vec::new();
     for i in 0..count {
         match take_record(bytes, at)? {
             Some((r, next)) => {
-                out.push_back(r);
+                out.push(r);
                 at = next;
             }
             None => return Err(corrupt(format!("the image ends inside record {i} of {count}"))),
@@ -360,7 +444,7 @@ fn load(bytes: &[u8]) -> Result<VecDeque<HistoryRecord>, FerroError> {
     while at < bytes.len() {
         match take_record(bytes, at) {
             Ok(Some((r, next))) => {
-                out.push_back(r);
+                out.push(r);
                 at = next;
             }
             // Torn: the last append did not finish, and was never acknowledged.
@@ -381,14 +465,13 @@ fn load(bytes: &[u8]) -> Result<VecDeque<HistoryRecord>, FerroError> {
             }
         }
     }
-    let mut last = 0u64;
-    for r in &out {
-        if r.hseq <= last {
-            return Err(corrupt(format!("hseq {} follows {last}; they must increase", r.hseq)));
-        }
-        last = r.hseq;
+    // Keyed by `hseq`, the first copy kept: a record a retried write put down twice is one record
+    // (AMENDED 2, F2), and one re-queued from the log lands in its place whatever its position.
+    let mut by_hseq: BTreeMap<u64, HistoryRecord> = BTreeMap::new();
+    for r in out {
+        by_hseq.entry(r.hseq).or_insert(r);
     }
-    Ok(out)
+    Ok(by_hseq)
 }
 
 /// **Reassemble tag-11 WAL parts into records**, for the open's catch-up.
@@ -548,5 +631,180 @@ mod tests {
         assert_eq!(whole[1].hseq, 2);
         assert!(assemble(vec![(5, 1, 1, 1, true, b"cd".to_vec())]).is_err());
         assert!(assemble(vec![(5, 1, 1, 0, false, b"ab".to_vec())]).is_err());
+    }
+
+    /// A filesystem that fails the next `append` or `rename` it is told to, and otherwise is the
+    /// real one — the fault a full disk or an EIO makes.
+    struct Faulty {
+        fail_append: std::sync::atomic::AtomicBool,
+        fail_rename: std::sync::atomic::AtomicBool,
+    }
+
+    impl Faulty {
+        fn new() -> Faulty {
+            Faulty {
+                fail_append: std::sync::atomic::AtomicBool::new(false),
+                fail_rename: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl FileOps for Faulty {
+        fn write(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            OsFileOps.write(path, bytes)
+        }
+        fn append(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            if self.fail_append.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Half the bytes land, as a write interrupted by a full disk leaves them.
+                OsFileOps.append(path, &bytes[..bytes.len() / 2])?;
+                return Err(std::io::Error::other("injected append failure"));
+            }
+            OsFileOps.append(path, bytes)
+        }
+        fn sync_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+            OsFileOps.sync_file(path)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            if self.fail_rename.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            OsFileOps.rename(from, to)
+        }
+        fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+            OsFileOps.sync_dir(dir)
+        }
+    }
+
+    /// **AMENDED 2, F2.** A failed write keeps every queued record queued and forces the next write
+    /// to be a full rewrite — never an append behind the half a failed append left.
+    ///
+    /// Mutant: the queue is taken off before the write (no restore) — record 2 is gone.
+    /// Mutant: a failure leaves `image_written` set — the retry appends behind the torn half, and
+    /// the reopen refuses the file or loses record 3.
+    #[test]
+    fn a_failed_write_keeps_the_queue_and_forces_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.history");
+        let faulty = Arc::new(Faulty::new());
+        struct Shared(Arc<Faulty>);
+        impl FileOps for Shared {
+            fn write(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { self.0.write(p, b) }
+            fn append(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { self.0.append(p, b) }
+            fn sync_file(&self, p: &std::path::Path) -> std::io::Result<()> { self.0.sync_file(p) }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> { self.0.rename(f, t) }
+            fn sync_dir(&self, d: &std::path::Path) -> std::io::Result<()> { self.0.sync_dir(d) }
+        }
+        let s = HistoryStore::open_with_ops(&path, 8, Box::new(Shared(faulty.clone()))).unwrap();
+        s.enqueue(vec![rec(1, 1)]);
+        s.drain().unwrap();
+        s.enqueue(vec![rec(2, 2)]);
+        faulty.fail_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.drain().is_err(), "the injected failure was swallowed");
+        assert_eq!(s.counters().failed_drains, 1);
+        s.enqueue(vec![rec(3, 3)]);
+        s.drain().unwrap();
+        assert_eq!(s.counters().rewrites, 2, "the write after a failure was not a full rewrite");
+        drop(s);
+        let s = HistoryStore::open(&path, 8).unwrap();
+        let hseqs: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(hseqs, [1, 2, 3], "a record queued across a failed write was lost or doubled");
+    }
+
+    /// **AMENDED 2, F1.** A torn tail, then an append at reopen: the first write of a process is a
+    /// full rewrite, so nothing lands behind the bytes replay stopped on.
+    ///
+    /// Mutant: the store trusts a file it did not write (`image_written: true` at open) — record 3
+    /// is appended behind the torn half of record 2, and the reopen drops it with the torn tail.
+    #[test]
+    fn a_torn_tail_is_rewritten_away_by_the_first_write_after_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.history");
+        let s = HistoryStore::open(&path, 8).unwrap();
+        s.enqueue(vec![rec(1, 1)]);
+        s.drain().unwrap();
+        s.enqueue(vec![rec(2, 2)]);
+        s.drain().unwrap();
+        drop(s);
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() - 5]).unwrap();
+
+        let s = HistoryStore::open(&path, 8).unwrap();
+        s.enqueue(vec![rec(3, 3)]);
+        s.drain().unwrap();
+        drop(s);
+        let s = HistoryStore::open(&path, 8).unwrap();
+        let hseqs: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(hseqs, [1, 3], "the record written after the torn tail was lost behind it");
+    }
+
+    /// **AMENDED 2, F3.** Two drains racing — two committing threads can each run the automatic
+    /// checkpoint — write each record once, because the hook mutex is held across the write.
+    ///
+    /// Deterministic rather than hoped-for: each append waits (up to 100 ms) for a second append to
+    /// begin. Under the mutex none can, so each round writes once and waits out the timeout. Under
+    /// the mutant — the mutex released before the write — both threads reach the write with the
+    /// same queue, meet, and both write it: the counters and the file show the record twice.
+    #[test]
+    fn two_racing_drains_write_each_record_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Rendezvous(AtomicUsize);
+        impl FileOps for Rendezvous {
+            fn write(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                OsFileOps.write(p, b)
+            }
+            fn append(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> {
+                let me = self.0.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                while self.0.load(Ordering::SeqCst) < (me | 1) + 1
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                OsFileOps.append(p, b)
+            }
+            fn sync_file(&self, p: &std::path::Path) -> std::io::Result<()> {
+                OsFileOps.sync_file(p)
+            }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> {
+                OsFileOps.rename(f, t)
+            }
+            fn sync_dir(&self, d: &std::path::Path) -> std::io::Result<()> {
+                OsFileOps.sync_dir(d)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.history");
+        let s = HistoryStore::open_with_ops(&path, 64, Box::new(Rendezvous(AtomicUsize::new(0))))
+            .unwrap();
+        s.enqueue(vec![rec(1, 1)]);
+        s.drain().unwrap();
+        for round in 0..5u64 {
+            s.enqueue(vec![rec(2 + round, 2 + round)]);
+            std::thread::scope(|t| {
+                t.spawn(|| s.drain().unwrap());
+                t.spawn(|| s.drain().unwrap());
+            });
+        }
+        let c = s.counters();
+        assert_eq!((c.rewrites, c.appends), (1, 5), "a queued record was written by both drains");
+        let whole = std::fs::read(&path).unwrap();
+        let framed: usize = s.records().iter().map(|r| RECORD_FRAME + r.body.len()).sum();
+        assert_eq!(whole.len(), IMAGE_HEADER + 4 + framed, "the file holds a record twice");
+    }
+
+    /// **AMENDED 2, F9.** The open re-queues by membership: a committed record the file lacks is
+    /// queued even when a later one is there.
+    #[test]
+    fn a_missing_record_older_than_the_tail_is_queued_by_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_in(&dir, 8);
+        s.enqueue(vec![rec(1, 1), rec(3, 3)]);
+        s.drain().unwrap();
+        s.enqueue(vec![rec(1, 1), rec(2, 2), rec(3, 3)]);
+        s.drain().unwrap();
+        drop(s);
+        let s = open_in(&dir, 8);
+        let hseqs: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(hseqs, [1, 2, 3]);
     }
 }
