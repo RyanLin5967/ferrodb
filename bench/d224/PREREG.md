@@ -258,3 +258,28 @@ unregistered kill, never folded in.
   **10–19 ticks** (0.5–0.95 s). Amendment 1 corrected the line numbers, not the range.
 - The lane report and the FAN-QUEUE row say "All 6 commits". `1b8d290..7d9567f` holds **5**
   (`git rev-list --count 1b8d290..7d9567f`).
+
+---
+
+## Amendment 3 — the review's fixes, test changes and mutants recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `92373ff` | red test H (amendment 2) |
+| `bb390f2` | amendment 2 |
+| `b05aaa3` | the fix: `Ok(_) => true`, with its doc corrected; the `stop` check before `idle_redials` counts; the premise, why half, the two-frame residual and the restart scope restated in `idle_probe_gap`, `idle_deadline` and the module header; busy links' two clock reads; the carried frame's policy |
+| `92e28fa` | the registered test changes, exactly as amendment 2 lists them: I and P settle, B's new margin and bound, and the stale comment at `tests_transport.rs:1680-1682` |
+| `a9d568c` | N6 added; N1–N6 regenerated from `92e28fa` |
+
+- **Code changed by `b05aaa3`: three lines**, all else is comments. They are the `Ok(_)` arm and a three-line
+  `if stop.load(..) { break; }` before the redial count. Instrument: `git show b05aaa3` with comment lines filtered
+  out.
+- **Assertions changed by `92e28fa`: B's only.** Its elapsed bound goes from 2 s to `gate + 1 s` = 5 s, and its
+  `idle_probes == 0` message now prints the bound, as registered. I and P each gain a sleep and a comment. No
+  assertion of theirs moves.
+- **Counts at `a9d568c`:** 62 `#[test]` in `tests_transport.rs`, one macOS-only. Run G2 stands: **62 passed on
+  macOS**, per-target **2602**.
+- **Mutants:** all six patches pass `git apply --check` against `a9d568c`'s tree. N1–N5 keep their edits: each
+  patch's `^[-+]` lines were compared with its copy at `7d9567f`, and only hunk context moved. Kill sets are
+  amendment 2's table.
+- **Command, every mutant:** `timeout 1800 cargo test --no-fail-fast --lib consensus::transport::tests::`.
