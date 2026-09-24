@@ -1807,7 +1807,9 @@ impl ArenaPageStore {
                 return Err(e);
             }
         };
-        g.image_bytes = written as u64;
+        // MUTANT (fire-check only, never land): a successful rewrite leaves the image forgotten.
+        let _ = written;
+        g.image_bytes = 0;
         g.tail_bytes = 0;
         g.image_epoch = crate::cluster::epoch();
         g.durable_pending_version = pending_version;
