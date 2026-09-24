@@ -470,3 +470,30 @@ the second half" is WITHDRAWN.**
 *Paper-facing scope (F4 is ledger D212).* `State` is rebuilt empty at every open, so walls #12, #17 and #18's Θ(M²)
 over M merges is **per process lifetime**, not per database. M in arm 2 counts merges since the last open, and every
 axis-(ii) number is read that way. Separately, REVERT refuses a merge from before a restart (D212), which is safe.
+
+**A6, 2026-09-24, before any build or run. A5's protocol is WITHDRAWN, and A4 stands again.**
+
+A5 followed a lead message ordering `cli::open_database` dropped. That message was written against the lane report
+at `e6773e8` (06:03:57Z): its "proposes calling `open_recovered` inside it" is that report's §7. At 06:09:13Z the
+lead's own commit `23994bd` (artie-research) VERIFIED `f298d9e`: `open_database` calls `open_recovered`, every other
+`Catalog::open(` sits under `#[cfg(test)]`, and the tripwire's rules hold. That commit **accepted the deviation**.
+
+`5678e28` reverts A5's code change (`61ddba9`). The code stands as follows:
+
+* `run_cli` → `cli::open_database` → `wal::recovery::open_recovered` (steps 1–4, timed inside it as `BootTimings`)
+  → the second half, written once;
+* the restart child calls `open_database`, which is what `run_cli` calls;
+* the parent does the same, so no harness copy of production code exists;
+* `LeaseStats::finished` is back, and `lease_thread::PASSES_FINISHED` and `cli::last_open_report` are gone.
+
+The tip merge (`b054ad5`) stays.
+
+*Still true from A5, and kept:*
+
+* **item 3**, R7's step names: `lock`, `boot.files`, `boot.recover`, `boot.catalog` and `boot.rebuild` (0 on every
+  clean restart, and covering a stale-index rebuild), then `branch_catalog`, `effect_log`, `runtime` and
+  `provenance`. All flat, each ≤ 50 ms.
+* **the paper-facing scope paragraph** (D212: Θ(M²) is per process lifetime).
+
+*The follow-up the lead recorded, unchanged here:* pgserver calls `open_recovered` but spells out the second half
+itself, so that half lives in two places. Making pgserver share `open_database`'s second half is a later lane.
