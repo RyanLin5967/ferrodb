@@ -24,6 +24,12 @@
 #   D3  new gate, the D2 state                           -> REFUSES at step 0; no tool runs
 #   E1  new gate, stubbed, prepush checks out MS mid-run -> REFUSES at the end: HEAD moved
 #   E2  PRE-D196 gate, the E1 state                      -> prints OK: the end check is new too
+# Added by amendment 1 of the pre-registration, before run 2:
+#   A2  new gate, the A1 state PLUS an untracked file    -> step-0 refusal, NOT the dirty-tree one
+#   C2  PRE-D196 gate, the A2 state                      -> the dirty-tree refusal (the misdirection)
+#   A3  cwd = linked worktree at C, gate = main clone's copy by absolute path, clone at M
+#                                                        -> REFUSES, naming the main clone: not cwd
+#   B4  new gate run from a LINKED worktree at C         -> passes step 0 (the production shape)
 #
 # Usage: bench/d196_gate_firecheck.sh [<candidate, default HEAD>] [<pre-D196 commit, default 9aa6968>]
 # Exit 0 only if every arm ran and every predicate held. KEEP=1 leaves the clone for inspection.
@@ -112,11 +118,16 @@ MS=$(g rev-parse HEAD)
 # check does not see it. It is the only difference between the A1 and C1 states.
 g show "$OLD:tools/land-gate.sh" > "$R/tools/land-gate.pre-d196.sh" || exit 2
 echo "tools/land-gate.pre-d196.sh" >> "$R/.git/info/exclude"
+# A LINKED worktree of the clone at C: the shape every real candidate has (amendment 1).
+W2=$T/wt2
+g worktree add -q --detach "$W2" "$CAND" || { echo "FIRECHECK: linked worktree failed"; exit 2; }
+R_REAL=$(cd "$R" && pwd -P); W2_REAL=$(cd "$W2" && pwd -P)
 
 echo "# fixture     M  $M"
 echo "# fixture     S  $S"
 echo "# fixture     MS $MS"
 echo "# fake verify dir (empty) $V"
+echo "# linked wt   $W2 (at C)   physical paths: clone $R_REAL   wt2 $W2_REAL"
 
 PREDS=0; FAILS=0; ARMS=0
 ok()   { PREDS=$((PREDS + 1)); echo "    PASS  $*"; }
@@ -133,22 +144,34 @@ rc_is(){ if [ "$RC" = "$1" ]; then ok "rc=$RC (want $1)"; else bad "rc=$RC (want
 no_build(){ if [ -e "$SENT" ]; then bad "cargo/rustup NOT reached -- REACHED:"; sed 's/^/            | /' "$SENT"
             else ok "cargo/rustup not reached (no sentinel)"; fi; }
 
-run_arm() { # name head-commit gate-file want [VAR=value for the gate's environment]
-    local name=$1 head=$2 gate=$3 want=$4 extra=${5:-}
+run_arm() { # name tree head-commit gate-file want [VAR=value for the gate's env] [cwd]
+    # The gate file is <tree>/<gate-file>. With no cwd it runs as `bash <gate-file>` from <tree>,
+    # the production shape; with a cwd it runs as `bash <tree>/<gate-file>` from there.
+    # EXPECT_DIRTY=1 flips the per-arm cleanliness precondition for the arms that need dirt.
+    local name=$1 tree=$2 head=$3 gate=$4 want=$5 extra=${6:-} cwd=${7:-} st
     ARMS=$((ARMS + 1))
     OUT=$T/arm_$name.out
     rm -f "$SENT"
-    g checkout -q --detach "$head"
+    git -C "$tree" checkout -q --detach "$head"
     echo
     echo "================================================================================"
-    echo "ARM $name   gate=$gate   HEAD=$(g rev-parse HEAD)   landing=$want   base=$OLD ${extra:+  env: $extra}"
-    if [ -z "$(g status --porcelain)" ]; then ok "precondition: clone clean at HEAD=$head"
-    else bad "precondition: clone clean at HEAD=$head -- DIRTY:"; g status --porcelain | sed 's/^/            | /'; fi
-    echo "  \$ bash $gate $V $want $OLD"
-    ( cd "$R" && env PATH="$T/fakebin:$PATH" $extra timeout 120 bash "$gate" "$V" "$want" "$OLD" ) > "$OUT" 2>&1
+    echo "ARM $name   tree=$tree   gate=$gate   HEAD=$(git -C "$tree" rev-parse HEAD)   landing=$want   base=$OLD ${extra:+  env: $extra}${cwd:+  cwd: $cwd}"
+    st=$(git -C "$tree" status --porcelain)
+    if [ "${EXPECT_DIRTY:-0}" = 1 ]; then
+        if [ -n "$st" ]; then ok "precondition: tree DIRTY on purpose at HEAD=$head"; echo "$st" | sed 's/^/            | /'
+        else bad "precondition: tree DIRTY on purpose at HEAD=$head -- it is clean"; fi
+    elif [ -z "$st" ]; then ok "precondition: tree clean at HEAD=$head"
+    else bad "precondition: tree clean at HEAD=$head -- DIRTY:"; echo "$st" | sed 's/^/            | /'; fi
+    if [ -z "$cwd" ]; then
+        echo "  \$ (cd $tree) bash $gate $V $want $OLD"
+        ( cd "$tree" && env PATH="$T/fakebin:$PATH" $extra timeout 120 bash "$gate" "$V" "$want" "$OLD" ) > "$OUT" 2>&1
+    else
+        echo "  \$ (cd $cwd) bash $tree/$gate $V $want $OLD"
+        ( cd "$cwd" && env PATH="$T/fakebin:$PATH" $extra timeout 120 bash "$tree/$gate" "$V" "$want" "$OLD" ) > "$OUT" 2>&1
+    fi
     RC=$?
     sed 's/^/  > /' "$OUT"
-    echo "  rc=$RC   HEAD after: $(g rev-parse HEAD)"
+    echo "  rc=$RC   HEAD after: $(git -C "$tree" rev-parse HEAD)"
     echo "  predicates:"
 }
 
@@ -172,7 +195,7 @@ pre "the fake cargo leaves the sentinel the arms look for" "grep -q -F 'FAKE car
 rm -f "$SENT"
 
 # ---- the three arms the brief asked for -------------------------------------------------------
-run_arm A1 "$M" tools/land-gate.sh "$CAND"
+run_arm A1 "$R" "$M" tools/land-gate.sh "$CAND"
 rc_is 1
 has "land-gate: REFUSING — $NEW_MARK."
 has "HEAD      $M"
@@ -182,7 +205,7 @@ lacks "[1/3]"
 lacks "land-gate: landing"
 no_build
 
-run_arm B1 "$CAND" tools/land-gate.sh "$CAND"
+run_arm B1 "$R" "$CAND" tools/land-gate.sh "$CAND"
 rc_is 1
 lacks "$NEW_MARK"
 has "HEAD is the commit being landed [step 0]"
@@ -191,21 +214,21 @@ has "certify-head: REFUSING — no persisted suite summary"
 lacks "[2/3]"
 no_build
 
-run_arm B2 "$CAND" tools/land-gate.sh "$(git rev-parse --short=7 "$CAND")"
+run_arm B2 "$R" "$CAND" tools/land-gate.sh "$(git rev-parse --short=7 "$CAND")"
 rc_is 1
 lacks "$NEW_MARK"
 has "HEAD is the commit being landed [step 0]"
 has "certify-head: REFUSING — no persisted suite summary"
 no_build
 
-run_arm B3 "$CAND" tools/land-gate.sh d196-fc-candidate
+run_arm B3 "$R" "$CAND" tools/land-gate.sh d196-fc-candidate
 rc_is 1
 lacks "$NEW_MARK"
 has "HEAD is the commit being landed [step 0]"
 has "certify-head: REFUSING — no persisted suite summary"
 no_build
 
-run_arm C1 "$M" tools/land-gate.pre-d196.sh "$CAND"
+run_arm C1 "$R" "$M" tools/land-gate.pre-d196.sh "$CAND"
 rc_is 1
 lacks "$NEW_MARK"
 has "land-gate: landing"
@@ -214,7 +237,7 @@ has "certify-head: REFUSING — no persisted suite summary"
 no_build
 
 # ---- beyond the brief: the whole gate, on stubbed tools ------------------------------------
-run_arm D1 "$S" tools/land-gate.sh "$S"
+run_arm D1 "$R" "$S" tools/land-gate.sh "$S"
 rc_is 0
 has "HEAD is the commit being landed [step 0]"
 has "STUB certify-head: OK"
@@ -223,20 +246,20 @@ has "land-gate: OK — the evidence in"
 lacks "REFUSING"
 no_build
 
-run_arm D2 "$MS" tools/land-gate.pre-d196.sh "$S"
+run_arm D2 "$R" "$MS" tools/land-gate.pre-d196.sh "$S"
 rc_is 0
 has "STUB certify-head: OK (dir=$V want=$S)"
 has "STUB prepush: would build HEAD=$MS"
 has "land-gate: OK — the evidence in"
 no_build
 
-run_arm D3 "$MS" tools/land-gate.sh "$S"
+run_arm D3 "$R" "$MS" tools/land-gate.sh "$S"
 rc_is 1
 has "land-gate: REFUSING — $NEW_MARK."
 lacks "STUB"
 no_build
 
-run_arm E1 "$S" tools/land-gate.sh "$S" "D196_FC_MOVE_HEAD_TO=$MS"
+run_arm E1 "$R" "$S" tools/land-gate.sh "$S" "D196_FC_MOVE_HEAD_TO=$MS"
 rc_is 1
 has "STUB prepush: moved HEAD to $MS"
 has "land-gate: REFUSING — $END_MARK: $S -> $MS."
@@ -244,16 +267,46 @@ lacks "the tree became dirty"
 lacks "land-gate: OK"
 no_build
 
-run_arm E2 "$S" tools/land-gate.pre-d196.sh "$S" "D196_FC_MOVE_HEAD_TO=$MS"
+run_arm E2 "$R" "$S" tools/land-gate.pre-d196.sh "$S" "D196_FC_MOVE_HEAD_TO=$MS"
 rc_is 0
 has "STUB prepush: moved HEAD to $MS"
 has "land-gate: OK — the evidence in"
 no_build
 
+# ---- amendment 1: order against the dirty check, and which tree is examined ----------------
+mkdir -p "$R/docs" && echo "another session's untracked notes" > "$R/docs/another-sessions-notes.md"
+EXPECT_DIRTY=1 run_arm A2 "$R" "$M" tools/land-gate.sh "$CAND"
+rc_is 1
+has "land-gate: REFUSING — $NEW_MARK."
+lacks "uncommitted change"
+no_build
+
+EXPECT_DIRTY=1 run_arm C2 "$R" "$M" tools/land-gate.pre-d196.sh "$CAND"
+rc_is 1
+has "the working tree has 1 uncommitted change(s)"
+lacks "$NEW_MARK"
+no_build
+rm -f "$R/docs/another-sessions-notes.md"; rmdir "$R/docs" 2>/dev/null
+
+run_arm A3 "$R" "$M" tools/land-gate.sh "$CAND" "" "$W2"
+rc_is 1
+has "land-gate: REFUSING — $NEW_MARK."
+has "  checkout  $R_REAL"
+lacks "checkout  $W2_REAL"
+lacks "[1/3]"
+no_build
+
+run_arm B4 "$W2" "$CAND" tools/land-gate.sh "$CAND"
+rc_is 1
+lacks "$NEW_MARK"
+has "checkout  $W2_REAL — HEAD is the commit being landed [step 0]"
+has "certify-head: REFUSING — no persisted suite summary"
+no_build
+
 # ---- verdict ----------------------------------------------------------------------------------
 echo
 echo "================================================================================"
-REGISTERED_ARMS=10
+REGISTERED_ARMS=14
 echo "arms run: $ARMS (registered $REGISTERED_ARMS)   predicates: $PREDS   failed: $FAILS"
 if [ "$ARMS" != "$REGISTERED_ARMS" ] || [ "$PREDS" = 0 ]; then
     echo "VERDICT: FAIL — not every registered arm ran, or nothing was checked. That is not a pass."

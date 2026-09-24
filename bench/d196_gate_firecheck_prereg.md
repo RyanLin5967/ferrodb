@@ -96,3 +96,35 @@ examines the checkout its own file lives in, so from the main checkout it runs *
 the text, which is pre-D196 until this lands. Before the merge, that arm would test the old gate. A1
 is the same state with the new text, in a clone. After the merge, the main checkout's gate refuses
 any other candidate at step 0 without building. That can be checked then, for free.
+
+---
+
+## Amendment 1: four more arms, added after run 1 and before run 2
+
+Run 1 (`bench/d196_gate_firecheck.txt`, committed `b4a5d48` before this amendment) went as predicted:
+10/10 arms, 77 predicates, 0 failed. I then attacked it myself. Two properties were pinned by no
+arm, although the brief or the refusal message claims them:
+
+1. **Step 0 comes before the dirty-tree check.** Every run-1 arm starts from a clean tree. So a
+   mutant that puts step 0 *after* the dirty check passes all ten. The order matters in practice.
+   The 00:37Z d193 gate, run from main's checkout, refused with the dirty-tree message. That message
+   points the operator at cleaning main's tree, which held another session's untracked `docs/`,
+   when the real problem was the wrong checkout.
+   - **A2**: new gate, HEAD = M, plus one untracked, NON-excluded file
+     `docs/another-sessions-notes.md`, landing C. Predicted **rc=1** with the step-0 refusal and
+     without `uncommitted change`. Precondition: the tree IS dirty.
+   - **C2**: pre-D196 gate, the A2 state. Predicted **rc=1** with
+     `the working tree has 1 uncommitted change(s)` and without the step-0 refusal. This reproduces
+     the misdirection.
+2. **"The gate examines the checkout its own file lives in, not your cwd."** The refusal says this,
+   and it decides which instruction is right. No arm tested it, because every run-1 arm ran with
+   cwd equal to the examined tree.
+   - **A3**: cwd is a LINKED worktree of the clone, at C (the candidate). The gate is invoked by
+     ABSOLUTE path to the main clone's copy, with the main clone at M, landing C. Predicted
+     **rc=1** with the step-0 refusal. Its `checkout` line names the main clone, not the cwd.
+   - **B4**: the production shape. The gate runs from a LINKED worktree at C, using that worktree's
+     own copy, landing C. Predicted **rc=1** from certify-head. The `[step 0]` line names the
+     linked worktree. Run 1 used only a standalone clone's primary worktree.
+
+Registered arm count for run 2: **14**. Run 2 writes to `bench/d196_gate_firecheck_run2.txt`, and
+run 1's file stays as it is.
