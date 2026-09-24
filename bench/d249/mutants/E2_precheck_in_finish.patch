@@ -1,6 +1,6 @@
 --- a/src/catalog/alter.rs
 +++ b/src/catalog/alter.rs
-@@ -577,7 +577,7 @@
+@@ -586,7 +586,7 @@
          let mut installed = entry.clone();
          installed.schema = new_schema.clone();
          rename_indexed_columns(&mut installed, actions);
@@ -9,7 +9,7 @@
  
          // The statistics are carried across the alteration by [`carried_stats`], and they are
          // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
-@@ -713,6 +713,9 @@
+@@ -754,6 +754,9 @@
              stats.columns = columns;
          }
          let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;

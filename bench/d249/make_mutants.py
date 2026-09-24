@@ -37,6 +37,16 @@ MUTANTS = [
         "    if !page.has_space(entry) {\n",
         "    if false && !page.has_space(entry) {\n",
     )]),
+    # PREREG amendment 3 (the D249 review). E4: the checked entry omits the index renames (F2).
+    # E5: the staleness check in `apply_plan` never refuses (F7).
+    ("E4_index_renames_not_checked", ALTER, [(
+        "        rename_indexed_columns(&mut installed, actions);\n",
+        "",
+    )]),
+    ("E5_staleness_check_removed", ALTER, [(
+        "            if now != checked {\n",
+        "            if false && now != checked {\n",
+    )]),
 ]
 
 
