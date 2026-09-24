@@ -2640,21 +2640,212 @@ use super::*;
         FAIL_RELEASES.with(|f| f.set(0));
     }
 
-    /// **DDL is refused BEFORE its mutation while a release is owed** (F2, for A8's reason). The
-    /// checkpoint a DDL needs refuses to truncate then, and a refusal after the mutation would leave
-    /// the DDL done and reported failed. Review 2's C6(b): a mutant deleting this pre-check survived
-    /// every listed test. Its red is mutant-only: the seam is new.
+    /// **Review 3's decision 1: a create runs while a release is owed, and only the truncation waits.**
+    /// Its checkpoint still flushes and syncs, keeps the log for the release, and counts the deferral.
+    /// At `7cede54` every DDL was refused before its mutation instead, so one release that never
+    /// succeeds blocked all DDL for ever (review 2's Q3). Replaces
+    /// `ddl_is_refused_before_its_mutation_while_a_release_is_owed` (lane §21.1).
     #[test]
-    fn ddl_is_refused_before_its_mutation_while_a_release_is_owed() {
-        // Two failures: the commit's release, then the DDL's pre-check retry.
-        let (_bp, _wal, txn, _heap, _rid, _dir) = owed_release(2);
+    fn a_create_runs_while_a_release_is_owed_and_defers_the_truncation() {
+        // Every attempt fails: the commit's release and every retry after it.
+        let (_bp, wal, txn, _heap, _rid, _dir) = owed_release(u32::MAX);
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let deferred = deferred_checkpoints();
         let mutated = std::cell::Cell::new(false);
-        let refused = txn.ddl_checkpointed(|| {
+        let out = txn.ddl_checkpointed(|| {
             mutated.set(true);
-            Ok(())
+            Ok(7)
         });
-        assert!(refused.is_err(), "DDL ran its checkpoint although a release is owed");
-        assert!(!mutated.get(), "DDL mutated before it was refused, so it is done and reported failed");
+        assert_eq!(out.expect("a create was refused while a release is owed"), 7);
+        assert!(mutated.get(), "the create reported success without running its mutation");
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the release stopped being owed");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the create's checkpoint truncated the log past a release that is still owed");
+        assert!(deferred_checkpoints() > deferred, "the create's checkpoint kept the log without counting a deferral");
+        FAIL_RELEASES.with(|f| f.set(0));
+    }
+
+    /// One SQL statement through the executor.
+    fn sql(text: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+        let tokens = Scanner::new(text.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse errors in `{text}`: {:?}", p.errors);
+        run(stmts.remove(0), catalog, bp.clone(), txn.clone(), session)
+    }
+
+    /// Tables `other` and `t (id, v, note)`, where a committed relocating UPDATE of `t`'s row 1 owes a
+    /// release that fails at every attempt. Row 2 (3900 B of note) goes in first and row 1 after it,
+    /// so row 1's 200 B note does not fit beside them and the UPDATE relocates it, retiring its slot.
+    fn table_owing_a_release() -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, Catalog, tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let mut s = Session::new();
+        for text in [
+            "CREATE TABLE other (id INTEGER NOT NULL);".to_string(),
+            "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER, note VARCHAR(4000));".to_string(),
+            format!("INSERT INTO t VALUES (2, 20, '{}');", "x".repeat(3900)),
+            "INSERT INTO t VALUES (1, 10, 'a');".to_string(),
+        ] {
+            sql(&text, &mut catalog, &bp, &txn, &mut s).unwrap_or_else(|e| panic!("`{text}` failed: {e}"));
+        }
+        FAIL_RELEASES.with(|f| f.set(u32::MAX));
+        let update = format!("UPDATE t SET note = '{}' WHERE id = 1;", "y".repeat(200));
+        sql(&update, &mut catalog, &bp, &txn, &mut s).unwrap_or_else(|e| panic!("the UPDATE failed: {e}"));
+        let owed = txn.pending_releases.lock().unwrap().clone();
+        assert_eq!(owed.len(), 1, "premise: the relocating UPDATE's release is not owed");
+        let t_heap = catalog.get_table("t").expect("t").first_directory_page_id;
+        assert_eq!(owed[0].1.dir_root, t_heap, "premise: the owed release is not on t's heap");
+        (bp, wal, txn, catalog, dir)
+    }
+
+    /// **Review 3's caveat 1 and decision 1: CREATE INDEX succeeds while a release is owed.** At
+    /// `7cede54` it built and flushed the index, and then its checkpoint answered "checkpoint refused",
+    /// so the client was told the DDL failed over an index that existed and was used (A8's shape).
+    /// CREATE TABLE is checked on the same database.
+    #[test]
+    fn create_index_succeeds_while_a_release_is_owed_and_the_index_serves_lookups() {
+        let (bp, wal, txn, mut catalog, _dir) = table_owing_a_release();
+        let mut s = Session::new();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let deferred = deferred_checkpoints();
+        sql("CREATE INDEX ix ON t (v);", &mut catalog, &bp, &txn, &mut s)
+            .unwrap_or_else(|e| panic!("CREATE INDEX was reported failed while a release is owed: {e}"));
+        let root = catalog.get_table("t").expect("t").indexes.first().expect("CREATE INDEX recorded no index").root_page_id;
+        let tree = BPlusTreeManager::<(Value, Value), ()>::open(root, bp.clone());
+        for (v, id) in [(10, 1), (20, 2)] {
+            assert!(
+                tree.search(&(Value::Integer(v), Value::Integer(id))).unwrap().is_some(),
+                "the index built while a release is owed has no entry for row {id}"
+            );
+        }
+        match sql("SELECT id FROM t WHERE v = 10;", &mut catalog, &bp, &txn, &mut s).unwrap() {
+            Outcome::Rows(rows) => assert_eq!(rows, vec![vec![Value::Integer(1)]], "a lookup by v after CREATE INDEX"),
+            _ => panic!("SELECT did not return rows"),
+        }
+        sql("CREATE TABLE u (id INTEGER NOT NULL);", &mut catalog, &bp, &txn, &mut s)
+            .unwrap_or_else(|e| panic!("CREATE TABLE was refused while a release is owed: {e}"));
+        assert!(catalog.get_table("u").is_some(), "CREATE TABLE answered Ok without creating the table");
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the release stopped being owed");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "a DDL checkpoint truncated the log past a release that is still owed");
+        assert!(deferred_checkpoints() >= deferred + 2, "the two DDL checkpoints kept the log without counting two deferrals");
+        FAIL_RELEASES.with(|f| f.set(0));
+    }
+
+    /// **A DROP of the table that owes a release discards the release and truncates** (lane §21: a
+    /// DROP frees every page of its table, so the release could only ever write into pages the table
+    /// no longer owns, and the log's record of it must go with the table). At `7cede54` the DROP was
+    /// refused, so a table holding a page that permanently fails could never be dropped.
+    #[test]
+    fn dropping_the_table_that_owes_a_release_discards_it_and_truncates() {
+        let (bp, wal, txn, mut catalog, _dir) = table_owing_a_release();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new())
+            .unwrap_or_else(|e| panic!("DROP of the table that owes the release was refused: {e}"));
+        assert!(catalog.get_table("t").is_none(), "DROP answered Ok without dropping the table");
+        assert!(txn.pending_releases.lock().unwrap().is_empty(), "the dropped table's release is still owed, and would write into pages the DROP freed");
+        assert!(wal.base_lsn.load(Ordering::SeqCst) > base, "the DROP's checkpoint kept the log, with the dropped table's records in it");
+        FAIL_RELEASES.with(|f| f.set(0));
+    }
+
+    /// **A DROP is refused BEFORE its mutation while ANOTHER table owes a release** (lane §21). The
+    /// DROP needs its truncation: with the log kept, the next open replays the dropped table's records
+    /// onto freed or reused pages. A refusal after the mutation would leave the table dropped and
+    /// reported failed (A8). A guard: `7cede54` refused every DDL here too. It carries the retired
+    /// `ddl_is_refused_before_its_mutation_while_a_release_is_owed`'s assertion for DROP.
+    #[test]
+    fn a_drop_is_refused_before_its_mutation_while_another_table_owes_a_release() {
+        let (bp, wal, txn, mut catalog, _dir) = table_owing_a_release();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let refused = sql("DROP TABLE other;", &mut catalog, &bp, &txn, &mut Session::new());
+        let e = match refused {
+            Err(e) => e,
+            Ok(_) => panic!("DROP ran while another table owes a release, so its truncation was skipped"),
+        };
+        assert!(e.to_string().contains("owed"), "the DROP was refused, but not for the owed release: {e}");
+        assert!(catalog.get_table("other").is_some(), "the refused DROP had already dropped the table");
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "the refused DROP discarded another table's release");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the refused DROP truncated the log");
+        FAIL_RELEASES.with(|f| f.set(0));
+    }
+
+    /// A page file that counts its syncs. Only a checkpoint syncs the page file
+    /// (`bp.disk_manager.sync()`), so on one database this counts checkpoint flushes.
+    struct SyncCountingFile {
+        file: std::fs::File,
+        syncs: Arc<AtomicU64>,
+    }
+
+    impl crate::storage::storage::Storage for SyncCountingFile {
+        fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pwrite(&self.file, buf, offset)
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pread(&self.file, buf, offset)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            crate::storage::storage::Storage::sync_all(&self.file)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            crate::storage::storage::Storage::sync_data(&self.file)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            crate::storage::storage::Storage::set_len(&self.file, len)
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            crate::storage::storage::Storage::len(&self.file)
+        }
+    }
+
+    /// **Review 3's decision 3: while a release is owed, the automatic checkpoint runs once per
+    /// interval, not once per commit.** At `7cede54` a deferral left `commits_since_checkpoint` over the
+    /// threshold, so every later commit with nothing else open flushed the whole pool and synced.
+    #[test]
+    fn while_a_release_is_owed_the_automatic_checkpoint_flushes_once_per_interval() {
+        const K: u64 = 6;
+        let interval = super::checkpoint_interval();
+        assert!(interval > K, "premise: FERRODB_CHECKPOINT_INTERVAL={interval} is not above {K}, so every commit is due anyway and this measures nothing");
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.path().join("cadence.db")).unwrap();
+        let syncs = Arc::new(AtomicU64::new(0));
+        let dm = Arc::new(DiskManager::with_storage(Arc::new(SyncCountingFile { file, syncs: syncs.clone() })).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        let wal = Arc::new(WalManager::new(dir.path().join("cadence.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        // A committed delete whose release fails at the commit and at every retry.
+        let t1 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![7; 40])).unwrap();
+        txn.commit(t1).unwrap();
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.delete(rid).unwrap();
+        FAIL_RELEASES.with(|f| f.set(u32::MAX));
+        txn.commit(t2).unwrap();
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the release is not owed");
+
+        // The next commit is due.
+        txn.commits_since_checkpoint.store(interval - 1, Ordering::SeqCst);
+        let before = syncs.load(Ordering::SeqCst);
+        let deferred = deferred_checkpoints();
+        for i in 0..K {
+            let t = txn.begin().unwrap();
+            heap.set_transaction(txn.clone(), t);
+            heap.insert(Tuple::new(vec![i as u8; 40])).unwrap();
+            txn.commit(t).unwrap();
+        }
+        let flushes = syncs.load(Ordering::SeqCst) - before;
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the release stopped being owed, so nothing was deferred");
+        assert!(deferred_checkpoints() > deferred, "the due commit's checkpoint kept the log without counting a deferral");
+        assert_eq!(
+            flushes,
+            1 + (K - 1) / interval,
+            "{K} commits with a release owed flushed and synced the pool {flushes} times: a deferred checkpoint must \
+             reset the trigger, so the retry runs once per {interval} commits"
+        );
         FAIL_RELEASES.with(|f| f.set(0));
     }
 }
