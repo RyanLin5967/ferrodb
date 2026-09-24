@@ -241,7 +241,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 /// one printed. A refused catalog persist must not also cost the arena its checkpoint (review 3,
 /// F4). This is the shape `rollback-index-orphan` gives its two checkpoints.
 pub fn exit_sequence(
-    catalog: &Catalog,
+    // In full: `rollback-index-orphan` narrows this file's `catalog` import to `column::Value`, and
+    // a merge that keeps that line must still compile (D230 review 7, F-A).
+    catalog: &crate::catalog::catalog::Catalog,
     txn: &TxnManager,
     store: &ArenaPageStore,
     arena_path: &Path,
