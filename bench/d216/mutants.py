@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""D216 / D227 / D234 mutants, each applied ALONE to a throwaway checkout of the tip.
+
+Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR]
+
+For each mutant: restore the tree, apply one exact replacement (refused unless the pattern matches
+exactly once), run the named cargo test targets, and record KILLED when every expected test is
+reported FAILED, SURVIVED otherwise. A mutant marked expect=SURVIVE is a stated blind spot.
+
+Raw cargo output goes to bench/d216/raw/<mutant>.txt beside this script, and one summary line per
+mutant to bench/d216/raw/summary.txt. Commit them by explicit path BEFORE reading them.
+
+The throwaway tree is `/Users/idide/wt/ferrodb-d216-mutants.noindex` (a `.noindex` name, for Spotlight),
+created detached at <tip-sha> and removed at the end, whatever happened. It refuses to start if that
+path already exists, rather than reusing somebody else's tree.
+"""
+import os
+import re
+import subprocess
+import sys
+
+REPO = "/Users/idide/projects/ferrodb"
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "raw")
+TREE = "/Users/idide/wt/ferrodb-d216-mutants.noindex"
+TIMEOUT = 3600  # seconds per cargo invocation
+
+LIB = ("--lib", "wal::")
+D227 = ("--test", "d227_restart_keeps_declarations")
+D234 = ("--test", "d234_declared_runs_reach_the_log")
+
+R = "wal::recovery::tests::"
+T = "wal::txn::tests::"
+L = "wal::log::tests::"
+
+# (name, file, old, new, targets, expected failing tests, expect)
+MUTANTS = [
+    ("M1_rebuild_ignores_marker", "src/wal/recovery.rs",
+     "    let rebuild = recovered || stale;\n", "    let rebuild = recovered;\n",
+     [LIB], [R + "the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations",
+             R + "a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty",
+             R + "the_stale_marker_is_honoured_over_an_empty_log"], "KILL"),
+    ("M2_no_rebuild_call", "src/wal/recovery.rs",
+     "    if rebuild {\n        rebuild_indexes(&mut catalog, &bp)?;\n    }\n", "    if rebuild {\n    }\n",
+     [LIB], [R + "a_crashed_uncommitted_heap_write_still_forces_the_rebuild",
+             R + "a_committed_row_whose_heap_page_reached_disk_still_forces_the_rebuild",
+             R + "the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations"], "KILL"),
+    ("M3_checkpoint_only_after_rebuild", "src/wal/recovery.rs",
+     "    if rebuild || holds_records || declares {\n", "    if rebuild {\n",
+     [LIB], [R + "the_open_discards_a_previous_processs_run_declarations",
+             R + "a_checkpoint_after_a_restart_still_declares_every_table",
+             R + "an_open_over_an_empty_log_still_declares_every_table"], "KILL"),
+    ("M4_any_record_is_stale", "src/wal/recovery.rs",
+     "    Ok(!touched.is_empty())\n", "    Ok(true)\n",
+     [LIB], [R + "a_clean_restart_after_ddl_does_not_rebuild_the_indexes",
+             R + "a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes",
+             R + "a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark",
+             R + "recovery_appends_nothing_for_a_log_of_declarations"], "KILL"),
+    ("M5_txn0_is_a_loser", "src/wal/recovery.rs",
+     ".filter(|id| *id != 0 && !ended.contains(id))", ".filter(|id| !ended.contains(id))",
+     [LIB], [R + "recovery_appends_nothing_for_a_log_of_declarations"], "KILL"),
+    ("M6_gate_skips_unlogged_pages", "src/buffer/buffer_pool.rs",
+     "                0 => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
+     "                0 => {}\n",
+     [LIB], [R + "an_index_page_reaches_disk_only_after_the_log_records_it_depends_on"], "KILL"),
+    ("M7_gate_flushes_whole_log", "src/buffer/buffer_pool.rs",
+     "                0 => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
+     "                0 => wal.flush()?,\n",
+     [LIB], [R + "an_index_page_whose_records_are_durable_does_not_flush_the_log"], "KILL"),
+    ("M8_flush_up_to_ge", "src/wal/log.rs",
+     "        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {\n",
+     "        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {\n",
+     [LIB], [L + "flush_up_to_writes_a_record_that_starts_at_the_flushed_point",
+             R + "a_commit_is_durable_when_everything_before_it_was_already_flushed",
+             R + "a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point"], "KILL"),
+    ("M9_txn_id_zero_issuable", "src/wal/txn.rs",
+     "        let start = wal.header_txn_id.max(1);\n", "        let start = wal.header_txn_id;\n",
+     [LIB], [R + "transaction_id_zero_is_never_handed_out"], "KILL"),
+    ("M10_no_table_refill", "src/wal/recovery.rs",
+     "    for rec in declarations {\n        txn.retain_ddl(&rec);\n    }\n",
+     "    for _rec in declarations {\n    }\n",
+     [LIB, D227], [R + "a_checkpoint_after_a_restart_still_declares_every_table",
+                   R + "an_open_over_an_empty_log_still_declares_every_table",
+                   "a_restarted_process_still_declares_its_tables_and_runs"], "KILL"),
+    ("M11_cli_declares_no_runs", "src/cli/cli.rs",
+     "    txn.declare_runs_of(&**runtime.provenance())?;\n", "",
+     [D227], ["a_restarted_process_still_declares_its_tables_and_runs"], "KILL"),
+    ("M12_marker_not_durable", "src/wal/txn.rs",
+     "        let written = crate::storage::atomic_file::replace_atomically(\n"
+     "            &crate::storage::atomic_file::OsFileOps,\n"
+     "            &marker,\n"
+     "            format!(\"txn {txn_id}: {e}\\n\").as_bytes(),\n"
+     "        );\n",
+     "        let written = std::fs::write(&marker, format!(\"txn {txn_id}: {e}\\n\"));\n",
+     [LIB], [], "SURVIVE"),
+    ("M13_pgserver_declares_no_runs", "examples/pgserver.rs",
+     "    txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!(\"pgserver: {e}\"));\n", "",
+     [LIB], [], "SURVIVE"),
+    ("M14_unconditional_replay", "src/wal/txn.rs",
+     "        if truncation == Truncation::Truncated {\n", "        if true {\n",
+     [LIB, D234], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing",
+                   "a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
+    ("M15_declare_runs_of_only_retains", "src/wal/txn.rs",
+     "                self.wal.append(0, 0, &RecKind::RunIdentity { run })?;\n                wrote = true;\n",
+     "                let _ = run;\n",
+     [D234], ["a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
+    ("M16_open_ignores_declarations", "src/wal/recovery.rs",
+     "    if rebuild || holds_records || declares {\n", "    if rebuild || holds_records {\n",
+     [LIB], [R + "an_open_over_an_empty_log_still_declares_every_table"], "KILL"),
+]
+
+FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
+
+
+def git(*args, cwd=None, check=True):
+    return subprocess.run(["git", *args], cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    tip = sys.argv[1]
+    env = dict(os.environ)
+    if "--target-dir" in sys.argv:
+        env["CARGO_TARGET_DIR"] = sys.argv[sys.argv.index("--target-dir") + 1]
+    if os.path.exists(TREE):
+        sys.exit(f"refusing: {TREE} already exists; remove it deliberately or pick another path")
+    os.makedirs(OUT, exist_ok=True)
+    git("worktree", "add", "--detach", TREE, tip, cwd=REPO)
+    summary = []
+    try:
+        for name, path, old, new, targets, expected, expect in MUTANTS:
+            git("checkout", "--", ".", cwd=TREE)
+            if git("status", "--porcelain", cwd=TREE).stdout.strip():
+                raise SystemExit(f"{name}: the throwaway tree is not clean before applying it")
+            full = os.path.join(TREE, path)
+            text = open(full).read()
+            count = text.count(old)
+            if count != 1:
+                summary.append(f"{name} PATTERN-MISMATCH ({count} matches) expect={expect}")
+                continue
+            open(full, "w").write(text.replace(old, new))
+            failed, log = set(), []
+            for target in targets:
+                cmd = ["cargo", "test", *target]
+                try:
+                    r = subprocess.run(cmd, cwd=TREE, env=env, capture_output=True, text=True, timeout=TIMEOUT)
+                    out, rc = r.stdout + r.stderr, r.returncode
+                except subprocess.TimeoutExpired as e:
+                    def text_of(x):
+                        return x.decode(errors="replace") if isinstance(x, bytes) else (x or "")
+                    out, rc = text_of(e.stdout) + text_of(e.stderr), 124
+                log.append(f"$ {' '.join(cmd)}\nrc={rc}\n{out}")
+                for line in out.splitlines():
+                    m = FAILED_LINE.match(line.strip())
+                    if m:
+                        failed.add(m.group(1))
+                if "error[E" in out or "could not compile" in out:
+                    failed.add("<COMPILE-ERROR>")
+            open(os.path.join(OUT, f"{name}.txt"), "w").write("\n".join(log))
+            if "<COMPILE-ERROR>" in failed:
+                verdict = "COMPILE-ERROR"
+            elif expected:
+                missing = [t for t in expected if t not in failed]
+                verdict = "KILLED" if not missing else f"SURVIVED (not failed: {missing})"
+            else:
+                verdict = "SURVIVED" if not failed else f"KILLED-UNEXPECTEDLY ({sorted(failed)})"
+            summary.append(f"{name} {verdict} expect={expect}")
+    finally:
+        git("worktree", "remove", "--force", TREE, cwd=REPO, check=False)
+        open(os.path.join(OUT, "summary.txt"), "w").write("\n".join(summary) + "\n")
+    print("\n".join(summary))
+
+
+if __name__ == "__main__":
+    main()
