@@ -527,18 +527,14 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
     let cur_primary = primary.root_page_id.load(Ordering::Relaxed);
     let stored_primary = catalog.get_table(table).ok_or(FerroError::KeyNotFound)?.primary_index_root;
     if cur_primary != stored_primary {
-        if let Err(e) = catalog.update_primary_root(table, cur_primary) {
-            first_err = first_err.or(Some(e));
-        }
+        catalog.update_primary_root(table, cur_primary)?; // D230 MUTANT M3
     }
     for handle in secondaries {
         let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
         let col_name = schema.columns[handle.col_index].name.clone();
         let stored = catalog.get_table(table).and_then(|e| e.indexes.iter().find(|i| i.column_name == col_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
-            if let Err(e) = catalog.update_index_root(table, &col_name, cur) {
-                first_err = first_err.or(Some(e));
-            }
+            catalog.update_index_root(table, &col_name, cur)?; // D230 MUTANT M3
         }
     }
     first_err.map_or(Ok(()), Err)
