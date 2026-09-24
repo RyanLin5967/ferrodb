@@ -184,3 +184,108 @@ timeout 14400 target/release/examples/d16_chain_retention 1000 2 fanout,chain,ov
 
 Exit 0 = every guard held and every prediction matched. Exit 1 = guards held, and at least one
 pre-registered prediction did not (a result, printed as `MISMATCH`). Exit 2 = `NOT A RESULT`.
+
+---
+
+## Amendment 1 — 2026-09-24, committed before the harness change it describes
+
+Still quiet mode: nothing has been compiled or run, so no number has been seen.
+
+### A1.1 Correction: `drain_pending()` is NOT a collector production runs
+
+"Fixture" above says the harness runs "`drain_pending()` once more and `collect_orphaned_extents()`
+once — the two collectors production also runs". **That is false for the drain.**
+`git grep -n "\.drain_pending(" -- src/` at `9aa6968` finds callers only inside `reaper.rs`'s
+`#[cfg(test)]` module. Production drains only inside each `reap` (`drain_pending_seeded`). Outside a
+reap it runs just one collector, `collect_orphans_if_due`, from `lease_thread.rs` after the reap
+lock is released. That is the `deferred` residue plus the full `collect_orphaned_extents` scan.
+
+It matters for more than wording. An extra drain run BEFORE the census would clean up after a reap
+that skipped its own drain (the D183 retraction's class), and the retention columns would then read
+0 while the defect was live.
+
+**New order, after each sweep:** `reap_expired` → `collect_orphaned_extents` (production's periodic
+collector; equal to `collect_orphans_if_due`'s work when `deferred` is empty, which new guard G7
+asserts) → G4 → **census (the reported numbers)** → `drain_pending()` as a **probe**. The probe is
+predicted to release 0. A non-zero probe means a reap left reclaimable pages parked. The probe runs
+after the census, so it cannot hide what it finds. The predicted integers do not change: in the
+predicted world the probe releases nothing.
+
+### A1.2 New guards
+
+- **G7:** `TwoTierReaper::deferred_len() == 0` after each sweep's collector: no drain returned early
+  with touched extents left unswept.
+- **G8:** the slot probe (A1.4) could fork.
+- **G0 is now run-level.** A dirty or unknown build stamp makes the whole run NOT A RESULT (exit 2),
+  and every line's tag says `build=DIRTY` or `build=unknown`. The per-cell verdict from G1–G8 and the
+  predictions is still printed. That is what lets a fire-check, which always builds dirty, be read.
+
+### A1.3 D200 does not move any retained-page prediction
+
+D200 (the cascade never releases a detached ancestor's id slot) is fixed on `wall21-reaped-subtree`
+@ `17cbd4c`. It is not on main. The page predictions do not depend on it (READ, `git show 206af08
+1107752`):
+- `release_id` writes a FREE_ID key. Retention is decided by `live_child_in_epoch_range` over CHILD
+  entries, which release does not touch, and a released slot keeps its record, so the drain's
+  `get_raw(owner)` still answers.
+- `extent_is_collectable` treats an owner as gone once its generation moved or it reads `Reaped`.
+  Both held before any release.
+- The fixture never forks after a reap until the slot probe (A1.4), which runs after every census.
+  So no slot is recycled underneath a page count.
+
+### A1.4 Secondary: an id-slot probe (D200 on the depth axis). This binary does not judge it
+
+After sweep 2's census, the harness forks D branches off trunk and counts how many were handed a
+slot id the fixture had used. `fork` takes a free slot before it mints a new id, so the count is the
+number of slots released. It prints as a `slots` line. It is not in the MATCH/MISMATCH verdict,
+because its expected value depends on the tree:
+
+| tree | `chain`, `overwrite` | `fanout` |
+|---|---|---|
+| main lineage without D200 (`9aa6968`) | **1** at every D (only the leaf's own reap releases; D−1 interior slots leak) | **D** |
+| `wall21-reaped-subtree` @ `17cbd4c` (D200) | **D** | **D** |
+
+### A1.5 Cost note, reconciled with wall21
+
+wall21's pre-registered counter covers the three per-reap liveness questions: Θ(D²) span scans for
+the interior sweep, `3·D(D−1)/2`. That is READ from `17cbd4c:tests/wall21_reaped_chain_liveness.rs`.
+The Θ(P·D³) figure above adds the drain's retests. Each reap retests the whole pending log, and
+`lane_wall21_reap_walk.md` §1.3 gives the same Θ(P·D³). It is INFERRED in both lanes. No duration is
+predicted.
+
+### A1.6 Fire-checks: mutants injected INSIDE the measured path
+
+Each mutant is a one-anchor source replacement in the engine, never in the harness. It is applied
+by `bench/d16_chain/firecheck.py`, which refuses a dirty `src/` and any anchor that does not occur
+exactly once, and it is restored from git after every build. Each anchor was checked with
+`git grep -nF` at `9aa6968`: 1 hit each. Harness arguments: `1,3,10 2 fanout,chain,overwrite`.
+D = 3 is the first depth at which the D16 pin, rather than the ordinary rule, holds a page.
+
+Expected per-cell verdict (`M` = MISMATCH with exactly these keys; `N` = NOT A RESULT with exactly
+these guard ids; `=` = MATCH):
+
+| # | mutant (file, anchor) | what it removes | `fanout` | `chain` and `overwrite` |
+|---|---|---|---|---|
+| M0 | none, clean build | — | = | = (and exit 0) |
+| M1 | `table_catalog.rs` `live_child_at`: the D16 arm's guard → `if false` | **the pin** (red arm) | = | D=1 `=`; D=3,10 **M** retained_pages, retained_reserved, retained_extents, pending (b(D−1)'s P pages only) |
+| M2 | `reaper.rs` `reap`: `drain_pending_seeded(own_arenas)` dropped | **a reap's own drain** (control a; D183's class) | = | D=1 `=`; D=3,10 **M** after_leaf_pages, after_leaf_reserved, after_leaf_extents, after_leaf_pending, after_leaf_drain |
+| M3 | `reaper.rs` `reap` fast path: `free_arena` dropped | **the fast path's free** (control b) | D=1 **M** after_leaf_pages, after_leaf_reserved, after_leaf_extents; D=3,10 **M** retained_pages, retained_reserved, retained_extents, after_leaf_pages, after_leaf_reserved, after_leaf_extents | every D **M** after_leaf_pages, after_leaf_reserved, after_leaf_extents |
+| M4 | `arena.rs` `release_page`: `live_pages.fetch_sub(1)` dropped | the net counter's decrement (G2) | = | D=1 `=`; D=3,10 **N** G2 |
+| M5 | `arena.rs` `cow_page`: the in-place test → `if true` | the copy (G6, G1) | = | `chain` = ; `overwrite` D=1 `=`, D=3,10 **N** G1, G6 |
+| M6 | `reaper.rs` `reap_expired`: `candidates` → `.skip(1)` | one reap per sweep (G3, G4) | D=1 **N** G3; D=3,10 **N** G3, G4 | D=1 **N** G3; D=3,10 **N** G3, G4 |
+| M7 | `reaper.rs` `drain_pending_seeded`: `guard.swept = true` dropped | the drain's disarm (G7) | **N** G7 | **N** G7 |
+
+Plus A0 on the clean build: an unparsable argument (`1,x`) must print `NOT A RESULT` and exit 2.
+
+A mutant whose cells differ from its row has not fired as registered. Report the difference; do not
+re-register it. Guards not fire-checked here, stated as blind spots: G5 (a page owned by a branch the
+fixture never made) and G8.
+
+### A1.7 Run commands, superseding "Run" above
+
+```
+cargo build --release --example d16_chain_retention
+timeout 1800 target/release/examples/d16_chain_retention 1,10,100 2 fanout,chain,overwrite
+timeout 14400 target/release/examples/d16_chain_retention 1000 2 fanout,chain,overwrite
+timeout 7200 python3 bench/d16_chain/firecheck.py
+```
