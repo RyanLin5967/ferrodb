@@ -41,7 +41,8 @@
 //!
 //! - **The first lookup, on a cold pool.** `read_leaf_for` tries the lock-free descent first, and
 //!   that reads only pages already in the buffer pool (`read_page_optimistic` returns `None`
-//!   otherwise). D's pool is fresh, so all 16 restarts miss and the latched descent answers. It
+//!   otherwise). No index page is in D's pool yet (the open reads the catalog, and T2's `ANALYZE`
+//!   reads only the heap), so all 16 restarts miss and the latched descent answers. It
 //!   stops at the first leaf it reaches, the stale root, and does NOT walk right. The scan opens at
 //!   the end of the left leaf, follows `next`, and yields every key from the right leaf's first up
 //!   to the one asked for, because nothing re-checks an inclusive lower bound. `id = 369` answers
