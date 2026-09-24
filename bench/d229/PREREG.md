@@ -96,3 +96,34 @@ here the durable catalog does). GREEN at the tip is now **13 run, 13 passed** fo
 New mutant **M12**: the intent is marked decided before the mutation's result is looked at; killed by that test (the
 checkpoint after the failed DROP frees pages the catalog still names). **The GREEN phase and mutant base is `6b70bbf`.**
 Everything else is unchanged; 11 expressions, one site each, at `6b70bbf` (PATTERNS_ONLY).
+
+**Amendment 3 (after the D250 merge `4d37508`).** `4d37508` merges `d250-drop-logged` @ `7869d4f` (on #16 @ `2c10f17`).
+D250 is the one mechanism for DROP under a retained log. It makes the `DropTable` record durable before the mutation,
+has recovery skip a dropped heap's records, poisons the log when the mutation fails after the record, and has the next
+open complete a logged DROP. It also retires #16's pin refusal, pin fence and owed-elsewhere refusal. Resolved as:
+- `drop_checkpointed(record, pages, f)`. The executor collects `table_pages` before the barrier. The intent is recorded
+  BEFORE the `DropTable` record, so every crash state that has the record also has the intent, and a DROP the next open
+  completes frees its pages. That closes D250's stated leak. `DropPages` is gone.
+- `open_recovered` completes logged DROPs (D250), then decides intents by that catalog (D229).
+- The frees run once, right after the checkpoint's sync, whatever happens to the truncation. `forget_dropped_table` is
+  `drop_table`. `record_free_intent` supersedes an undecided intent for the same table.
+
+**Tests that assumed the parent's refusals: none of D229's.** R2's pin is a PAGE pin (`fetch_page`), not a WAL pin;
+no test relied on the owed-elsewhere refusal. **Restated:** `a_drop_whose_mutation_fails_after_naming_its_pages_frees_none_of_them`
+asserted the table survives a DROP whose mutation fails; under D250 the next open completes that DROP. It is now
+`a_drop_whose_mutation_fails_frees_nothing_until_the_next_open_completes_it`. In the failing process it asserts: nothing
+freed, the checkpoint refused (poisoned log), the intent present. After the next open it asserts: `t` absent, none of
+its pages allocated unless reached, the intent gone. **R1 is now a joint D229 + D250 test:** the frees run before the
+truncate, so at crash #1 `t`'s pages are already free while the log still names them, and opens #2 and #3 stay correct
+because D250's recovery skips those records.
+
+D250's two `drop_checkpointed` test call sites (`txn.rs` review-4 finding-4 test, `recovery.rs` failed-mutation test)
+pass the pages argument; their assertions are unchanged.
+
+**Mutants M3 and M12 are RETIRED as equivalent by construction.** M3 (free before the checkpoint): the `DropTable` record
+is durable before the mutation, so a crash before the unlink is durable is completed by the next open, and the early
+free aliases nothing. M12 (decide before the mutation's result): a failed mutation poisons the log, so no checkpoint,
+and therefore no in-process free, can follow. D229 (a)'s free-after-durable-unlink ordering is now a second guard behind
+D250's completion: recorded as a finding, not removed. `lane_d229_run.sh` carries 9 mutants (M1, M2, M4-M7, M9-M11), one
+site each at `4d37508`. GREEN: `wal::recovery::tests_crash_frees::` **13 run, 13 passed**, predicted. **The GREEN phase
+and mutant base is `4d37508`**; `src/` at this amendment's commit is identical to it.
