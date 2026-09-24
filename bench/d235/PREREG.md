@@ -159,3 +159,48 @@ M7  src/branch/record.rs            (the walk ignores incarnations)
 
 - `--test d235_rebuild_keeps_d16_pins`: **3 passed**.
 - per-target suite: **2579 + 10 = 2589 passed, 0 failed** (3 integration + 7 unit).
+
+---
+
+## Amendment 3 — 2026-09-24, after a type-pass review of `cc13461..19265ff`; before the change
+
+Nothing compiled or run. The review found no type error, and traced the new test at `9aa6968`,
+`6589552` and `19265ff` exactly as amendment 2 registers it. Changes:
+
+- **Amendment 2's M5 cell was wrong.** Under M5 the new test also goes RED, at its migration arm.
+  M5 attaches N's stale edge under Q, and it resolves through N's slot → X (Reaped) → C (Live).
+- **The new test's premise "X still pins C" was mislabelled.** That is C's own entry under X, not
+  a D16 pin, and it holds at the base too.
+- **The test did not assert the pin the tip deliberately keeps:** X's entry under P's OLD slot,
+  which N now occupies. Pages old P parked are judged by slot id (`record::parent_entry_holders`'
+  doc). Without that assertion the test could not tell "the walk stopped at the recycled slot"
+  from "the walk never ran". It now asserts `has_live_children(P's slot)` and
+  `max_live_child(P's slot) == Some(X's fork epoch)` in both arms, BEFORE the Q claim. That makes
+  the test **FAIL at the base too, at a different line**: the base rule never derives X's entry.
+- **The D201 citation is made explicit** (SCALE-LEDGER D201, `runtime.rs`'s reaper-less `seal`).
+
+### The new test at each tree (supersedes amendment 2's table)
+
+| tree | expected first failure |
+|---|---|
+| `9aa6968` | **FAIL**, log arm: `X's entry must stay under P's old slot` (the base rule drops every reaped record's entry) |
+| `6589552` | **FAIL**, log arm: `Q reads as having a live child` (the over-pin assertion passes first) |
+| tip | **PASS** |
+
+### Every mutant against every D235 test at the tip (supersedes the mutant cells of amendments 1 and 2)
+
+T1 = `a_log_catalog_reopen_keeps_the_pin_of_a_reaped_interior` (with its table control), T2 = the
+migration-equivalence test, T3 = `a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant`,
+U = `record::d235_parent_entry_holders` (7 tests), R = `branch::catalog::tests::live_children_is_derived_at_replay_and_excludes_reaped_children`.
+
+| # | T1 log (control stays green) | T2 | T3 | U | R |
+|---|---|---|---|---|---|
+| M1 no walk | RED | RED | RED, log arm, over-pin | 6 red, 1 green | green |
+| M2 skip in `index` | RED | green | RED, log arm, over-pin | green | green |
+| M3 skip in `migrate_from` | green | RED | RED, migration arm, over-pin | green | green |
+| M4 only `Live` holds | green | RED (window on `held`) | green | 1 red (Quarantined/Reaping) | green |
+| M5 `migrate_from` attaches all | green | RED (post-fork probe at spare's epoch) | RED, migration arm, `Q reads as having a live child` | green | green |
+| M6 `index` derives all | green | green | green (Q is cleared: N is no holder) | green | **RED** |
+| M7 walk ignores incarnations | green | green | RED, log arm, `Q reads as having a live child` | 1 red (recycled slot) | green |
+
+Counts are unchanged: `--test d235_rebuild_keeps_d16_pins` 3 passed; per-target 2589.
