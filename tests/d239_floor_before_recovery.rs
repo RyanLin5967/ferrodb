@@ -164,9 +164,9 @@ fn code_of(path: &str) -> String {
 ///
 /// `tests/open_path_allowlist.rs` keeps every binary on `wal::recovery::open_recovered` and keeps
 /// `recover(` out of everything else, so pinning the order inside that one body pins it for the
-/// CLI, pgserver, `table_dump` and `crash_mid_merge` alike. pgserver never rebuilds, so the binary
-/// test above cannot reach it: its exposure is recovery's own allocation (`add_to_directory` takes
-/// a new page when a directory page is full).
+/// CLI, pgserver, `table_dump` and `crash_mid_merge` alike. The binary test above drives only the
+/// CLI, and only through the rebuild; recovery's own allocation (`add_to_directory` takes a new
+/// page when a directory page is full) is the other way in, and this order covers both.
 ///
 /// The body is cut the way the allowlist cuts it: from `pub fn open_recovered(` to the first `}` at
 /// column 0 after it.

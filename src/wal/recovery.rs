@@ -330,6 +330,11 @@ pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
 pub struct BootTimings {
     /// The file, the buffer pool, the WAL and the transaction manager.
     pub files: Duration,
+    /// **D239.** Reading `{db}.arena` and registering the arena region before recovery. Kept out
+    /// of `files`, whose steps do not grow with the database: this reads and checksums the whole
+    /// arena image, O(arena extents), the same read the arena store's reopen repeats after this
+    /// returns. Near zero when there is no arena checkpoint.
+    pub floor: Duration,
     /// [`recover`]: redo and undo of the heap records.
     pub recover: Duration,
     /// `Catalog::open`, or `Catalog::create` for a new file.
@@ -411,17 +416,20 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // this returns, and until a region is registered every arena page reads as free to the page
     // allocator, because arena pages never set bitmap bits. Recovery's directory repair and the
     // rebuild below both allocate, and a rebuild that outgrew a full table region was handed arena
-    // pages and wrote over live branch data. See `ArenaPageStore::reserve_persisted_floor`.
+    // pages and wrote over live branch data. See `ArenaPageStore::reserve_persisted_floor`. Timed
+    // apart from `files` (see [`BootTimings::floor`]).
+    let floor = Instant::now();
     let mut arena_path = db_path.as_os_str().to_os_string();
     arena_path.push(".arena");
     ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
+    timings.floor = floor.elapsed();
     let bp = Arc::new(BufferPoolManager::new(dm));
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push(".wal");
     let wal = Arc::new(WalManager::new(PathBuf::from(wal_path))?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
-    timings.files = t.elapsed();
+    timings.files = t.elapsed().saturating_sub(timings.floor);
     let t = Instant::now();
     let recovered = recover(&txn)?;
     timings.recover = t.elapsed();
