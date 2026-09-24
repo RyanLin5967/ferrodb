@@ -1891,6 +1891,8 @@ pub struct TransportCounters {
     pub unauthenticated: u64,
     pub unencodable: u64,
     pub unaddressable: u64,
+    pub idle_probes: u64,
+    pub idle_redials: u64,
     pub live_inbound_conns: usize,
     pub inbox_bytes: usize,
 }
@@ -1913,6 +1915,8 @@ impl Transport {
             unauthenticated: self.unauthenticated(),
             unencodable: self.unencodable(),
             unaddressable: self.unaddressable(),
+            idle_probes: self.idle_probes(),
+            idle_redials: self.idle_redials(),
             live_inbound_conns: self.live_inbound_conns(),
             inbox_bytes: self.inbox_bytes(),
         }
