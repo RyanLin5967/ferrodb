@@ -5040,7 +5040,29 @@ impl AgentRuntime {
         // disk before the publish begins; the publish loop's ride `record_applied`'s row authorship,
         // the merge's final durable write. `provenance.flush()` after it covers anything left, and
         // the guard's `Drop` covers every early return. So a merge syncs the provenance file once,
-        // plus once per altered table whose rewrite moved an attributed row.
+        // plus once per altered table whose rewrite moved an attributed row, plus, for a branch
+        // whose `BEGIN` has not completed, the one sync that makes its run's record durable first
+        // (D246 A3, above).
+        // **D246 A3: the run's provenance record is durable BEFORE the log is told the run exists.**
+        //
+        // `bind_run` below declares this run's slot to the WAL, and the publish commit makes that
+        // declaration durable. Until D246 §6.1 the provenance file always had the run by then,
+        // because `intern` synced it at `BEGIN`. Now a fork's run record is pending until the
+        // fork's `complete()`, and pgwire releases the catalog guard before calling it, so another
+        // connection can MERGE `b_N` inside that window. Without this line, that merge would commit
+        // the slot to the log and write the run record only in the provenance sync after the
+        // commit. A crash between the two leaves the log declaring a slot the reopened store
+        // issues again to the next new run: D246's defect by another door.
+        //
+        // HERE, in the plan phase, because it can refuse (a store refusing writes, or the run's
+        // sync failing): after the schema apply below, a refusal returned `Err` with the branch's
+        // edits installed and logged (A4, review D-2). For every run whose `BEGIN` completed,
+        // which is every ordinary merge, it is a map lookup under the provenance store's lock and
+        // touches no disk. Only a merge inside that window waits on a disk, and that wait is the
+        // one the invariant requires.
+        if !snapshot.prov.is_none() {
+            self.provenance().await_run(snapshot.prov)?;
+        }
         let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
         let prov = Arc::clone(provenance.stamper());
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
@@ -5146,25 +5168,6 @@ impl AgentRuntime {
             for record in records {
                 ctx.txn.log_ddl(record)?;
             }
-        }
-
-        // **D246 A3: the run's provenance record is durable BEFORE the log is told the run exists.**
-        //
-        // `bind_run` below declares this run's slot to the WAL, and the publish commit makes that
-        // declaration durable. Until D246 §6.1 the provenance file always had the run by then,
-        // because `intern` synced it at `BEGIN`. Now a fork's run record is pending until the
-        // fork's `complete()`, and pgwire releases the catalog guard before calling it, so another
-        // connection can MERGE `b_N` inside that window. Without this line, that merge would commit
-        // the slot to the log and write the run record only in the provenance sync after the
-        // commit. A crash between the two leaves the log declaring a slot the reopened store
-        // issues again to the next new run: D246's defect by another door.
-        //
-        // Placed before the reservation so a refusal leaks nothing. For every run whose `BEGIN`
-        // completed, which is every ordinary merge, it is a map lookup under the provenance
-        // store's lock and touches no disk. Only a merge inside that window waits on a disk,
-        // and that wait is the one the invariant requires.
-        if !snapshot.prov.is_none() {
-            self.provenance().await_run(snapshot.prov)?;
         }
 
         // **Reserve the version sequence BEFORE the rows become visible.**
@@ -7610,5 +7613,26 @@ mod tests {
              refused statement changed the target's schema and logged it to the change feed"
         );
         drop(f.fork.take());
+    }
+
+    /// **R4 (A4, D-5): a fork whose completion fails closes the session it opened.** Dispatch
+    /// installs the session before the caller completes the fork, so a failed `complete()?` used
+    /// to return `Err` for the `BEGIN` while the connection stayed inside that very session.
+    #[test]
+    fn a_failed_completion_closes_the_session_it_opened() {
+        let mut f = uncompleted_fork();
+        f.durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut agent = Some(f.session.clone());
+        let err = f
+            .fork
+            .take()
+            .expect("the staged fork")
+            .complete_for(&mut agent)
+            .expect_err("the injected provenance failure was swallowed");
+        assert!(format!("{err}").contains("injected provenance append failure"), "{err}");
+        assert!(
+            agent.is_none(),
+            "a BEGIN whose sync failed left the connection inside the session it refused"
+        );
     }
 }

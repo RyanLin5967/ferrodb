@@ -341,7 +341,9 @@ pub struct SyncCounts {
 
 impl SyncCounts {
     /// Every sync issued, whatever it carried: each is booked under exactly one field. D219's exit
-    /// — one sync per MERGE, physical and logical together — is stated in this number.
+    /// — one sync per MERGE, physical and logical together — is stated in this number. (A MERGE of
+    /// a branch whose `BEGIN` has not completed adds the one sync that makes its run's record
+    /// durable before the log names the run, D246 A3.)
     pub fn total(&self) -> u64 {
         self.runs + self.stamps + self.row_authors + self.forgets
     }

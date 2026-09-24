@@ -153,7 +153,7 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
     let mut pending = None;
     let outcome = run_staged(stmt, catalog, bp, txn, session, &mut pending);
     if let Some(d) = pending {
-        d.complete()?;
+        d.complete_for(&mut session.agent)?;
     }
     outcome
 }

@@ -503,9 +503,10 @@ impl DurableProvenanceStore {
     /// **Synchronous on every call, deliberately.** The whole claim of this module is that a stamp
     /// survives the process that made it; a buffered write that has not reached the disk survives
     /// a clean exit and nothing else, and the difference is invisible until the crash that matters.
-    /// The cost is one fsync per append — per interned run, per stamped version, per forget, per
-    /// BATCH of row authorship, and per flush of pending stamps (D219) — which is the price of the
-    /// guarantee rather than an oversight.
+    /// The cost is one fsync per append — per run interned by `intern`, per stamped version, per
+    /// forget, per BATCH of row authorship, and per flush of pending stamps (D219) — which is the
+    /// price of the guarantee rather than an oversight. A fork's run is the exception since D246: it
+    /// is interned pending and synced by `await_run`, group-committed outside the lock.
     ///
     /// `issued_by` is the counter of the write path that issued the sync; see [`SyncCounters`].
     fn append_locked(
@@ -605,11 +606,6 @@ impl DurableProvenanceStore {
     /// The group sync behind `await_run`, issued by `CommitGroup::wait_durable`'s leader OUTSIDE the
     /// file lock, and booked under `runs`: everything `await_run` writes is run records.
     fn sync_runs(&self) -> Result<(), FerroError> {
-        // A store that has refused a write does not vouch for anything written since, and a failed
-        // fsync is NOT retried by the next waiter the group makes leader: a second fsync can report
-        // success for pages the kernel already dropped after the first failed. So every waiter is
-        // refused instead.
-        self.refuse_if_poisoned()?;
         #[cfg(test)]
         {
             let gate = self.sync_gate.lock().unwrap().take();
@@ -623,7 +619,21 @@ impl DurableProvenanceStore {
             return Err(FerroError::Provenance(format!("sync {}: {e}", self.path.display())));
         }
         self.syncs.runs.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        // **Checked AFTER the fsync, under the file lock (A4, review D-1).** `sync_handle` shares
+        // one open file description with the append descriptor, so on Linux an fsync error is
+        // reported to whichever of them syncs first, once: an in-lock writer whose own fsync failed
+        // can consume the error for pages this leader's records were in, and this fsync then
+        // returns 0. Every in-lock writer holds the lock from its fsync to its `poisoned.store`,
+        // so once this lock is taken, any error that writer consumed is visible here. The same
+        // check refuses a follower the group makes leader after a failed sync, rather than trust a
+        // second fsync the kernel may answer with success for pages it already dropped.
+        let _file = self.file.lock().map_err(|_| {
+            FerroError::Provenance(format!(
+                "{}: the provenance lock was poisoned by a panicking writer; refusing to sync",
+                self.path.display()
+            ))
+        })?;
+        self.refuse_if_poisoned()
     }
 
     /// `intern` and `intern_pending` as far as the record: the in-memory intern, and the new run's
@@ -873,7 +883,9 @@ impl ProvenanceStore for DurableProvenanceStore {
     /// "nothing pending, nothing to do" true for the stamps it answers for. The records ahead of
     /// this run's are written here only while they are all run records, which is every case the
     /// SQL shapes produce: a MERGE queues its stamps under the catalog guard and makes them durable
-    /// before releasing it, so no stamp is pending when a fork completes behind the guard. When a
+    /// before releasing it (its `ProvenanceFlush` on every exit, and a plain ALTER flushes what it
+    /// queued even when a restamp is refused, A4), so no stamp is pending when a fork completes
+    /// behind the guard. When a
     /// stamp IS queued ahead (the embedded API, with no guard serialising writers), the pending
     /// records are written and synced here under the lock instead, as any other append would.
     fn await_run(&self, id: ProvId) -> Result<(), FerroError> {
@@ -886,13 +898,17 @@ impl ProvenanceStore for DurableProvenanceStore {
                     self.path.display()
                 ))
             })?;
+            // A store refusing writes vouches for no run through this call (A4, review D-3e and
+            // N-9): it must not append a record after a failed append, and a run it holds no
+            // number for may be one whose synchronous `intern` failed, in the index and not in the
+            // file. Refusing here matches `intern`, which refused on a poisoned store before D246.
+            self.refuse_if_poisoned()?;
             let Some(&seq) = file.run_seqs.get(&id) else {
                 // Interned by `intern`, recovered from the file, or already seen durable here.
                 return Ok(());
             };
             let written = file.queued - file.pending.len() as u64;
             if seq > written {
-                self.refuse_if_poisoned()?;
                 let runs_ahead =
                     file.pending.iter().take_while(|b| b.first() == Some(&TAG_RUN)).count();
                 if runs_ahead as u64 >= seq - written {

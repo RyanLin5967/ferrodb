@@ -419,7 +419,7 @@ impl Statement {
                             // has landed in the pool: dropping it on this statement's error path
                             // would leave those pages unsynced.
                             if let Some(d) = pending {
-                                d.complete()?;
+                                d.complete_for(&mut session.agent)?;
                             }
                             ran?
                         }

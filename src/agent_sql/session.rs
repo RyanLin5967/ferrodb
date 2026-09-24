@@ -110,6 +110,22 @@ impl ForkDurability {
         };
         forked.and(interned)
     }
+
+    /// `complete()`, for the statement that has just opened `agent` on this fork
+    /// (`BEGIN AGENT SESSION`): when the sync fails, the session is closed as well as the statement
+    /// refused.
+    ///
+    /// Dispatch installs the session before any caller can complete the fork, so a failed
+    /// `complete()?` left the connection inside a session whose `BEGIN` it had just refused, and a
+    /// retried `BEGIN` was then refused as nested (D246 A4, review D-5). The branch itself is left
+    /// to its lease, as a disconnected client's is.
+    pub fn complete_for(self, agent: &mut Option<AgentSession>) -> Result<(), FerroError> {
+        let completed = self.complete();
+        if completed.is_err() {
+            *agent = None;
+        }
+        completed
+    }
 }
 
 impl Drop for ForkDurability {
@@ -125,8 +141,9 @@ impl Drop for ForkDurability {
         // D246: the run's record, discharged the same way. [`fallback_syncs`] counts only the
         // fork's ticket, which every staged fork on a table catalog carries, so a forgotten
         // `complete()` there is counted once. On a catalog that does not split (no ticket) this
-        // await is not counted. `await_run` refuses a poisoned file lock rather than panicking
-        // on it, so this is safe during unwinding.
+        // await is not counted. `await_run` refuses a poisoned file lock rather than panicking on
+        // it; the only unwraps left on this path are `CommitGroup`'s, on a mutex no code panics
+        // while holding.
         if let Some((store, prov)) = self.run.take() {
             let _ = store.await_run(prov);
         }

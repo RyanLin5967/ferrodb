@@ -533,7 +533,7 @@ pub fn run_agent_stmt(
     // already landed in the buffer pool, so a later failure in this statement does not un-fork it.
     // Dropping the ticket instead would leave those pages unsynced and trip the `Drop` assertion.
     if let Some(d) = pending {
-        d.complete()?;
+        d.complete_for(&mut session.agent)?;
     }
     outcome
 }

@@ -753,10 +753,14 @@ impl Catalog {
         // callers log only on `Ok`), the environmental class of the heap flush that follows.
         if let Some(store) = &prov {
             if !moved.is_empty() {
-                for (rid, who) in &moved {
-                    store.stamp_pending(*rid, *who)?;
-                }
-                store.flush()?;
+                // A restamp refused part-way (a page dictionary at its cap) still writes the stamps
+                // queued before it: the table IS altered by now, and a plain ALTER hands this the
+                // raw store, with no `ProvenanceFlush` guard to write them on the early return
+                // (D246 A4, review N-5). The refusal is what is returned.
+                let queued =
+                    moved.iter().try_for_each(|(rid, who)| store.stamp_pending(*rid, *who));
+                let flushed = store.flush();
+                queued.and(flushed)?;
             }
         }
         Ok(shapes[1..].iter().map(shape_of).collect())
