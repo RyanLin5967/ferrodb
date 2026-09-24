@@ -445,6 +445,16 @@ impl FeedStreamer {
         // are lost under a clean report
         // (`a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it`,
         // `every_commit_a_refusal_holds_back_keeps_its_rows`).
+        //
+        // Over EVERY decoded event, excluded and snapshot-suppressed ones included (review 4's
+        // second finding, kept on the lead's option): clamping over deliverable events only would let
+        // the cursor pass the excluded rows of a held-back commit, and an amendment publishing that
+        // table would then replay it torn. The edge that remains, stated: an excluded commit BELOW
+        // the refused one whose rows straddle this cursor is re-read in part, and if an amendment has
+        // published its table and no later delivered commit moved `emitted_through` past it, it is
+        // delivered with only its later rows. The `open_from` clamp had the same exposure. A
+        // watermark of everything decided about, filtering replays in place of `emitted_through`,
+        // would close it (lane report §9 (E)(2)).
         let refused_from = refused_commit
             .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());
         let next = refused_from.map_or(next, |first| next.min(first));
