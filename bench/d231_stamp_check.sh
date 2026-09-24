@@ -4,8 +4,8 @@
 # FAN WORK: this builds ferrodb (twice from scratch, then incrementally). Queue it; never run it
 # under quiet mode. Run it once per commit under test, the D231 base and the D231 tip:
 #
-#     bench/d231_stamp_check.sh 9aa6968        # expected RED: 27-35 PASS, exit 1
-#     bench/d231_stamp_check.sh <d231 tip>     # expected GREEN: 50 PASS, exit 0
+#     bench/d231_stamp_check.sh 9aa6968        # expected RED: 32-41 PASS, exit 1
+#     bench/d231_stamp_check.sh <d231 tip>     # expected GREEN: 64 PASS, exit 0
 #
 # THE PRE-REGISTRATION IS bench/d231_PREREG.md (its latest amendment): the per-step outcome at both
 # commits, which base steps may flip with timing and in which direction, the mutant kill map, and
@@ -25,7 +25,8 @@
 #   rerun=yes|no   whether this build rewrote the build script's `output` file, i.e. re-stamped;
 #   lib_fresh      cargo's own `fresh` flag for the ferrodb lib, from --message-format=json.
 # A step PASSES only if the printed stamp AND `rerun` are both what the step expects, and, for
-# steps 5, 7, 23 and 24, the files git touched are exactly the ones the step exists to isolate.
+# steps 5, 7, 23, 24, 26 and 28, the files git touched are exactly the ones the step exists to
+# isolate.
 # Every build gets one line:
 #   D231 commit=<sha12> arm=<clone|linked> step=<n-name> expect="<stamp>" got="<stamp>"
 #        stamp_ok=<y|n> expect_rerun=<yes|no> rerun=<yes|no> [witness...] lib_fresh=<true|false>
@@ -39,8 +40,10 @@
 # checkout, `reset --hard`, `checkout --`) makes that write-back produce an index with nothing
 # racy, so exactly ONE later build shows it, the SETTLE step, and the step after that starts
 # clean at both commits. The tip never writes the index, so the sleeps change nothing there.
-# The harness's own `git status` calls all pass `--no-optional-locks`, so it never writes the
-# index either.
+# The harness's own read-only questions never write the index either: its `git status` calls pass
+# `--no-optional-locks`, and step 25's `write-tree`, which rewrites the index it reads even with
+# that flag (review 4, MEASURED), runs on a COPY of the index. The index is written only by the
+# git operations that ARE a step's change (add, commit, reset, checkout, update-index).
 #
 # STEPS, per arm. Q0 is a second commit with S0's exact tree; foreign.git's HEAD is <commit>^;
 # $first is the arm's first branch (d231-probe, or d231-probe-linked).
@@ -77,12 +80,26 @@
 #   25 replace             `git replace Q0 X`, X = a commit of the current
 #                          index tree (so honouring the replacement reads
 #                          clean), index touched; `replace -d` after      at Q0 +DIRTY   yes
+#   26 unrelated-packed-ref an UNRELATED packed ref deleted (packed-refs
+#                          rewritten); witness: only packed-refs moved    at Q0 +DIRTY   NO
+#   27 chain-three-links   symref link2 -> link; HEAD -> link2             at Q0 +DIRTY   yes
+#   28 third-link          `git update-ref $first S0`: the chain's THIRD
+#                          link; witness: only $first's file moved        at S0 +DIRTY   yes
+#   29 status-fails        status.aheadBehind=bogus (fails `git status`
+#                          only), index touched; unset after              at unknown +DIRTY yes
+#   30 status-recovers     index touched                                  at S0 +DIRTY   yes
+#   31 assume-unchanged    src/lib.rs edited, then marked assume-unchanged
+#                          (status hides it); cleared and restored after at unknown +DIRTY yes
+#   32 export-inside-      `git archive S0` into the checkout's ignored
+#      checkout            target/d231-export/, built there               at unknown +DIRTY yes
 #
 # WHICH STEP KILLS WHICH MUTANT OF build.rs (each removal fails at least the steps named):
 #   HEAD watch 7, 22 · index watch 6, 19, 25 · every link 5, 23, 24 · links past the first
 #   (`links.len() < 1`) 24 · a recursive `symbolic-ref -q HEAD` 23 · src/ 3 · examples/ 10 ·
 #   tests/ 13 · Cargo.toml 16 · INPUTS = ["src","benches","build.rs"] 10, 13, 16 · env clearing 6
-#   · --no-optional-locks 2, 9, 12, 15, 18, 21 · --no-replace-objects 25.
+#   · --no-optional-locks 2, 9, 12, 15, 18, 21 · --no-replace-objects 25 · packed-refs watched 26
+#   · links.len() < 2 28 · a failed status keeping the sha 29 · no index-bit check 31 · no
+#   --show-toplevel check 32.
 #   ⚠ SHARED INFERRED PREMISE: the Cargo.toml kill (step 16 at the tip) and base clone step 16's
 #   FAIL both rest on cargo NOT re-running a rerun-if-changed script when only a comment is
 #   appended to Cargo.toml. Base clone step 16 is its only measurement: if it comes out PASS with
@@ -90,27 +107,33 @@
 #   NOT EXERCISED by any step: Cargo.lock (cargo may rewrite a lock it did not write); benches/
 #   (absent); the reftable directories (ferrodb uses the files store); the fallback for a git
 #   without `--no-recurse`; the refusal when git does not answer one absolute path per question;
-#   the depth cap (git resolves 4 links and refuses 5; the walk collects at most 5).
+#   the depth cap (git resolves 4 links and refuses 5; the walk collects at most 5); the
+#   skip-worktree tag and core.ignoreStat (step 31 exercises assume-unchanged only); the N6
+#   re-read of the sha (no step can move HEAD inside one script run); core.preferSymlinkRefs, a
+#   known limit (review 4, N7).
 #
-# PRE-REGISTERED (bench/d231_PREREG.md, amendment 1): 2 arms x 25 steps = 50 verdicts.
-#   AT THE D231 TIP: 50 PASS, exit 0. No step depends on timing.
-#   AT 9aa6968: nominally 27 PASS / 23 FAIL, exit 1.
-#     clone  PASS 1 4 7 8 11 14 17 19 20 22;   FAIL 2 3 5 6 9 10 12 13 15 16 18 21 23 24 25
-#     linked PASS 1 3 4 5 7 8 10 11 13 14 16 17 19 20 22 23 24;   FAIL 2 6 9 12 15 18 21 25
+# PRE-REGISTERED (bench/d231_PREREG.md, amendments 1, 2 and 2a): 2 arms x 32 steps = 64 verdicts.
+#   AT THE D231 TIP: 64 PASS, exit 0. No step depends on timing.
+#   AT 9aa6968: nominally 32 PASS / 32 FAIL, exit 1.
+#     clone  PASS 1 4 7 8 11 14 17 19 20 22 27 30
+#            FAIL 2 3 5 6 9 10 12 13 15 16 18 21 23 24 25 26 28 29 31 32
+#     linked PASS 1 3 4 5 7 8 10 11 13 14 16 17 19 20 22 23 24 27 28 30
+#            FAIL 2 6 9 12 15 18 21 25 26 29 31 32
 #   TIMING-DEPENDENT base steps, and the only flips allowed:
 #     clone 2, 9, 12, 15, 18  FAIL->PASS with rerun=no, only if the preceding git operation's file
 #                             writes and index write straddled a second boundary;
-#     clone 5, 23, 24         FAIL->PASS with rerun=yes, only if the preceding builds took under
+#     clone 5, 23, 24, 28     FAIL->PASS with rerun=yes, only if the preceding builds took under
 #                             about 1 s (each recompiles the lib, so INFERRED improbable).
-#   So a base run gives PASS 27..35, FAIL 15..23, exit 1; any other deviation is a MISMATCH.
+#   So a base run gives PASS 32..41, FAIL 23..32, exit 1; any other deviation is a MISMATCH.
 #
-# EXIT: 0 only if FAIL is 0 AND PASS is exactly 50; 1 any FAIL; 2 the harness could not measure:
+# EXIT: 0 only if FAIL is 0 AND PASS is exactly 64; 1 any FAIL; 2 the harness could not measure:
 # a build failed; the probe printed something that is not a stamp; cargo emitted no
 # build-script-executed message for ferrodb (the Cargo book says it is emitted even when the
 # script does not run); the script's `output` was missing before or after a build; a witnessed
 # file was missing before or after its git operation; one of the harness's own edits did not take
 # (an append `git status` cannot see, a restore it still sees, a `touch` that did not move the
-# mtime); a git operation or sha lookup failed; or other than 50 verdicts were reached. A run that
+# mtime); a git operation, a `git status` or a sha lookup failed; a step's premise did not hold
+# (steps 25, 26, 29, 31 and 32 assert theirs); or other than 64 verdicts were reached. A run that
 # collected nothing has not passed, so 2 is never folded into 0 or 1.
 #
 # EVIDENCE: every D231 line is also written to $WORK/d231-result-<sha12>.txt, and each step's
@@ -156,12 +179,13 @@ PARSE=$WORK/d231_parse.py
 RESULT=$WORK/d231-result-$SHA12.txt
 PASS=0
 FAIL=0
-EXPECTED_VERDICTS=50
+EXPECTED_VERDICTS=64
 # What build_provenance() prints: `at <sha, 12 or more hex|unknown>`, then ` +DIRTY (...)`.
 STAMP_RE='^at ([0-9a-f]{12,}|unknown)( \+DIRTY .*)?$'
 # Set by `witness`, consumed and cleared by the next `check`.
 WITNESS_NOTE=""
 WITNESS_OK=y
+OUTKEY=""
 SNAP_F=()
 SNAP_M=()
 
@@ -216,14 +240,34 @@ sha12() {
 # The harness's own edits, each checked to have taken before anything is built on it: an edit
 # that silently failed would otherwise be scored, and at the base a no-op edit reproduces exactly
 # the FAILs the PREREG predicts.
-porcelain() { git -C "$1" --no-optional-locks status --porcelain --untracked-files=no -- "$2"; }
+# st <var> <checkout> [git flag...] [-- <path>]: `git status --porcelain` into <var>. A git error
+# exits 2: a failing status prints nothing on stdout, and nothing reads exactly like "clean".
+st() {
+  local var=$1 ck=$2 out
+  shift 2
+  # `${1+"$@"}`: bash 3.2 calls an empty "$@" unbound under set -u.
+  out=$(git -C "$ck" --no-optional-locks ${1+"$@"} status --porcelain --untracked-files=no 2>/dev/null) \
+    || harness "git status failed in $ck"
+  printf -v "$var" '%s' "$out"
+}
+# The same, for one path.
+st_path() {
+  local var=$1 ck=$2 path=$3 out
+  out=$(git -C "$ck" --no-optional-locks status --porcelain --untracked-files=no -- "$path" 2>/dev/null) \
+    || harness "git status -- $path failed in $ck"
+  printf -v "$var" '%s' "$out"
+}
 append() {  # append <checkout> <path> <text>
+  local seen
   printf '%s' "$3" >> "$1/$2" || harness "could not append to $1/$2"
-  [ -n "$(porcelain "$1" "$2")" ] || harness "an append to $2 is not visible to git status"
+  st_path seen "$1" "$2"
+  [ -n "$seen" ] || harness "an append to $2 is not visible to git status"
 }
 restore() {  # restore <checkout> <path>
+  local seen
   g "$1" checkout -q -- "$2" || harness "git checkout -- $2 failed"
-  [ -z "$(porcelain "$1" "$2")" ] || harness "$2 still differs after git checkout --"
+  st_path seen "$1" "$2"
+  [ -z "$seen" ] || harness "$2 still differs after git checkout --"
 }
 touch_moved() {  # touch_moved <file>...: every file must exist and its mtime must move
   local f b a
@@ -253,8 +297,11 @@ outfile_for() { cat "$WORK/outfile.$1" 2>/dev/null || echo "-"; }
 check() {
   local arm=$1 ck=$2 tgt=$3 step=$4 expect=$5 expect_rerun=$6
   shift 6
-  local of before json_line got after rerun fresh out_dir stamp_ok verdict wnote
-  of=$(outfile_for "$arm")
+  local of before json_line got after rerun fresh out_dir stamp_ok verdict wnote key
+  # The build script's output is tracked per package: step 32 builds a different one.
+  key=${OUTKEY:-$arm}
+  OUTKEY=""
+  of=$(outfile_for "$key")
   before=0
   if [ "$of" != "-" ]; then
     mt before "$of"
@@ -275,7 +322,7 @@ check() {
   # in this harness's reading, never a reason to reuse the last step's path.
   [ "$out_dir" != "-" ] || harness "cargo emitted no build-script-executed message for ferrodb, arm=$arm step=$step"
   of=$(dirname "$out_dir")/output
-  echo "$of" > "$WORK/outfile.$arm"
+  echo "$of" > "$WORK/outfile.$key"
   # stdout only: an exec error or a panic goes to stderr, and must not be read as a stamp.
   got=$("$tgt/debug/examples/d231_stamp_probe" | head -1)
   # Only a stamp is a measurement. Anything else would score as a FAIL, and a FAIL is what the
@@ -463,16 +510,82 @@ for arm in clone linked; do
   # git that honours replacements reads the tree clean. Its parent is S0, not Q0, so the
   # replacement cannot form a cycle. Both premises are asserted before the build: honoured it
   # reads clean, and with --no-replace-objects it does not.
-  xtree=$(git -C "$ck" write-tree) || harness "git write-tree failed"
+  cp "$idx" "$WORK/index.copy" || harness "could not copy the index"
+  xtree=$(GIT_INDEX_FILE="$WORK/index.copy" git -C "$ck" write-tree) || harness "git write-tree failed"
   xcommit=$(g "$ck" commit-tree "$xtree" -p "$SHA" -m "d231 probe: replacement for Q0") || harness "commit-tree for the replacement failed"
   g "$ck" replace "$Q0FULL" "$xcommit" || harness "git replace failed"
-  [ -z "$(git -C "$ck" --no-optional-locks status --porcelain --untracked-files=no)" ] \
-    || harness "with the replacement honoured the tree does not read clean; step 25 would not discriminate"
-  [ -n "$(git -C "$ck" --no-optional-locks --no-replace-objects status --porcelain --untracked-files=no)" ] \
-    || harness "without the replacement the tree reads clean; step 25 would not discriminate"
+  st honoured "$ck"
+  [ -z "$honoured" ] || harness "with the replacement honoured the tree does not read clean; step 25 would not discriminate"
+  st unhonoured "$ck" --no-replace-objects
+  [ -n "$unhonoured" ] || harness "without the replacement the tree reads clean; step 25 would not discriminate"
   touch_moved "$idx"
   check "$arm" "$ck" "$tgt" 25-replace "at $Q0 +DIRTY" yes
   g "$ck" replace -d "$Q0FULL" > /dev/null || harness "git replace -d failed"
+
+  # 26 (N3): an UNRELATED packed ref deleted. packed-refs is rewritten and nothing HEAD resolves
+  # through moves, so the stamp must NOT re-run: the reason build.rs does not watch packed-refs.
+  pr="$(git -C "$ck" rev-parse --path-format=absolute --git-common-dir)/packed-refs" || harness "no common dir"
+  victim=$(git -C "$ck" for-each-ref --format='%(refname)' refs/remotes/ | grep -v '/HEAD$' | head -1)
+  [ -n "$victim" ] || harness "no remote-tracking ref to delete"
+  grep -q " $victim\$" "$pr" || harness "$victim is not in packed-refs, so deleting it would not rewrite packed-refs"
+  snap "$idx" "$hf" "$lf" "$ff" "$pr"
+  g "$ck" update-ref -d "$victim" || harness "git update-ref -d $victim failed"
+  witness "no no no no yes"
+  check "$arm" "$ck" "$tgt" 26-unrelated-packed-ref "at $Q0 +DIRTY" no
+
+  # 27: a three-link chain, HEAD -> link2 -> link -> $first.
+  link2="refs/heads/d231-link2-$arm"
+  g "$ck" symbolic-ref "$link2" "$link" || harness "could not create $link2"
+  g "$ck" symbolic-ref HEAD "$link2" || harness "could not point HEAD at $link2"
+  check "$arm" "$ck" "$tgt" 27-chain-three-links "at $Q0 +DIRTY" yes
+  l2f=$(gpath "$ck" "$link2") || harness "no path for $link2"
+
+  # 28 (N5): move the THIRD link, $first itself, back to S0. Only $first's file moves.
+  snap "$idx" "$hf" "$l2f" "$lf" "$ff"
+  g "$ck" update-ref "$first" "$SHA" || harness "git update-ref $first failed"
+  witness "no no no no yes"
+  check "$arm" "$ck" "$tgt" 28-third-link "at $S0 +DIRTY" yes
+
+  # 29 (N4): `git status` fails while every other question build.rs asks still works
+  # (PREREG amendment 2a: status.aheadBehind=bogus fails status, not ls-files or rev-parse).
+  g "$ck" config status.aheadBehind bogus || harness "could not set status.aheadBehind"
+  if git -C "$ck" --no-optional-locks status --porcelain --untracked-files=no > /dev/null 2>&1; then
+    harness "git status still succeeds with status.aheadBehind=bogus; step 29 would not discriminate"
+  fi
+  git -C "$ck" --no-optional-locks ls-files -v > /dev/null 2>&1 \
+    || harness "ls-files fails too with status.aheadBehind=bogus; step 29 would not isolate the status rule"
+  touch_moved "$idx"
+  check "$arm" "$ck" "$tgt" 29-status-fails "at unknown +DIRTY" yes
+  g "$ck" config --unset status.aheadBehind || harness "could not unset status.aheadBehind"
+
+  # 30: status works again, and the `unknown` does not stick.
+  touch_moved "$idx"
+  check "$arm" "$ck" "$tgt" 30-status-recovers "at $S0 +DIRTY" yes
+
+  # 31 (N2): an edit hidden from `git status` by the assume-unchanged bit.
+  append "$ck" src/lib.rs $'\n// d231 probe edit (assume-unchanged)\n'
+  g "$ck" update-index --assume-unchanged src/lib.rs || harness "git update-index --assume-unchanged failed"
+  tag=$(git -C "$ck" --no-optional-locks ls-files -v -- src/lib.rs) || harness "git ls-files -v failed"
+  case "$tag" in "h "*) ;; *) harness "src/lib.rs is not tagged assume-unchanged ('$tag')" ;; esac
+  st_path hidden "$ck" src/lib.rs
+  [ -z "$hidden" ] || harness "git status still lists src/lib.rs; step 31 would not discriminate"
+  check "$arm" "$ck" "$tgt" 31-assume-unchanged "at unknown +DIRTY" yes
+  g "$ck" update-index --no-assume-unchanged src/lib.rs || harness "git update-index --no-assume-unchanged failed"
+  restore "$ck" src/lib.rs
+
+  # 32 (N1): a `git archive` copy of S0 inside this checkout's gitignored target/. git discovery
+  # walks up from the copy and finds THIS checkout, whose HEAD the copy was not built from.
+  ex_dir="$ck/target/d231-export"
+  mkdir -p "$ex_dir" || harness "could not create $ex_dir"
+  git -C "$ck" archive "$SHA" | tar -x -C "$ex_dir" || harness "git archive into $ex_dir failed"
+  [ -f "$ex_dir/build.rs" ] && [ ! -e "$ex_dir/.git" ] || harness "$ex_dir is not a bare copy of the sources"
+  top=$(git -C "$ex_dir" rev-parse --show-toplevel) || harness "git finds no repository above $ex_dir"
+  [ "$top" != "$ex_dir" ] || harness "$ex_dir is its own repository; step 32 would not discriminate"
+  git -C "$ck" check-ignore -q "target/d231-export/build.rs" \
+    || harness "the export is not in an ignored directory of $ck"
+  probe_source "$ex_dir"
+  OUTKEY="$arm-export"
+  check "$arm" "$ex_dir" "$tgt" 32-export-inside-checkout "at unknown +DIRTY" yes
 done
 
 say "D231 SUMMARY commit=$SHA12 pass=$PASS fail=$FAIL verdicts=$((PASS + FAIL)) expected_verdicts=$EXPECTED_VERDICTS result=$RESULT"

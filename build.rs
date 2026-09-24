@@ -93,10 +93,38 @@
 //! * In a reftable repository the shared table changes on every ref update in every worktree, so
 //!   any commit anywhere re-stamps, and rebuilds, every worktree. ferrodb's repository uses the
 //!   files store, so this is latent here.
-//! * If `git` is absent, or cannot say where this package's repository is (which includes a git
-//!   older than 2.31, too old to answer the question the way it is asked), it emits `unknown`,
-//!   which reads as loudly as it should. It does NOT fail the build: refusing to compile ferrodb
-//!   because git is missing would be a worse failure than an honest `unknown`.
+//! * With the deprecated `core.preferSymlinkRefs`, `HEAD` is a symbolic LINK, and `--git-path
+//!   HEAD` names its target's real path, so retargeting `HEAD` moves no watched file and the stamp
+//!   keeps the old branch's sha (measured by D231's review 4). A known limit: the option is not
+//!   set on this machine, and git has deprecated it.
+//! * The sha and the dirty bit are read before rustc compiles anything. An edit that lands after
+//!   this script's `git status` and before rustc reads the file is compiled and not stamped; the
+//!   next build re-stamps.
+//!
+//! # When it says `unknown`, which is never a guess in the direction that invites trust
+//!
+//! The stamp is `unknown`, marked dirty, whenever the two facts cannot be read as a description
+//! of the tree cargo is compiling:
+//!
+//! * `git` is absent, or cannot say where this package's repository is. That includes a git older
+//!   than 2.31, too old to answer the path question the way it is asked.
+//! * **The repository git finds is not this package's own** (D231 review 4, N1). Git discovery
+//!   walks UP from the package root, so a `git archive` copy extracted inside another checkout,
+//!   under its `target/` for example, would otherwise be stamped with THAT checkout's sha. It can
+//!   read clean, too, because the copy is untracked there. `git rev-parse --show-toplevel` must be
+//!   the package root. ferrodb is a single-package repository, so a package below the repository
+//!   root is refused in the same way.
+//! * **An index entry is told to hide changes** (N2): assume-unchanged (a lowercase `ls-files -v`
+//!   tag), skip-worktree (`S`), or `core.ignoreStat`. `git status` skips such entries by design,
+//!   so an edited, compiled file would read clean.
+//! * **`git status` fails** (N4). "Dirty" with the old sha would still name a commit, and nothing
+//!   here was able to compare the tree with it.
+//! * **HEAD moved while the two facts were being read** (N6). The sha is read, then `status` runs,
+//!   then the sha is read again. A commit landing between them would otherwise pair the parent's
+//!   sha with the child's status.
+//!
+//! None of these fails the build: refusing to compile ferrodb because git is missing or odd would
+//! be a worse failure than an honest `unknown`.
 //!
 //! It describes the repository at the package root and nothing else: every variable that
 //! `git rev-parse --local-env-vars` lists (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and the
@@ -151,7 +179,12 @@ fn main() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
 
-    // Fail loud. Without a repository there is nothing to watch and nothing to believe.
+    // Fail loud. A repository that is not this package's own describes some other tree, and
+    // without a repository there is nothing to watch and nothing to believe.
+    if !repository_is_the_package(&git, &root) {
+        stamp("unknown", true);
+        return;
+    }
     let Some(git_paths) = git_state_paths(&git) else {
         stamp("unknown", true);
         return;
@@ -159,8 +192,11 @@ fn main() {
     for p in &git_paths {
         watch(p);
     }
-
-    let commit = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // After the watch list is emitted, so that whatever changes the answer re-stamps.
+    if index_hides_changes(&git) {
+        stamp("unknown", true);
+        return;
+    }
 
     // `--porcelain` over TRACKED files only, and that is a deliberate trade with a real hole in it.
     //
@@ -174,14 +210,18 @@ fn main() {
     // The hole that remains is narrow and worth naming precisely: a NEW file that is on the build
     // path and has never been committed. An edit to any file the crate already tracks IS caught,
     // and that is the case the mechanism exists for.
-    let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
-        Some(s) => !s.is_empty(),
-        // Could not ask. "clean" would be a guess in the direction that invites trust, so it is
-        // reported as unknown-and-therefore-suspect instead.
-        None => true,
-    };
-
-    stamp(&commit, dirty);
+    //
+    // The sha is read on both sides of `status`: two git processes are two moments, and a commit
+    // landing between them would pair one commit's sha with another's status.
+    let before = git(&["rev-parse", "--short=12", "HEAD"]);
+    let status = git(&["status", "--porcelain", "--untracked-files=no"]);
+    let after = git(&["rev-parse", "--short=12", "HEAD"]);
+    match (before, status, after) {
+        (Some(sha), Some(changes), Some(again)) if sha == again => stamp(&sha, !changes.is_empty()),
+        // No sha, a status that failed, or a HEAD that moved in between. "Dirty" beside a sha
+        // would still name a commit nothing here compared the tree with.
+        _ => stamp("unknown", true),
+    }
 }
 
 fn watch(p: &Path) {
@@ -205,6 +245,37 @@ fn local_git_env() -> Vec<String> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// Whether the repository git finds from the package root is the package's own (module doc, N1).
+///
+/// Discovery walks UP, so a copy of the sources extracted inside another checkout finds that
+/// checkout. Both sides are canonicalised, because the manifest directory and git's answer can
+/// spell one directory differently (a symlinked prefix, `/` against `\` on Windows).
+fn repository_is_the_package(git: &dyn Fn(&[&str]) -> Option<String>, root: &Path) -> bool {
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (std::fs::canonicalize(&top), std::fs::canonicalize(root)) {
+        (Ok(top), Ok(root)) => top == root,
+        _ => false,
+    }
+}
+
+/// Whether the index is told to hide changes from `git status` (module doc, N2): an entry marked
+/// assume-unchanged (`ls-files -v` prints its tag in lower case) or skip-worktree (`S`), or
+/// `core.ignoreStat`, which marks entries assume-unchanged as they are added. An index that cannot
+/// be listed counts as hiding: "clean" is not the answer to a question that could not be asked.
+fn index_hides_changes(git: &dyn Fn(&[&str]) -> Option<String>) -> bool {
+    if git(&["config", "--bool", "core.ignoreStat"]).as_deref() == Some("true") {
+        return true;
+    }
+    match git(&["ls-files", "-v"]) {
+        Some(entries) => {
+            entries.lines().any(|l| l.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
+        }
+        None => true,
+    }
 }
 
 /// Every git file whose change can change the stamp, as absolute paths, or `None` when git cannot
