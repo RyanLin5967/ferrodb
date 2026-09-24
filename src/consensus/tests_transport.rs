@@ -1678,8 +1678,8 @@ fn concurrent_inbound_connections_are_capped_and_the_refusals_are_counted() {
 fn a_silent_peer_is_closed_on_the_idle_deadline_rather_than_pinning_a_thread_for_ever() {
     // A peer whose host vanishes without a FIN leaves a socket that never becomes readable and
     // never errors, so its thread and both descriptors are held for the life of the process.
-    // Consensus heartbeats every few ticks, so silence past the deadline is a gone peer, not a slow
-    // one.
+    // Silence past the deadline is not proof the peer is gone: follower-to-follower links carry
+    // nothing for a whole stable term, and their sender probes before its next write (D224).
     let mut opts = fast();
     opts.idle_deadline = Duration::from_millis(200);
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2708,6 +2708,10 @@ fn a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt
         b.idle_closed() >= 1 && b.live_inbound_conns() == 0,
         "B never closed A's idle link, so this test exercises nothing"
     );
+    // That proves B SENT its FIN, not that A's kernel has processed it; on macOS loopback delivery
+    // can lag under load. The settle lets it land, so the probe sees the close rather than racing it
+    // (the D224 review's F2). Without a probe the frame is lost whatever the delay.
+    std::thread::sleep(Duration::from_millis(200));
 
     // The campaign frame, sent exactly once.
     a.send(&msg(2)).unwrap();
@@ -2733,15 +2737,22 @@ fn a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt
 fn a_busy_link_is_never_probed() {
     // The control. The probe is for links consensus leaves silent, and a link it keeps busy must
     // never reach the gate. That is a leader's link to a follower, which carries a heartbeat every
-    // 150 ms at the defaults. Here the link carries a frame every 100 ms for longer than twice the
-    // gate, which is `idle_deadline / 2` = 1 s. A link that skipped the refresh after each write would
-    // be probed within a second.
+    // 150 ms at the defaults. Here the link carries a frame every 100 ms for well past the gate,
+    // which is `idle_deadline / 2` = 4 s. A link that skipped the refresh after each write would be
+    // probed on every frame after the first 4 s, about 20 of them.
+    //
+    // The margin is wide on purpose (the D224 review's F3): a false failure needs one stall of
+    // almost 4 s between two consecutive writes. If it fails anyway, the message says which it was.
+    let gate = Duration::from_secs(4);
     let mut opts = fast();
-    opts.idle_deadline = Duration::from_secs(2);
+    opts.idle_deadline = 2 * gate;
+    // Before `pair()`, so it is no later than the dial the first gap is counted from.
+    let t0 = Instant::now();
     let (a, b) = pair(opts);
-    let started = Instant::now();
-    const FRAMES: u64 = 25;
+    const FRAMES: u64 = 60;
+    let (mut t_send, mut t_recv) = (Vec::new(), Vec::new());
     for term in 1..=FRAMES {
+        t_send.push(Instant::now());
         a.send(&Message {
             from: NodeId(1),
             to: NodeId(2),
@@ -2750,15 +2761,25 @@ fn a_busy_link_is_never_probed() {
         })
         .unwrap();
         assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, term);
+        t_recv.push(Instant::now());
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Anti-vacuity: the link lived past the gate, so skipping the refresh would have shown here. A
-    // lower bound on elapsed time, which load can only lengthen.
-    assert!(started.elapsed() >= Duration::from_secs(2), "the link did not outlive the probe gate");
+    // Anti-vacuity: the link lived past the gate by a second, so skipping the refresh would have
+    // shown here. A lower bound on elapsed time, which load can only lengthen.
+    assert!(t0.elapsed() >= gate + Duration::from_secs(1), "the link did not outlive the probe gate");
+
+    // Write k happened within [t_send[k], t_recv[k]], so this bounds every gap between A's writes
+    // from above, the first counted from the dial.
+    let mut bound = t_recv[0] - t0;
+    for k in 0..t_send.len() - 1 {
+        bound = bound.max(t_recv[k + 1] - t_send[k]);
+    }
     assert_eq!(
         a.idle_probes(),
         0,
-        "a link carrying a frame every 100 ms was probed; the gate is not only for idle links"
+        "a link carrying a frame every 100 ms was probed. No gap between writes exceeded {bound:?} \
+         (gate {gate:?}): below the gate, the probe is a defect; at or above it, the run stalled, so \
+         re-run it. Either way this is red."
     );
 }
 
@@ -2784,6 +2805,8 @@ fn an_idle_closed_link_is_probed_once_and_redialled() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(b.idle_closed() >= 1 && b.live_inbound_conns() == 0, "B never closed A's idle link");
+    // B has sent its FIN; let A's kernel process it, as in the test above (the D224 review's F2).
+    std::thread::sleep(Duration::from_millis(200));
 
     // Read around the one send, so a probe of the first frame on a loaded box cannot be mistaken for
     // this one.
