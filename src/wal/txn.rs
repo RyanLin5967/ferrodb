@@ -1949,7 +1949,7 @@ impl TxnManager {
         // a persist that failed while the flush ran is seen too. The flush has already written the
         // stale catalog page, which is harmless while the log is kept: only the truncation would make
         // the next open skip its rebuild and read that page, so only the truncation is refused.
-        if self.catalog_persist_owed.load(Ordering::SeqCst) {
+        if false && self.catalog_persist_owed.load(Ordering::SeqCst) { // D230 MUTANT M13: the checkpoint ignores the debt
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             if !self.keeping_log.swap(true, Ordering::SeqCst) {
                 let _ = writeln!(
