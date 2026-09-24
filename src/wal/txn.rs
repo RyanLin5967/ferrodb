@@ -111,6 +111,11 @@ pub struct TxnManager {
     /// **Keyed by slot (`prov_id.0`)**, so a declaration costs O(log R), not the linear scan a `Vec`
     /// needed on every `bind_run` (the D216 re-adversary's F3). Replayed in slot order.
     run_log: Mutex<BTreeMap<u32, RunEntity>>,
+    /// **D234: where the log's last FULL schema declaration begins** (the LSN at which
+    /// [`TxnManager::replay_schema`] last started appending). A reader whose pin sits above it cannot
+    /// see any table declared before it, which is what a checkpoint that a pin keeps from truncating
+    /// asks before it re-declares the schema. Zero until the first declaration.
+    schema_declared_at: AtomicU64,
     /// Open transaction -> the run that will be named immediately before its `Commit`.
     ///
     /// Held here rather than written when it is bound, and that is the whole correctness property.
@@ -294,7 +299,7 @@ impl TxnManager {
         // undoes it. A fresh log's header starts at 1, but `WalManager::truncate` writes whatever
         // it is given, and a snapshot install gives it 0.
         let start = wal.header_txn_id.max(1);
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(BTreeMap::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(BTreeMap::new()), schema_declared_at: AtomicU64::new(0), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1063,6 +1068,9 @@ impl TxnManager {
     /// first checkpoint, which is to say almost never.
     fn replay_schema(&self) -> Result<(), FerroError> {
         let records = self.schema_log.lock().unwrap().clone();
+        // Where this declaration begins, recorded even when there is nothing to declare: a reader at
+        // or below it has seen the whole schema, which is then empty (D234).
+        self.schema_declared_at.store(self.wal.next_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
         if records.is_empty() {
             return Ok(());
         }
@@ -1131,21 +1139,38 @@ impl TxnManager {
         // Reset either way: every page was flushed, and a counter left over the threshold would
         // make every commit under a pin take another flush of the whole pool.
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
-        // **D234: re-declare only after a real truncation.** A pin below the log's end (a base
-        // backup, a snapshot handoff, a change stream's cursor) makes `truncate` keep the whole log,
-        // and the kept log still holds every declaration a reader starting at its base needs:
-        // - the ones the last real truncation re-appended;
+        // **D234: re-declare after a real truncation; under a pin, only what a reader cannot see.**
+        // A pin below the log's end (a base backup, a snapshot handoff, a change stream's cursor) makes
+        // `truncate` keep the whole log. The kept log still holds, for a reader starting at its base:
+        // - the declarations the last real truncation re-appended;
         // - every DDL since, which `log_ddl` appended as it ran;
         // - every run since, as the binding its commit appended.
-        // Re-appending them anyway grew the log by every declaration at every checkpoint: O(M) per
-        // checkpoint, O(M²) over a pinned period, and recovery read all of it.
-        if truncation == Truncation::Truncated {
-            // The truncation just discarded every DDL record. Put them back, or a log reader
-            // starting at the new base has no way to know what any table is.
-            self.replay_schema()?;
-            // And every run declaration, for the same reason: a reader starting at the new base
-            // would otherwise have no way to name the database's writers.
-            self.replay_runs()?;
+        // Re-appending all of them anyway grew the log by every declaration at every checkpoint: O(M)
+        // per checkpoint, O(M²) over a pinned period, and recovery read all of it. The lead's
+        // decisions for a kept checkpoint:
+        // - runs are never re-declared (D227 run half, 09:44Z); an event's writer travels in its own
+        //   binding;
+        // - the schema is re-declared only when a reader starts ABOVE its last full declaration
+        //   (09:47Z, lane §10.2). A change-feed consumer follows the log, and its own pin keeps every
+        //   checkpoint from truncating, so without this it would never learn a table declared before
+        //   its cursor. This costs O(tables) each time a pin advances past a declaration.
+        // "A reader starts above it" is the NEWEST pin, not the oldest. A lagging reader below the
+        // declaration must not keep a newer one from being told (the lane's reading of the decision
+        // for several readers).
+        match truncation {
+            Truncation::Truncated => {
+                // The truncation just discarded every DDL record. Put them back, or a log reader
+                // starting at the new base has no way to know what any table is.
+                self.replay_schema()?;
+                // And every run declaration, for the same reason: a reader starting at the new base
+                // would otherwise have no way to name the database's writers.
+                self.replay_runs()?;
+            }
+            Truncation::Kept { newest_pin, .. } => {
+                if newest_pin > self.schema_declared_at.load(Ordering::SeqCst) {
+                    self.replay_schema()?;
+                }
+            }
         }
         Ok(())
     }

@@ -77,9 +77,10 @@ pub struct WalManager {
 pub enum Truncation {
     /// The log was discarded and restarted at its end.
     Truncated,
-    /// A pin below the end kept the whole log; nothing was discarded. `oldest_pin` is the lowest
-    /// LSN still pinned.
-    Kept { oldest_pin: u64 },
+    /// A pin below the end kept the whole log; nothing was discarded. `oldest_pin` and
+    /// `newest_pin` are the lowest and highest LSNs still pinned: every reader starts at or above
+    /// the oldest, and the newest decides whether any reader starts above a given record.
+    Kept { oldest_pin: u64, newest_pin: u64 },
 }
 
 /// A claim on the log from `lsn` onwards. Released on drop.
@@ -792,10 +793,10 @@ impl WalManager {
         let file = self.file.lock().unwrap();
         let next = self.next_lsn.load(Ordering::SeqCst);
 
-        if let Some(&oldest) = pins.values().min() {
+        if let (Some(&oldest), Some(&newest)) = (pins.values().min(), pins.values().max()) {
             if oldest < next {
                 // Something still needs records below the new base. Keep the log.
-                return Ok(Truncation::Kept { oldest_pin: oldest });
+                return Ok(Truncation::Kept { oldest_pin: oldest, newest_pin: newest });
             }
         }
 

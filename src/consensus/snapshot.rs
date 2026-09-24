@@ -1521,7 +1521,7 @@ impl SnapshotStore for PageStoreSnapshots {
         // throws the log away whole and restarts it at the current end, which is exactly what a
         // node whose pages are now a checkpoint needs.
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
-        if let crate::wal::log::Truncation::Kept { oldest_pin } = self.wal.truncate(0)? {
+        if let crate::wal::log::Truncation::Kept { oldest_pin, .. } = self.wal.truncate(0)? {
             // `truncate` honours a pin by keeping the whole log and still returning `Ok`. Silent
             // there is right — a checkpoint that reclaims nothing is not a failure — and wrong
             // here: the records it kept are the ones that must never be replayed. Asked of
