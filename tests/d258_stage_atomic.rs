@@ -992,6 +992,11 @@ fn a_restore_of_a_row_whose_write_never_landed_is_skipped() {
     assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 20), (2, 20)]);
     assert_eq!(db.tree_row(branch, "ledger", 1), row1(20));
     assert_eq!(db.remaining(branch, "ledger", 1), Some(5), "the failed statement kept its escrow");
+    assert_eq!(
+        db.runtime.page_mirror_divergences(),
+        0,
+        "a row that was never changed was counted as a page mirror that may disagree"
+    );
 
     db.faults.arm_cow(0);
     db.ok("UPDATE ledger SET qty = qty - 5 WHERE id = 1;", &mut a);
@@ -1032,6 +1037,11 @@ fn a_restore_that_fails_keeps_the_original_error() {
     for id in [1, 2] {
         assert_eq!(db.remaining(branch, "ledger", id), Some(5), "row {id}'s escrow was spent");
     }
+    assert_eq!(
+        db.runtime.page_mirror_divergences(),
+        1,
+        "row 1's failed restore left its page mirror ahead of the workspace, and it was not counted"
+    );
 
     db.faults.arm_cow(0);
     db.exec(S, &mut a).unwrap_or_else(|e| panic!("the retry after a failed restore: {e}"));

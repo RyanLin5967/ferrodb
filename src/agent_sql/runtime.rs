@@ -502,18 +502,22 @@ struct MirrorUndo {
     prior: Option<Vec<Value>>,
 }
 
-/// The error a failed staging step reports once the page tree has been put back — or, when
-/// putting it back failed too, both errors, because the tree may then disagree with the workspace
-/// and whoever reads the message has to know that. "May": a restore can itself land and then
-/// report failure, exactly as the write it was undoing could.
-fn unstage_error(e: FerroError, restored: Result<(), FerroError>) -> FerroError {
-    match restored {
-        Ok(()) => e,
-        Err(r) => FerroError::Internal(format!(
-            "{e}; and putting the branch's page tree back afterwards failed too: {r}. Nothing was \
-             staged — the workspace, the frame and the effect log's index are untouched — but the \
-             branch's page tree may now disagree with its workspace"
-        )),
+/// Does the page tree already hold exactly `prior` for a row — the same bytes, not merely an equal
+/// value?
+///
+/// **Bytes, because `Value`'s `==` is numeric** (`Decimal("1.50") == Decimal("1.5")`,
+/// `Integer(1) == Float(1.0)`). A write that landed a respelled value would compare equal to its
+/// prior under `==`, skip its restore, and leave the tree holding a value the workspace does not.
+/// The tree stores [`encode_row`]'s bytes, so comparing those is comparing what is on the page.
+/// An encoding that fails is not a match: the restore then runs, which is the safe direction.
+fn same_image(now: &Option<Vec<Value>>, prior: &Option<Vec<Value>>) -> bool {
+    match (now, prior) {
+        (None, None) => true,
+        (Some(a), Some(b)) => match (encode_row(a), encode_row(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1314,6 +1318,10 @@ pub struct AgentRuntime {
     /// records [`AgentRuntime::attestation_head`] can later prove the log was only appended to.
     /// Persisting it is a separate decision about where roots are published, not a wiring detail.
     attested: Mutex<AttestedHistory>,
+    /// **D258.** Rows whose page-tree restore failed after a staging step failed: each is a row
+    /// whose page mirror may now disagree with its branch's workspace. See
+    /// [`AgentRuntime::page_mirror_divergences`].
+    page_mirror_divergences: AtomicU64,
 }
 
 impl Default for AgentRuntime {
@@ -1352,6 +1360,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         }
     }
 
@@ -1411,6 +1420,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         })
     }
 
@@ -1451,6 +1461,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         })
     }
 
@@ -3078,8 +3089,9 @@ impl AgentRuntime {
     /// 3. **Spend the escrow** — check and charge in one call, [`EscrowLedger::spend_all`], under one
     ///    lock hold. Every later failure refunds it.
     /// 4. **Write the page tree**, each row's prior image recorded before its write; a failure on
-    ///    row k puts rows k..0 back, row k included, because its write may have landed before it
-    ///    reported failure ([`AgentRuntime::mirror_rows`]). Besides I/O and a starved allocator,
+    ///    row k puts rows k..0 back — row k included when its prior read succeeded, because its
+    ///    write may have landed before it reported failure — skipping any row the tree already
+    ///    holds unchanged ([`AgentRuntime::mirror_rows`]). Besides I/O and a starved allocator,
     ///    `cow_page` also refuses a branch reaped mid-statement or an arena claimed under an older
     ///    authority; all of them take the same undo.
     /// 5. **Append the frame.** After step 1 this fails only on I/O; the tree is put back.
@@ -3094,9 +3106,11 @@ impl AgentRuntime {
     ///
     /// **What is left, stated.** An I/O failure in step 2's durability step, or any failure in step
     /// 4 or 5, leaves the row-write budget spent — the same fail-closed direction the charge below
-    /// has always taken. A double fault, where putting the tree back fails too, is reported as both
-    /// errors; the workspace, the frame and the log's index are still untouched then, and only the
-    /// page mirror may disagree with them. "Nothing staged" is about ROWS, not pages: a failed
+    /// has always taken. A double fault, where putting the tree back fails too, still reports the
+    /// error that failed the statement, in its own class, and counts the row in
+    /// [`AgentRuntime::page_mirror_divergences`]; the workspace, the frame and the log's index are
+    /// untouched then, and only the page mirror may disagree with them until that row is next
+    /// written. "Nothing staged" is about ROWS, not pages: a failed
     /// statement can leave the branch holding private copies of pages it shared with its parent,
     /// and pages the failed tree operation allocated stay in the branch's arena until `free_arena`
     /// or the reaper takes them back (`cow::btree`'s `WriteJournal` says why they are not freed on
@@ -3276,9 +3290,9 @@ impl AgentRuntime {
 
         // ---- 5. the log -----------------------------------------------------------------------
         if let Err(e) = self.log.append(&candidate) {
-            let restored = self.unmirror_rows(branch, &mirrored);
+            self.unmirror_rows(branch, &mirrored);
             self.state.lock().unwrap().escrow.refund_all(branch, &spends);
-            return Err(unstage_error(e, restored));
+            return Err(e);
         }
 
         // ---- 6. install -----------------------------------------------------------------------
@@ -3328,8 +3342,9 @@ impl AgentRuntime {
     /// copy-on-write tree — all of them, or none.
     ///
     /// Returns, per row, what it takes to put that row back. A failure part-way puts back every
-    /// row it reached — the failing one included — before it returns, so an `Err` here means the
-    /// tree is as it was (or, when putting it back failed too, says so — [`unstage_error`]).
+    /// row it recorded — the failing one included, when its prior read succeeded — before it
+    /// returns the failure's own error, so an `Err` here means the tree is as it was, unless a
+    /// restore failed too, which [`AgentRuntime::unmirror_rows`] counts.
     ///
     /// **Each row's prior image is recorded BEFORE its write, not after it (D258 review 1, F1).**
     /// A write can land and still return an error: `put_row` commits the tree operation and then
@@ -3365,35 +3380,64 @@ impl AgentRuntime {
                     }
                 });
                 if let Err(e) = written {
-                    let restored = self.unmirror_rows(branch, &undo);
-                    return Err(unstage_error(e, restored));
+                    self.unmirror_rows(branch, &undo);
+                    return Err(e);
                 }
             }
         }
         Ok(undo)
     }
 
-    /// Put back every row [`AgentRuntime::mirror_rows`] wrote, newest first.
+    /// Put back every row [`AgentRuntime::mirror_rows`] recorded, newest first — the failing row
+    /// included, whose write may or may not have landed.
+    ///
+    /// **A row whose tree image is already its prior, byte for byte, is skipped** (D258 review 2,
+    /// R2-1). That is every row whose write never landed. Rewriting it would ask the store for a
+    /// page again — a shared leaf is copied, not written in place — so on the exhausted or failing
+    /// store that just refused the write, the rewrite failed too, and an ordinary storage error was
+    /// reported as a failure to put the tree back. It also copied pages the statement never
+    /// changed. If the current image cannot be read, the row is put back anyway: skipping it could
+    /// leave a landed write in place, and a needless restore costs only a page.
     ///
     /// Every row is attempted even when one fails: they are independent keys, and stopping at the
-    /// first failure would leave the rest wrong for no gain. The first error is returned.
-    fn unmirror_rows(&self, branch: BranchId, undo: &[MirrorUndo]) -> Result<(), FerroError> {
-        let mut first_err = None;
+    /// first failure would leave the rest wrong for no gain. **A failed restore does not change the
+    /// error the statement reports** — the client is owed the error that failed its statement, in
+    /// that error's own class — and is counted instead in
+    /// [`AgentRuntime::page_mirror_divergences`]: each is a row whose page mirror may now disagree
+    /// with the workspace. "May", because a restore can itself land and then report failure,
+    /// exactly as the write it was undoing could.
+    fn unmirror_rows(&self, branch: BranchId, undo: &[MirrorUndo]) {
+        let mut failed = 0u64;
         for u in undo.iter().rev() {
+            if let Ok(now) = self.get_row(branch, &u.table, u.row)
+                && same_image(&now, &u.prior)
+            {
+                continue;
+            }
             let restored = match &u.prior {
                 Some(vals) => self.put_row(branch, &u.table, u.row, vals),
                 None => self.delete_row(branch, &u.table, u.row),
             };
-            if let Err(e) = restored
-                && first_err.is_none()
-            {
-                first_err = Some(e);
+            if restored.is_err() {
+                failed += 1;
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if failed > 0 {
+            self.page_mirror_divergences.fetch_add(failed, AtomicOrdering::Relaxed);
         }
+    }
+
+    /// **D258.** How many rows, over this runtime's life, a failed staging step could not put back
+    /// on a branch's page tree.
+    ///
+    /// Each is a row whose page mirror may disagree with its branch's workspace until the next
+    /// write of that row: `SELECT`, `DIFF` and `MERGE` read the workspace and are unaffected, while
+    /// [`AgentRuntime::get_row`], [`AgentRuntime::scan_rows`], the page-derived changeset and a
+    /// child forked from the branch read the tree. Zero on a runtime whose storage never failed
+    /// twice in one statement. In memory, so a restart resets it — the mirror it counts does not
+    /// survive a restart as a branch's staged state either.
+    pub fn page_mirror_divergences(&self) -> u64 {
+        self.page_mirror_divergences.load(AtomicOrdering::Relaxed)
     }
 
     // ---- DIFF ------------------------------------------------------------------------------
@@ -7273,6 +7317,37 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D258 (review 2, R2-1). A restore is skipped only when the tree holds the prior's exact
+    /// BYTES.** `Value`'s `==` is numeric, so each `false` pair below is one that `==` calls equal:
+    /// a write that landed a respelled value would then skip its restore and leave the page tree
+    /// holding a value the workspace does not. The `true` rows are the anti-vacuity: a comparison
+    /// that always answered "different" would restore every row and pass the `false` rows.
+    #[test]
+    fn same_image_compares_bytes_not_numeric_equality() {
+        let row = |v: Value| Some(vec![Value::Integer(1), v]);
+        for (now, prior, same) in [
+            (row(Value::Decimal("1.50".into())), row(Value::Decimal("1.5".into())), false),
+            (row(Value::Integer(1)), row(Value::Float(1.0)), false),
+            (row(Value::Varchar("x".into())), row(Value::Varchar("x".into())), true),
+            (row(Value::Decimal("1.50".into())), row(Value::Decimal("1.50".into())), true),
+            (None, None, true),
+            (row(Value::Null), None, false),
+            (None, row(Value::Null), false),
+        ] {
+            assert_eq!(
+                same_image(&now, &prior),
+                same,
+                "same_image({now:?}, {prior:?}) should be {same}"
+            );
+        }
+        assert_eq!(
+            row(Value::Decimal("1.50".into())),
+            row(Value::Decimal("1.5".into())),
+            "fixture: the premise is that `==` calls this pair equal; if it no longer does, the \
+             first row above stopped testing anything"
+        );
+    }
 
     /// A workspace with nothing in it but the two fields `txn_refs` indexes.
     fn ws(name: &str, txn: u64, inherited: &[u64]) -> Workspace {
