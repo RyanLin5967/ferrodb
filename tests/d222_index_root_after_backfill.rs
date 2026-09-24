@@ -54,9 +54,9 @@
 //!
 //! `drop_table` frees each index from its RECORDED root, and `free_subtree` on a leaf frees that
 //! one page. So at `9aa6968` dropping a table whose index was built by a splitting backfill
-//! returned the leftmost leaf and leaked every other page of the tree. `wal::recovery::
-//! rebuild_indexes` frees the old tree from the same record and leaked the same way; that path is
-//! not tested here.
+//! returned the leftmost leaf and leaked every other page of the tree, for both index kinds.
+//! `wal::recovery::rebuild_indexes` frees the old tree from the same record (`free_tree`, which
+//! also frees one page from a leaf) and leaked the same way; that path is not tested here.
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -488,66 +488,122 @@ fn an_insert_after_create_fulltext_index_posts_into_the_leaf_that_covers_its_tok
     );
 }
 
-/// Build `t` with `LEAK_ROWS` rows and an index on `v` — created BEFORE the rows when
-/// `index_first`, so the INSERT path builds it and `sync_roots` records every root move, and AFTER
-/// them otherwise, so the backfill builds it — then drop and rebuild it twice.
+/// The two index kinds the `DROP TABLE` test covers: the same free loop in `drop_table` walks both
+/// lists, and each `create_*` had its own copy of the before-read.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    BTree,
+    FullText,
+}
+
+/// Build a table with `LEAK_ROWS` rows and one index of `kind` — created BEFORE the rows when
+/// `index_first`, so the INSERT path builds it and `sync_roots`/`sync_fulltext_roots` record every
+/// root move, and AFTER them otherwise, so the backfill builds it — then drop and rebuild it twice.
 ///
-/// Returns the highest allocated page with the second copy built, and again with the third built.
-/// The first build-and-drop absorbs one-off growth, as in `catalog.rs`'s
+/// Returns the allocator's high-water mark (`bitmap_high_water`: one past the highest page the
+/// bitmap has handed out) with the second copy built, and again with the third built. The first
+/// build-and-drop absorbs one-off growth, as in `catalog.rs`'s
 /// `dropping_a_table_returns_its_pages_including_the_time_travel_heap`. The allocator hands out the
 /// lowest free page, and identical statements need identical pages, so if the drop returned every
 /// page the third copy lands exactly on the pages the second one freed and the two numbers match.
-fn highest_page_across_a_drop(index_first: bool) -> (u32, u32) {
+///
+/// ⚠ Blind spot, stated: equal marks prove every page came back only when no page BELOW the mark
+/// is free when it is read. That holds here, because each build fills every hole the drop before
+/// it left before extending the file, so a leak of k pages reads as a mark k higher. A leak no
+/// larger than the free pages below the mark would read as equal. The control arm does not cover
+/// that; it covers leaks that are not D222's.
+fn high_water_across_a_drop(kind: Kind, index_first: bool) -> (u32, u32) {
+    let (table, column, create) = match kind {
+        Kind::BTree => ("t", "v", "CREATE INDEX iv ON t (v);"),
+        Kind::FullText => ("docs", "body", "CREATE FULLTEXT INDEX fx ON docs (body);"),
+    };
+    let text = |i: i32| match kind {
+        Kind::BTree => value(i),
+        Kind::FullText => token(i),
+    };
     let mut d = Db::new();
     let build = |d: &mut Db| {
-        d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(255));");
+        d.sql(&format!("CREATE TABLE {table} (id INTEGER NOT NULL, {column} VARCHAR(255));"));
         if index_first {
-            d.sql("CREATE INDEX iv ON t (v);");
+            d.sql(create);
         }
         for i in 1..=LEAK_ROWS {
-            d.sql(&format!("INSERT INTO t VALUES ({i}, '{}');", value(i)));
+            d.sql(&format!("INSERT INTO {table} VALUES ({i}, '{}');", text(i)));
         }
         if !index_first {
-            d.sql("CREATE INDEX iv ON t (v);");
+            d.sql(create);
         }
     };
     build(&mut d);
-    d.sql("DROP TABLE t;");
+    d.sql(&format!("DROP TABLE {table};"));
     build(&mut d);
-    let chain = leaf_chain(&d.bp, d.secondary_root());
+    let root = match kind {
+        Kind::BTree => d.secondary_root(),
+        Kind::FullText => d.fulltext_root(),
+    };
+    let chain = leaf_chain(&d.bp, root);
     assert!(
         chain.len() > 1,
-        "premise failed: {LEAK_ROWS} rows left t.v's tree one leaf, so there is no split tree to \
-         leak and this measures nothing"
+        "premise failed: {LEAK_ROWS} rows left {table}.{column}'s tree one leaf, so there is no \
+         split tree to leak and this measures nothing"
     );
     let peak = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
-    d.sql("DROP TABLE t;");
+    d.sql(&format!("DROP TABLE {table};"));
     build(&mut d);
     let after = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
     (peak, after)
 }
 
-/// `DROP TABLE` returns every page of an index that `CREATE INDEX` built by backfill.
+/// `DROP TABLE` returns every page of an index that `CREATE INDEX` or `CREATE FULLTEXT INDEX`
+/// built by backfill.
 ///
-/// The control is the same table and the same rows with the index created FIRST, so no backfill
-/// happens and the recorded root is kept current by `sync_roots`. It must not move at the base or
-/// with the fix; if it does, something other than D222 is leaking and the second arm says nothing.
+/// Each kind's control is the same table and the same rows with the index created FIRST, so no
+/// backfill happens and the recorded root is kept current by the INSERT path. It must not move at
+/// the base or with the fix; if it does, something other than D222 is leaking in that kind, and
+/// that kind's backfill arm says nothing. Each arm has its own database, so one kind's leak cannot
+/// move the other's marks.
+///
+/// **All four arms are measured before any mark is judged**, and both backfill arms are judged by
+/// ONE assertion that prints every mark. (A premise or a failed statement inside an arm still ends
+/// the test where it happens.) Judged kind by kind, the B-tree leak would end the test at
+/// `9aa6968` before the full-text arms ran — by reading, not run — so the full-text half of the
+/// claim would have no red behind it (found by a fresh-context review of `2ffdb68`). At the base
+/// the full-text evidence is the `FullText, built by the backfill` line of the message, not the
+/// failure itself, which either kind's leak produces.
 #[test]
 fn drop_table_returns_every_page_of_an_index_built_by_backfill() {
-    let (control_peak, control_after) = highest_page_across_a_drop(true);
-    assert_eq!(
-        control_after, control_peak,
-        "control: with the index created BEFORE the rows, rebuilding an identical table after a \
-         DROP moved the highest allocated page from {control_peak} to {control_after}. Something \
-         other than the backfill's root read is leaking, so the arm below cannot be read."
-    );
+    let mut arms = Vec::new();
+    for kind in [Kind::BTree, Kind::FullText] {
+        for index_first in [true, false] {
+            let (peak, after) = high_water_across_a_drop(kind, index_first);
+            arms.push((kind, index_first, peak, after));
+        }
+    }
+    let seen: String = arms
+        .iter()
+        .map(|(kind, index_first, peak, after)| {
+            let arm = if *index_first { "control, index created first" } else { "built by the backfill" };
+            format!("\n  {kind:?}, {arm}: {peak} -> {after}")
+        })
+        .collect();
+    // Printed on a PASS too (visible with `--nocapture`), so a green run leaves the marks in its log.
+    println!("d222 allocator high-water mark, second build -> third build:{seen}");
 
-    let (peak, after) = highest_page_across_a_drop(false);
-    assert_eq!(
-        after, peak,
-        "with the index built by CREATE INDEX's backfill, rebuilding an identical table after a \
-         DROP moved the highest allocated page from {peak} to {after}: the drop did not return the \
-         index's pages. `drop_table` frees from the recorded root, and a root read before the \
-         backfill is the leftmost leaf, which frees one page."
+    for (kind, index_first, peak, after) in &arms {
+        if *index_first {
+            assert_eq!(
+                after, peak,
+                "{kind:?} control: with the index created BEFORE the rows, rebuilding an identical \
+                 table after a DROP moved the allocator's high-water mark. Something other than the \
+                 backfill's root read is leaking, so this kind's backfill arm says nothing.{seen}"
+            );
+        }
+    }
+    assert!(
+        arms.iter().all(|(_, index_first, peak, after)| *index_first || after == peak),
+        "with the index built by the backfill, rebuilding an identical table after a DROP moved the \
+         allocator's high-water mark, so the drop did not return the index's pages. `drop_table` \
+         frees from the recorded root, and a root read before the backfill is the leftmost leaf, \
+         which frees one page.{seen}"
     );
 }
