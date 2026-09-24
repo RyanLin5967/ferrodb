@@ -513,21 +513,35 @@ pub fn alteration_of(action: &AlterAction, before: &Schema) -> Result<ColumnAlte
     })
 }
 
+/// Record in the catalog the root each of a statement's trees now has.
+///
+/// **D230 — every moved root is recorded before any error is returned.** Each `update_*_root` sets
+/// the in-memory record and then persists, so a persist that failed on the first one used to return
+/// here and leave every index after it unrecorded. Those records then lagged their trees until the
+/// table's next successful write, and any `persist` in between wrote the lag to disk. So every update
+/// is attempted and the first error is the one returned. A failed persist still leaves the catalog
+/// PAGE behind until the next persist that succeeds; the in-memory records, which every later persist
+/// writes from, are right.
 pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value, RecordId>, secondaries: &[IndexHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
+    let mut first_err = None;
     let cur_primary = primary.root_page_id.load(Ordering::Relaxed);
     let stored_primary = catalog.get_table(table).ok_or(FerroError::KeyNotFound)?.primary_index_root;
     if cur_primary != stored_primary {
-        catalog.update_primary_root(table, cur_primary)?;
+        if let Err(e) = catalog.update_primary_root(table, cur_primary) {
+            first_err = first_err.or(Some(e));
+        }
     }
     for handle in secondaries {
         let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
         let col_name = schema.columns[handle.col_index].name.clone();
         let stored = catalog.get_table(table).and_then(|e| e.indexes.iter().find(|i| i.column_name == col_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
-            catalog.update_index_root(table, &col_name, cur)?;
+            if let Err(e) = catalog.update_index_root(table, &col_name, cur) {
+                first_err = first_err.or(Some(e));
+            }
         }
     }
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
 /// `sync_roots` for the full-text list — B8.
@@ -540,15 +554,20 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
 /// Separate from `sync_roots` because the lists are separate. Matching a full-text column name
 /// inside `TableEntry::indexes` would either miss it or find a same-named B-tree index and record a
 /// token tree's root as that index's.
+///
+/// Every update is attempted before an error is returned, for the reason `sync_roots` gives (D230).
 pub fn sync_fulltext_roots(table: &str, fulltext: &[FullTextHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
+    let mut first_err = None;
     for handle in fulltext {
         let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
         let stored = catalog.get_table(table).and_then(|e| e.fulltext_indexes.iter().find(|i| i.column_name == handle.column_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
-            catalog.update_fulltext_root(table, &handle.column_name, cur)?;
+            if let Err(e) = catalog.update_fulltext_root(table, &handle.column_name, cur) {
+                first_err = first_err.or(Some(e));
+            }
         }
     }
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 pub fn evaluate(expr: &BoundExpr, row: &[Value]) -> Result<Value, FerroError> {
     return match expr {
