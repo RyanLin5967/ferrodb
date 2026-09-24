@@ -272,16 +272,18 @@ impl Arms {
 }
 
 /// `CURVE_FIRECHECK=<mode>`: break exactly one guard's premise on purpose, so the guard is seen to
-/// fire (PREREG section 4). Three kinds (A11.5), labelled on each variant:
+/// fire (PREREG section 4). Four kinds (A11.5, A13.1), labelled on each variant:
 ///
 /// * COMPARISON: offsets or swaps the expected value, or drops a measured delta, at the harness's
 ///   own comparison. It proves that comparison and its NOT A RESULT line work, and nothing more.
 /// * CONTROL: changes what the timed CONTROL arm does (arm 1), so the guard watching the control
 ///   sees real work move. The measured branch path is untouched.
 /// * IN PATH (A7.5, A8, A11.6): a real state change that the measured code then sees.
+/// * JUDGE (A13.1): a real state change that moves a JUDGED integer, which the verdict script
+///   checks against the pre-registration. No harness guard reads it, so the run exits 0.
 ///
-/// Every mode breaks one arm's guard, so a mode whose arm is not in `CURVE_ARMS` is refused at
-/// startup (A11.4, A12.3): it could only print "every guard held" having injected nothing.
+/// Every mode needs one arm, so a mode whose arm is not in `CURVE_ARMS` is refused at startup
+/// (A11.4, A12.3): it could only print "every guard held" having injected nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fire {
     None,
@@ -341,9 +343,14 @@ enum Fire {
     /// the file a failed index undo leaves (`TxnManager::mark_indexes_stale`), so the child's open
     /// finds it and rebuilds for it.
     StaleMarker,
+    /// A12.1's replay bytes (judge, A13.1): one real `CREATE TABLE` right after axis (ii)'s reopen
+    /// puts one `Ddl` record in `schema_log`, so every axis-(ii) checkpoint re-appends it and the
+    /// bytes line gains an intercept of exactly that record's size.
+    CkptDdl,
 }
 
-/// The arm whose guard a fire mode breaks (A12.3). `Any` is G1, which every arm set checks.
+/// The arm a fire mode needs (A12.3): the one holding the guard it breaks, or for `ckpt-ddl` the
+/// integer it moves. `Any` is G1, which every arm set checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NeedsArm {
     Any,
@@ -377,7 +384,8 @@ impl Fire {
             | Fire::WrongDelta
             | Fire::WrongLiveMerge
             | Fire::WrongCkptFlag
-            | Fire::PinnedCheckpoint => NeedsArm::Merge,
+            | Fire::PinnedCheckpoint
+            | Fire::CkptDdl => NeedsArm::Merge,
             Fire::WrongArenas
             | Fire::WrongLive
             | Fire::ChildLocked
@@ -451,12 +459,13 @@ impl Fire {
             "no-cluster-time" => Fire::NoClusterTime,
             "pinned-checkpoint" => Fire::PinnedCheckpoint,
             "stale-marker" => Fire::StaleMarker,
+            "ckpt-ddl" => Fire::CkptDdl,
             other => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
                  wrong-live-merge, wrong-ckpt-flag, extra-branch, child-locked, extra-extent, \
-                 orphan-extent, no-cluster-time, pinned-checkpoint, stale-marker"
+                 orphan-extent, no-cluster-time, pinned-checkpoint, stale-marker, ckpt-ddl"
             ),
         }
     }
@@ -830,17 +839,17 @@ impl RestartRow {
     }
 }
 
+/// The stale-index marker `open_recovered` honours, beside `{db}.wal`: the engine's own path helper.
+fn stale_marker(db_path: &str) -> std::path::PathBuf {
+    ferrodb::wal::txn::stale_indexes_marker(Path::new(&format!("{db_path}.wal")))
+}
+
 /// The CHILD: a fresh process that opens the database exactly as the shipped binary does, times
 /// it, waits for the lease thread's first pass, closes cleanly, and prints ONE tagged line.
 ///
 /// A fresh process because a real restart is one (D65 adversary, finding e): the parent has a
 /// large live heap and warm allocator. The OS page cache is warm either way — purging it needs
 /// root — so this is a WARM-CACHE restart, and PREREG says so.
-/// The stale-index marker `open_recovered` honours, beside `{db}.wal`: the engine's own path helper.
-fn stale_marker(db_path: &str) -> std::path::PathBuf {
-    ferrodb::wal::txn::stale_indexes_marker(Path::new(&format!("{db_path}.wal")))
-}
-
 fn open_only_child(db_path: &str, fire: Fire) -> ! {
     // H5's in-path fire (PREREG A7.5): a cluster member with no applied `LeaseTick`, held from
     // before the open to after the close. Its lease passes refuse before the orphan sweep.
@@ -1032,6 +1041,9 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
 
 /// The SQL table every merge publishes one NEW row into, created once on trunk.
 const MERGE_TABLE: &str = "m";
+/// `ckpt-ddl`'s table (A13.1). PREREG derives its one `Ddl` record's encoded size by hand from this
+/// name and its single column, so neither may change without amending A13.1.
+const CKPT_DDL_SQL: &str = "CREATE TABLE ckpt_ddl (c INTEGER);";
 /// Merges each axis-(ii) report averages: the last this many before its M target.
 const MERGE_BLOCK: usize = 64;
 
@@ -1197,13 +1209,15 @@ struct CkptPoint {
     replay_bytes: Option<u64>,
     ns: u128,
     /// The median ns of the applied merges since the previous checkpoint that did not checkpoint.
-    median: f64,
+    /// `None` when there were none (reachable only at a checkpoint interval of 1): that point still
+    /// counts for the JUDGED bytes line and is left out of the time fit alone (A13.7).
+    median: Option<f64>,
     period: u64,
 }
 
 impl CkptPoint {
-    fn excess(&self) -> f64 {
-        self.ns as f64 - self.median
+    fn excess(&self) -> Option<f64> {
+        self.median.map(|m| self.ns as f64 - m)
     }
 }
 
@@ -1253,15 +1267,16 @@ fn fit_line(pts: &[(f64, f64)]) -> Option<Line> {
 ///   (review 4 R1), so it prints each slope with its standard error and nothing more.
 fn print_ckpt_fit(points: &[CkptPoint]) {
     println!("arm 2, axis (ii): every auto-checkpoint (A11.3, A12.1); excess = ns - the median of its own period");
+    let whole = |v: Option<f64>| v.map(|x| format!("{x:.0}")).unwrap_or_else(|| "-".into());
     for p in points {
         println!(
-            "  CKPT M={} runs={} replay_bytes={} ns={} period_median_ns={:.0} excess_ns={:.0} period={}",
+            "  CKPT M={} runs={} replay_bytes={} ns={} period_median_ns={} excess_ns={} period={}",
             p.m,
             p.runs,
             p.replay_bytes.map(|b| b.to_string()).unwrap_or_else(|| "-".into()),
             p.ns,
-            p.median,
-            p.excess(),
+            whole(p.median),
+            whole(p.excess()),
             p.period
         );
     }
@@ -1294,9 +1309,18 @@ fn print_ckpt_fit(points: &[CkptPoint]) {
         })
         .unwrap_or_else(|| "not computable".into())
     };
-    let excess = |pts: &[CkptPoint]| -> Vec<(f64, f64)> { pts.iter().map(|p| (p.runs as f64, p.excess())).collect() };
+    // Only points with a period median (A13.7); the bytes line above takes every point.
+    let excess = |pts: &[CkptPoint]| -> Vec<(f64, f64)> {
+        pts.iter().filter_map(|p| p.excess().map(|e| (p.runs as f64, e))).collect()
+    };
     let range = |pts: &[CkptPoint]| match (pts.first(), pts.last()) {
-        (Some(f), Some(l)) => format!("runs {}..={}, {} points", f.runs, l.runs, pts.len()),
+        (Some(f), Some(l)) => format!(
+            "runs {}..={}, {} points, {} with a period median",
+            f.runs,
+            l.runs,
+            pts.len(),
+            pts.iter().filter(|p| p.median.is_some()).count()
+        ),
         _ => "no points".into(),
     };
     // The lower half takes floor(n/2) points; for an odd n the middle point is the upper half's.
@@ -1336,6 +1360,19 @@ impl MergeRow {
         let mut v: Vec<u128> = self.ones.iter().map(|o| o.nanos).collect();
         v.sort_unstable();
         v.get(v.len() / 2).copied().unwrap_or(0) as f64
+    }
+    /// The typical merge's ns (A13.3): mean and standard error (sd / √n) over the block's applied
+    /// merges that did not checkpoint. `None` below two such merges.
+    fn typ_mean_se(&self) -> Option<(f64, f64)> {
+        let v: Vec<f64> =
+            self.ones.iter().filter(|o| o.applied_to_target && !o.checkpointed).map(|o| o.nanos as f64).collect();
+        if v.len() < 2 {
+            return None;
+        }
+        let n = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        Some((mean, (var / n).sqrt()))
     }
 }
 
@@ -1433,6 +1470,9 @@ fn main() {
 
     let dir = std::env::temp_dir().join(format!("ferrodb-wcurve-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // A13.2: the (f0) refusal checks assert this line is ABSENT. The directory itself cannot say,
+    // because `RemoveOnDrop` below deletes it on unwind too. stderr, so no stdout table moves.
+    eprintln!("RUN DIR {}", dir.display());
     // Declared first so it drops LAST, after every handle below. A panic anywhere in this run
     // (every `expect` here is one) used to skip the old trailing `remove_dir_all` and leave a
     // multi-GB database in the temp dir of a disk this harness is guarding with FREE_FLOOR.
@@ -1568,6 +1608,10 @@ fn main() {
             "  layout: PRODUCTION, via ferrodb::cli::cli::open_database at {db_path_str}. Parent lease \
              interval {PARENT_SCAN_INTERVAL:?}, first pass awaited before anything is timed; the \
              restart child is a fresh process running the same open at the production interval."
+        );
+        println!(
+            "  checkpoint interval: FERRODB_CHECKPOINT_INTERVAL={} (A13.7: each CKPT line's `period` reads against it)",
+            std::env::var("FERRODB_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "unset, so the engine default".into())
         );
         println!(
             "  workload: trunk row {ROW} = BigInt({TRUNK_VALUE}); each branch forks from trunk and \
@@ -2042,6 +2086,22 @@ fn main() {
         hd = Handles::of(&reopened);
         db = Some(reopened);
         let open = db.as_ref().expect("the production database is open");
+        // A13.1's judge fire: one retained `Ddl` record, created before any merge. Its own
+        // checkpoint (`ddl_checkpointed`) truncates first and resets the commit counter, and the
+        // record is logged after it, so the log past its base is that record alone.
+        if fire == Fire::CkptDdl {
+            let mut plain = Session::with_runtime(Arc::clone(&open.runtime));
+            let base0 = open.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            exec_sql(open, &mut plain, CKPT_DDL_SQL).expect("ckpt-ddl fire: create the table");
+            let base1 = open.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            let past = open.txn.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst) - base1;
+            assert!(
+                base1 != base0 && past > 0,
+                "ckpt-ddl fire did not inject: base moved={}, {past} bytes past the base",
+                base1 != base0
+            );
+            println!("  CKPT-DDL base_moved=1 bytes_past_base={past}");
+        }
         let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let mut m_done = 0usize;
         let mut since_ckpt = 0u64;
@@ -2061,16 +2121,16 @@ fn main() {
                 if one.applied_to_target && one.checkpointed {
                     axis_ckpts += 1;
                     period_ns.sort_unstable();
-                    if let Some(&median) = period_ns.get(period_ns.len() / 2) {
-                        ckpt_points.push(CkptPoint {
-                            m: m_done,
-                            runs: one.runs_after,
-                            replay_bytes: one.replay_bytes,
-                            ns: one.nanos,
-                            median: median as f64,
-                            period: one.period.unwrap_or(0),
-                        });
-                    }
+                    // Every checkpointing merge is a point (A13.7): an empty period costs the time
+                    // fit its median, never the JUDGED bytes line its point.
+                    ckpt_points.push(CkptPoint {
+                        m: m_done,
+                        runs: one.runs_after,
+                        replay_bytes: one.replay_bytes,
+                        ns: one.nanos,
+                        median: period_ns.get(period_ns.len() / 2).map(|&m| m as f64),
+                        period: one.period.unwrap_or(0),
+                    });
                     period_ns.clear();
                 } else if one.applied_to_target {
                     period_ns.push(one.nanos);
@@ -2084,6 +2144,14 @@ fn main() {
             merge_rows.push(row);
         }
         drop(pin);
+        // A13.9: the judge fire needs a truncating checkpoint to move the line it is for.
+        if fire == Fire::CkptDdl && !ckpt_points.iter().any(|p| p.replay_bytes.is_some()) {
+            failures.push(format!(
+                "A12.1: CURVE_FIRECHECK=ckpt-ddl was requested but no axis-(ii) checkpoint truncated \
+                 ({m_done} merges; the targets must reach one checkpoint interval), so the judge was \
+                 not moved"
+            ));
+        }
         if fire == Fire::PinnedCheckpoint && axis_ckpts == 0 {
             failures.push(format!(
                 "M6: CURVE_FIRECHECK=pinned-checkpoint was requested but no axis-(ii) merge \
@@ -2157,16 +2225,18 @@ fn read_vs_n_summary(
         // log-log slopes from the previous row of the same axis.
         for (axis, against) in [("i", "N"), ("ii", "M")] {
             let rows: Vec<&MergeRow> = merge_rows.iter().filter(|r| r.axis == axis).collect();
-            // A7.4: Q10 is judged on the MEDIAN. The mean is printed beside it and not judged,
-            // because each axis-(ii) block's last merge pays the auto-checkpoint (`ckpts`).
+            // A13.3: Q10 is REPORTED, not judged. Its time columns (the median, the local slope of
+            // the median from the previous row, and the typical merge's mean ± SE) move with the box
+            // as much as with N or M, and nothing here controls for that. The judged content of
+            // "merge cost against N and M" is the integers: Q1–Q9 and the replay bytes (A12.1).
             // A10.1: the checkpoint is amortized over its MEASURED period (`MergeOne::period`), not
             // over 256: the trigger waits for an empty active-transaction table, and a cycle may
             // commit more than once. Not over the printed blocks' checkpoint share either: axis
             // (ii)'s blocks end at multiples of 256 on purpose, so they over-sample that merge.
-            println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN:");
+            println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN (reported, A13.3):");
             println!(
                 "         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  \
-                 seq tup  c.fault  ret runs  ckpts    ckpt ns  period   amort ns"
+                 seq tup  c.fault  ret runs  ckpts    ckpt ns  period   amort ns   typ ns ± SE"
             );
             let mut prev: Option<(usize, f64, f64)> = None;
             for r in &rows {
@@ -2184,7 +2254,7 @@ fn read_vs_n_summary(
                 let last = r.ones.last().copied().unwrap_or_default();
                 let (ckpts, ckpt_ns, _) = r.ckpt();
                 // The checkpoint's excess over the typical merge, and the amortized cost it implies.
-                // Its linearity in M is judged on `print_ckpt_fit`, over every checkpoint (A11.3).
+                // Its growth with M is judged on the replay BYTES in `print_ckpt_fit` (A12.1).
                 let excess = ckpt_ns.map(|c| c - ns);
                 let periods: Vec<u64> = r.ones.iter().filter_map(|o| o.period).collect();
                 let period = (!periods.is_empty())
@@ -2194,9 +2264,13 @@ fn read_vs_n_summary(
                     _ => format!("{:>10}", "-"),
                 };
                 let period = period.map(|p| format!("{p:>7.1}")).unwrap_or_else(|| format!("{:>7}", "-"));
+                let typ = r
+                    .typ_mean_se()
+                    .map(|(m, se)| format!("{:>13}", format!("{m:.0}±{se:.0}")))
+                    .unwrap_or_else(|| format!("{:>13}", "-"));
                 println!(
                     "  {:>8} {:>8} {:>10.0} {s_ns} {:>10.0} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3} {:>9} {:>6} \
-                     {:>10} {period} {amort}",
+                     {:>10} {period} {amort} {typ}",
                     r.n,
                     r.m,
                     ns,
@@ -2216,6 +2290,11 @@ fn read_vs_n_summary(
             println!(
                 "  axis ({axis}): `period` = merge cycles since the previous checkpoint (or the open), \
                  the checkpointing one included; `amort ns` = median + (ckpt ns - median) / period (A10.1)."
+            );
+            println!(
+                "  axis ({axis}): `slope` spans the previous row to this one ({}); `typ ns ± SE` is the mean \
+                 and sd/sqrt(n) over the block's applied merges that did not checkpoint. Reported, not judged (A13.3).",
+                rows.iter().map(|r| (if axis == "i" { r.n } else { r.m }).to_string()).collect::<Vec<_>>().join(" -> ")
             );
             if axis == "ii" {
                 print_ckpt_fit(ckpt_points);
@@ -2325,7 +2404,12 @@ fn read_vs_n_summary(
         }
     }
     println!();
-    if fire != Fire::None {
+    if fire == Fire::CkptDdl {
+        println!(
+            "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads it, so none may appear below; \
+             the replay-bytes line above must carry the pre-registered intercept."
+        );
+    } else if fire != Fire::None {
         println!("FIRECHECK {fire:?}: exactly the guard this mode breaks must appear below, and no other.");
     }
     if failures.is_empty() && ns_void.is_empty() {
