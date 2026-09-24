@@ -149,6 +149,18 @@ pub enum RecKind {
     HeapInsert { dir_root: u32, page_id: u32, slot: u16, tuple: Vec<u8> },
     HeapDelete { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8> }, 
     HeapUpdate { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8>, new: Vec<u8> },
+    /// **D213: a committed transaction frees a slot its delete RETIRED.** Tag 11, the next free
+    /// number, so every older record keeps its meaning.
+    ///
+    /// A logged `HeapDelete` no longer frees its slot: it retires it, so the bytes stay occupied
+    /// and a rollback restores the tuple in place (`storage::heap_page::RETIRED`). This record is
+    /// the commit's release of those bytes, written by `TxnManager::commit` after the `Commit`
+    /// record is durable, in the same transaction. Redo and a replica apply it like any other page
+    /// change, gated by the page's LSN. Without it a replica, or recovery after a crash, would keep
+    /// the slot retired while the primary's later inserts used its bytes, and replaying those
+    /// inserts would find no room. It carries no row, so it is not a change-feed event, and nothing
+    /// ever undoes it: its transaction has committed.
+    HeapRelease { dir_root: u32, page_id: u32, slot: u16 },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
     Checkpoint,
     /// A schema change, logged so the change feed can carry it.
@@ -365,6 +377,12 @@ impl RecKind {
                 buffer.extend_from_slice(&(new.len() as u32).to_be_bytes());
                 buffer.extend_from_slice(new);
             }
+            RecKind::HeapRelease { dir_root, page_id, slot } => {
+                buffer.push(11);
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&page_id.to_be_bytes());
+                buffer.extend_from_slice(&slot.to_be_bytes());
+            }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
                 buffer.push(9);
                 // Tags 0 and 1 keep their meaning and their position, so every DDL record already
@@ -531,6 +549,13 @@ impl RecKind {
                         BranchId::new(branch_id, generation),
                     ),
                 })
+            }
+            11 => {
+                let mut at = 1usize;
+                let dir_root = take_u32(bytes, &mut at)?;
+                let page_id = take_u32(bytes, &mut at)?;
+                let slot = take_u16(bytes, &mut at)?;
+                Ok(RecKind::HeapRelease { dir_root, page_id, slot })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -1158,6 +1183,19 @@ mod tests {
     fn deserialize_rejects_empty_and_unknown_tag() {
         assert!(RecKind::deserialize(&[]).is_err());
         assert!(RecKind::deserialize(&[99]).is_err());
+    }
+
+    /// **D213: `HeapRelease` round-trips under tag 11, and a truncated one is refused.** Tag 11 is
+    /// the next free number, so the older tags checked below keep their meaning.
+    #[test]
+    fn a_heap_release_round_trips_under_its_own_tag() {
+        let kind = RecKind::HeapRelease { dir_root: 7, page_id: 42, slot: 3 };
+        let mut buf = Vec::new();
+        kind.serialize(&mut buf).unwrap();
+        assert_eq!(buf[0], 11, "HeapRelease is not tag 11");
+        assert_eq!(buf.len(), 11, "a HeapRelease is its tag plus a u32, a u32 and a u16");
+        assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        assert!(RecKind::deserialize(&buf[..10]).is_err(), "a truncated HeapRelease decoded");
     }
 
     /// **The additive-tag discipline, for tag 10.**
