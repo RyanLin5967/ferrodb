@@ -2463,6 +2463,8 @@ fn read_vs_n_summary(
         let centi = |l: u64| if l == u64::MAX { format!("{:>6}", "-") } else { format!("{:>6.2}", l as f64 / 100.0) };
         println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows  recovered  child net ms   load0   load1   L2");
         let mut prev: Option<(usize, f64, f64)> = None;
+        // A15.3: which rows L2 can vouch for, and which it cannot.
+        let (mut flagged, mut unavailable, mut partly) = (Vec::new(), Vec::new(), Vec::new());
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
             let total = r.get("total_us") as f64 / 1000.0;
             let lease = r.get("lease_start_us") as f64 / 1000.0;
@@ -2475,10 +2477,24 @@ fn read_vs_n_summary(
             };
             let (l0, l1) = (r.get("load_start_centi"), r.get("load_end_centi"));
             let hi = [l0, l1].into_iter().filter(|&l| l != u64::MAX).max();
+            let readings = [l0, l1].into_iter().filter(|&l| l != u64::MAX).count();
             let l2 = match (hi, load_median) {
                 _ if is_h6(r) => "H6",
-                (Some(h), Some(m)) => if (h as f64) > 1.5 * (m as f64) { "1" } else { "0" },
-                _ => "-",
+                (Some(h), Some(m)) => {
+                    if readings < 2 {
+                        partly.push(r.n);
+                    }
+                    if (h as f64) > 1.5 * (m as f64) {
+                        flagged.push(r.n);
+                        "1"
+                    } else {
+                        "0"
+                    }
+                }
+                _ => {
+                    unavailable.push(r.n);
+                    "UNAVAILABLE"
+                }
             };
             let (load0, load1) = (centi(l0), centi(l1));
             println!(
@@ -2506,6 +2522,22 @@ fn read_vs_n_summary(
              (A15.6, the verdict script's rule). The time slopes and R5's magnitude are REPORTED \
              (A14.2); O(N) is judged on R1-R3's integers.",
             load_median.map(|m| format!("{:.2}", m as f64 / 100.0)).unwrap_or_else(|| "-".into())
+        );
+        // A15.3: a clean-load statement only when every counted row has both readings.
+        if !unavailable.is_empty() || !partly.is_empty() {
+            println!(
+                "  L2 is incomplete: UNAVAILABLE (unguarded) at N={unavailable:?}; one reading only at \
+                 N={partly:?}; L2 = 1 at N={flagged:?}. No clean-load statement is made for this run."
+            );
+        } else if flagged.is_empty() {
+            println!("  L2: no row carries L2 = 1, and every counted row has both readings.");
+        } else {
+            println!("  L2 = 1 at N={flagged:?}: read those rows' times as load-contaminated.");
+        }
+        println!(
+            "  L2's blind spot (A15.3): its instrument is two point readings of a 1-minute exponentially damped \
+             average, so around an open of a few seconds both readings describe mostly the minute BEFORE it. \
+             L2 = 0 on a short open is not evidence of a quiet open."
         );
         let measured = restart_rows.iter().filter(|r| !r.child.is_empty()).count();
         if measured < 2 {
