@@ -38,6 +38,236 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::error::FerroError;
 use crate::storage::index::BPlusTreeManager;
 
+use self::stored::{StoredCore, StoredDeadline, StoredRecord, Writable};
+
+/// **What this catalog's tree holds, as types that are not what it hands out — D198.**
+///
+/// The catalog stores every lease deadline in VIRTUAL time, `v = lease − D`, where `D` is the
+/// durable cumulative downtime ([`TableBranchCatalog::lease_offset`]); that is what makes a
+/// restart's grace one write instead of one per branch. Everything it hands out is on the lease
+/// clock, `v + D`. A path that forgot the outward half would hand out `v`, `D` too EARLY, and the
+/// lease would be reaped early: the destructive direction, silently, with a plausible value.
+///
+/// So that forgetting it does not compile, a record read from the tree is a [`StoredCore`] or a
+/// [`StoredRecord`], and its deadline a [`StoredDeadline`] — none of them a `CoreRecord`,
+/// `BranchRecord` or `LeaseDeadline`, and none convertible into one except by the two translations
+/// here, `outward(D)` and `inward(D)`. The fields are private to THIS module, not merely to the
+/// file, for `CoreRecord`'s own reason (`record.rs`): a newtype declared next to its consumer is
+/// honour-system, because `.0` is in scope. There is no `Deref` and no raw accessor.
+///
+/// The one door left is deliberate and visible: `StoredRecord::inward` accepts a `BranchRecord`,
+/// because a `BranchRecord` in this file can only ever be on the lease clock — every value that
+/// came from the tree is one of these types until it goes out.
+mod stored {
+    use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+    use crate::branch::tree_keys as keys;
+    use crate::branch::types::{
+        ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
+    };
+
+    /// A lease deadline in the catalog's virtual time. Not a [`LeaseDeadline`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct StoredDeadline(u64);
+
+    impl StoredDeadline {
+        /// **The outward translation**: `v + D` on the lease clock.
+        ///
+        /// D206: the sum stops at `u64::MAX − 1` through `LeaseDeadline::saturating_deadline`
+        /// (`31364b3`), because `u64::MAX` is `TRUNK_LEASE`, "never expires", and a shift that
+        /// produced it would make a branch indistinguishable from trunk and un-reapable. A stored
+        /// `u64::MAX` is a caller's explicit "never" and is a fixed point.
+        pub(super) fn outward(self, offset: u64) -> LeaseDeadline {
+            if self.0 == u64::MAX {
+                return LeaseDeadline(u64::MAX);
+            }
+            LeaseDeadline(LeaseDeadline::saturating_deadline(self.0, offset))
+        }
+
+        /// **The inward translation**: `lease − D`, saturating at 0.
+        ///
+        /// Saturating at 0 is the one lossy case, and it loses in the harmless direction: a
+        /// deadline earlier than `D` — `expire_lease`'s offline 0, a test's `LeaseDeadline(1)` — is
+        /// stored as 0 and reads back as `D`, long past on any real lease clock, so still expired.
+        /// `u64::MAX` is the same fixed point as outward: stored `u64::MAX − D` would read back as a
+        /// real deadline, and a caller's "never" would quietly become one after a restart.
+        pub(super) fn inward(lease: LeaseDeadline, offset: u64) -> StoredDeadline {
+            if lease.0 == u64::MAX {
+                return StoredDeadline(u64::MAX);
+            }
+            StoredDeadline(lease.0.saturating_sub(offset))
+        }
+
+        /// This deadline's DEADLINE-index key. The index is keyed in virtual time, which is what
+        /// lets a restart leave it alone.
+        pub(super) fn index_key(self, id: u64) -> Vec<u8> {
+            keys::deadline(self.0, id)
+        }
+    }
+
+    /// The DEADLINE-index span holding every stored deadline that is expired at lease-clock `now`
+    /// under offset `D`, or `None` when nothing can be.
+    ///
+    /// A stored `v` is expired iff `outward(v) <= now`. For `v` below the clamp that is
+    /// `v <= now − D`, one range. `now < D` expires nothing, since every `v + D >= D > now`.
+    /// `now == u64::MAX` expires everything, the sentinel included, as `expired_at_or_before(MAX)`
+    /// always has. The clamp region — `v` within `D` of `u64::MAX`, which reads `u64::MAX − 1` — is
+    /// outside the range for any `now < u64::MAX − 1`, and so is its value, so the range and the
+    /// predicate agree there too; the caller re-checks every row against `outward` regardless.
+    pub(super) fn expired_span(now: u64, offset: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let stored_now = if now == u64::MAX { u64::MAX } else { now.checked_sub(offset)? };
+        Some(keys::expired_at_or_before(stored_now))
+    }
+
+    /// A core record exactly as the tree holds it: deadline in virtual time.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct StoredCore(CoreRecord);
+
+    impl StoredCore {
+        /// The only way a RECORD value's bytes become a record in this catalog.
+        pub(super) fn decode(bytes: &[u8]) -> Result<StoredCore, BranchError> {
+            BranchRecord::deserialize_core(bytes).map(StoredCore)
+        }
+        pub(super) fn branch_id(&self) -> BranchId {
+            self.0.branch_id()
+        }
+        pub(super) fn generation(&self) -> u32 {
+            self.0.generation()
+        }
+        pub(super) fn state(&self) -> BranchState {
+            self.0.state()
+        }
+        pub(super) fn depth(&self) -> u32 {
+            self.0.depth()
+        }
+        pub(super) fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
+            self.0.check_readable(requested)
+        }
+        pub(super) fn deadline(&self) -> StoredDeadline {
+            StoredDeadline(self.0.lease_deadline().0)
+        }
+        pub(super) fn serialize_core(&self) -> Vec<u8> {
+            self.0.serialize_core()
+        }
+        /// On the lease clock, for handing out.
+        pub(super) fn outward(self, offset: u64) -> CoreRecord {
+            let lease = self.deadline().outward(offset);
+            self.0.with_lease_deadline(lease)
+        }
+        /// With its unbounded fields, still as stored. `hydrate`'s one call.
+        pub(super) fn into_hydrated(
+            self,
+            arenas: Vec<ArenaId>,
+            envelope: Option<CapabilityEnvelope>,
+        ) -> StoredRecord {
+            StoredRecord(self.0.into_hydrated(arenas, envelope))
+        }
+        /// A child of this parent whose deadline is ALREADY stored — `fork`'s one construction.
+        pub(super) fn fork_child(
+            &self,
+            parent_envelope: Option<&CapabilityEnvelope>,
+            child: BranchId,
+            fork_epoch: Epoch,
+            deadline: StoredDeadline,
+        ) -> Result<StoredRecord, BranchError> {
+            BranchRecord::fork_child_from_core(
+                &self.0,
+                parent_envelope,
+                child,
+                fork_epoch,
+                LeaseDeadline(deadline.0),
+            )
+            .map(StoredRecord)
+        }
+    }
+
+    /// A whole record exactly as the tree holds it: deadline in virtual time. Mutated only
+    /// through the field setters below — never through a `&mut BranchRecord`, which would expose
+    /// the stored deadline typed as a `LeaseDeadline`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct StoredRecord(BranchRecord);
+
+    impl StoredRecord {
+        /// A lease-clock record, translated for writing.
+        pub(super) fn inward(mut rec: BranchRecord, offset: u64) -> StoredRecord {
+            rec.lease_deadline = LeaseDeadline(StoredDeadline::inward(rec.lease_deadline, offset).0);
+            StoredRecord(rec)
+        }
+        /// On the lease clock, for handing out.
+        pub(super) fn outward(mut self, offset: u64) -> BranchRecord {
+            self.0.lease_deadline = StoredDeadline(self.0.lease_deadline.0).outward(offset);
+            self.0
+        }
+        pub(super) fn branch_id(&self) -> BranchId {
+            self.0.branch_id
+        }
+        pub(super) fn state(&self) -> BranchState {
+            self.0.state
+        }
+        pub(super) fn arenas(&self) -> &[ArenaId] {
+            &self.0.arenas
+        }
+        pub(super) fn envelope(&self) -> Option<&CapabilityEnvelope> {
+            self.0.envelope.as_ref()
+        }
+        pub(super) fn deadline(&self) -> StoredDeadline {
+            StoredDeadline(self.0.lease_deadline.0)
+        }
+        pub(super) fn serialize_core(&self) -> Vec<u8> {
+            self.0.serialize_core()
+        }
+        pub(super) fn set_deadline(&mut self, deadline: StoredDeadline) {
+            self.0.lease_deadline = LeaseDeadline(deadline.0);
+        }
+        pub(super) fn set_root(&mut self, root: PageId) {
+            self.0.root_page_id = root;
+        }
+        pub(super) fn set_state(&mut self, to: BranchState) {
+            self.0.state = to;
+        }
+        /// `BranchRecord::mark_reaped`: state, generation bump, arenas cleared.
+        pub(super) fn mark_reaped(&mut self) {
+            self.0.mark_reaped();
+        }
+        /// `reparent`'s four position fields, which move together or not at all.
+        pub(super) fn reposition(
+            &mut self,
+            parent: BranchId,
+            fork_epoch: Epoch,
+            depth: u32,
+            root: PageId,
+        ) {
+            self.0.parent_id = Some(parent);
+            self.0.fork_epoch = fork_epoch;
+            self.0.depth = depth;
+            self.0.root_page_id = root;
+        }
+    }
+
+    /// What `write_record` and `write_record_new` accept: a record already stored, borrowed as it
+    /// is, or a lease-clock `BranchRecord`, translated by `inward`.
+    ///
+    /// The second arm is safe BECAUSE of this module: nothing read from the tree is a
+    /// `BranchRecord` until it has gone out through `outward`, so a `BranchRecord` here is always on
+    /// the lease clock, and translating it inward is always right. It is what lets the format tests
+    /// that write records the engine never would (`d10_guard`, `serial_section_profile`) keep
+    /// handing the writers a `BranchRecord`, as they did before D198.
+    pub(super) trait Writable {
+        fn stored(&self, offset: u64) -> std::borrow::Cow<'_, StoredRecord>;
+    }
+
+    impl Writable for StoredRecord {
+        fn stored(&self, _offset: u64) -> std::borrow::Cow<'_, StoredRecord> {
+            std::borrow::Cow::Borrowed(self)
+        }
+    }
+
+    impl Writable for BranchRecord {
+        fn stored(&self, offset: u64) -> std::borrow::Cow<'_, StoredRecord> {
+            std::borrow::Cow::Owned(StoredRecord::inward(self.clone(), offset))
+        }
+    }
+}
+
 /// Header payload: `next_id` then `epoch`, both big-endian.
 const HEADER_BYTES: usize = 16;
 
@@ -71,9 +301,9 @@ pub struct TableBranchCatalog {
     ///
     /// Stored deadlines are VIRTUAL, `v = lease − D`; everything this catalog hands out is on the
     /// lease clock, `v + D` (both saturating). So one `D += downtime` at a restart extends every
-    /// lease there is, with no record rewritten — Chubby's stopped timer done as arithmetic. See
-    /// [`TableBranchCatalog::to_lease_clock`] for where the translation happens and why every
-    /// outward path must go through it.
+    /// lease there is, with no record rewritten — Chubby's stopped timer done as arithmetic. The
+    /// translation lives in the private module [`stored`], whose types make an untranslated path a
+    /// compile error rather than a lease reaped `D` early.
     ///
     /// Durable in the `[0x08]` key beside the last-alive mark, and loaded at `open`. A catalog that
     /// has never had one reads `D = 0`, which makes every stored deadline mean exactly what it meant
@@ -318,9 +548,10 @@ impl TableBranchCatalog {
                 }
             }
             let old = cat.core(full.branch_id.id)?;
-            // Verbatim, and correct only because `cat` is brand new: its virtual lease clock's
-            // offset is 0, so a deadline's stored value IS its value (D198, `to_stored`).
-            cat.write_record(&full, old.as_ref())?;
+            // `full` came out of the source on ITS lease clock, so it goes in through `inward` —
+            // an identity here, because `cat` is brand new and its offset is 0, but a translation
+            // by type rather than by that argument.
+            cat.write_record(&cat.inward(full), old.as_ref())?;
         }
         for (parent, epoch, child) in children {
             cat.attach_child(parent, epoch, child)?;
@@ -462,9 +693,11 @@ impl TableBranchCatalog {
             key_rewrites: AtomicU64::new(0),
             lease_offset: AtomicU64::new(0),
         };
-        let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
-        cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
-        cat.tree.insert(keys::state(trunk.state.as_u8(), trunk.branch_id.id), Vec::new())?;
+        // Through `inward` like every other write, although the offset of a new catalog is 0 and
+        // `TRUNK_LEASE` is the sentinel, a fixed point either way.
+        let trunk = cat.inward(BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE));
+        cat.tree.insert(keys::record(trunk.branch_id().id), trunk.serialize_core())?;
+        cat.tree.insert(keys::state(trunk.state().as_u8(), trunk.branch_id().id), Vec::new())?;
         // Trunk is deliberately absent from the DEADLINE span: it is excluded from every reap
         // query, so an entry for it would sit at the head of the range for ever and every scan
         // would step over it.
@@ -563,7 +796,7 @@ impl TableBranchCatalog {
     /// record that came back empty would delete every arena on the next write. `live_children` is
     /// deliberately left EMPTY — it is unbounded, and every caller was moved onto the indexed
     /// queries first so that nothing reads it.
-    fn hydrate(&self, core: CoreRecord) -> Result<BranchRecord, FerroError> {
+    fn hydrate(&self, core: StoredCore) -> Result<StoredRecord, FerroError> {
         let id = core.branch_id().id;
         let mut arenas = Vec::new();
         let (lo, hi) = keys::arenas_of(id);
@@ -584,9 +817,9 @@ impl TableBranchCatalog {
         }
     }
 
-    fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
+    fn core(&self, id: u64) -> Result<Option<StoredCore>, FerroError> {
         match self.tree.search(&keys::record(id))? {
-            Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
+            Some(b) => Ok(Some(StoredCore::decode(&b)?)),
             None => Ok(None),
         }
     }
@@ -625,24 +858,27 @@ impl TableBranchCatalog {
     /// The precedent is eight lines away: `fork` already calls `self.tree.insert` directly for the
     /// child key, on exactly this reasoning. This extends it to the four keys that are new for the
     /// identical reason.
-    fn write_record_new(&self, rec: &BranchRecord) -> Result<(), FerroError> {
+    fn write_record_new<R: Writable>(&self, rec: &R) -> Result<(), FerroError> {
+        // D198: whatever came in, what is written is in virtual time. See `stored`.
+        let rec = rec.stored(self.offset());
+        let id = rec.branch_id();
         // A real assert, not debug_assert. A record carrying arenas would have them silently
         // dropped here, and "silently dropped arenas" is precisely the defect that leaked pages
         // permanently once already (6e28372) while the obvious assertion passed. One `is_empty()`
         // is nanoseconds; a repeat of that bug is not.
         assert!(
-            rec.arenas.is_empty(),
+            rec.arenas().is_empty(),
             "write_record_new was handed a record with {} arenas; it does not reconcile the arena \
              span, so they would be silently dropped. Use write_record.",
-            rec.arenas.len()
+            rec.arenas().len()
         );
-        self.tree.insert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.tree.insert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
-        if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.tree.insert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+        self.tree.insert(keys::record(id.id), rec.serialize_core())?;
+        self.tree.insert(keys::state(rec.state().as_u8(), id.id), Vec::new())?;
+        if Self::in_deadline_index(rec.state(), id) {
+            self.tree.insert(rec.deadline().index_key(id.id), Vec::new())?;
         }
-        if let Some(e) = &rec.envelope {
-            self.tree.insert(keys::envelope(rec.branch_id.id), e.serialize())?;
+        if let Some(e) = rec.envelope() {
+            self.tree.insert(keys::envelope(id.id), e.serialize())?;
         }
         Ok(())
     }
@@ -663,33 +899,34 @@ impl TableBranchCatalog {
     /// reaper (`expired_before` missing an entry means "not expired yet", and
     /// `reap_if_still_expired` re-reads the record anyway), which is why it is noted here rather
     /// than treated as the same defect.
-    fn write_record(
+    fn write_record<R: Writable>(
         &self,
-        rec: &BranchRecord,
-        old: Option<&CoreRecord>,
+        rec: &R,
+        old: Option<&StoredCore>,
     ) -> Result<(), FerroError> {
+        // D198: whatever came in, what is written is in virtual time — and `old` is typed as what
+        // the tree holds, so the keys removed are the keys that were written. See `stored`.
+        let rec = rec.stored(self.offset());
+        let id = rec.branch_id();
         if let Some(prev) = old {
             self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
             if Self::in_deadline_index(prev.state(), prev.branch_id()) {
-                self.remove_if_present(&keys::deadline(
-                    prev.lease_deadline().0,
-                    prev.branch_id().id,
-                ))?;
+                self.remove_if_present(&prev.deadline().index_key(prev.branch_id().id))?;
             }
         }
-        self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.upsert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
-        if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+        self.upsert(keys::record(id.id), rec.serialize_core())?;
+        self.upsert(keys::state(rec.state().as_u8(), id.id), Vec::new())?;
+        if Self::in_deadline_index(rec.state(), id) {
+            self.upsert(rec.deadline().index_key(id.id), Vec::new())?;
         }
-        match &rec.envelope {
-            Some(e) => self.upsert(keys::envelope(rec.branch_id.id), e.serialize())?,
+        match rec.envelope() {
+            Some(e) => self.upsert(keys::envelope(id.id), e.serialize())?,
             None => {
-                self.remove_if_present(&keys::envelope(rec.branch_id.id))?;
+                self.remove_if_present(&keys::envelope(id.id))?;
             }
         }
         // Arenas: the record is the authority, so the span is made to match it.
-        let (lo, hi) = keys::arenas_of(rec.branch_id.id);
+        let (lo, hi) = keys::arenas_of(id.id);
         let existing: Vec<Vec<u8>> = self
             .tree
             .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
@@ -700,13 +937,13 @@ impl TableBranchCatalog {
         for k in existing {
             if k.len() == 13 {
                 let a = ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap()));
-                if !rec.arenas.contains(&a) {
+                if !rec.arenas().contains(&a) {
                     self.remove_if_present(&k)?;
                 }
             }
         }
-        for a in &rec.arenas {
-            self.upsert(keys::arena(rec.branch_id.id, a.0), Vec::new())?;
+        for a in rec.arenas() {
+            self.upsert(keys::arena(id.id, a.0), Vec::new())?;
         }
         Ok(())
     }
@@ -921,64 +1158,37 @@ impl TableBranchCatalog {
         self.upsert(keys::alive(), v)
     }
 
-    /// A STORED (virtual) deadline on the lease clock: `v + D`, saturating.
-    ///
-    /// # The rule this whole scheme stands on
-    ///
-    /// **Every path that hands a deadline OUT of this catalog goes through here, and every path
-    /// that takes one IN goes through [`Self::to_stored`].** Internal read-modify-writes (`set_root`,
-    /// `set_state`, `reparent`, `restrict_envelope`, `charge_row_writes`) read the stored value and
-    /// write it back untouched, so they translate nothing — which is also why `hydrate` and `core`
-    /// do not translate: they feed those writes.
-    ///
-    /// A path that forgets the outward half returns `v`, which is SMALLER than the lease by `D`, and
-    /// whoever compares it with the lease clock sees the lease expire `D` early. That is the
-    /// destructive direction, and it is silent: the value is plausible. The outward paths are
-    /// `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `expired_before`, `enforced_lease`,
-    /// `reparent`'s return and `fork_staged`'s child; `f1_lease_grace` asserts through each of them
-    /// but `reparent` (no production caller since D63). A method added later that returns a record
-    /// must call [`Self::outward`].
-    ///
-    /// # D206 — the sentinel
-    ///
-    /// `u64::MAX` is `TRUNK_LEASE`, "never expires", and the reaper skips it. A shift must never
-    /// PRODUCE it — that would make a branch indistinguishable from trunk and un-reapable, with no
-    /// symptom — so the sum stops at `u64::MAX − 1` through `LeaseDeadline::saturating_deadline`,
-    /// the function `from_now` uses (`31364b3`). A stored `u64::MAX` is a caller's explicit "never"
-    /// and is returned unchanged: a fixed point of both translations. Wrapping, the third option,
-    /// would put a deadline in 1970.
-    fn to_lease_clock(&self, stored: LeaseDeadline) -> LeaseDeadline {
-        if stored.0 == u64::MAX {
-            // A caller's explicit "never" (`TRUNK_LEASE`, or a fork given `LeaseDeadline(u64::MAX)`):
-            // a fixed point, not a deadline to shift.
-            return stored;
-        }
-        // D206: a shifted deadline stops one short of the sentinel, as `from_now` does.
-        LeaseDeadline(LeaseDeadline::saturating_deadline(
-            stored.0,
-            self.lease_offset.load(Ordering::SeqCst),
-        ))
+    /// `D`, the virtual lease clock's offset. See [`TableBranchCatalog::lease_offset`].
+    fn offset(&self) -> u64 {
+        self.lease_offset.load(Ordering::SeqCst)
     }
 
-    /// A lease-clock deadline as it is STORED: `lease − D`, saturating at 0.
-    ///
-    /// Saturating at 0 is the one lossy case, and it loses in the harmless direction: a deadline
-    /// earlier than `D` — `expire_lease`'s offline 0, or a test's `LeaseDeadline(1)` — is stored as
-    /// 0 and reads back as `D`, a moment long past on any real lease clock, so it is still expired.
-    fn to_stored(&self, lease: LeaseDeadline) -> LeaseDeadline {
-        if lease.0 == u64::MAX {
-            // The same fixed point as `to_lease_clock`: stored `u64::MAX − D` would read back as a
-            // real deadline, and a caller's "never" would quietly become one after a restart.
-            return lease;
-        }
-        LeaseDeadline(lease.0.saturating_sub(self.lease_offset.load(Ordering::SeqCst)))
+    /// A stored deadline on the lease clock. The translation and its D206 clamp live in
+    /// [`stored`]; this binds them to this catalog's `D`.
+    fn to_lease_clock(&self, stored: StoredDeadline) -> LeaseDeadline {
+        stored.outward(self.offset())
     }
 
-    /// A record read from the tree, with its deadline put on the lease clock. See
-    /// [`Self::to_lease_clock`].
-    fn outward(&self, mut rec: BranchRecord) -> BranchRecord {
-        rec.lease_deadline = self.to_lease_clock(rec.lease_deadline);
-        rec
+    /// A lease-clock deadline as it is stored. See [`stored`].
+    fn to_stored(&self, lease: LeaseDeadline) -> StoredDeadline {
+        StoredDeadline::inward(lease, self.offset())
+    }
+
+    /// A stored record, handed out on the lease clock. Every outward path that returns a record
+    /// ends here — and since D198 cannot not end here, because what the tree yields is a
+    /// `StoredRecord` and what the trait returns is a `BranchRecord` (see [`stored`]).
+    fn outward(&self, rec: StoredRecord) -> BranchRecord {
+        rec.outward(self.offset())
+    }
+
+    /// A stored core record, handed out on the lease clock (`expired_before`'s answer).
+    fn outward_core(&self, core: StoredCore) -> CoreRecord {
+        core.outward(self.offset())
+    }
+
+    /// A lease-clock record, translated for writing. See [`stored::Writable`].
+    fn inward(&self, rec: BranchRecord) -> StoredRecord {
+        StoredRecord::inward(rec, self.offset())
     }
 
     /// Live branches, for parity with `LogBranchCatalog::live_count`.
@@ -1002,10 +1212,9 @@ impl TableBranchCatalog {
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         let old = self.core(record.branch_id.id)?;
-        // The caller's record came from `get`, on the lease clock; the tree holds virtual time.
-        let mut stored = record.clone();
-        stored.lease_deadline = self.to_stored(record.lease_deadline);
-        self.write_record(&stored, old.as_ref())?;
+        // The caller's record came from `get`, on the lease clock; `write_record` takes it through
+        // `inward` because it is a `BranchRecord`.
+        self.write_record(record, old.as_ref())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -1103,8 +1312,7 @@ impl BranchCatalog for TableBranchCatalog {
         };
         let child_id = BranchId::new(child_num, generation);
             // Stored in virtual time (D198); handed back on the lease clock, below.
-            let child = BranchRecord::fork_child_from_core(
-                &parent_core,
+            let child = parent_core.fork_child(
                 parent_envelope.as_ref(),
                 child_id,
                 fork_epoch,
@@ -1169,10 +1377,7 @@ impl BranchCatalog for TableBranchCatalog {
         // prevent and this method inherits the duty of. (D13b's caller was `collapse`, deleted by
         // D63; the duty is a property of this write, not of that caller.)
         let mut rec = self.hydrate(core)?;
-        rec.parent_id = Some(parent);
-        rec.fork_epoch = fork_epoch;
-        rec.depth = depth;
-        rec.root_page_id = root;
+        rec.reposition(parent, fork_epoch, depth, root);
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1246,7 +1451,7 @@ impl BranchCatalog for TableBranchCatalog {
             // what removes the ARENA keys of a branch whose extents the reaper has just returned.
             rec.mark_reaped();
         } else {
-            rec.state = to;
+            rec.set_state(to);
         }
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
@@ -1273,7 +1478,7 @@ impl BranchCatalog for TableBranchCatalog {
         core.check_readable(branch)?;
         let old = core.clone();
         let mut rec = self.hydrate(core)?;
-        rec.root_page_id = root;
+        rec.set_root(root);
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1288,30 +1493,22 @@ impl BranchCatalog for TableBranchCatalog {
         // `v`, answers it with one range and no per-branch rewrite ever having happened.
         // `now < D` expires nothing (every `v + D >= D > now`); `now == u64::MAX` expires
         // everything, including a `v` whose `v + D` saturated there.
-        let d = self.lease_offset.load(Ordering::SeqCst);
-        let stored_now = if now_millis == u64::MAX {
-            u64::MAX
-        } else {
-            match now_millis.checked_sub(d) {
-                Some(v) => v,
-                None => return Ok(Vec::new()),
-            }
+        let Some((lo, hi)) = stored::expired_span(now_millis, self.offset()) else {
+            return Ok(Vec::new());
         };
-        let (lo, hi) = keys::expired_at_or_before(stored_now);
         let mut out = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if let Some(rec) = self.core(id)? {
                 // The index holds only Live non-trunk branches, so this re-check is belt and
                 // braces against an index entry that outlived its record rather than a filter the
                 // query depends on. On the lease clock, like the answer.
-                let lease = self.to_lease_clock(rec.lease_deadline());
                 if Self::in_deadline_index(rec.state(), rec.branch_id())
-                    && lease.is_expired_at(now_millis)
+                    && self.to_lease_clock(rec.deadline()).is_expired_at(now_millis)
                 {
                     // NOT hydrated. The reaper reads branch_id, depth and fork_epoch -- all core.
                     // Hydrating here cost an arena range-scan plus an envelope lookup PER ANSWER
                     // ROW, both discarded: 24.3 us/row measured, against ~5 us for this descent.
-                    out.push(rec.with_lease_deadline(lease));
+                    out.push(self.outward_core(rec));
                 }
             }
         }
@@ -1349,7 +1546,7 @@ impl BranchCatalog for TableBranchCatalog {
         // it any more - they use the three indexed queries.
         Ok(Box::new(it.map(move |e| {
             let (_, v) = e?;
-            let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
+            let rec = StoredCore::decode(&v).map_err(FerroError::from)?;
             Ok(self.outward(self.hydrate(rec)?))
         })))
     }
@@ -1376,7 +1573,7 @@ impl BranchCatalog for TableBranchCatalog {
             .range_scan(Bound::Included(keys::record(lo)), Bound::Included(keys::record(hi)))?;
         Ok(Box::new(it.map(move |e| {
             let (_, v) = e?;
-            let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
+            let rec = StoredCore::decode(&v).map_err(FerroError::from)?;
             Ok(self.outward(self.hydrate(rec)?))
         })))
     }
@@ -1567,7 +1764,7 @@ impl BranchCatalog for TableBranchCatalog {
         let old = core.clone();
         let mut rec = self.hydrate(core)?;
         // D198: stored in virtual time. See `to_stored`.
-        rec.lease_deadline = self.to_stored(lease);
+        rec.set_deadline(self.to_stored(lease));
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1584,7 +1781,7 @@ impl BranchCatalog for TableBranchCatalog {
         let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         rec.check_readable(branch)?;
         Ok(Self::in_deadline_index(rec.state(), rec.branch_id())
-            .then_some(self.to_lease_clock(rec.lease_deadline())))
+            .then_some(self.to_lease_clock(rec.deadline())))
     }
 
     fn resume_leases(&self, now_millis: u64) -> Result<crate::branch::LeaseResume, FerroError> {
@@ -3035,7 +3232,13 @@ mod f1_lease_grace {
             stored_before,
             "the resume rewrote a record; the offset exists so that it never has to"
         );
-        assert_eq!(c.core(running.id).unwrap().unwrap().lease_deadline(), LeaseDeadline(1_500));
+        // The stored value is exactly the inward translation of what it now reads as. (Typed since
+        // D198's follow-up: a stored deadline is not a `LeaseDeadline` and has no raw accessor.)
+        assert_eq!(
+            c.core(running.id).unwrap().unwrap().deadline(),
+            c.to_stored(LeaseDeadline(4_500)),
+            "the stored deadline moved"
+        );
 
         // The expiry question gets the same answers the per-branch rewrite gave, at the same
         // instants: what ran out before the restart is still out, what was running is credited.
@@ -3282,6 +3485,27 @@ mod f1_lease_grace {
         let expired = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap().branch_id;
         assert_ne!(lease(&c, expired), u64::MAX, "a huge offset forged the sentinel");
         assert_eq!(lease(&c, never), u64::MAX);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `reparent` was the one outward path translated but not asserted (no production caller
+    /// since D63). It rewrites a record's position and must hand the record back on the lease
+    /// clock, and leave the deadline it did not name exactly where it was.
+    #[test]
+    fn reparent_hands_its_record_out_on_the_lease_clock() {
+        let path = sidecar("reparent");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+
+        let moved = c.reparent(b, a, Epoch(99), 7).unwrap();
+        assert_eq!(moved.lease_deadline, LeaseDeadline(4_500), "reparent's own return value");
+        assert_eq!((moved.parent_id, moved.root_page_id), (Some(a), 7), "premise: it reparented");
+        assert_eq!(lease(&c, b), 4_500, "reparent moved a deadline it did not name");
+        assert!(expired_ids(&c, 4_499).is_empty());
+        assert_eq!(expired_ids(&c, 4_500), vec![b.id], "the DEADLINE key moved with the rewrite");
         let _ = std::fs::remove_file(&path);
     }
 
