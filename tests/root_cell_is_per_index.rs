@@ -464,6 +464,178 @@ fn an_alter_after_a_lagging_record_keeps_the_cell_and_catches_the_record_up() {
     assert_eq!(d.ids(&format!("SELECT id FROM t WHERE id = {high};")), vec![high], "the row inserted after the ALTER is missing by key");
 }
 
+/// **Review 2's C4, for the index trees: an ALTER catches every index record up from its CELL, as it
+/// does the primary's (D214).** T11a (B-tree) and T11b (full-text), through the real ALTER path.
+///
+/// A failed INSERT can leave an index record behind its cell exactly as it can the primary's. It
+/// splits the index tree through the shared handle, then returns before `sync_roots` /
+/// `sync_fulltext_roots`. The ALTER's one persist then wrote that lagging record as it was. In
+/// memory that is harmless, because every statement descends the cell. But the persisted record is
+/// what an open that does not rebuild would seed its cell from. That one step (the lag) is
+/// SIMULATED: the index tree is grown until its root really splits, and its in-memory record is set
+/// back to the pre-split page. The ALTER renames a column the index does not cover.
+///
+/// FAILS at `3a1b57e` (INFERRED) at "wrote the lagging ... record as it was": `finish` caught up
+/// the primary record only.
+fn assert_alter_catches_up_a_lagging_index_record(fulltext: bool) {
+    let kind = if fulltext { "full-text" } else { "B-tree" };
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(100), w INTEGER);");
+    d.rows(if fulltext { "CREATE FULLTEXT INDEX fv ON t (v);" } else { "CREATE INDEX iv ON t (v);" });
+    let record = |d: &Db| -> u32 {
+        let (btree, ft) = d.record_roots("v");
+        let root = if fulltext { ft } else { btree };
+        root.expect("premise failed: no index record on v")
+    };
+    let pre_split = record(&d);
+    let mut id = 0;
+    while record(&d) == pre_split {
+        assert!(id < 5000, "premise failed: 5000 rows never split the {kind} index's root");
+        d.rows(&format!("INSERT INTO t VALUES ({id}, 'tok{id:06}', {id});"));
+        id += 1;
+    }
+    let cell = d.cell(if fulltext { IndexTree::FullText("v") } else { IndexTree::Secondary("v") });
+    let post_split = cell.load(Ordering::SeqCst);
+    assert_eq!(record(&d), post_split, "premise failed: the {kind} record did not catch up with the split");
+
+    // The one simulated step: the record a failed INSERT leaves before its root sync.
+    {
+        let e = d.catalog.tables.get_mut("t").unwrap();
+        if fulltext {
+            e.fulltext_indexes[0].root_page_id = pre_split;
+        } else {
+            e.indexes[0].root_page_id = pre_split;
+        }
+    }
+
+    d.rows("ALTER TABLE t RENAME COLUMN w TO w2;");
+
+    assert!(
+        Arc::ptr_eq(&cell, &d.cell(if fulltext { IndexTree::FullText("v") } else { IndexTree::Secondary("v") })),
+        "the ALTER replaced the {kind} index's cell"
+    );
+    assert_eq!(cell.load(Ordering::SeqCst), post_split, "the ALTER moved the {kind} index's cell");
+    assert_eq!(record(&d), post_split, "the ALTER wrote the lagging {kind} record as it was, instead of catching it up from its cell");
+}
+
+#[test]
+fn an_alter_catches_up_a_lagging_btree_record_from_its_cell() {
+    assert_alter_catches_up_a_lagging_index_record(false);
+}
+
+#[test]
+fn an_alter_catches_up_a_lagging_fulltext_record_from_its_cell() {
+    assert_alter_catches_up_a_lagging_index_record(true);
+}
+
+/// Rows per build in T12: enough to split the primary, the B-tree and the posting tree, each
+/// asserted as a premise.
+const DROP_ROWS: i32 = 600;
+
+/// Build `t` with a primary, a B-tree index and a full-text index on `v`, and `DROP_ROWS` rows,
+/// asserting that every tree's root split. When `lag` is set, put every record back on its tree's
+/// pre-split root: the lag failed INSERTs leave, the one simulated step. The pre-split root is now
+/// that tree's leftmost leaf.
+fn build_split_table(d: &mut Db, lag: bool) {
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(100));");
+    d.rows("CREATE INDEX iv ON t (v);");
+    d.rows("CREATE FULLTEXT INDEX fv ON t (v);");
+    let first_primary = d.catalog.get_table("t").unwrap().primary_index_root;
+    let (first_btree, first_ft) = d.record_roots("v");
+    for i in 0..DROP_ROWS {
+        d.rows(&format!("INSERT INTO t VALUES ({i}, 'v{i:06}');"));
+    }
+    let (btree, ft) = d.record_roots("v");
+    assert_ne!(d.catalog.get_table("t").unwrap().primary_index_root, first_primary, "premise failed: {DROP_ROWS} rows never split the primary root");
+    assert_ne!(btree, first_btree, "premise failed: {DROP_ROWS} rows never split the B-tree index's root");
+    assert_ne!(ft, first_ft, "premise failed: {DROP_ROWS} rows never split the posting tree's root");
+    if lag {
+        let e = d.catalog.tables.get_mut("t").unwrap();
+        e.primary_index_root = first_primary;
+        e.indexes[0].root_page_id = first_btree.unwrap();
+        e.fulltext_indexes[0].root_page_id = first_ft.unwrap();
+    }
+}
+
+/// `build_split_table`, then drop and rebuild it twice. Returns the highest allocated page with the
+/// second copy built, and again with the third.
+///
+/// This is `tests/d222_index_root_after_backfill.rs`'s instrument, reused. The first build-and-drop
+/// absorbs one-off growth. The allocator hands out the lowest free page, and identical statements
+/// need identical pages. So if each drop returned every page, the third copy lands exactly on the
+/// pages the second freed, and the two numbers match.
+fn highest_page_across_a_drop_after_lag(lag: bool) -> (u32, u32) {
+    let mut d = Db::new();
+    let build = |d: &mut Db| build_split_table(d, lag);
+    build(&mut d);
+    d.rows("DROP TABLE t;");
+    build(&mut d);
+    let peak = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
+    d.rows("DROP TABLE t;");
+    build(&mut d);
+    let after = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
+    (peak, after)
+}
+
+/// **T12, review 2's C4: DROP TABLE frees every tree from its CELL, so a record that lags frees the
+/// live tree and not the stale leaf it names.**
+///
+/// A lagging record names the pre-split root, which is now the tree's LEFTMOST LEAF, and freeing a
+/// leaf frees that one page. So a DROP from the records leaked every other page of all three trees.
+/// The control is the same schedule with no lag. It must hold at the base and with the fix; if it
+/// does not, something else is leaking and the second arm cannot be read.
+///
+/// FAILS at `3a1b57e` (INFERRED) at the second arm: the third copy needs pages beyond the second's.
+#[test]
+fn a_drop_after_lagging_records_frees_every_live_tree() {
+    let (control_peak, control_after) = highest_page_across_a_drop_after_lag(false);
+    assert_eq!(
+        control_after, control_peak,
+        "control: with every record current, rebuilding an identical table after a DROP moved the \
+         highest allocated page from {control_peak} to {control_after}. Something other than the \
+         lag is leaking, so the arm below cannot be read."
+    );
+
+    let (peak, after) = highest_page_across_a_drop_after_lag(true);
+    assert_eq!(
+        after, peak,
+        "with every record lagging its cell, rebuilding an identical table after a DROP moved the \
+         highest allocated page from {peak} to {after}: the drop freed the stale leaves the records \
+         name and leaked the live trees"
+    );
+}
+
+/// `build_split_table` on a fresh database, then `rebuild_indexes` on the live catalog, as the crash
+/// rebuild runs it. Returns the highest allocated page afterwards.
+fn highest_page_after_a_rebuild(lag: bool) -> u32 {
+    let mut d = Db::new();
+    build_split_table(&mut d, lag);
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+    d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap")
+}
+
+/// **T13, review 2's C4 carried through: `rebuild_indexes` frees every old tree from its CELL.**
+///
+/// The rebuild frees each old tree and then builds a fresh one. The allocator hands out the lowest
+/// free page, so a rebuild that freed a whole tree builds the new one on those pages. A rebuild that
+/// freed only the stale leaf a lagging record names builds past them, and the highest allocated
+/// page rises. The two arms are two fresh databases fed identical statements. The only difference
+/// is the simulated lag, so page allocation is the same until the frees differ.
+///
+/// Reachable only by a live caller. At `open_recovered`, `Catalog::open` has just seeded every cell
+/// from the records. FAILS at `bd2e29b` (INFERRED) at the assertion below.
+#[test]
+fn a_rebuild_after_lagging_records_frees_every_live_tree() {
+    let current = highest_page_after_a_rebuild(false);
+    let lagging = highest_page_after_a_rebuild(true);
+    assert_eq!(
+        lagging, current,
+        "with every record lagging its cell, a rebuild left the highest allocated page at {lagging} \
+         against {current} with current records: it freed the stale leaves the records name and \
+         leaked the live trees"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cells themselves (D208's fix). These use `IndexTree`, so they compile only from the fix on;
 // the behavioural tests above are the red phase and compile against either API.
@@ -617,9 +789,14 @@ fn a_rename_carries_both_kinds_cells_to_the_new_name() {
 /// `sync_root_cells` never overwrites, and retires a dead key only when it runs. `drop_table`
 /// returns at its `persist()?` before its sync, so a DROP whose persist failed leaves the dead
 /// tree's cell under the key. A CREATE of the same key then kept that cell and descended a FREED
-/// tree. Each test removes a record the way that DROP leaves it (gone from `tables`, no sync), then
-/// creates the same key again. The dead tree's pages are not freed here, so the new tree lands on
-/// new pages, and the premise says so.
+/// tree. Each test removes a record without a sync, then creates the same key again. The dead
+/// tree's pages are not freed here, so the new tree lands on new pages, and the premise says so.
+///
+/// **Only the TABLE test's state is reachable today** (D208 review 2, C5; PREREG amendment 7).
+/// That is a DROP TABLE whose persist failed, then CREATE TABLE. There is no `DROP INDEX`, and after
+/// that failed DROP the CREATE TABLE's sync retires the dead table's index keys before any CREATE
+/// INDEX can run. So the index and full-text tests pin defensive behaviour, for the day an index
+/// can leave its key some other way.
 ///
 /// FAIL at `f612ba8` (INFERRED) at the `ptr_eq`: the create's sync keeps the dead `Arc`.
 fn assert_fresh(dead: &Arc<std::sync::atomic::AtomicU32>, fresh: &Arc<std::sync::atomic::AtomicU32>, record: Option<u32>, what: &str) {

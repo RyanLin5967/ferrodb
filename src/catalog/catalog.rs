@@ -187,6 +187,38 @@ impl Catalog {
         }
     }
 
+    /// The root a tree IS at: its shared cell's value, or the record for a tree the catalog never
+    /// gave a cell. **One source of truth** (D208 review 2, C4): every statement descends the cell,
+    /// and a record can LAG it. An INSERT that split a root through the shared handle and then
+    /// failed before its root sync leaves the record on the pre-split page, which is now the tree's
+    /// leftmost leaf. Anything that reads a whole tree from its root must read it from here.
+    pub(crate) fn live_root(&self, table: &str, index: Option<IndexTree<&str>>, recorded: u32) -> u32 {
+        self.root_cell(table, index).map_or(recorded, |cell| cell.load(Ordering::Acquire))
+    }
+
+    /// Bring every INDEX record of `table` up to its shared cell (D208 review 2, C4). This is the rule
+    /// ALTER's `finish` follows for the primary index (D214), applied to the B-tree and full-text
+    /// indexes.
+    ///
+    /// ALTER's one persist writes every record of the table, so a record that lagged its cell was
+    /// written as it was. In memory that is harmless, because statements descend the cell. But the
+    /// persisted record is what an open that does not rebuild would seed its cell from. `pub(crate)`
+    /// for `catalog::alter`, and for `wal::recovery::rebuild_indexes`, which frees each old index
+    /// tree from its record. It never writes a cell.
+    pub(crate) fn catch_up_index_records(&mut self, table: &str) {
+        let Some(entry) = self.tables.get_mut(table) else { return };
+        for idx in entry.indexes.iter_mut() {
+            if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::Secondary(idx.column_name.clone())))) {
+                idx.root_page_id = cell.load(Ordering::Acquire);
+            }
+        }
+        for ft in entry.fulltext_indexes.iter_mut() {
+            if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::FullText(ft.column_name.clone())))) {
+                ft.root_page_id = cell.load(Ordering::Acquire);
+            }
+        }
+    }
+
     /// Install a FRESH shared cell for a tree the caller has just created and made durable (F4 of
     /// the D208 review).
     ///
@@ -463,17 +495,21 @@ impl Catalog {
     /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
     /// where those pages are.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
+        // Every tree is freed from its LIVE root, its shared cell, and not from the record (D208
+        // review 2, C4). A record that lags its cell names the pre-split page, which is now the
+        // leftmost leaf. Freeing that frees one page and leaks the rest of the tree
+        // (`tests/root_cell_is_per_index.rs`, T12).
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;
             (
                 entry.first_directory_page_id,
                 entry.time_travel_root,
-                entry.primary_index_root,
+                self.live_root(name, None, entry.primary_index_root),
                 // B8: the full-text roots go in the SAME list because the trees are the same type,
                 // and leaving them out would leak one tree per full-text index on every DROP TABLE
                 // — the E69 gap, re-opened by a second index list.
-                entry.indexes.iter().map(|i| i.root_page_id)
-                    .chain(entry.fulltext_indexes.iter().map(|i| i.root_page_id))
+                entry.indexes.iter().map(|i| self.live_root(name, Some(IndexTree::Secondary(&i.column_name)), i.root_page_id))
+                    .chain(entry.fulltext_indexes.iter().map(|i| self.live_root(name, Some(IndexTree::FullText(&i.column_name)), i.root_page_id)))
                     .collect::<Vec<_>>(),
             )
         };
