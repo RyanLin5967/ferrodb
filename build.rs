@@ -31,20 +31,28 @@
 //!   each only if it exists), `build.rs`, `Cargo.toml` and `Cargo.lock`. An edit to any of them is
 //!   an edit to what is being compiled, so it re-stamps. This is what makes an unstaged edit say
 //!   `+DIRTY`.
-//! * **The git state**: this worktree's `HEAD` and index, the checked-out branch's ref file, and
-//!   `packed-refs`, plus the `reftable/` directories on a repository that keeps its refs that way.
-//!   Every one is resolved by `git rev-parse --git-path`, because in a linked worktree `HEAD` and
-//!   the index live in the worktree's own git directory and the refs in the shared one. A commit
-//!   moves the branch's ref file and leaves `HEAD` alone; `git reset --soft` moves it and leaves
-//!   the index alone too.
+//! * **The git state**: this worktree's `HEAD` and index, and the checked-out branch's ref file
+//!   (or, on a repository that keeps its refs in reftable, its `reftable/` directories). Each is
+//!   resolved by `git rev-parse` (`--git-path`, and `--git-common-dir` for the shared reftable),
+//!   because in a linked worktree `HEAD` and the index live in the worktree's own git directory
+//!   and the refs in the shared one. A commit moves the branch's ref file and leaves `HEAD`
+//!   alone; `git reset --soft` moves it and leaves the index alone too.
+//!
+//!   `packed-refs` is deliberately NOT watched. While the branch's ref file exists it shadows the
+//!   packed value, so a change to `packed-refs` cannot change what `HEAD` resolves to; while the
+//!   file does not exist, watching it already re-runs this script on every build (below).
+//!   Watching `packed-refs` as well would add no information, and would rebuild every worktree
+//!   of the repository whenever any packed branch anywhere is deleted, which rewrites that one
+//!   shared file (measured by D231's review).
 //!
 //! **D231.** The list used to be `.git/HEAD` and `.git/index`, relative to the package. In a main
 //! checkout that missed every unstaged edit, so a binary said clean for code it was not built
 //! from, and every branch move that did not also rewrite the index (`git reset --soft` does not).
 //! In a linked worktree `.git` is a file and both paths were missing, and the Cargo FAQ says a
 //! missing watched path re-runs the script, and rebuilds the crate, on every build: the stamp came
-//! out right there, at the price of a rebuild per cargo invocation. D231's check script
-//! (`bench/d231_stamp_check.sh`) measures all three rather than taking them from the docs.
+//! out right there, at the price of a rebuild per cargo invocation. `bench/d231_stamp_check.sh`
+//! measures all three at the base and at the fix; its output, not this paragraph, is the
+//! evidence.
 //!
 //! # What it cannot do
 //!
@@ -57,13 +65,26 @@
 //!   since a clean re-stamp, not that nothing in the repository has. Anything the crate compiles
 //!   in from outside those paths, such as an `include_str!` of a file elsewhere, must be added to
 //!   `INPUTS` or it is invisible here.
-//! * Cargo detects a change by mtime alone, so an edit that keeps a file's mtime is invisible.
+//! * Cargo detects a change by mtime alone, against the time this script last ran. A change that
+//!   leaves a file's mtime no newer than that is invisible: an edit that preserves the mtime, or
+//!   an older copy put back with `cp -p` or `rsync -a`.
 //! * It cannot see a dirty SUBMODULE or an untracked file that is not on the build path.
+//! * **Every re-stamp rebuilds the crate, and so everything that links it.** The Cargo FAQ lists a
+//!   re-running build script as a cause of rebuilds; that the dependents follow is inferred. So an
+//!   edit to one test or example rebuilds the library and every target, where cargo alone would
+//!   have rebuilt that one target, and so does a file in a watched directory that is never
+//!   compiled: `tests/pg/`'s Python clients, or the `__pycache__/` Python writes beside them the
+//!   first time they run. That is the price of the stamp living in the library, and it is paid
+//!   deliberately: a harness in `examples/` edited and not committed must still say `+DIRTY`.
 //! * A watched git path that does not exist makes cargo re-run this script, and therefore rebuild
 //!   the crate, on every build until it does exist. The stamp stays right and the rebuild is the
 //!   cost. A branch that lives only in `packed-refs` does this until its next commit creates its
 //!   ref file.
-//! * If `git` is absent, or cannot say where this package's repository is, it emits `unknown`,
+//! * In a reftable repository the shared table changes on every ref update in every worktree, so
+//!   any commit anywhere re-stamps, and rebuilds, every worktree. ferrodb's repository uses the
+//!   files store, so this is latent here.
+//! * If `git` is absent, or cannot say where this package's repository is (which includes a git
+//!   older than 2.31, too old to answer the question the way it is asked), it emits `unknown`,
 //!   which reads as loudly as it should. It does NOT fail the build: refusing to compile ferrodb
 //!   because git is missing would be a worse failure than an honest `unknown`.
 //!
@@ -176,8 +197,8 @@ fn local_git_env() -> Vec<String> {
 /// say where this package's repository is.
 ///
 /// `--git-path` rather than names joined onto `--git-dir` by hand: git knows that `HEAD` and the
-/// index belong to this worktree and the refs to the common directory, and it honours relocations
-/// such as `GIT_INDEX_FILE`.
+/// index belong to this worktree and the refs to the common directory. (It would also honour a
+/// relocation such as `GIT_INDEX_FILE`, but `main` has cleared those by the time this runs.)
 fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBuf>> {
     // The two ref stores are asked different questions. In a reftable repository the `HEAD` file
     // is a fixed placeholder (`ref: refs/heads/.invalid`), every ref lives in a `reftable/`
@@ -190,14 +211,15 @@ fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBu
     // `refs/heads/<branch>`, or nothing when HEAD is detached. A detached HEAD holds the commit
     // itself, so its file is then the whole of it.
     let branch = if reftable { None } else { git(&["symbolic-ref", "-q", "HEAD"]) };
+    // The branch's ref file is asked for EVEN when it does not exist. Then the branch lives only
+    // in `packed-refs`, its next commit creates the file, and until then cargo's re-run on every
+    // build for a missing watched path is what keeps the stamp right. (`packed-refs` itself is
+    // not watched: the module doc says why.)
     let mut asked = vec!["HEAD", "index"];
     if reftable {
         asked.push("reftable");
-    } else {
-        asked.push("packed-refs");
-        if let Some(b) = branch.as_deref() {
-            asked.push(b);
-        }
+    } else if let Some(b) = branch.as_deref() {
+        asked.push(b);
     }
     let mut args = vec!["rev-parse", "--path-format=absolute", "--git-common-dir"];
     for name in &asked {
@@ -214,17 +236,7 @@ fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBu
         return None;
     }
 
-    let mut watched = Vec::new();
-    for (name, path) in asked.iter().zip(&paths[1..]) {
-        // `packed-refs` does not exist until something packs refs, and while it does not, the
-        // branch's own ref file (watched too) is the whole answer. That file is watched EVEN when
-        // absent: then the branch lives only in `packed-refs`, its next commit creates the file,
-        // and until then the re-run on every build is what keeps the stamp right.
-        if *name == "packed-refs" && !path.exists() {
-            continue;
-        }
-        watched.push(path.clone());
-    }
+    let mut watched = paths[1..].to_vec();
     if reftable {
         // `--git-path reftable` is this worktree's own table; the branches are in the shared one,
         // which in a main checkout is the same directory.

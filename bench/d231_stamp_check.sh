@@ -18,30 +18,47 @@
 # THE INSTRUMENT is the binary itself: an untracked example, examples/d231_stamp_probe.rs, written
 # into each checkout before its first build, prints `ferrodb::build_provenance()`. That is the
 # same call every bench harness prints. Beside it, two witnesses are read off cargo:
-#   rerun=yes|no   whether the build script's `output` file was rewritten by this build;
+#   rerun=yes|no   whether this build rewrote the build script's `output` file, i.e. re-stamped;
 #   lib_fresh      cargo's own `fresh` flag for the ferrodb lib, from --message-format=json.
-# Every build gets one line:
+# A step PASSES only if BOTH the printed stamp and `rerun` are what the step expects: a stamp that
+# comes out right without the script having re-run proves nothing about the watch that step
+# exists to exercise. Every build gets one line:
 #   D231 commit=<sha12> arm=<clone|linked> step=<n-name> expect="<stamp>" got="<stamp>"
-#        rerun=<yes|no> lib_fresh=<true|false> script_stamp=<commit>/<dirty> verdict=<PASS|FAIL>
-# plus one HEAT line per arm for the no-change rebuild, which is a measurement and not a verdict.
+#        stamp_ok=<y|n> expect_rerun=<yes|no> rerun=<yes|no> lib_fresh=<true|false>
+#        script_stamp=<commit>/<dirty> verdict=<PASS|FAIL>
 #
-# STEPS, per arm, each followed by a build and a probe:
-#   1-fresh-build        nothing changed                          -> at S0
-#   2-no-change-rebuild  nothing changed, again (HEAT line)       -> at S0
-#   3-unstaged-edit      a comment appended to src/lib.rs         -> at S0 +DIRTY
-#   4-commit             `git add` + `git commit` of that edit    -> at S1
-#   5-reset-soft         `git reset --soft HEAD~1` moves only the branch ref file: HEAD and the
-#                        index are untouched (measured on git 2.50.1, see the lane report)
-#                                                                 -> at S0 +DIRTY (edit staged)
-#   6-foreign-git-dir    the index's mtime touched to force a re-stamp, and the build run with
-#                        GIT_DIR=foreign.git, as a git hook would   -> at S0 +DIRTY, NOT <commit>^
+# STEPS, per arm. Q0 is a second commit with S0's exact tree; foreign.git's HEAD is <commit>^.
+# Each step is one change, then a build, then the probe:
+#   1-fresh-build        nothing                                        at S0          rerun yes
+#   2-no-change-rebuild  nothing, again: the re-run on EVERY build that
+#                        a missing watched path causes shows up here    at S0          rerun no
+#   3-unstaged-edit      a comment appended to src/lib.rs               at S0 +DIRTY   rerun yes
+#   4-commit             `git add` + `git commit` of that edit          at S1          rerun yes
+#   5-reset-soft         `git reset --soft HEAD~1`: moves the branch's
+#                        ref file only; HEAD and the index untouched
+#                        (a WITNESS line measures that)                 at S0 +DIRTY   rerun yes
+#   6-foreign-git-dir    index mtime touched, build run with
+#                        GIT_DIR=foreign.git as a git hook would        at S0 +DIRTY   rerun yes
+#                        (NOT at <commit>^, foreign.git's HEAD)
+#   7-head-only          `git symbolic-ref HEAD` to a branch at Q0:
+#                        rewrites HEAD only (WITNESS line)              at Q0 +DIRTY   rerun yes
+#   8-clean-again        `git reset --hard`                             at Q0          rerun yes
+#   9-index-only         README.md (not a build input) edited and
+#                        `git add`ed: rewrites the index only           at Q0 +DIRTY   rerun yes
+#   10-stale-stat        README.md and src/lib.rs touched (contents
+#                        unchanged) and the index touched, so the
+#                        script re-runs with stale stat information     at Q0 +DIRTY   rerun yes
+#   11-no-self-rerun     nothing: a script whose `git status` wrote the
+#                        index back in step 10 re-runs itself here      at Q0 +DIRTY   rerun no
 #
 # EXIT: 0 every verdict PASS; 1 at least one FAIL (the expected result at the base); 2 the
-# harness could not measure (a build failed, the probe printed nothing, a sha did not resolve).
-# A run that collected nothing has not passed, so 2 is never folded into 0 or 1.
+# harness could not measure (a build failed, the probe printed nothing, a sha did not resolve, an
+# mtime could not be read). A run that collected nothing has not passed, so 2 is never folded into
+# 0 or 1. On exit 2, $WORK is left in place for diagnosis.
 #
-# CLEANUP: $WORK is removed at the end unless D231_KEEP=1. The removal is guarded by a sentinel
-# this script writes and by the path's shape, so it cannot remove anything it did not make.
+# CLEANUP: on exit 0 or 1, $WORK is removed unless D231_KEEP=1. The removal is guarded by a
+# sentinel this script writes into a directory it created itself (`mkdir` without `-p`, so two
+# runs cannot share one), and by the path's shape.
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -58,8 +75,9 @@ case "$WORK" in
   */d231-check-*.noindex) ;;
   *) echo "D231 HARNESS: WORK=$WORK must match */d231-check-*.noindex (Spotlight, and the cleanup guard)"; exit 2 ;;
 esac
-if [ -e "$WORK" ]; then echo "D231 HARNESS: $WORK already exists; refusing to reuse or overwrite it"; exit 2; fi
-mkdir -p "$WORK" || exit 2
+mkdir -p "$(dirname "$WORK")" || exit 2
+# No `-p`: creating the directory IS the check that nobody else is using it.
+mkdir "$WORK" 2>/dev/null || { echo "D231 HARNESS: could not create $WORK (it exists, or its parent is unwritable)"; exit 2; }
 : > "$WORK/.d231-stamp-check-sentinel"
 
 SELF=$(git -C "$(dirname "$0")" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -93,8 +111,17 @@ for line in sys.stdin:
 print(out_dir, fresh)
 PY
 
-mtime_ns() {  # prints the file's mtime in ns, or 0 when it does not exist
-  python3 -c 'import os,sys; p=sys.argv[1]; print(os.stat(p).st_mtime_ns if os.path.exists(p) else 0)' "$1"
+# mt <var> <path>: set <var> to the file's mtime in ns, or 0 when it does not exist. Runs in the
+# calling shell rather than inside `$(...)`, so its `exit 2` ends the run. An unreadable mtime is a
+# harness failure: an empty answer compared with another empty answer reads as "unchanged", which
+# looks exactly like a measurement.
+mt() {
+  local v
+  v=$(python3 -c 'import os,sys; p=sys.argv[1]; print(os.stat(p).st_mtime_ns if os.path.exists(p) else 0)' "$2")
+  case "$v" in
+    ''|*[!0-9]*) echo "D231 HARNESS: could not read the mtime of $2"; exit 2 ;;
+  esac
+  printf -v "$1" '%s' "$v"
 }
 
 script_stamp() {  # the env lines the build script handed cargo: <commit>/<dirty>
@@ -110,14 +137,14 @@ script_stamp() {  # the env lines the build script handed cargo: <commit>/<dirty
 # build's `check`, read by the next.
 outfile_for() { cat "$WORK/outfile.$1" 2>/dev/null || echo "-"; }
 
-# check <arm> <checkout> <target> <step> <expected stamp> [VAR=value ...]
+# check <arm> <checkout> <target> <step> <expected stamp> <expected rerun: yes|no> [VAR=value ...]
 check() {
-  local arm=$1 ck=$2 tgt=$3 step=$4 expect=$5
-  shift 5
-  local of before json_line got after rerun fresh out_dir verdict
+  local arm=$1 ck=$2 tgt=$3 step=$4 expect=$5 expect_rerun=$6
+  shift 6
+  local of before json_line got after rerun fresh out_dir stamp_ok verdict
   of=$(outfile_for "$arm")
   before=0
-  [ "$of" != "-" ] && before=$(mtime_ns "$of")
+  if [ "$of" != "-" ]; then mt before "$of"; fi
 
   # `${1+"$@"}`, not `"$@"`: bash 3.2 (macOS /bin/bash) calls an empty "$@" unbound under set -u.
   if ! ( cd "$ck" && env CARGO_TARGET_DIR="$tgt" ${1+"$@"} timeout 3600 cargo build --offline --quiet \
@@ -127,7 +154,7 @@ check() {
     tail -5 "$WORK/build.$arm.$step.err"
     exit 2
   fi
-  json_line=$(python3 "$PARSE" < "$WORK/build.$arm.$step.json")
+  json_line=$(python3 "$PARSE" < "$WORK/build.$arm.$step.json") || exit 2
   out_dir=${json_line% *}
   fresh=${json_line##* }
   if [ "$out_dir" != "-" ]; then
@@ -136,23 +163,24 @@ check() {
   fi
   got=$("$tgt/debug/examples/d231_stamp_probe" 2>&1 | head -1)
   if [ -z "$got" ]; then echo "D231 HARNESS: the probe printed nothing, arm=$arm step=$step"; exit 2; fi
-
-  if [ "$of" = "-" ]; then
-    rerun="?"
-  else
-    after=$(mtime_ns "$of")
-    if [ "$after" != "$before" ]; then rerun=yes; else rerun=no; fi
-  fi
+  if [ "$of" = "-" ]; then echo "D231 HARNESS: cargo never said where the build script's output is, arm=$arm step=$step"; exit 2; fi
+  mt after "$of"
+  if [ "$after" != "$before" ]; then rerun=yes; else rerun=no; fi
 
   case "$expect" in
-    *" +DIRTY") case "$got" in "$expect "*) verdict=PASS ;; *) verdict=FAIL ;; esac ;;
-    *) if [ "$got" = "$expect" ]; then verdict=PASS; else verdict=FAIL; fi ;;
+    *" +DIRTY") case "$got" in "$expect "*) stamp_ok=y ;; *) stamp_ok=n ;; esac ;;
+    *) if [ "$got" = "$expect" ]; then stamp_ok=y; else stamp_ok=n; fi ;;
   esac
+  if [ "$stamp_ok" = y ] && [ "$rerun" = "$expect_rerun" ]; then verdict=PASS; else verdict=FAIL; fi
   if [ "$verdict" = PASS ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
-  echo "D231 commit=$SHA12 arm=$arm step=$step expect=\"$expect\" got=\"$got\" rerun=$rerun lib_fresh=$fresh script_stamp=$(script_stamp "$of") verdict=$verdict"
-  if [ "$step" = "2-no-change-rebuild" ]; then
-    echo "D231 HEAT commit=$SHA12 arm=$arm no-change-rebuild rerun=$rerun lib_fresh=$fresh"
-  fi
+  echo "D231 commit=$SHA12 arm=$arm step=$step expect=\"$expect\" got=\"$got\" stamp_ok=$stamp_ok expect_rerun=$expect_rerun rerun=$rerun lib_fresh=$fresh script_stamp=$(script_stamp "$of") verdict=$verdict"
+}
+
+# witness <arm> <what> <index-before> <head-before> <ref-before> <index-file> <head-file> <ref-file>
+witness() {
+  local i h r
+  mt i "$6"; mt h "$7"; mt r "$8"
+  echo "D231 WITNESS arm=$1 $2 index_touched=$([ "$3" = "$i" ] && echo no || echo yes) head_touched=$([ "$4" = "$h" ] && echo no || echo yes) branch_ref_touched=$([ "$5" = "$r" ] && echo no || echo yes)"
 }
 
 probe_source() {
@@ -170,16 +198,27 @@ g() {  # git in a probe checkout: no hooks, no signing, a fixed identity
       -c user.name=d231-probe -c user.email=d231@probe.invalid "${@:2}"
 }
 
+gpath() {  # an absolute git path in a checkout: gpath <checkout> <name>
+  git -C "$1" rev-parse --path-format=absolute --git-path "$2"
+}
+
 # --- the checkouts ---------------------------------------------------------------------------
 git clone -q --shared --no-checkout "$REPO" "$CLONE" || exit 2
 g "$CLONE" checkout -q -b d231-probe "$SHA" || exit 2
 g "$CLONE" worktree add -q -b d231-probe-linked "$LINKED" "$SHA" || exit 2
 git clone -q --bare --shared "$REPO" "$FOREIGN" || exit 2
 git --git-dir="$FOREIGN" update-ref --no-deref HEAD "$SHA^" || exit 2
+# Q0: a second commit with EXACTLY S0's tree. Steps 7-11 move HEAD to it, so the stamp must move
+# while every file, build.rs included, stays the one under test. (<commit>^ would not do: its
+# build.rs is not necessarily the one being tested.)
+Q0FULL=$(g "$CLONE" commit-tree "$SHA^{tree}" -p "$SHA" -m "d231 probe: S0's tree, another commit") || exit 2
 S0=$(git -C "$CLONE" rev-parse --short=12 HEAD)
+Q0=$(git -C "$CLONE" rev-parse --short=12 "$Q0FULL")
 FOREIGN12=$(git --git-dir="$FOREIGN" rev-parse --short=12 HEAD)
-if [ "$S0" = "$FOREIGN12" ]; then echo "D231 HARNESS: foreign HEAD equals S0, step 6 cannot discriminate"; exit 2; fi
-echo "D231 SHAS S0=$S0 foreign=$FOREIGN12"
+if [ "$S0" = "$Q0" ] || [ "$S0" = "$FOREIGN12" ]; then
+  echo "D231 HARNESS: S0=$S0 Q0=$Q0 foreign=$FOREIGN12; steps 6 and 7 need three different commits"; exit 2
+fi
+echo "D231 SHAS S0=$S0 Q0=$Q0 foreign=$FOREIGN12"
 
 for arm in clone linked; do
   if [ "$arm" = clone ]; then ck=$CLONE; else ck=$LINKED; fi
@@ -189,26 +228,41 @@ for arm in clone linked; do
   if [ "$arm" = clone ] && [ ! -d "$ck/.git" ]; then echo "D231 HARNESS: $ck/.git is not a directory"; exit 2; fi
   if [ "$arm" = linked ] && [ ! -f "$ck/.git" ]; then echo "D231 HARNESS: $ck/.git is not a file"; exit 2; fi
 
-  check "$arm" "$ck" "$tgt" 1-fresh-build "at $S0"
-  check "$arm" "$ck" "$tgt" 2-no-change-rebuild "at $S0"
+  check "$arm" "$ck" "$tgt" 1-fresh-build "at $S0" yes
+  check "$arm" "$ck" "$tgt" 2-no-change-rebuild "at $S0" no
 
   printf '\n// d231 probe edit\n' >> "$ck/src/lib.rs"
-  check "$arm" "$ck" "$tgt" 3-unstaged-edit "at $S0 +DIRTY"
+  check "$arm" "$ck" "$tgt" 3-unstaged-edit "at $S0 +DIRTY" yes
 
   g "$ck" add src/lib.rs && g "$ck" commit -q -m "d231 probe commit" || exit 2
   S1=$(git -C "$ck" rev-parse --short=12 HEAD)
-  check "$arm" "$ck" "$tgt" 4-commit "at $S1"
+  check "$arm" "$ck" "$tgt" 4-commit "at $S1" yes
 
-  idx=$(git -C "$ck" rev-parse --path-format=absolute --git-path index)
-  head_file=$(git -C "$ck" rev-parse --path-format=absolute --git-path HEAD)
-  i0=$(mtime_ns "$idx"); h0=$(mtime_ns "$head_file")
+  idx=$(gpath "$ck" index); hf=$(gpath "$ck" HEAD); rf=$(gpath "$ck" "$(git -C "$ck" symbolic-ref -q HEAD)")
+  mt i0 "$idx"; mt h0 "$hf"; mt r0 "$rf"
   g "$ck" reset -q --soft HEAD~1 || exit 2
-  i1=$(mtime_ns "$idx"); h1=$(mtime_ns "$head_file")
-  echo "D231 WITNESS arm=$arm reset-soft index_touched=$([ "$i0" = "$i1" ] && echo no || echo yes) head_touched=$([ "$h0" = "$h1" ] && echo no || echo yes)"
-  check "$arm" "$ck" "$tgt" 5-reset-soft "at $S0 +DIRTY"
+  witness "$arm" reset-soft "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
+  check "$arm" "$ck" "$tgt" 5-reset-soft "at $S0 +DIRTY" yes
 
   touch "$idx"
-  check "$arm" "$ck" "$tgt" 6-foreign-git-dir "at $S0 +DIRTY" GIT_DIR="$FOREIGN"
+  check "$arm" "$ck" "$tgt" 6-foreign-git-dir "at $S0 +DIRTY" yes GIT_DIR="$FOREIGN"
+
+  g "$ck" branch -q "d231-probe-$arm-q0" "$Q0FULL" || exit 2
+  mt i0 "$idx"; mt h0 "$hf"; mt r0 "$rf"
+  g "$ck" symbolic-ref HEAD "refs/heads/d231-probe-$arm-q0" || exit 2
+  witness "$arm" head-only "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
+  check "$arm" "$ck" "$tgt" 7-head-only "at $Q0 +DIRTY" yes
+
+  g "$ck" reset -q --hard || exit 2
+  check "$arm" "$ck" "$tgt" 8-clean-again "at $Q0" yes
+
+  printf '\nd231 probe\n' >> "$ck/README.md"
+  g "$ck" add README.md || exit 2
+  check "$arm" "$ck" "$tgt" 9-index-only "at $Q0 +DIRTY" yes
+
+  touch "$ck/README.md" "$ck/src/lib.rs" "$idx"
+  check "$arm" "$ck" "$tgt" 10-stale-stat "at $Q0 +DIRTY" yes
+  check "$arm" "$ck" "$tgt" 11-no-self-rerun "at $Q0 +DIRTY" no
 done
 
 echo "D231 SUMMARY commit=$SHA12 pass=$PASS fail=$FAIL"
