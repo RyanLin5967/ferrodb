@@ -971,6 +971,49 @@ mod tests {
         assert_eq!(final_catalog.tables.len(), 10);
     }
 
+    /// **A table named on two catalog pages loads from the EARLIER page** (D229 (c); the candidates
+    /// adversary's caveat on R0, `frontier/d229_candidates_adversary.md` (e)).
+    ///
+    /// Once the chain never shrinks, a persist that moves an entry to an earlier page leaves the
+    /// entry's old copy on a later page until that page is written too. `flush_all` writes in
+    /// ascending page id and page 1 is the lowest, so a crash in between leaves page 1 new and the
+    /// tail old: the same table on both, the earlier copy the newer one. `load` kept the LAST copy
+    /// it met, which is the stale one, root and all.
+    ///
+    /// FAILS at `a6e93ab` (INFERRED): `t` loads with the tail's root, 600.
+    #[test]
+    fn a_table_named_on_two_catalog_pages_loads_from_the_earlier_page() {
+        let catalog = setup_catalog();
+        let bp = catalog.buffer_pool.clone();
+        let tail_id = bp.new_page().unwrap();
+        let entry = |root: u32| TableEntry {
+            name: "t".to_string(),
+            first_directory_page_id: 2,
+            primary_index_root: root,
+            schema: create_test_schema(),
+            indexes: vec![],
+            fulltext_indexes: vec![],
+            time_travel_root: 3,
+        };
+        let mut first = CatalogPage::new(1);
+        first.add_entry(entry(700)).unwrap();
+        first.next_catalog_page = tail_id;
+        let mut tail = CatalogPage::new(tail_id);
+        tail.add_entry(entry(600)).unwrap();
+        for (id, page) in [(1, first), (tail_id, tail)] {
+            let frame_i = bp.fetch_page(id).unwrap();
+            bp.frame_write(frame_i).data = page.serialize().unwrap();
+            bp.unpin_page(id, true);
+        }
+
+        let opened = Catalog::open(bp, 1).unwrap();
+        assert_eq!(
+            opened.get_table("t").expect("t did not load").primary_index_root,
+            700,
+            "a table on two catalog pages loaded from the later page, the copy a torn persist left stale"
+        );
+    }
+
     #[test]
     fn test_create_table_adds_time_travel_root() {
         let mut catalog = setup_catalog();

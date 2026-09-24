@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -451,17 +451,12 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             db_path.display()
         )));
     }
-    let existed = db_path.exists();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(db_path)
-        .map_err(|e| FerroError::Io(format!("open {}: {e}", db_path.display())))?;
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file)?)));
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push(".wal");
-    let wal = Arc::new(WalManager::new(PathBuf::from(wal_path))?);
+    let wal_path = PathBuf::from(wal_path);
+    let (db_file, wal_file, existed) = open_files(db_path, &wal_path)?;
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::with_storage(db_file)?)));
+    let wal = Arc::new(WalManager::with_storage(wal_file, wal_path)?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
     let recovered = recover(&txn)?;
@@ -506,6 +501,52 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     }
     Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
 }
+
+/// The page file and the log [`open_recovered`] opens, and whether the page file existed before
+/// this open: `DiskManager::new` and `WalManager::new` did exactly this, on the same files.
+///
+/// In this crate's own tests a thread may hand over the storage to use instead
+/// (`tests_crash_frees::TEST_FILES`), so a `SimFabric` can put a crash at any operation of an open.
+/// That is the only difference, and it does not exist outside `#[cfg(test)]`.
+fn open_files(db_path: &Path, wal_path: &Path) -> Result<(Arc<dyn Storage>, Arc<dyn Storage>, bool), FerroError> {
+    if let Some(files) = test_files() {
+        return Ok(files);
+    }
+    let existed = db_path.exists();
+    let db: Arc<dyn Storage> = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(db_path)
+            .map_err(|e| FerroError::Io(format!("open {}: {e}", db_path.display())))?,
+    );
+    let wal: Arc<dyn Storage> = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(wal_path)
+            .map_err(|e| FerroError::Wal(e.to_string()))?,
+    );
+    Ok((db, wal, existed))
+}
+
+/// The test seam's production half: no storage is ever handed over.
+#[cfg(not(test))]
+fn test_files() -> Option<(Arc<dyn Storage>, Arc<dyn Storage>, bool)> {
+    None
+}
+
+/// The test seam's test half: whatever this thread handed over, taken once.
+#[cfg(test)]
+fn test_files() -> Option<(Arc<dyn Storage>, Arc<dyn Storage>, bool)> {
+    tests_crash_frees::TEST_FILES.with(|f| f.borrow_mut().take())
+}
+
+#[cfg(test)]
+#[path = "tests_crash_frees.rs"]
+mod tests_crash_frees;
 
 #[cfg(test)]
 mod tests {
