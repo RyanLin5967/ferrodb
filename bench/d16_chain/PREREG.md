@@ -485,3 +485,28 @@ reports success without having run what is registered. Changes:
   caused it, because that is the condition the operator must act on. A failed `git grep` for the
   D200 marker refuses (exit 2) instead of reading as "absent". Every `VALUES` key must name a mutant,
   or the script refuses. HEAD and the tree are re-checked before the final baseline build too.
+
+---
+
+## Amendment 5 — 2026-09-24, after a fourth fresh-context review of the restore path; before the change
+
+Nothing compiled or run. The review found no single-signal path that leaves a mutant in `src/` or
+loses a SIGTERM/SIGHUP. It did find narrow windows that mislabel an outcome or give the wrong exit
+code. Amendment 4's restore description is refined as follows:
+
+- **The signal handler is one-shot, and SIGINT uses it too.** The first SIGTERM, SIGHUP or SIGINT sets
+  all three to ignored, then unwinds. A second signal can no longer interrupt the handler: the
+  installed GNU `timeout` signals the child and then its process group.
+- **Applying a mutant is atomic with respect to signals too.** The three signals are blocked from
+  "remember what is applied" through "mutant on disk", exactly as during a restore.
+- **A file that holds HEAD's own bytes is not a foreign edit.** Only bytes that are neither the
+  original nor the mutant count as one. The run checks the file against HEAD BEFORE claiming that
+  HEAD's bytes were put back.
+- **One exit path.** However `main` ends, `__main__` restores and then verifies the last mutated file
+  against HEAD:
+  - a failed restore, or a file that does not match HEAD: exit 2;
+  - a signal: exit 3, and the message says the file was verified;
+  - otherwise `main`'s code, with a note when an interrupt arrived while a stop condition took
+    precedence.
+- **Blind spot, stated.** A foreign write that lands between the restore's read of the file and its
+  `os.replace` is overwritten and not saved.
