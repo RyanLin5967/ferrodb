@@ -1624,4 +1624,43 @@ mod tests {
         assert_eq!(total, 20, "not every change was delivered across batches");
         assert!(rounds > 1, "the backlog came out in one batch, so bounding was never exercised");
     }
+
+    /// **A pump's bound inside a record must not break the next pump (the D252 review's B1).**
+    ///
+    /// A bounded pump reads the record that straddles its bound whole, and the decoder's history
+    /// recorded the bound itself as covered: a position inside that record. When the next pump
+    /// started past the bound, its gap fill read from the middle of a record, failed, and failed on
+    /// every later pump of that decoder. At `00f4c39` a `Commit` straddling the bound did it, as here:
+    /// its event's `commit_end_lsn` carried the cursor past the bound. D252's cursor passes any
+    /// straddling record with nothing open, which made it routine
+    /// (`a_large_backlog_is_delivered_in_bounded_batches` fails that way without the fix).
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the second pump's `expect`.
+    #[test]
+    fn a_bound_inside_a_commit_does_not_break_the_next_pump() {
+        let (_d, w) = wal("straddle");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        let commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // The bound falls one byte into transaction 1's `Commit`.
+        let bound = commit + 1;
+        let s = streamer().with_max_bytes(bound - start);
+        let p1 = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: the first pump did not deliver the commit its bound cuts: {p1:?}");
+        assert!(
+            p1.cursor > bound,
+            "premise failed: the cursor {} did not pass the bound {bound}, so the next pump never starts inside the gap",
+            p1.cursor
+        );
+        let p2 = s
+            .pump(&w, p1.cursor, p1.emitted_through, &mut Vec::new())
+            .expect("the pump after a bound inside a record failed");
+        assert_eq!(p2.emitted, 1, "the second transaction did not arrive: {p2:?}");
+    }
 }
