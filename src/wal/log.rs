@@ -68,8 +68,12 @@ pub struct WalManager {
     pub header_txn_id: u64,
     /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
     pins: Mutex<std::collections::BTreeMap<u64, u64>>,
+    /// Taken shared by every new pin ([`WalManager::pin`], [`WalManager::pin_durable`]) and
+    /// exclusively by [`WalManager::fence_pins`]. Lock order: `pin_fence`, then `pins`, then
+    /// `buffer`, then `file`.
+    pin_fence: std::sync::RwLock<()>,
     next_pin_id: AtomicU64,
-    /// **Test-only: make the next [`WalManager::append`] fail once.**
+    /// **Test-only: make one [`WalManager::append`] fail: the n-th from now.**
     ///
     /// `append` cannot fail on its own — it extends an in-memory buffer and ends in `Ok`. That
     /// makes several error paths that guard against a failed append unreachable, and an unreachable
@@ -79,8 +83,10 @@ pub struct WalManager {
     ///
     /// `#[cfg(test)]` so it does not exist in any shipped build, nor in integration tests: this is
     /// a lever for the unit tests in this crate and nothing else.
+    /// A countdown since lane §21.18: 0 is disarmed, and n fails the n-th append from now, so a test
+    /// can fail a later append of a sequence (a commit's `TxnEnd`, after its `Commit`).
     #[cfg(test)]
-    pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
+    pub(crate) fail_next_append: std::sync::atomic::AtomicU32,
     /// The format this log was written in: [`VERSION`], or [`LEGACY_VERSION`] until a truncation
     /// rewrites the header.
     format: AtomicU32,
@@ -599,12 +605,21 @@ impl WalManager {
         Self::with_storage(Arc::new(file), path)
     }
 
-    /// Open the log on any [`Storage`]. `path` is still carried because callers report it and
-    /// `WalManager::path` is public; nothing here opens it.
+    /// Open the log on any [`Storage`]. `path` is carried because callers report it and
+    /// `WalManager::path` is public. The log itself is never opened through it, but a FRESH log (length
+    /// 0) moves the release quarantine beside `path` aside first (`txn::start_fresh_quarantine`), so
+    /// even a log on simulated storage does real filesystem I/O next to `path`, and a failed move fails
+    /// the log's creation.
     pub fn with_storage(file: Arc<dyn Storage>, path: PathBuf) -> Result<Self, FerroError> {
         let len = file.len().map_err(|e| FerroError::Wal(e.to_string()))?;
 
         let (base_lsn, header_txn_id, format) = if len == 0 {
+            // A fresh log is a new database at this path: its quarantine starts fresh too (review 5's
+            // F6). BEFORE the header (review 6's caveat 2): until the move succeeds the log stays
+            // empty, so every later open retries it rather than taking the old file as current.
+            crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
+                FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
+            })?;
             let mut header = [0u8; HEADER_SIZE];
             header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
@@ -633,9 +648,9 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1),
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), pin_fence: std::sync::RwLock::new(()), next_pin_id: AtomicU64::new(1),
             #[cfg(test)]
-            fail_next_append: std::sync::atomic::AtomicBool::new(false),
+            fail_next_append: std::sync::atomic::AtomicU32::new(0),
             format: AtomicU32::new(format), poisoned: AtomicBool::new(false), poison_reason: Mutex::new(None)})
     }
 
@@ -721,8 +736,10 @@ impl WalManager {
     /// pin was added to prevent, reintroduced by the fix for it. [`WalManager::truncate`] takes
     /// the same lock, so there is no gap to land in.
     ///
-    /// Lock order is pins -> buffer -> file, matching `truncate`.
+    /// Lock order is `pin_fence` (shared), then pins -> buffer -> file. `truncate` takes pins -> buffer
+    /// -> file, and a DROP holds the fence exclusively around its check and its truncation.
     pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
+        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let lsn = self.flushed_lsn.load(Ordering::SeqCst);
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
@@ -736,6 +753,7 @@ impl WalManager {
     /// built on records that are gone, and silently moving the pin forward would hand it a
     /// plausible-looking claim over the wrong range.
     pub fn pin(self: &std::sync::Arc<Self>, lsn: u64) -> Result<WalPin, FerroError> {
+        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let base = self.base_lsn.load(Ordering::SeqCst);
         if lsn < base {
@@ -746,6 +764,21 @@ impl WalManager {
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
         pins.insert(id, lsn);
         Ok(WalPin { wal: std::sync::Arc::clone(self), id, lsn })
+    }
+
+    /// Hold every NEW pin off until the returned guard is dropped. Pins already held stay, and can
+    /// still be released.
+    ///
+    /// For a caller whose decision rests on "no pin is below the log's end" and that must still
+    /// hold at its [`WalManager::truncate`]: `truncate` keeps the log, and answers `Ok`, while any pin
+    /// is below the end. A DROP is that caller (`TxnManager::drop_checkpointed`, lane §21.6). It
+    /// checks [`WalManager::min_pinned_lsn`] and truncates under one guard, so a pin cannot land
+    /// between the two, which is the check-then-act shape [`WalManager::pin_durable`] warns about.
+    /// A pin that waited is taken against the truncated log, as if it had arrived after the
+    /// checkpoint: one below the new base is refused, as it always was. Never take a pin while
+    /// holding this guard: a pin waits on it.
+    pub fn fence_pins(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.pin_fence.write().unwrap()
     }
 
     /// The oldest LSN any pin still needs, if there are any.
@@ -819,11 +852,18 @@ impl WalManager {
 
     // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
     pub fn append(&self, txn_id: u64, prev_lsn: u64, kind: &RecKind) -> Result<u64, FerroError> {
-        // One-shot, and it disarms itself so a test can fail exactly the append it means to and let
-        // the cleanup that follows succeed. Compiled out entirely outside this crate's unit tests.
+        // A countdown that disarms itself at the append it fails, so a test can fail exactly the
+        // append it means to and let the cleanup that follows succeed. Compiled out entirely outside
+        // this crate's unit tests.
         #[cfg(test)]
-        if self.fail_next_append.swap(false, Ordering::SeqCst) {
-            return Err(FerroError::Wal("injected append failure".into()));
+        {
+            let armed = self.fail_next_append.load(Ordering::SeqCst);
+            if armed > 0 {
+                self.fail_next_append.store(armed - 1, Ordering::SeqCst);
+                if armed == 1 {
+                    return Err(FerroError::Wal("injected append failure".into()));
+                }
+            }
         }
         self.refuse_if_poisoned()?;
         // **Review 2's Q5: the log itself refuses the two records whose meaning changed, while it
