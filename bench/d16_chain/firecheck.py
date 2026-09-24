@@ -3,15 +3,18 @@
 
 Every mutant edits the engine (`src/`). None edits `examples/d16_chain_retention.rs`: a forced result
 at the call site would exercise nothing inside the reaper, the catalog or the store. The pattern is
-`bench/d154_mutate.py`'s. What this adds is recorded in `bench/d16_chain/PREREG.md` A2.6 and A3.4:
+`bench/d154_mutate.py`'s. What this adds is recorded in `bench/d16_chain/PREREG.md` A2.6, A3.4 and
+amendment 4:
 
   * It REFUSES to start unless the cwd is the repository top level and no tracked file is modified.
-    It pins HEAD at start. Before EVERY mutant it re-checks the whole tree, HEAD and the target
-    file's blob.
-  * It restores the mutated file by writing back the bytes it read, with SIGTERM and SIGHUP ignored
-    while it does, then checks the blob against HEAD. `git checkout --` needs the index lock, and a
-    stale lock left by a killed build would strand the mutant. SIGTERM (what `timeout` sends) and
-    SIGHUP unwind through the same `finally` everywhere else.
+    It pins HEAD at start. Before EVERY build it re-checks the whole tree and HEAD, and before every
+    mutant, the target file's blob.
+  * It restores the mutated file from the bytes it read, atomically (a sibling temp file, then
+    `os.replace`), with SIGTERM and SIGHUP BLOCKED meanwhile: a signal arriving then is delivered
+    once the write is done, not lost. No git: `git checkout --` needs the index lock, and a stale lock
+    left by a killed build would strand the mutant. If the file no longer holds the bytes the script
+    wrote, another writer changed it mid-run. Their bytes are saved to the run directory before HEAD's
+    go back, and the run stops.
   * Raw output goes to a NEW directory per run, `bench/d16_chain/firecheck/<head>-<utc>/`, with the
     environment in ENV.txt and every build log beside its run. A re-run can neither overwrite an
     earlier run's raw files nor dirty a committed copy of them.
@@ -20,8 +23,10 @@ at the call site would exercise nothing inside the reaper, the catalog or the st
     the build flag, the sha and the exit code equal the ones pre-registered in PREREG A1.6, A2.3-A2.4
     and A3.2. "Something went red" is not enough: the red has to come from the detector the mutant
     was aimed at.
-  * The two clean baselines must print identical `measured`, `slots` and `verdict` lines. Each
-    matching the registration on its own is not enough.
+  * There is deliberately NO "the two baselines are identical" check. A passing baseline prints
+    MATCH in all 9 cells, against predictions that depend only on (arm, D, P), with slots, sha and
+    build pinned exactly. Two passing baselines are identical by construction, so such a check could
+    never fire (amendment 4).
 
 Run from the worktree root, on a committed tree:
 
@@ -29,11 +34,12 @@ Run from the worktree root, on a committed tree:
 
 Commit the run's output directory before interpreting it.
 
-Exit 0: both baselines as registered and identical, A0 refuses, and every mutant fired exactly as
-registered. Exit 1: something differed from its registration, or a build failed. Exit 2: could not
-run (wrong cwd, dirty tree, HEAD moved, the first baseline failed, an anchor did not occur exactly
-once, or a restore did not match HEAD). Exit 3: interrupted by a signal; the mutated file, if any,
-was restored.
+Exit 0: both baselines as registered, A0 refuses, and every mutant fired exactly as registered.
+Exit 1: something differed from its registration, or a build failed. Exit 2: could not run, or must
+not continue: wrong cwd, dirty tree, HEAD moved, the first baseline failed, an anchor did not occur
+exactly once, a failed `git grep`, a restore that does not match HEAD, or another writer's edit. This
+takes precedence over exit 3. Exit 3: interrupted by SIGTERM, SIGHUP or SIGINT, with the mutated
+file, if any, restored and verified against HEAD.
 """
 import datetime
 import os
@@ -265,8 +271,9 @@ COMPARE = re.compile(r"^compare\s+D=(\d+) P=\d+ sha=\S+ (.*)$")
 SLOTS = re.compile(r"^slots\s+arm=(\S+) D=(\d+) .*?slots_recycled=(\d+) ")
 
 
-class Terminated(Exception):
-    pass
+class Terminated(BaseException):
+    """BaseException, like KeyboardInterrupt, so no `except Exception` below can swallow a signal
+    and mislabel it as a failed restore."""
 
 
 def on_signal(signum, _frame):
@@ -421,33 +428,61 @@ def slot_diffs(slots, expect):
             for a in ARMS for d in DEPTHS if slots.get((a, d)) != expect(a, d)]
 
 
-def stable_lines(stdout):
-    """The lines two runs of the same tree must print identically: no wall clock in any of them."""
-    return [l for l in stdout.splitlines() if l.startswith(("measured ", "slots ", "verdict "))]
-
-
-# The file this script has mutated and not yet restored, and the exact BYTES it read from that file.
-# `restore` writes back ONLY those bytes, to ONLY that file, and only while it is set. Bytes, not
-# text: the sources hold non-ASCII, and a text round trip depends on the locale's encoding and on
-# newline translation, either of which could make the "restored" file differ from HEAD.
+# The file this script has mutated and not yet restored, the exact BYTES it read from that file, and
+# the bytes it wrote there. `restore` writes back ONLY those bytes, to ONLY that file, and only while
+# it is set. Bytes, not text: the sources hold non-ASCII, and a text round trip depends on the
+# locale's encoding and on newline translation, either of which could make the "restored" file
+# differ from HEAD.
 APPLIED = None
 APPLIED_BYTES = None
+APPLIED_MUTANT = None
+# The last file ever mutated, so an interrupt can verify it against HEAD; where evidence goes; and
+# where another writer's bytes were saved, if restore found any.
+LAST_PATH = None
+EVIDENCE_DIR = None
+FOREIGN_EDIT = None
+
+
+def atomic_write(path, data):
+    """Write `data` to `path` so that a reader, or a crash, sees the old bytes or the new ones and
+    never a truncated file. The temp name does not end in `.rs`, so cargo never compiles it."""
+    tmp = pathlib.Path(str(path) + ".d16-firecheck.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
 def restore():
-    global APPLIED, APPLIED_BYTES
+    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, FOREIGN_EDIT
     if APPLIED is None:
         return
-    # Ignore a second SIGTERM/SIGHUP while writing back: an unwind here is the one that strands the
-    # mutant. No git: `git checkout --` needs the index lock, which a killed build can leave stale.
-    old_term = signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    old_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # BLOCK, not ignore. A SIGTERM or SIGHUP landing here is held until HEAD's bytes are back, then
+    # delivered, so `timeout` still ends the run (exit 3) instead of being lost.
+    blocked = {signal.SIGTERM, signal.SIGHUP}
+    signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
     try:
-        pathlib.Path(APPLIED).write_bytes(APPLIED_BYTES)
-        APPLIED, APPLIED_BYTES = None, None
+        p = pathlib.Path(APPLIED)
+        current = p.read_bytes() if p.exists() else b""
+        if current != APPLIED_MUTANT:
+            # Another writer changed this file while the mutant was in place. Keep their bytes as
+            # evidence before HEAD's go back; the caller stops the run.
+            dest = (EVIDENCE_DIR or pathlib.Path(".")) / (APPLIED.replace("/", "_") + ".foreign-edit")
+            dest.write_bytes(current)
+            FOREIGN_EDIT = str(dest)
+        atomic_write(p, APPLIED_BYTES)
+        APPLIED, APPLIED_BYTES, APPLIED_MUTANT = None, None, None
     finally:
-        signal.signal(signal.SIGTERM, old_term)
-        signal.signal(signal.SIGHUP, old_hup)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+
+
+def tree_moved(head_full):
+    """Why this run must not build again, or None. Checked before every build."""
+    dirty = tree_dirty()
+    if dirty:
+        return f"tracked files are modified:\n{dirty}"
+    now = git("rev-parse", "HEAD")
+    if now != head_full:
+        return f"HEAD moved from {head_full} to {now}"
+    return None
 
 
 def at_head(path):
@@ -464,7 +499,7 @@ def baseline(outdir, label, expect_slots, head):
     rc, out = build(outdir, label)
     if rc != 0:
         print(f"{label}: BUILD FAILED on the clean tree\n{out[-3000:]}", flush=True)
-        return False, []
+        return False
     rc, stdout = run(outdir, label, ARGS)
     cells, _values, compares, slots, builds, shas = parse(stdout)
     diffs = compare_cells(cells, lambda a, d: MATCH) + compare_lines(compares, cmp_eq)
@@ -477,28 +512,38 @@ def baseline(outdir, label, expect_slots, head):
         diffs.append(f"sha {sorted(shas)}, pinned {head}")
     print(f"{label}: rc={rc} "
           f"{'ALL AS REGISTERED' if not diffs else 'FAILED: ' + '; '.join(diffs[:8])}", flush=True)
-    return not diffs, stable_lines(stdout)
+    return not diffs
 
 
 def main():
-    global APPLIED, APPLIED_BYTES
+    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, LAST_PATH, EVIDENCE_DIR
     top = git("rev-parse", "--show-toplevel")
     here = pathlib.Path.cwd().resolve()
     if here != pathlib.Path(top).resolve() or not pathlib.Path("build.rs").is_file():
         print(f"REFUSED: run from the repository top level ({top}); cwd is {here}")
         return 2
+    unknown = sorted(set(VALUES) - {m[0] for m in MUTANTS})
+    if unknown:
+        print(f"REFUSED: VALUES names no mutant: {unknown}. A misspelt key would check nothing.")
+        return 2
     dirty = tree_dirty()
     if dirty:
-        print(f"REFUSED: tracked files are modified; the build would stamp DIRTY and a restore could "
-              f"destroy them:\n{dirty}")
+        print(f"REFUSED: tracked files are modified; the build would stamp DIRTY, and a restore would "
+              f"overwrite an edit to any file it mutates:\n{dirty}")
         return 2
     head_full = git("rev-parse", "HEAD")
     head = git("rev-parse", "--short=12", "HEAD")
-    d200 = subprocess.run(["git", "grep", "-q", "-F", D200_MARKER, "HEAD", "--", "src/"]).returncode == 0
+    grep = subprocess.run(["git", "grep", "-q", "-F", D200_MARKER, "HEAD", "--", "src/"])
+    if grep.returncode not in (0, 1):
+        print(f"REFUSED: `git grep` for the D200 marker failed (rc={grep.returncode}); it must not "
+              f"read as 'absent'.")
+        return 2
+    d200 = grep.returncode == 0
     expect_slots = slots_d200 if d200 else slots_main_lineage
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = pathlib.Path("bench/d16_chain/firecheck") / f"{head}-{stamp}"
     outdir.mkdir(parents=True, exist_ok=False)
+    EVIDENCE_DIR = outdir
     (outdir / "ENV.txt").write_text(
         f"head={head_full}\nd200_marker_in_src={d200}\n"
         f"RUSTFLAGS={os.environ.get('RUSTFLAGS', '<unset>')}\n"
@@ -508,8 +553,7 @@ def main():
           f"{'D200 present' if d200 else 'main lineage (D200 absent)'}; raw output in {outdir}",
           flush=True)
 
-    ok, first = baseline(outdir, "M0-baseline", expect_slots, head)
-    if not ok:
+    if not baseline(outdir, "M0-baseline", expect_slots, head):
         print("STOP: the unmutated build must be as registered before any mutant can mean anything.")
         return 2
 
@@ -521,10 +565,10 @@ def main():
 
     failures = [] if a0 else ["A0-bad-argument"]
     for label, path, old, new, expect, expect_cmp, mutant_slots in MUTANTS:
-        dirty = tree_dirty()
-        if dirty or git("rev-parse", "HEAD") != head_full or not at_head(path):
-            print(f"{label}: REFUSED, the tree or HEAD changed underneath this run:\n"
-                  f"{dirty or git('rev-parse', 'HEAD') + ' / ' + path}", flush=True)
+        moved = tree_moved(head_full)
+        if moved or not at_head(path):
+            print(f"{label}: REFUSED, the tree changed underneath this run: {moved or path}",
+                  flush=True)
             return 2
         p = pathlib.Path(path)
         original = p.read_bytes()
@@ -533,9 +577,10 @@ def main():
             print(f"{label}: NOT RUN, the anchor occurs {n}x in {path}, not once. The source moved; "
                   f"re-register this mutant.", flush=True)
             return 2
+        mutated = original.replace(old.encode(), new.encode())
         try:
-            APPLIED, APPLIED_BYTES = path, original
-            p.write_bytes(original.replace(old.encode(), new.encode()))
+            APPLIED, APPLIED_BYTES, APPLIED_MUTANT, LAST_PATH = path, original, mutated, path
+            atomic_write(p, mutated)
             rc, out = build(outdir, label)
             if rc != 0:
                 print(f"{label}: BUILD FAILED, so the mutant never ran\n{out[-2000:]}", flush=True)
@@ -543,7 +588,18 @@ def main():
                 continue
             rc, stdout = run(outdir, label, ARGS)
         finally:
-            restore()
+            # A signal delivered when `restore` unblocks it is a Terminated (BaseException), so it is
+            # not caught here and the interrupt path below verifies the file instead.
+            try:
+                restore()
+            except Exception as e:
+                print(f"{label}: RESTORE FAILED ({e!r}); {path} may still hold the mutant. Stopping.",
+                      flush=True)
+                return 2
+            if FOREIGN_EDIT:
+                print(f"{label}: {path} was changed by another writer during this run. Their bytes "
+                      f"are saved at {FOREIGN_EDIT} and HEAD's were put back. Stopping.", flush=True)
+                return 2
             if not at_head(path):
                 print(f"{label}: RESTORE FAILED, {path} does not match HEAD. Stopping.", flush=True)
                 return 2
@@ -571,35 +627,46 @@ def main():
                   f"{len(compares)} compare lines, {len(VALUES.get(label, {}))} valued cells)",
                   flush=True)
 
-    # The restored tree must measure exactly as the first baseline did, not merely pass on its own.
-    ok, last = baseline(outdir, "M0-baseline-after", expect_slots, head)
-    if not ok:
+    # The restored tree must pass on its own. It is not compared with the first baseline: two passing
+    # baselines are identical by construction (amendment 4), so that comparison could never fire.
+    moved = tree_moved(head_full)
+    if moved:
+        print(f"M0-baseline-after: REFUSED, the tree changed underneath this run: {moved}")
+        return 2
+    if not baseline(outdir, "M0-baseline-after", expect_slots, head):
         failures.append("M0-baseline-after")
-    elif last != first:
-        failures.append("M0-baseline-after")
-        changed = sorted(set(first) ^ set(last))
-        print(f"M0-baseline-after: its measured/slots/verdict lines differ from the first "
-              f"baseline's:\n    " + "\n    ".join(changed[:8]), flush=True)
 
     print()
     if failures:
         print(f"RESULT: {len(failures)} did not behave as registered: {', '.join(failures)}")
         return 1
-    print(f"RESULT: both baselines as registered and identical, A0 refuses, and all {len(MUTANTS)} "
-          f"mutants fired as registered")
+    print(f"RESULT: both baselines as registered, A0 refuses, and all {len(MUTANTS)} mutants fired "
+          f"as registered")
     return 0
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
+    code = 1
     try:
         code = main()
-    except Terminated as e:
+    except (Terminated, KeyboardInterrupt) as e:
+        # Exiting now: a second signal must not interrupt the restore or the check below.
+        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(s, signal.SIG_IGN)
         restore()
-        print(f"INTERRUPTED by {e}; any applied mutant was restored. Exit 3.")
-        code = 3
+        if FOREIGN_EDIT:
+            print(f"INTERRUPTED by {e!r}; {LAST_PATH} had been changed by another writer (saved at "
+                  f"{FOREIGN_EDIT}) and HEAD's bytes were put back. Exit 2.")
+            code = 2
+        elif LAST_PATH is not None and not at_head(LAST_PATH):
+            print(f"INTERRUPTED by {e!r}; {LAST_PATH} does NOT match HEAD. Exit 2.")
+            code = 2
+        else:
+            print(f"INTERRUPTED by {e!r}; no mutant is left in src/ (verified against HEAD). Exit 3.")
+            code = 3
     finally:
-        # A no-op unless an exception other than a signal landed while a mutant was applied.
+        # A no-op unless an exception other than an interrupt landed while a mutant was applied.
         restore()
     sys.exit(code)
