@@ -503,15 +503,16 @@ struct MirrorUndo {
 }
 
 /// The error a failed staging step reports once the page tree has been put back — or, when
-/// putting it back failed too, both errors, because the tree then disagrees with the workspace
-/// and whoever reads the message has to know that.
+/// putting it back failed too, both errors, because the tree may then disagree with the workspace
+/// and whoever reads the message has to know that. "May": a restore can itself land and then
+/// report failure, exactly as the write it was undoing could.
 fn unstage_error(e: FerroError, restored: Result<(), FerroError>) -> FerroError {
     match restored {
         Ok(()) => e,
         Err(r) => FerroError::Internal(format!(
             "{e}; and putting the branch's page tree back afterwards failed too: {r}. Nothing was \
-             staged — the workspace, the frame and the log are untouched — but the page tree now \
-             holds rows the branch's workspace does not"
+             staged — the workspace, the frame and the effect log's index are untouched — but the \
+             branch's page tree may now disagree with its workspace"
         )),
     }
 }
@@ -3071,12 +3072,16 @@ impl AgentRuntime {
     /// 1. **Decide, mutating nothing.** The envelope over every table; the escrow's batch check;
     ///    the candidate frame (`ws.frame` plus this batch) against [`EffectLog::check_append`];
     ///    every row against [`PagedRows::check_put`], the tree's own size rule.
-    /// 2. **Charge the row-write budget.** The first mutation, and atomic, so its refusal leaves
-    ///    everything untouched.
+    /// 2. **Charge the row-write budget.** The first mutation. A budget refusal leaves everything
+    ///    untouched; an I/O failure in the charge's own durability step can leave the charge spent
+    ///    (`TableBranchCatalog` makes it visible before its fsync), with nothing else mutated.
     /// 3. **Spend the escrow** — check and charge in one call, [`EscrowLedger::spend_all`], under one
     ///    lock hold. Every later failure refunds it.
-    /// 4. **Write the page tree**, each row's prior image read first; a failure on row k puts rows
-    ///    k-1..0 back ([`AgentRuntime::mirror_rows`]).
+    /// 4. **Write the page tree**, each row's prior image recorded before its write; a failure on
+    ///    row k puts rows k..0 back, row k included, because its write may have landed before it
+    ///    reported failure ([`AgentRuntime::mirror_rows`]). Besides I/O and a starved allocator,
+    ///    `cow_page` also refuses a branch reaped mid-statement or an arena claimed under an older
+    ///    authority; all of them take the same undo.
     /// 5. **Append the frame.** After step 1 this fails only on I/O; the tree is put back.
     /// 6. **Install** the rows and the frame into the workspace — nothing in it can fail.
     ///
@@ -3087,10 +3092,18 @@ impl AgentRuntime {
     /// `cow_page` mutates a page the branch already owns IN PLACE: once a `put` succeeds, the old
     /// root no longer describes the old tree.
     ///
-    /// **What is left, stated.** An I/O or allocator failure in step 4 or 5 leaves the row-write
-    /// budget spent — the same fail-closed direction the charge below has always taken. A double
-    /// fault, where putting the tree back fails too, is reported as both errors; the workspace, the
-    /// frame and the log are still untouched then, and only the page mirror is ahead of them.
+    /// **What is left, stated.** An I/O failure in step 2's durability step, or any failure in step
+    /// 4 or 5, leaves the row-write budget spent — the same fail-closed direction the charge below
+    /// has always taken. A double fault, where putting the tree back fails too, is reported as both
+    /// errors; the workspace, the frame and the log's index are still untouched then, and only the
+    /// page mirror may disagree with them. "Nothing staged" is about ROWS, not pages: a failed
+    /// statement can leave the branch holding private copies of pages it shared with its parent,
+    /// and pages the failed tree operation allocated stay in the branch's arena until `free_arena`
+    /// or the reaper takes them back (`cow::btree`'s `WriteJournal` says why they are not freed on
+    /// the error path). And a log write whose `pwrite` landed but whose `sync_data` failed leaves a
+    /// complete record in the file that the index never took; `DurableEffectLog::append` writes the
+    /// next record over it, but a reopen before that replays it — a property of the store that
+    /// predates D258.
     fn stage_all(&self, branch: BranchId, mut batch: Vec<StagedTable>) -> Result<(), FerroError> {
         // ---- 1. decide ------------------------------------------------------------------------
         //
@@ -3232,7 +3245,9 @@ impl AgentRuntime {
         // `charge_row_writes` is atomic against every other mutation of the record and re-checks
         // the budget under the catalog's own lock, so it is the charge — not `admit` above — that
         // decides. The window it leaves is an I/O failure further down (mirroring to pages,
-        // appending the frame) with the budget already spent. That direction is deliberate:
+        // appending the frame), or in this charge's own durability step (`TableBranchCatalog`
+        // makes the charge visible before its fsync), with the budget already spent. That
+        // direction is deliberate:
         // charging afterwards would mean a failed record write leaves a row written and
         // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
         // admits one.
@@ -3312,9 +3327,21 @@ impl AgentRuntime {
     /// Step 4 of [`AgentRuntime::stage_all`]: write a batch's rows onto the branch's own
     /// copy-on-write tree — all of them, or none.
     ///
-    /// Returns, per row written, what it takes to put that row back. A failure part-way puts the
-    /// rows already written back before it returns, so an `Err` here means the tree is as it was
-    /// (or, when putting it back failed too, says so — [`unstage_error`]).
+    /// Returns, per row, what it takes to put that row back. A failure part-way puts back every
+    /// row it reached — the failing one included — before it returns, so an `Err` here means the
+    /// tree is as it was (or, when putting it back failed too, says so — [`unstage_error`]).
+    ///
+    /// **Each row's prior image is recorded BEFORE its write, not after it (D258 review 1, F1).**
+    /// A write can land and still return an error: `put_row` commits the tree operation and then
+    /// calls `set_root`, and both production catalogs move the root before their durability step
+    /// can fail (`LogBranchCatalog` in memory, then its fsync'd append; `TableBranchCatalog` with
+    /// `write_record`, then `durable`). Recording the undo only once the write returned `Ok` left
+    /// exactly that row in the tree. Putting back a write that never landed is harmless: it rewrites
+    /// the prior image, or deletes a key that is absent, and a delete that hits nothing shadows
+    /// nothing.
+    ///
+    /// The read costs one descent per staged row. It is the price of the undo: the tree mutates the
+    /// branch's own pages in place, so nothing else remembers what was there.
     ///
     /// Guarded on `storage`, because `AgentRuntime::new()` is still map-backed and has no tree to
     /// write to. A runtime without a page store keeps exactly its old behaviour.
@@ -3329,38 +3356,21 @@ impl AgentRuntime {
         }
         for t in batch {
             for item in &t.items {
-                match self.mirror_row(branch, &t.table, item.row.0, &item.after) {
-                    Ok(prior) => {
-                        undo.push(MirrorUndo { table: t.table.clone(), row: item.row.0, prior })
+                let row = item.row.0;
+                let written = self.get_row(branch, &t.table, row).and_then(|prior| {
+                    undo.push(MirrorUndo { table: t.table.clone(), row, prior });
+                    match &item.after {
+                        RowState::Present(vals) => self.put_row(branch, &t.table, row, vals),
+                        RowState::Deleted => self.delete_row(branch, &t.table, row),
                     }
-                    Err(e) => {
-                        let restored = self.unmirror_rows(branch, &undo);
-                        return Err(unstage_error(e, restored));
-                    }
+                });
+                if let Err(e) = written {
+                    let restored = self.unmirror_rows(branch, &undo);
+                    return Err(unstage_error(e, restored));
                 }
             }
         }
         Ok(undo)
-    }
-
-    /// One row of [`AgentRuntime::mirror_rows`]: read what the tree holds for it, then write the
-    /// staged state over it. Returns the image it replaced, `None` when the key was absent.
-    ///
-    /// The read costs one descent per staged row. It is the price of an undo: the tree mutates the
-    /// branch's own pages in place, so nothing else remembers what was there.
-    fn mirror_row(
-        &self,
-        branch: BranchId,
-        table: &str,
-        row: u64,
-        after: &RowState,
-    ) -> Result<Option<Vec<Value>>, FerroError> {
-        let prior = self.get_row(branch, table, row)?;
-        match after {
-            RowState::Present(vals) => self.put_row(branch, table, row, vals)?,
-            RowState::Deleted => self.delete_row(branch, table, row)?,
-        }
-        Ok(prior)
     }
 
     /// Put back every row [`AgentRuntime::mirror_rows`] wrote, newest first.
