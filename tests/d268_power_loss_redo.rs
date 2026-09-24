@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use ferrodb::storage::heap_file_manager::HeapFileManager;
+use ferrodb::storage::page_directory::PageDirectory;
 use ferrodb::storage::sim::{Durability, SimFabric};
 use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::WalManager;
@@ -178,5 +179,116 @@ fn d268_an_init_insert_keeps_a_page_that_already_holds_its_own_later_image() {
         rows(&db, b_dir),
         vec![b0, u],
         "redo reset page {p}, which already held its own image at b0's record, and lost the unlogged row"
+    );
+}
+
+/// The pages the directory at `dir` lists, and whether page `p` is all zeros, both in the bytes that
+/// survived: what a device kept when it persisted the directory's write and not `p`'s image.
+fn durable_listing(fabric: &Arc<SimFabric>, dir: u32, p: Option<u32>) -> (Vec<u32>, bool) {
+    let image = fabric.durable_image();
+    let db = &image[DB];
+    let page = |id: u32| -> [u8; PAGE_SIZE] {
+        db[id as usize * PAGE_SIZE..(id as usize + 1) * PAGE_SIZE].try_into().expect("a whole page")
+    };
+    let listed: Vec<u32> = PageDirectory::deserialize(page(dir)).entries.iter().map(|e| e.page_id).collect();
+    let zero = p.map_or(false, |p| page(p).iter().all(|b| *b == 0));
+    (listed, zero)
+}
+
+/// B's scan after recovery: every row, or the refusal that stopped it.
+fn scan_or_refusal(db: &Db, dir: u32) -> Result<Vec<Vec<u8>>, String> {
+    HeapFileManager::open(dir, db.bp.clone())
+        .scan()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|rows| rows.into_iter().map(|(_, t)| t.data).collect())
+        .map_err(|e| e.to_string())
+}
+
+/// Test 7 (D229 review 2, Q1 case 1). A device persists the directory's write and not the new page's
+/// image, while the insert that took the page is uncommitted, so no record of it was flushed. The
+/// init record must be durable before the directory can reach disk, and redo then initialises the
+/// page: the scan succeeds, and the loser's row is undone.
+#[test]
+fn d268_a_listed_page_whose_image_never_reached_disk_is_initialised_by_redo_after_an_uncommitted_insert() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let db = open(&fabric);
+    let mut b = HeapFileManager::new(db.bp.clone()).unwrap();
+    let b_dir = b.first_directory_page_id;
+    db.txn.checkpoint().unwrap();
+    let t = db.txn.begin().unwrap();
+    b.set_transaction(db.txn.clone(), t);
+    let p = b.insert(Tuple::new(vec![0xB0u8; 40])).unwrap().page_id;
+
+    // The directory is written back, as an eviction writes it, and the device persists that write
+    // (the sync). P's frame is never written, so P on disk is `new_page`'s zero write.
+    db.bp.flush_page(b_dir).unwrap();
+    db.bp.disk_manager.sync().unwrap();
+    let (listed, zero) = durable_listing(&fabric, b_dir, Some(p));
+    assert!(listed.contains(&p), "premise: the durable directory does not list page {p}, so nothing is tested");
+    assert!(zero, "premise: page {p}'s image reached disk");
+
+    let db = open(&fabric.restart());
+    recover(&db.txn).expect("recover");
+    match scan_or_refusal(&db, b_dir) {
+        Ok(rows) => assert!(rows.is_empty(), "the uncommitted row survived recovery: {} row(s)", rows.len()),
+        Err(e) => panic!("B's scan refused the listed page {p}, whose image never reached disk: {e}"),
+    }
+}
+
+/// Test 8 (D229 review 2, Q1 case 2). The same loss for a page ALTER's reservation added through an
+/// unlogged handle, which no insert ever names.
+#[test]
+fn d268_a_reserved_page_whose_image_never_reached_disk_is_initialised_by_redo() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let db = open(&fabric);
+    let b_dir = HeapFileManager::new(db.bp.clone()).unwrap().first_directory_page_id;
+    db.txn.checkpoint().unwrap();
+    let unlogged = HeapFileManager::open(b_dir, db.bp.clone());
+    assert_eq!(unlogged.reserve_free_space(1).unwrap(), 1, "premise: the reservation did not add one page");
+
+    db.bp.flush_page(b_dir).unwrap();
+    db.bp.disk_manager.sync().unwrap();
+    let (listed, _) = durable_listing(&fabric, b_dir, None);
+    assert_eq!(listed.len(), 1, "premise: the durable directory does not list the reserved page");
+    let p = listed[0];
+    assert!(durable_listing(&fabric, b_dir, Some(p)).1, "premise: page {p}'s image reached disk");
+
+    let db = open(&fabric.restart());
+    recover(&db.txn).expect("recover");
+    match scan_or_refusal(&db, b_dir) {
+        Ok(rows) => assert!(rows.is_empty(), "the reserved page {p} holds {} row(s)", rows.len()),
+        Err(e) => panic!("B's scan refused the reserved page {p}, whose image never reached disk: {e}"),
+    }
+}
+
+/// Test 11. An init record does not reset a page that already holds its own image at the record's
+/// LSN: a page ALTER reserved and then filled without logging, while a pin keeps the log. Passes
+/// before D268 v2 too; it pins why the new page's image carries the init record's LSN.
+#[test]
+fn d268_an_init_record_keeps_a_page_holding_unlogged_rows_written_after_it() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let db = open(&fabric);
+    let b_dir = HeapFileManager::new(db.bp.clone()).unwrap().first_directory_page_id;
+    db.txn.checkpoint().unwrap();
+    let base = db.wal.base_lsn.load(Ordering::SeqCst);
+    let _pin = db.wal.pin(base).expect("pin");
+
+    let unlogged = HeapFileManager::open(b_dir, db.bp.clone());
+    unlogged.reserve_free_space(1).unwrap();
+    let u = vec![0x0Du8; 40];
+    let p = unlogged.insert(Tuple::new(u.clone())).unwrap().page_id;
+    db.txn.checkpoint().expect("checkpoint");
+    assert_eq!(
+        db.wal.base_lsn.load(Ordering::SeqCst),
+        base,
+        "premise: the checkpoint truncated the log despite the pin"
+    );
+
+    let db = open(&fabric.restart());
+    recover(&db.txn).expect("recover");
+    assert_eq!(
+        rows(&db, b_dir),
+        vec![u],
+        "redo reset page {p} and lost the row written unlogged after the page's init record"
     );
 }

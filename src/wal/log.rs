@@ -1364,6 +1364,53 @@ mod tests {
         assert_eq!(encoded[0][1..], encoded[1][1..], "tag 12's payload is not tag 5's");
     }
 
+    /// **D277: a truncated heap or CLR record is refused as corruption naming its kind, never a
+    /// panic.** These arms indexed their slices unchecked, so a short record panicked, and a replica
+    /// decodes whatever a peer's frame carries once its CRC matches. Built from raw bytes, so this
+    /// does not depend on `RecKind`'s fields. Lane report: artie-research
+    /// `frontier/lane_d268_power_loss_redo.md` §2.2 E, test 9.
+    #[test]
+    fn a_truncated_heap_or_clr_record_is_refused_as_corruption_naming_its_kind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        // A heap record: its tag, dir_root, page_id and slot, then each byte string behind its u32 length.
+        let heap = |tag: u8, strings: &[&[u8]]| -> Vec<u8> {
+            let mut b = vec![tag];
+            b.extend_from_slice(&7u32.to_be_bytes());
+            b.extend_from_slice(&42u32.to_be_bytes());
+            b.extend_from_slice(&3u16.to_be_bytes());
+            for s in strings {
+                b.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                b.extend_from_slice(s);
+            }
+            b
+        };
+        let insert = heap(5, &[&[1, 2, 3]]);
+        // A CLR: its tag, undone_lsn and undo_next, then the record it carries.
+        let mut clr = vec![8u8];
+        clr.extend_from_slice(&11u64.to_be_bytes());
+        clr.extend_from_slice(&0u64.to_be_bytes());
+        clr.extend_from_slice(&insert);
+        let cases: Vec<(u8, Vec<u8>)> =
+            vec![(5, insert.clone()), (6, heap(6, &[&[4, 5]])), (7, heap(7, &[&[6], &[7, 8, 9]])), (8, clr)];
+        for (tag, full) in &cases {
+            assert!(RecKind::deserialize(full).is_ok(), "premise: the whole kind-{tag} record does not decode");
+            for n in 1..full.len() {
+                let cut = &full[..n];
+                let what = format!("a kind-{tag} record cut to {n} of {} bytes", full.len());
+                match catch_unwind(AssertUnwindSafe(|| RecKind::deserialize(cut))) {
+                    Err(_) => panic!("{what} PANICKED instead of being refused"),
+                    Ok(Ok(kind)) => panic!("{what} DECODED as {kind:?}"),
+                    Ok(Err(FerroError::Corruption(m))) => {
+                        // A CLR cut inside the record it carries is refused naming that record's kind.
+                        let named = if *tag == 8 && n > 17 { 5 } else { *tag };
+                        assert!(m.contains(&format!("kind {named}")), "{what} was refused without naming kind {named}: {m}");
+                    }
+                    Ok(Err(e)) => panic!("{what} was refused, but not as corruption: {e}"),
+                }
+            }
+        }
+    }
+
     /// **The additive-tag discipline, for tag 10.**
     ///
     /// Tags 0..9 were taken when `RunIdentity` arrived, so it took the next free number. A log
