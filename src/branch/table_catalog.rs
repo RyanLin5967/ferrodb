@@ -5063,6 +5063,62 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **Review 4, C1, the migration's form.** The migration records the source's age in the
+    /// soft mark it writes, stamped with the migrating process's lease clock. If that age is taken
+    /// on the WALL clock, the migrating process's own lag is counted twice by the next start, as in
+    /// the test above. The source is a legacy log, last written an hour ago by a build whose lease
+    /// clock was the wall clock; the migrating process's wall clock runs `S` ahead of its lease
+    /// clock; the next start resumes at once. Owed: about an hour. Red against `012f65c`.
+    #[test]
+    fn a_migration_by_a_process_whose_lease_clock_lagged_carries_no_lag_into_the_next_credit() {
+        use crate::cluster::wall_step;
+        const S: u64 = 2 * HOUR;
+        let dir = std::env::temp_dir().join(format!("ferro-f1-miglag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        let legacy = dir.join("legacy.db.branches");
+        let t = LeaseDeadline::now_millis();
+        {
+            let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
+            log.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+        }
+        let m = t - HOUR;
+        age_file(&legacy, m);
+        {
+            let _slept = wall_step::by(S as i64);
+            drop(TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap());
+        }
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let (_, credited) = c.alive_state().unwrap().expect("the resume recorded a mark");
+        assert!(
+            credited <= now - m + 2_000,
+            "credited {credited} ms, but only {} ms of lease time have passed since the source was \
+             last written: the migrating process's {S} ms lag was counted twice (review 4, C1)",
+            now - m
+        );
+        assert!(credited + 60_000 >= now - m, "credited {credited} ms; about {} ms were owed", now - m);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Review 4, C7(a): the pre-D198 fixture helper refuses a catalog that is not at `D = 0`.**
+    /// Stripping `[0x08]` and `[0x09]` from a catalog whose offset left 0 would leave deadlines
+    /// stored as `lease − D` under the new magic — not a pre-D198 catalog, silently. The helper's
+    /// guard, forced to fire. Red against `012f65c`, where the helper has no guard.
+    #[test]
+    #[should_panic(expected = "only a catalog still at D = 0")]
+    fn the_pre_d198_fixture_helper_refuses_a_catalog_whose_offset_left_zero() {
+        let path = sidecar("strip-refuses");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap();
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+        let _ = c.as_written_before_d198();
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
