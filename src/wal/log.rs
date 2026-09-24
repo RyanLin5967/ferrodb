@@ -1010,6 +1010,14 @@ impl WalManager {
         Ok(())
     }
 
+    /// Fsync the log file as it stands, whatever the buffer holds (D229). At an open, the records
+    /// that make it rebuild the indexes were written by a process that may have died before its own
+    /// fsync. The recovery reset frees index pages the durable catalog still names, which is safe
+    /// only while those records are certain to be read again by the next open.
+    pub fn sync_file(&self) -> Result<(), FerroError> {
+        self.file.lock().unwrap().sync_all().map_err(|e| FerroError::Wal(e.to_string()))
+    }
+
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
         if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());

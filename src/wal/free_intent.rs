@@ -9,8 +9,9 @@
 //! - an intent is written durably BEFORE the unlink can reach the disk;
 //! - at open, its pages are quarantined BEFORE recovery can allocate (the review's A1);
 //! - a table the durable catalog still names means the DROP never took effect, and the intent is
-//!   dropped; a table that is gone is rolled forward once no retained log record names its pages
-//!   (A3);
+//!   dropped; a table that is gone is rolled forward after the open's checkpoint has synced. A
+//!   record of the dropped table still in a kept log is D250's to skip at redo, not this file's to
+//!   wait for (the review's A3, re-decided by the lead);
 //! - the frees are synced before the intent goes, and the intent's removal is synced before its
 //!   quarantine is released (A4).
 //!

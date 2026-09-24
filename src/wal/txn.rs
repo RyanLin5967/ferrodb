@@ -4,7 +4,7 @@ use crate::catalog::column::{DataType, Value};
 use crate::storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager};
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{free_intent::{self, FreeIntent}, log::{DdlOp, RecKind, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
 ///
@@ -147,6 +147,48 @@ pub struct TxnManager {
     /// decision 3: the stderr line is printed when this CHANGES (owed, then clear again), not at every
     /// checkpoint that keeps the log. `DEFERRED_CHECKPOINTS` counts every one.
     keeping_log: std::sync::atomic::AtomicBool,
+    /// **The DROP intents not yet carried out (D229 (a)),** in the order they were recorded. The
+    /// durable copy is the intent file beside the log (`wal::free_intent`); every change to this
+    /// list is written there first. Each intent's pages are quarantined in the `DiskManager` for
+    /// as long as it is here.
+    ///
+    /// Lock order: `att`, `release_retry`, then this, then the buffer pool and the log.
+    pending_frees: Mutex<Vec<PendingFree>>,
+}
+
+/// One DROP intent, and whether its table's unlink is known to have happened.
+///
+/// Undecided: recorded by a DROP whose mutation then failed, or read back at an open before the
+/// durable catalog was consulted. Such an intent is never carried out in this process. Decided: the
+/// unlink happened (the DROP's mutation returned, or the durable catalog no longer names the table),
+/// and the pages are freed at the next checkpoint, once it has synced.
+struct PendingFree {
+    intent: FreeIntent,
+    decided: bool,
+}
+
+/// Handed to a DROP's mutation by [`TxnManager::drop_checkpointed`]: the one way to name the pages
+/// the DROP gives up, and it must be used BEFORE the table is unlinked (D229 (a)).
+///
+/// [`DropPages::record`] writes the intent durably and quarantines the pages. The unlink that
+/// follows then reaches the disk with the intent already there, so every crash state has either the
+/// table in the catalog with all its pages allocated, or an intent that says which pages to free.
+pub struct DropPages<'a> {
+    txn: &'a TxnManager,
+    recorded: Option<u32>,
+}
+
+impl DropPages<'_> {
+    /// Name `pages` as the pages of `table`, whose heap's first directory page is `dir_root`: the
+    /// identity the next open looks for in the durable catalog.
+    pub fn record(&mut self, table: &str, dir_root: u32, pages: Vec<u32>) -> Result<(), FerroError> {
+        if self.recorded.is_some() {
+            return Err(FerroError::Internal("a DROP records one intent, and this one already has".into()));
+        }
+        self.txn.record_free_intent(FreeIntent { table: table.to_string(), dir_root, pages })?;
+        self.recorded = Some(dir_root);
+        Ok(())
+    }
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -223,6 +265,17 @@ pub fn deferred_checkpoints() -> u64 {
     DEFERRED_CHECKPOINTS.load(Ordering::Relaxed)
 }
 
+/// DROP intents whose frees failed at an attempt (D229): a batch refused because a page was pinned,
+/// or an I/O error in the frees, their sync or the intent's rewrite. The pages stay allocated and
+/// quarantined, the intent stays on disk, and the next checkpoint or open tries again. Each attempt
+/// also prints one line.
+pub static FREE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`FREE_FAILURES`].
+pub fn free_failures() -> u64 {
+    FREE_FAILURES.load(Ordering::Relaxed)
+}
+
 /// Every failure counter this module keeps that is not zero, as one line, or `None` when all are
 /// zero. The CLI prints it at exit (review 2: the counters had no reader outside tests).
 ///
@@ -237,6 +290,7 @@ pub fn failure_counters_line() -> Option<String> {
         ("release mismatches", release_mismatches()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
+        ("DROP free failures", free_failures()),
     ];
     let nonzero: Vec<String> = counts.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k} {n}")).collect();
     (!nonzero.is_empty()).then(|| format!("ferrodb: {}", nonzero.join(", ")))
@@ -426,7 +480,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), pending_frees: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1492,15 +1546,20 @@ impl TxnManager {
         &self,
         f: impl FnOnce() -> Result<T, FerroError>,
     ) -> Result<T, FerroError> {
-        self.ddl_unit(&[], f)
+        self.ddl_unit(&[], |_| f())
     }
 
-    /// [`TxnManager::ddl_checkpointed`] for a DROP. `f` frees every page of the heaps whose
-    /// directories start at `frees`: the table's heap and its time-travel heap. Lane §21.
+    /// [`TxnManager::ddl_checkpointed`] for a DROP. `frees` names the heaps the DROP gives up, by the
+    /// first page of their directories: the table's heap and its time-travel heap. Lane §21.
     ///
-    /// **A DROP needs its truncation, not only its flush.** It frees its table's heap pages and
-    /// directory pages on disk at once, and `allocate` hands freed pages out first. So two things must
-    /// not outlive the drop:
+    /// **D229 (a): `f` frees nothing.** It names every page of the table through the [`DropPages`] it
+    /// is handed, BEFORE it unlinks the table, and the pages are freed here once the checkpoint has
+    /// flushed and synced the unlink ([`TxnManager::free_pending_frees`]). Until then they are
+    /// quarantined, and the intent file says which they are across a crash. A DROP whose `f` fails
+    /// therefore frees nothing, whatever step failed (the D237 review's F5).
+    ///
+    /// **A DROP needs its truncation, not only its flush.** Once it frees its table's heap pages and
+    /// directory pages, `allocate` hands them out first. So two things must not outlive the drop:
     /// - the log's records of those pages. The next open's redo would replay them onto whatever then
     ///   holds the pages: a reused page is a zero page with LSN 0, so every record reapplies. The
     ///   directory repair would write into the freed directory root.
@@ -1521,17 +1580,23 @@ impl TxnManager {
     /// behind the log's end, no OTHER table can be dropped. A checkpoint that fails after the drop
     /// for a reason not visible beforehand (an I/O error in the flush or the truncation) still leaves
     /// the dropped table's records in the log: D229, whose deferred frees retire this interim rule.
+    ///
+    /// D229 does NOT wait for the log to stop naming the pages (the lead's decision, 10:05Z). The
+    /// first of those hazards is D250's: the `DropTable` record names the dropped heaps, and redo,
+    /// the directory repair and the owed-release set skip records of a dropped heap, which is
+    /// PostgreSQL's shape. A deferral would never end while a change-feed subscription pins the log
+    /// (D252). The pin refusal above is retired on D250's branch.
     pub fn drop_checkpointed<T>(
         &self,
         frees: &[u32],
-        f: impl FnOnce() -> Result<T, FerroError>,
+        f: impl FnOnce(&mut DropPages<'_>) -> Result<T, FerroError>,
     ) -> Result<T, FerroError> {
         self.ddl_unit(frees, f)
     }
 
     /// The body of [`TxnManager::ddl_checkpointed`] and [`TxnManager::drop_checkpointed`]. `frees`
-    /// is empty for a create.
-    fn ddl_unit<T>(&self, frees: &[u32], f: impl FnOnce() -> Result<T, FerroError>) -> Result<T, FerroError> {
+    /// is empty for a create, whose `f` names no pages.
+    fn ddl_unit<T>(&self, frees: &[u32], f: impl FnOnce(&mut DropPages<'_>) -> Result<T, FerroError>) -> Result<T, FerroError> {
         let att = self.att_read();
         if !att.is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
@@ -1571,31 +1636,164 @@ impl TxnManager {
                 )));
             }
         }
-        let out = f()?;
+        let mut drop_pages = DropPages { txn: self, recorded: None };
+        // An `f` that fails after naming its pages leaves the intent UNDECIDED: this process never
+        // frees it, and the next open decides it by whether the durable catalog still names the
+        // table. Nothing was freed either way.
+        let out = f(&mut drop_pages)?;
+        if let Some(dir_root) = drop_pages.recorded {
+            self.decide_recorded(dir_root);
+        }
         if !frees.is_empty() {
             self.discard_releases_on(frees);
         }
+        // Flushes and syncs the unlink, truncates when nothing is owed, then carries out every
+        // decided intent.
         self.checkpoint_or_keep_held(false)?;
         Ok(out)
     }
 
-    /// Discard the owed releases on the heaps whose directories start at `roots`, which a DROP has
-    /// just freed: there is nothing left for them to release. `release_retry` must be held.
-    fn discard_releases_on(&self, roots: &[u32]) {
-        use std::io::Write;
-        let discarded = {
-            let mut pending = self.pending_releases.lock().unwrap();
-            let before = pending.len();
-            pending.retain(|(_, r)| !roots.contains(&r.dir_root));
-            before - pending.len()
-        };
-        if discarded > 0 {
-            let _ = writeln!(
-                std::io::stderr(),
-                "ferrodb: DROP discarded {discarded} release(s) owed on the dropped table: its pages are freed, \
-                 so nothing is left to release"
-            );
+    /// Write `intent` into the durable intent file beside the other pending ones, then quarantine
+    /// its pages and hold it, undecided. Before the DROP's unlink (D229 (a)).
+    fn record_free_intent(&self, intent: FreeIntent) -> Result<(), FerroError> {
+        let mut pending = self.pending_frees.lock().unwrap();
+        let mut all: Vec<FreeIntent> = pending.iter().map(|p| p.intent.clone()).collect();
+        all.push(intent.clone());
+        free_intent::store(&self.wal.path, &all)?;
+        self.bp.disk_manager.quarantine(&intent.pages);
+        pending.push(PendingFree { intent, decided: false });
+        Ok(())
+    }
+
+    /// The DROP that recorded the intent for `dir_root` has unlinked its table.
+    fn decide_recorded(&self, dir_root: u32) {
+        let mut pending = self.pending_frees.lock().unwrap();
+        if let Some(p) = pending.iter_mut().rev().find(|p| p.intent.dir_root == dir_root && !p.decided) {
+            p.decided = true;
         }
+    }
+
+    /// **D229's A1, at an open: read the intents a crashed process left, and quarantine their pages,
+    /// BEFORE `recover` runs.** Recovery's directory repair allocates pages. A DROP whose frees had
+    /// begun (or failed part-way) left some of its pages clear on disk, and without the quarantine the
+    /// repair could hand one to a live table, which the intent would then free a second time.
+    /// Returns how many intents were read. They stay undecided until
+    /// [`TxnManager::decide_free_intents`].
+    pub fn adopt_free_intents(&self) -> Result<usize, FerroError> {
+        let intents = free_intent::load(&self.wal.path)?;
+        let n = intents.len();
+        let mut pending = self.pending_frees.lock().unwrap();
+        for intent in intents {
+            self.bp.disk_manager.quarantine(&intent.pages);
+            pending.push(PendingFree { intent, decided: false });
+        }
+        Ok(n)
+    }
+
+    /// **Decide every undecided intent by the durable catalog, after `Catalog::open`.** `present`
+    /// answers whether a table whose heap starts at the given directory page is in the catalog.
+    ///
+    /// - Present: the DROP's unlink never reached the disk, and nothing was freed, because the frees
+    ///   wait for the checkpoint that makes the unlink durable. The intent is removed from the file
+    ///   (durably, with its directory synced) and only then are its pages released (A4).
+    /// - Absent: the unlink is durable, so the intent is decided, and carried out after the open's
+    ///   checkpoint ([`TxnManager::free_pending_frees`]).
+    ///
+    /// Refuses the open if the file cannot be rewritten: an intent left on disk for a table that is
+    /// present would be carried out after a later DROP of a table recreated under it.
+    pub fn decide_free_intents(&self, present: impl Fn(u32) -> bool) -> Result<(), FerroError> {
+        let mut pending = self.pending_frees.lock().unwrap();
+        let (keep, back): (Vec<PendingFree>, Vec<PendingFree>) =
+            pending.drain(..).partition(|p| p.decided || !present(p.intent.dir_root));
+        let kept: Vec<FreeIntent> = keep.iter().map(|p| p.intent.clone()).collect();
+        if !back.is_empty() {
+            if let Err(e) = free_intent::store(&self.wal.path, &kept) {
+                pending.extend(keep);
+                pending.extend(back);
+                return Err(e);
+            }
+            for p in &back {
+                self.bp.disk_manager.release_quarantine(&p.intent.pages);
+            }
+        }
+        *pending = keep.into_iter().map(|p| PendingFree { decided: true, ..p }).collect();
+        Ok(())
+    }
+
+    /// Every page of every intent not yet carried out: the recovery reset keeps them (the review's
+    /// A2). A reset that freed one would let the rebuild take it, and the intent free it again.
+    pub fn pending_free_pages(&self) -> Vec<u32> {
+        self.pending_frees.lock().unwrap().iter().flat_map(|p| p.intent.pages.iter().copied()).collect()
+    }
+
+    /// **Carry out every decided intent** (D229 (a)). Returns how many intents are still pending.
+    ///
+    /// Per intent: the pages are freed in one batch (refused whole if one is pinned), the page file
+    /// is synced, the intent file is rewritten without it (its directory synced when it goes empty,
+    /// A4), and only then is the quarantine released. A failure at any step keeps the intent and its
+    /// quarantine, counts in [`FREE_FAILURES`], prints a line, and is retried at the next checkpoint or
+    /// open: a free is idempotent, and a quarantined page cannot have been handed out meanwhile.
+    ///
+    /// **It does not ask whether the log still names the pages** (the lead's decision, 10:05Z: the
+    /// review's A3 is carried by D250 instead, whose recovery skips every record of a dropped heap).
+    /// Only a DROP's heap and time-travel pages have log records at all.
+    ///
+    /// Called at the end of every checkpoint, which has just flushed and synced every page, and by
+    /// `open_recovered` after its own checkpoint or in place of one.
+    pub fn free_pending_frees(&self) -> usize {
+        use std::io::Write;
+        let mut pending = self.pending_frees.lock().unwrap();
+        if !pending.iter().any(|p| p.decided) {
+            return pending.len();
+        }
+        let (ready, mut wait): (Vec<PendingFree>, Vec<PendingFree>) = pending.drain(..).partition(|p| p.decided);
+        // The unlink every ready intent rests on is durable before anything is freed. A checkpoint
+        // has just synced, and an open that ran none read its catalog from a file nothing synced yet.
+        if !ready.is_empty() {
+            if let Err(e) = self.bp.disk_manager.sync() {
+                FREE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(std::io::stderr(), "ferrodb: a DROP's pages wait: the page file could not be synced ({e})");
+                wait.extend(ready);
+                *pending = wait;
+                return pending.len();
+            }
+        }
+        let mut freed = Vec::new();
+        for p in ready {
+            match self.bp.free_pages(&p.intent.pages) {
+                Ok(()) => freed.push(p),
+                Err(e) => {
+                    FREE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: the {} page(s) of dropped table {} were not freed ({e}); they stay allocated, and the next checkpoint or open tries again",
+                        p.intent.pages.len(),
+                        p.intent.table
+                    );
+                    wait.push(p);
+                }
+            }
+        }
+        if !freed.is_empty() {
+            let remaining: Vec<FreeIntent> = wait.iter().map(|p| p.intent.clone()).collect();
+            match self.bp.disk_manager.sync().and_then(|()| free_intent::store(&self.wal.path, &remaining)) {
+                Ok(()) => {
+                    for p in &freed {
+                        self.bp.disk_manager.release_quarantine(&p.intent.pages);
+                    }
+                }
+                Err(e) => {
+                    FREE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: a DROP's pages were freed, but their intent could not be made to say so ({e}); they stay out of use, and the next checkpoint or open frees them again"
+                    );
+                    wait.extend(freed);
+                }
+            }
+        }
+        *pending = wait;
+        pending.len()
     }
 
     /// The checkpoint after a DDL that frees no page and mutates first: CREATE INDEX and CREATE
@@ -1677,6 +1875,15 @@ impl TxnManager {
     /// only the truncation and the replays after it. The caller holds `release_retry` across the retry
     /// and the decision (C1).
     ///
+    /// ⚠ **The reason above is history since D229:** the rebuild walks no old tree (it resets them by
+    /// identity, `wal::recovery`), so an unflushed rebuild no longer bricks the next open, which
+    /// simply rebuilds again. The flush is still owed to everything else a kept log leaves in the
+    /// pool, and to D229's frees, which may run only once what they free is durably unnamed.
+    ///
+    /// **Ends by carrying out every decided DROP intent** (D229, [`TxnManager::free_pending_frees`]):
+    /// right after a truncation, before the replays append anything, and on a kept log once its sync
+    /// is done. Their failures are counted, not returned.
+    ///
     /// A kept log is counted in `DEFERRED_CHECKPOINTS`. The stderr line is printed only when the
     /// log-keeping state CHANGES: once when a checkpoint first keeps the log, and once when one
     /// truncates again (review 3's decision 3).
@@ -1699,6 +1906,7 @@ impl TxnManager {
                     checkpoint_interval()
                 );
             }
+            self.free_pending_frees();
             return Ok(owed);
         }
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
@@ -1708,6 +1916,7 @@ impl TxnManager {
         if self.keeping_log.swap(false, Ordering::SeqCst) {
             let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");
         }
+        self.free_pending_frees();
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.
         self.replay_schema()?;
@@ -1953,6 +2162,15 @@ fn append_durably(path: &Path, line: &str) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
+    sync_directory_of(path)
+}
+
+/// Fsync the file at `path` and its directory, so a file an earlier process wrote without syncing
+/// (a stale-indexes marker written before review 3's decision 7) is durable before anything rests
+/// on it: D229's recovery reset frees pages only once the trigger that makes every later open
+/// rebuild cannot vanish (the review's caveat 1). Opened for writing, as Windows' flush requires.
+pub(crate) fn sync_file_and_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
     sync_directory_of(path)
 }
 

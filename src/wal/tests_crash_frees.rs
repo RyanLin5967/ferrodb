@@ -106,9 +106,14 @@ impl Machine {
     }
 
     fn open(&self) -> Result<Opened, FerroError> {
+        self.open_on(self.fabric.open(FAB_DB))
+    }
+
+    /// Open with `db_file` as the page file: the fabric's, or a wrapper around it that misbehaves
+    /// on purpose.
+    fn open_on(&self, db_file: Arc<dyn Storage>) -> Result<Opened, FerroError> {
         let db = self.dir.path().join(DB_NAME);
         let lock = DbLock::acquire(&db)?;
-        let db_file: Arc<dyn Storage> = self.fabric.open(FAB_DB);
         let wal_file: Arc<dyn Storage> = self.fabric.open(FAB_WAL);
         let files = (db_file, wal_file, self.existed);
         TEST_FILES.with(|f| *f.borrow_mut() = Some(files));
@@ -528,12 +533,33 @@ fn check_rows(o: &mut OpenedDatabase, table: &str, ids: &[i32]) -> Result<(), St
     let mut s = Session::new();
     let entry = o.catalog.get_table(table).ok_or_else(|| format!("table {table} is gone"))?.clone();
     if entry.indexes.is_empty() && entry.fulltext_indexes.is_empty() {
-        return match sql(o, &mut s, &format!("SELECT id FROM {table};")) {
-            Ok(Outcome::Rows(rows)) if rows.len() == ids.len() => Ok(()),
-            Ok(Outcome::Rows(rows)) => Err(format!("{table} holds {} rows, not {}", rows.len(), ids.len())),
-            Ok(_) => Err(format!("SELECT from {table} returned no rows")),
-            Err(e) => Err(format!("SELECT from {table} failed: {e}")),
+        // No `v`/`w` model: the ids, by a scan and by key through the primary index.
+        let got: BTreeSet<i32> = match sql(o, &mut s, &format!("SELECT id FROM {table};")) {
+            Ok(Outcome::Rows(rows)) => rows.iter().map(|r| if let Value::Integer(id) = r[0] { id } else { i32::MIN }).collect(),
+            Ok(_) => return Err(format!("SELECT from {table} returned no rows")),
+            Err(e) => return Err(format!("SELECT from {table} failed: {e}")),
         };
+        let want: BTreeSet<i32> = ids.iter().copied().collect();
+        if got != want {
+            return Err(format!("a scan of {table} finds {} ids against {}", got.len(), want.len()));
+        }
+        let cell = o.catalog.root_cell(table, None).ok_or_else(|| format!("{table} has no primary cell"))?;
+        let primary = BPlusTreeManager::<Value, RecordId>::open_shared(cell, o.bp.clone());
+        let heap = HeapFileManager::open(entry.first_directory_page_id, o.bp.clone());
+        for id in ids {
+            let rid = primary
+                .search(&Value::Integer(*id))
+                .map_err(|e| format!("{table}: the primary index fails on row {id}: {e}"))?
+                .ok_or_else(|| format!("{table}: row {id} is missing by key"))?;
+            let vals = heap
+                .read(rid)
+                .and_then(|t| t.deserialize(&entry.schema))
+                .map_err(|e| format!("{table}: row {id}'s key names {rid:?}, which does not read: {e}"))?;
+            if vals.first() != Some(&Value::Integer(*id)) {
+                return Err(format!("{table}: row {id} by key is row {:?}", vals.first()));
+            }
+        }
+        return Ok(());
     }
     let want: BTreeSet<(i32, String, String)> = ids.iter().map(|id| (*id, v_of(*id), w_of(*id))).collect();
     let got: BTreeSet<(i32, String, String)> = match sql(o, &mut s, &format!("SELECT id, v, w FROM {table};")) {
@@ -857,13 +883,38 @@ fn a_crash_at_every_operation_of_a_rebuilding_open_leaves_two_good_opens() {
 /// The fixture's catalog spans two pages and dropping `t` lets it fit one, so this is also the
 /// candidates adversary's (e) (D238): a shrinking persist frees the tail before page 1 is durable.
 ///
+/// Here `t`'s last rows are still in the log at the DROP; [`drop_sweep`] explains the other stage.
+///
 /// RED at `a6e93ab` (INFERRED, design §7 F2): `drop_table` frees before it persists, so a crash in
 /// between leaves `t` named over free pages.
 #[test]
 fn a_crash_at_every_operation_of_drop_table_leaves_the_table_whole_or_gone() {
+    drop_sweep(true);
+}
+
+/// **F2 with nothing of `t` in the log at the DROP.** D229 frees a DROP's pages once no retained
+/// record names them, so with `t`'s records in the log the frees wait for the truncation, and a
+/// free moved before the DROP's checkpoint (mutant M3) would still wait. With none in the log it
+/// would run at once, before the unlink is durable. Added with the fix; its red is mutant-only.
+#[test]
+fn a_crash_at_every_operation_of_drop_table_with_nothing_of_it_in_the_log_leaves_it_whole_or_gone() {
+    drop_sweep(false);
+}
+
+/// Open the fixture; when `logged`, add [`EXTRA`] rows to `t` so its records are in the log.
+fn stage_drop(m: &Machine, logged: bool) -> Opened {
+    if logged {
+        stage_rows(m, "t")
+    } else {
+        m.open().expect("stage: open the fixture")
+    }
+}
+
+fn drop_sweep(logged: bool) {
+    let rows = if logged { ROWS + EXTRA } else { ROWS };
     let census = Machine::boot(fixture(), None);
     let (from, to, pages) = {
-        let mut d = stage_rows(&census, "t");
+        let mut d = stage_drop(&census, logged);
         let pages = pages_of(&d.o, "t").expect("walk t");
         let before = walk(&d.o).expect("walk before the DROP");
         assert!(
@@ -888,12 +939,12 @@ fn a_crash_at_every_operation_of_drop_table_leaves_the_table_whole_or_gone() {
 
     let mut want = fixture_want();
     want.present.remove("t");
-    want.either = Some(("t".to_string(), (0..ROWS + EXTRA).collect(), pages));
+    want.either = Some(("t".to_string(), (0..rows).collect(), pages));
     let mut failures = Vec::new();
     for op in &points {
         let m = Machine::boot(fixture(), Some(plan(*op)));
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            let mut d = stage_rows(&m, "t");
+            let mut d = stage_drop(&m, logged);
             let _ = sql(&mut d.o, &mut Session::new(), "DROP TABLE t;");
         }));
         if let Err(e) = fired_at(&m, *op) {
@@ -904,7 +955,8 @@ fn a_crash_at_every_operation_of_drop_table_leaves_the_table_whole_or_gone() {
             failures.push(format!("crash at operation {op} of the DROP: {e}"));
         }
     }
-    report("a crash inside DROP TABLE", points.len(), &failures);
+    let what = if logged { "a crash inside DROP TABLE" } else { "a crash inside DROP TABLE, nothing of it in the log" };
+    report(what, points.len(), &failures);
 }
 
 /// **F3: the zero-root brick, aimed directly.** The open's checkpoint writes pages in ascending id,

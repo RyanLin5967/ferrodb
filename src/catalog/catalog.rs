@@ -212,8 +212,8 @@ impl Catalog {
     /// ALTER's one persist writes every record of the table, so a record that lagged its cell was
     /// written as it was. In memory that is harmless, because statements descend the cell. But the
     /// persisted record is what an open that does not rebuild would seed its cell from. `pub(crate)`
-    /// for `catalog::alter`, and for `wal::recovery::rebuild_indexes`, which frees each old index
-    /// tree from its record. It never writes a cell.
+    /// for `catalog::alter`. It never writes a cell. (The recovery rebuild used it too, to free each
+    /// old tree from a current record; since D229 it frees no tree at all.)
     pub(crate) fn catch_up_index_records(&mut self, table: &str) {
         let Some(entry) = self.tables.get_mut(table) else { return };
         for idx in entry.indexes.iter_mut() {

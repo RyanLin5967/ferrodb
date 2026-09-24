@@ -1,6 +1,6 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -241,10 +241,21 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
     Ok(())
 }
 
+/// Build every index tree afresh from its table's heap, record the new roots, and repoint the
+/// shared cells at them.
+///
+/// **It frees nothing and walks no old tree (D229 (b)).** It used to free each old tree by walking
+/// it from its recorded root, and after a crash that root cannot be trusted: index pages are not
+/// logged, `flush_all` writes the catalog's page 1 before the tree pages it names, and a crash in
+/// between leaves a recorded root that is a zero page (the next open fails at every attempt) or a
+/// recycled page whose stale children are live (the walk frees them). In an open that owes a
+/// rebuild, the old trees' pages are reclaimed BEFORE this runs, by identity rather than by walking:
+/// see [`open_recovered`]. A caller that rebuilds a live database itself, as tests do, leaves the
+/// old trees allocated.
 pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Result<(), FerroError> {
-    // **By table name, not by `HashMap` order.** This loop frees every index tree and builds a fresh
-    // one, so the order decides which page ids the new trees get and therefore every byte written
-    // from here on. Iterating `values_mut()` made that a function of a per-process hash seed: the
+    // **By table name, not by `HashMap` order.** This loop builds a fresh tree for every index, so
+    // the order decides which page ids the new trees get and therefore every byte written from here
+    // on. Iterating `values_mut()` made that a function of a per-process hash seed: the
     // same crash, recovered twice, produced two different databases. Both were correct; neither could
     // be compared with the other, which is what a crash sweep has to do.
     let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
@@ -255,19 +266,6 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // fresh roots were stored into one cell, the posting tree's last.
     let mut rebuilt: Vec<(String, Option<IndexTree<String>>, u32)> = Vec::new();
     for name in names {
-        // Every old tree is freed from its LIVE root, its shared cell (D208 review 2, C4), as
-        // `drop_table` frees. A record that lags its cell names the pre-split page, now the new
-        // root's left child (a leaf or an internal node, by the tree's depth), and freeing from it
-        // leaks the rest of the tree. At `open_recovered`, the one production
-        // caller, `Catalog::open` has just seeded every cell from these records, so the two agree.
-        // A live caller (the tests) can hold a lagging record. So the index records are caught up
-        // from their cells and the primary's live root is read before the entry is borrowed
-        // mutably, and the frees below use them (`tests/root_cell_is_per_index.rs`, T13).
-        catalog.catch_up_index_records(&name);
-        let live_primary = {
-            let entry = catalog.tables.get(&name).expect("name came from this map");
-            catalog.live_root(&name, None, entry.primary_index_root)
-        };
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
         let mut rows = Vec::new();
@@ -278,8 +276,6 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             let deleted = tuple.version_header()?.end_ts != 0;
             rows.push((rid, tuple.deserialize(&entry.schema)?, deleted));
         }
-        let old = BPlusTreeManager::<Value, RecordId>::open(live_primary, bp.clone());
-        old.free_tree()?;
         let fresh = BPlusTreeManager::<Value, RecordId>::create(bp.clone())?;
 
         // **One primary entry per key, pointing at the live version.**
@@ -328,8 +324,6 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
         // secondary indexes
         for info in entry.indexes.iter_mut() {
             let col = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-            let old = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
-            old.free_tree()?;
             let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
             for (_, vals, _) in &rows {
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
@@ -338,8 +332,8 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             rebuilt.push((name.clone(), Some(IndexTree::Secondary(info.column_name.clone())), info.root_page_id));
         }
 
-        // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
-        // old tree, create a fresh one, refill it, record the new root. This is all a full-text
+        // B8 — full-text indexes, rebuilt from the same `rows` by the same steps: create a fresh
+        // tree, refill it, record the new root. This is all a full-text
         // index needs to survive a crash, and it is why no WAL record was added for one: index
         // structure is not logged at all, the heap is authoritative after redo/undo, and every tree
         // in the database is reconstructed here.
@@ -353,8 +347,6 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
         // double-counting one, which is worse than losing it.
         for info in entry.fulltext_indexes.iter_mut() {
             let col = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-            let old = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
-            old.free_tree()?;
             let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
             for (_, vals, _) in &rows {
                 if let Some(text) = indexed_text(&vals[col])? {
@@ -367,8 +359,8 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     }
     // **D205: the records above are the only copy that moved.** Every loop in this function
     // writes the fresh root into the `TableEntry`, and the SHARED cells (`Catalog::roots`, D53)
-    // still hold the roots `Catalog::open` seeded before any of this ran: the trees `free_tree` has
-    // just released. `plan::open_table` and the optimizer prefer the cell to the record, so without
+    // still hold the roots `Catalog::open` seeded before any of this ran: the old trees, which the
+    // open's reset has just released. `plan::open_table` and the optimizer prefer the cell to the record, so without
     // this the rebuild is correct on disk and invisible. Every statement after recovery descended a
     // freed tree, and the fresh-context adversary's schedule (a DROP below the table, then a crash)
     // turned that into a committed row missing by key and a duplicate admitted.
@@ -398,6 +390,144 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     catalog.persist()
 }
 
+/// **Proof that the recovery rebuild is owed, and that what owes it will outlive a crash**
+/// (D229 (b)). [`reset_index_pages`] takes one.
+///
+/// The reset frees index pages the durable catalog still names. That is safe only because every
+/// open rebuilds until the rebuild's own checkpoint removes the trigger, so no open reads those
+/// trees again. So the trigger must be durable BEFORE the first free (the design review's caveat
+/// 1): the only constructor fsyncs the log, whose records are the trigger, and the stale-indexes
+/// marker with its directory. And it is constructed only inside [`open_recovered`], before any
+/// statement, arena or runtime exists, so no writer can hold a page it has allocated and not yet
+/// linked. That is D96's race, which a reachability sweep in a live process walks straight into
+/// (the review's caveat 3), and why nothing outside this file can run the reset.
+struct RebuildOwed(());
+
+impl RebuildOwed {
+    fn made_durable(wal: &WalManager, marker: &Path) -> Result<RebuildOwed, FerroError> {
+        wal.sync_file()?;
+        if marker.exists() {
+            crate::wal::txn::sync_file_and_directory(marker)
+                .map_err(|e| FerroError::Io(format!("sync {}: {e}", marker.display())))?;
+        }
+        Ok(RebuildOwed(()))
+    }
+}
+
+/// What [`reset_index_pages`] did.
+struct Reset {
+    freed: usize,
+    /// Allocated pages nothing reaches that hold neither index bytes nor zeros: kept, and reported.
+    kept: Vec<u32>,
+    /// Pages a durable structure names whose bit was clear, and was set again.
+    rebitted: usize,
+}
+
+/// **D229 (b): free every allocated page that no logged structure reaches and whose bytes are a
+/// B+tree node or all zeros**, before the rebuild builds anything. The old trees are reclaimed by
+/// IDENTITY, never by walking them: after a crash their recorded roots cannot be trusted (see
+/// [`rebuild_indexes`]).
+///
+/// **The keep set** is read through the pool, after `recover` has redone and relinked every heap
+/// page the log names: the allocation bitmap's own chain; the catalog chain; each table's heap and
+/// time-travel directory chains and every page they list; and every page of a DROP intent not yet
+/// carried out (the review's A2: those are freed by their intent, and a reset that freed one would
+/// let the rebuild take it and the intent free it again). A directory page that is not a directory
+/// page, or lists more entries than a page holds, stops the reset before it frees anything; an
+/// all-zero one is the unwritten end of its chain.
+///
+/// **A candidate**, a page whose bit is set and which is not kept, is freed when it lies wholly past
+/// the end of the file (its zero-write never landed) or reads as a B+tree node or all zeros. The
+/// design review enumerated every production owner of a main-file bit: B+trees are the only one
+/// outside the keep set (`tests/d229_allocation_sites.rs` keeps it so). Anything else is kept and
+/// reported: a heap or catalog page nothing names is a table the catalog lost, or a leak, and
+/// freeing it on absence alone is the D228 mistake. So is a page that does not read.
+///
+/// **A kept page whose bit is clear has it set again** (the review's caveat 2): a crash model that
+/// loses unsynced writes can revert a bit that the log's redo relinked a page under. If the bit
+/// cannot be set, the page is quarantined for this process instead, so the rebuild cannot take it.
+///
+/// Idempotent: a page it freed has a clear bit and is no candidate next time, and the pages a
+/// crashed rebuild took are unreachable B+tree or zero pages, freed again.
+fn reset_index_pages(catalog: &Catalog, bp: &Arc<BufferPoolManager>, pending: &[u32], _owed: &RebuildOwed) -> Result<Reset, FerroError> {
+    let dm = &bp.disk_manager;
+    let page = |id: u32| -> Result<[u8; PAGE_SIZE], FerroError> {
+        let frame_i = bp.fetch_page(id)?;
+        let bytes = bp.frames[frame_i].read().unwrap().data;
+        bp.unpin_page(id, false);
+        Ok(bytes)
+    };
+    let mut live: BTreeSet<u32> = dm.bitmap_chain()?.into_iter().collect();
+    let mut id = catalog.first_catalog_page_id;
+    loop {
+        if !live.insert(id) {
+            return Err(FerroError::Io(format!("the catalog chain reaches page {id} a second time")));
+        }
+        let next = CatalogPage::deserialize(page(id)?)?.next_catalog_page;
+        if next == 0 {
+            break;
+        }
+        id = next;
+    }
+    let mut names: Vec<&String> = catalog.tables.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let entry = &catalog.tables[name];
+        for first in [entry.first_directory_page_id, entry.time_travel_root] {
+            let mut chain = BTreeSet::new();
+            let mut dir_id = first;
+            while dir_id != 0 {
+                if !chain.insert(dir_id) {
+                    return Err(FerroError::Io(format!("{name}'s directory chain from page {first} cycles at page {dir_id}")));
+                }
+                live.insert(dir_id);
+                let Some(dir) = PageDirectory::parse_checked(page(dir_id)?)? else { break };
+                live.extend(dir.entries.iter().map(|e| e.page_id));
+                dir_id = dir.next_page_directory;
+            }
+        }
+    }
+
+    let allocated = dm.allocated_pages()?;
+    let set: BTreeSet<u32> = allocated.iter().copied().collect();
+    let clear: Vec<u32> = live.iter().copied().filter(|p| !set.contains(p)).collect();
+    let mut rebitted = 0;
+    if !clear.is_empty() {
+        match dm.set_allocated(&clear) {
+            Ok(()) => rebitted = clear.len(),
+            Err(e) => {
+                use std::io::Write;
+                dm.quarantine(&clear);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: {} page(s) a durable structure names have a clear allocation bit that could not be set ({e}); they are kept out of use for this process",
+                    clear.len()
+                );
+            }
+        }
+    }
+
+    let keep: BTreeSet<u32> = live.into_iter().chain(pending.iter().copied()).collect();
+    let file_len = dm.file_len()?;
+    let mut free = Vec::new();
+    let mut kept = Vec::new();
+    for p in allocated {
+        if keep.contains(&p) {
+            continue;
+        }
+        if p as u64 * PAGE_SIZE as u64 >= file_len {
+            free.push(p);
+            continue;
+        }
+        match page(p) {
+            Ok(b) if b[0] == BPLUS_INTERNAL_TYPE || b[0] == BPLUS_LEAF_TYPE || b.iter().all(|x| *x == 0) => free.push(p),
+            Ok(_) | Err(_) => kept.push(p),
+        }
+    }
+    bp.free_pages(&free)?;
+    Ok(Reset { freed: free.len(), kept, rebitted })
+}
+
 /// The page the table catalog starts on, in every database file. One constant for the one open
 /// path. The CLI and three examples each used to declare their own.
 pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
@@ -416,10 +546,15 @@ pub struct OpenedDatabase {
 /// out for itself (`tests/open_path_allowlist.rs` enforces that).
 ///
 /// The order is the whole content:
-/// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL;
+/// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL; read
+///    any DROP intent a crashed process left and quarantine its pages (D229's A1);
 /// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
-/// 3. open the catalog, or create it for a new file;
-/// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
+/// 3. open the catalog, or create it for a new file, and decide each intent by it: dropped if the
+///    catalog still names its table, to be carried out if not;
+/// 4. if recovery replayed anything, make that trigger durable, reset the old index trees by
+///    identity ([`reset_index_pages`], D229 (b)), [`rebuild_indexes`] from the recovered heap, then
+///    checkpoint;
+/// 5. carry out the decided intents.
 ///    The rebuild ends by repointing the shared root cells at the trees it built (D205). Without
 ///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
 ///    there because the rebuilt trees and the catalog page are then on disk, so the log that
@@ -459,12 +594,18 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let wal = Arc::new(WalManager::with_storage(wal_file, wal_path)?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    // D229, the review's A1: a DROP whose frees a crash interrupted left an intent naming its pages.
+    // They are quarantined BEFORE recovery, whose directory repair allocates.
+    txn.adopt_free_intents()?;
     let recovered = recover(&txn)?;
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
     } else {
         Catalog::create(bp.clone())?
     };
+    // D229: an intent whose table the durable catalog still names never took effect, and is dropped;
+    // one whose table is gone is carried out after the checkpoint below.
+    txn.decide_free_intents(|dir_root| catalog.tables.values().any(|e| e.first_directory_page_id == dir_root))?;
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
     // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
@@ -477,6 +618,29 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // log with nothing in it.
     let legacy = wal.is_legacy();
     if recovered || stale {
+        use std::io::Write;
+        // D229 (b): the old trees are reclaimed by identity, never walked, and only once the trigger
+        // that makes every later open rebuild again is durable.
+        let owed = RebuildOwed::made_durable(&wal, &marker)?;
+        match reset_index_pages(&catalog, &bp, &txn.pending_free_pages(), &owed) {
+            Ok(reset) if !reset.kept.is_empty() => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: the index reset freed {} page(s), set {} bit(s) again, and kept {} allocated page(s) that nothing names and that hold no index (e.g. {:?}): a table the catalog lost, or a leak",
+                    reset.freed,
+                    reset.rebitted,
+                    reset.kept.len(),
+                    &reset.kept[..reset.kept.len().min(8)]
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: the index reset stopped ({e}); the rebuild builds into the free space there is, and the old trees stay allocated"
+                );
+            }
+        }
         rebuild_indexes(&mut catalog, &bp)?;
     }
     if recovered || stale || legacy {
@@ -499,6 +663,9 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             }
         }
     }
+    // D229: carry out the decided intents. The checkpoint above already did when it ran; when it did
+    // not, this syncs the catalog it read before freeing anything.
+    txn.free_pending_frees();
     Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
 }
 
