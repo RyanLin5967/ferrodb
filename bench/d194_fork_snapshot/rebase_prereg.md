@@ -57,3 +57,18 @@ wrong, not REBASE.
 
 A compile error at commit 2 is a failure of this pre-registration, not a thing to fix silently: record
 it here, then fix it in its own commit.
+
+## Amendment 1 (append-only, before any run): the QoS the run is made at changes the expected count
+
+`frontier/FAN-QUEUE.md` row #3 now says to run the D194 targets at **DEFAULT QoS, never
+`taskpolicy -b`**, because `-b` fabricates the `sync.rs:402` failure (lane report §5.2). The counts
+above assumed `-b`. Both, so neither can be picked after the fact:
+
+| QoS | result lines | passed | failed | ignored | the failures |
+|---|---|---|---|---|---|
+| default (the queue's instruction) | 56 | **2147** | **1** | 2 | the envelope tripwire (`get_mut(` count 5, expected 3) |
+| `taskpolicy -b` | 56 | 2146 | 2 | 2 | the envelope tripwire + `sync.rs:402` |
+
+Arithmetic: 2135 passed at `2eeed40` (run of record, under `-b`) + 1 (`sync.rs:402`, default QoS only)
++ 1 (`a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it`) + 7
+(`d194_rebase`) + 3 (parser, binder and dispatch unit tests) = 2147.
