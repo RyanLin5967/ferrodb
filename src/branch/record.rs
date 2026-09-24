@@ -1294,28 +1294,37 @@ pub fn reclaimable(live_children: &[Epoch], birth: Epoch, freed: Epoch) -> bool 
 /// - the reaped interior's id slot went back on the free list.
 /// Adversary: artie-research `frontier/d16_restart_pin_adversary.md` @ `911aef8`.
 ///
-/// `nodes` maps every record's id to its parent's id and its state. Returns the ids whose entry
-/// belongs under their parent. It is O(records): each walk up a parent chain stops at the first
-/// ancestor that is not `Reaped` (that one holds an entry on its own account) or that is already
-/// marked (the walk that marked it marked everything above it too). The already-marked stop also
-/// ends a walk around a cycle. No catalog produces one, but a corrupt log could, and a rebuild must
-/// terminate on whatever it is given.
+/// `nodes` maps every record's id slot to the record's own `branch_id`, its `parent_id` and its
+/// state. Returns the ids whose entry belongs under their parent. It is O(records): each walk up a
+/// parent chain stops at the first ancestor that is not `Reaped` (that one holds an entry on its own
+/// account) or that is already marked (the walk that marked it marked everything above it too). The
+/// already-marked stop also ends a walk around a cycle. No catalog produces one, but a corrupt log
+/// could, and a rebuild must terminate on whatever it is given.
+///
+/// **A walk also stops at a slot that now holds a DIFFERENT incarnation (D235 review F3).** A
+/// child's `parent_id` is its parent record's `branch_id` at fork. A reap bumps the record's
+/// `generation` and leaves `branch_id` alone, so a genuine reaped parent still matches. A recycled
+/// slot's new occupant is minted at the bumped generation, so it never matches. Without this check,
+/// a pinned node whose parent slot had been recycled would pin the unrelated new occupant and walk
+/// up that occupant's lineage. That direction only over-pins, but it is wrong. The running reaper
+/// cannot build that shape: `release_id` refuses a slot with live children. A pre-D16 legacy log
+/// migrated by `default_for_database`, or D201's seal fallback, can.
 pub(crate) fn parent_entry_holders(
-    nodes: &HashMap<u64, (Option<u64>, BranchState)>,
+    nodes: &HashMap<u64, (BranchId, Option<BranchId>, BranchState)>,
 ) -> HashSet<u64> {
     let mut holders = HashSet::with_capacity(nodes.len());
-    for (&id, &(parent, state)) in nodes {
+    for (&id, &(_, parent, state)) in nodes {
         if state == BranchState::Reaped {
             continue;
         }
         holders.insert(id);
         // Every `Reaped` ancestor between this live node and the next non-`Reaped` one is a pin
-        // held open by it.
+        // held open by it: the same incarnation, found by the handle the child recorded.
         let mut up = parent;
-        while let Some(p) = up {
-            match nodes.get(&p) {
-                Some(&(grand, BranchState::Reaped)) => {
-                    if !holders.insert(p) {
+        while let Some(want) = up {
+            match nodes.get(&want.id) {
+                Some(&(me, grand, BranchState::Reaped)) if me == want => {
+                    if !holders.insert(want.id) {
                         break;
                     }
                     up = grand;
@@ -2132,8 +2141,17 @@ mod d235_parent_entry_holders {
     const LIVE: BranchState = BranchState::Live;
     const REAPED: BranchState = BranchState::Reaped;
 
-    fn graph(edges: &[(u64, Option<u64>, BranchState)]) -> HashMap<u64, (Option<u64>, BranchState)> {
-        edges.iter().map(|&(id, parent, st)| (id, (parent, st))).collect()
+    /// Every record at generation 0 and every parent link to generation 0: the shape a history with
+    /// no recycled slot produces. The recycled-slot case builds its nodes by hand.
+    fn graph(
+        edges: &[(u64, Option<u64>, BranchState)],
+    ) -> HashMap<u64, (BranchId, Option<BranchId>, BranchState)> {
+        edges
+            .iter()
+            .map(|&(id, parent, st)| {
+                (id, (BranchId::new(id, 0), parent.map(|p| BranchId::new(p, 0)), st))
+            })
+            .collect()
     }
 
     #[test]
@@ -2181,6 +2199,37 @@ mod d235_parent_entry_holders {
         assert!(h.contains(&1), "1 is pinned by 2, on 2's own walk");
         assert!(h.contains(&9), "9 is pinned by 10 even though 9's own parent record is missing");
         assert!(!h.contains(&8), "a missing record is not invented");
+    }
+
+    /// Review F2: the rule is "not `Reaped`", NOT "`Live`". A `Quarantined` branch is unmerged
+    /// but still readable, and a `Reaping` one is what a crash mid-reap leaves. Both must keep their
+    /// own entry and pin a reaped parent. Dropping either is the data-loss direction, and no other
+    /// fixture here holds such a record under a reaped node.
+    #[test]
+    fn a_quarantined_or_reaping_child_holds_its_entry_and_pins_a_reaped_parent() {
+        // 0 -> 1 (reaped) -> 2 (quarantined);  0 -> 3 (reaped) -> 4 (reaping)
+        let g = graph(&[(0, None, LIVE), (1, Some(0), REAPED), (2, Some(1), BranchState::Quarantined),
+                        (3, Some(0), REAPED), (4, Some(3), BranchState::Reaping)]);
+        let h = parent_entry_holders(&g);
+        for id in [1, 2, 3, 4] {
+            assert!(h.contains(&id), "{id} must hold its entry: nothing below a pin is Reaped");
+        }
+    }
+
+    /// Review F3: a walk stops at a slot that now holds a different incarnation. Slot 1 was reaped
+    /// and recycled (its record is now generation 1, and reaped again), while node 2 still names
+    /// the generation-0 parent it forked from.
+    #[test]
+    fn a_walk_does_not_pin_a_recycled_slot_s_new_occupant() {
+        let mut g = graph(&[(0, None, LIVE), (2, Some(1), REAPED), (3, Some(2), LIVE)]);
+        g.insert(1, (BranchId::new(1, 1), Some(BranchId::new(0, 0)), REAPED));
+        let h = parent_entry_holders(&g);
+        assert!(h.contains(&2), "2 is pinned by live 3");
+        assert!(
+            !h.contains(&1),
+            "slot 1 now holds a different incarnation than the one 2 forked from; pinning it would \
+             protect an unrelated branch's parent pages"
+        );
     }
 
     #[test]

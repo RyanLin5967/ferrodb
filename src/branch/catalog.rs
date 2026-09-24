@@ -224,9 +224,9 @@ impl LogBranchCatalog {
         // - A crash earlier in the reap leaves the child `Reaping`, which is not `Reaped`, so its
         //   entry is kept and the pages stay PARKED until the resumed reap finishes. That is the
         //   safe direction.
-        let nodes: HashMap<u64, (Option<u64>, BranchState)> = records
+        let nodes: HashMap<u64, (BranchId, Option<BranchId>, BranchState)> = records
             .iter()
-            .map(|(id, r)| (*id, (r.parent_id.map(|p| p.id), r.state)))
+            .map(|(id, r)| (*id, (r.branch_id, r.parent_id, r.state)))
             .collect();
         let holders = parent_entry_holders(&nodes);
         let mut derived: HashMap<u64, Vec<Epoch>> = HashMap::new();
@@ -920,8 +920,10 @@ mod tests {
     ///
     /// The derivation only visits parents that HAVE live children, so a parent that has none is
     /// never written by that loop and would keep whatever its last serialised copy held. That is
-    /// reachable: `detach_from_parent` runs before `mark_reaped`, so a crash between them — or a
-    /// `put` that never landed — leaves exactly this shape on disk.
+    /// reachable: a crash between `reap` marking a child `Reaped` and detaching it, or a `put` that
+    /// never landed, leaves exactly this shape on disk. (This said `detach_from_parent` runs BEFORE
+    /// `mark_reaped`. That order was reversed long ago; corrected in D235's review. The shape and
+    /// the test are unchanged by it.)
     ///
     /// It matters because `release_id` refuses to recycle a slot while `live_children` is
     /// non-empty. A stale entry for a child that no longer exists strands that id permanently, and
@@ -938,8 +940,9 @@ mod tests {
         {
             let c = LogBranchCatalog::open(&path, 1).unwrap();
             let child = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
-            // The parent's stored copy still lists the child — this is what a crash between
-            // `detach_from_parent` and `mark_reaped` leaves behind.
+            // The parent's stored copy still lists the child. This is what a crash between `reap`
+            // marking the child `Reaped` and detaching it leaves behind (the order was stated
+            // backwards here until D235's review).
             let mut trunk = c.get_raw(0).unwrap();
             assert_eq!(trunk.live_children, vec![child.fork_epoch]);
             c.put(&trunk).unwrap();
@@ -1000,7 +1003,9 @@ mod tests {
                 24,
                 "in-memory array is built by add_live_child and is not what this test is about"
             );
-            // Reap the middle one the way the reaper does: detach, then mark reaped.
+            // Reap the middle one: detach it and mark it reaped. The reaper does these in the other
+            // order (mark first), and the replayed result is the same either way, since both
+            // records are appended before the reopen.
             let mut brec = c.get_raw(b.branch_id.id).unwrap();
             let mut trunk = c.get_raw(0).unwrap();
             trunk.remove_live_child(brec.fork_epoch);
