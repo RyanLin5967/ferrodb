@@ -893,3 +893,203 @@ Amendment 10's M43/M44 are superseded by M50–M53: the rider they mutate no lon
 - `f1_lease_grace` → **36** (+2 at `960cc02`, +1 `a_marked_catalog_writes_no_soft_mark` with the fix).
 - **base + 53**.
 - The lib filter of amendment 10 → **47** (36 + 5 + 3 + 1 + 1 + 1).
+
+## Amendment 12 — review 4 (`frontier/lease_review4.md` @ `64b519b`) and the lead's decisions on it. Written before their fixes.
+
+Nothing here has been run (quiet mode). `012f65c` is cited, so everything is appended. `L_p` is process
+`p`'s lease clock, `W` the wall clock, `m` an OS mtime (wall), `lag_p = W − L_p`.
+
+### Committed so far, with predictions
+
+| commit | test | at that commit (`012f65c` source) | after the fixes | kills |
+|---|---|---|---|---|
+| `78ed41c` | `f1_lease_grace::an_unresumed_writer_whose_lease_clock_lagged_at_open_carries_no_lag_into_the_next_credit` (C1) | **FAIL**: `accrued = max(W − m, L − m) = 1 h + S` at the writer's open, so credited ≈ `now − m + S` > `now − m + 2000` | PASS: `accrued = L_w(open) − m`, credited ≈ `now − m` | M59 |
+| `1d64b36` | `f1_lease_grace::a_migration_by_a_process_whose_lease_clock_lagged_carries_no_lag_into_the_next_credit` (C1, the migration) | **FAIL**: the migration's `accrued` is the wall age, `1 h + S` | PASS: `accrued = L_mig − m` | M60 |
+| `1d64b36` | `f1_lease_grace::the_pre_d198_fixture_helper_refuses_a_catalog_whose_offset_left_zero` (C7a, `#[should_panic]`) | **FAIL**: the helper strips a `D = 3000` catalog without complaint | PASS: it panics with "only a catalog still at D = 0" | M61 |
+
+### The fixes that follow
+
+**C1 — one clock per expression.** `first_start_owed`, the `accrued` that this process's soft marks
+carry, is computed from LEASE-clock terms only:
+
+    owed_at_open = accrued_prev + max( L_w(open) − s_prev.mark , L_w(open) − m )
+
+- The migration's `accrued` is `L_mig − m_src`.
+- The resume keeps the lead's review-3 wall half in its file term:
+  `credit(now) = accrued + max(now − s.mark, W(now) − m, now − m)`.
+- There, the wall half over-credits by the resumer's own lag, and only there.
+
+**The relations the bound relies on** (these go into the doc beside the formula):
+- **R1.** `L_p(x) = W(x) − lag_p(x)`, where `lag_p ≥ 0` never decreases within `p`. The exception is
+  a BACKWARD wall step after `p`'s anchor, for which the file term takes the lease half.
+- **R2.** A pre-D198 writer, or a legacy log's writer, has `lag = 0`, because its lease clock IS the
+  wall clock (READ `main:src/cluster/mod.rs:335`).
+- **R3.** `m ≤ W(last moment its writer was alive)`. Every soft mark is written in a commit, so the
+  file is never older, on the wall, than its last soft mark.
+- **R4.** `s.mark ≤ L_w(last moment w was alive)`, because a soft mark is stamped at a commit.
+
+**The derivation** (INFERRED):
+- A lease written on writer `w`'s clock is owed `L_new(now) − L_w(last_alive)`.
+  - By R4 that is ≤ `L_new(now) − s.mark`: an over-credit by the idle tail only.
+  - For a pre-D198 predecessor, it is ≤ `L_new(now) − m`, by R2 and R3.
+- With a soft mark present, the lease-scale file term `L − m` cannot exceed the soft term. By R3 and
+  R1, `m ≥ W(s's commit) ≥ s.mark`. So at an intermediate writer's open the max IS the soft term:
+  exact, with no lag counted twice.
+- The chain is lease-minus-lease at every link. The only wall term left is at the final resume.
+- `012f65c`'s `max(W − m, L − m)` at the writer's open added `lag_w(open)` to a quantity the next
+  start ALSO reads on `w`'s clock. That is review 4's double count.
+
+**C2.**
+- **The E1 test is changed (a test edit on this lane's own unlanded test, per the lead).**
+  - `an_unmarked_writer_whose_lease_clock_lagged_keeps_its_leases_across_the_next_start` now holds
+    `wall_step::by(S)` across the writer's open and fork, as the C1 test does.
+  - Its assertions and expected values are unchanged.
+  - It can now tell a lease-clock soft mark from a wall-clock one: stamped with the wall, the mark
+    reads `≈ t + S` and the credit is ≈ 10 s.
+- **M58** stamps the soft mark with the wall: at `012f65c`'s API, `mark: crate::cluster::wall_millis_since(0)`.
+  - The changed E1 test kills it.
+  - After C3 that spelling does not compile, because no function returns a wall reading.
+  - An inline `SystemTime::now()` is M41b's blind spot, since `wall_step` cannot step it.
+
+**C3 — a wall reading made unrepresentable.** `cluster::wall_millis_since(u64)` is replaced by
+`cluster::FileWallStamp`:
+- `FileWallStamp::of(&Path) -> Option<FileWallStamp>` reads that file's mtime, and it is the ONLY
+  constructor.
+- `millis()` gives the stamp.
+- `wall_age_millis()` gives `W(now) − stamp`, saturating.
+
+A plain `fn(&Path) -> age` was not used: the evidence is the file's time AT OPEN, and its age is
+needed at the resume, after this process may have written the file.
+
+Stated hole: the age of a file whose mtime is the epoch IS a wall reading. Getting one means
+creating such a file, so it is not reachable by accident.
+
+Callers change as follows:
+- `open_sidecar_at` (own stamp);
+- `default_for_database` (legacy and source stamps);
+- the evidence's resume-time wall half;
+- `file_mtime_millis` becomes `#[cfg(test)]` (the C5 test's premise).
+
+**Cost, second acquisition removed.** `record_soft_mark`, the open-time `owed`, and the migration read
+`cluster::standalone_lease_millis() -> Option<u64>`:
+- one acquisition of the process lock gives authority and reading together;
+- it closes review 4's `is_clustered`/`try_now_millis` TOCTOU.
+
+Per unmarked commit that leaves one lock acquisition, one `Instant` read and one upsert.
+
+**C4 — over-credit is UNBOUNDED, and that is stated, not fixed** (the safe direction by design: Chubby
+grace). Nothing in the policy caps any route. Each is bounded only by a physical interval:
+
+| route | bounded by |
+|---|---|
+| a writer's idle tail after its last commit | that tail |
+| the resumer's own lag, through the wall half at the resume | the resumer's host sleep since its anchor |
+| leases GRANTED by an unresumed writer receive the whole `accrued` outage from before that writer existed | the pre-writer outage (can be months) |
+| a stale soft mark after D198 → `main` → D198 | **`main`'s whole service period**: `now − stale_mark` spans it |
+| a read-only opener's uptime | its run |
+
+**Corrections to amendment 10.**
+- Its "a stale `[0x09]` … over-credit by the gap before the D198 start" was true of `bf15efb`'s 8-byte
+  record. It is STALE under the soft mark: the over-credit is `main`'s whole service period, as in the
+  table.
+- **M37 is not a double count and not an over-credit route.** It merges the magic switch and the
+  record into one durable. Its torn state (`D > 0`, old magic) comes before any deadline is stored at
+  that `D`, `main` reads it correctly, and the next D198 open switches it. So it is benign.
+- **M57 is a mutant, not the code's behaviour.** `OwnOrLegacy` with a soft mark takes own only.
+- **The one double count the code made was C1**, fixed here.
+
+**C5.**
+- **(a) Torn first commit, STATED residual.** Eviction can write a commit's pages before its
+  `durable`, and the catalog tree has no WAL. So after a SIGKILL or a power loss, a FIRST commit over
+  a catalog with no soft mark can leave the file time moved and no `[0x09]`. The pre-writer outage is
+  then lost. That is never below `D = 0`, and the commit was never acknowledged.
+- **(b) Fixed structurally.** `soft_mark_superseded` is REMOVED.
+  - The mark's own commit, in `resume_leases` and `record_lease_alive`, goes through a new
+    `stage_mark`, which writes no soft mark.
+  - `marked` is set only after that commit's `durable`.
+  - So a failed mark write leaves the catalog soft-marking, and there is no flag to forget to clear.
+- **(c)** A cluster member, or no lease clock: stated, as before.
+- **(d)** The migration fsyncs the tmp file before the rename (`disk_manager.sync()`). It fsyncs the
+  directory after the two renames through the validated `storage::atomic_file::OsFileOps::sync_dir`
+  and `parent_dir`, whose Windows no-op is stated there. This was pre-existing at `9aa6968`. Nothing
+  can test it without a power cut, so **M63** (the directory fsync removed) is a registered survivor.
+
+**C6 — the cost, to be MEASURED (FAN-QUEUE step, pre-registered here).** A new harness,
+`examples/d198_soft_mark_cost.rs`, has two arms over fresh sidecars:
+- `unmarked` writes a soft mark on every commit;
+- `marked` is marked before the timed loop by `record_lease_alive` + `resume_leases` at the same
+  reading, so `D = 0`, and writes none.
+
+It is the same code path minus the soft mark, with no switch that disables anything.
+- **Two commit kinds:** `fork_staged`, never awaited, isolates the serial section under `logical`;
+  durable `set_root` includes the fsync.
+- **Order:** arms interleaved `ABBA` over R rounds.
+- **Output:** per arm and kind, the per-commit median and p90, and the INTEGER
+  `key_rewrites` per commit.
+
+**Predictions:**
+- **I (integer, fixed by control flow):** `key_rewrites` per commit, unmarked minus marked, is
+  **exactly 1**, in both kinds.
+- **R-staged:** the ratio of median staged-fork time, unmarked over marked, is in **[1.00, 1.40]**.
+- **R-durable:** the same ratio for durable `set_root` is in **[0.95, 1.10]**.
+
+**Falsifiers:**
+- I ≠ 1 means the arms do not differ by exactly the soft mark: a harness defect, and no ratio is
+  quoted.
+- A ratio outside its interval is reported as the finding, not re-run until it fits.
+
+**Baselines (stated in the FAN-QUEUE row).** 24 of the 27 example files that open a catalog never
+resume (review 4, MEASURED by grep), so they pay the soft mark on every commit. Bench numbers for
+those examples from before `8d0606e` are NOT comparable to runs after it.
+
+**C7 — fixtures.**
+- **(a)** `as_written_before_d198` asserts `D = 0` and the old magic before it strips. Otherwise it
+  panics with "only a catalog still at D = 0". It is forced to fire by `1d64b36`'s test.
+- **(b)** A comment only: review 3's C1 test pins arithmetic (it kills M35). Its lagging-writer story
+  is not a schedule a pre-D198 writer can reach, and the comment now says so. No code in it changes.
+- **(c) The accrual test is re-staged with consistent clocks** (a test edit on this lane's own
+  unlanded test, per the lead).
+  - **Why.** Its old lower bound `lapsed + 4h + (w0 − (t + 2h))` demanded 5 h, while its resumer's
+    lease clock read `t` against a wall of `t + 3h`. The fifth hour was that 3 h resumer lag, the
+    over-credit the design names, so the test required a defect-shaped term.
+  - **New staging:**
+    1. The pre-D198 authority wrote at `m_prev = t − 4h` (the fixture is stripped).
+    2. Program-order readings: `t0` before the writer's reopen, then the writer opens and commits
+       `set_root`, then `t1`.
+    3. The next start resumes at the lease reading `now = t1 + 1h`, with `wall_step::by(1h)`, so its
+       wall clock and lease clock agree (resumer lag ≈ 0).
+  - **The owed credit**, lease terms only: `(L_w(open) − m_prev) + max(now − s, file term)`, with
+    `L_w(open)` and `s` both in `[t0, t1]`.
+  - **New bounds, on the lease:**
+    - `lo = lapsed + (t0 − m_prev) + 1h`: `L_w(open) ≥ t0`, and `now − s ≥ 1h`.
+    - `hi = lapsed + (t1 − m_prev) + 1h + (t_after − t0) + 2000`: `t_after` is read after the
+      resume, and 2000 ms covers wall/lease skew and mtime granularity.
+  - What it still pins: the four hours before the writer are carried (M53: `accrued` 0 → ≈ 1 h,
+    below `lo`). The writer's own run is excluded by the last-commit test, not here.
+
+**The queued doc fix.** `holds_a_live_lease` is NOT one descent. `RangeScanner::next` follows
+`leaf.next` through every empty leaf (READ `src/storage/range_scan.rs:58–95`). The adversary
+`deadline-leaf-adversary` is testing that `delete` never frees or merges a leaf. So the cost is one
+descent plus every empty leaf at the head of the DEADLINE group. It has three call sites:
+- `take_first_start_evidence`, at every open of an existing unmarked sidecar;
+- the migration;
+- `resume_leases`.
+
+Nothing new is registered for it.
+
+### New mutants
+
+| mutant | must fail |
+|---|---|
+| M58 the soft mark stamped with the wall clock (`012f65c`'s API: `wall_millis_since(0)`) | the E1 test, changed as above. After C3: fails to compile |
+| M59 `first_start_owed` computed with the wall half | `78ed41c`'s C1 test |
+| M60 the migration's `accrued` taken as the wall age | `1d64b36`'s migration test |
+| M61 `as_written_before_d198` without its `D = 0` guard | `1d64b36`'s `should_panic` test |
+| M62 `stage_mark` replaced by `stage` in the mark's own commit (the old M55's route) | `a_marked_catalog_writes_no_soft_mark` |
+| M63 the migration's directory fsync removed | **SURVIVES** (needs a power cut). Registered. |
+
+### Counts, per-target
+
+- `f1_lease_grace` → **39** (+1 at `78ed41c`, +2 at `1d64b36`).
+- **base + 56**.
+- The lib filter of amendment 10 → **50** (39 + 5 + 3 + 1 + 1 + 1).
