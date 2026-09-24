@@ -523,11 +523,13 @@ impl Catalog {
 
     /// Remove a table from the catalog. **Frees nothing** (D229).
     ///
-    /// Its pages are freed by the DROP that calls this, and only after the DDL's checkpoint has made
-    /// the removal durable and truncated the log: `TxnManager::drop_checkpointed`, with the pages
-    /// from [`Catalog::table_pages`] named in a durable intent BEFORE this runs. Freeing here, before
-    /// the removal was durable, was what let a crash leave a table named over free pages, and a
-    /// free that failed part-way leave one in the same process (`frontier/d229_design.md` §2 (b), (f)).
+    /// Its pages are freed by the DROP that calls this, and only after the DDL's checkpoint has
+    /// flushed and synced the removal, whether or not that checkpoint then truncates the log (a WAL
+    /// pin can cancel the truncation, and D250's recovery skips the dropped table's records):
+    /// `TxnManager::drop_checkpointed`, with the pages from [`Catalog::table_pages`] named in a
+    /// durable intent BEFORE this runs. Freeing here, before the removal was durable, was what let a
+    /// crash leave a table named over free pages, and a free that failed part-way leave one in the
+    /// same process (`frontier/d229_design.md` §2 (b), (f)).
     ///
     /// E69, which found the time-travel heap never freed, also found two gaps that stay closed here:
     /// `self.stats` kept the dropped table's row counts, so a table recreated under the same name
@@ -554,8 +556,9 @@ impl Catalog {
     /// its intent, `open_recovered` decides it after this (the table is now absent) and the intent frees
     /// the pages after the open's checkpoint; they were quarantined before recovery, so recovery took
     /// none. The intent is recorded before the `DropTable` record, so every DROP this build logs has
-    /// one; only a DROP logged by a build without D229 leaks its pages here (D250's stated cost, now
-    /// narrowed to that). The rest is what [`Catalog::drop_table`] does.
+    /// one, and D250's stated cost (a completed DROP leaks its pages) is closed for them. Only a DROP
+    /// logged by a build without D229 leaks its pages here. The rest is what [`Catalog::drop_table`]
+    /// does.
     pub fn forget_dropped_table(&mut self, name: &str) -> Result<(), FerroError> {
         self.drop_table(name)
     }
@@ -961,10 +964,65 @@ mod tests {
         );
     }
 
+    /// Every page `name`'s structures name, walked here from the page formats into a `Vec` with one
+    /// entry per structure that names the page. Nothing de-duplicates ACROSS structures, so a page two
+    /// of them name is in it twice. Within one tree a node reached twice (a leaf by its parent and by
+    /// its left sibling) is one node, as it is for `collect_pages`. Record roots, not shared cells:
+    /// the callers split no tree.
+    fn raw_pages(catalog: &Catalog, name: &str) -> Vec<u32> {
+        use crate::storage::index_page::BPlusTreePage;
+        use crate::storage::page_directory::PageDirectory;
+        let bp = catalog.buffer_pool.clone();
+        let e = catalog.get_table(name).unwrap().clone();
+        let mut out = Vec::new();
+        for first in [e.first_directory_page_id, e.time_travel_root] {
+            let mut id = first;
+            while id != 0 {
+                out.push(id);
+                let frame_i = bp.fetch_page(id).unwrap();
+                let dir = PageDirectory::deserialize(bp.frames[frame_i].read().unwrap().data);
+                bp.unpin_page(id, false);
+                out.extend(dir.entries.iter().map(|x| x.page_id));
+                id = dir.next_page_directory;
+            }
+        }
+        let primary = BPlusTreeManager::<Value, RecordId>::open(e.primary_index_root, bp.clone());
+        let (mut mine, mut stack) = (BTreeSet::new(), vec![e.primary_index_root]);
+        while let Some(id) = stack.pop() {
+            if mine.insert(id) {
+                out.push(id);
+                match primary.read_node(id).unwrap() {
+                    BPlusTreePage::Internal(n) => stack.extend(n.child_ptrs),
+                    BPlusTreePage::Leaf(l) => stack.extend(l.next),
+                }
+            }
+        }
+        for root in e.indexes.iter().map(|i| i.root_page_id).chain(e.fulltext_indexes.iter().map(|i| i.root_page_id)) {
+            let tree = BPlusTreeManager::<(Value, Value), ()>::open(root, bp.clone());
+            let (mut mine, mut stack) = (BTreeSet::new(), vec![root]);
+            while let Some(id) = stack.pop() {
+                if mine.insert(id) {
+                    out.push(id);
+                    match tree.read_node(id).unwrap() {
+                        BPlusTreePage::Internal(n) => stack.extend(n.child_ptrs),
+                        BPlusTreePage::Leaf(l) => stack.extend(l.next),
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// **`table_pages` names both heaps and every tree** (E69's gap, carried into D229: a DROP frees
     /// what this returns and nothing else, so a structure left out here is a structure leaked). The
     /// time-travel heap's directory, the primary root and the B-tree index's root are checked by
-    /// id, and the list holds no page twice.
+    /// id, and the list is exactly what a walk written here from the page formats finds, which
+    /// names no page twice.
+    ///
+    /// **And a page two structures name is refused, not collected once** (D229 review 1's R6: this
+    /// test's earlier no-page-twice check ran on `table_pages`' own output, which is built in a set
+    /// and so could not fail). The primary root is planted in the heap's directory; the raw walk
+    /// then holds it twice, and `table_pages` must refuse. Mutant-only red: M23.
     #[test]
     fn table_pages_names_both_heaps_and_every_tree() {
         let mut catalog = setup_catalog();
@@ -980,8 +1038,24 @@ mod tests {
         ] {
             assert!(pages.contains(&page), "table_pages leaves out the {what}, page {page}: {pages:?}");
         }
-        let distinct: std::collections::BTreeSet<u32> = pages.iter().copied().collect();
-        assert_eq!(distinct.len(), pages.len(), "table_pages names a page twice: {pages:?}");
+        // The raw walk, checked before anything puts it in a set.
+        let mut raw = raw_pages(&catalog, "t");
+        raw.sort_unstable();
+        let twice: Vec<u32> = raw.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+        assert!(twice.is_empty(), "two of t's structures name page(s) {twice:?}: {raw:?}");
+        assert_eq!(raw, pages, "table_pages is not the pages t's structures name");
+
+        HeapFileManager::open(e.first_directory_page_id, catalog.buffer_pool.clone())
+            .add_to_directory(e.primary_index_root, 0)
+            .unwrap();
+        let raw = raw_pages(&catalog, "t");
+        assert_eq!(
+            raw.iter().filter(|p| **p == e.primary_index_root).count(),
+            2,
+            "premise: the planted alias is not named twice in the raw walk: {raw:?}"
+        );
+        let refused = catalog.table_pages("t");
+        assert!(refused.is_err(), "table_pages collected a page two of t's structures name, once: {refused:?}");
     }
 
     /// A dropped table must not leave its statistics behind for the next table of the same name.

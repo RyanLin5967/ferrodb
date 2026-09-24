@@ -73,11 +73,12 @@ pub struct ServerContext {
     /// Set while an EXCLUSIVE catalog borrow is outstanding.
     ///
     /// Half of a two-flag handshake with the per-connection busy slots below. `DROP TABLE` frees
-    /// heap, time-travel, primary and secondary pages **immediately**
-    /// (`Catalog::drop_table`), and once a read stopped taking the outermost lock there was
-    /// nothing left to stop it descending those pages as they were freed. The epoch cannot fix
-    /// that: it is bumped *after* the pages are gone, and a statement already in flight never
-    /// re-reads it.
+    /// heap, time-travel, primary and secondary pages **inside the statement** (D229: right after the
+    /// DROP's checkpoint has synced the unlink, `TxnManager::drop_checkpointed`; a batch that fails
+    /// there is retried by a later checkpoint or open), and once a read stopped taking the outermost
+    /// lock there was nothing left to stop it descending those pages as they were freed. The epoch
+    /// cannot fix that: it is bumped *after* the pages are gone, and a statement already in flight
+    /// never re-reads it.
     writer_active: std::sync::atomic::AtomicBool,
     /// One busy slot per live connection, each written only by its owner.
     ///

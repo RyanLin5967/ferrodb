@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{atomic_file::{FileOps, OsFileOps}, db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -417,17 +417,17 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
 /// open rebuilds until the rebuild's own checkpoint removes the trigger, so no open reads those
 /// trees again. So the trigger must be durable BEFORE the first free (the design review's caveat
 /// 1): the only constructor fsyncs the log, whose records are the trigger, and the stale-indexes
-/// marker with its directory. And it is constructed only inside [`open_recovered`], before any
-/// statement, arena or runtime exists, so no writer can hold a page it has allocated and not yet
-/// linked. That is D96's race, which a reachability sweep in a live process walks straight into
+/// marker with its directory, the marker through the manager's file ops so a test can see that it
+/// happened. And it is constructed only inside [`open_recovered`], before any statement, arena or
+/// runtime exists, so no writer can hold a page it has allocated and not yet linked. That is D96's race, which a reachability sweep in a live process walks straight into
 /// (the review's caveat 3), and why nothing outside this file can run the reset.
 struct RebuildOwed(());
 
 impl RebuildOwed {
-    fn made_durable(wal: &WalManager, marker: &Path) -> Result<RebuildOwed, FerroError> {
-        wal.sync_file()?;
+    fn made_durable(txn: &TxnManager, marker: &Path) -> Result<RebuildOwed, FerroError> {
+        txn.wal.sync_file()?;
         if marker.exists() {
-            crate::wal::txn::sync_file_and_directory(marker)
+            txn.sync_file_and_directory(marker)
                 .map_err(|e| FerroError::Io(format!("sync {}: {e}", marker.display())))?;
         }
         Ok(RebuildOwed(()))
@@ -686,7 +686,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let (db_file, wal_file, existed) = open_files(db_path, &wal_path)?;
     let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::with_storage(db_file)?)));
     let wal = Arc::new(WalManager::with_storage(wal_file, wal_path)?);
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    let txn = Arc::new(TxnManager::new_with_file_ops(wal.clone(), bp.clone(), file_ops()));
     bp.attach_wal(wal.clone());
     // D229, the review's A1: a DROP whose frees a crash interrupted left an intent naming its pages.
     // They are quarantined BEFORE recovery, whose directory repair allocates.
@@ -731,7 +731,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         use std::io::Write;
         // D229 (b): the old trees are reclaimed by identity, never walked, and only once the trigger
         // that makes every later open rebuild again is durable.
-        let owed = RebuildOwed::made_durable(&wal, &marker)?;
+        let owed = RebuildOwed::made_durable(&txn, &marker)?;
         match reset_index_pages(&catalog, &bp, &txn.pending_free_pages(), &owed) {
             Ok(reset) if !reset.kept.is_empty() => {
                 let _ = writeln!(
@@ -821,6 +821,28 @@ fn test_files() -> Option<(Arc<dyn Storage>, Arc<dyn Storage>, bool)> {
 #[cfg(test)]
 fn test_files() -> Option<(Arc<dyn Storage>, Arc<dyn Storage>, bool)> {
     tests_crash_frees::TEST_FILES.with(|f| f.borrow_mut().take())
+}
+
+/// The filesystem [`open_recovered`]'s transaction manager writes D229's intent file and fsyncs the
+/// stale-indexes marker through: the real one. In this crate's own tests a thread may hand over a
+/// double instead (`tests_crash_frees::TEST_FILE_OPS`), which records every step or fails one, so the
+/// orders that only a power loss could otherwise tell apart (A4; the rebuild trigger before the
+/// first free) are testable (D229 review 1's R7). Like [`open_files`]'s seam, the difference does
+/// not exist outside `#[cfg(test)]`.
+fn file_ops() -> Arc<dyn FileOps + Send + Sync> {
+    test_file_ops().unwrap_or_else(|| Arc::new(OsFileOps))
+}
+
+/// The file-ops seam's production half: nothing is ever handed over.
+#[cfg(not(test))]
+fn test_file_ops() -> Option<Arc<dyn FileOps + Send + Sync>> {
+    None
+}
+
+/// The file-ops seam's test half: whatever this thread handed over, taken once.
+#[cfg(test)]
+fn test_file_ops() -> Option<Arc<dyn FileOps + Send + Sync>> {
+    tests_crash_frees::TEST_FILE_OPS.with(|f| f.borrow_mut().take())
 }
 
 #[cfg(test)]

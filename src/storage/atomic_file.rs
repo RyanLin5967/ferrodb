@@ -52,6 +52,16 @@ pub trait FileOps {
     /// **Stated blind spot:** on Windows [`OsFileOps`] cannot do this at all (see its
     /// implementation) and does nothing. Every other step runs on every platform.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+
+    /// Remove `path`. Makes nothing durable: the removal survives a power cut only once its
+    /// directory is synced ([`FileOps::sync_dir`]).
+    ///
+    /// A default, so the recorders that predate it need no change: it removes the real file. D229's
+    /// intent file is the caller (`wal::free_intent::store`), and it is here so a test double can fail
+    /// it.
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
 }
 
 /// The real filesystem.

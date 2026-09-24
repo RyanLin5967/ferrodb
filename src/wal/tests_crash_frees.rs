@@ -17,10 +17,14 @@
 //!
 //! **Blind spots, stated:**
 //! - The files beside the log (the stale-indexes marker, the release quarantine, D229's intent) are
-//!   written through the real filesystem. No fault is ever aimed at one of their operations, so
-//!   each is durable the moment it returns.
-//! - `Durability::WriteThrough` only: kill -9, where every write that returned is kept. A power loss
-//!   that keeps an arbitrary subset of unsynced writes is not modelled here.
+//!   written through the real filesystem, and no sweep aims a fault at one of their operations, so a
+//!   crash finds each durable the moment it returned. D229 review 1's tests reach them another way:
+//!   a file-ops double ([`Ops`]) records every step of the intent file and the marker's fsyncs, or
+//!   fails one step once, in a live process. That is how their ORDER is checked (A4; the rebuild's
+//!   trigger before its first free); a power loss between two of those steps is still not modelled.
+//! - `Durability::WriteThrough` (kill -9, where every write that returned is kept), except one test
+//!   that needs a bitmap write lost under a durable log record and boots `SyncOnly`. A power loss that
+//!   keeps an arbitrary subset of unsynced writes is not modelled here.
 //! - Every fault is a lost write, a failed sync or a skipped `set_len`, and then the crash. Torn and
 //!   garbled page writes are outside the engine's stated model (`tests/sim_durability.rs`,
 //!   `fabric`).
@@ -32,8 +36,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{open_recovered, OpenedDatabase};
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -44,6 +49,7 @@ use crate::error::FerroError;
 use crate::execution::executor::{run, Outcome};
 use crate::execution::session::Session;
 use crate::parser::{parser::Parser, scanner::Scanner};
+use crate::storage::atomic_file::{FileOps, OsFileOps};
 use crate::storage::db_lock::DbLock;
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
@@ -63,6 +69,11 @@ thread_local! {
     /// files**, as `(page file, log, whether the page file existed)`. The open takes it, once.
     /// Thread-local, so a test that hands storage over cannot redirect an open in a test beside it.
     pub(crate) static TEST_FILES: RefCell<Option<(Arc<dyn Storage>, Arc<dyn Storage>, bool)>> = const { RefCell::new(None) };
+
+    /// **Test-only: the filesystem the next [`open_recovered`] on this thread hands its transaction
+    /// manager** for D229's intent file and the stale-indexes marker's fsyncs, instead of the real
+    /// one (D229 review 1's R7). Taken once, like [`TEST_FILES`].
+    pub(crate) static TEST_FILE_OPS: RefCell<Option<Arc<dyn FileOps + Send + Sync>>> = const { RefCell::new(None) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -99,12 +110,18 @@ struct Opened {
 
 impl Machine {
     fn boot(s: &Snapshot, plan: Option<FaultPlan>) -> Machine {
+        Machine::boot_as(s, plan, Durability::WriteThrough)
+    }
+
+    /// [`Machine::boot`] under `durability`. `SyncOnly` loses, at the crash, every write no sync
+    /// covered: that is how a bitmap bit is lost while the log record that relinks its page is durable.
+    fn boot_as(s: &Snapshot, plan: Option<FaultPlan>, durability: Durability) -> Machine {
         let dir = tempfile::tempdir().expect("a directory for the machine");
         for (name, bytes) in &s.side {
             std::fs::write(dir.path().join(name), bytes).expect("restore a file beside the log");
         }
         let existed = s.images.get(FAB_DB).is_some_and(|b| !b.is_empty());
-        let fabric = SimFabric::from_images(s.images.clone(), plan, Durability::WriteThrough);
+        let fabric = SimFabric::from_images(s.images.clone(), plan, durability);
         // The engine's own model: a page write lands whole or not at all (`tests/sim_durability.rs`).
         fabric.set_write_atomicity(FAB_DB, PAGE_SIZE as u64);
         Machine { fabric, dir, existed }
@@ -117,14 +134,26 @@ impl Machine {
     /// Open with `db_file` as the page file: the fabric's, or a wrapper around it that misbehaves
     /// on purpose.
     fn open_on(&self, db_file: Arc<dyn Storage>) -> Result<Opened, FerroError> {
+        self.open_with(db_file, self.fabric.open(FAB_WAL), None)
+    }
+
+    /// Open with `db_file` and `wal_file` as the page file and the log, and `ops` as the filesystem the
+    /// transaction manager writes the intent file and fsyncs the marker through (the real one when
+    /// `None`).
+    fn open_with(
+        &self,
+        db_file: Arc<dyn Storage>,
+        wal_file: Arc<dyn Storage>,
+        ops: Option<Arc<dyn FileOps + Send + Sync>>,
+    ) -> Result<Opened, FerroError> {
         let db = self.dir.path().join(DB_NAME);
         let lock = DbLock::acquire(&db)?;
-        let wal_file: Arc<dyn Storage> = self.fabric.open(FAB_WAL);
-        let files = (db_file, wal_file, self.existed);
-        TEST_FILES.with(|f| *f.borrow_mut() = Some(files));
+        TEST_FILES.with(|f| *f.borrow_mut() = Some((db_file, wal_file, self.existed)));
+        TEST_FILE_OPS.with(|f| *f.borrow_mut() = ops);
         let opened = open_recovered(&db, &lock);
-        // Taken by the open unless it refused before reaching its files.
+        // Taken by the open unless it refused before reaching them.
         TEST_FILES.with(|f| f.borrow_mut().take());
+        TEST_FILE_OPS.with(|f| f.borrow_mut().take());
         Ok(Opened { o: opened?, _lock: lock })
     }
 
@@ -897,12 +926,18 @@ fn a_crash_at_every_operation_of_drop_table_leaves_the_table_whole_or_gone() {
     drop_sweep(true);
 }
 
-/// **F2 with nothing of `t` in the log at the DROP.** D229 frees a DROP's pages once no retained
-/// record names them, so with `t`'s records in the log the frees wait for the truncation, and a
-/// free moved before the DROP's checkpoint (mutant M3) would still wait. With none in the log it
-/// would run at once, before the unlink is durable. Added with the fix; its red is mutant-only.
+/// **F2 with no row of `t` in the log at the DROP.** Recovery then has no heap record of `t` to skip,
+/// so every crash point rests on the intent and on D250's completion alone; the logged sweep above
+/// also exercises D250's skip.
+///
+/// Added with the fix for a premise that is retired: that D229 frees only once no retained record
+/// names the pages, so that with `t`'s rows in the log the frees would wait for the truncation. Under
+/// D250 the DROP's own `DropTable` record is always in the log, and the frees run right after the
+/// checkpoint's sync whatever the truncation does (D229 review 1's R5; the lead's decision, 10:05Z).
+/// A guard with no mutant of its own: M3, which it was added for, is registered as a predicted
+/// survivor (PREREG amendments 3 and 10), and a kill here would falsify that prediction.
 #[test]
-fn a_crash_at_every_operation_of_drop_table_with_nothing_of_it_in_the_log_leaves_it_whole_or_gone() {
+fn a_crash_at_every_operation_of_drop_table_with_no_row_of_it_in_the_log_leaves_it_whole_or_gone() {
     drop_sweep(false);
 }
 
@@ -1398,7 +1433,7 @@ fn a_stale_intent_for_a_dropped_root_frees_nothing_of_the_table_re_created_there
             old_pages.iter().any(|p| now.contains(p)),
             "premise: the new r holds none of the old r's pages, so a wrong free could hit nothing of it"
         );
-        free_intent::store(&d.o.wal.path, &[FreeIntent { table: "r".into(), dir_root: root, pages: old_pages }])
+        free_intent::store(&OsFileOps, &d.o.wal.path, &[FreeIntent { table: "r".into(), dir_root: root, pages: old_pages }])
             .expect("plant the old r's intent");
         drop(pin);
         // The crash.
@@ -1527,4 +1562,501 @@ fn an_intent_left_pending_by_a_crash_frees_nothing_of_the_table_re_created_after
         }
         assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "{arm}: the open left the intent in place");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// D229 review 1's R7 and the merge review's §4: the orders a crash sweep cannot aim at
+// ---------------------------------------------------------------------------------------------
+
+/// One step the open or a statement took, in the order taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ev {
+    /// A sync of the page file (`"db"`) or the log (`"wal"`) that succeeded.
+    Synced(&'static str),
+    /// Pages whose bits on the first bitmap page a write turned from set to clear: pages freed.
+    Cleared(Vec<u32>),
+    /// Pages whose bits on the first bitmap page a write turned from clear to set.
+    Set(Vec<u32>),
+    /// A step through the file-ops double: its name, its path, and how it ended.
+    Fs(&'static str, PathBuf, Result<(), std::io::ErrorKind>),
+}
+
+/// The steps, shared by the page file, the log and the file-ops double of one test.
+type Events = Arc<Mutex<Vec<Ev>>>;
+
+/// A page file or a log that records its syncs into `events`, and, for the page file, every change
+/// to the first bitmap page's bits. When armed, its next `sync_data` fails once: that is a log
+/// flush's sync.
+struct Watched {
+    inner: Arc<dyn Storage>,
+    name: &'static str,
+    events: Events,
+    fail_next_sync_data: AtomicBool,
+}
+
+impl Watched {
+    fn new(inner: Arc<dyn Storage>, name: &'static str, events: &Events) -> Arc<Watched> {
+        Arc::new(Watched { inner, name, events: events.clone(), fail_next_sync_data: AtomicBool::new(false) })
+    }
+}
+
+impl Storage for Watched {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        if self.name != "db" || offset != 0 || buf.len() != PAGE_SIZE {
+            return self.inner.pwrite(buf, offset);
+        }
+        let mut old = [0u8; PAGE_SIZE];
+        self.inner.pread(&mut old, 0)?;
+        let wrote = self.inner.pwrite(buf, offset)?;
+        let (mut cleared, mut set) = (Vec::new(), Vec::new());
+        for byte in 4..PAGE_SIZE {
+            for bit in 0..8 {
+                let page = ((byte - 4) * 8 + bit) as u32;
+                match ((old[byte] >> bit) & 1, (buf[byte] >> bit) & 1) {
+                    (1, 0) => cleared.push(page),
+                    (0, 1) => set.push(page),
+                    _ => {}
+                }
+            }
+        }
+        let mut events = self.events.lock().unwrap();
+        if !cleared.is_empty() {
+            events.push(Ev::Cleared(cleared));
+        }
+        if !set.is_empty() {
+            events.push(Ev::Set(set));
+        }
+        Ok(wrote)
+    }
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.pread(buf, offset)
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.inner.sync_all()?;
+        self.events.lock().unwrap().push(Ev::Synced(self.name));
+        Ok(())
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        if self.fail_next_sync_data.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected: this sync_data fails, once"));
+        }
+        self.inner.sync_data()?;
+        self.events.lock().unwrap().push(Ev::Synced(self.name));
+        Ok(())
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// **The file-ops double** (D229 review 1's R7): every step goes to the real filesystem
+/// ([`OsFileOps`]) and is recorded into `events` with how it ended. Two faults can be armed, each
+/// firing once: the next `remove` fails, or the next `sync_dir` after a successful `remove` fails.
+struct Ops {
+    events: Events,
+    fail_next_remove: AtomicBool,
+    fail_sync_dir_after_remove: AtomicBool,
+    removed: AtomicBool,
+}
+
+impl Ops {
+    fn new(events: &Events) -> Arc<Ops> {
+        Arc::new(Ops {
+            events: events.clone(),
+            fail_next_remove: AtomicBool::new(false),
+            fail_sync_dir_after_remove: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
+        })
+    }
+
+    fn note<T>(&self, step: &'static str, path: &Path, r: &std::io::Result<T>) {
+        let outcome = r.as_ref().map(|_| ()).map_err(|e| e.kind());
+        self.events.lock().unwrap().push(Ev::Fs(step, path.to_path_buf(), outcome));
+    }
+}
+
+impl FileOps for Ops {
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let r = OsFileOps.write(path, bytes);
+        self.note("write", path, &r);
+        r
+    }
+    fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let r = OsFileOps.append(path, bytes);
+        self.note("append", path, &r);
+        r
+    }
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        let r = OsFileOps.sync_file(path);
+        self.note("sync_file", path, &r);
+        r
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let r = OsFileOps.rename(from, to);
+        self.note("rename", to, &r);
+        r
+    }
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        let r = if self.removed.load(Ordering::SeqCst) && self.fail_sync_dir_after_remove.swap(false, Ordering::SeqCst) {
+            Err(std::io::Error::other("injected: the directory sync after a remove fails, once"))
+        } else {
+            OsFileOps.sync_dir(dir)
+        };
+        self.note("sync_dir", dir, &r);
+        r
+    }
+    fn remove(&self, path: &Path) -> std::io::Result<()> {
+        let r = if self.fail_next_remove.swap(false, Ordering::SeqCst) {
+            Err(std::io::Error::other("injected: this remove fails, once"))
+        } else {
+            OsFileOps.remove(path)
+        };
+        if r.is_ok() {
+            self.removed.store(true, Ordering::SeqCst);
+        }
+        self.note("remove", path, &r);
+        r
+    }
+}
+
+/// The DROP intent file of the database on `m`.
+fn intent_file(m: &Machine) -> PathBuf {
+    m.dir.path().join(format!("{DB_NAME}.wal.drop-intent"))
+}
+
+/// `t (id, v)` with rows 1, 2 and 3.
+fn small_t(o: &mut OpenedDatabase, s: &mut Session) {
+    must(o, s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
+    for id in 1..=3 {
+        must(o, s, &format!("INSERT INTO t VALUES ({id}, {id});"));
+    }
+}
+
+/// **A retried removal of the intent file syncs its directory before the quarantine is released**
+/// (D229 review 1's R1; PREREG amendment 9). The double fails the directory sync that follows the
+/// intent's removal, once: the removal happened but is not durable, so the intent stays pending and its
+/// pages stay quarantined. The retry (the next checkpoint) finds the file already gone, and only a
+/// directory sync then makes the earlier removal survive a power cut. Returning at `NotFound` released
+/// the quarantine over an intent a power loss could bring back, and the next open would free the pages
+/// again under whatever had taken them.
+///
+/// Mutant-only red: M17 returns at `NotFound` before the directory sync.
+#[test]
+fn a_retried_intent_removal_syncs_the_directory_before_the_quarantine_is_released() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let events = Events::default();
+    let ops = Ops::new(&events);
+    let mut d = m.open_with(m.fabric.open(FAB_DB), m.fabric.open(FAB_WAL), Some(ops.clone())).expect("open a new database");
+    let s = &mut Session::new();
+    small_t(&mut d.o, s);
+    let old_t = d.o.catalog.table_pages("t").expect("t's pages");
+    ops.fail_sync_dir_after_remove.store(true, Ordering::SeqCst);
+    must(&mut d.o, s, "DROP TABLE t;");
+    assert!(
+        events.lock().unwrap().iter().any(|e| matches!(e, Ev::Fs("sync_dir", _, Err(_)))),
+        "premise: the directory sync after the intent's removal never failed"
+    );
+    assert!(!intent_file(&m).exists(), "premise: the intent file was not removed before its directory sync failed");
+    let quarantined = d.o.bp.disk_manager.quarantined();
+    let released: Vec<u32> = old_t.iter().copied().filter(|p| !quarantined.contains(p)).collect();
+    assert!(released.is_empty(), "the dropped t's pages {released:?} left the quarantine while the removal of its intent was not durable");
+
+    let mark = events.lock().unwrap().len();
+    d.o.txn.checkpoint().expect("the checkpoint that retries the removal");
+    let after: Vec<Ev> = events.lock().unwrap()[mark..].to_vec();
+    let gone = after
+        .iter()
+        .position(|e| *e == Ev::Fs("remove", intent_file(&m), Err(std::io::ErrorKind::NotFound)))
+        .unwrap_or_else(|| panic!("premise: the retry did not find the intent file already gone: {after:?}"));
+    assert!(
+        after[gone + 1..].iter().any(|e| matches!(e, Ev::Fs("sync_dir", dir, Ok(())) if dir.as_path() == m.dir.path())),
+        "the retry found the intent file gone and did not sync its directory, so the earlier removal may not survive a power cut: {after:?}"
+    );
+    assert_eq!(d.o.bp.disk_manager.quarantined(), Vec::<u32>::new(), "premise: the retry did not release the quarantine");
+    assert_eq!(d.o.txn.pending_free_pages(), Vec::<u32>::new(), "premise: the intent is still pending after the retry");
+}
+
+/// **A DROP's pages stay out of use until its intent is durably gone** (A4; D229 review 1's R7,
+/// PREREG amendment 9). The double fails the intent's removal once, after the pages were freed. The
+/// intent file still names them then, so a crash would free them again at the next open: no table may
+/// take one until a retry has removed the intent. `notes` takes two new heap pages in between (no
+/// checkpoint runs), the retry runs, and then the crash.
+///
+/// Mutant-only red: M16 releases the quarantine before the intent file is rewritten.
+#[test]
+fn an_intent_whose_removal_fails_keeps_its_pages_out_of_use_until_it_is_gone() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let events = Events::default();
+    let ops = Ops::new(&events);
+    let old_t;
+    {
+        let mut d = m.open_with(m.fabric.open(FAB_DB), m.fabric.open(FAB_WAL), Some(ops.clone())).expect("open a new database");
+        let s = &mut Session::new();
+        small_t(&mut d.o, s);
+        must(&mut d.o, s, "CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));");
+        must(&mut d.o, s, &note_sql(0));
+        old_t = d.o.catalog.table_pages("t").expect("t's pages");
+        ops.fail_next_remove.store(true, Ordering::SeqCst);
+        must(&mut d.o, s, "DROP TABLE t;");
+        assert!(
+            events.lock().unwrap().iter().any(|e| matches!(e, Ev::Fs("remove", _, Err(_)))),
+            "premise: the intent's removal never failed"
+        );
+        assert!(intent_file(&m).exists(), "premise: the intent file is gone although its removal failed");
+        let bits = allocated(&d.o.bp).expect("read the bitmap");
+        assert!(old_t.iter().all(|p| !bits.contains(p)), "premise: the DROP's frees did not run before the removal");
+        let before = pages_of(&d.o, "notes").expect("walk notes");
+        must(&mut d.o, s, &note_sql(1));
+        must(&mut d.o, s, &note_sql(2));
+        let taken: Vec<u32> = pages_of(&d.o, "notes")
+            .expect("walk notes again")
+            .difference(&before)
+            .copied()
+            .filter(|p| old_t.contains(p))
+            .collect();
+        assert!(taken.is_empty(), "notes took page(s) {taken:?} of the dropped t while t's intent file still named them");
+        assert!(intent_file(&m).exists(), "premise: something removed the intent before the retry");
+        d.o.txn.checkpoint().expect("the checkpoint that retries the removal");
+        assert!(!intent_file(&m).exists(), "premise: the retry did not remove the intent");
+        assert_eq!(d.o.bp.disk_manager.quarantined(), Vec::<u32>::new(), "the retry removed the intent and kept its pages quarantined");
+        structure(&d.o).unwrap_or_else(|e| panic!("after the retry: {e}"));
+        check_rows(&mut d.o, "notes", &[0, 1, 2]).unwrap_or_else(|e| panic!("notes after the retry: {e}"));
+        // The crash.
+    }
+    let mut want = Want::default();
+    want.present.insert("notes".to_string(), vec![0, 1, 2]);
+    want.either = Some(("t".to_string(), vec![1, 2, 3], old_t.into_iter().collect()));
+    let m2 = Machine::boot(&m.snapshot(), None);
+    let mut d = m2.open().expect("the open after the retried removal");
+    assert!(d.o.catalog.get_table("t").is_none(), "the dropped t came back");
+    oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open: {e}"));
+}
+
+/// **A rebuilding open makes its trigger durable before its first free** (the design review's caveat
+/// 1; D229 review 1's R7, PREREG amendment 9). The reset frees index pages the durable catalog still
+/// names. That is safe only while every later open is certain to rebuild, so the log (whose records
+/// are the trigger) and the stale-indexes marker with its directory must be synced first: a marker
+/// or a log tail that an earlier process never synced could otherwise vanish in a power cut after the
+/// frees, and the next open would walk freed trees. One event list, shared by the page file, the log
+/// and the file-ops double, must show those three syncs before the open's first cleared bit.
+///
+/// Mutant-only red: M18 skips the marker's syncs; M19 skips the log's.
+#[test]
+fn a_rebuilding_open_makes_its_trigger_durable_before_its_first_free() {
+    let mut owed = owed_rebuild();
+    let marker_name = format!("{DB_NAME}.wal.stale-indexes");
+    owed.side.insert(marker_name.clone(), b"planted: an earlier process's index undo failed\n".to_vec());
+    assert_eq!(
+        &owed.images[FAB_DB][0..4],
+        &[0u8; 4][..],
+        "premise: the bitmap chain runs past page 0, and only page 0's bits are watched"
+    );
+    let m = Machine::boot(&owed, None);
+    let events = Events::default();
+    let d = m
+        .open_with(
+            Watched::new(m.fabric.open(FAB_DB), "db", &events),
+            Watched::new(m.fabric.open(FAB_WAL), "wal", &events),
+            Some(Ops::new(&events)),
+        )
+        .expect("the rebuilding open");
+    assert!(d.o.recovered, "premise: the open replayed nothing, so no reset ran");
+    let ev = events.lock().unwrap().clone();
+    let first_free = ev
+        .iter()
+        .position(|e| matches!(e, Ev::Cleared(_)))
+        .unwrap_or_else(|| panic!("premise: the open freed no page, so there is no order to check: {ev:?}"));
+    let before = &ev[..first_free];
+    let marker = m.dir.path().join(&marker_name);
+    assert!(
+        before.contains(&Ev::Synced("wal")),
+        "the open freed a page before it synced the log, whose records make every later open rebuild: {before:?}"
+    );
+    let synced = before
+        .iter()
+        .position(|e| *e == Ev::Fs("sync_file", marker.clone(), Ok(())))
+        .unwrap_or_else(|| panic!("the open freed a page before it synced the stale-indexes marker: {before:?}"));
+    assert!(
+        before[synced + 1..].iter().any(|e| matches!(e, Ev::Fs("sync_dir", dir, Ok(())) if dir.as_path() == m.dir.path())),
+        "the open freed a page before it synced the marker's directory: {before:?}"
+    );
+}
+
+/// **A page the log relinks after its bit was lost has its bit set again** (the design review's
+/// caveat 2; D229 review 1's R7, PREREG amendment 9). Under `SyncOnly` a crash loses every write no
+/// sync covered. `notes` takes a page for its second row: the bitmap write that allocated it is lost,
+/// while the row's log record is durable at its commit. The open's redo and directory repair put the
+/// page back into `notes`' heap with its bit clear; left so, the rebuild could allocate it as a tree
+/// node, under a live row.
+///
+/// The page is one the file already holds as zeros (taken, zero-written, freed and synced first), so
+/// redo starts it from an empty page. A page past the durable end of the file would fail the redo's
+/// read instead, and a page holding a dropped table's stale bytes would be redone onto them: both are
+/// outside this test (the second is recorded in the lane as a finding).
+///
+/// Mutant-only red: M15 skips the reset's `set_allocated`.
+#[test]
+fn a_page_the_log_relinks_after_its_bit_was_lost_has_its_bit_set_again() {
+    let m = Machine::boot_as(&Snapshot::default(), None, Durability::SyncOnly);
+    let lost;
+    {
+        let mut d = m.open().expect("open a new database");
+        let s = &mut Session::new();
+        must(&mut d.o, s, "CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));");
+        must(&mut d.o, s, &note_sql(0));
+        let spare = d.o.bp.new_page().expect("take a page");
+        d.o.bp.delete_page(spare).expect("give it back");
+        d.o.txn.checkpoint().expect("the checkpoint that makes everything so far durable");
+        let before = pages_of(&d.o, "notes").expect("walk notes");
+        must(&mut d.o, s, &note_sql(1));
+        let new: Vec<u32> = pages_of(&d.o, "notes").expect("walk notes again").difference(&before).copied().collect();
+        assert_eq!(new, vec![spare], "premise: the second note did not take exactly the page given back");
+        lost = spare;
+        // The crash: nothing has synced the page file since the checkpoint.
+    }
+    let crash = m.snapshot();
+    let db = &crash.images[FAB_DB];
+    assert!(
+        db[(lost / 8) as usize + 4] & (1 << (lost % 8)) == 0,
+        "premise: page {lost}'s allocation bit survived the crash, so there is no bit to set again"
+    );
+    let at = lost as usize * PAGE_SIZE;
+    assert!(
+        db.len() >= at + PAGE_SIZE && db[at..at + PAGE_SIZE].iter().all(|b| *b == 0),
+        "premise: page {lost} is not a zero page inside the durable file, so redo does not start it empty"
+    );
+    let m2 = Machine::boot(&crash, None);
+    let mut d = m2.open().expect("the open after the lost bit");
+    assert!(d.o.recovered, "premise: the open replayed nothing, so its insert was not durable");
+    assert_eq!(
+        walk(&d.o).expect("walk").owner.get(&lost).map(String::as_str),
+        Some("notes's heap"),
+        "premise: recovery did not put page {lost} back into notes' heap"
+    );
+    assert!(allocated(&d.o.bp).expect("read the bitmap").contains(&lost), "page {lost}, which notes' heap lists after the open, is free");
+    let mut want = Want::default();
+    want.present.insert("notes".to_string(), vec![0, 1]);
+    oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open that relinked page {lost}: {e}"));
+}
+
+/// **A DROP's intent is written before its `DropTable` record** (the D229 merge review's §4.1;
+/// PREREG amendment 10). The log's flush of the record fails at its sync, after its bytes reached the
+/// file: D250 poisons the log and the DROP reports failure, while the log on disk calls `t` dropped.
+/// The intent must exist by then. Otherwise the next open completes the DROP with nothing naming its
+/// pages, and they leak.
+///
+/// Mutant-only red: M20 records the intent after the record.
+#[test]
+fn a_drop_whose_record_flush_failed_left_its_intent_for_the_open_that_completes_it() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let events = Events::default();
+    let wal = Watched::new(m.fabric.open(FAB_WAL), "wal", &events);
+    let pages;
+    {
+        let mut d = m.open_with(m.fabric.open(FAB_DB), wal.clone(), None).expect("open a new database");
+        let s = &mut Session::new();
+        small_t(&mut d.o, s);
+        must(&mut d.o, s, "CREATE TABLE u (id INTEGER NOT NULL, v INTEGER);");
+        must(&mut d.o, s, "INSERT INTO u VALUES (0, 0);");
+        pages = pages_of(&d.o, "t").expect("walk t");
+        wal.fail_next_sync_data.store(true, Ordering::SeqCst);
+        assert!(sql(&mut d.o, s, "DROP TABLE t;").is_err(), "premise: the DROP succeeded, so its record's flush did not fail");
+        let why = d.o.wal.poisoned().unwrap_or_default();
+        assert!(why.contains("could not make its record durable"), "premise: the log was not poisoned by the DROP's record flush: {why:?}");
+        assert!(intent_file(&m).exists(), "the DROP's record reached the log's file, and no intent had been written before it");
+        // The crash.
+    }
+    let m2 = Machine::boot(&m.snapshot(), None);
+    {
+        let mut d = m2.open().expect("the open after the failed DROP");
+        assert_eq!(
+            d.o.completed_drops,
+            vec!["t".to_string()],
+            "premise: the DropTable record did not reach the log's file, so the open had no DROP to complete"
+        );
+        let mut want = Want::default();
+        want.present.insert("u".to_string(), vec![0]);
+        want.either = Some(("t".to_string(), vec![1, 2, 3], pages));
+        oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open that completed the DROP: {e}"));
+    }
+    assert!(!intent_file(&m2).exists(), "the open left the completed DROP's intent in place");
+}
+
+/// **A DROP frees its pages whether or not its checkpoint truncates** (the D229 merge review's §4.2,
+/// FREEPOSm; PREREG amendment 10). A WAL pin cancels the truncation. The frees must still run in the
+/// same process, right after the checkpoint's sync, and a table created next must be able to take the
+/// pages without anything aliasing. D250's recovery skip is what makes the kept records harmless: the
+/// crash with the pin still held, and the open after it, check that half.
+///
+/// Mutant-only red: M21 frees only on the truncated path.
+#[test]
+fn a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let old_t;
+    {
+        let mut d = m.open().expect("open a new database");
+        let s = &mut Session::new();
+        small_t(&mut d.o, s);
+        old_t = d.o.catalog.table_pages("t").expect("t's pages");
+        let base = d.o.wal.base_lsn.load(Ordering::SeqCst);
+        let _pin = d.o.wal.pin(base).expect("pin the log at its base");
+        must(&mut d.o, s, "DROP TABLE t;");
+        assert_eq!(d.o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log, so the DROP's checkpoint truncated");
+        let bits = allocated(&d.o.bp).expect("read the bitmap");
+        let kept: Vec<u32> = old_t.iter().copied().filter(|p| bits.contains(p)).collect();
+        assert!(kept.is_empty(), "a DROP whose truncation a pin cancelled left page(s) {kept:?} allocated");
+        assert!(!intent_file(&m).exists(), "the DROP's intent is still on disk after its frees");
+        assert_eq!(d.o.bp.disk_manager.quarantined(), Vec::<u32>::new(), "pages stay quarantined after the frees");
+        must(&mut d.o, s, "CREATE TABLE u (id INTEGER NOT NULL, v INTEGER);");
+        for id in 0..3 {
+            must(&mut d.o, s, &format!("INSERT INTO u VALUES ({id}, {id});"));
+        }
+        let u_pages = pages_of(&d.o, "u").expect("walk u");
+        assert!(old_t.iter().any(|p| u_pages.contains(p)), "premise: u took none of the old t's pages, so nothing could alias them");
+        structure(&d.o).unwrap_or_else(|e| panic!("after u took the freed pages: {e}"));
+        check_rows(&mut d.o, "u", &[0, 1, 2]).unwrap_or_else(|e| panic!("u, on the freed pages: {e}"));
+        // The crash, with the pin still held.
+    }
+    let mut want = Want::default();
+    want.present.insert("u".to_string(), vec![0, 1, 2]);
+    want.either = Some(("t".to_string(), vec![1, 2, 3], old_t.into_iter().collect()));
+    let m2 = Machine::boot(&m.snapshot(), None);
+    let mut d = m2.open().expect("the open after a DROP under a pin");
+    assert!(d.o.catalog.get_table("t").is_none(), "the dropped t came back");
+    oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open: {e}"));
+}
+
+/// **A DROP of a table whose pages a pending intent already names is refused before anything
+/// happens** (the D229 merge review's §4.3; PREREG amendment 10). No DROP in this build leaves such
+/// an intent: its pages are quarantined until it is gone, and a failed DROP poisons the log. So one is
+/// PLANTED, as a damaged or stale intent file would leave it, and adopted. Carrying out both intents
+/// would free the pages twice, or free them under a live owner.
+///
+/// Mutant-only red: M22 never refuses.
+#[test]
+fn a_drop_of_a_table_a_pending_intent_already_names_is_refused_before_anything_happens() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    let mut d = m.open().expect("open a new database");
+    let s = &mut Session::new();
+    small_t(&mut d.o, s);
+    let root = d.o.catalog.get_table("t").expect("t").first_directory_page_id;
+    let pages = d.o.catalog.table_pages("t").expect("t's pages");
+    free_intent::store(&OsFileOps, &d.o.wal.path, &[FreeIntent { table: "t".into(), dir_root: root, pages: pages.clone() }])
+        .expect("plant an intent naming t's pages");
+    assert_eq!(d.o.txn.adopt_free_intents().expect("adopt the planted intent"), 1, "premise: the planted intent was not adopted");
+    let planted = std::fs::read(intent_file(&m)).expect("read the planted intent");
+    let why = match sql(&mut d.o, s, "DROP TABLE t;") {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a DROP ran over a table whose pages a pending intent names"),
+    };
+    assert!(why.contains("already named by a pending DROP intent"), "the DROP failed, but not by the refusal: {why}");
+    assert_eq!(d.o.wal.poisoned(), None, "the refusal poisoned the log");
+    assert_eq!(std::fs::read(intent_file(&m)).expect("read the intent file"), planted, "the refused DROP rewrote the intent file");
+    let bits = allocated(&d.o.bp).expect("read the bitmap");
+    let freed: Vec<u32> = pages.iter().copied().filter(|p| !bits.contains(p)).collect();
+    assert!(freed.is_empty(), "the refused DROP freed page(s) {freed:?}");
+    check_rows(&mut d.o, "t", &[1, 2, 3]).unwrap_or_else(|e| panic!("t after the refused DROP: {e}"));
 }

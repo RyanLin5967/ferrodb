@@ -5,6 +5,7 @@ use crate::storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlu
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{free_intent::{self, FreeIntent}, log::{DdlOp, RecKind, WalManager, WalPin}}};
+use crate::storage::atomic_file::{FileOps, OsFileOps};
 
 /// Commits between automatic checkpoints.
 ///
@@ -159,6 +160,10 @@ pub struct TxnManager {
     ///
     /// Lock order: `att`, `release_retry`, then this, then the buffer pool and the log.
     pending_frees: Mutex<Vec<PendingFree>>,
+    /// The filesystem the intent file and the stale-indexes marker's fsyncs go through: `OsFileOps`,
+    /// or a double that fails or records a step, so the durability orders (A4; the rebuild
+    /// trigger's fsyncs) are testable at all (D229 review 1's R7). See [`TxnManager::new_with_file_ops`].
+    file_ops: Arc<dyn FileOps + Send + Sync>,
 }
 
 /// One DROP intent, and whether its table's unlink is known to have happened.
@@ -486,8 +491,15 @@ pub struct ReadView {
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
+        Self::new_with_file_ops(wal, bp, Arc::new(OsFileOps))
+    }
+
+    /// [`TxnManager::new`] with the filesystem D229's intent file and marker fsyncs go through.
+    /// Production passes `OsFileOps`; this crate's tests pass a double through `open_recovered`'s
+    /// test seam.
+    pub fn new_with_file_ops(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>, file_ops: Arc<dyn FileOps + Send + Sync>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), pending_frees: Mutex::new(Vec::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), pending_frees: Mutex::new(Vec::new()), file_ops }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1400,6 +1412,12 @@ impl TxnManager {
     /// that lets two statements on one database run concurrently (an `RwLock`, or a per-table lock)
     /// must re-establish this, or turn this undo into a compare-and-restore.
     ///
+    /// **The same precondition makes a DROP's intent complete** (the D229 merge review's §6.1). The
+    /// executor collects `Catalog::table_pages` BEFORE [`TxnManager::drop_checkpointed`] takes its
+    /// barrier, so a statement interleaving between the two could allocate a page into the table
+    /// that the intent does not name, and it would leak (never alias: the intent frees only what it
+    /// names).
+    ///
     /// Every write is attempted even if one fails, and the first error is returned.
     fn undo_primary_writes(&self, writes: Vec<PrimaryWrite>) -> Result<(), FerroError> {
         let mut first_err = None;
@@ -1708,27 +1726,35 @@ impl TxnManager {
     /// Write `intent` into the durable intent file beside the other pending ones, then quarantine
     /// its pages and hold it, undecided. Before the DROP's `DropTable` record (D229 (a)).
     ///
-    /// **It supersedes an undecided intent for the same table.** Unreachable in this build: a DROP
-    /// that fails after recording its intent poisons the log (D250), so no later DROP runs in the
-    /// process, and an open rolls back the intent of a table it finds present. Kept so a stale intent
-    /// can never be carried out a second time, after its pages went to a new owner, if either changes.
+    /// **Refused, before anything is written, when a pending intent already names one of its pages**
+    /// (the D229 merge review's §4.3, the lead's decision). A live table's page in a pending intent is
+    /// a state this build never makes: an intent's pages are quarantined until it is gone (A4), so no
+    /// table created meanwhile holds one, and a DROP whose record or mutation fails poisons the log
+    /// (D250), and a poisoned log refuses the next DROP before this runs. So a shared page means the
+    /// intent file is damaged or stale, and carrying out both intents would free a page twice, or
+    /// free it under its owner. This replaced a branch that superseded such an intent, which nothing
+    /// could reach.
     fn record_free_intent(&self, intent: FreeIntent) -> Result<(), FerroError> {
         let mut pending = self.pending_frees.lock().unwrap();
-        let (stale, keep): (Vec<PendingFree>, Vec<PendingFree>) =
-            pending.drain(..).partition(|p| !p.decided && p.intent.dir_root == intent.dir_root);
-        let mut all: Vec<FreeIntent> = keep.iter().map(|p| p.intent.clone()).collect();
+        let mine: HashSet<u32> = intent.pages.iter().copied().collect();
+        if let Some((other, shared)) = pending.iter().find_map(|p| {
+            let shared = p.intent.pages.iter().filter(|page| mine.contains(*page)).count();
+            (shared > 0).then_some((p, shared))
+        }) {
+            return Err(FerroError::Wal(format!(
+                "DROP refused: {shared} page(s) of `{}` are already named by a pending DROP intent (for `{}`, \
+                 whose heap starts at page {}), which this build never records for a live table; the intent \
+                 file {} is damaged or stale, and carrying both out would free a page twice or under its owner",
+                intent.table,
+                other.intent.table,
+                other.intent.dir_root,
+                free_intent::intent_path(&self.wal.path).display()
+            )));
+        }
+        let mut all: Vec<FreeIntent> = pending.iter().map(|p| p.intent.clone()).collect();
         all.push(intent.clone());
-        if let Err(e) = free_intent::store(&self.wal.path, &all) {
-            pending.extend(keep);
-            pending.extend(stale);
-            return Err(e);
-        }
+        free_intent::store(&*self.file_ops, &self.wal.path, &all)?;
         self.bp.disk_manager.quarantine(&intent.pages);
-        for p in &stale {
-            let gone: Vec<u32> = p.intent.pages.iter().copied().filter(|page| !intent.pages.contains(page)).collect();
-            self.bp.disk_manager.release_quarantine(&gone);
-        }
-        *pending = keep;
         pending.push(PendingFree { intent, decided: false });
         Ok(())
     }
@@ -1775,7 +1801,7 @@ impl TxnManager {
             pending.drain(..).partition(|p| p.decided || !present(p.intent.dir_root));
         let kept: Vec<FreeIntent> = keep.iter().map(|p| p.intent.clone()).collect();
         if !back.is_empty() {
-            if let Err(e) = free_intent::store(&self.wal.path, &kept) {
+            if let Err(e) = free_intent::store(&*self.file_ops, &self.wal.path, &kept) {
                 pending.extend(keep);
                 pending.extend(back);
                 return Err(e);
@@ -1786,6 +1812,15 @@ impl TxnManager {
         }
         *pending = keep.into_iter().map(|p| PendingFree { decided: true, ..p }).collect();
         Ok(())
+    }
+
+    /// Fsync the file at `path` and its directory through this manager's file ops, so a file an earlier
+    /// process wrote without syncing (a stale-indexes marker written before review 3's decision 7) is
+    /// durable before anything rests on it: D229's recovery reset frees pages only once the trigger
+    /// that makes every later open rebuild cannot vanish (the design review's caveat 1).
+    pub(crate) fn sync_file_and_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.file_ops.sync_file(path)?;
+        self.file_ops.sync_dir(crate::storage::atomic_file::parent_dir(path))
     }
 
     /// Every page of every intent not yet carried out: the recovery reset keeps them (the review's
@@ -1806,8 +1841,9 @@ impl TxnManager {
     /// review's A3 is carried by D250 instead, whose recovery skips every record of a dropped heap).
     /// Only a DROP's heap and time-travel pages have log records at all.
     ///
-    /// Called at the end of every checkpoint, which has just flushed and synced every page, and by
-    /// `open_recovered` after its own checkpoint or in place of one.
+    /// Called right after every checkpoint's sync, whatever the checkpoint then does with the log
+    /// (every page is flushed and synced by then), and by `open_recovered` after its own checkpoint
+    /// or in place of one.
     pub fn free_pending_frees(&self) -> usize {
         use std::io::Write;
         let mut pending = self.pending_frees.lock().unwrap();
@@ -1844,7 +1880,7 @@ impl TxnManager {
         }
         if !freed.is_empty() {
             let remaining: Vec<FreeIntent> = wait.iter().map(|p| p.intent.clone()).collect();
-            match self.bp.disk_manager.sync().and_then(|()| free_intent::store(&self.wal.path, &remaining)) {
+            match self.bp.disk_manager.sync().and_then(|()| free_intent::store(&*self.file_ops, &self.wal.path, &remaining)) {
                 Ok(()) => {
                     for p in &freed {
                         self.bp.disk_manager.release_quarantine(&p.intent.pages);
@@ -2309,15 +2345,6 @@ fn append_durably(path: &Path, line: &str) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
-    sync_directory_of(path)
-}
-
-/// Fsync the file at `path` and its directory, so a file an earlier process wrote without syncing
-/// (a stale-indexes marker written before review 3's decision 7) is durable before anything rests
-/// on it: D229's recovery reset frees pages only once the trigger that makes every later open
-/// rebuild cannot vanish (the review's caveat 1). Opened for writing, as Windows' flush requires.
-pub(crate) fn sync_file_and_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
     sync_directory_of(path)
 }
 

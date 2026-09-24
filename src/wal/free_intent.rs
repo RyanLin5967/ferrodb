@@ -1,12 +1,14 @@
 //! **D229 (a): the durable record of pages a DROP has given up and not yet freed.**
 //!
-//! A DROP frees its table's pages only after its checkpoint has made the unlink durable and
-//! truncated the log. Between the unlink and the frees, and across a crash anywhere in between,
-//! this file is what says which pages those are. It sits beside the log, `<wal>.drop-intent`, and
-//! holds every pending intent at once, rewritten whole.
+//! A DROP frees its table's pages only after its checkpoint has flushed and synced the unlink,
+//! whatever that checkpoint then does with the log (a WAL pin can keep it; D250's recovery skips the
+//! dropped table's records). Between the unlink and the frees, and across a crash anywhere in
+//! between, this file is what says which pages those are. It sits beside the log,
+//! `<wal>.drop-intent`, and holds every pending intent at once, rewritten whole.
 //!
 //! The rules it serves live in `wal::txn` (`TxnManager::adopt_free_intents` and what follows):
-//! - an intent is written durably BEFORE the unlink can reach the disk;
+//! - an intent is written durably BEFORE the DROP's `DropTable` record, and so before the unlink,
+//!   so every crash state in which the next open completes the DROP from the log has its intent;
 //! - at open, its pages are quarantined BEFORE recovery can allocate (the review's A1);
 //! - a table the durable catalog still names means the DROP never took effect, and the intent is
 //!   dropped; a table that is gone is rolled forward after the open's checkpoint has synced. A
@@ -26,7 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::FerroError;
-use crate::storage::atomic_file::{parent_dir, replace_atomically, FileOps, OsFileOps};
+use crate::storage::atomic_file::{parent_dir, replace_atomically, FileOps};
 use crate::wal::log::crc32;
 
 const MAGIC: &[u8; 4] = b"D229";
@@ -169,28 +171,35 @@ pub fn load(wal_path: &Path) -> Result<Vec<FreeIntent>, FerroError> {
     })
 }
 
-/// Make `intents` the durable content of the intent file: replaced atomically, or, when there are
-/// none, removed with its directory synced (A4), so a power loss cannot bring back an intent whose
-/// pages have since been handed out again.
-pub fn store(wal_path: &Path, intents: &[FreeIntent]) -> Result<(), FerroError> {
+/// Make `intents` the durable content of the intent file, through `ops` (`OsFileOps` in production,
+/// a faulting double in tests): replaced atomically, or, when there are none, removed with its
+/// directory synced (A4), so a power loss cannot bring back an intent whose pages have since been
+/// handed out again.
+///
+/// **An intent file already gone still gets its directory synced** (D229 review 1's R1). A remove
+/// that succeeded and whose directory sync then failed left the removal undurable; the retry finds
+/// the file gone, and only this sync makes that earlier removal survive a power cut. Returning
+/// before it let the caller release the quarantine over an intent a power loss could bring back.
+pub fn store(ops: &dyn FileOps, wal_path: &Path, intents: &[FreeIntent]) -> Result<(), FerroError> {
     let path = intent_path(wal_path);
     if intents.is_empty() {
-        match std::fs::remove_file(&path) {
+        match ops.remove(&path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(FerroError::Io(format!("remove {}: {e}", path.display()))),
         }
-        return OsFileOps
+        return ops
             .sync_dir(parent_dir(&path))
             .map_err(|e| FerroError::Io(format!("sync the directory of {}: {e}", path.display())));
     }
-    replace_atomically(&OsFileOps, &path, &encode(intents)?)
+    replace_atomically(ops, &path, &encode(intents)?)
         .map_err(|e| FerroError::Io(format!("write {}: {e}", path.display())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::atomic_file::OsFileOps;
 
     fn intent(table: &str, dir_root: u32, pages: &[u32]) -> FreeIntent {
         FreeIntent { table: table.to_string(), dir_root, pages: pages.to_vec() }
@@ -230,10 +239,10 @@ mod tests {
     fn storing_no_intents_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("x.wal");
-        store(&wal, &[intent("t", 7, &[7])]).unwrap();
+        store(&OsFileOps, &wal, &[intent("t", 7, &[7])]).unwrap();
         assert!(intent_path(&wal).exists(), "the intent was not written");
         assert_eq!(load(&wal).unwrap(), vec![intent("t", 7, &[7])]);
-        store(&wal, &[]).unwrap();
+        store(&OsFileOps, &wal, &[]).unwrap();
         assert!(!intent_path(&wal).exists(), "no intents left, and the file is still there");
         assert_eq!(load(&wal).unwrap(), Vec::new());
     }

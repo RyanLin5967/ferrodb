@@ -346,7 +346,8 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             // D229: every page of the table is named here, while this process still trusts its trees,
             // and the barrier makes that list a durable intent before the `DropTable` record. The pages
             // are freed only after the checkpoint has made the unlink durable. `drop_table` frees
-            // nothing.
+            // nothing. Named BEFORE the barrier, so the list is complete only because statements on one
+            // database are serialised (`TxnManager::undo_primary_writes` states that precondition).
             let pages = catalog.table_pages(&table)?;
             let record = DdlRecord {
                 op: DdlOp::DropTable,
