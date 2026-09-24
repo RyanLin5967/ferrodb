@@ -168,7 +168,9 @@ pub struct HistoryStore {
     /// **The hook mutex** (AMENDED 2, F3): held from the drain, through the window computation, to
     /// the durable write, so two checkpoints — two committing threads can each run the automatic
     /// one — never interleave their writes. Taken before `atomic_file`'s `REPLACE_LOCK`, like the
-    /// arena's `PersistState`.
+    /// arena's `PersistState`, and after `att` and `release_retry` when a checkpoint takes it
+    /// (AMENDED 3, item 5; the whole order is at `TxnManager::history`). Only this type's methods
+    /// take it, and none returns the guard.
     state: Mutex<StoreState>,
 }
 

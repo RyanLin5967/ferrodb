@@ -112,6 +112,15 @@ pub struct TxnManager {
     /// Attached by the entry point BEFORE `recover`, because the open's catch-up queues committed
     /// history records into it and the CLI checkpoints right after `recover`, before any runtime
     /// exists (`cli.rs`). Set once.
+    ///
+    /// **This handle is the checkpoint hook** (AMENDED 3, item 5): the store owns nothing but its
+    /// records and its file, and `wal::history` imports nothing from `agent_sql`, so the hook cannot
+    /// reach runtime state. **Lock order: `att` → `release_retry` → the store's mutex (F3) →
+    /// `atomic_file`'s `REPLACE_LOCK`.** The hook takes F3 under `release_retry` (and under `att` in
+    /// `ddl_unit`); `commit` pushes and runs its bounded drain with NOTHING held and before
+    /// `release_retired` takes `release_retry`. F3 is taken only inside `HistoryStore`'s methods and no
+    /// method returns its guard, so no caller can hold it into another lock: the order is enforced by
+    /// construction rather than checked.
     history: std::sync::OnceLock<Arc<HistoryStore>>,
     /// Open transaction -> the history records it wrote to the log, moved onto the store's queue
     /// the moment its `Commit` is durable and dropped by its abort. See
@@ -3944,6 +3953,51 @@ use super::*;
         let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
         assert_eq!(held, [1], "a checkpoint between T's Commit and its push lost T's history");
         assert!(during.is_err(), "a checkpoint ran while a committed transaction's history was not yet queued");
+    }
+
+    /// **D212 (a') AMENDED 3, item 5: the commit-path drain and a concurrent checkpoint both
+    /// finish.** One thread commits records large enough that its commit path drains the queue (F7)
+    /// while another loops checkpoints, whose hook takes the same store mutex under
+    /// `release_retry`. A GUARD, green by construction (see `TxnManager::history`): no one-line
+    /// mutant can invert the lock order, because the store holds no handle to `att` or
+    /// `release_retry`. The deadline is generous; passing costs nothing.
+    #[test]
+    fn a_commit_path_drain_and_a_concurrent_checkpoint_both_finish() {
+        let (_bp, _wal, txn, store, _dir) = with_history();
+        let big = crate::wal::history::QUEUE_DRAIN_BYTES / 3;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let committer = {
+            let (txn, done) = (Arc::clone(&txn), done_tx.clone());
+            std::thread::spawn(move || {
+                for h in 1..=8u64 {
+                    let t = txn.begin().unwrap();
+                    txn.bind_history(t, HistoryRecord { hseq: h, ordinal: h, commit_lsn: 0, body: vec![h as u8; big] })
+                        .unwrap();
+                    txn.commit(t).unwrap();
+                }
+                done.send("committer").unwrap();
+            })
+        };
+        let checkpointer = {
+            let (txn, done) = (Arc::clone(&txn), done_tx);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    // Refused whenever the committer has a transaction open; that is fine.
+                    let _ = txn.checkpoint_keeping_owed();
+                }
+                done.send("checkpointer").unwrap();
+            })
+        };
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a commit-path drain and a checkpoint deadlocked (neither finished within 60 s)");
+        }
+        committer.join().unwrap();
+        checkpointer.join().unwrap();
+        assert!(store.counters().drains > 0, "premise: nothing drained, so the two never contended");
+        let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(held, (1..=8).collect::<Vec<u64>>(), "a record went missing under the contention");
     }
 }
 
