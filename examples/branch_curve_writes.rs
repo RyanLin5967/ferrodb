@@ -2713,7 +2713,7 @@ fn read_vs_n_summary(
              changed; amend before reading); `A12.1: CURVE_FIRECHECK=ckpt-ddl was requested but no axis-(ii) \
              checkpoint truncated ...` (A13.9) = DID_NOT_FIRE (the record was retained, but nothing re-appended \
              it); `the parent's first lease pass did not finish ...` (PARENT_PASS), `the production database did \
-             not close cleanly ...` (CLOSE) and `LEASE ...` = findings, each ALSO a finding beside A13.9's line \
+             not close cleanly ...` and `CLOSE ...` (CLOSE, A21.1) and `LEASE ...` = findings, each ALSO a finding beside A13.9's line \
              (A20.2); any other = a finding."
         );
     } else if fire != Fire::None {
