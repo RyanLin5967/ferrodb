@@ -245,10 +245,6 @@ impl ProvenanceStore for MemProvenanceStore {
             .ok_or_else(|| FerroError::Provenance(format!("unknown provenance slot {}", id)))
     }
 
-    fn runs(&self) -> Result<Vec<RunEntity>, FerroError> {
-        MemProvenanceStore::runs(self)
-    }
-
     fn attribute(&self, rid: RecordId) -> Result<ProvId, FerroError> {
         let inner = self.inner.read().map_err(|_| Self::poisoned())?;
         Ok(inner

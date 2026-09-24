@@ -95,16 +95,21 @@ pub struct TxnManager {
     /// name the database's writers.
     ///
     /// **Stated cost:** this grows with the number of distinct runs and is never pruned, and every
-    /// checkpoint that truncates the log rewrites all of it (since D234, not one a pin kept) — the same unbounded shape `schema_log` has for tables, where
-    /// the bound is the schema and here it is the agent history. A database with a very large
+    /// checkpoint that truncates the log rewrites all of it (since D234, not one a pin kept) — the
+    /// same unbounded shape `schema_log` has for tables, where the bound is the schema and here it
+    /// is the runs this process has bound. A database with a very large
     /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a
     /// caller sees the size; nothing here caps it, because dropping declarations would silently
     /// make some writers unnameable and that is the failure this record exists to prevent.
     ///
-    /// **Keyed by slot (`prov_id.0`) since D227**, so one declaration costs O(log R). Each entry
-    /// point now declares every run its provenance store knows at open
-    /// ([`TxnManager::declare_runs_of`]), and the linear scan a `Vec` needed per declaration made
-    /// that O(R²) (the D216 re-adversary's F3). Replayed in slot order.
+    /// It holds only the runs bound in THIS process, and is never refilled at open: the lead's
+    /// 09:44Z decision on D227's run half (SCALE-DESIGN "D227 run half"). Refilling it from the
+    /// provenance store made every open and every checkpoint re-declare every run ever interned, one
+    /// per branch ever created, while an event's writer already travels in its own transaction's
+    /// binding.
+    ///
+    /// **Keyed by slot (`prov_id.0`)**, so a declaration costs O(log R), not the linear scan a `Vec`
+    /// needed on every `bind_run` (the D216 re-adversary's F3). Replayed in slot order.
     run_log: Mutex<BTreeMap<u32, RunEntity>>,
     /// Open transaction -> the run that will be named immediately before its `Commit`.
     ///
@@ -620,20 +625,13 @@ impl TxnManager {
     ///
     /// Refuses to hold two different actors under one `prov_id`: the slot is the reference every
     /// stamped version carries, so two meanings for it would make every attribution ambiguous.
-    pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
-        self.retain_run(run).map(|_| ())
-    }
-
-    /// The body of [`Self::declare_run`], answering whether `run` was new: `Ok(false)` for a run
-    /// already retained under its slot (the same actor), `Err` for a different actor in that slot.
     ///
-    /// ⚠ Retaining writes nothing (the D234 adversary's F6). Since D234 a checkpoint re-appends the
+    /// ⚠ This writes nothing (the D234 adversary's F6). Since D234 a checkpoint re-appends the
     /// retained runs only after a real truncation, so a run that is only retained stays out of the
-    /// log for as long as a pin keeps every checkpoint from truncating. `bind_run`, the one production
-    /// caller of `declare_run`, is covered by the binding its commit writes (a rolled-back binding
-    /// described no committed row), and `declare_runs_of` writes each new run itself. A new caller must
-    /// do one of the two.
-    fn retain_run(&self, run: RunEntity) -> Result<bool, FerroError> {
+    /// log for as long as a pin keeps every checkpoint from truncating. `bind_run`, the one
+    /// production caller, is covered by the binding its commit writes (a rolled-back binding
+    /// described no committed row). A new caller that needs the run in the log must write it.
+    pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
         let mut log = self.run_log.lock().unwrap();
         if let Some(existing) = log.get(&run.prov_id.0) {
             // `same_actor`, not `==`. Full equality compares `started_at`, which is when a session
@@ -649,37 +647,9 @@ impl TxnManager {
                     run.describe()
                 )));
             }
-            return Ok(false);
+            return Ok(());
         }
         log.insert(run.prov_id.0, run);
-        Ok(true)
-    }
-
-    /// Declare every run `store` knows, writing each new one to the log now (D234), so the log names
-    /// them from here on and every checkpoint that truncates re-declares them. D227.
-    ///
-    /// `run_log` lives in memory and was filled only by the merges this process ran, so after a
-    /// restart the log stopped naming the database's writers at its first checkpoint. Each entry
-    /// point calls this once its provenance store is open. The store and not the log is the source:
-    /// it is the store that hands out slots, so its runs are what the slot in every version header
-    /// means. A store kept in memory knows nothing after a restart and declares nothing, which is
-    /// right for it, because it hands the same slots out again.
-    ///
-    /// **D234: each run not already retained is also WRITTEN, as a declaration, now**, the way
-    /// `log_ddl` writes DDL as it runs. A checkpoint re-appends the retained runs only after a real
-    /// truncation, so a run that was only retained would stay out of the log for as long as a pin
-    /// keeps every checkpoint from truncating.
-    pub fn declare_runs_of(&self, store: &dyn crate::provenance::ProvenanceStore) -> Result<(), FerroError> {
-        let mut wrote = false;
-        for run in store.runs()? {
-            if self.retain_run(run.clone())? {
-                self.wal.append(0, 0, &RecKind::RunIdentity { run })?;
-                wrote = true;
-            }
-        }
-        if wrote {
-            self.wal.flush()?;
-        }
         Ok(())
     }
 
@@ -1166,8 +1136,7 @@ impl TxnManager {
         // and the kept log still holds every declaration a reader starting at its base needs:
         // - the ones the last real truncation re-appended;
         // - every DDL since, which `log_ddl` appended as it ran;
-        // - every run since, as the binding its commit appended, or as the declaration
-        //   `declare_runs_of` appended.
+        // - every run since, as the binding its commit appended.
         // Re-appending them anyway grew the log by every declaration at every checkpoint: O(M) per
         // checkpoint, O(M²) over a pinned period, and recovery read all of it.
         if truncation == Truncation::Truncated {

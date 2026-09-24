@@ -46,8 +46,9 @@ fn main() {
     };
     // **D204: the one open path.** Recovery; every index rebuilt from the recovered heap if
     // recovery replayed a data record or the stale-indexes marker asks; then a checkpoint after a
-    // rebuild or whenever the log holds records. Through the same function the CLI calls. This file used to spell the sequence out
-    // itself, and from D9 until D202 its copy omitted the rebuild. Index pages are not logged, so a
+    // rebuild or whenever the log holds records. Through the same function the CLI calls. This
+    // file used to spell the sequence out itself, and from D9 until D202 its copy omitted the
+    // rebuild. Index pages are not logged, so a
     // row committed after the last checkpoint came back in the heap but not in its primary index: a
     // lookup by key missed it, and an INSERT of its key was admitted as a second live row
     // (`tests/pgserver_crash_rebuilds_indexes.rs`). `tests/open_path_allowlist.rs` keeps it from
@@ -115,11 +116,6 @@ fn main() {
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
-
-    // D227, the same call the CLI makes: the runs this runtime's provenance store knows, declared
-    // and written to the log, so every checkpoint that truncates re-declares them. The store here is in memory, so after a restart it knows
-    // none and this declares none; it is here so the two entry points cannot drift apart on it.
-    txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!("pgserver: {e}"));
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));

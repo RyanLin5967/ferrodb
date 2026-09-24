@@ -206,8 +206,7 @@ pub enum RecKind {
     ///   at length why anywhere else loses it.
     /// * `txn_id == 0` — a **declaration**: this run exists. Written by `TxnManager` after every
     ///   checkpoint that truncates, because a truncation discards the log whole, exactly as
-    ///   `replay_schema` does for DDL, and (D234) when `TxnManager::declare_runs_of` first retains a
-    ///   run. Transaction 0 never commits, so a declaration binds nothing.
+    ///   `replay_schema` does for DDL. Transaction 0 never commits, so a declaration binds nothing.
     RunIdentity { run: RunEntity },
 }
 
