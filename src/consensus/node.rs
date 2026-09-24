@@ -419,7 +419,10 @@ impl<A: Applier> Node<A> {
     }
 
     /// Ask for a command to be committed. Only meaningful on a leader; anywhere else the state
-    /// machine produces a `NotLeader` refusal, which lands in [`Node::take_refusals`].
+    /// machine produces a `NotLeader` refusal, which lands in [`Node::take_refusals`]. A leader also
+    /// refuses a command the wire could never carry (D223's admission check), and that refusal
+    /// lands there too. Either way the round returned is the previous last round, not a new one, so
+    /// a caller must read the refusals; `NodeReplicator::propose` does.
     ///
     /// Returns the round the leader assigned. **That is not an acknowledgement** — the round is
     /// acknowledged when [`Node::commit_round`] reaches it, which is the only moment a quorum has
