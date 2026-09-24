@@ -197,6 +197,21 @@ it read. Reverting A's merge halts by default and names B as the blocker — an 
 because the read was retained. **B never wrote row 1.** Without read-sets there is no edge at all
 and the revert would silently corrupt B's work. `CASCADE` then undoes B first, then A.
 
+**Reach (D212).** What REVERT reads is written into each merge's own transaction in the WAL, and
+from there into `<db>.history` before the log is truncated, so a merge made before a restart or a
+crash is revertible after it, dependents found across the restart included. Merge ids read
+`m_<nonce>_<n>`: they never repeat across restarts, restores or upgrades, and an old `m_<n>` id is
+refused by its format. The reach is a retention window: the last `FERRODB_REVERT_RETENTION_MERGES`
+published merges (default 1024), and an older one is refused with a message that names the window;
+the file holds about that window whatever the number of merges ever made. A REVERT is one
+transaction, a second REVERT of the same merge is refused rather than applied again (D218), and each
+reverted row goes back to the author it had before the merge (D226) — just after the revert commits,
+because authorship lives in the provenance store: a crash between the two leaves the reverted run
+still named, exactly as a crash just after a merge's commit leaves its rows naming the author they
+had before it. One runtime drives a database's history: a second runtime that finds it moved since
+it read it refuses MERGE and REVERT. Not yet: a snapshot install or base backup does not carry
+`<db>.history`, so REVERT on a re-seeded cluster member reaches only merges made after it.
+
 ---
 
 ## What this does not do yet
