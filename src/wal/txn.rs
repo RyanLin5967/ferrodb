@@ -3047,32 +3047,20 @@ use super::*;
         FAIL_RELEASES.with(|f| f.set(0));
     }
 
-    /// **A DROP is refused BEFORE its mutation while ANOTHER table owes a release** (lane §21). The
-    /// DROP needs its truncation: with the log kept, the next open replays the dropped table's records
-    /// onto freed or reused pages. A refusal after the mutation would leave the table dropped and
-    /// reported failed (A8). A guard: `7cede54` refused every DDL here too. It carries the retired
-    /// `ddl_is_refused_before_its_mutation_while_a_release_is_owed`'s assertion for DROP.
+    /// **D250 (lane `lane_d250_drop_logged.md` §2 test 3; replaces the parent's
+    /// `a_drop_is_refused_before_its_mutation_while_another_table_owes_a_release`): a DROP while
+    /// ANOTHER table owes a release succeeds, and the truncation waits.** The owed release keeps the
+    /// log, so the dropped table's records stay in it. That is harmless once the DROP's record is
+    /// durable before its frees and recovery skips every record a later DROP names.
     #[test]
-    fn a_drop_is_refused_before_its_mutation_while_another_table_owes_a_release() {
+    fn a_drop_while_another_table_owes_a_release_succeeds_and_keeps_the_log() {
         let (bp, wal, txn, mut catalog, _dir) = table_owing_a_release();
         let base = wal.base_lsn.load(Ordering::SeqCst);
-        let owned = {
-            let e = catalog.get_table("other").expect("other");
-            [e.first_directory_page_id, e.time_travel_root, e.primary_index_root]
-        };
-        let refused = sql("DROP TABLE other;", &mut catalog, &bp, &txn, &mut Session::new());
-        let e = match refused {
-            Err(e) => e,
-            Ok(_) => panic!("DROP ran while another table owes a release, so its truncation was skipped"),
-        };
-        assert!(e.to_string().contains("owed"), "the DROP was refused, but not for the owed release: {e}");
-        assert!(catalog.get_table("other").is_some(), "the refused DROP had already dropped the table");
-        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "the refused DROP discarded another table's release");
-        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the refused DROP truncated the log");
-        // Nothing was freed (lane §21.2): `allocate` hands out the lowest clear bit, so a page of
-        // `other` freed by the refused DROP would be the next one handed out.
-        let next = bp.disk_manager.allocate().unwrap();
-        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `other`, which still names it");
+        sql("DROP TABLE other;", &mut catalog, &bp, &txn, &mut Session::new())
+            .unwrap_or_else(|e| panic!("DROP was refused while another table owes a release: {e}"));
+        assert!(catalog.get_table("other").is_none(), "DROP answered Ok without dropping the table");
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "the DROP discarded another table's release");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the DROP truncated the log past a release that is still owed");
         FAIL_RELEASES.with(|f| f.set(0));
     }
 
@@ -3092,34 +3080,20 @@ use super::*;
         (bp, wal, txn, catalog, owned, dir)
     }
 
-    /// **A DROP is refused BEFORE its mutation while a WAL pin would keep the log** (lane §21.6; the
-    /// lead's interim decision after `rollback-review4` and the D216 lane). `WalManager::truncate`
-    /// keeps the log, and answers `Ok`, while any pin is below its end. A DROP under a pin therefore
-    /// freed its pages and left their records in the log, and the next open replayed them onto
-    /// whatever reused those pages. `allocate` hands out the lowest clear bit, so a page the refused
-    /// DROP had freed would be the next one handed out.
+    /// **D250 (lane §2 test 4; replaces the parent's
+    /// `a_drop_is_refused_before_its_mutation_while_a_pin_would_keep_the_log`): a DROP under a WAL pin
+    /// succeeds, and the pin keeps the log.** What makes the kept log harmless after a crash is
+    /// tested in `wal::recovery::tests::after_a_pinned_drop_and_a_crash_redo_writes_no_page_the_drop_freed`.
     #[test]
-    fn a_drop_is_refused_before_its_mutation_while_a_pin_would_keep_the_log() {
-        let (bp, wal, txn, mut catalog, owned, _dir) = table_to_drop();
+    fn a_drop_under_a_pin_succeeds_and_keeps_the_log() {
+        let (bp, wal, txn, mut catalog, _owned, _dir) = table_to_drop();
         let base = wal.base_lsn.load(Ordering::SeqCst);
-        // A reader (a replication stream, a base backup, a snapshot handoff) holds the log from its base.
-        let pin = wal.pin(base).expect("pin the log at its base");
+        let _pin = wal.pin(base).expect("pin the log at its base");
         assert!(base < wal.next_lsn.load(Ordering::SeqCst), "premise: the pin is not below the log's end, so it keeps nothing");
-        let e = match sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new()) {
-            Err(e) => e,
-            Ok(_) => panic!("DROP ran while a pin kept the log, so the log still holds the records of the pages it freed"),
-        };
-        assert!(e.to_string().contains("pin"), "the DROP was refused, but not for the pin: {e}");
-        assert!(catalog.get_table("t").is_some(), "the refused DROP had already dropped the table");
-        let next = bp.disk_manager.allocate().unwrap();
-        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `t`, which still names it");
-        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the refused DROP moved the log's base");
-
-        drop(pin);
         sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new())
-            .unwrap_or_else(|e| panic!("DROP was refused after the pin was released: {e}"));
+            .unwrap_or_else(|e| panic!("DROP was refused under a pin: {e}"));
         assert!(catalog.get_table("t").is_none(), "DROP answered Ok without dropping the table");
-        assert!(wal.base_lsn.load(Ordering::SeqCst) > base, "the DROP did not truncate once nothing pinned the log");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
     }
 
     /// **A DROP is refused BEFORE its mutation on a poisoned log** (lane §21.6). A poisoned log

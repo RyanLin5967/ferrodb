@@ -1071,4 +1071,174 @@ use super::*;
         assert_eq!(rows("SELECT id, v FROM fresh;", &mut o), vec![v(1, 10), v(2, 20), v(3, 30)], "`fresh` after the reopen");
         assert_eq!(rows("SELECT id, v FROM fresh WHERE id = 2;", &mut o), vec![v(2, 20)], "`fresh` by key after the reopen");
     }
+
+    /// One SQL statement through the executor, in a fresh session.
+    fn run_sql(sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>) -> Result<crate::execution::executor::Outcome, FerroError> {
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+        crate::execution::executor::run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut Session::new())
+    }
+
+    /// Every heap `(dir_root, page)` the retained log writes, looking through a CLR to what it redoes.
+    fn heap_writes(wal: &WalManager) -> Vec<(u32, u32)> {
+        fn heap_page(kind: &RecKind) -> Option<(u32, u32)> {
+            match kind {
+                RecKind::HeapInsert { dir_root, page_id, .. }
+                | RecKind::HeapDelete { dir_root, page_id, .. }
+                | RecKind::HeapUpdate { dir_root, page_id, .. }
+                | RecKind::HeapRelease { dir_root, page_id, .. } => Some((*dir_root, *page_id)),
+                RecKind::Clr { redo, .. } => heap_page(redo),
+                _ => None,
+            }
+        }
+        let mut out = Vec::new();
+        let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+        let end = wal.next_lsn.load(Ordering::SeqCst);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).unwrap();
+            out.extend(heap_page(&rec.kind));
+            lsn = next;
+        }
+        out
+    }
+
+    /// Every page `table` owns as far as its catalog entry and the log say: its heap's directory root,
+    /// its time-travel root, its primary root, and every page a record of either heap writes.
+    fn pages_of(catalog: &Catalog, wal: &WalManager, table: &str) -> Vec<u32> {
+        let e = catalog.get_table(table).expect("table");
+        let (heap, tt) = (e.first_directory_page_id, e.time_travel_root);
+        let mut pages = vec![heap, tt, e.primary_index_root];
+        pages.extend(heap_writes(wal).into_iter().filter(|(d, _)| *d == heap || *d == tt).map(|(_, p)| p));
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
+    /// The open after a crash must write none of `freed`, and leave them free: each holds the bytes it
+    /// held before the crash, and `allocate`, which hands out the lowest clear bit, returns one of them.
+    fn assert_reopen_leaves_freed_pages_alone(db: &Path, freed: &[u32], before: &[Vec<u8>]) {
+        let lock = DbLock::acquire(db).unwrap();
+        let o = open_recovered(db, &lock).expect("the open after the DROP and a crash failed");
+        assert!(o.catalog.get_table("t").is_none(), "the dropped table came back");
+        for (p, bytes) in freed.iter().zip(before) {
+            let now = o.bp.disk_manager.read(*p).unwrap();
+            assert!(now.as_slice() == bytes.as_slice(), "the open wrote page {p}, which the DROP freed: redo, the directory repair or a release replayed the dropped table onto it");
+        }
+        let next = o.bp.disk_manager.allocate().unwrap();
+        assert!(freed.contains(&next), "page {next} was handed out, so the pages the DROP freed are not all free any more");
+    }
+
+    /// **D250 (lane `lane_d250_drop_logged.md` §2 test 1): after a DROP that a WAL pin kept in the log
+    /// and a crash, the next open writes no page the DROP freed.** The pin cancels the DROP's
+    /// truncation (`WalManager::truncate`), so the log still holds the table's records. Redo takes a
+    /// freed page as it finds it: one never flushed is a zero page, `Page::empty` with LSN 0, and
+    /// every record applies. The fix: the DROP's record is durable before its frees, and recovery
+    /// skips every record a later DROP names. Red at `2c10f17`, where the DROP is refused for the pin;
+    /// the hazard half is red under the mutant that removes the skip.
+    #[test]
+    fn after_a_pinned_drop_and_a_crash_redo_writes_no_page_the_drop_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pinned_drop.db");
+        let (freed, before) = {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            for id in 1..=3 {
+                ok(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut o);
+            }
+            let freed = pages_of(&o.catalog, &o.wal, "t");
+            let heap = o.catalog.get_table("t").unwrap().first_directory_page_id;
+            let base = o.wal.base_lsn.load(Ordering::SeqCst);
+            let pin = o.wal.pin(base).expect("pin the log at its base");
+            ok("DROP TABLE t;", &mut o);
+            assert_eq!(o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+            assert!(
+                heap_writes(&o.wal).iter().any(|(d, _)| *d == heap),
+                "premise: the kept log no longer holds the dropped table's records, so redo has nothing to misapply"
+            );
+            let before: Vec<Vec<u8>> = freed.iter().map(|p| o.bp.disk_manager.read(*p).unwrap().to_vec()).collect();
+            drop(pin);
+            (freed, before)
+            // The crash: every handle goes, and no checkpoint runs.
+        };
+        assert_reopen_leaves_freed_pages_alone(&db, &freed, &before);
+    }
+
+    /// A page file whose syncs fail while `armed`, so a checkpoint can be made to fail after its flush.
+    struct SyncFailsWhenArmed {
+        file: std::fs::File,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::storage::storage::Storage for SyncFailsWhenArmed {
+        fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pwrite(&self.file, buf, offset)
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pread(&self.file, buf, offset)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: the page file's sync failed"));
+            }
+            crate::storage::storage::Storage::sync_all(&self.file)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: the page file's sync failed"));
+            }
+            crate::storage::storage::Storage::sync_data(&self.file)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            crate::storage::storage::Storage::set_len(&self.file, len)
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            crate::storage::storage::Storage::len(&self.file)
+        }
+    }
+
+    /// **D250 (lane §2 test 2): after a DROP whose checkpoint failed after its frees, and a crash, the
+    /// next open writes no page the DROP freed.** The same state as a pin, reached by an I/O error: the
+    /// pages are free on disk, the catalog change was written, and the log still holds the table's
+    /// records. Red at `2c10f17` at the page bytes: there the `DropTable` record was logged only after
+    /// a successful checkpoint, so the log held the inserts and no DROP, and redo replayed them onto
+    /// the table's zeroed data page.
+    #[test]
+    fn after_a_drop_whose_checkpoint_failed_and_a_crash_redo_writes_no_page_the_drop_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("failed_drop.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (freed, before) = {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&db).unwrap();
+            let dm = DiskManager::with_storage(Arc::new(SyncFailsWhenArmed { file, armed: armed.clone() })).unwrap();
+            let bp = Arc::new(BufferPoolManager::new(Arc::new(dm)));
+            let wal = Arc::new(WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap());
+            let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+            bp.attach_wal(wal.clone());
+            let mut catalog = Catalog::create(bp.clone()).unwrap();
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            for id in 1..=3 {
+                run_sql(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog, &bp, &txn).unwrap();
+            }
+            let freed = pages_of(&catalog, &wal, "t");
+            armed.store(true, Ordering::SeqCst);
+            let e = match run_sql("DROP TABLE t;", &mut catalog, &bp, &txn) {
+                Err(e) => e,
+                Ok(_) => panic!("premise failed: the DROP's checkpoint did not fail"),
+            };
+            assert!(e.to_string().contains("injected"), "premise failed: the DROP failed, but not at its checkpoint's sync: {e}");
+            assert!(catalog.get_table("t").is_none(), "premise failed: the DROP failed before its mutation, so it freed nothing");
+            armed.store(false, Ordering::SeqCst);
+            let before: Vec<Vec<u8>> = freed.iter().map(|p| bp.disk_manager.read(*p).unwrap().to_vec()).collect();
+            (freed, before)
+            // The crash: every handle goes, and no checkpoint runs.
+        };
+        assert_reopen_leaves_freed_pages_alone(&db, &freed, &before);
+    }
 }
