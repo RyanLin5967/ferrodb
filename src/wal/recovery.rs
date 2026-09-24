@@ -21,21 +21,31 @@ use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, 
 /// the WAL header catches up only at a checkpoint.
 ///
 /// A loser whose records are all transaction control undoes nothing, so it does not count either.
-/// That is sound on two conditions. No index page reaches the disk before the log records it
-/// depends on (`BufferPoolManager::wal_gate`). And every index write outside DDL follows the heap
-/// record it indexes: `execution::insert` and `execution::update` write the heap first, and D202's
-/// rollback undo (`TxnManager::abort`) takes back entries whose heap records were appended before
-/// it. Together they mean that an index page on disk carrying a transaction's change implies the
+/// That is sound on three conditions:
+/// - no page the buffer pool writes back reaches the disk before the log records it depends on:
+///   `BufferPoolManager::wal_gate`, against `Frame::wal_mark` for a page with no LSN of its own;
+/// - a record `WalManager::flush_up_to` reports durable IS durable. Until the D216 adversary's F1
+///   it skipped a record that started exactly at the flushed point;
+/// - every index write outside DDL follows the heap record it indexes. `execution::insert` and
+///   `execution::update` write the heap first, and D202's rollback undo (`TxnManager::abort`)
+///   takes back entries whose heap records were appended before it.
+///
+/// Together they mean that an index page on disk carrying a transaction's change implies the
 /// change's heap record is in the log. (`rebuild_indexes` writes trees with no record at all, but
 /// it runs only when this function or the marker has already asked for it, and until its
 /// checkpoint completes the same trigger is still there for the next open.)
 ///
-/// Not covered: a crash inside a DDL statement. DDL is not logged, and no DDL here is
-/// crash-atomic (the ALTER arm of `execution::executor::run` says so). The old any-record rule
-/// rebuilt after some such crashes only because earlier re-declarations happened to be in the log.
-/// That was never reliable, and it was not a repair either: `rebuild_indexes` first frees the old
-/// tree by walking it (`free_tree`), and a half-written tree's child pointers name pages that were
-/// never written.
+/// Not covered, and never covered by more than coincidence:
+/// - A crash inside a DDL statement. DDL is not logged, and no DDL here is crash-atomic (the ALTER
+///   arm of `execution::executor::run` says so). The old any-record rule rebuilt after some such
+///   crashes only because earlier re-declarations happened to be in the log. That was never
+///   reliable, and not reliably a repair either: `rebuild_indexes` first frees the old tree by
+///   walking it (`free_tree`), and a half-written tree's child pointers can name pages that were
+///   never written.
+/// - Pages that reach the file without the buffer pool: a restored base backup
+///   (`replication::backup::restore`) or an installed snapshot (`consensus::snapshot`). Their index
+///   pages are a copy taken while the source was running, and the redo window that makes their
+///   heap consistent replays heap records only.
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
     // read whole log

@@ -54,8 +54,8 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // lives to the end of this function and releases on the way out, including on `?`.
     let _lock = DbLock::acquire(Path::new(db_path))?;
     // D204: recover, then rebuild every index from the recovered heap and checkpoint when recovery
-    // replayed a data record (D216: not for a clean restart), in the one function every binary
-    // opens through. This sequence used to be written out here, and
+    // replayed a data record or the stale-indexes marker asks (D216: a clean restart does neither),
+    // in the one function every binary opens through. This sequence used to be written out here, and
     // `examples/pgserver.rs` had its own copy that omitted the rebuild.
     let OpenedDatabase { bp, txn, catalog, .. } = open_recovered(Path::new(db_path), &_lock)?;
 
