@@ -12,7 +12,8 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
-use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
+use crate::storage::index_page::admit_entry;
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -87,6 +88,26 @@ impl Modify for Update {
                 }
             }
             let pk = old_values[0].clone();
+            // **D225 — refuse a new index entry over `MAX_ENTRY_BYTES` before this row is written**,
+            // for the reason `execution::insert` gives: the tree would refuse it only after the
+            // heap update, and an abort does not undo the primary index. Only entries the writes
+            // below will make: a changed secondary value, and the tokens of changed text.
+            for handle in &self.secondary_indexes {
+                let new_v = &new_values[handle.col_index];
+                if &old_values[handle.col_index] != new_v {
+                    admit_entry(&(new_v.clone(), pk.clone()), &())?;
+                }
+            }
+            for ft in &self.fulltext_indexes {
+                let new_text = indexed_text(&new_values[ft.col_index])?;
+                if indexed_text(&old_values[ft.col_index])? != new_text {
+                    if let Some(text) = new_text {
+                        for token in distinct_tokens(text) {
+                            admit_entry(&posting_key(&token, &pk), &())?;
+                        }
+                    }
+                }
+            }
             let mut old_ver = self.heap.read(rid)?;
             old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
             let mut tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;

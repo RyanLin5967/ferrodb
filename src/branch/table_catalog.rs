@@ -37,6 +37,7 @@ use crate::branch::BranchCatalog;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::error::FerroError;
 use crate::storage::index::BPlusTreeManager;
+use crate::storage::index_page::admit_entry;
 
 /// Header payload: `next_id` then `epoch`, both big-endian.
 const HEADER_BYTES: usize = 16;
@@ -593,6 +594,7 @@ impl TableBranchCatalog {
              span, so they would be silently dropped. Use write_record.",
             rec.arenas.len()
         );
+        Self::admit_envelope(rec)?;
         self.tree.insert(keys::record(rec.branch_id.id), rec.serialize_core())?;
         self.tree.insert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
         if Self::in_deadline_index(rec.state, rec.branch_id) {
@@ -602,6 +604,21 @@ impl TableBranchCatalog {
             self.tree.insert(keys::envelope(rec.branch_id.id), e.serialize())?;
         }
         Ok(())
+    }
+
+    /// **D225 — refuse an envelope too large for a B+tree entry before any of `rec` is written.**
+    ///
+    /// The envelope is the one variable-length value in this tree, and the record writers put it
+    /// LAST. The tree refuses an entry over `MAX_ENTRY_BYTES` by name, but that refusal would land
+    /// after the record, state and deadline keys were already written, leaving a record whose
+    /// envelope never arrived (and `write_record` would first have removed the old one's index
+    /// keys). About 150 column capabilities is enough to reach it. So both writers ask the same
+    /// bound first, for the entry they will write last.
+    fn admit_envelope(rec: &BranchRecord) -> Result<(), FerroError> {
+        match &rec.envelope {
+            Some(e) => admit_entry(&keys::envelope(rec.branch_id.id), &e.serialize()),
+            None => Ok(()),
+        }
     }
 
     /// `rec` must be WHOLE -- its arena span is rewritten to match it. `old` is deliberately a
@@ -625,6 +642,7 @@ impl TableBranchCatalog {
         rec: &BranchRecord,
         old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
+        Self::admit_envelope(rec)?;
         if let Some(prev) = old {
             self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
             if Self::in_deadline_index(prev.state(), prev.branch_id()) {
@@ -1750,6 +1768,61 @@ mod d10_guard {
         let back = cat.get_raw(child.branch_id.id).expect("child record");
         assert_eq!(back.branch_id, child.branch_id);
         assert_eq!(back.state, BranchState::Live);
+    }
+}
+
+#[cfg(test)]
+mod d225_envelope_bound {
+    //! D225: the envelope is the one variable-length value in the branch catalog's tree, so it is
+    //! the one that can exceed `MAX_ENTRY_BYTES`, and it is written last. `admit_envelope` asks
+    //! the bound before the record's first key. Without it, the record and state keys land and
+    //! the envelope is refused after them.
+    use super::*;
+    use crate::branch::record::{ColumnCapability, Verb};
+
+    fn fresh_catalog() -> (TableBranchCatalog, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d225-{}-{:?}",
+            std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("e.branchcat");
+        let _ = std::fs::remove_file(&path);
+        (TableBranchCatalog::open_sidecar(&path, 1).expect("open"), path)
+    }
+
+    /// An envelope granting `columns` open columns on one table: 21 + 8 + 13 per column bytes.
+    fn envelope_of(columns: u32) -> CapabilityEnvelope {
+        CapabilityEnvelope::new(Verb::ALL, 10).allow(1, (0..columns).map(ColumnCapability::open).collect())
+    }
+
+    /// **An envelope too large for a B+tree entry refuses the whole record, before any key of it
+    /// is written.** 153 columns is 21 + 8 + 153·13 = 2018 bytes of envelope. Under the 9-byte
+    /// envelope key the entry is 4 + 9 + 4 + 2018 = 2035 bytes, one over the bound; 152 columns
+    /// is 2022, under it. Expected sizes are this arithmetic.
+    #[test]
+    fn an_envelope_over_the_entry_bound_refuses_the_whole_record() {
+        let (cat, _p) = fresh_catalog();
+        let trunk = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
+        assert_eq!(envelope_of(153).serialize().len(), 2018, "premise: the envelope's size");
+
+        let mut over = trunk.clone();
+        over.branch_id = BranchId::new(4242, 0);
+        over.envelope = Some(envelope_of(153));
+        let e = cat.write_record_new(&over).expect_err("a 2035-byte envelope entry must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert!(cat.core(4242).expect("read").is_none(), "the record key was written before the refusal");
+        assert_eq!(cat.tree.search(&keys::envelope(4242)).expect("search"), None);
+
+        // Negative control: one column fewer lands whole.
+        let mut under = trunk.clone();
+        under.branch_id = BranchId::new(4243, 0);
+        under.envelope = Some(envelope_of(152));
+        cat.write_record_new(&under).expect("a 2022-byte envelope entry is under the bound");
+        assert!(cat.core(4243).expect("read").is_some(), "the record under the bound was not written");
+        assert_eq!(
+            cat.tree.search(&keys::envelope(4243)).expect("search"),
+            Some(envelope_of(152).serialize()),
+            "the envelope under the bound was not written"
+        );
     }
 }
 

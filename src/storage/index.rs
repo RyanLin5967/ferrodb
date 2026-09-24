@@ -71,7 +71,7 @@
 
 use std::{marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}, range_scan::RangeScanner}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{admit_entry, BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize, MAX_ENTRY_BYTES}, range_scan::RangeScanner}};
 use crate::storage::index_page::BPlusTreePage;
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::storage::page_latch::{PageLatches, PageReadGuard, PageWriteGuard};
@@ -91,6 +91,19 @@ enum LeafWrite {
     /// Remove any existing entry for the key and add the new one, in one in-memory leaf image and
     /// therefore in one page write.
     Replace,
+}
+
+/// Every page one leaf split writes, built and checked in memory before the first write. D225.
+///
+/// `BPlusTreeManager::write_into_latched_leaf` says why a split is planned whole rather than
+/// written as it goes.
+struct SplitPlan {
+    /// The split leaf's old right neighbour, and the new leaf its `prev` must now name.
+    relink: Option<(u32, u32)>,
+    /// `(page, image)` in publication order: each new page before the page that points at it.
+    writes: Vec<(u32, [u8; PAGE_SIZE])>,
+    /// A root split's new root, stored into the root cell after every page is written.
+    new_root: Option<u32>,
 }
 
 pub struct BPlusTreeManager<K, V> {
@@ -191,7 +204,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// Fast path first: if the leaf has room, only that leaf is latched for writing and only that
     /// leaf is written. If it would split, nothing has been written yet and the whole insert is
     /// retried with write latches on the entire root-to-leaf path.
+    ///
+    /// An entry over [`MAX_ENTRY_BYTES`] is refused by name before anything is latched or written:
+    /// above it a leaf split is not guaranteed to exist (D225; the constant's doc has the proof).
     pub fn insert(&self, key: K, value: V) -> Result<(), FerroError> {
+        admit_entry(&key, &value)?;
         if self.try_write_without_split(&key, &value, LeafWrite::Insert)? {
             return Ok(());
         }
@@ -231,7 +248,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// **It does not make a multi-key update atomic.** One key, one page write. A caller rewriting
     /// several keys still needs its own exclusion across them — `TableBranchCatalog::logical` is
     /// that, and stays.
+    ///
+    /// Refuses an entry over [`MAX_ENTRY_BYTES`] exactly as [`Self::insert`] does, before the old
+    /// value is touched.
     pub fn upsert(&self, key: K, value: V) -> Result<(), FerroError> {
+        admit_entry(&key, &value)?;
         if self.try_write_without_split(&key, &value, LeafWrite::Replace)? {
             return Ok(());
         }
@@ -509,11 +530,27 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// split the leaf — in which case **nothing has been written** and the caller must retry
     /// pessimistically.
     ///
-    /// Under [`LeafWrite::Replace`] a same-size rewrite cannot reach the `Ok(false)` arm: no leaf
-    /// is ever left persisted in a full state (a split leaves both halves under the threshold), so
-    /// removing an entry and adding one of the same length lands on the size the leaf already had.
-    /// That is what keeps `set_root` and `renew_lease`, which rewrite a fixed-width core record,
-    /// on the single-latch path.
+    /// Under [`LeafWrite::Replace`] a same-size rewrite cannot reach the `Ok(false)` arm **on any
+    /// leaf this build wrote**: no leaf it persists is full, so removing an entry and adding one
+    /// of the same length (key and value as stored) lands on the size the leaf already had. That
+    /// is what keeps `set_root` and `renew_lease`, which rewrite a fixed-width core record, on the
+    /// single-latch path.
+    ///
+    /// **Re-derived for D225**, because the first version of this paragraph rested on "a split
+    /// leaves both halves under the threshold", and the count split guaranteed that only for
+    /// fixed-width entries. With variable-width keys (a VARCHAR or DECIMAL key, a posting tree,
+    /// the `Vec<u8>` branch catalog) one half could land at exactly 4069 bytes, full but still
+    /// serializable, and a same-size replace into it then split (`d208_review2` C1). "No leaf
+    /// this build persists is full" now rests on three things, each checked where it happens:
+    ///
+    /// 1. this arm refuses a full image, so the fast path never writes one;
+    /// 2. a split writes only halves under the threshold: `split_point` picks only such a cut,
+    ///    `split_at` refuses any other, and `write_into_latched_leaf` refuses when no cut exists;
+    /// 3. a delete only shrinks a leaf.
+    ///
+    /// **What it does not cover:** a leaf an earlier build left exactly full stays full until its
+    /// next write. A same-size replace into it takes the slow path once and splits, and both
+    /// halves are then under the threshold.
     fn try_write_without_split(&self, key: &K, value: &V, mode: LeafWrite) -> Result<bool, FerroError> {
         let (page_id, _latch) = self.latch_leaf_for_write(key)?;
         let mut leaf = self.read_leaf_raw(page_id)?;
@@ -570,54 +607,195 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// the in-memory image before the split, so the key is in `leaf` until `write_page(leaf_id)`
     /// publishes both halves' contents, and in exactly one half afterwards. Nothing in between
     /// removes it from a page a reader can reach.
+    ///
+    /// # D225: plan every page, check every half, then write
+    ///
+    /// A split used to write as it went: both leaf halves first, then each parent in turn up the
+    /// stack. That is sound only while nothing after the first write can fail, and D225's guards
+    /// are exactly such failures: a refusal at a parent would have left the new leaf reachable
+    /// through `next` but through no parent, where a latched descent cannot find its keys and a
+    /// writer inserts them into the wrong leaf. So the whole cascade is built in memory first
+    /// ([`Self::plan_split`]), every half checked by `split_at` and every image serialized, which
+    /// refuses rather than panics. Only a complete plan is published ([`Self::publish_split`]), in
+    /// the same order as before. A refusal writes nothing and gives back the pages it allocated.
     fn write_into_latched_leaf(&self, leaf_id: u32, stack: &mut Vec<u32>, key: K, value: V, mode: LeafWrite) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
         Self::apply_to_leaf(&mut leaf, key, value, mode);
         if !leaf.is_full() {
             return self.write_page(leaf_id, leaf.serialize()?);
         }
-        // ⛔ A full leaf holding ONE entry cannot be split into two that fit: the entry is itself
-        // larger than a page. `split` takes `mid = len / 2`, which is 0 here, so `split_off(0)`
-        // would move everything to the new page, leave THIS leaf empty, and then panic inside
-        // `serialize` — `range end index 4143 out of range for slice of length 4096` on the test
-        // below, from a `copy_from_slice` in `index_page.rs`, which names neither the key nor the
-        // cause. Refuse by name instead, before anything is written.
+        // ⛔ No cut, no split: refused by name, before anything is allocated or written.
         //
-        // **D126 is why this is here.** `Insert` could only reach the case on an EMPTY leaf, where
-        // it has always panicked. `Replace` reaches it on a populated one: a replacement value can
-        // grow a one-entry leaf past the page without ever making it two entries, which is a shape
-        // no `insert` can produce. The guard is written for both, and
-        // `an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf` fires it
-        // from both directions and checks that a value that DOES fit is still accepted.
-        if leaf.key_arr.len() < 2 {
-            return Err(FerroError::Io(format!(
-                "a single entry does not fit in a {PAGE_SIZE}-byte leaf page (page {leaf_id}); \
-                 splitting cannot help, and doing it anyway would leave an empty leaf"
+        // D126 put the first guard here, for a full leaf holding ONE entry. The count split took
+        // `mid = 0` there, moved everything to the new page, left this leaf empty, and `serialize`
+        // then panicked: `range end index 4143 out of range for slice of length 4096`. `Replace`
+        // reached it on a populated leaf, by growing a one-entry leaf's value past the page.
+        //
+        // D225 generalises it. `split_point` is `None` exactly when no cut leaves both halves
+        // non-empty and under the threshold, and a one-entry leaf is the smallest such case.
+        // `admit_entry` now refuses both of D126's shapes earlier, as entries over
+        // `MAX_ENTRY_BYTES`, and that bound's proof makes this arm unreachable for a leaf this
+        // build wrote. What is left is a leaf an earlier build left exactly full around an entry
+        // over the bound; `a_leaf_an_earlier_build_left_full_is_refused_not_split_badly` builds one.
+        let Some(mid) = leaf.split_point() else {
+            return Err(FerroError::Internal(format!(
+                "leaf page {leaf_id} does not fit in a {PAGE_SIZE}-byte page ({} bytes in {} \
+                 entries) and no split point leaves both halves under it, so it holds an entry \
+                 over MAX_ENTRY_BYTES ({MAX_ENTRY_BYTES}) written by an earlier build; refused \
+                 before anything was written",
+                leaf.payload_len(),
+                leaf.key_arr.len()
             )));
+        };
+
+        let mut fresh: Vec<(u32, PageWriteGuard<'_>)> = Vec::new();
+        match self.plan_split(leaf_id, leaf, mid, stack, &mut fresh) {
+            Ok(plan) => {
+                let published = self.publish_split(plan);
+                drop(fresh);
+                published
+            }
+            Err(refused) => {
+                // Nothing was written, so no page points at the ones the plan allocated. Give
+                // them back rather than leak them.
+                let allocated: Vec<u32> = fresh.iter().map(|(id, _)| *id).collect();
+                drop(fresh);
+                for id in allocated {
+                    if let Err(e) = self.buffer_pool.free_page(id) {
+                        return Err(FerroError::Internal(format!(
+                            "{refused}; and returning page {id}, which the refused split had \
+                             allocated, failed too: {e}"
+                        )));
+                    }
+                }
+                Err(refused)
+            }
         }
+    }
 
-        let new_page_id = self.buffer_pool.new_page()?;
-        // A freshly allocated page is reachable by nobody, so this latch is uncontended by
-        // construction and adds no edge to the wait-for graph. It is taken anyway so that the
-        // moment the page becomes reachable — the `write_page(leaf_id, ..)` below — a scanner
-        // arriving at it waits rather than reading a page mid-write.
-        let new_guard = self.latches().write(new_page_id);
-        let (split_key, new_leaf) = leaf.split(new_page_id);
+    /// Build, in memory, every page image one leaf split writes, in publication order: the two
+    /// halves, then each ancestor the separator reaches, then a new root if the old one splits.
+    /// Every half is checked by `split_at` and every image is serialized on the way, so a plan
+    /// that comes back is one `publish_split` can write whole. Allocates the new pages,
+    /// write-latched into `fresh` where the caller keeps them until publication, and writes
+    /// nothing.
+    ///
+    /// **The caller must hold write latches on every page id in `stack`**; `write_splitting` takes
+    /// them on the way down. This acquires none for existing pages, which is what stops it from
+    /// trying to latch upward.
+    fn plan_split<'a>(
+        &'a self,
+        leaf_id: u32,
+        mut leaf: BPlusTreeLeafPage<K, V>,
+        mid: usize,
+        stack: &mut Vec<u32>,
+        fresh: &mut Vec<(u32, PageWriteGuard<'a>)>,
+    ) -> Result<SplitPlan, FerroError> {
+        let new_leaf_id = self.allocate_latched(fresh)?;
+        let (mut separator, new_leaf) = leaf.split_at(mid, new_leaf_id)?;
+        let mut plan = SplitPlan {
+            relink: new_leaf.next.map(|old_next| (old_next, new_leaf_id)),
+            // New page first: writing the old leaf is what publishes `next -> new_leaf_id`.
+            writes: vec![(new_leaf_id, new_leaf.serialize()?), (leaf_id, leaf.serialize()?)],
+            new_root: None,
+        };
+        let (mut left_id, mut right_id) = (leaf_id, new_leaf_id);
+        loop {
+            let Some(parent_id) = stack.pop() else {
+                // The root split: a new root holding the one separator over the two halves, and
+                // the tree grows a level.
+                let root_id = self.allocate_latched(fresh)?;
+                let mut root = BPlusTreeInternalPage::<K>::new(root_id);
+                root.key_arr.push(separator);
+                root.child_ptrs.push(left_id);
+                root.child_ptrs.push(right_id);
+                root.num_keys = 1;
+                plan.writes.push((root_id, root.serialize()?));
+                plan.new_root = Some(root_id);
+                return Ok(plan);
+            };
+            let mut parent = match self.read_node_raw(parent_id)? {
+                BPlusTreePage::Internal(n) => n,
+                BPlusTreePage::Leaf(_) => return Err(FerroError::Io(format!(
+                    "page {parent_id} was reached as an internal node but holds a leaf"
+                ))),
+            };
 
-        if let Some(old_next_id) = new_leaf.next {
+            // INSERT FIRST, THEN SPLIT - the same order `insert` uses for leaves, and a correctness
+            // fix rather than a tidy-up.
+            //
+            // This used to ask `is_full()` BEFORE inserting. That check reads
+            // `INTERNAL_HEADER_SIZE + keys + child_ptrs >= PAGE_SIZE`, i.e. "are the CURRENT contents
+            // already at capacity", while its own comment says "does adding one more entry exceed
+            // capacity?". So a node sitting at 4090 bytes reported not-full, took one more key plus a
+            // 4-byte child pointer, and `serialize` wrote past the end of the page:
+            //   `range end index 4100 out of range for slice of length 4096`.
+            // Reachable by any tree deep enough to fill an internal node, which is why small fixtures
+            // never saw it; it was found by driving 8000 branches through the branch catalog.
+            //
+            // Inserting first is safe because the node is an in-memory struct of `Vec`s at this point.
+            // Only `serialize` is bounded by the page, and nothing is serialized until after the split.
+            let index = parent.key_arr.binary_search(&separator).unwrap_or_else(|i| i);
+            parent.insert_key_child(index, separator, right_id);
+            if !parent.is_full() {
+                plan.writes.push((parent_id, parent.serialize()?));
+                return Ok(plan);
+            }
+            // Unreachable for a separator a leaf admits (`MAX_ENTRY_BYTES` proves an internal cut
+            // always exists), and refused by name rather than assumed.
+            let Some(up) = parent.split_point() else {
+                return Err(FerroError::Internal(format!(
+                    "internal page {parent_id} is full ({} bytes in {} keys) and no split point \
+                     leaves both halves under the page; refused before anything was written",
+                    parent.payload_len(),
+                    parent.key_arr.len()
+                )));
+            };
+            let new_parent_id = self.allocate_latched(fresh)?;
+            let (up_key, new_parent) = parent.split_at(up, new_parent_id)?;
+            // New page first, for the same reason as the leaf: the parent's write is what makes
+            // `new_parent_id` reachable.
+            plan.writes.push((new_parent_id, new_parent.serialize()?));
+            plan.writes.push((parent_id, parent.serialize()?));
+            separator = up_key;
+            left_id = parent_id;
+            right_id = new_parent_id;
+        }
+    }
+
+    /// Write a complete [`SplitPlan`] in its order: the old right neighbour's `prev`, then each
+    /// page image, then the root cell. Everything was built and checked by `plan_split`, so only
+    /// an I/O failure can stop this part-way, exactly as before D225.
+    fn publish_split(&self, plan: SplitPlan) -> Result<(), FerroError> {
+        if let Some((old_next_id, new_leaf_id)) = plan.relink {
             // Rightward along the leaf chain, which is the permitted direction.
             let sibling = self.latches().write(old_next_id);
             let mut next_leaf = self.read_leaf_raw(old_next_id)?;
-            next_leaf.prev = Some(new_page_id);
+            next_leaf.prev = Some(new_leaf_id);
             self.write_page(old_next_id, next_leaf.serialize()?)?;
             drop(sibling);
         }
+        for (page_id, image) in plan.writes {
+            self.write_page(page_id, image)?;
+        }
+        if let Some(root) = plan.new_root {
+            // Release, paired with the Acquire load in every descent: the new root's bytes are in
+            // the pool before any thread can learn the id that points at them.
+            self.root_page_id.store(root, Ordering::Release);
+        }
+        Ok(())
+    }
 
-        self.write_page(new_page_id, new_leaf.serialize()?)?;
-        self.write_page(leaf_id, leaf.serialize()?)?;
-        drop(new_guard);
-
-        self.insert_into_parent(stack, leaf_id, split_key, new_page_id)
+    /// Allocate a page for a split, write-latched from now until the split is published.
+    ///
+    /// A freshly allocated page is reachable by nobody, so this latch is uncontended by
+    /// construction and adds no edge to the wait-for graph. It is taken anyway so that the moment
+    /// the page becomes reachable (the write that publishes a pointer to it) a reader arriving at
+    /// it waits rather than reading a page mid-write.
+    fn allocate_latched<'a>(&'a self, fresh: &mut Vec<(u32, PageWriteGuard<'a>)>) -> Result<u32, FerroError> {
+        let page_id = self.buffer_pool.new_page()?;
+        fresh.push((page_id, self.latches().write(page_id)));
+        Ok(page_id)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -670,75 +848,6 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         let node = self.read_node_raw(page_id);
         drop(guard);
         node
-    }
-
-    /// Insert `mid_key`/`right_id` into the parent, splitting upward as needed.
-    ///
-    /// **The caller must hold write latches on every page id in `stack`** — `insert_splitting` is
-    /// the only caller and takes them on the way down. This function acquires none of its own for
-    /// existing pages, which is what stops it from trying to latch upward.
-    fn insert_into_parent(&self, stack: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
-        // root was split, so need to allocate new root, make an internal node with one key (mid_key)
-        // and two children (left, right id); update root_page_id, tree height grew
-        if stack.is_empty() {
-            let new_page_id = self.buffer_pool.new_page()?;
-            let mut new_root = BPlusTreeInternalPage::<K>::new(new_page_id);
-            new_root.key_arr.push(mid_key);
-            new_root.child_ptrs.push(left_id);
-            new_root.child_ptrs.push(right_id);
-            new_root.num_keys = 1;
-
-            let new_guard = self.latches().write(new_page_id);
-            self.write_page(new_page_id, new_root.serialize()?)?;
-            drop(new_guard);
-            // Release, paired with the Acquire load in every descent: the new root's bytes are in
-            // the pool before any thread can learn the id that points at them.
-            self.root_page_id.store(new_page_id, Ordering::Release);
-            return Ok(())
-            // later store the page id in catalog
-        }
-        // else, have to pop parent id from stack, read it, insert_key_child at right position, if
-        // parent not full, done, if it's full, have to do internal split (where middle key moves
-        // up), write back both, recurse with parent's middle key
-        let parent_id = stack.pop().expect("non-empty");
-        let mut parent_node = match self.read_node_raw(parent_id)? {
-            BPlusTreePage::Internal(n) => n,
-            BPlusTreePage::Leaf(_) => return Err(FerroError::Io(format!(
-                "page {parent_id} was reached as an internal node but holds a leaf"
-            ))),
-        };
-
-        // INSERT FIRST, THEN SPLIT - the same order `insert` uses for leaves, and a correctness
-        // fix rather than a tidy-up.
-        //
-        // This used to ask `is_full()` BEFORE inserting. That check reads
-        // `INTERNAL_HEADER_SIZE + keys + child_ptrs >= PAGE_SIZE`, i.e. "are the CURRENT contents
-        // already at capacity", while its own comment says "does adding one more entry exceed
-        // capacity?". So a node sitting at 4090 bytes reported not-full, took one more key plus a
-        // 4-byte child pointer, and `serialize` wrote past the end of the page:
-        //   `range end index 4100 out of range for slice of length 4096`.
-        // Reachable by any tree deep enough to fill an internal node, which is why small fixtures
-        // never saw it; it was found by driving 8000 branches through the branch catalog.
-        //
-        // Inserting first is safe because the node is an in-memory struct of `Vec`s at this point.
-        // Only `serialize` is bounded by the page, and nothing is serialized until after the split.
-        let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
-        parent_node.insert_key_child(index, mid_key, right_id);
-
-        if parent_node.is_full() {
-            let new_parent_id = self.buffer_pool.new_page()?;
-            let (up_key, new_parent) = parent_node.split(new_parent_id);
-            // New page first, for the same reason as the leaf split: the parent's write is what
-            // makes `new_parent_id` reachable.
-            let new_guard = self.latches().write(new_parent_id);
-            self.write_page(new_parent_id, new_parent.serialize()?)?;
-            self.write_page(parent_id, parent_node.serialize()?)?;
-            drop(new_guard);
-            self.insert_into_parent(stack, parent_id, up_key, new_parent_id)?;
-        } else {
-            self.write_page(parent_id, parent_node.serialize()?)?;
-        }
-        Ok(())
     }
 
     pub fn free_subtree(&self, page_id: u32) -> Result<(), FerroError> {
@@ -1088,6 +1197,13 @@ mod tests {
     ///
     /// The refusal happens before anything is written, so the pre-existing value must survive —
     /// asserted, because "refuses" and "refuses without corrupting" are different claims.
+    ///
+    /// **Since D225 both arms are refused one step earlier**, by `admit_entry`: each entry is over
+    /// `MAX_ENTRY_BYTES`, and that refusal also says "does not fit", so every assertion here holds
+    /// as written. The one-entry split refusal this test was written for is now `split_point`'s
+    /// `None` in `write_into_latched_leaf`, which
+    /// `a_leaf_an_earlier_build_left_full_is_refused_not_split_badly` reaches. The negative
+    /// control's 2000-byte value makes a 2016-byte entry, under the bound.
     #[test]
     fn an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf() {
         let dir = tempfile::tempdir().unwrap();
@@ -1147,5 +1263,94 @@ mod tests {
                 "key {i} lost after the splits the control forced"
             );
         }
+    }
+
+    fn vec_tree(dir: &tempfile::TempDir, name: &str) -> (BPlusTreeManager<Vec<u8>, Vec<u8>>, Arc<BufferPoolManager>) {
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dir.path().join(name)).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        (BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp.clone()).unwrap(), bp)
+    }
+
+    /// **D225 — the tree refuses an entry over `MAX_ENTRY_BYTES` by name, on both write paths,
+    /// before anything is written; and admits one exactly at the bound.**
+    ///
+    /// A `Vec<u8>` entry costs 4 + key + 4 + value bytes, so an 8-byte key with a 2018-byte value
+    /// is 2034 and with 2019 is 2035. Then 64 entries of exactly 2034 bytes: two to a leaf, the
+    /// third forces a split every time, and every one must still be found.
+    #[test]
+    fn an_entry_over_max_entry_bytes_is_refused_by_name_and_one_at_it_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tree, _bp) = vec_tree(&dir, "bound.db");
+        let k = b"boundary".to_vec();
+
+        let e = tree.insert(k.clone(), vec![7u8; 2019]).expect_err("a 2035-byte entry must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(tree.search(&k).unwrap(), None, "the refused insert wrote something");
+
+        tree.insert(k.clone(), vec![7u8; 2018]).expect("a 2034-byte entry is at the bound and admitted");
+        let e = tree.upsert(k.clone(), vec![8u8; 2019]).expect_err("an upsert over the bound must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(tree.search(&k).unwrap(), Some(vec![7u8; 2018]), "the refused upsert changed the value");
+
+        for i in 0u32..64 {
+            // 4 + 4 key bytes, 4 + 2022 value bytes: 2034.
+            tree.insert(i.to_be_bytes().to_vec(), vec![i as u8; 2022]).expect("an entry at the bound");
+        }
+        for i in 0u32..64 {
+            assert_eq!(tree.search(&i.to_be_bytes().to_vec()).unwrap(), Some(vec![i as u8; 2022]), "key {i} lost");
+        }
+        assert_eq!(tree.search(&k).unwrap(), Some(vec![7u8; 2018]), "the boundary entry was lost in the splits");
+    }
+
+    /// **D225 — a leaf an earlier build left exactly full, around an entry over the bound, is
+    /// refused by name when no cut exists; nothing is allocated or written.**
+    ///
+    /// The count split could persist a half of exactly 4069 bytes, full but serializable, and
+    /// before D225 an entry could be nearly a page. So this leaf is written to the page directly,
+    /// as an earlier build could have left it: a 3000-byte entry under `m` and a 1069-byte one
+    /// under `z`, 4069 bytes. A new 2034-byte entry, which `admit_entry` accepts, sorts first.
+    /// Cutting after it leaves 4069 bytes on the right, which is full; cutting after `m` leaves
+    /// 5034 on the left. No cut exists. Expected values are this arithmetic, not the code's.
+    #[test]
+    fn a_leaf_an_earlier_build_left_full_is_refused_not_split_badly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tree, bp) = vec_tree(&dir, "legacy.db");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+
+        let mut legacy = BPlusTreeLeafPage::<Vec<u8>, Vec<u8>>::new(root);
+        legacy.insert_entry(b"m".to_vec(), vec![1u8; 2991]); // 4 + 1 + 4 + 2991 = 3000
+        legacy.insert_entry(b"z".to_vec(), vec![2u8; 1060]); // 4 + 1 + 4 + 1060 = 1069
+        assert_eq!(legacy.payload_len(), 4069, "premise: exactly the leaf body");
+        assert!(legacy.is_full(), "premise: an earlier build left it full");
+        let image = legacy.serialize().expect("premise: a leaf of exactly the body still serializes");
+        {
+            let frame_i = bp.fetch_page(root).unwrap();
+            let mut frame = bp.frame_write(frame_i);
+            frame.data = image;
+            drop(frame);
+            bp.unpin_page(root, true);
+        }
+        let pages_before = bp.disk_manager.high_water().unwrap();
+
+        // 4 + 1 + 4 + 2025 = 2034: admitted, so only the missing cut can refuse it.
+        let e = tree.insert(b"a".to_vec(), vec![3u8; 2025]).expect_err("no cut exists; the insert must be refused");
+        assert!(e.to_string().contains("no split point"), "refused, but not by the no-cut refusal: {e}");
+        assert_eq!(tree.root_page_id.load(Ordering::Acquire), root, "the root moved on a refused split");
+        assert_eq!(bp.disk_manager.high_water().unwrap(), pages_before, "a page was allocated for a refused split");
+        match tree.read_node(root).unwrap() {
+            BPlusTreePage::Leaf(leaf) => assert!(leaf == legacy, "the refused insert rewrote the leaf"),
+            BPlusTreePage::Internal(_) => panic!("the refused insert turned the root into an internal node"),
+        }
+
+        // Negative control: the same leaf still takes an entry that leaves a cut, so the refusal
+        // above is about the missing cut and not about the leaf. A 1000-byte entry under `a`
+        // (4 + 1 + 4 + 991): cutting after it leaves 4069 on the right, full, but cutting after `m`
+        // gives 4000 | 1069, both under. The tree must then hold all three.
+        tree.insert(b"a".to_vec(), vec![4u8; 991]).expect("a cut exists for a 1000-byte entry");
+        assert_eq!(tree.search(&b"a".to_vec()).unwrap(), Some(vec![4u8; 991]));
+        assert_eq!(tree.search(&b"m".to_vec()).unwrap(), Some(vec![1u8; 2991]));
+        assert_eq!(tree.search(&b"z".to_vec()).unwrap(), Some(vec![2u8; 1060]));
     }
 }

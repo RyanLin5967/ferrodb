@@ -56,7 +56,8 @@ use crate::catalog::column::Value;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
-use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
+use crate::storage::index_page::admit_entry;
 use crate::provenance::{ProvId, ProvenanceStore};
 use std::sync::Arc;
 
@@ -104,6 +105,27 @@ impl Modify for Insert {
                     "column '{}' of '{}' is declared NOT NULL, so it needs a value",
                     col.name, self.table
                 )))
+            }
+        }
+        // **D225 — every index entry this row will add must be one the trees admit, asked BEFORE
+        // any of the row is written.**
+        //
+        // Each tree refuses an entry over `MAX_ENTRY_BYTES` by name (`admit_entry`), but it would
+        // refuse too late: by the secondary and full-text writes below, the heap row and the
+        // primary entry are already written. The abort undoes only the heap, so the primary entry
+        // would be left pointing at a deleted slot, and every later INSERT of that key would fail
+        // reading it (`SlotDeleted`) — a key refused once could never be used again. So the same
+        // bound is asked here, for the entries the writes below will make, in the shapes they make
+        // them: `(pk, rid)`, `(value, pk)` per index, `(token, pk)` per distinct token.
+        admit_entry(&vals[0], &RecordId::new(0, 0))?;
+        for sec_idx in &self.secondary_indexes {
+            admit_entry(&(vals[sec_idx.col_index].clone(), vals[0].clone()), &())?;
+        }
+        for ft in &self.fulltext_indexes {
+            if let Some(text) = indexed_text(&vals[ft.col_index])? {
+                for token in distinct_tokens(text) {
+                    admit_entry(&posting_key(&token, &vals[0]), &())?;
+                }
             }
         }
         // **An index entry outlives the row it points at.** DELETE stamps `end_ts` on the version

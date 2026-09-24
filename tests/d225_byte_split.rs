@@ -96,6 +96,18 @@ impl Db {
             .unwrap_or_else(|e| panic!("`{}` failed: {e}", abbreviate(sql)))
     }
 
+    /// The error a statement is refused with. Panics if it is accepted.
+    fn err(&mut self, sql: &str) -> String {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{}`: {:?}", abbreviate(sql), p.errors);
+        match run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut self.session) {
+            Ok(_) => panic!("`{}` was accepted; it must be refused", abbreviate(sql)),
+            Err(e) => e.to_string(),
+        }
+    }
+
     /// The first column of every returned row, as an `Integer`, sorted.
     fn ids(&mut self, sql: &str) -> Vec<i32> {
         let rows = match self.sql(sql) {
@@ -140,10 +152,10 @@ impl Db {
 
 /// A statement with a 247-character literal in it is unreadable in a failure message.
 fn abbreviate(sql: &str) -> String {
-    if sql.len() <= 120 {
-        return sql.to_string();
+    match sql.char_indices().nth(100) {
+        Some((cut, _)) if sql.len() > 120 => format!("{}...({} bytes)", &sql[..cut], sql.len()),
+        _ => sql.to_string(),
     }
-    format!("{}...({} bytes)", &sql[..100], sql.len())
 }
 
 fn entry_bytes(k: &(Value, Value)) -> usize {
@@ -347,4 +359,71 @@ fn random_widths_never_leave_a_page_at_or_over_the_threshold() {
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(scanned, sorted, "the scan lost, duplicated or reordered keys");
+}
+
+// ---- The entry bound, from SQL -------------------------------------------------------------------
+//
+// A byte split exists for every entry up to `MAX_ENTRY_BYTES` (2034 bytes, key and value as
+// stored; its doc has the proof), and a larger one is refused by name. These pin the bound at the
+// byte through each SQL write path, and that a refused row leaves nothing behind. They compile
+// against `9aa6968` and are red there for the plain reason that no bound existed: the rows over it
+// were accepted.
+
+/// **A secondary value whose entry is over the bound is refused by name, and the refused row
+/// writes nothing.**
+///
+/// `(v, id)` under an INTEGER id is 3 + len + 5 bytes: 2026 characters is 2034 (admitted), 2027 is
+/// 2035 (refused). "Writes nothing" is the half that needs `execution::insert` to ask the bound
+/// BEFORE the heap write. Were the tree left to refuse it, the heap row and the primary entry
+/// would already be written, the abort would undo only the heap, and id 2 could never be inserted
+/// again: its primary entry would point at a deleted slot. So the test inserts id 2 again.
+#[test]
+fn a_secondary_value_over_the_entry_bound_is_refused_by_name_and_writes_nothing() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    d.sql(&format!("INSERT INTO t VALUES (1, '{}');", "x".repeat(2026)));
+
+    let e = d.err(&format!("INSERT INTO t VALUES (2, '{}');", "y".repeat(2027)));
+    assert!(e.contains("index entry too large: 2035 bytes"), "not the named refusal: {}", abbreviate(&e));
+
+    d.sql("INSERT INTO t VALUES (2, 'short');");
+    assert_eq!(d.ids("SELECT id FROM t;"), vec![1, 2], "the refused row left something behind");
+    assert_eq!(d.ids("SELECT id FROM t WHERE v = 'short';"), vec![2]);
+    assert_eq!(d.ids(&format!("SELECT id FROM t WHERE v = '{}';", "x".repeat(2026))), vec![1]);
+}
+
+/// **A VARCHAR primary key whose entry is over the bound is refused by name.** A primary entry is
+/// the key and a 6-byte `RecordId`: 3 + 2025 + 6 = 2034 is admitted, 2026 characters is refused.
+#[test]
+fn a_varchar_primary_key_over_the_entry_bound_is_refused_by_name() {
+    let mut d = db();
+    d.sql("CREATE TABLE k (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql(&format!("INSERT INTO k VALUES ('{}', 1);", "p".repeat(2025)));
+    let e = d.err(&format!("INSERT INTO k VALUES ('{}', 2);", "q".repeat(2026)));
+    assert!(e.contains("index entry too large: 2035 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids("SELECT n FROM k;"), vec![1], "the refused row left something behind");
+}
+
+/// **An UPDATE to a value whose entry is over the bound is refused, and the row keeps its value.**
+///
+/// The row grows from 6 characters to 2027, so the heap is likely to move it, and the primary
+/// entry would then be repointed before the secondary write. `execution::update` asks the bound
+/// before either. The lookup by id goes through the primary index when the planner uses it; a
+/// primary entry left pointing at an undone slot is what it would find.
+#[test]
+fn an_update_to_a_value_over_the_entry_bound_is_refused_and_the_row_keeps_its_value() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    d.sql("INSERT INTO t VALUES (1, 'before');");
+
+    let e = d.err(&format!("UPDATE t SET v = '{}' WHERE id = 1;", "z".repeat(2027)));
+    assert!(e.contains("index entry too large: 2035 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids("SELECT id FROM t WHERE v = 'before';"), vec![1], "the refused update changed the row");
+    assert_eq!(d.ids("SELECT id FROM t WHERE id = 1;"), vec![1], "the row is unreachable by its key");
+
+    let at = "z".repeat(2026);
+    d.sql(&format!("UPDATE t SET v = '{at}' WHERE id = 1;"));
+    assert_eq!(d.ids(&format!("SELECT id FROM t WHERE v = '{at}';")), vec![1]);
 }
