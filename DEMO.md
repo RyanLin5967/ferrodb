@@ -197,6 +197,13 @@ it read. Reverting A's merge halts by default and names B as the blocker — an 
 because the read was retained. **B never wrote row 1.** Without read-sets there is no edge at all
 and the revert would silently corrupt B's work. `CASCADE` then undoes B first, then A.
 
+**Reach (D212).** What REVERT reads is written in the same transaction as each merge's rows, so a
+merge made before a restart or a crash is revertible after it, dependents found across the restart
+included. The reach is a retention window: at least the last `FERRODB_REVERT_RETENTION_MERGES`
+published merges (default 1024), and an older one is refused with a message that names the window.
+A REVERT is one transaction, a second REVERT of the same merge is refused rather than applied again
+(D218), and each reverted row goes back to the author it had before the merge (D226).
+
 ---
 
 ## What this does not do yet

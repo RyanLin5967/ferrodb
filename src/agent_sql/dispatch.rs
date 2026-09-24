@@ -428,6 +428,9 @@ pub fn run_agent_stmt_staged(
     let current = session.agent.as_ref().map(|a| a.branch);
     let bound = Binder::new(catalog).bind_agent(&stmt, runtime.as_ref(), current)?;
     let mut ctx = ExecCtx { catalog, bp, txn };
+    // D212 — before anything mints an id or stamps a read: `BEGIN AGENT SESSION` mints a txn id
+    // without a context of its own, so the database's counters are read here, at the gateway.
+    runtime.attach_history(&ctx.read())?;
 
     match bound {
         BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, prompt, parent } => {
@@ -555,6 +558,7 @@ pub fn run_in_session(
         None => return Err(FerroError::Branch("no agent session on this connection".into())),
     };
     let mut ctx = ExecCtx { catalog, bp, txn };
+    runtime.attach_history(&ctx.read())?;
     match stmt {
         s @ Stmt::Select { .. } => {
             let rows = runtime.select(&ctx.read(), branch, &s, Some(branch))?;
