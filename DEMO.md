@@ -202,7 +202,10 @@ merge made before a restart or a crash is revertible after it, dependents found 
 included. The reach is a retention window: at least the last `FERRODB_REVERT_RETENTION_MERGES`
 published merges (default 1024), and an older one is refused with a message that names the window.
 A REVERT is one transaction, a second REVERT of the same merge is refused rather than applied again
-(D218), and each reverted row goes back to the author it had before the merge (D226).
+(D218), and each reverted row goes back to the author it had before the merge (D226). That last
+step runs just after the revert commits, because authorship lives in the provenance store and not in
+the WAL: a crash between the two leaves the reverted run still named, exactly as a crash just after a
+merge's commit leaves its rows unattributed.
 
 ---
 

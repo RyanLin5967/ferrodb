@@ -1,7 +1,8 @@
 //! **D212 option (a) — REVERT's substrate survives a restart.** Exit tests (1)–(5) of
 //! `frontier/d212_design.md` §6, plus (3b) for the capture of an ancestor published through its
 //! child. (6) and (7) kill a real process and live in `d212_revert_crash.rs`; (8) sets an
-//! environment variable and lives alone in `d212_revert_retention.rs`.
+//! environment variable and lives alone in `d212_revert_retention.rs`, as does the poisoning of a
+//! failed history write in `d212_revert_poison.rs`.
 //!
 //! # The contract each test holds, and the structure whose removal must turn it red
 //!
@@ -9,10 +10,11 @@
 //! |---|---|---|
 //! | (1) | `versions` | `attach_history` skips the `state.versions` fill from `read_versions` |
 //! | (2) | `apply_seq` | `attach_history` skips `state.apply_seq = max(..)` |
-//! | (3) | captures | `persist_publish` writes no `CAPTURE` records |
-//! | (3b) | inherited captures | `persist_publish` writes the merging task's capture only |
+//! | (3) | captures | `plan_history` plans no `CAPTURE` records |
+//! | (3b) | inherited captures | `plan_history` plans the merging task's capture only |
 //! | (4) | `next_txn` | `attach_history` skips `state.next_txn = max(..)` |
 //! | (5) | `next_merge`, `merges`, `applied`, revert markers | skip `state.next_merge = max(..)`; or no `MERGES_TABLE` row; or no `APPLIED` record; or `write_revert` writes no `REVERTED` record |
+//! | two runtimes | the durable version clock | the publish's freshness check drops `durable_seq` |
 //!
 //! Every restart here is real: the files are checkpointed, every in-process object — sessions
 //! first — is dropped, and a new `Catalog`, WAL, buffer pool, branch catalog and `AgentRuntime` are
@@ -342,4 +344,42 @@ fn exit_5_a_pre_restart_id_reverts_the_pre_restart_merge_once_across_restarts() 
     );
     drop(s);
     assert_eq!(db.qty_of(1), 10, "the Add was inverted more than once");
+}
+
+/// **Two runtimes over one database** (option (a) review, F1). A runtime that attached before
+/// another one published holds a version clock the other has already used. Publishing on it would
+/// stamp versions, and file captures under txn ids, that the durable history already holds — and
+/// after a restart a REVERT would read both merges as one. Its publish is refused against the clock
+/// the history last committed, read from disk at the publish.
+///
+/// RED at `0185f06`, which checked only this runtime's own `applied`: the second merge lands.
+#[test]
+fn a_runtime_whose_clock_another_runtime_overtook_cannot_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    db.seed(&[(1, 10), (2, 20), (3, 30)]);
+
+    // A second runtime attaches, at its first agent statement, while the history is empty.
+    let mut b = Session::with_runtime(Arc::new(AgentRuntime::new()));
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("UPDATE inventory SET qty = 21 WHERE id = 2;", &mut b);
+
+    // The database's own runtime publishes first, on a different row.
+    db.task("a", &["UPDATE inventory SET qty = 11 WHERE id = 1;"]);
+
+    let refused = db.exec("MERGE;", &mut b).err().map(|e| e.to_string());
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains("already been handed out")),
+        "a runtime whose version clock another runtime overtook published anyway: {refused:?}"
+    );
+    drop(b);
+    assert_eq!(db.qty_of(2), 20, "the refused merge published its row");
+
+    // Anti-vacuity: a runtime that attaches AFTER that publish reads the clock, and merges.
+    let mut c = Session::with_runtime(Arc::new(AgentRuntime::new()));
+    db.ok("BEGIN AGENT SESSION AS 'c' RUN 'r_c';", &mut c);
+    db.ok("UPDATE inventory SET qty = 31 WHERE id = 3;", &mut c);
+    db.merge(&mut c);
+    drop(c);
+    assert_eq!(db.qty_of(3), 31);
 }

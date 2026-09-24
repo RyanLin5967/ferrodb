@@ -936,6 +936,16 @@ struct RevertState {
     /// it the answer is gone. A `REVERT` hands each undone row back to this author; without it
     /// `who_wrote_row` went on naming the reverted run as the author of a value it no longer wrote.
     prior_author: BTreeMap<(u64, u32, u64), ProvId>,
+    /// **D212 (a) — set when writing the durable history failed part-way, or a commit carrying it
+    /// returned an error, and so what is on disk is no longer known to match this runtime.**
+    ///
+    /// Every later MERGE and REVERT is refused, naming this, until the database is reopened —
+    /// attach then reads the truth from disk. Continuing instead would compute log keys and version
+    /// upserts from a cursor that may be behind or ahead of the file, and an aborted insert leaves
+    /// its primary-index entry behind (D202), so the next write of the same key fails anyway, with a
+    /// message that names neither cause. The durable provenance store poisons itself on a failed
+    /// append for the same reason.
+    poisoned: Option<String>,
 }
 
 /// **D217 — this runtime's position against the durable counters in `revert_store`.**
@@ -953,6 +963,11 @@ struct HistoryCursor {
     /// runtime mints is above it. That split is what keeps a REVERT from reading one txn's ops or
     /// capture from both places.
     boot_txn_floor: u64,
+    /// **D212 (a).** The highest `begin_ts` over the `versions` restored at attach: a recount of the
+    /// stamps the published rows carry, not the counter that issued them. After a restart `applied`
+    /// is empty, so this is the independent record the publish's freshness check stands on
+    /// (`d212_design.md` §2). Computed once here, where `versions` is read in full anyway.
+    boot_version_high: u64,
     /// **D212 (a).** How many published merges back a `REVERT` reaches: the retention window `W`.
     retention: u64,
 }
@@ -3563,6 +3578,7 @@ impl AgentRuntime {
         // it under the state lock for every row a read returns, so it has to be resident — and it
         // is bounded by rows ever published, not by merges.
         let versions = revert_store::read_versions(ctx)?;
+        let boot_version_high = versions.iter().map(|v| v.begin_ts).max().unwrap_or(0);
         let retention = revert_retention_from_env()?;
         let mut state = self.state.lock().unwrap();
         if state.revert.cursor.is_some() {
@@ -3596,6 +3612,7 @@ impl AgentRuntime {
             meta,
             boot_merge_floor: durable.merge_ceiling,
             boot_txn_floor: durable.txn_high,
+            boot_version_high,
             retention,
         });
         Ok(())
@@ -3700,10 +3717,16 @@ impl AgentRuntime {
         };
         let txn_id = ctx.txn.begin()?;
         if let Err(e) = self.write_meta_in(ctx, txn_id, durable, after) {
+            // An aborted first insert of the row leaves its primary-index entry behind (D202), and
+            // every later reservation would retry that insert: poisoned, so it says why instead.
+            self.poison_history(&e);
             ctx.txn.abort(txn_id)?;
             return Err(e);
         }
-        ctx.txn.commit(txn_id)?;
+        if let Err(e) = ctx.txn.commit(txn_id) {
+            self.poison_history(&e);
+            return Err(e);
+        }
         let mut state = self.state.lock().unwrap();
         // Past anything another run reserved since the cursor was read; never backwards.
         state.next_merge = state.next_merge.max(after.merge_ceiling - MERGE_ID_BLOCK);
@@ -5206,6 +5229,8 @@ impl AgentRuntime {
                 eval.violated_predicates().join("; ")
             )));
         }
+        // D212 (a): a merge whose history cannot be written consistently is not published at all.
+        self.history_usable()?;
 
         let now = fnv64_update(
             self.fingerprint_tables(ctx, &eval.tables_read)?,
@@ -5442,11 +5467,23 @@ impl AgentRuntime {
         // ALREADY broken for a leaked reservation on every ORDINARY refusal — and the schema
         // refusals above fire whenever an agent stages an edit its table cannot take, which is a
         // thing that happens.
+        //
+        // **D212 (a): and against two records that survive a restart.** After one, `applied` is
+        // empty and on its own would vouch for any base. The highest stamp the restored `versions`
+        // carry is the independent recount (`HistoryCursor::boot_version_high`). The version clock
+        // the history last COMMITTED, read from disk now rather than from this runtime's memory,
+        // catches a second runtime driving the same database: its private clock would stamp
+        // versions, and file captures under txn ids, that another runtime's publish already used.
+        let durable_seq = revert_store::read_meta(&ctx.read())?.map_or(0, |m| m.apply_seq);
         let reserved: std::ops::Range<u64> = {
             let mut state = self.state.lock().unwrap();
             let base = state.apply_seq;
-            fresh_reservation(highest_applied_seq(&state.applied), base)
-                .map_err(FerroError::Merge)?;
+            let restored = state.revert.cursor.as_ref().map_or(0, |c| c.boot_version_high);
+            let highest = highest_applied_seq(&state.applied)
+                .into_iter()
+                .chain([restored, durable_seq].into_iter().filter(|s| *s > 0))
+                .max();
+            fresh_reservation(highest, base).map_err(FerroError::Merge)?;
             state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
             base..state.apply_seq
         };
@@ -5458,6 +5495,18 @@ impl AgentRuntime {
         // D212 (a): the history tables this publish writes into exist before its transaction opens.
         // Creating one is DDL, which does not go inside a transaction.
         self.ensure_history_tables(ctx)?;
+        // ...and the history itself is decided now, every refusal included; see `plan_history`.
+        let effects = durable_effects(snapshot.txn, &rows, &snapshot, &images, reserved.clone());
+        let history = self.plan_history(
+            &ctx.read(),
+            &merge_id,
+            from,
+            &snapshot,
+            &effects,
+            &prior_authors,
+            reserved.end,
+        )?;
+        let history_after = history.meta_after;
 
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
@@ -5513,26 +5562,20 @@ impl AgentRuntime {
         // The one unit that is atomic with the published rows is this transaction, so this is the
         // only place the history can be written without a crash window in which rows exist and
         // their history does not (REVERT under-reports) or history exists and its rows do not
-        // (REVERT inverts writes that never landed) — `d212_design.md` §3a. Everything written is
-        // already known here: the reserved sequence, the images, the capture.
-        let effects = durable_effects(snapshot.txn, &rows, &snapshot, &images, reserved.clone());
-        let history = match self.persist_publish(
-            ctx,
-            publish_txn,
-            &merge_id,
-            from,
-            &snapshot,
-            &effects,
-            &prior_authors,
-            reserved.end,
-        ) {
-            Ok(meta) => meta,
-            Err(e) => {
-                ctx.txn.abort(publish_txn)?;
-                return Err(e);
-            }
-        };
-        ctx.txn.commit(publish_txn)?;
+        // (REVERT inverts writes that never landed) — `d212_design.md` §3a. It was planned before the
+        // transaction opened; here it is only written. A failure from here to the end of the commit
+        // is environmental, and it poisons the history rather than leaving this runtime computing
+        // keys and upserts from a picture of the file that may no longer be true.
+        let written = self.write_history(ctx, publish_txn, history);
+        if let Err(e) = written {
+            self.poison_history(&e);
+            ctx.txn.abort(publish_txn)?;
+            return Err(e);
+        }
+        if let Err(e) = ctx.txn.commit(publish_txn) {
+            self.poison_history(&e);
+            return Err(e);
+        }
         // Exit test (6)'s kill point: the publish and its history are durable, and nothing in
         // memory knows either yet. Inert unless the test arms it.
         crash_after_publish_commit();
@@ -5552,7 +5595,7 @@ impl AgentRuntime {
                 state.revert.prior_author.insert((snapshot.txn.0, tbl, row), author);
             }
             if let Some(cursor) = state.revert.cursor.as_mut() {
-                cursor.meta = Some(history);
+                cursor.meta = Some(history_after);
             }
             #[cfg(debug_assertions)]
             audit_durable_effects(&state, snapshot.txn, &effects);
@@ -5654,12 +5697,16 @@ impl AgentRuntime {
         Ok(out.into_iter().collect())
     }
 
-    /// **D212 (a) — write everything a later REVERT of this merge reads, inside `publish_txn`.**
+    /// **D212 (a) — everything a later REVERT of this merge reads, decided before the publish
+    /// transaction opens.** [`AgentRuntime::write_history`] then only writes it.
     ///
-    /// Returns the counters as they will stand once `publish_txn` commits; the caller installs them
-    /// in the cursor only after the commit.
+    /// The split is E82's rule, `publish_evaluation_as`'s own: everything that can refuse refuses
+    /// before the first byte is written. A record that cannot be encoded — a retained WHERE text over
+    /// what a length prefix holds — is refused here, while the user's rows are untouched, rather
+    /// than inside the transaction after them, where the abort would leave D202's index residue on
+    /// every key the merge inserted.
     ///
-    /// What is written, and why each one (`d212_design.md` §0.2 — fewer than all of them
+    /// What is planned, and why each one (`d212_design.md` §0.2 — fewer than all of them
     /// under-reports after a restart):
     /// - an `APPLIED` record: the ops `plan_undo` inverts, each with its row's prior author (D226);
     /// - one `CAPTURE` record per txn this publish made published — the merging task's own, carrying
@@ -5670,22 +5717,19 @@ impl AgentRuntime {
     /// - one [`revert_store::VERSIONS_TABLE`] upsert per row it published, with its new version;
     /// - the counters: the version clock, the highest txn named, the log's high key, retention.
     ///
-    /// ⚠ The `versions` update is an `UPDATE ... WHERE k = <key>`, and every `UPDATE`/`DELETE` is
-    /// planned as a sequential scan today (ledger D178), so it costs O(rows in that table) per
-    /// published row — the same wall the publish's own row updates already pay against the user
-    /// table, not a new one. It goes when D178 routes those statements through the index.
+    /// The `versions` upsert is an `UPDATE ... WHERE k = <key>`, planned through the primary index
+    /// like every DML statement since D178 (`planner::plan::build_scan` optimizes its predicate).
     #[allow(clippy::too_many_arguments)]
-    fn persist_publish(
+    fn plan_history(
         &self,
-        ctx: &mut ExecCtx,
-        publish_txn: u64,
+        ctx: &ReadCtx,
         merge_id: &str,
         from: BranchId,
         snapshot: &WorkspaceSnapshot,
         effects: &DurableEffects,
         prior_authors: &[((u32, u64), ProvId)],
         apply_seq: u64,
-    ) -> Result<Meta, FerroError> {
+    ) -> Result<HistoryPlan, FerroError> {
         let number = merge_number(merge_id).ok_or_else(|| {
             FerroError::Internal(format!("{merge_id} is not a merge id this runtime mints"))
         })?;
@@ -5755,30 +5799,46 @@ impl AgentRuntime {
         let txn_high =
             captures.iter().map(|c| c.txn.0).chain([base.txn_high, txn.0]).max().unwrap_or(txn.0);
 
-        // ---- retention: keep the newest W merges, pruning once W + W/8 are held ---------------
+        // ---- versions: one upsert per row, carrying the LAST version this merge produced -------
+        let mut last: BTreeMap<(u32, u64), VersionRef> = BTreeMap::new();
+        for v in &effects.versions {
+            last.insert((v.tbl.0, v.row.0), *v);
+        }
+        let mut versions = Vec::with_capacity(last.len());
+        for (key, v) in last {
+            let row = revert_store::version_row(&v)?;
+            versions.push(match versions_before.get(&key).copied().flatten() {
+                None => VersionWrite::Insert(row),
+                Some(old) => VersionWrite::Update {
+                    key: revert_store::version_key(key.0, key.1),
+                    row,
+                    before: revert_store::version_row(&old)?,
+                },
+            });
+        }
+
+        // ---- retention: keep the newest W merges, pruning once more than W + W/8 are held ------
         //
         // Batched so the O(W) read of the merges table is paid once per W/8 merges, not per merge.
         let mut retained_from = base.retained_from;
         let mut retained_count = base.retained_count + 1;
         let mut prune: Option<(u64, u64)> = None;
-        if retained_count > retention + (retention / 8).max(1) {
-            let mut held: Vec<(u64, u64)> = revert_store::read_merges(&ctx.read())?
-                .iter()
-                .map(|m| (m.number, m.log_from))
-                .collect();
+        if retained_count > retention.saturating_add((retention / 8).max(1)) {
+            let mut held: Vec<(u64, u64)> =
+                revert_store::read_merges(ctx)?.iter().map(|m| (m.number, m.log_from)).collect();
             held.push((stored.number, stored.log_from));
             held.sort_unstable();
-            let keep = retention as usize;
-            if held.len() > keep {
-                let (oldest_kept, its_log) = held[held.len() - keep];
-                prune = Some((oldest_kept, its_log));
-                retained_from = oldest_kept;
-                retained_count = retention;
-            } else {
-                retained_count = held.len() as u64;
+            match usize::try_from(retention) {
+                Ok(keep) if held.len() > keep => {
+                    let (oldest_kept, its_log) = held[held.len() - keep];
+                    prune = Some((oldest_kept, its_log));
+                    retained_from = oldest_kept;
+                    retained_count = retention;
+                }
+                _ => retained_count = held.len() as u64,
             }
         }
-        let after = Meta {
+        let meta_after = Meta {
             merge_ceiling: base.merge_ceiling,
             txn_high,
             apply_seq: apply_seq.max(base.apply_seq),
@@ -5786,39 +5846,73 @@ impl AgentRuntime {
             retained_from,
             retained_count,
         };
+        Ok(HistoryPlan {
+            log_rows,
+            merge_row: stored.to_row()?,
+            versions,
+            prune,
+            meta_before,
+            meta_after,
+        })
+    }
 
-        // ---- the writes, all inside `publish_txn` ------------------------------------------------
-        for row in log_rows {
+    /// Write a [`HistoryPlan`] inside `publish_txn`. Nothing here decides anything; a failure here is
+    /// environmental, and the caller poisons the history (see [`RevertState::poisoned`]).
+    fn write_history(
+        &self,
+        ctx: &mut ExecCtx,
+        publish_txn: u64,
+        plan: HistoryPlan,
+    ) -> Result<(), FerroError> {
+        fail_history_write()?;
+        for row in plan.log_rows {
             insert_one(ctx, publish_txn, revert_store::LOG_TABLE, row)?;
         }
-        insert_one(ctx, publish_txn, revert_store::MERGES_TABLE, stored.to_row()?)?;
-        // One upsert per row, carrying the LAST version this merge produced for it.
-        let mut last: BTreeMap<(u32, u64), VersionRef> = BTreeMap::new();
-        for v in &effects.versions {
-            last.insert((v.tbl.0, v.row.0), *v);
-        }
-        for (key, v) in last {
-            let row = revert_store::version_row(&v)?;
-            match versions_before.get(&key).copied().flatten() {
-                None => insert_one(ctx, publish_txn, revert_store::VERSIONS_TABLE, row)?,
-                Some(old) => update_one(
+        insert_one(ctx, publish_txn, revert_store::MERGES_TABLE, plan.merge_row)?;
+        for v in plan.versions {
+            match v {
+                VersionWrite::Insert(row) => {
+                    insert_one(ctx, publish_txn, revert_store::VERSIONS_TABLE, row)?
+                }
+                VersionWrite::Update { key, row, before } => update_one(
                     ctx,
                     publish_txn,
                     revert_store::VERSIONS_TABLE,
                     revert_store::versions_schema(),
-                    revert_store::version_key(key.0, key.1),
+                    key,
                     row,
-                    revert_store::version_row(&old)?,
+                    before,
                 )?,
             }
         }
-        if let Some((oldest_kept, its_log)) = prune {
+        if let Some((oldest_kept, its_log)) = plan.prune {
             // A record's first key is where pruning cuts, so no record is ever left half-deleted.
             delete_below(ctx, publish_txn, revert_store::LOG_TABLE, "k", its_log)?;
             delete_below(ctx, publish_txn, revert_store::MERGES_TABLE, "m", oldest_kept)?;
         }
-        self.write_meta_in(ctx, publish_txn, meta_before, after)?;
-        Ok(after)
+        self.write_meta_in(ctx, publish_txn, plan.meta_before, plan.meta_after)
+    }
+
+    /// **D212 (a) — stop trusting this runtime's picture of the durable history.** Called when a
+    /// write of it failed part-way or a commit carrying it returned an error. See
+    /// [`RevertState::poisoned`].
+    fn poison_history(&self, why: &FerroError) {
+        let mut state = self.state.lock().unwrap();
+        if state.revert.poisoned.is_none() {
+            state.revert.poisoned = Some(why.to_string());
+        }
+    }
+
+    /// Refuse while the history is poisoned.
+    fn history_usable(&self) -> Result<(), FerroError> {
+        match &self.state.lock().unwrap().revert.poisoned {
+            None => Ok(()),
+            Some(why) => Err(FerroError::Merge(format!(
+                "the REVERT history could not be written consistently ({why}), so what is on disk \
+                 may not match what this server believes. Every MERGE and REVERT is refused until \
+                 the database is reopened, which reads the history back from disk"
+            ))),
+        }
     }
 
     /// The composed effect the target absorbed on this cell since we forked, if any.
@@ -6338,6 +6432,7 @@ impl AgentRuntime {
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
         self.attach_history(&ctx.read())?;
+        self.history_usable()?;
 
         // ---- which merge, and whether its history is in memory or only on disk ----------------
         let found = {
@@ -6464,10 +6559,15 @@ impl AgentRuntime {
         let revert_txn = ctx.txn.begin()?;
         if let Err(e) = self.write_revert(ctx, revert_txn, writes, marker_rows, meta_before, meta_after)
         {
+            // Every refusal the data could cause was made by `plan_undo`, so this is environmental.
+            self.poison_history(&e);
             ctx.txn.abort(revert_txn)?;
             return Err(e);
         }
         let committed = ctx.txn.commit(revert_txn);
+        if let Err(e) = &committed {
+            self.poison_history(e);
+        }
         // Recorded even when `commit` returned an error. `commit` can fail AFTER its record is
         // durable (the `TxnEnd` append, or the automatic checkpoint behind it), and a revert that
         // may have landed must not be accepted again: refusing a retry is recoverable, inverting
@@ -6656,6 +6756,25 @@ struct DurableEffects {
     written: Vec<WriteRecord>,
 }
 
+/// **D212 (a) — every write of one publish's history, decided before its transaction opens.**
+struct HistoryPlan {
+    /// The chunked `APPLIED` and `CAPTURE` records, in key order.
+    log_rows: Vec<Vec<Value>>,
+    merge_row: Vec<Value>,
+    versions: Vec<VersionWrite>,
+    /// `(oldest merge kept, its first log key)`, when this publish prunes.
+    prune: Option<(u64, u64)>,
+    /// The counters as they are durable now (`None` while no row exists) and as they will be.
+    meta_before: Option<Meta>,
+    meta_after: Meta,
+}
+
+/// One row's version upsert: an insert the first time a merge publishes the row, an update after.
+enum VersionWrite {
+    Insert(Vec<Value>),
+    Update { key: Value, row: Vec<Value>, before: Vec<Value> },
+}
+
 /// The computation `record_applied`'s loop performs, without installing anything.
 ///
 /// **A second computation of the same values, on purpose, and audited.** `record_applied` runs
@@ -6721,7 +6840,8 @@ fn durable_effects(
 }
 
 /// **The audit that makes the mirror safe:** what `record_applied` installed must be exactly what
-/// `persist_publish` wrote. Debug builds only; a panic names the first field that disagrees.
+/// `plan_history` planned and `write_history` wrote. Debug builds only; a panic names the first
+/// field that disagrees.
 #[cfg(debug_assertions)]
 fn audit_durable_effects(state: &State, txn: TxnId, effects: &DurableEffects) {
     let n = effects.ops.len();
@@ -6862,9 +6982,10 @@ fn outside_window(merge_id: &str, retention: u64, oldest: u64) -> FerroError {
 fn earlier_run_unpublished(merge_id: &str, floor: u64) -> FerroError {
     FerroError::Merge(format!(
         "{merge_id} belongs to an earlier server run (every merge id up to m_{floor} was issued, or \
-         reserved and left unused, before this server started), and no merge was published under \
-         it: it was a conflicting or quarantined MERGE, a merge into a sibling branch, or an id \
-         reserved and never used"
+         reserved and left unused, before this server started), and the REVERT history holds no \
+         merge published under it: it was a conflicting or quarantined MERGE, a merge into a \
+         sibling branch, an id reserved and never used — or a merge published by a build that kept \
+         no REVERT history, before D212 option (a)"
     ))
 }
 
@@ -6877,6 +6998,23 @@ fn crash_after_publish_commit() {
     if *ARMED.get_or_init(|| std::env::var_os("FERRODB_CRASH_AFTER_PUBLISH_COMMIT").is_some()) {
         std::process::abort();
     }
+}
+
+/// **D212 (a) poisoning test.** Inert unless `FERRODB_FAIL_HISTORY_WRITE` is set to a count `n`:
+/// then the first `n` history writes fail as a disk would, inside the publish transaction and after
+/// the rows are written — the one shape that must poison the history rather than be refused up front.
+fn fail_history_write() -> Result<(), FerroError> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    static SPENT: AtomicUsize = AtomicUsize::new(0);
+    let budget = *BUDGET.get_or_init(|| {
+        std::env::var("FERRODB_FAIL_HISTORY_WRITE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if budget > 0 && SPENT.fetch_add(1, AtomicOrdering::Relaxed) < budget {
+        return Err(FerroError::Io("injected: FERRODB_FAIL_HISTORY_WRITE".into()));
+    }
+    Ok(())
 }
 
 /// **D212 exit test (7).** Inert unless `FERRODB_CRASH_MID_REVERT` is set to a count: then the
