@@ -930,3 +930,88 @@ switch retires that file, and V4's sweep crashes inside that window.
 All 35 patches pass `git apply --check` against `38efedb`'s tree. M1–M34 keep their edits, and only hunk context
 moved: each patch's `^[-+]` lines were compared with its copy at `36e0a81`, and eight patches were regenerated with
 identical edits.
+
+---
+
+## Amendment 13 — review 4's caveats C1–C4, written BEFORE the tests (nothing built)
+
+Source: `artie-research frontier/d207_review4.md` @ `6867645`, review of `1b8d290..d815c1b`, verdict
+SOUND-WITH-CAVEATS. F2's mechanism holds and nothing blocks. This amendment closes C1's test gap, records C2–C4, and
+corrects one citation. **No `src/` code changes**: tests are added and comments corrected.
+
+### C1: four tests, post-fix, each with mutant-only red
+
+Every large append in V1, V3, V4 and U is a one-entry batch on a log at floor 0 (the review, READ). So three unsafe
+mutants survive every registered test, and V4 never reopens with this build. The four tests below are additions
+only, to `tests_log.rs`. They pass on the tip, and their red evidence is the mutants that follow.
+
+| key | test | what it pins |
+|---|---|---|
+| **W1** | `a_mixed_batch_raises_the_version_whichever_entry_is_large` | a `[small, large]` batch and a `[large, small]` batch, each on a version-1 log, leave a live header an older build refuses. Each is on its own fabric, and each panic names its order |
+| **W2** | `the_version_is_raised_exactly_above_the_pre_d223_read_bound` | a disk frame of exactly the test's own literal 8,384,576 bytes leaves the log at version 1, and one of 8,384,577 raises it. Each fixture checks its stored frame length from the image bytes |
+| **W3** | `a_version_raise_on_a_checkpointed_log_keeps_the_floor_and_every_round` | a log at floor 2@1 holding 3@1 and 4@2 takes a large round 5. After a reopen: floor 2, floor term 1, every round 3–5 intact, and a header an older build refuses |
+| **W4** | `no_crash_during_a_version_raise_loses_a_round_this_build_reads` | V4's sweep (both durabilities, three shapes, every faultable operation of the first large append after rounds 1–3), with a reopen by THIS build at every point. The log must open with floor 0, `last_round` 3 or 4, and rounds 1–3 unchanged. Round 4, if present, must be the large entry |
+
+**The fixtures for W1 and W2 are sized in disk bytes.** A `WalBatch` disk frame is `24 + 13 + bytes` (READ
+`encode_frame`, and `encode_command`'s `WalBatch` arm: tag 1, `start_lsn` 8, length 4). W1's large entry is a disk
+frame of `PRE_D223_READ_BOUND + 1`, a size one real `Append` can carry beside a small entry, as the review asked.
+
+### Mutants for C1 (cut from the tests' commit; log module)
+
+| mutant | what it does | fails |
+|---|---|---|
+| **M41 `raise_only_when_all_large`** | the batch rule becomes `all` | W1 (its first half, `[small, large]`) |
+| **M42 `raise_on_first_only`** | `frames.first()` | W1's `[small, large]` half |
+| **M43 `raise_on_last_only`** | `frames.last()` | W1's `[large, small]` half |
+| **M44 `legacy_bound_raised`** | `LEGACY_READ_BOUND = 8_388_538`, the top of the unsafe range the review names | W2's 8,384,577 half |
+| **M45 `raise_floor_term_is_last_term`** | the raise passes `self.last_term()` as the floor term | W3. The reopen's scan starts at `prev_term` 2 and trims round 3@1 onward, so `last_round` reads 2 |
+| **M46 `raise_rewrites_the_header_in_place`** | the design this lane rejected: the raise rewrites the live file's header in place, without the switch | W4 only. A torn or corrupt in-place header on a log that holds frames leaves no readable header, and `open` refuses rather than reinitialise. V4 passes it, because a header that cannot be read is also one an older build refuses |
+
+M41–M43 together make both halves of W1 necessary. M44 would also be killed by any value in
+(8,384,576, 8,388,538]. A LOWER bound (the safe direction) fails W2's 8,384,576 half. So W2 pins the constant
+exactly. All of these kill sets are INFERRED.
+
+### Records
+
+- **C2: the rolling-upgrade constraint is per disk frame, for every command kind.**
+  - An older follower refuses any disk frame over **8,384,512 bytes** (`9aa6968:log.rs:1022`,
+    `total > MAX_ENTRY_BYTES`). An older build trims any frame over 8,384,576. Both are measured by `encode_frame`,
+    whatever the command.
+  - Amendment 11's "`WalBatch` payload over 8,384,475" is the `WalBatch` case of that: a disk frame is the payload
+    plus 37.
+  - The constraint, stated generally: **until every node runs this build, no committed entry may exceed 8,384,512
+    disk bytes**, or decision 10 must land.
+  - It is latent. `src/` proposes only `Command::Branch`, and `WalBatch` is built only in an example, the
+    simulator and tests (the review, READ). But `Node::propose` is `pub`, so an embedder could still propose one.
+- **C3: a downgrade stall.**
+  - Disk frames of **8,384,513–8,384,576 bytes** are above every older build's write bound and at or below its read
+    bound. They stay at version 1, correctly, because an older build reads them.
+  - But after a downgrade, an older follower that lacks such a round refuses to store it. It never acknowledges, and
+    it stalls until a snapshot covers that round.
+  - Nothing is lost, and no version mark can fix it: the follower that stalls is the one that does not hold the
+    frame.
+  - Downgrading across D223 is therefore safe only when no committed entry over 8,384,512 disk bytes is still needed
+    by a follower. Decision 10 would also cover it.
+- **C4: a log can reach version 2 without holding a large frame.** The raise comes before the write, so the log stays
+  at version 2 in three cases: a large append that then fails (`write_batch` returns `Io`), a crash before the frame
+  is durable, or a later truncation. Amendment 12 named only the truncation. The exact rule is: **a log to which no
+  large frame was ever submitted stays version 1.** That is conservative, not unsafe.
+- These three are recorded in `log.rs`'s docs as well, in a comment-only commit.
+
+### Correction to amendment 11 (append-only; A11 stands as written)
+
+Amendment 11 says "READ at `9aa6968`: `log.rs:311` refuses any other version with `Corrupt`". **At `9aa6968` that
+line is `:297`** (`if version != VERSION {`, inside `Header::decode` at `:288`). `:311` is its position at
+`1b8d290`/`3083397`. Instrument: `git show 9aa6968:src/consensus/log.rs | sed -n 288,300p`.
+
+### Run G7 at the tip (predicted)
+
+| module | tests | predicted |
+|---|---|---|
+| log | 54 + W1–W4 = **58** | all pass |
+| node | 13 | unchanged |
+| transport | 58 (57 off macOS) | unchanged |
+| replicate | 60 | unchanged |
+
+**Per-target: 2604 + 4 = 2608** on macOS. Command for M41–M46: the log module,
+`timeout 1800 cargo test --no-fail-fast --lib consensus::log::tests_log::`.
