@@ -1,0 +1,13 @@
+trapcheck: tip=e77852b932116416eb1417295a64f48d7a55448b judge=bench/d263/firecheck.sh subject=11f6c82df16f0fac9fe811caf3c79b795eb72aef old=bc3ae30bf7ec7ad162a3c88843b652b7a55a395d
+branches: 7 d263-rv1-mut-*
+firecheck.sh park=list sig=TERM: rc=143 exit_after=0s parked_fake=no src=ok
+firecheck.sh park=list sig=HUP: rc=129 exit_after=0s parked_fake=no src=ok
+firecheck.sh park=list sig=INT: rc=130 exit_after=1s parked_fake=no src=ok
+firecheck.sh park=list sig=QUIT: rc=131 exit_after=0s parked_fake=no src=ok
+firecheck.sh park=arm sig=TERM: rc=143 exit_after=0s parked_fake=no src=ok
+firecheck.sh park=arm sig=HUP: rc=129 exit_after=1s parked_fake=no src=ok
+firecheck.sh park=arm sig=INT: rc=130 exit_after=0s parked_fake=no src=ok
+firecheck.sh park=arm sig=QUIT: rc=131 exit_after=0s parked_fake=no src=ok
+old_judge.sh park=list sig=TERM: rc=143 DEFERRED (alive 10 s after the signal; exited 11 s after it once the park was released) src=ok
+/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/d232/trapcheck.sh: line 80: 94998 Hangup: 1               ( cd "$CLONE" && PATH="$WORK/bin:$PATH" FAKE_SUBJECT="$SUBJECT" FAKE_PARK="$park" FAKE_LOG="$WORK/fake.log" exec bash "$judge" ) > "$WORK/judge.$park.$sig.out" 2>&1
+old_judge.sh park=arm sig=HUP: rc=129 exit_after=0s parked_fake=ORPHAN src=ok
