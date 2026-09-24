@@ -1555,7 +1555,7 @@ impl ArenaPageStore {
         // hold above, which lasts to the end of the install (D263 review 1 F1): cleared in a hold
         // of its own, a free or claim failing after it and before the install pushed a range the
         // clear never saw, and the next fold listed it free in the installed map.
-        persist.quarantine.clear();
+        // MUTANT (fire-check only, never land): load_state leaves the quarantine as it was.
         let mut st = self.state.lock().unwrap();
         *st =
             // **D85: every restored extent's fill is SUSPECT until probed.**
