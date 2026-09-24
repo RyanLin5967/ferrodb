@@ -677,3 +677,51 @@ unchanged; only their hunk line numbers moved. M28–M34 are new, cut as amendme
 
 Predicted kills are amendment 8's table, with M27 now killed by T5. **Run G5 at the tip**: replicate 60 passed, log
 49 passed, transport 58 passed. Per-target **2598**.
+
+---
+
+## Amendment 10 — lane D73's three transport observations, before any run (nothing built)
+
+Source: `artie-research frontier/lane_d73_pump_clock.md` §9. The lead forwarded it and asked that each observation be
+verified. Doc commit **`749d399`**; the mutants are re-cut from it. Only hunk line numbers moved; all 29 patches
+pass `git apply --check`. Test counts are unchanged: transport 58, replicate 60, log 49.
+
+1. **O-2, "accept_loop may leak a slot and a descriptor when `set_nonblocking` or `set_read_timeout` fails": REAL
+   at `9aa6968`, and it IS D207.**
+   - READ: `transport.rs:1844` `map.insert(id, mine)`, then `:1849-1853` `continue` with no release.
+   - It is fixed on this branch by `cfe9cf5`. `ConnRegistration` is made in the same critical section that reserves
+     the slot, and it drops at that `continue`, which releases the slot and the dup'd descriptor `mine` it holds.
+     The accepted `stream` itself is a local that drops at the same `continue`.
+   - Its red test is **A** (`6ceb719`), registered in Run R at `leaked` 4. A's registry reading empty means both
+     descriptors are gone, because the registry holds the only other one.
+   - I found no other leak path at the tip, READ `accept_loop` at `749d399`:
+     - a failed `try_clone` takes no slot, and `stream` drops;
+     - cap-full: `mine` is never inserted and drops, and `stream` drops;
+     - a failed spawn drops the closure;
+     - every `conn_loop` exit drops `_registration` and `stream`.
+2. **O-1, "the 60 s idle close may delay real failover on the wall clock": VERIFIED by reading.** The timing is
+   INFERRED, not measured.
+   - The receiver closes a connection silent for longer than `idle_deadline`: `conn_loop`,
+     `if last_heard.elapsed() > opts.idle_deadline` at `:2167` (line numbers at `ec08152`; `749d399` only moved
+     docs), and the default is 60 s (`:1155`).
+   - During stable leadership, followers send only to the leader: an ack or refusal addressed to the Append's sender
+     (`replicate.rs:828`, `:850`). Campaign frames go out only when an election starts (`election.rs:350-357`,
+     `:401`). So each follower-to-follower connection goes silent and is closed by its receiver.
+   - The sender never reads its socket after the handshake (`sender_loop`, `:1859` on; only `dial` reads), so it
+     does not see the close.
+   - The next write into the closed connection succeeds locally and the peer answers with a reset. It is the
+     following write that fails, is counted (`:1929-1935`), and makes the sender redial. The repo already records
+     this TCP behaviour: `tests_transport.rs:1871`, "the first write after a FIN may succeed, the peer answers RST,
+     and the next one fails".
+   - **So when the leader dies after 60 s of stable leadership, each survivor's first campaign frame to the other is
+     lost uncounted, and its second is lost counted.** The vote they need only crosses on a later election round.
+   - Not fixed here; §3 names the options.
+3. **"The transport's doc claims every loss is counted": NARROWED** in `749d399`.
+   - The module header, the `Counters` doc and the `idle_deadline` doc now say exactly which losses are counted:
+     every drop and refusal the transport decides on, including D223's `unencodable` and `unaddressable`.
+   - They also say which losses cannot be counted: frames TCP loses after they left this process; the first frame
+     after a peer's idle close; and what a receiver discards after closing on an unknown tag, an undecodable,
+     truncated or over-long frame, or the idle deadline, where only the idle close is counted.
+   - They cannot all be made true by counting, because TCP gives no delivery receipt.
+
+**Predictions are unchanged** from amendments 8 and 9. `749d399` touches doc comments only; no test reads them.

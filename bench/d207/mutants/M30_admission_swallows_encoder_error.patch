@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -261,7 +261,7 @@
+@@ -274,7 +274,7 @@
  /// held the round, or from the encoder on every heartbeat, discarded by `node.rs`.
  pub(crate) fn admit_entry(e: &Entry) -> Result<(), FerroError> {
      let mut b = Vec::new();

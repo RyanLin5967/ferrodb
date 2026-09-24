@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1266,9 +1266,7 @@
+@@ -1288,9 +1288,7 @@
      /// Both redial waits in `sender_loop` go through here, so there is one copy to get right.
      fn wait_before_redial(&self, stop: &AtomicBool, delay: Duration) {
          let st = self.state.lock().unwrap();

@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2062,7 +2062,6 @@
+@@ -2084,7 +2084,6 @@
                      // fails with EINVAL. `registration` is dropped by this `continue`, which
                      // releases the slot; the refusal is counted, because an unserved connection
                      // with no number attached is the silent loss this module does not allow.

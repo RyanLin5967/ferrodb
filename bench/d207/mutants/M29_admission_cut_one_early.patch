@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -263,7 +263,7 @@
+@@ -276,7 +276,7 @@
      let mut b = Vec::new();
      encode_entry(&mut b, e)?;
      let budget = append_entries_budget();

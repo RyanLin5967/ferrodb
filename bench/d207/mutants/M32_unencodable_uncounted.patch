@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1619,9 +1619,7 @@
+@@ -1641,9 +1641,7 @@
          })?;
          // Counted as well as returned: `node.rs` discards this error by design, so without the count
          // a message the encoder refuses vanishes with no number attached (D223).
