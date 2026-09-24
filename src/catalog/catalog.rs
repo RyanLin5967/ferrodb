@@ -463,7 +463,9 @@ impl Catalog {
         self.persist()?;
         // Keep the SHARED cell in step with the durable record. A split stores into the cell and
         // then calls this, so the two usually already agree; a caller that sets the root directly
-        // (tests, ALTER) would otherwise leave the cell pointing at the old tree.
+        // (tests) would otherwise leave the cell pointing at the old tree. ALTER does not come
+        // through here: its `finish` writes the record and stores into the cell itself, in its one
+        // persist (D214).
         if let Some(cell) = self.roots.get(&(table.to_string(), None)) {
             cell.store(new_root, Ordering::Release);
         }

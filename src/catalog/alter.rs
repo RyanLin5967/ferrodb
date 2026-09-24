@@ -712,7 +712,8 @@ impl Catalog {
     /// `primary_root_now` is the primary index's root as [`rewrite_heap`] left it. It is written
     /// back here, in the same `persist` as the schema, rather than through
     /// [`Catalog::update_primary_root`] — two persists would be two chances to store one half of an
-    /// alteration.
+    /// alteration. It is stored into the primary index's SHARED cell here too (D214), because
+    /// every statement descends from the cell, not the record (D53).
     ///
     /// **Nothing in here may be fallible except the `persist` itself**, and that is a property to
     /// preserve rather than a coincidence. This function runs after `rewrite_heap` has converted
@@ -734,6 +735,16 @@ impl Catalog {
         entry.schema = new_schema;
         entry.primary_index_root = primary_root_now;
         let shape = shape_of(&entry.schema);
+        // D214 — the SHARED cell as well as the record. `commit_rewrite` repoints rows through a
+        // PRIVATE handle, so nothing else tells the cell where the tree now is, and a cell left on
+        // the old root would have every later statement descend a tree the record no longer names.
+        // Stored beside the record, before the persist: both describe where the tree IS, which the
+        // rewrite has already made true whether or not the persist succeeds. It is a store into an
+        // existing `Arc` (holders follow it, as D205's rebuild does) and it is infallible, so the
+        // persist is still the one fallible step and the only persist.
+        if let Some(cell) = self.root_cell(table, None) {
+            cell.store(primary_root_now, Ordering::Release);
+        }
         self.persist()?;
         Ok(shape)
     }
@@ -1085,7 +1096,8 @@ fn commit_rewrite(
         }
     }
 
-    // A split during the repointing above can move the tree's root, and the caller records it.
+    // A split during the repointing above can move the tree's root, and the caller records it, in
+    // the record and in the shared cell (`finish`, D214).
     //
     // **This used to be a refusal, and a refusal was the wrong answer.** The observation behind it
     // is right — the catalog holds the root page id, and a root that is not written back leaves the
@@ -1100,7 +1112,10 @@ fn commit_rewrite(
     // stayed put at 300 rows x 1300 bytes, 600 x 600 and 1200 x 60 — every row relocating, every
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
-    // inventing a rule for it.
+    // inventing a rule for it. D214 adds the reason it never moved: the `upsert` above only ever
+    // REPLACES a key the tree holds, with a fixed-size `RecordId`, and
+    // `BPlusTreeManager::try_write_without_split` documents that a same-size replacement cannot
+    // reach a split. `finish`'s cell store is therefore tested as a unit, not through an ALTER.
     Ok(primary.root_page_id.load(Ordering::Relaxed))
 }
 
