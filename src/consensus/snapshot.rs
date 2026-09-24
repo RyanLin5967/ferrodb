@@ -1521,17 +1521,16 @@ impl SnapshotStore for PageStoreSnapshots {
         // throws the log away whole and restarts it at the current end, which is exactly what a
         // node whose pages are now a checkpoint needs.
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
-        self.wal.truncate(0)?;
-        let after = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
-        if after == before && self.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst) != before {
+        if let crate::wal::log::Truncation::Kept { oldest_pin } = self.wal.truncate(0)? {
             // `truncate` honours a pin by keeping the whole log and still returning `Ok`. Silent
             // there is right — a checkpoint that reclaims nothing is not a failure — and wrong
-            // here: the records it kept are the ones that must never be replayed.
+            // here: the records it kept are the ones that must never be replayed. Asked of
+            // `truncate` itself since D234; this used to infer it from the base not moving.
             return Err(FerroError::Wal(format!(
                 "this node's WAL could not be discarded before installing a snapshot (base is \
-                 still {before}); something holds a pin below it. Those records describe the \
-                 database this install replaced and recovery would replay them over the installed \
-                 pages."
+                 still {before}); something holds a pin at lsn {oldest_pin}, below it. Those \
+                 records describe the database this install replaced and recovery would replay \
+                 them over the installed pages."
             )));
         }
 

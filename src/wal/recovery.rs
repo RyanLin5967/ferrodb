@@ -468,7 +468,9 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // D227: what every checkpoint from here on re-declares. `schema_log` lives in memory and was
     // filled only by DDL this process ran, so a restarted process declared no table at all from its
     // first checkpoint on. Before that checkpoint, so the one this open may take re-declares them.
-    for rec in table_declarations(&catalog) {
+    let declarations = table_declarations(&catalog);
+    let declares = !declarations.is_empty();
+    for rec in declarations {
         txn.retain_ddl(&rec);
     }
     let rebuild = recovered || stale;
@@ -478,16 +480,20 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // **D216: a checkpoint for any log that holds records, and a rebuild only for a stale one.**
     // Before D216 the two went together, because any non-empty log counted as stale. The rebuild
     // is the O(rows) half and is skipped for a log of re-declarations. The checkpoint costs a
-    // flush and a truncation, and is kept for two reasons:
+    // flush and a truncation, and is taken in three cases:
     // - after a rebuild, so the next open does not replay the same records and rebuild again
     //   (reasoning from `b9a0a75`);
     // - after a clean close, so the previous process's run declarations do not outlive it. A
     //   provenance store kept in memory (pgserver's) hands out slot ids from 1 again after a
     //   restart, and an old declaration of slot 1 left beside a new binding of slot 1 to another
     //   actor is a log `LogicalDecoder` refuses whole. At 00f4c39 this checkpoint ran on every
-    //   non-empty log, so that could not happen.
+    //   non-empty log, so that could not happen;
+    // - (D234) whenever there is a table to declare, so the declarations are in the log before
+    //   anything can pin it. A checkpoint that a pin keeps from truncating re-declares nothing,
+    //   and at an open nothing holds a pin yet. Only a log written before D227 can be empty while
+    //   the catalog has tables; after D227 every checkpoint re-declares them.
     let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
-    if rebuild || holds_records {
+    if rebuild || holds_records || declares {
         txn.checkpoint()?;
         // On the flag that decided the rebuild. Today `rebuild && stale` is the same as `stale`;
         // it is spelled this way so that an edit to the rebuild's condition cannot leave the
@@ -1685,7 +1691,7 @@ use super::*;
         let dir = tempfile::tempdir().unwrap();
         {
             let (_bp, wal, _txn) = setup(dir.path());
-            wal.truncate(0).unwrap();
+            let _ = wal.truncate(0).unwrap();
         }
         let (_bp, wal, txn) = setup(dir.path());
         assert_eq!(wal.header_txn_id, 0, "premise failed: the log's header does not say 0");

@@ -4,7 +4,7 @@ use crate::catalog::column::{DataType, Value};
 use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, Truncation, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
 ///
@@ -621,6 +621,12 @@ impl TxnManager {
     /// Refuses to hold two different actors under one `prov_id`: the slot is the reference every
     /// stamped version carries, so two meanings for it would make every attribution ambiguous.
     pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
+        self.retain_run(run).map(|_| ())
+    }
+
+    /// The body of [`Self::declare_run`], answering whether `run` was new: `Ok(false)` for a run
+    /// already retained under its slot (the same actor), `Err` for a different actor in that slot.
+    fn retain_run(&self, run: RunEntity) -> Result<bool, FerroError> {
         let mut log = self.run_log.lock().unwrap();
         if let Some(existing) = log.get(&run.prov_id.0) {
             // `same_actor`, not `==`. Full equality compares `started_at`, which is when a session
@@ -636,10 +642,10 @@ impl TxnManager {
                     run.describe()
                 )));
             }
-            return Ok(());
+            return Ok(false);
         }
         log.insert(run.prov_id.0, run);
-        Ok(())
+        Ok(true)
     }
 
     /// Declare every run `store` knows, so the next checkpoint re-declares them. D227.
@@ -650,9 +656,21 @@ impl TxnManager {
     /// it is the store that hands out slots, so its runs are what the slot in every version header
     /// means. A store kept in memory knows nothing after a restart and declares nothing, which is
     /// right for it, because it hands the same slots out again.
+    ///
+    /// **D234: each run not already retained is also WRITTEN, as a declaration, now**, the way
+    /// `log_ddl` writes DDL as it runs. A checkpoint re-appends the retained runs only after a real
+    /// truncation, so a run that was only retained would stay out of the log for as long as a pin
+    /// keeps every checkpoint from truncating.
     pub fn declare_runs_of(&self, store: &dyn crate::provenance::ProvenanceStore) -> Result<(), FerroError> {
+        let mut wrote = false;
         for run in store.runs()? {
-            self.declare_run(run)?;
+            if self.retain_run(run.clone())? {
+                self.wal.append(0, 0, &RecKind::RunIdentity { run })?;
+                wrote = true;
+            }
+        }
+        if wrote {
+            self.wal.flush()?;
         }
         Ok(())
     }
@@ -1131,14 +1149,27 @@ impl TxnManager {
         self.bp.disk_manager.sync()?;
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
-        self.wal.truncate(self.txn_ids.issued_through())?;
+        let truncation = self.wal.truncate(self.txn_ids.issued_through())?;
+        // Reset either way: every page was flushed, and a counter left over the threshold would
+        // make every commit under a pin take another flush of the whole pool.
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
-        // The truncation just discarded every DDL record. Put them back, or a log reader starting
-        // at the new base has no way to know what any table is.
-        self.replay_schema()?;
-        // And every run declaration, for the same reason: a reader starting at the new base would
-        // otherwise have no way to name the database's writers.
-        self.replay_runs()?;
+        // **D234: re-declare only after a real truncation.** A pin below the log's end (a base
+        // backup, a snapshot handoff, a change stream's cursor) makes `truncate` keep the whole log,
+        // and the kept log still holds every declaration a reader starting at its base needs:
+        // - the ones the last real truncation re-appended;
+        // - every DDL since, which `log_ddl` appended as it ran;
+        // - every run since, as the binding its commit appended, or as the declaration
+        //   `declare_runs_of` appended.
+        // Re-appending them anyway grew the log by every declaration at every checkpoint: O(M) per
+        // checkpoint, O(M²) over a pinned period, and recovery read all of it.
+        if truncation == Truncation::Truncated {
+            // The truncation just discarded every DDL record. Put them back, or a log reader
+            // starting at the new base has no way to know what any table is.
+            self.replay_schema()?;
+            // And every run declaration, for the same reason: a reader starting at the new base
+            // would otherwise have no way to name the database's writers.
+            self.replay_runs()?;
+        }
         Ok(())
     }
 
@@ -2008,7 +2039,7 @@ use super::*;
 
         // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
         // resume point must fail.
-        wal.truncate(txn.txn_ids.issued_through()).unwrap();
+        let _ = wal.truncate(txn.txn_ids.issued_through()).unwrap();
         assert!(
             wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
             "the log was not truncated past the open transaction, so this test proves nothing"

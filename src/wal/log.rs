@@ -66,6 +66,22 @@ pub struct WalManager {
     pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
 }
 
+/// What [`WalManager::truncate`] did. D234.
+///
+/// A checkpoint re-appends the retained DDL and run declarations after a truncation, because the
+/// truncation discarded them. When a pin kept the log, nothing was discarded, and re-appending them
+/// only grew the log by every declaration at every checkpoint. So the answer has to reach the
+/// caller, and it cannot be dropped without a warning.
+#[must_use = "a checkpoint re-declares only after a real truncation (D234), so it has to know whether there was one"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// The log was discarded and restarted at its end.
+    Truncated,
+    /// A pin below the end kept the whole log; nothing was discarded. `oldest_pin` is the lowest
+    /// LSN still pinned.
+    Kept { oldest_pin: u64 },
+}
+
 /// A claim on the log from `lsn` onwards. Released on drop.
 ///
 /// This is a minimal **replication slot**. It exists because a base backup taken while the primary
@@ -753,18 +769,20 @@ impl WalManager {
         Ok(buf)
     }
 
-    /// Discard the log and restart it at the current end.
+    /// Discard the log and restart it at the current end, and say whether that happened.
     ///
     /// **A pin below that point cancels the truncation.** This log cannot be truncated part-way —
     /// it is thrown away whole and restarted — so honouring a pin means keeping everything. The
-    /// checkpoint still succeeds; it simply reclaims nothing this time.
+    /// checkpoint still succeeds; it simply reclaims nothing this time, and the answer is
+    /// [`Truncation::Kept`]. D234: a caller that re-appends anything after a truncation has to know
+    /// whether there was one, which is why the answer is `#[must_use]`.
     ///
     /// The cost is the same one PostgreSQL replication slots have: a pin nobody releases makes the
     /// WAL grow without bound. That is a real hazard and it is not guarded here beyond
     /// [`WalManager::min_pinned_lsn`] being available to look at. It is the right trade against the
     /// alternative, which is discarding records a replica has been promised and only finding out
     /// when the replica is refused.
-    pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
+    pub fn truncate(&self, next_txn_id: u64) -> Result<Truncation, FerroError> {
         self.flush()?;
         // Taken first and held across the decision, so a pin cannot be registered against a range
         // this call is in the middle of discarding. `pin_durable` reads the frontier under this
@@ -777,7 +795,7 @@ impl WalManager {
         if let Some(&oldest) = pins.values().min() {
             if oldest < next {
                 // Something still needs records below the new base. Keep the log.
-                return Ok(());
+                return Ok(Truncation::Kept { oldest_pin: oldest });
             }
         }
 
@@ -795,7 +813,7 @@ impl WalManager {
         buffer.bytes.clear();
         buffer.start_lsn = next;
         self.flushed_lsn.store(next, Ordering::SeqCst);
-        Ok(())
+        Ok(Truncation::Truncated)
 
     }
 
