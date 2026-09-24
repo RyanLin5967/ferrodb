@@ -1844,9 +1844,7 @@ impl ArenaPageStore {
     ) -> Result<usize, FerroError> {
         let epoch = crate::cluster::epoch();
         g.quarantine.retain(|q| q.epoch == epoch);
-        for q in &g.quarantine {
-            self.space.give_back(q.start, q.pages);
-        }
+        // MUTANT (fire-check only, never land): a rewrite never lists quarantined ranges free.
         match self.checkpoint_with(&OsFileOps, path) {
             Ok(written) => {
                 g.quarantine.clear();
