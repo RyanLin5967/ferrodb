@@ -178,3 +178,121 @@ AA's row assertion. That is wrong (READ `storage/tuple.rs`):
   `--test adv_f4_false_refusal`.
   - These are the targets that drive ALTER, and the merge path through `plan_alters`.
   - The pre-check refuses only an entry `persist` would itself have refused, so none of them should move.
+
+---
+
+## Amendment 3 — the review's F1, F2 and F4–F7, written BEFORE their code (nothing built)
+
+Source: `artie-research frontier/d249_review.md` @ `13577b1`, verdict SOUND-WITH-CAVEATS: the fix is sound and the
+evidence is weak. These are the lead's decisions. The review's F3 is a new row, D254, on the child branch
+`d254-catalog-persist-bound` with its own PREREG.
+
+### F1 and F6: amendment 1's premise was wrong, and E2 is re-registered
+
+- **Retracted** (append-only): amendment 1's "a ninth column makes the bitmap two bytes; a row rewritten under
+  nine columns is then misread under eight, or refused by `deserialize`". Both halves are false (READ
+  `storage/tuple.rs`):
+  - **Alignment padding hides the extra bitmap byte.** Every INTEGER, value or NULL, is padded to a 4-byte boundary
+    measured from the start of the tuple (`get_padding(4, …)`, `:72`, `:124`, `:180`), after the 24-byte version
+    header (`:9`). Eight columns give 24 + 1 = 25, padded to 28. Nine columns give 24 + 2 = 26, also padded to 28.
+    Every INTEGER sits at the same offset in both layouts, so the eight-column reader reads the nine-column row
+    correctly.
+  - **`deserialize` has no refusal.** It checks no length, and an overrun is a slice panic (`:186`, `:217-218`).
+- **So E2 survives A9, as well as AR and AA.** Before this amendment, no registered test pinned where the refusal
+  happens.
+- **A33** = `a_thirty_third_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten`, additions only.
+  - The setup: `t` with 32 INTEGER columns (`id NOT NULL`, `c1..c31`), holding `(1..=32)`, then
+    `ADD COLUMN <300 bytes> INTEGER`.
+  - It must be refused by name, the catalog must keep 32 columns, `SELECT *` must return exactly `(1..=32)`, and a
+    later CREATE TABLE must succeed.
+  - **The layout arithmetic.** 32 columns give 24 + 4 = 28, with no padding. 33 columns give 24 + 5 = 29, padded to
+    32. So every value moves.
+  - **The premise, asserted without becoming the expected value:** `Tuple::serialize((1..=32) + NULL, 33-column
+    schema)` followed by `.deserialize(32-column schema)` must NOT equal `(1..=32)`. If a future layout change
+    makes the fixture non-discriminating, this fails loudly.
+- **A9 stays**, because it still pins the wedge. Its doc comment repeats the false premise and is corrected
+  (comment only; no assertion moves).
+
+### F2: the index-rename half of the pre-check is unpinned. E4, and test AI
+
+- **E4 `index_renames_not_checked`** deletes `rename_indexed_columns(&mut installed, actions);` from `plan_alters`.
+  It survives AR, AA, A9, A33, U1 and U2.
+  - Wherever a renamed index name exceeds 255 bytes, the same name is already in the schema. The column-name guard
+    (4/8) fires before the index-name guards (6/8, 8/8).
+  - So index renames change the answer only through the size arm.
+- **AI** = `a_rename_that_grows_an_indexed_column_past_a_page_is_refused_by_size`, additions only. The numbers are
+  READ lengths and INFERRED sums, per the review:
+  - **Setup:** `t` with `id`, `v`, and 14 filler INTEGER columns with distinct 255-byte names; `CREATE INDEX` on
+    `v`; then `RENAME COLUMN v TO <255 bytes>`.
+  - **Before the rename** the entry is 23 + 3645 = 3668 bytes. **After it** the entry is 3668 + 254 (schema) + 254
+    (index) = 4176, which is over 4096, so the size arm refuses it as a `Constraint` naming `"t"` and "catalog page".
+  - **The premises**, asserted through `CatalogPage::has_space` on an empty page:
+    - the fully renamed entry does NOT fit;
+    - the entry with only the schema renamed DOES fit (3922). That second premise is what makes the test see E4.
+  - **Then:** the table keeps `v`, its index still covers `v`, and a later CREATE TABLE succeeds.
+  - **Predicted kills:**
+    - E4: the check passes at 3922. The rename-only chain skips the rewrite, `finish` installs, and `persist`
+      cannot place the 4176-byte entry. AI fails at its schema assertion.
+    - E1: the same failure.
+    - E3: `serialize` panics on the oversized entry.
+- **The hazard, bounded.** Under E1 or E4, AI reaches `persist`'s unbounded page loop (D254). So AI's harness
+  calls `dm.reserve_region("test floor", 256, u32::MAX)` before `Catalog::create`, which makes allocation refuse
+  past page 255 instead of filling the disk. AR, AA, A9 and A33 get the same bound, because E1 sends them into the
+  same `persist`.
+  - **Correction.** Under E1 those four do not loop: a 300-byte name refuses in the length guard, which `persist`
+    reaches only after placing the entry. Only an oversized entry loops. They are bounded anyway, as a guard.
+
+### F4: two in-tree comments the fix made false
+
+`plan_alters`' "Every refusal lives in `resulting_schema` … an agent is told at the moment it types the statement
+exactly what it would be told at merge" (`alter.rs:556-559`), and `stage_schema_edit`'s "Validated now … with the
+same rules `Catalog::alter_table` applies" (`agent_sql/runtime.rs:2545-2547`), are both amended to name the
+exception:
+
+- the encoder's check is made at `plan_alters`, which a branch reaches only at MERGE;
+- so a staged rename or column that the catalog cannot encode is refused at merge, before anything is written, not
+  when typed.
+
+The check is NOT moved into staging (the lead's decision). Comments only.
+
+### F5: the size arm's error variant (a record of a decision already in the code)
+
+The fix plan registered U1 as `Err(Unrepresentable { limit: PAGE_SIZE, .. })`. The code (`24c0ead`) and U1 use
+`FerroError::Constraint`. That switch was made without an amendment, and this records it and its reasons:
+
+- `Unrepresentable` is documented as arithmetic on a length field (`error.rs:73-86`), and it explicitly says a
+  page-size limit is not its case.
+- `NotEnoughSpace` is the page-size variant, but it carries no text, so it cannot name the table the operator has
+  to change.
+- `Constraint` carries a message and is what this module already uses for a refusal the user can act on.
+
+### F7: a plan held across a change to its own table
+
+- **The latent state.** `plan_alters` checks a clone of the entry. If a caller held the plan while the same table's
+  entry changed, for example by a CREATE INDEX, `apply_plan` would install renames on an entry nobody checked. No
+  caller does that today, but `apply_plan`'s own comment says "a plan can be held across a statement".
+- **The fix.** `AlterPlan` stores the entry it checked. `apply_plan`, before anything it writes (before
+  `reserve_free_space`), rebuilds that entry from the LIVE one, with the plan's final shape and renames applied. It
+  refuses with a `Constraint` if the result differs from what was checked. This is a staleness check, not a second
+  encoder guard.
+- **ST** = `a_plan_held_across_a_change_to_its_own_table_is_refused`, additions only, red first.
+  - The steps, through the public `Catalog` API: `plan_alters(RENAME COLUMN v TO w)`, then `create_index(t, v)`,
+    then `apply_plan(plan)`.
+  - It must be refused, and the table must keep `v`, with its index on `v`.
+  - **Red at the tip before F7:** `apply_plan` installs the rename, so the refusal assertion fails.
+- **E5 `staleness_check_removed`** deletes the comparison. It fails ST.
+
+### Counts and runs, amended (predicted)
+
+- **New tests:** A33, AI and ST are integration tests in `d249_alter_encodable`, so that target has **6** tests.
+  - ST is red against the tip before F7's code; A33 and AI pass there.
+  - The target's red run R at `d42549f` is unchanged: 3 tests, all red.
+- **Per-target: 2579 + 8 = 2587** (AR, AA, A9, A33, AI, ST, U1, U2). The 2579 was measured on main's tree.
+
+| mutant | fails |
+|---|---|
+| E1 | AR, AA, A9, A33, AI |
+| E2 | **A33 only**, at its row assertion, whose first value reads `16777216` (the review's MODEL) |
+| E3 | U1, and AI (a panic in `serialize`) |
+| E4 | AI |
+| E5 | ST |
