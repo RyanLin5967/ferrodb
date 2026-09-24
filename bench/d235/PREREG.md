@@ -204,3 +204,53 @@ U = `record::d235_parent_entry_holders` (7 tests), R = `branch::catalog::tests::
 | M7 walk ignores incarnations | green | green | RED, log arm, `Q reads as having a live child` | 1 red (recycled slot) | green |
 
 Counts are unchanged: `--test d235_rebuild_keeps_d16_pins` 3 passed; per-target 2589.
+
+---
+
+## Amendment 4 — 2026-09-24, the lead's decisions on review 3 (`frontier/d235_review3.md` @ `0b8ddf8`)
+
+Nothing compiled or run. Review 3 is SOUND-WITH-CAVEATS at `faf45e5`: no behaviour change, no type
+error. The test, the rule and the matrix hold as registered. The record changes:
+
+- **W1: the D201 claim was overstated.** Corrected in the code comments in the next commit:
+  `tests/d235_rebuild_keeps_d16_pins.rs` above `a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant`,
+  and `record::parent_entry_holders`' doc. The reaper-less `seal` fallback (`runtime.rs`,
+  SCALE-LEDGER D201) supplies ONLY the unconditional detach: it never calls `release_id`.
+  - READ here at `faf45e5`: outside test modules the only callers are `reaper.rs:715` (`reap`) and
+    `table_catalog.rs:337` (`migrate_from`). `catalog.rs:697` is the trait forwarding to the
+    inherent method.
+  - Recycling P's slot additionally needs a PRE-D235 rebuild freeing P (the legacy-log route), or a
+    reaper releasing P.
+  - At the tip, a reopen after a fallback detach RE-PINS rather than frees (INFERRED, review 3).
+    `mark_reaped` bumps only `generation`, so P's `branch_id` still matches X's handle. The walk
+    re-derives X's entry under P, and P's slot stays unfree.
+- **W2: the kept-pin assertion is named by its message, not as "over-pin".** In amendment 3's matrix
+  "over-pin" meant the assertion whose message begins `X's entry must stay under P's old slot`. The
+  M5 and M7 failure is ALSO an over-pin (N pins Q), so the label cannot tell the two apart. A runner
+  checking cells against panic text should read the T3 cells as:
+
+  | # | T3 first failure (the panic message after the arm prefix `log reopen: ` or `migration: `) |
+  |---|---|
+  | M1 | `log reopen: X's entry must stay under P's old slot` |
+  | M2 | `log reopen: X's entry must stay under P's old slot` |
+  | M3 | `migration: X's entry must stay under P's old slot` |
+  | M4 | green |
+  | M5 | `migration: Q reads as having a live child` |
+  | M6 | green |
+  | M7 | `log reopen: Q reads as having a live child` |
+  | `9aa6968` src (step a2) | `log reopen: X's entry must stay under P's old slot` |
+  | `6589552` src (step a2) | `log reopen: Q reads as having a live child` |
+
+- **W3: the suite count is only partly derived.** The +10 is READ: `git diff 9aa6968 faf45e5` adds
+  exactly 10 `#[test]` lines, with no `#[ignore]`, no `should_panic` and no macro. That is 3 in the
+  d235 target and 7 in the unit module. **2579 is NOT re-derived**: it is read from FAN-QUEUE rows
+  12–15. So 2589 is conditional on it, and the count is left to the fan run. Quote its result in
+  **per-target** mode, as measured.
+- **N1, recorded so nobody re-derives it (no action; INFERRED, review 3).** The kept pin rarely
+  protects anything in practice.
+  - It never protects N's pages: they are born after X's fork.
+  - It protects old P's pages only if some were still pending at rebuild time. That needs a drain
+    that refused and put them back (the D83/D124 path), because `release_id` needs P's array empty
+    and `reap` drains right after releasing.
+  - Otherwise it is a slot leak until C is reaped. The docstring's "dropping it COULD release a page"
+    stands, and keeping the entry is the leak direction.
