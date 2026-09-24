@@ -1752,7 +1752,7 @@ impl TxnManager {
             // refused before its mutation, like the releases owed elsewhere below. (A DROP whose own
             // persist is the FIRST to fail cannot be refused beforehand: that is `drop_table`'s
             // free-before-persist order, D229's.)
-            if self.catalog_persist_owed() {
+            if false && self.catalog_persist_owed() { // D230 MUTANT M17: no DROP refusal while a persist is owed
                 return Err(FerroError::Wal(
                     "DROP refused: a catalog persist failed and none has succeeded since, so every \
                      checkpoint keeps the log, and a DROP needs its checkpoint to truncate it, or the \
