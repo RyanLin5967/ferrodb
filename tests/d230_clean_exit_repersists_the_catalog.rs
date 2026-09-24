@@ -17,6 +17,9 @@
 //!   flushes the log without truncating it. The next open recovers and rebuilds. (Its injection makes
 //!   the read-back unreadable too, so it reaches the branch that names every in-memory root; the
 //!   comparison branch is pinned by the lib unit test. D230 review 3, F7.)
+//! - **F2** (on the #16 resolution only, where `open_recovered` exists): a failed persist, then the
+//!   AUTOMATIC checkpoint, then no exit at all. While a persist is owed every checkpoint keeps the
+//!   log, so the next open rebuilds. Red at `0ba2295`, before the debt existed.
 //!
 //! # How the persist is made to fail
 //!
@@ -55,9 +58,10 @@ use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::index::BPlusTreeManager;
-use ferrodb::storage::index_page::BPlusTreePage;
+use ferrodb::storage::db_lock::DbLock;
+use ferrodb::storage::index_page::{BPlusTreePage, BPLUS_INTERNAL_TYPE};
 use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::{rebuild_indexes, recover};
+use ferrodb::wal::recovery::{open_recovered, rebuild_indexes, recover, OpenedDatabase};
 use ferrodb::wal::txn::TxnManager;
 
 /// Rows before the split: the primary's single leaf is one entry short of full.
@@ -228,10 +232,18 @@ fn assert_record_is_the_root(d: &Db) {
 /// Phases A and B: `t` with 369 rows, then one restart so the log A's DDL left is rebuilt from and
 /// the next open finds it empty.
 fn built_then_restarted(dir: &Path) {
+    built_then_restarted_with(dir, &[]);
+}
+
+/// [`built_then_restarted`], with `extra` statements run in A after `t` is filled.
+fn built_then_restarted_with(dir: &Path, extra: &[&str]) {
     let (mut a, _) = open(dir);
     a.sql("CREATE TABLE t (id INTEGER NOT NULL);");
     for i in 1..=FULL_LESS_ONE {
         a.sql(&format!("INSERT INTO t VALUES ({i});"));
+    }
+    for stmt in extra {
+        a.sql(stmt);
     }
     a.txn.checkpoint().expect("A's exit");
     drop(a);
@@ -355,6 +367,72 @@ fn a_clean_exit_that_cannot_persist_the_catalog_fails_loudly_and_leaves_the_log_
     // A second, clean restart before looking: the rebuilding open's shared cells were seeded before
     // its rebuild ran (D205, fixed on other lanes), and this test is about the log, not about that.
     exit_cleanly(d);
+    let mut e = open_without_rebuild(dir.path(), "E");
+    assert_right_key_found(&mut e);
+    assert_record_is_the_root(&e);
+}
+
+/// Open `dir`'s database as production does, through `open_recovered`, which gives the catalog the
+/// transaction manager's persist debt (F2). The lock must outlive the handles.
+fn open_as_production(dir: &Path) -> (Db, bool, DbLock) {
+    let path = dir.join("d230x.db");
+    let lock = DbLock::acquire(&path).expect("take the database lock");
+    let OpenedDatabase { bp, wal: _, txn, catalog, recovered } = open_recovered(&path, &lock).expect("open_recovered");
+    (Db { catalog, bp, txn, session: Session::new() }, recovered, lock)
+}
+
+/// Whether `page` holds a B+tree internal node ON DISK. A split's new root is written to disk as a
+/// zero page by `new_page` and lives in the pool after that, so this turns true when a checkpoint's
+/// flush writes it.
+fn on_disk_internal(bp: &Arc<BufferPoolManager>, page: u32) -> bool {
+    bp.disk_manager.read(page).expect("read a page from the disk")[0] == BPLUS_INTERNAL_TYPE
+}
+
+/// **F2 (D230 review 3, the lead's decision): a failed persist, then the AUTOMATIC checkpoint, then
+/// no clean exit at all.**
+///
+/// The exit's own persist cannot help here, because the process never reaches it (a kill, a panic,
+/// or pgserver, which has no reachable exit). What must hold instead: while a persist is owed,
+/// every checkpoint keeps the log, so the next open recovers and rebuilds every index from the heap
+/// rather than reading the stale catalog page.
+///
+/// - **A/B:** T4's, plus `u (k, v)` with one row, for commits that move no root.
+/// - **C:** opened as production opens, so the catalog carries the debt. Row 370 splits `t`'s root
+///   while every persist fails (T4's injection), then the fault clears. Same-width UPDATEs of `u`
+///   commit, and move no root, so nothing persists again, until the automatic checkpoint has
+///   flushed the split. Then the process drops.
+/// - **D:** opened as production opens, then a clean exit. As T5, the lookup waits for one more
+///   restart: a recovering open seeds its cells before its rebuild (D205).
+/// - **E:** `id = 369` cold. At `0ba2295` the automatic checkpoint truncated the log over the stale
+///   page, D did not rebuild, and E answers rows 186..=369.
+#[test]
+fn an_automatic_checkpoint_after_a_failed_persist_keeps_the_log_so_the_next_open_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    built_then_restarted_with(
+        dir.path(),
+        &["CREATE TABLE u (k INTEGER NOT NULL, v INTEGER);", "INSERT INTO u VALUES (1, 0);"],
+    );
+
+    let (mut c, recovered, lock) = open_as_production(dir.path());
+    assert!(!recovered, "premise failed: C's open found a log to replay, so it rebuilt and nothing is stale");
+    let (page_one, root_now) = split_the_root_with_persist_failing(&mut c);
+    c.catalog.first_catalog_page_id = page_one; // the fault clears; nothing below moves a root
+    assert!(
+        !on_disk_internal(&c.bp, root_now),
+        "premise failed: the new root reached the disk before any checkpoint"
+    );
+    let mut commits = 0;
+    while !on_disk_internal(&c.bp, root_now) {
+        commits += 1;
+        assert!(commits <= 10_000, "premise failed: {commits} commits and no automatic checkpoint flushed the split");
+        c.sql("UPDATE u SET v = 1 WHERE k = 1;");
+    }
+    drop(c);
+    drop(lock); // no exit at all
+
+    let (d, _, lock) = open_as_production(dir.path());
+    exit_cleanly(d);
+    drop(lock);
     let mut e = open_without_rebuild(dir.path(), "E");
     assert_right_key_found(&mut e);
     assert_record_is_the_root(&e);
