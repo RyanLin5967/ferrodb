@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # bench/d219/run.sh — the D219 FAN-QUEUE row, steps (a)–(d), in order. The BEFORE curve is first.
+# Revised for the whole exit (one provenance sync per MERGE, physical stamps included).
 #
 # ⛔ FAN WORK. It builds and runs a benchmark. Run it only when the lead releases the D219 row from
 # frontier/FAN-QUEUE.md, and only under the suite lock:
@@ -18,8 +19,9 @@ WT=/Users/idide/wt/ferrodb-d219-provenance-sync.noindex
 FIRE=/Users/idide/wt/ferrodb-d219-fire.noindex
 OUT=$WT/bench/d219
 BASE=9aa6968     # main when the lane was cut
-HARNESS=3b9a39e  # instrument + red test + harness, NO fix: the BEFORE tree
-FIX=871846a      # the fix
+HARNESS=3b9a39e  # instrument + first red test + harness, NO fix: the BEFORE tree
+ROWONLY=bf10eec  # row authorship batched (871846a) + the whole-exit red test, stamps NOT batched
+FIX=39fd5a5      # the whole fix (86e1762) + the harness's model labels
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -55,6 +57,11 @@ step a_curve_before_$HARNESS timeout 7200 "$WT/target/d219_before_bin"
 step b_red_$HARNESS timeout 3600 cargo test --test "$T"
 step b_instrument_$HARNESS timeout 3600 cargo test --lib provenance::durable::tests::the_sync_counter_fires_once_per_append_by_kind_and_not_for_a_failed_one
 step b_lib_list_$HARNESS timeout 3600 cargo test --lib provenance:: -- --list
+
+# ---- (b2) the whole-exit red test, on the row-only tree ------------------------------------------
+git -C "$FIRE" checkout --detach -q "$ROWONLY" || exit 3
+step b2_red_$ROWONLY timeout 3600 cargo test --test "$T"
+step b2_lib_list_$ROWONLY timeout 3600 cargo test --lib provenance:: -- --list
 
 # ---- (c) AFTER: the fix --------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -q "$FIX" || exit 3
@@ -92,6 +99,14 @@ mutant M5_ignore_the_memory_refusal provenance::durable::tests::a_batch_naming_a
 mutant M6_empty_batch_is_a_write provenance::durable::tests::an_empty_batch_is_not_a_write
 mutant M7_no_interned_guard provenance::store::tests::a_batch_of_rows_is_refused_whole_or_applied_whole
 mutant M8_counter_books_the_wrong_kind provenance::durable::tests::the_sync_counter_fires_once_per_append_by_kind_and_not_for_a_failed_one INTEGRATION
+mutant M9_publish_stamps_eager INTEGRATION
+mutant M10_rewrite_stamps_eager INTEGRATION
+mutant M11_no_explicit_flush INTEGRATION provenance::
+mutant M12_pending_written_last provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
+mutant M13_pending_ignores_the_refusal provenance::deferred::tests::the_stamper_refuses_at_the_stamp_and_queues_nothing_it_refused
+mutant M14_guard_drop_does_not_flush provenance::deferred::tests::a_guard_dropped_without_a_flush_still_writes_its_stamps
+mutant M15_store_drop_does_not_flush provenance::durable::tests::a_store_dropped_with_pending_stamps_writes_them
+mutant M16_pending_never_cleared provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"

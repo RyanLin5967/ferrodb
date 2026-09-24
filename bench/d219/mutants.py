@@ -9,14 +9,17 @@
 A mutant whose pattern matches zero or several sites is REFUSED, never applied: a pattern that
 silently matched nothing would report every test "surviving" a mutation that never happened.
 
-M4 is the one mutant pre-registered to SURVIVE: syncing before the write is invisible to every test
-here, because nothing fault-injects the file underneath the store. It is run so the blind spot is
-measured rather than asserted.
+Two mutants are pre-registered to SURVIVE, and are run so each blind spot is measured rather than
+asserted:
+  M4  syncing before the write is invisible to every test here: nothing fault-injects the file.
+  M11 the explicit flush after record_applied only REPORTS a flush failure; the guard's Drop still
+      makes the stamps durable before the MERGE returns, and no test can make a flush fail.
 """
 import subprocess
 import sys
 
 DURABLE = "src/provenance/durable.rs"
+DEFERRED = "src/provenance/deferred.rs"
 STORE = "src/provenance/store.rs"
 RUNTIME = "src/agent_sql/runtime.rs"
 
@@ -24,8 +27,8 @@ MUTANTS = {
     # One sync per record again: the batch is appended body by body.
     "M1_sync_per_record": (
         DURABLE,
-        "        if let Err(e) = self.append_all_locked(&file, &bodies) {\n",
-        "        if let Err(e) = bodies.iter().try_for_each(|b| self.append_locked(&file, b)) {\n",
+        "        if let Err(e) = self.append_all_locked(&mut file, &bodies, &self.syncs.row_authors) {\n",
+        "        if let Err(e) = bodies.iter().try_for_each(|b| self.append_locked(&mut file, b, &self.syncs.row_authors)) {\n",
     ),
     # A batch that deduplicates: one sync, but a different file (a two-column update's second
     # record is gone).
@@ -43,13 +46,15 @@ MUTANTS = {
     # Sync issued BEFORE the write it is meant to cover. Pre-registered SURVIVOR (see docstring).
     "M4_sync_before_write": (
         DURABLE,
-        "        pwrite_all(file, &frames, end)\n"
+        "        pwrite_all(&out.file, &frames, end)\n"
         "            .map_err(|e| FerroError::Provenance(format!(\"append to {}: {e}\", self.path.display())))?;\n"
-        "        file.sync_data()\n"
+        "        out.file\n"
+        "            .sync_data()\n"
         "            .map_err(|e| FerroError::Provenance(e.to_string()))?;\n",
-        "        file.sync_data()\n"
+        "        out.file\n"
+        "            .sync_data()\n"
         "            .map_err(|e| FerroError::Provenance(e.to_string()))?;\n"
-        "        pwrite_all(file, &frames, end)\n"
+        "        pwrite_all(&out.file, &frames, end)\n"
         "            .map_err(|e| FerroError::Provenance(format!(\"append to {}: {e}\", self.path.display())))?;\n",
     ),
     # The in-memory refusal ignored, so a batch naming an uninterned run reaches the file.
@@ -79,8 +84,57 @@ MUTANTS = {
     # The instrument miscounts: row-authorship syncs booked as physical stamps.
     "M8_counter_books_the_wrong_kind": (
         DURABLE,
-        "            Some(TAG_ROW_AUTHOR) => Ok(&self.row_authors),\n",
-        "            Some(TAG_ROW_AUTHOR) => Ok(&self.stamps),\n",
+        "        if let Err(e) = self.append_all_locked(&mut file, &bodies, &self.syncs.row_authors) {\n",
+        "        if let Err(e) = self.append_all_locked(&mut file, &bodies, &self.syncs.stamps) {\n",
+    ),
+    # ---- the whole-exit fix (86e1762) ------------------------------------------------------------
+    # The publish loop stamps through the eager store again: one sync per published version.
+    "M9_publish_stamps_eager": (
+        RUNTIME,
+        "            let author = Some((Arc::clone(&prov), snapshot.prov));\n",
+        "            let author = Some((Arc::clone(self.provenance()), snapshot.prov));\n",
+    ),
+    # The ALTER rewrite stamps through the eager store again: one sync per moved row.
+    "M10_rewrite_stamps_eager": (
+        RUNTIME,
+        "                .plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))\n",
+        "                .plan_alters(&report.table, &actions, &ctx.txn, Some(self.provenance()))\n",
+    ),
+    # No explicit flush after record_applied. Pre-registered SURVIVOR (see docstring).
+    "M11_no_explicit_flush": (
+        RUNTIME,
+        "        provenance.flush()?;\n",
+        "",
+    ),
+    # Pending records written AFTER the caller's, so file order is no longer index order.
+    "M12_pending_written_last": (
+        DURABLE,
+        "            out.pending.iter().map(Vec::as_slice).chain(bodies.iter().copied()).collect();\n",
+        "            bodies.iter().copied().chain(out.pending.iter().map(Vec::as_slice)).collect();\n",
+    ),
+    # A pending stamp queued even when the index refused it.
+    "M13_pending_ignores_the_refusal": (
+        DURABLE,
+        "        self.mem.stamp(rid, id)?;\n        file.pending.push(stamp_body(rid, id));\n",
+        "        let _ = self.mem.stamp(rid, id);\n        file.pending.push(stamp_body(rid, id));\n",
+    ),
+    # The guard's Drop does not write: an early exit leaves stamps in the index and not the file.
+    "M14_guard_drop_does_not_flush": (
+        DEFERRED,
+        "            let _ = self.store.flush();\n",
+        "",
+    ),
+    # The store's Drop does not write its pending stamps.
+    "M15_store_drop_does_not_flush": (
+        DURABLE,
+        "            let _ = self.flush();\n",
+        "",
+    ),
+    # Pending records never cleared: every later append writes them again.
+    "M16_pending_never_cleared": (
+        DURABLE,
+        "        out.pending.clear();\n",
+        "",
     ),
 }
 
