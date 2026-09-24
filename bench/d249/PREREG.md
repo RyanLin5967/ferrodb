@@ -145,3 +145,36 @@ AA's row assertion. That is wrong (READ `storage/tuple.rs`):
 | E3 `oversize_arm_removed` | U1 |
 
 **Per-target, amended: 2579 + 5 = 2584** (AR, AA, A9, U1, U2).
+
+---
+
+## Amendment 2 — the fix, tests and mutants recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `baa1d3c` | red tests AR, AA (additions only, `175 0`) |
+| `ab53915` | this PREREG |
+| `d42549f` | red test A9 (additions only, `47 0`) |
+| `7d72862` | amendment 1 |
+| `24c0ead` | **the fix**: `catalog_page::refuse_unless_encodable`, called from `Catalog::plan_alters` on the entry `finish` will install; `rename_indexed_columns` extracted from `apply_plan` |
+| `76d2c36` | unit tests U1, U2 (additions only) |
+| `44f67db` | mutants E1–E3, cut from `76d2c36` by `bench/d249/make_mutants.py`, each passing `git apply --check` |
+
+- **Removed code lines, in `git diff 9aa6968 44f67db -- src/ tests/`:** only the rename loop that `apply_plan` held
+  inline. It now lives in `rename_indexed_columns`, with the same two lists in the same chain order, called by
+  `apply_plan` under the same "any rename?" condition, so `apply_plan` still fetches the entry only when there is a
+  rename. No test line is removed.
+- **Counts:** `git diff 9aa6968 44f67db | grep -cE '^\+[[:space:]]*#\[test\]'` = **5**, and 0 are removed. Those
+  are AR, AA and A9 in the new target `d249_alter_encodable`, and U1 and U2 in the lib. No test is `cfg`-gated.
+  **Per-target: 2579 + 5 = 2584** (2579 measured on main's tree).
+- **Run G (predicted):** `--test d249_alter_encodable` 3 passed. `--lib catalog::catalog_page::tests::`: every test
+  passes, U1 and U2 included.
+- **Mutant commands:**
+  - E1 and E2 on `--test d249_alter_encodable`: E1 fails AR, AA and A9; E2 fails A9 only.
+  - E3 on `--lib catalog::catalog_page::tests::`: it fails U1, through a panic in `serialize`.
+- **Collateral (every test must pass):** `--lib catalog::`; then `--test d141_long_identifier`,
+  `--test integration_alter_column`, `--test integration_alter_refusal_paths`,
+  `--test integration_alter_refusal_safety`, `--test integration_merge_ddl_atomicity`, `--test adversarial_i20` and
+  `--test adv_f4_false_refusal`.
+  - These are the targets that drive ALTER, and the merge path through `plan_alters`.
+  - The pre-check refuses only an entry `persist` would itself have refused, so none of them should move.
