@@ -397,7 +397,7 @@ mod tests {
     // ---- D213: space an uncommitted transaction freed is not reusable until it commits.
 
     use crate::error::FerroError;
-    use crate::storage::heap_page::{RETIRED, SLOT_ENTRY_SIZE};
+    use crate::storage::heap_page::RETIRED;
     use crate::storage::tuple::Tuple;
 
     /// A page holding one tuple per entry of `lens`, the i-th being `lens[i]` bytes of `i + 1`. The
@@ -417,6 +417,11 @@ mod tests {
     }
 
     /// Free bytes between the slot array and the lowest occupied offset: what an insert can use.
+    ///
+    /// The expected values below are LITERALS, not this function applied to an earlier page, so a
+    /// uniform error in `get_free_space_end`/`get_free_space_start` cannot cancel out (the
+    /// adversary's F5). `page_with(&[100, 50])`: the slot array ends at 23 + 2 * 4 = 31, and the
+    /// lowest tuple starts at 4096 - 150 = 3946, so 3915 bytes are free.
     fn room(page: &Page) -> usize {
         page.get_free_space_end() as usize - page.get_free_space_start() as usize
     }
@@ -424,7 +429,7 @@ mod tests {
     #[test]
     fn a_shrink_keeps_the_slots_capacity_so_growing_back_is_in_place() {
         let mut page = page_with(&[100, 50]);
-        let before = room(&page);
+        assert_eq!(room(&page), 3915, "premise: the fixture's free space");
         page.update(0, Tuple::new(vec![9; 30])).unwrap();
         let mut page = round_trip(&page);
         assert_eq!(page.slot_arr[0].length, 100, "the shrink gave up the slot's capacity");
@@ -435,7 +440,7 @@ mod tests {
         let offset = page.slot_arr[0].offset;
         page.update(0, Tuple::new(vec![1; 100])).unwrap();
         assert_eq!(page.slot_arr[0].offset, offset, "growing back within the capacity moved the tuple");
-        assert_eq!(room(&page), before, "growing back within the capacity used free space");
+        assert_eq!(room(&page), 3915, "growing back within the capacity used free space");
         assert_eq!(page.read(0).unwrap().data, vec![1; 100]);
     }
 
@@ -444,15 +449,14 @@ mod tests {
         // Slot 1 is the LOWEST tuple: the case where a plain delete freed its bytes at the next
         // serialise, so another transaction could take them before the rollback.
         let mut page = page_with(&[100, 50]);
-        let before = room(&page);
         let old = page.read(1).unwrap().data;
         page.retire(1).unwrap();
         let mut page = round_trip(&page);
         assert!(matches!(page.read(1), Err(FerroError::SlotDeleted)), "a retired slot is readable");
-        assert_eq!(room(&page), before, "retiring the lowest tuple freed its bytes before its transaction committed");
+        assert_eq!(room(&page), 3915, "retiring the lowest tuple freed its bytes before its transaction committed");
 
-        // Other transactions fill every free byte, as they may.
-        let fill = room(&page) - SLOT_ENTRY_SIZE;
+        // Other transactions fill every free byte, as they may: 3915 less a 4 B slot.
+        let fill = 3911;
         page.insert(Tuple::new(vec![7; fill])).unwrap();
         let mut page = round_trip(&page);
         assert_eq!(room(&page), 0, "premise: the page is not full");
@@ -467,13 +471,13 @@ mod tests {
     #[test]
     fn releasing_a_retired_slot_frees_its_bytes() {
         let mut page = page_with(&[100, 50]);
-        let before = room(&page);
         page.retire(1).unwrap();
         let mut page = round_trip(&page);
         page.release(1).unwrap();
         let page = round_trip(&page);
         assert!(page.slot_arr[1].is_free(), "the released slot is not free");
-        assert_eq!(room(&page), before + 50, "releasing the lowest retired tuple did not free its bytes");
+        // The lowest tuple is now the 100 B one, at 4096 - 100 = 3996: 3996 - 31 = 3965.
+        assert_eq!(room(&page), 3965, "releasing the lowest retired tuple did not free its 50 bytes");
         assert_eq!(page.read(0).unwrap().data, vec![1; 100], "the release damaged the other tuple");
     }
 
@@ -485,7 +489,8 @@ mod tests {
         let old = page.read(0).unwrap().data;
         page.delete(0).unwrap();
         let mut page = round_trip(&page);
-        let fill = room(&page) - SLOT_ENTRY_SIZE - 10;
+        // Freeing the TOP tuple frees no room: still 3915. Leave exactly 10 B: 3915 - 4 - 10.
+        let fill = 3901;
         page.insert(Tuple::new(vec![7; fill])).unwrap();
         let mut page = round_trip(&page);
         assert_eq!(room(&page), 10, "premise: the page does not have exactly 10 B free");

@@ -18,6 +18,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         return Ok(false);
     }
 
+    // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
+    // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
+    let legacy = wal.is_legacy();
     let mut max_txn = 0u64;
     let mut last_lsn = HashMap::new();
     // The earliest record each transaction still has in the retained log. For a loser this is its
@@ -36,7 +39,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         last_lsn.insert(rec.txn_id, rec.lsn);
         first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
         match &rec.kind {
-            RecKind::HeapDelete { dir_root, page_id, slot, .. } => {
+            RecKind::HeapDelete { dir_root, page_id, slot, .. } if !legacy => {
                 owed.entry(rec.txn_id).or_default().push(RetiredSlot { dir_root: *dir_root, page_id: *page_id, slot: *slot });
             }
             RecKind::HeapRelease { page_id, slot, .. } => {
@@ -98,7 +101,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         match &rec.kind {
             RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
             | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
-                redo_one(bp, rec.lsn, &rec.kind)?;
+                redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
             }
             _ => {}
         }
@@ -126,20 +129,6 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         txn.abort(id)?;
     }
 
-    // D213: finish the releases a crash cut off. A committed transaction's retired slots are freed
-    // by `HeapRelease` records written after its `Commit`, and those wait in the log buffer for the
-    // next flush. A crash in between leaves the slots retired, and nothing else would ever free
-    // them. Before the directory repair below, so the directory counts the freed bytes. Ascending
-    // id, for the reason the losers are sorted.
-    let mut owed: Vec<(u64, Vec<RetiredSlot>)> = owed
-        .into_iter()
-        .filter(|(id, slots)| committed.contains(id) && !slots.is_empty())
-        .collect();
-    owed.sort_unstable_by_key(|(id, _)| *id);
-    for (id, slots) in owed {
-        txn.finish_releases(id, last_lsn[&id], first_lsn[&id], &slots);
-    }
-
     // repair directory
     for (dir_root, page_id) in &touched {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
@@ -155,6 +144,24 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             Err(e) => return Err(e)
         }
     }
+
+    // D213: finish the releases a crash cut off. A committed transaction's retired slots are freed
+    // by `HeapRelease` records written after its `Commit`, and those wait in the log buffer for the
+    // next flush. A crash in between leaves the slots retired, and nothing else would ever free
+    // them. AFTER the directory repair (the adversary's F3): the directory is not logged, so a page
+    // added since the last checkpoint is listed only once the repair has run, and each release
+    // tells the directory its page's new free space. Before it, that update found no entry and was
+    // counted and printed as a failed release. Ascending id, for the reason the losers are sorted.
+    // A release that fails here waits in the pending list, and the checkpoint `open_recovered` would
+    // run is skipped, so the log keeps the record of it (F2).
+    let mut owed: Vec<(u64, Vec<RetiredSlot>)> = owed
+        .into_iter()
+        .filter(|(id, slots)| committed.contains(id) && !slots.is_empty())
+        .collect();
+    owed.sort_unstable_by_key(|(id, _)| *id);
+    for (id, slots) in owed {
+        txn.finish_releases(id, &slots);
+    }
     Ok(true)
 }
 
@@ -167,11 +174,21 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
 ///
 /// `kind` is the record as logged. A `Clr` is passed WHOLE, not unwrapped: a `HeapDelete` inside a
 /// CLR frees its slot, while the same record outside one retires it (D213).
+///
+/// **A replica applies with version-3 meaning** (`wal::log::VERSION`). A primary on this binary
+/// never ships a version-2 record: it replays and upgrades an older log before any transaction
+/// runs, and the upgrade truncates the older records away. A replica on this binary fed by a
+/// primary BEFORE D213 is a mixed-build pair. That primary's forward deletes free, while this
+/// replica retires them. The first later insert into those bytes is refused here and the batch
+/// fails, so the pair stops rather than diverging silently. The handshake does not refuse the
+/// pair: that needs `REPL_VERSION` bumped, which is a lead decision (lane §19).
 pub fn apply_redo(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
-    redo_one(bp, lsn, kind)
+    redo_one(bp, lsn, kind, true)
 }
 
-fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
+/// `retire_forward_deletes` is false only for a log written before D213 (`WalManager::is_legacy`),
+/// where a forward `HeapDelete` freed its slot at once.
+fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forward_deletes: bool) -> Result<(), FerroError> {
     // A CLR is redone as the record it carries, with one difference that is the CLR's own. Its
     // `HeapDelete` undoes an insert, so it FREES the slot. A forward `HeapDelete` RETIRES it, as the
     // delete did when it ran: its transaction may still roll back, and if it committed, a
@@ -201,6 +218,7 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
     }
     match op {
         RecKind::HeapDelete { slot, ..} if compensation => page.delete(*slot as usize)?,
+        RecKind::HeapDelete { slot, ..} if !retire_forward_deletes => page.delete(*slot as usize)?,
         RecKind::HeapDelete { slot, ..} => page.retire(*slot as usize)?,
         RecKind::HeapRelease { slot, .. } => page.release(*slot as usize)?,
         RecKind::HeapInsert { slot, tuple, ..} => {
@@ -455,17 +473,35 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
     let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
     let stale = marker.exists();
+    // F1: a log written before D213 has just been replayed with its own meaning. The checkpoint
+    // rewrites it as version 3, and no transaction may run before that (`WalManager::append` refuses
+    // one), so it runs even for such a log with nothing in it.
+    let legacy = wal.is_legacy();
     if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
-        if stale {
-            if let Err(e) = std::fs::remove_file(&marker) {
-                use std::io::Write;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
-                    marker.display()
-                );
+    }
+    if recovered || stale || legacy {
+        use std::io::Write;
+        // F2: a release that recovery could not finish is still owed, and the log is the only record
+        // of it. So the checkpoint, which would truncate the log, is skipped: the database opens,
+        // the release waits in the pending list, and the next checkpoint or open retries it.
+        let pending = txn.retry_pending_releases();
+        if pending > 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: {pending} release(s) owed by committed transactions could not be finished; \
+                 the log is kept, not checkpointed, and the next checkpoint or open retries them"
+            );
+        } else {
+            txn.checkpoint()?;
+            if stale {
+                if let Err(e) = std::fs::remove_file(&marker) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
+                        marker.display()
+                    );
+                }
             }
         }
     }

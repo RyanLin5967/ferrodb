@@ -201,18 +201,30 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
         // transaction's rollback had begun (`TxnManager::commit`), or a ROLLBACK whose undo had no
         // room, then left the transaction open in the ATT and forgotten by the only session that could
         // finish it: its rows held, every checkpoint refused, and no ROLLBACK able to reach it.
+        //
+        // **F4(ii) (the adversary on `115f0b7`): and it lets go once the transaction HAS ended,
+        // whatever the call returned.** A COMMIT can fail after `TxnEnd`, in the automatic
+        // checkpoint. Keeping the id then wedged the session: ROLLBACK found no transaction, BEGIN
+        // found one, and every statement failed. The test is the ATT itself (`TxnManager::is_open`),
+        // not the error's wording.
         Stmt::Commit => match session.current {
             Some(id) => {
-                txn.commit(id)?;
-                session.current = None;
+                let committed = txn.commit(id);
+                if committed.is_ok() || !txn.is_open(id) {
+                    session.current = None;
+                }
+                committed?;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
         }
         Stmt::Rollback => match session.current {
             Some(id) => {
-                txn.abort(id)?;
-                session.current = None;
+                let aborted = txn.abort(id);
+                if aborted.is_ok() || !txn.is_open(id) {
+                    session.current = None;
+                }
+                aborted?;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
