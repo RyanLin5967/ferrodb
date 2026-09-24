@@ -953,21 +953,26 @@ pub struct DiffCost {
 ///   `[h, s)`, and is popped otherwise. A pin taken later is at or above every `begin_ts` already
 ///   published, so if nobody reads `h` now, nobody ever will. The one pin that does not start
 ///   there is a child's, and the child inherits a value that is already live.
-/// * **When ANY pin value leaves** (`drop_pin` takes its count to 0), the entries that can have
-///   lost their last reader are exactly those with `h` in `(a, p]`, where `a` is the next lower
-///   live pin. An entry with `h ≤ a` still contains `a`. That range is queued in `pending` and
-///   swept, re-testing each entry locally with `pins.range(h..s)`. The local test is exact whatever
-///   pins came and went in between.
+/// * **Each kept entry is filed under its HIGHEST live reader**, the largest pin in `[h, s)`
+///   (`by_reader`, Amendment 14). When that pin value leaves (`drop_pin` takes its count to 0),
+///   its bucket is swept. With `a` the next lower live pin, an entry with `a ≥ h` is still read by
+///   `a` and is handed down to `a`'s bucket in O(log n). Any other entry has no reader left and is
+///   freed. That frees exactly the rectangle `(a, p] × (p, b]`, where `b` is the next higher live
+///   pin.
+///
+///   A departure never touches an entry whose highest reader is another pin, so it never re-tests
+///   what a higher pin reads. Review 6 found that the strip queue this replaced did exactly that:
+///   `(a, p]` restarted at 0 under oldest-first turnover and starved.
+///
+/// Arrivals touch no bucket. A new pin is at or above every recorded `s`, so it lies in no kept
+/// entry's `[h, s)`. An inherited pin copies a value that is already live.
 ///
 /// The bound is independent of merges: per row, the newest entry, plus one entry per distinct live
 /// pin value that reads an older version, plus garbage kept below half the row (see `garbage`).
-/// Entries still waiting in `pending` are over that. ⚠ The queue is NOT guaranteed to drain (review
-/// 6, E). When the lowest live pin departs, its interval `(0, p]` swallows the queue's partly swept
-/// front, and re-tests entries a higher pin still reads. Under oldest-first turnover that can
-/// starve the entries behind them. Amendment 13 registers the replacement, which queues each
-/// departure's own entries by their highest live reader.
+/// Entries in the buckets of departed pins still in `pending` are over that. Each unit of sweep
+/// work processes one such entry, so the queue drains at the budgets' rate and never restarts.
 ///
-/// All four fields are derived from `workspaces` and `version_history`, and they change only
+/// All six fields are derived from `workspaces` and `version_history`, and they change only
 /// through `State`'s own methods. None holds per-branch state that a statement can write.
 #[derive(Default)]
 struct HistoryRetention {
@@ -986,10 +991,12 @@ struct HistoryRetention {
     /// Every retained non-newest entry, keyed by its value `h`: `h -> (tbl, row, s)`, where `s` is
     /// the version that superseded it. The key is unique: every applied op gets its own seq.
     ///
-    /// Invariant: each entry has a live pin in `[h, s)`, or lies in a `pending` interval that has
-    /// not been swept yet. This index is what lets a departure find the entries it may have
-    /// orphaned without scanning every row.
+    /// Invariant: each entry sits in exactly one bucket of `by_reader`. That bucket is its highest
+    /// live reader's, or a departed pin's still queued in `pending`.
     readers: BTreeMap<u64, (u32, u64, u64)>,
+    /// `(pin, h)`: entry `h` filed under its highest live reader `pin` (Amendment 14). A departure
+    /// of `pin` finds its own entries by a range probe on this key, and nothing else.
+    by_reader: BTreeSet<(u64, u64)>,
     /// Per row, how many entries still sit in its `Vec` although they have left `readers`.
     ///
     /// Taking an entry out of the middle of a row one at a time would cost O(len) per removal,
@@ -1000,13 +1007,16 @@ struct HistoryRetention {
     /// A garbage entry never changes a live pin's answer. The newest version at or below a live pin
     /// is always retained, and nothing retained lies between it and the pin.
     garbage: std::collections::HashMap<(u32, u64), u32>,
-    /// Intervals `(lo, hi]` of `readers` keys still to be re-tested, disjoint, keyed by `lo`.
+    /// Departed pins whose buckets still hold entries. A pin enters when it departs with a
+    /// non-empty bucket, and leaves in the same step that empties that bucket.
     ///
-    /// A departure adds `(a, p]` and sweeps at most `DEPARTURE_SWEEP_BUDGET` entries. Every publish
-    /// sweeps `PUBLISH_SWEEP_BUDGET` more. So the work under the state lock is bounded per
-    /// operation, however many entries the departing pin read. With no publish and no departure,
-    /// what is queued waits.
-    pending: BTreeMap<u64, u64>,
+    /// A departure sweeps at most `DEPARTURE_SWEEP_BUDGET` entries, and every publish sweeps
+    /// `PUBLISH_SWEEP_BUDGET` more. So the work under the state lock is bounded per operation, however
+    /// many entries the departing pin read. With no publish and no departure, what is queued waits.
+    pending: BTreeSet<u64>,
+    /// Bucket entries a sweep has processed, freed or handed down, since the state was built. It
+    /// is the instrument that shows each departure touching only the entries it read highest.
+    visits: u64,
 }
 
 /// Entries one pin departure may re-test while it holds the state lock (Amendment 10, decision 3).
@@ -1297,10 +1307,14 @@ impl State {
             Some(newest) if newest < v.begin_ts => {
                 // `v` supersedes `newest`. The live pins in `[newest, v)` read it; any other pin,
                 // and every pin taken from now on, reads something else.
-                if pins.range(newest..v.begin_ts).next().is_some() {
-                    self.retention.readers.insert(newest, (key.0, key.1, v.begin_ts));
-                } else {
-                    history.pop();
+                match pins.range(newest..v.begin_ts).next_back() {
+                    Some((&top, _)) => {
+                        self.retention.readers.insert(newest, (key.0, key.1, v.begin_ts));
+                        self.retention.by_reader.insert((top, newest));
+                    }
+                    None => {
+                        history.pop();
+                    }
                 }
                 history.push(v.begin_ts);
                 release_spare(history);
@@ -1312,10 +1326,12 @@ impl State {
                 if history.get(at) != Some(&v.begin_ts) {
                     history.insert(at, v.begin_ts);
                     if let Some(&next) = history.get(at + 1) {
-                        if pins.range(v.begin_ts..next).next().is_some() {
-                            self.retention.readers.insert(v.begin_ts, (key.0, key.1, next));
-                        } else {
-                            out_of_order_garbage = true;
+                        match pins.range(v.begin_ts..next).next_back() {
+                            Some((&top, _)) => {
+                                self.retention.readers.insert(v.begin_ts, (key.0, key.1, next));
+                                self.retention.by_reader.insert((top, v.begin_ts));
+                            }
+                            None => out_of_order_garbage = true,
                         }
                     }
                 }
@@ -1328,63 +1344,56 @@ impl State {
         self.sweep_pending(PUBLISH_SWEEP_BUDGET);
     }
 
-    /// **Amendment 10, decision 1 — a pin value has left** (its count reached 0). The entries that
-    /// can have lost their last reader have `h` in `(a, p]`, with `a` the next lower live pin, or 0
-    /// when there is none. An entry with `h ≤ a` still contains `a`. Queue that range and sweep a
-    /// bounded amount of the queue now (decision 3). This departure's own work is the entries it
-    /// read that `a` does not, and what exceeds `DEPARTURE_SWEEP_BUDGET` waits for later sweeps.
+    /// **A pin value has left** (its count reached 0; Amendment 14). Only the entries it read
+    /// highest can change: they are in its bucket. Queue it if that bucket holds anything, and
+    /// sweep a bounded amount of the queue now (Amendment 10, decision 3). What exceeds
+    /// `DEPARTURE_SWEEP_BUDGET` waits for later sweeps.
     fn on_pin_departed(&mut self, p: u64) {
-        let below = self.retention.pins.range(..p).next_back().map(|(&a, _)| a).unwrap_or(0);
-        self.add_pending(below, p);
+        if self.bucket_first(p).is_some() {
+            self.retention.pending.insert(p);
+        }
         self.sweep_pending(DEPARTURE_SWEEP_BUDGET);
     }
 
-    /// Queue `(lo, hi]` for sweeping, merged with every queued interval it overlaps or touches, so
-    /// the queue holds disjoint intervals and no entry is queued twice.
-    fn add_pending(&mut self, mut lo: u64, mut hi: u64) {
-        if lo >= hi {
-            return;
-        }
-        let touching: Vec<u64> = self
-            .retention
-            .pending
-            .range(..=hi)
-            .rev()
-            .take_while(|&(_, &h)| h >= lo)
-            .map(|(&l, _)| l)
-            .collect();
-        for l in touching {
-            if let Some(h) = self.retention.pending.remove(&l) {
-                lo = lo.min(l);
-                hi = hi.max(h);
-            }
-        }
-        self.retention.pending.insert(lo, hi);
+    /// The first entry filed under `pin`, if any.
+    fn bucket_first(&self, pin: u64) -> Option<u64> {
+        self.retention.by_reader.range((pin, 0)..=(pin, u64::MAX)).next().map(|&(_, h)| h)
     }
 
-    /// Re-test up to `budget` queued entries, front of the queue first. An entry is freed when no
-    /// live pin lies in `[h, s)`, which is a local test and exact whatever pins came and went since
-    /// it was queued: a pin taken later is at or above `s`.
+    /// Process up to `budget` entries from the buckets of departed pins, the oldest departed value
+    /// first. Each entry costs one unit:
+    /// - it is handed down to `a`, the next lower LIVE pin, if `a` still reads it (`a ≥ h`);
+    /// - otherwise it is freed.
+    ///
+    /// A pin leaves `pending` in the step that empties its bucket, so the queue never holds an
+    /// empty bucket and no unit is spent finding nothing.
     fn sweep_pending(&mut self, mut budget: usize) {
-        use std::ops::Bound::{Excluded, Included};
         while budget > 0 {
-            let Some((&lo, &hi)) = self.retention.pending.first_key_value() else { return };
-            let next = self
-                .retention
-                .readers
-                .range((Excluded(lo), Included(hi)))
-                .next()
-                .map(|(&h, &(tbl, row, s))| (h, (tbl, row), s));
-            self.retention.pending.remove(&lo);
-            // Every interval visited costs budget, found or not (Amendment 12, F3). Otherwise a
-            // queue of empty ranges would be walked end to end in one call.
+            let Some(&d) = self.retention.pending.first() else { return };
+            debug_assert!(
+                !self.retention.pins.contains_key(&d),
+                "a live pin's bucket was queued as departed ({d})"
+            );
+            let Some(h) = self.bucket_first(d) else {
+                // Unreachable while the invariant holds; costs nothing, and keeps the loop finite.
+                self.retention.pending.remove(&d);
+                continue;
+            };
             budget -= 1;
-            let Some((h, key, s)) = next else { continue };
-            if h < hi {
-                self.retention.pending.insert(h, hi);
+            self.retention.visits += 1;
+            self.retention.by_reader.remove(&(d, h));
+            let below = self.retention.pins.range(..d).next_back().map(|(&a, _)| a);
+            match below {
+                Some(a) if a >= h => {
+                    self.retention.by_reader.insert((a, h));
+                }
+                _ => {
+                    let (tbl, row, _) = self.retention.readers[&h];
+                    self.free_entry(h, (tbl, row));
+                }
             }
-            if self.retention.pins.range(h..s).next().is_none() {
-                self.free_entry(h, key);
+            if self.bucket_first(d).is_none() {
+                self.retention.pending.remove(&d);
             }
         }
     }
@@ -10085,27 +10094,6 @@ mod tests {
         }
     }
 
-    /// **F3: a sweep's budget counts every interval it visits, found or not.** Otherwise one call
-    /// walks the whole queue whenever the queued ranges hold nothing, and the per-call stall is
-    /// the queue's length rather than the budget.
-    ///
-    /// At `ff971ee` a sweep with budget 2 consumed all 10 empty intervals.
-    #[test]
-    fn version_history_sweep_budget_counts_empty_intervals() {
-        let mut st = State::default();
-        for i in 0..10u64 {
-            st.add_pending(10 * i, 10 * i + 5);
-        }
-        assert_eq!(st.retention.pending.len(), 10, "fixture: the intervals should be disjoint");
-        st.sweep_pending(2);
-        assert_eq!(
-            st.retention.pending.len(),
-            8,
-            "a sweep with budget 2 visited {} intervals",
-            10 - st.retention.pending.len()
-        );
-    }
-
     /// **F6: a read that carries no seq is refused.** Every read path pairs its snapshot with one,
     /// so `None` could only come from a new caller. Accepting it would bring back Q7: the latest
     /// version named for a row the scan may not have seen, and a clock taken at record time.
@@ -10138,28 +10126,6 @@ mod tests {
             err.as_deref().is_some_and(|e| e.contains("carries no seq")),
             "a read with no paired seq must be refused: {err:?}"
         );
-    }
-
-    /// **F4: `add_pending` merges an interval with every queued one it overlaps or touches**, so
-    /// the queue stays disjoint and no entry is queued twice. Mutant-only: M36 (insert without
-    /// merging) fails it.
-    #[test]
-    fn version_history_pending_intervals_merge_when_they_overlap_or_touch() {
-        let mut st = State::default();
-        let queue = |st: &State| st.retention.pending.iter().map(|(&l, &h)| (l, h)).collect::<Vec<_>>();
-        st.add_pending(10, 20);
-        st.add_pending(30, 40);
-        assert_eq!(queue(&st), vec![(10, 20), (30, 40)], "disjoint intervals stay apart");
-        st.add_pending(15, 25);
-        assert_eq!(queue(&st), vec![(10, 25), (30, 40)], "an overlapping interval is absorbed");
-        st.add_pending(25, 30);
-        assert_eq!(queue(&st), vec![(10, 40)], "touching intervals on both sides become one");
-        st.add_pending(50, 60);
-        st.add_pending(70, 80);
-        st.add_pending(5, 75);
-        assert_eq!(queue(&st), vec![(5, 80)], "an interval spanning several absorbs them all");
-        st.add_pending(90, 90);
-        assert_eq!(queue(&st), vec![(5, 80)], "an empty interval queues nothing");
     }
 
     /// **F4: an unpinned scan inside a publish window pairs with the window's start.** The
@@ -10433,5 +10399,93 @@ mod tests {
                 "P2 no longer names the version of cold row {row} it reads"
             );
         }
+    }
+
+    /// **E's visit counter: each departure touches only the entries it read highest.** The same
+    /// fixture. P0's departure processes its 100 hot entries, and P1's processes nothing. P1 read
+    /// the cold versions too, but P2 reads them higher, so they are never P1's to test.
+    ///
+    /// Mutant-only: it reads `visits`. M45, which also queues the next higher pin, fails it.
+    #[test]
+    fn version_history_each_departure_touches_only_what_it_read_highest() {
+        let (cold, hot) = (DEPARTURE_SWEEP_BUDGET as u64 + 1000, 100u64);
+        let (mut st, ..) = fifo_turnover_fixture(cold, hot);
+        let before = st.retention.visits;
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert_eq!(st.retention.visits - before, hot, "P0's departure touched other than its own bucket");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        assert_eq!(
+            st.retention.visits - before,
+            hot,
+            "P1's departure touched entries a higher pin reads"
+        );
+        assert!(st.retention.pending.is_empty(), "the queue did not drain");
+        assert_eq!(held_for(&st, 1..=cold), cold as usize, "a cold version P2 reads was freed");
+    }
+
+    /// **Every unit of sweep work costs budget, and the queue drains.** This is the intent of
+    /// Amendment 12's retired budget test, restated for the bucket queue. Ten entries sit in one
+    /// departed pin's bucket. A sweep with budget 2 processes exactly 2. The next sweep processes
+    /// the other 8, and the pin leaves the queue in the step that empties its bucket, at no extra
+    /// cost.
+    ///
+    /// Mutant-only: M47 (the bucket-emptied check dropped) and M48 (the budget ignored) fail it.
+    #[test]
+    fn version_history_sweep_charges_one_unit_per_entry_and_drains() {
+        let mut st = State::default();
+        for row in 1..=10u64 {
+            publish_next(&mut st, row);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for row in 1..=10u64 {
+            publish_next(&mut st, row);
+        }
+        assert_eq!(st.retention.readers.len(), 10, "fixture: the pin should read ten old versions");
+        // Remove the workspace without the departure's own sweep, so the queue is swept by hand.
+        let ws = st.workspaces.remove(&BranchId::new(7, 0)).expect("fixture: b_7 not live");
+        st.drop_txn_refs(&ws);
+        st.retention.pins.remove(&at);
+        st.retention.pending.insert(at);
+        let before = st.retention.visits;
+        st.sweep_pending(2);
+        assert_eq!(st.retention.visits - before, 2, "a sweep with budget 2 did other than 2 units");
+        assert_eq!(st.retention.readers.len(), 8, "a sweep with budget 2 freed other than 2 entries");
+        assert!(st.retention.pending.contains(&at), "the pin left the queue with entries in its bucket");
+        st.sweep_pending(100);
+        assert_eq!(st.retention.visits - before, 10, "draining ten entries took other than ten units");
+        assert!(st.retention.readers.is_empty(), "the bucket did not drain");
+        assert!(st.retention.pending.is_empty(), "a drained pin stayed queued");
+    }
+
+    /// **An entry read by two pins is handed down, not freed, when the higher one departs.** This
+    /// replaces Amendment 12's interval-algebra test as the test of the queue's structure. P1 < P2
+    /// both read version `h` of row 1. P2's departure moves the entry to P1's bucket, and P1 still
+    /// names it. P1's departure then frees it.
+    ///
+    /// Mutant-only: it reads `by_reader`. M46 (hand-down replaced by free) fails it.
+    #[test]
+    fn version_history_hands_an_entry_down_to_its_next_reader() {
+        let mut st = State::default();
+        publish_next(&mut st, 1);
+        let h = st.apply_seq;
+        let p1 = st.apply_seq;
+        st.insert_workspace(BranchId::new(1, 0), pinned("b_1", 101, p1));
+        publish_next(&mut st, 2);
+        let p2 = st.apply_seq;
+        st.insert_workspace(BranchId::new(2, 0), pinned("b_2", 102, p2));
+        publish_next(&mut st, 1);
+        assert!(st.retention.by_reader.contains(&(p2, h)), "fixture: P2 should be h's highest reader");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        assert!(st.retention.readers.contains_key(&h), "P1 still reads h, yet it was freed");
+        assert!(st.retention.by_reader.contains(&(p1, h)), "h was not handed down to P1's bucket");
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(p1)).map(|v| v.begin_ts),
+            Some(h),
+            "P1 no longer names the version it reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert!(!st.retention.readers.contains_key(&h), "no pin reads h, yet it is still held");
+        assert!(st.retention.by_reader.is_empty() && st.retention.pending.is_empty());
     }
 }
