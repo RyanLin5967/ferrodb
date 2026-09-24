@@ -18,6 +18,22 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         return Ok(false);
     }
 
+    // **D212 (a') AMENDED 3, item 4: a log that holds REVERT history is recovered only with the
+    // store attached**, refused here before recovery writes anything. Such a log was written by a
+    // manager that had one (`bind_history` refuses without), and recovering it without one would let
+    // the next checkpoint discard the history's only copy. `open_recovered`, the one open path,
+    // attaches `<db>.history` before calling this.
+    if txn.history_store().is_none() {
+        let history = records.iter().filter(|r| matches!(r.kind, RecKind::RevertHistory { .. })).count();
+        if history > 0 {
+            return Err(FerroError::Internal(format!(
+                "the log holds {history} REVERT history record(s) and no history store is attached, so \
+                 the next checkpoint would discard them; open the database through \
+                 wal::recovery::open_recovered, which attaches <db>.history before recovering"
+            )));
+        }
+    }
+
     // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
     // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
     let legacy = wal.is_legacy();
@@ -153,10 +169,10 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // the log beside its rows; if a crash beat the checkpoint that writes them into the store, this
     // is their only copy. Only a transaction with a `Commit` counts — `ended` would also admit one
     // that aborted, since `abort` writes `TxnEnd` too — and the store queues a record only if it does
-    // not already hold its `hseq`, wherever that falls (AMENDED 2, F9). The next checkpoint (the CLI
-    // takes one right after this) writes them. With no store attached they are counted instead, and
-    // no checkpoint truncates the log while that count stands (F5). Each record carries its
+    // not already hold its `hseq`, wherever it falls at or above the store's prune floor (AMENDED 2,
+    // F9; AMENDED 3, item 3). The open's checkpoint writes them. Each record carries its
     // transaction's `Commit` LSN (AMENDED 3, item 2); a transaction without one is not committed.
+    // With no store attached, a log holding any was refused above (AMENDED 3, item 4).
     let commit_lsns: HashMap<u64, u64> =
         records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| (r.txn_id, r.lsn)).collect();
     let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
@@ -170,9 +186,8 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         .collect();
     if !parts.is_empty() {
         let history = crate::wal::history::assemble(parts)?;
-        match txn.history_store() {
-            Some(store) => store.enqueue(history),
-            None => txn.note_unstored_history(history.len() as u64),
+        if let Some(store) = txn.history_store() {
+            store.enqueue(history);
         }
     }
 
@@ -451,6 +466,10 @@ pub struct OpenedDatabase {
     /// the tables whose provenance [`OpenedDatabase::attach_runtime`] forgets (D250 review 2's R2-4).
     /// It contains `completed_drops`. PRIVATE for the same reason.
     dropped_tables: Vec<String>,
+    /// **D212 (a') AMENDED 3, item 4 — REVERT's history store**, `<db>.history`, opened by
+    /// [`open_recovered`] and registered with `txn` before `recover`. [`OpenedDatabase::attach_runtime`]
+    /// hands it to the runtime. PRIVATE, so a runtime reaches it only through the door.
+    history: Arc<crate::wal::history::HistoryStore>,
 }
 
 impl OpenedDatabase {
@@ -473,10 +492,15 @@ impl OpenedDatabase {
     /// memory.
     ///
     /// `&self` and no drain: every runtime attached to one open forgets the same tables.
+    ///
+    /// **D212 (a') AMENDED 3, item 4: it also hands the runtime this database's REVERT history
+    /// store**, so the runtime is refused over any other database's log
+    /// (`AgentRuntime::attach_history`).
     pub fn attach_runtime(&self, runtime: AgentRuntime) -> Arc<AgentRuntime> {
         for table in &self.dropped_tables {
             runtime.forget_table(table);
         }
+        runtime.bind_history_store(Arc::clone(&self.history));
         Arc::new(runtime)
     }
 }
@@ -625,6 +649,13 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let wal = Arc::new(WalManager::new(PathBuf::from(wal_path))?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    // **D212 (a') AMENDED 3, item 4: REVERT's history store, opened HERE and registered BEFORE
+    // `recover`.** The open's catch-up puts the committed history a crash left only in the log into
+    // it, and the checkpoint below drains it before truncating that log. This is the one open path,
+    // and between the manager's construction and `recover` is the only moment a store can be
+    // registered in time; `recover` refuses a log holding history with none.
+    let history = crate::wal::history::HistoryStore::open_for_database(db_path, existed)?;
+    txn.attach_history_store(Arc::clone(&history))?;
     let recovered = recover(&txn)?;
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
@@ -715,6 +746,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         #[cfg(test)]
         completed_drops,
         dropped_tables,
+        history,
     })
 }
 

@@ -68,7 +68,7 @@
 //! is `agent_sql::revert_store`'s, which is the only reader of a body.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::FerroError;
@@ -221,30 +221,33 @@ impl StoreState {
 }
 
 impl HistoryStore {
-    /// `<db>.history`, the file an entry point opens for the database at `db_path`.
-    pub fn path_for_database(db_path: &str) -> PathBuf {
-        format!("{db_path}.history").into()
+    /// `<db>.history`, the file `open_recovered` opens for the database at `db_path`.
+    pub fn path_for_database(db_path: &Path) -> PathBuf {
+        let mut p = db_path.as_os_str().to_os_string();
+        p.push(".history");
+        PathBuf::from(p)
     }
 
-    /// **What an entry point calls, before `recover`:** `<db>.history` with the window from
-    /// `FERRODB_REVERT_RETENTION_MERGES`.
+    /// **What `wal::recovery::open_recovered` calls, before `recover`** (AMENDED 3, item 4):
+    /// `<db>.history` with the window from `FERRODB_REVERT_RETENTION_MERGES`.
     ///
     /// **Refuses a history file beside a database file that does not exist yet:** it was left by
     /// another database at that path, and reading it would give a new, empty database the merge
     /// history of an old one — history without its rows.
     /// `database_existed` is whether the database file was there BEFORE this open created it, which
-    /// only the caller can know: every entry point creates the file before it attaches the store.
+    /// only the caller can know: the open creates the file before it attaches the store.
     pub fn open_for_database(
-        db_path: &str,
+        db_path: &Path,
         database_existed: bool,
     ) -> Result<Arc<HistoryStore>, FerroError> {
         let history = HistoryStore::path_for_database(db_path);
         if !database_existed && history.exists() {
             return Err(FerroError::Internal(format!(
-                "{} exists but the database {db_path} does not: it is another database's REVERT \
+                "{} exists but the database {} does not: it is another database's REVERT \
                  history, and a new database must not inherit it. Move it away to create the \
                  database here",
-                history.display()
+                history.display(),
+                db_path.display()
             )));
         }
         HistoryStore::open(history, retention_from_env()?)
@@ -288,6 +291,11 @@ impl HistoryStore {
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
         Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
+    }
+
+    /// The file this store writes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The window `W`, in publishes.

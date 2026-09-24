@@ -922,6 +922,11 @@ struct RevertState {
     /// `None` until [`AgentRuntime::attach_history`] has read it, which every path that mints a
     /// merge id or answers a `REVERT` does first.
     cursor: Option<HistoryCursor>,
+    /// **D212 (a') AMENDED 3, item 4 — the store `OpenedDatabase::attach_runtime` handed this runtime**:
+    /// its database's history, opened by `open_recovered`. A runtime that has one is refused over a
+    /// log that carries any other ([`AgentRuntime::attach_history`]). `None` for a runtime built
+    /// outside the door, which takes whatever store its first statement's log carries.
+    door_store: Option<Arc<HistoryStore>>,
     /// **D218 — every txn a `REVERT` has undone, and the merge whose `REVERT` undid it.**
     ///
     /// The undo inverts the ops `applied` holds for a txn, and nothing about those ops changes when
@@ -3547,15 +3552,40 @@ impl AgentRuntime {
     /// path reaches that state, because every one attaches first; the refusal guards a caller that
     /// drives the runtime directly.
     ///
-    /// ⚠ **Blind spot, stated:** it attaches ONCE per runtime, so a runtime is bound to the first
-    /// database it is used against. Nothing in production drives one runtime over two databases —
-    /// a `ServerContext` pairs one runtime with one catalog — and nothing here detects it.
+    /// **One runtime, one database's history** (AMENDED 3, item 4), checked at EVERY call, O(1): the
+    /// store this statement's log carries must be the one the door handed this runtime
+    /// (`OpenedDatabase::attach_runtime`) and the one it attached to, both compared by pointer. A
+    /// runtime driven over a second database is refused before it mints anything there: its
+    /// counters and window describe the first, and the second's history would be filed under them.
     pub fn attach_history(&self, ctx: &ReadCtx) -> Result<(), FerroError> {
-        if self.state.lock().unwrap().revert.cursor.is_some() {
-            return Ok(());
-        }
         // Read with the state lock NOT held.
         let store = ctx.txn.history_store();
+        {
+            let state = self.state.lock().unwrap();
+            let same = |held: &Option<Arc<HistoryStore>>| match (held, &store) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            let door = state.revert.door_store.clone();
+            let attached = state.revert.cursor.as_ref().map(|c| c.store.clone());
+            for (what, held) in [("was attached to", door.map(Some)), ("attached to", attached)] {
+                if let Some(held) = held {
+                    if !same(&held) {
+                        return Err(FerroError::Merge(format!(
+                            "this runtime {what} the REVERT history at {}, and this statement runs over \
+                             another database's log (history {}); a runtime serves the one database \
+                             it was attached to",
+                            held.as_ref().map_or("(none)".to_string(), |s| s.path().display().to_string()),
+                            store.as_ref().map_or("(none)".to_string(), |s| s.path().display().to_string())
+                        )));
+                    }
+                }
+            }
+            if state.revert.cursor.is_some() {
+                return Ok(());
+            }
+        }
         let (last_hseq, view) = match &store {
             Some(s) => {
                 let records = s.records();
@@ -3598,6 +3628,12 @@ impl AgentRuntime {
             boot_version_high,
         });
         Ok(())
+    }
+
+    /// **D212 (a') AMENDED 3, item 4 — the door's half:** `OpenedDatabase::attach_runtime` hands the
+    /// runtime its database's history store. See [`RevertState::door_store`].
+    pub(crate) fn bind_history_store(&self, store: Arc<HistoryStore>) {
+        self.state.lock().unwrap().revert.door_store = Some(store);
     }
 
     /// **D212 (a') — refuse while a commit that carried history has an unknown outcome.** See

@@ -8,7 +8,7 @@
 //! | `exit_8_...` | exit test (8): REVERT refuses outside the window, naming `W` | `revert_merge` skips the in-memory ordinal check; or the store never prunes |
 //! | `falsifier_1_...` | (1) the file's bytes flat in M, within one prune's worth, and ≤ (W + W/8)·max record | `drain`'s prune condition is never true |
 //! | `falsifier_3_...` | (3) single-threaded: after a checkpoint the log holds no history record, and the store holds every one | the hook drains nothing; or `commit` queues nothing |
-//! | `f5_...` | AMENDED 2 F5: an open with no store attached keeps the log | `checkpoint_locked` ignores the unstored count |
+//! | `f5_...` | AMENDED 2 F5: an open with no store attached keeps the log. **SUPERSEDED by AMENDED 3 item 4**, which deleted the count: `recover` now REFUSES such a log, so this test fails as written; its replacement is a ⚖ in the lane report (not committed) | (none: the count is gone) |
 //! | `falsifier_5_...` | AMENDED 2 F7: with an idle open transaction, queue bytes stay ≤ B, flat in M | `commit` skips the byte-bounded drain |
 //! | `falsifier_5b_...` | AMENDED 3 item 8: with an idle open transaction, the FILE's bytes stay ≤ (W + W/8)·max record, flat in M | `drain`'s prune forced off (the one routine the hook and the commit path share) |
 //!

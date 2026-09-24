@@ -109,9 +109,10 @@ pub struct TxnManager {
     run_bindings: Mutex<HashMap<u64, RunEntity>>,
     /// **D212 (a') — the REVERT history store, when one is attached** (`wal::history`).
     ///
-    /// Attached by the entry point BEFORE `recover`, because the open's catch-up queues committed
-    /// history records into it and the CLI checkpoints right after `recover`, before any runtime
-    /// exists (`cli.rs`). Set once.
+    /// Attached by `wal::recovery::open_recovered`, the one open path, BEFORE `recover` (AMENDED 3,
+    /// item 4): the open's catch-up queues committed history records into it, and the open's
+    /// checkpoint drains them before any runtime exists. Set once. A manager built directly on
+    /// `TxnManager::new` has none, keeps no durable history, and refuses every history binding.
     ///
     /// **This handle is the checkpoint hook** (AMENDED 3, item 5): the store owns nothing but its
     /// records and its file, and `wal::history` imports nothing from `agent_sql`, so the hook cannot
@@ -126,11 +127,6 @@ pub struct TxnManager {
     /// the moment its `Commit` is durable and dropped by its abort. See
     /// [`TxnManager::bind_history`].
     history_bindings: Mutex<HashMap<u64, Vec<HistoryRecord>>>,
-    /// **D212 (a') AMENDED 2, F5 — committed history records in the log that no store has taken**,
-    /// counted by `recover` when it finds them with no store attached. While it is non-zero and no
-    /// store is attached, a checkpoint keeps the log: truncating it would discard the only copy of
-    /// that history. O(1) per checkpoint; the count is taken during the scan `recover` makes anyway.
-    unstored_history: AtomicU64,
     /// Open transaction -> every primary-index entry it moved, oldest first. D202.
     ///
     /// Index pages are not logged, so the heap undo in [`TxnManager::abort`] cannot reach them,
@@ -484,30 +480,17 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), unstored_history: AtomicU64::new(0) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()) }
     }
 
     /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
-    /// or the open's catch-up has nowhere to put what the log holds. Refuses a second store: one
-    /// database has one history.
+    /// or the open's catch-up has nowhere to put what the log holds; `open_recovered` is the caller
+    /// that matters, and `recover` refuses a log holding committed history with no store attached.
+    /// Refuses a second store: one database has one history.
     pub fn attach_history_store(&self, store: Arc<HistoryStore>) -> Result<(), FerroError> {
-        let unstored = self.unstored_history.load(Ordering::SeqCst);
-        if unstored > 0 {
-            // `recover` already ran without it and left these records out of any store; a store
-            // attached now would let the next checkpoint truncate them away.
-            return Err(FerroError::Internal(format!(
-                "attach the REVERT history store BEFORE recover: recovery already found {unstored} \
-                 committed history record(s) with no store to put them in"
-            )));
-        }
         self.history.set(store).map_err(|_| {
             FerroError::Internal("a REVERT history store is already attached to this log".into())
         })
-    }
-
-    /// Called by `recover` when it finds committed history records and no store is attached.
-    pub(crate) fn note_unstored_history(&self, records: u64) {
-        self.unstored_history.fetch_add(records, Ordering::SeqCst);
     }
 
     /// The attached REVERT history store, if any.
@@ -1957,15 +1940,11 @@ impl TxnManager {
         // owed releases still drains the queue (review of `816321d`, finding 3). A failure returns
         // here: the flushes above have run, and the truncation is refused, so the log keeps every
         // history record the store does not.
-        match self.history.get() {
-            Some(store) => store.drain()?,
-            // F5: history the log holds and no store has — keep the whole log, as a pin does, and
-            // answer as a pin's keep. (Deleted by AMENDED 3 item 4.)
-            None if self.unstored_history.load(Ordering::SeqCst) > 0 => {
-                DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-                return Ok(CheckpointOutcome::KeptByPin);
-            }
-            None => {}
+        // With no store there is no history in the log: `bind_history` refuses without one, and
+        // `recover` refuses a log that holds some (AMENDED 3, item 4, which deleted AMENDED 2's
+        // count of unstored records).
+        if let Some(store) = self.history.get() {
+            store.drain()?;
         }
         if owed > 0 {
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
