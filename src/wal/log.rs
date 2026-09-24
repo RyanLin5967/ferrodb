@@ -849,8 +849,30 @@ impl WalManager {
         Ok(())
     }
 
+    /// Make the record that STARTS at `lsn` durable, and everything before it. What `commit` asks
+    /// for its `Commit`, and what the buffer pool asks for a heap page whose LSN is `lsn`.
+    ///
+    /// **`>`, not `>=` (the D216 adversary's F1).** An LSN is where a record starts, and
+    /// `flushed_lsn` is one past the last durable byte, so a record that was first in an empty
+    /// buffer has `lsn == flushed_lsn` and is NOT durable. `>=` returned early for exactly that
+    /// record. `commit` then returned `Ok` with its `Commit` only in memory whenever something had
+    /// flushed the log since the transaction's previous record, and a heap page could be written
+    /// ahead of its own record. `flushed_lsn` only ever lands on a record boundary (a flush drains
+    /// whole frames), so `flushed_lsn > lsn` means the whole record is durable.
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
-        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
+        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {
+            return Ok(());
+        }
+        self.flush()
+    }
+
+    /// Make every byte of the log below `end` durable. `end` is a position the log's END reached,
+    /// not where a record starts. This is what the buffer pool asks for a page that carries no LSN
+    /// of its own, whose `Frame::wal_mark` records where the log's end was when the page last
+    /// changed. `>=` is right here and wrong in [`WalManager::flush_up_to`]: the two differ only in
+    /// which end of a record their argument names.
+    pub fn flush_through(&self, end: u64) -> Result<(), FerroError> {
+        if self.flushed_lsn.load(Ordering::SeqCst) >= end {
             return Ok(());
         }
         self.flush()
