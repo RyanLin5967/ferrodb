@@ -768,3 +768,42 @@ GREEN here.
 - `wal::txn::tests`, `wal::free_intent::tests`, `integration_cluster_snapshot`,
   `integration_cli_row_authorship_durability` and `open_path_allowlist` all pass.
 - Killed as in amendment 20; the move-form M3, M7 and M12 survive.
+
+**Amendment 22 (the first build, and D229 review 3's F4, `frontier/d229_review3.md` @ `37a49fc`: SOUND-WITH-CAVEATS at
+`ebbcb0b`; F1-F3 are D250's, routed to `delete-insert-gap`).**
+
+*The first build.* Quiet mode is off (the lead, from Ryan). `82d6033` commits the raw output of
+`lockrun d229 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-run` over
+these targets:
+- `--lib`;
+- `--test` for `d229_allocation_sites`, `open_path_allowlist`, `lock_order_allowlist`, `d53_private_root_allowlist`,
+  `integration_cluster_snapshot` and `integration_cli_row_authorship_durability`;
+- `--example pgserver`.
+
+The run was at `ebbcb0b` on a clean tree. Result: **rc=0 and eight executables**. So every UNBUILT commit of this lane,
+the merges and the type passes included, compiles. It produced 4 lib-test warnings:
+- `unused_mut` at `src/wal/tests_crash_frees.rs:1363` is D229's own, in
+  `a_drop_whose_mutation_fails_frees_nothing_until_the_next_open_completes_it`. It is fixed in the commit after this
+  amendment: `let mut d` becomes `let d`. Nothing else in the test changes;
+- `unused_mut` at `src/catalog/catalog_page.rs:800` predates the lane;
+- `unused variable: reaper` at `src/branch/reaper.rs:2263` predates the lane.
+
+The non-test lib (built for the integration tests) had no warnings, so `-D dead_code` has nothing to catch there.
+
+*F4, text only.* Amendment 21 says D250's accepted empty-failed-CREATE residual "stays reachable through `ddl_unit`'s
+own post-truncation re-append". That names one route of two. The residual needs three things:
+- a RETAINED `DropTable(t, R)` record;
+- whose root `R` a later same-name CREATE takes;
+- with no later `CreateTable`, heap record or DDL at `R` (the CREATE failed at its sync, after its catalog write).
+
+On this tree a DROP's frees run in process right after its checkpoint's sync, whatever the truncation then does, so
+`R` becomes reusable in the same process. Both routes that retain the record therefore reach the residual:
+1. **the truncated case**: `ddl_unit` re-appends the record after the truncation, for the change feed;
+2. **the pin-kept case** (`KeptByPin`): the original record simply stays in the log, and the frees have run all the
+   same (`a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation`).
+
+For D229 it is harmless on either route: no intent names the re-created table, so nothing of it is freed. The reset frees
+its empty primary leaf, and its directory roots leak (`LEAKED_ROOTS = 2`).
+
+**The runner's base:** the tip after the `mut` fix, which the lane file names. `src/` changes by that one test line only.
+Every prediction of amendments 20 and 21 carries over, and PATTERNS_ONLY is re-checked there before the run.
