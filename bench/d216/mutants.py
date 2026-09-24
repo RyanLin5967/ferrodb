@@ -3,6 +3,9 @@
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,M27,...]
 
+A mutant whose pattern or `--test` target the tip does not have is reported NOT-AT-TIP and left out
+of everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else.
+
 `--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
 `d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves`
 until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
@@ -245,6 +248,23 @@ def main():
     git("worktree", "add", "--detach", TREE, tip, cwd=REPO)
     summary = []
     try:
+        # NOT-AT-TIP: a mutant whose subject or test target the tip does not have is reported and left
+        # out, CONTROL included, so one script serves `d216-clean-restart` (no D252 test, no D252
+        # code) and `d252-caught-up-pin`. Reported, never silent: the pre-registration names which
+        # mutants each tip must list here.
+        present = []
+        for m in mutants:
+            name, path, old = m[0], m[1], m[2]
+            count = open(os.path.join(TREE, path)).read().count(old)
+            missing = [t[1] for t in m[4] if t != BUILD_EXAMPLES and t[0] == "--test"
+                       and not os.path.exists(os.path.join(TREE, "tests", t[1] + ".rs"))]
+            if missing or count == 0:
+                summary.append(f"{name} NOT-AT-TIP (pattern matches {count}, absent targets {missing}) expect={m[6]}")
+            elif count != 1:
+                summary.append(f"{name} PATTERN-MISMATCH ({count} matches) expect={m[6]}")
+            else:
+                present.append(m)
+        mutants = present
         # CONTROL: every target the mutants use, on the unmutated tip. A test that already fails here
         # cannot be credited to a mutant, and a target that cannot run makes every verdict on it void.
         all_targets = []
