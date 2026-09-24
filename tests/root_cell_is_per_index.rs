@@ -454,6 +454,15 @@ fn an_alter_after_a_lagging_record_keeps_the_cell_and_catches_the_record_up() {
         post_split,
         "the ALTER left the record behind the cell it planned from"
     );
+    // The PERSISTED record too, read back from the catalog pages (D208 review 3, C2): the claim is
+    // about what the ALTER's one persist wrote, and a record caught up in memory after that persist
+    // would pass the assertion above. Page 1 is the first catalog page (`Catalog::create`).
+    let persisted = Catalog::open(d.bp.clone(), 1).expect("reopen the catalog from its pages");
+    assert_eq!(
+        persisted.get_table("t").unwrap().primary_index_root,
+        post_split,
+        "the ALTER's persist wrote the lagging primary record; it was caught up only in memory, after it"
+    );
 
     let high = id + 1000;
     d.rows(&format!("INSERT INTO t VALUES ({high}, 0);"));
@@ -516,6 +525,16 @@ fn assert_alter_catches_up_a_lagging_index_record(fulltext: bool) {
     );
     assert_eq!(cell.load(Ordering::SeqCst), post_split, "the ALTER moved the {kind} index's cell");
     assert_eq!(record(&d), post_split, "the ALTER wrote the lagging {kind} record as it was, instead of catching it up from its cell");
+    // The PERSISTED record, read back from the catalog pages (D208 review 3, C2). This is what the
+    // claim is about ("this persist writes every record of the table"). A catch-up moved after the
+    // persist passes every assertion above and fails this one (PREREG amendment 9, K31).
+    let persisted = Catalog::open(d.bp.clone(), 1).expect("reopen the catalog from its pages");
+    let e = persisted.get_table("t").unwrap();
+    let persisted_root = if fulltext { e.fulltext_indexes[0].root_page_id } else { e.indexes[0].root_page_id };
+    assert_eq!(
+        persisted_root, post_split,
+        "the ALTER's persist wrote the lagging {kind} record; it was caught up only in memory, after it"
+    );
 }
 
 #[test]
@@ -555,6 +574,16 @@ fn build_split_table(d: &mut Db, lag: bool) {
         e.indexes[0].root_page_id = first_btree.unwrap();
         e.fulltext_indexes[0].root_page_id = first_ft.unwrap();
     }
+    // Premise (D208 review 3, C3): every tree's CELL is off its first root, which is the value the
+    // lag writes into the record. In the lag arm that is "cell != lagged record": without it the lag
+    // would be no lag. In both arms it catches a regression that stopped moving cells, which would
+    // otherwise fail T12's CONTROL arm with a message blaming "something other than the lag".
+    let primary_cell = d.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell").load(Ordering::SeqCst);
+    let btree_cell = d.cell(IndexTree::Secondary("v")).load(Ordering::SeqCst);
+    let ft_cell = d.cell(IndexTree::FullText("v")).load(Ordering::SeqCst);
+    assert_ne!(primary_cell, first_primary, "premise failed: the primary cell is on the root the lag writes into the record");
+    assert_ne!(Some(btree_cell), first_btree, "premise failed: the B-tree cell is on the root the lag writes into the record");
+    assert_ne!(Some(ft_cell), first_ft, "premise failed: the posting tree's cell is on the root the lag writes into the record");
 }
 
 /// `build_split_table`, then drop and rebuild it twice. Returns the highest allocated page with the
