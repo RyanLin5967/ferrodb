@@ -277,20 +277,22 @@ impl TwoTierReaper {
     /// first, like every other reap order here, so a child's detach empties its parent's span
     /// before the parent is asked.
     ///
-    /// # Cost at open
+    /// # Cost at open — O(unreleased), never O(ever reaped)
     ///
-    /// - The candidate query: one range scan of the `Reaped` STATE span and one of the FREE_ID
-    ///   span, merged in memory, plus one point lookup per slot in the first and not the second
-    ///   (`TableBranchCatalog::unreleased_reaped_candidates`). Never a scan of every record.
-    ///   ⚠ Still O(Reaped records) per open: D1's falsifier ("open is not O(1)") names exactly
-    ///   this for a DERIVED free list. It is paid here as recovery work, as
-    ///   `collect_orphaned_extents` pays O(live arenas) at open, and it stays bounded: a released
-    ///   slot is recycled by the next fork, and a recycled slot leaves the span.
-    /// - Per candidate: one record read and one liveness question. A healthy catalog's only
-    ///   candidates are its pinned reaped interiors, whose questions the witness cache answers
-    ///   after the first walk under each chain.
+    /// - The candidate query is one range scan of the catalog's UNRELEASED span
+    ///   (`TableBranchCatalog::unreleased_reaped_candidates`), which holds a slot from its entry
+    ///   into `Reaping` until `release_id`. On a healthy catalog that is its pinned reaped
+    ///   interiors and nothing else; a crash can add the slot it interrupted. Pinned by
+    ///   `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_slot`: 1 key with 8 or 64
+    ///   released slots. (The first version merged the whole `Reaped` and FREE_ID spans at every
+    ///   open, one key per branch ever reaped, because a released slot stays `Reaped` until
+    ///   recycled.)
+    /// - Per candidate: one record read and one liveness question. The witness cache answers the
+    ///   pinned interiors' questions after the first walk under each chain.
     /// - Writes: none on a healthy catalog. Per leaked slot, one detach and one release, each a
-    ///   group-committed sync, and only once.
+    ///   group-committed sync, once.
+    /// - Once per catalog written before the span existed: the one-time build at its first open,
+    ///   O(Reaped + free) (`TableBranchCatalog::build_unreleased_index_if_missing`).
     fn reclaim_unreleased_slots(&self) -> Result<(), FerroError> {
         let mut refusals = Vec::new();
         let mut candidates: Vec<BranchRecord> = Vec::new();

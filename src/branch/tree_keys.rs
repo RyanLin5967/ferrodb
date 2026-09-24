@@ -70,6 +70,16 @@ pub mod tag {
     /// branches would need every released id in the header, and the header must stay O(1) or
     /// `open` is O(N) again by another route. "Lowest free id" is the first key in this span.
     pub const FREE_ID: u8 = 0x04;
+    /// `[0x08][branch id]` → empty. **D200.** Every slot whose record is `Reaping` or `Reaped`
+    /// and whose id has not been released: put here by `set_state` on the way into `Reaping`
+    /// (or straight into `Reaped`), taken off only by `release_id`.
+    ///
+    /// It exists so the open-time sweep for leaked slots reads what is UNRELEASED — pinned reaped
+    /// interiors, plus whatever a crash left — and not every slot ever reaped: a released slot
+    /// stays a `Reaped` record until a fork recycles it, so the `Reaped` STATE span grows with
+    /// branches ever reaped. The one-byte key `[0x08]` alone is not a slot; it marks the span as
+    /// complete for this catalog (see `unreleased_index_built`).
+    pub const UNRELEASED: u8 = 0x08;
 }
 
 /// `[0x00][id]`
@@ -148,6 +158,30 @@ pub fn free_id(id: u64) -> Vec<u8> {
     k.push(tag::FREE_ID);
     k.extend_from_slice(&(u64::MAX - id).to_be_bytes());
     k
+}
+
+/// `[0x08][id]` — **D200.** See [`tag::UNRELEASED`].
+pub fn unreleased(id: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9);
+    k.push(tag::UNRELEASED);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `[0x08]` alone — **D200.** Present once the UNRELEASED span names every unreleased slot in
+/// this catalog: written by `create`, or by the one-time build a catalog from before the span
+/// gets at its first open. One byte, so it sorts before every id key in the span and
+/// [`unreleased_id_from_key`] skips it.
+pub fn unreleased_index_built() -> Vec<u8> {
+    vec![tag::UNRELEASED]
+}
+
+/// Recover the id from an UNRELEASED key; `None` for the marker and anything else.
+pub fn unreleased_id_from_key(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key[0] != tag::UNRELEASED {
+        return None;
+    }
+    Some(u64::from_be_bytes(key[1..9].try_into().ok()?))
 }
 
 /// Recover the id from a `FREE_ID` key.

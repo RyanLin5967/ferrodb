@@ -226,6 +226,9 @@ impl TableBranchCatalog {
         let cat = Self::open(pool, root)?;
         cat.header_page.store(header_page, Ordering::SeqCst);
         cat.published_root.store(root, Ordering::SeqCst);
+        // D200, after `header_page` is set: the build writes, and a root split it causes must be
+        // published like any other mutation's (D33).
+        cat.build_unreleased_index_if_missing()?;
         Ok(cat)
     }
 
@@ -400,6 +403,11 @@ impl TableBranchCatalog {
         cat.next_id.store(max_id + 1, Ordering::SeqCst);
         cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
 
+        // D200: every reaped record goes on the UNRELEASED span first, as `set_state` would have
+        // put it; `release_id` below takes off each one it frees, leaving the pinned ones.
+        for id in &reaped {
+            cat.upsert(keys::unreleased(*id), Vec::new())?;
+        }
         // Free ids last: `release_id` refuses while a slot still has live children, so it has to
         // see the child entries that were just attached.
         for id in reaped {
@@ -534,6 +542,8 @@ impl TableBranchCatalog {
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
         cat.tree.insert(keys::state(trunk.state.as_u8(), trunk.branch_id.id), Vec::new())?;
+        // D200: a new catalog has no unreleased slot, so its UNRELEASED span is complete now.
+        cat.tree.insert(keys::unreleased_index_built(), Vec::new())?;
         // Trunk is deliberately absent from the DEADLINE span: it is excluded from every reap
         // query, so an entry for it would sit at the head of the range for ever and every scan
         // would step over it.
@@ -1019,6 +1029,50 @@ impl TableBranchCatalog {
     }
 
     /// Ids of every entry in a span whose key ends with an 8-byte branch id.
+    /// **D200.** Give a catalog written before the UNRELEASED span existed its span — once.
+    ///
+    /// Such a catalog can hold `Reaped` slots that were never released (the pre-D200 cascade left
+    /// one per pruned interior) with no key naming them, and the open sweep reads only the span.
+    /// So its first open finds them the expensive way: the `Reaped` STATE span merged against the
+    /// FREE_ID span, O(Reaped + free), plus the `Reaping` span, which `set_state` would also have
+    /// put on it. It writes one key per slot found, then the marker, in one sync. Every later
+    /// open reads the marker and returns. A catalog made by `create` has the marker from birth.
+    fn build_unreleased_index_if_missing(&self) -> Result<(), FerroError> {
+        if self.tree.search(&keys::unreleased_index_built())?.is_some() {
+            return Ok(());
+        }
+        let _g = self.logical.lock().unwrap();
+        let (flo, fhi) = keys::whole_group(keys::tag::FREE_ID);
+        let mut free: Vec<u64> = Vec::new();
+        for entry in self.tree.range_scan(Bound::Included(flo), Bound::Excluded(fhi))? {
+            let (k, _) = entry?;
+            if let Some(id) = keys::free_id_from_key(&k) {
+                free.push(id);
+            }
+        }
+        free.sort_unstable();
+        let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
+        for id in self.ids_in_span(lo, hi)? {
+            if id == 0 || free.binary_search(&id).is_ok() {
+                continue;
+            }
+            // Re-read: a STATE key that outlived its state (pre-F4 recycling) names a live slot.
+            if let Some(rec) = self.core(id)? {
+                if rec.state() == BranchState::Reaped {
+                    self.upsert(keys::unreleased(id), Vec::new())?;
+                }
+            }
+        }
+        let (rlo, rhi) = keys::whole_state(BranchState::Reaping.as_u8());
+        for id in self.ids_in_span(rlo, rhi)? {
+            self.upsert(keys::unreleased(id), Vec::new())?;
+        }
+        self.upsert(keys::unreleased_index_built(), Vec::new())?;
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
+    }
+
     fn ids_in_span(&self, lo: Vec<u8>, hi: Vec<u8>) -> Result<Vec<u64>, FerroError> {
         let mut out = Vec::new();
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
@@ -1143,6 +1197,9 @@ impl BranchCatalog for TableBranchCatalog {
         let (child_num, generation, reused, slot_core) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
+                // D200: a free slot was taken off the UNRELEASED span when it was released; this
+                // only makes a recycled slot's absence from it unconditional.
+                self.remove_if_present(&keys::unreleased(id))?;
                 let slot_core = self.core(id)?;
                 let slot_gen = slot_core.as_ref().map(|r| r.generation()).unwrap_or(0);
                 (id, slot_gen, true, slot_core)
@@ -1300,6 +1357,13 @@ impl BranchCatalog for TableBranchCatalog {
             rec.state = to;
         }
         self.write_record(&rec, Some(&old))?;
+        // **D200.** On the way into `Reaping` — or straight into `Reaped`, which the runtime's
+        // reaper-less arm does — the slot goes on the UNRELEASED span; only `release_id` takes it
+        // off. On the reaper's path that makes the key durable one sync BEFORE the `Reaped` flip,
+        // so no crash can leave a reaped, unreleased slot the open sweep cannot see.
+        if to == BranchState::Reaping || (to == BranchState::Reaped && expect != BranchState::Reaping) {
+            self.upsert(keys::unreleased(branch.id), Vec::new())?;
+        }
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -1554,6 +1618,9 @@ impl BranchCatalog for TableBranchCatalog {
         };
         if reusable {
             let _ = self.upsert(keys::free_id(id), Vec::new());
+            // D200: off the UNRELEASED span, under the same lock and in the same sync as the
+            // free-list entry.
+            let _ = self.remove_if_present(&keys::unreleased(id));
             // Same as the others: release the lock before the fsync. Errors stay swallowed
             // to match the log catalog's signature -- a failure here leaks an id slot,
             // which is recoverable, while propagating would abort a reap midway.
@@ -1564,29 +1631,22 @@ impl BranchCatalog for TableBranchCatalog {
         }
     }
 
-    /// **D200.** A merge of two key spans, never a scan of every record: the `Reaped` STATE span
-    /// (ascending id) against the FREE_ID span (complemented, so descending; sorted here). Every
-    /// survivor's record is then read once, so a STATE key that outlived its state cannot put a
-    /// recycled, live slot on the list.
+    /// **D200.** One range scan of the UNRELEASED span: O(unreleased), never O(ever reaped).
+    ///
+    /// The first version merged the whole `Reaped` STATE span against the whole FREE_ID span at
+    /// every open, and a released slot stays `Reaped` until recycled, so a healthy open paid one
+    /// key per branch ever reaped (`d200_reap_releases_id_slots::a_healthy_open_reads_no_released_slot`).
+    /// A healthy catalog's span holds only its pinned reaped interiors; a crash can add the slot
+    /// it interrupted. Each entry's record is re-read, so only a `Reaped` slot is offered —
+    /// `Reaping` ones are the resume's, which runs first.
     fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
-        let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
-        let reaped = self.ids_in_span(lo, hi)?;
-        self.candidate_keys.fetch_add(reaped.len() as u64, Ordering::Relaxed);
-        let (flo, fhi) = keys::whole_group(keys::tag::FREE_ID);
-        let mut free: Vec<u64> = Vec::new();
-        for entry in self.tree.range_scan(Bound::Included(flo), Bound::Excluded(fhi))? {
-            let (k, _) = entry?;
-            if let Some(id) = keys::free_id_from_key(&k) {
-                self.candidate_keys.fetch_add(1, Ordering::Relaxed);
-                free.push(id);
-            }
-        }
-        free.sort_unstable();
+        let (lo, hi) = keys::whole_group(keys::tag::UNRELEASED);
         let mut out = Vec::new();
-        for id in reaped {
-            if id == 0 || free.binary_search(&id).is_ok() {
-                continue;
-            }
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, _) = entry?;
+            // The marker is not a slot.
+            let Some(id) = keys::unreleased_id_from_key(&k) else { continue };
+            self.candidate_keys.fetch_add(1, Ordering::Relaxed);
             if let Some(rec) = self.core(id)? {
                 if rec.state() == BranchState::Reaped {
                     out.push(id);
@@ -3038,6 +3098,69 @@ mod tests {
         //    the root it starts from.
         assert_eq!(held(), 0, "witnesses outlived their subtree");
         let _ = std::fs::remove_file(p);
+    }
+
+    /// **D200 — a catalog from before the UNRELEASED span gets it at its first open, and once.**
+    ///
+    /// The open sweep reads only that span, so a catalog written before it existed would hide
+    /// every slot the pre-D200 cascade leaked. The fixture builds the three shapes such a catalog
+    /// holds — leaked, freed, pinned — then deletes the span and its marker, which is exactly what
+    /// a pre-D200 file looks like, and reopens it from the file alone.
+    #[test]
+    fn a_catalog_from_before_the_unreleased_span_builds_it_once_at_open() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d200-unreleased-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = BranchId::TRUNK.id;
+        let reap = |c: &TableBranchCatalog, b: BranchId| {
+            c.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+        };
+        let (leaked, pinned) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let leaked = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            reap(&c, leaked.branch_id);
+            assert!(c.detach_child(t, leaked.fork_epoch).unwrap());
+            let freed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            reap(&c, freed.branch_id);
+            assert!(c.detach_child(t, freed.fork_epoch).unwrap());
+            c.release_id(freed.branch_id.id);
+            let pinned = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            let _kid = c.fork(pinned.branch_id, LeaseDeadline(100)).unwrap();
+            reap(&c, pinned.branch_id);
+
+            // Make it a pre-D200 file: no UNRELEASED key and no marker, durably.
+            let _g = c.logical.lock().unwrap();
+            for k in [
+                keys::unreleased(leaked.branch_id.id),
+                keys::unreleased(pinned.branch_id.id),
+                keys::unreleased_index_built(),
+            ] {
+                assert!(c.remove_if_present(&k).unwrap(), "fixture: set_state wrote no such key");
+            }
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            assert!(
+                c.unreleased_reaped_candidates().unwrap().is_empty(),
+                "fixture: the span must be empty, as in a catalog from before it"
+            );
+            (leaked.branch_id.id, pinned.branch_id.id)
+        };
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let mut got = c.unreleased_reaped_candidates().unwrap();
+        got.sort_unstable();
+        let mut want = vec![leaked, pinned];
+        want.sort_unstable();
+        assert_eq!(got, want, "the first open did not put every unreleased slot on the span");
+        assert!(c.tree.search(&keys::unreleased_index_built()).unwrap().is_some(), "no marker");
+
+        // ONCE: with the marker in place the build returns without writing.
+        let syncs = c.syncs_issued();
+        c.build_unreleased_index_if_missing().unwrap();
+        assert_eq!(c.syncs_issued(), syncs, "the build ran again on a catalog that already has it");
+        let _ = std::fs::remove_file(&path);
     }
 }
 
