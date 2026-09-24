@@ -59,7 +59,8 @@
 //! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
 //! the next write that fails. Since D224 a sender probes a link it has left idle before writing to
 //! it, and redials if the peer closed it ([`Transport::idle_probes`], [`Transport::idle_redials`]).
-//! So an idle close costs a frame only in the narrow race `idle_probe_gap` describes. The same is
+//! So an idle close costs frames (two, the first uncounted) only in the narrow race
+//! `idle_probe_gap` describes. The same is
 //! true of the receiving side. A connection closed on a frame with an
 //! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
 //! whatever the peer sends after it; of those closes, only the idle one is counted
@@ -1155,8 +1156,8 @@ pub struct TransportOptions {
     /// long stable term took an election round or two longer.
     ///
     /// Now the sender probes a link idle for half of this before its next write, and redials first
-    /// if the link is closed (`idle_probe_gap`). Both ends must run the same value for that to hold,
-    /// as every node does through `NodeOptions`.
+    /// if the link is closed (`idle_probe_gap`). For that to hold, no node's value may be below half
+    /// of another's. Nothing enforces it; every node in this repo runs this default.
     pub idle_deadline: Duration,
     /// Most bytes of undelivered inbound messages held before further ones are refused.
     ///
@@ -1911,7 +1912,9 @@ fn sender_loop(
     // whether the link is probed before the next write (D224; the gate is just before the write).
     let mut last_used = Instant::now();
     // A frame already taken from the queue whose link the probe found closed. It is written first on
-    // the next connection, so finding the close costs the frame nothing.
+    // the next connection, so finding the close costs the frame nothing. It sits outside the queue's
+    // drop-oldest bound while the peer is down, so on return the stalest frame goes first, against
+    // `push`'s policy. Consensus refuses a stale term, so one such frame is harmless.
     let mut carried: Option<Vec<u8>> = None;
     // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
     let probe_gap = idle_probe_gap(&opts);
@@ -1983,10 +1986,18 @@ fn sender_loop(
         // would not know: the frame would go into the closed connection and be lost with no number
         // attached, and only the next write would fail. Consensus leaves follower-to-follower links
         // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
-        // leader died. A link consensus keeps busy never reaches this gate, so it costs them nothing.
+        // leader died. A link consensus keeps busy never reaches this gate, so all it pays is two clock
+        // reads per frame: this one and the refresh after the write.
         if last_used.elapsed() >= probe_gap {
             counters.idle_probes.fetch_add(1, Ordering::SeqCst);
             if peer_has_closed(s) {
+                // A shutdown closes `st.live`, which shares this socket, so the probe sees its close
+                // too. Both shutdown paths set `stop` before they close it, so that close is always
+                // seen here with `stop` set: it is not a redial, and it is not counted as one. The
+                // frame is dropped uncounted, as the queue is at shutdown.
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 counters.idle_redials.fetch_add(1, Ordering::SeqCst);
                 let mut st = ob.state.lock().unwrap();
                 if let Some(old) = st.live.take() {
@@ -2036,17 +2047,31 @@ fn sender_loop(
 /// the default deadline this gate is 200 heartbeats away. A link that missed that many has lost its
 /// leader several election timeouts ago.
 ///
-/// **At most `idle_deadline`, so every link the peer may have closed is probed.** The peer closes a
-/// link only after hearing nothing for longer than its `idle_deadline`, counted from its last read,
-/// which is no earlier than this sender's last write. So a gap under this cannot have been closed.
-/// Premise, stated: both ends run the same `idle_deadline`, as every node does through
-/// `NodeOptions`.
+/// **At most the peer's `idle_deadline`, so every link the peer may have closed is probed.** The peer
+/// closes a link only after hearing nothing for longer than its `idle_deadline`, counted from its
+/// last read, which is no earlier than this sender's last write. So a gap under this cannot have
+/// been closed, as long as the peer's deadline is at least this gate.
 ///
-/// Half rather than all of it, so a link still open when probed is written to — which resets the
-/// peer's clock — well before the peer's close. What remains is a link whose gap lands within about
-/// one `poll_interval` and a round trip of the peer's close: the probe may see it open just before it
-/// closes, and one frame can still be lost uncounted. A follower-to-follower link idle for a whole
-/// term is far outside that window.
+/// **Premise, stated and not enforced: no node's `idle_deadline` is below half of another's.** That
+/// is the receiver's `D_r ≥ D_s / 2`, where `D_s` is this sender's; equal deadlines are not needed.
+/// The handshake carries no options, so nothing checks it, and in this repo every node runs the
+/// default. If it is violated, gaps between `D_r` and this gate are closed but never probed, and the
+/// pre-D224 loss returns for that band only. There is no new failure mode.
+///
+/// **Why half: tolerance, not a narrower race.** Half is what lets a peer's deadline be as low as half
+/// this one's. It does not narrow the race below, which sits at the peer's close wherever the gate
+/// is.
+///
+/// **The residual race.** A gap that lands within about one `poll_interval` and a round trip of the
+/// peer's close can be probed just before the close. The write then succeeds locally and is lost
+/// uncounted. It also refreshes the gap, so the next frame is not probed: it fails against the reset
+/// and is counted. That is two frames, the whole pre-D224 cost, at a small probability. A
+/// follower-to-follower link idle for a whole term is far outside that window.
+///
+/// **A restarted peer is caught only across a gap of at least this**, which in practice means an idle
+/// follower-to-follower link. It is not caught on a busy link, where it costs two heartbeats, nor
+/// when the peer restarts mid-election, when campaign frames go out under a second apart. A rebooted
+/// host sends nothing to find until this side writes.
 fn idle_probe_gap(opts: &TransportOptions) -> Duration {
     opts.idle_deadline / 2
 }
@@ -2054,9 +2079,13 @@ fn idle_probe_gap(opts: &TransportOptions) -> Duration {
 /// Whether the peer has closed this connection: asked without blocking and without consuming
 /// anything (D224).
 ///
-/// After the handshake the accepting side never writes, so the only readable states on a sender's
-/// socket are a FIN (`peek` returns 0) or an error (a reset). Nothing to read means the link is up.
-/// A socket that cannot be put back into blocking mode is treated as closed: the sender redials
+/// This side only ever writes to the link. The accepting side writes after the handshake on one
+/// path only: a refused handshake sends its own handshake, then an `Error` frame, then closes
+/// (`conn_loop`). `dial` reads just the six handshake bytes, so that frame stays unread for good, in
+/// front of the FIN. So every readable state means the link is closed or closing: a FIN (`peek`
+/// returns 0), a reset (an error), or unread bytes. Reading unread bytes as "alive" left the probe
+/// blind on such a link for good (the D224 review's F4). Nothing to read means the link is up. A
+/// socket that cannot be put back into blocking mode is treated as closed too: the sender redials
 /// rather than write through a socket in the wrong mode.
 fn peer_has_closed(s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() {
@@ -2065,8 +2094,9 @@ fn peer_has_closed(s: &TcpStream) -> bool {
     let mut probe = [0u8; 1];
     let closed = match s.peek(&mut probe) {
         Ok(0) => true,
-        // Bytes the peer should never have sent: whatever this is, the link is alive.
-        Ok(_) => false,
+        // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
+        // link. Either way the frame is carried to a redial, which costs it nothing.
+        Ok(_) => true,
         Err(e) => !matches!(
             e.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
