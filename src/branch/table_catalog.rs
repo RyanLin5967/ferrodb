@@ -828,29 +828,52 @@ impl TableBranchCatalog {
     /// written stays in the pool, where any later `durable` flushes it.
     ///
     /// **D264 (wall21 review audit 5, B2): so the move is ADDITIVE-FIRST.** The new STATE key, the
-    /// RECORD and the new DEADLINE key are written first, and only then are the old index keys
-    /// removed. This used to remove STATE(old) first, so an error before the RECORD upsert left a
-    /// record that NO state key named. A `Reaping` one torn that way was never resumed (the resume
-    /// enumerates the STATE span), never offered, never expired, and its parent read it as a live
-    /// child for ever. Now every error or crash point leaves at least one STATE key:
-    /// - before the RECORD is written: the record is in its OLD state, with both keys, so a
+    /// new DEADLINE key and the RECORD are written first, in that order, and only then are the old
+    /// index keys removed. This used to remove STATE(old) first, so an error before the RECORD
+    /// upsert left a record that NO state key named. A `Reaping` one torn that way was never
+    /// resumed (the resume enumerates the STATE span), never offered, never expired, and its parent
+    /// read it as a live child for ever. **Every ERROR point now leaves at least one STATE key**:
+    /// - before the RECORD is written: the record is in its OLD state, with both STATE keys, so a
     ///   `Reaping` one is still resumed;
     /// - after it: the record is in its NEW state, and the old key is stale. A stale `Reaping` key
     ///   on a `Reaped` record is audit 5's B5 shape: the resume refuses it (A3), and the sweep
     ///   releases the slot if it is keyed.
     ///
+    /// ⚠ **Crash points (audit 6 E5): the same holds only after a COMPLETE flush.** This orders
+    /// writes in the pool. A torn `flush_all` keeps a page-id prefix, and a concurrent
+    /// group-commit `durable` samples each page at its own moment, so either can persist STATE(old)'s
+    /// removal without STATE(new). That is the pre-existing class this file already states: every
+    /// crash argument here is an ordering argument between two `durable()` calls.
+    ///
+    /// **DEADLINE(new) comes BEFORE the RECORD (audit 6 E4).** A move INTO `Live` from an unindexed
+    /// state (`release_from_quarantine`, a fork's recycle) then never tears into a `Live` record
+    /// with no DEADLINE key, which would never expire. A DEADLINE key naming a record still in an
+    /// unindexed state is filtered by `expired_before`'s `in_deadline_index` re-check.
+    ///
     /// An old key EQUAL to its new key is never removed, since removing it after the upsert would
     /// delete the new one: `set_root`, `put` and a `renew_lease` that keeps its deadline rewrite
-    /// with the state unchanged. The cost of the order is a torn DEADLINE move, which now leaves a
-    /// stale EXTRA key instead of none. None meant the branch never expired. An extra key is
-    /// filtered by `expired_before`'s re-check, at one key read per scan, until the branch is next
-    /// rewritten out of `Live`. And the unlocked readers (`live_count`, `in_state`,
-    /// `expired_before`) can see a branch in BOTH spans mid-move where they used to see it in
-    /// NEITHER, so `live_count` can over-count by one instead of under-counting; the reaper
-    /// re-reads the record either way.
+    /// with the state unchanged.
     ///
-    /// ⚠ Merge note: D233, D235, lease-grace and D244 also touch this method. At every merge, keep
-    /// the order: no `remove_if_present(&keys::state(` before `upsert(keys::record(`.
+    /// **The costs of the order.**
+    /// - A torn index move leaves a stale EXTRA key where the old order left none.
+    /// - **A stale DEADLINE key is PERMANENT** (audit 6 E3). The old one's removal is keyed on the
+    ///   previous RECORD's deadline, so a key left by a torn renew is never named again. It costs
+    ///   one record read per lease scan. `expired_before` dedups by id, so it never duplicates a
+    ///   candidate row, which would otherwise be a spurious refusal on a healthy reap.
+    /// - A stale STATE key lasts until the record next enters that state and leaves it.
+    ///   `in_state` re-checks the record's state (E6); the resume refuses (A3); and the candidate
+    ///   query and the build re-check `Reaped`.
+    /// - `live_count` does not re-check, so it can over-count after a tear. It has no production
+    ///   consumer.
+    /// - The unlocked readers can see a branch in BOTH spans mid-move where they used to see it in
+    ///   NEITHER. The reaper re-reads the record either way.
+    ///
+    /// ⚠ Merge note (audit 6 Q5): only lease-grace rewrites this method's body; D233, D235 and D244
+    /// leave it as at `9aa6968`. At that merge:
+    /// - compute the new keys from the STORED record;
+    /// - compare deadline keys as `index_key` values;
+    /// - keep the order and the equal-key guard. No old STATE or DEADLINE removal may come before
+    ///   the RECORD upsert.
     fn write_record(
         &self,
         rec: &BranchRecord,
@@ -860,10 +883,10 @@ impl TableBranchCatalog {
         let new_deadline = Self::in_deadline_index(rec.state, rec.branch_id)
             .then(|| keys::deadline(rec.lease_deadline.0, rec.branch_id.id));
         self.upsert(new_state.clone(), Vec::new())?;
-        self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
         if let Some(k) = &new_deadline {
             self.upsert(k.clone(), Vec::new())?;
         }
+        self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
         if let Some(prev) = old {
             let old_state = keys::state(prev.state().as_u8(), prev.branch_id().id);
             if old_state != new_state {
@@ -1674,6 +1697,12 @@ impl BranchCatalog for TableBranchCatalog {
             }
         }
         out.sort_unstable_by_key(|r| r.branch_id().id);
+        // **E3 (wall21 review audit 6).** A torn renew leaves a stale DEADLINE key that nothing
+        // ever removes (`write_record`), and the re-check above reads the RECORD's deadline, not
+        // the key's, so both keys name the same live, expired record. One row per id: a second
+        // row would reach `reap_if_still_expired` after the first reap bumped the generation, and
+        // come back as a spurious refusal.
+        out.dedup_by_key(|r| r.branch_id().id);
         Ok(out)
     }
 
@@ -1682,7 +1711,13 @@ impl BranchCatalog for TableBranchCatalog {
         let mut out = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if let Some(rec) = self.core(id)? {
-                out.push(self.hydrate(rec)?);
+                // **E6 (wall21 review audit 6):** a STATE key can outlive its state (a torn move,
+                // D264), so the record is asked. Without this, `in_state(Quarantined)` (the
+                // `ferro_quarantine` view) listed a `Live` or a reaped branch as held. One
+                // comparison per row, as in `expired_before` and the candidate query.
+                if rec.state() == state {
+                    out.push(self.hydrate(rec)?);
+                }
             }
         }
         out.sort_unstable_by_key(|r| r.branch_id.id);

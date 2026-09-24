@@ -1079,19 +1079,30 @@ impl ArenaPageStore {
         free_epoch: Epoch,
     ) -> Result<u32, FerroError> {
         let mut released = 0u32;
+        // **Wall21 review audit 6 E1: the loop's two pure reads are the reaped slot's reads.** A
+        // non-`Branch` failure of either (one bad page, one bad leaf of this slot's CHILD span) is
+        // made `Branch` here by `reaper::one_slot_read`, so a resumed reap that meets it is that
+        // reap's refusal instead of a failed open. Unmapped, the reap stopped before its flip,
+        // the record stayed `Reaping`, and EVERY open failed on the same leaf. Absorbing a failure
+        // mid-loop is benign (audit 6 E8): `release_page` puts a page back into the OWNER's own
+        // extent, idempotently, and a `Reaping` owner allocates nothing, so nothing reaches
+        // another owner. `persist_if_configured` below is a WRITE and is not wrapped.
+        let slot = rec.branch_id.id;
+        // A `use`, not a `let`: a `let` would fix the generic `T` at its first call.
+        use crate::branch::reaper::one_slot_read as read;
         for arena in rec.arenas.iter().copied() {
             // **D85.** `allocated_pages` is `(0..next_free)`, so an understated `next_free` makes
             // this loop park NONE of a live child's pages. Probe first.
             self.resolve_fill(arena);
             for page_id in self.allocated_pages(arena) {
-                let birth = self.page_birth(page_id)?;
+                let birth = read(slot, "a page's birth epoch", self.page_birth(page_id))?;
                 // The reclamation rule as an index question rather than an array walk: is
                 // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
                 // structure that can answer it without holding every child resident.
-                if !self.catalog.live_child_in_epoch_range(
-                    rec.branch_id.id,
-                    birth,
-                    free_epoch,
+                if !read(
+                    slot,
+                    "the live children in a page's epoch window",
+                    self.catalog.live_child_in_epoch_range(slot, birth, free_epoch),
                 )? {
                     self.release_page(page_id, arena);
                     released += 1;

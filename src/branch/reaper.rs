@@ -80,9 +80,10 @@ const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 /// reclamation, and a reaper that stopped on the first oddity would be strictly worse than the bug
 /// this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the caller
 /// records it and moves to the next candidate. Only a non-`Branch` error still aborts. Since
-/// wall21 review audit 5, a failed READ about one slot inside a reap is a `Branch` error whatever
-/// its cause (`one_slot_read`), so what still aborts is a WRITE error: at open it fails the
-/// open (`resume_interrupted_reaps`).
+/// wall21 review audits 5 and 6, a failed READ at one of the six mapped read sites inside a reap
+/// is a `Branch` error whatever its cause (`one_slot_read` lists them). What still aborts is a
+/// WRITE error, or an unmapped read that fails with a non-`Branch` error (`set_state`'s own reads,
+/// the drain's). At open, either fails the open (`resume_interrupted_reaps`).
 ///
 /// ⚠ **Absorbing is not excusing.** Now that every refusal is an I/O error or a corrupt catalog,
 /// the sweep continuing is exactly why the count and the reason have to reach a reader — the
@@ -214,20 +215,26 @@ impl TwoTierReaper {
     /// ⚠ **W6 (wall21 review audit 3): "every" was false since C2a.** Each of these is a counted
     /// refusal ([`Self::refused_reaps`], reasons in [`Self::open_slot_refusals`]), and the open
     /// goes on:
-    /// - a resumed reap that fails on a `Branch` error: a check, or a failed READ about one slot,
-    ///   which `one_slot_read` makes `Branch` whatever its cause (C2a; A1 of audit 4, narrowed
-    ///   to reads by audit 5);
+    /// - a resumed reap that fails on a `Branch` error: a check, or a failed READ at one of the
+    ///   six mapped read sites, which `one_slot_read` makes `Branch` whatever its cause (C2a; A1
+    ///   of audit 4, narrowed to reads by audit 5, the slow path's two added by audit 6 E1). A
+    ///   non-`Branch` failure of an unmapped read (`set_state`'s, the drain's) fails the open, as
+    ///   at `0e3c36a`. Each fails ONE open only: a persistent fault there is met first by a mapped
+    ///   read of the same data, and the drain runs after the flip, so no later resume asks again
+    ///   (audit 6 E1);
     /// - a `Reaping` id whose record cannot be read, of any error type (W3, A1);
     /// - a `Reaping` STATE key whose record is in another state, which is never reaped (A3).
     ///
     /// **A WRITE error inside a resumed reap fails the whole call, as at `0e3c36a` (audit 5).**
     /// Audit 4's A1 absorbed those too, arguing that a unit stopped part-way is the state a crash
-    /// at that point leaves. That is false twice:
-    /// - `free_arena` gives an extent back in memory before its free record is durable, so an
-    ///   absorbed persist failure lets a later claim alias a range the durable map still gives to
-    ///   the owner (B1, D263);
-    /// - `write_record`'s index move could leave a record no STATE key names (B2, D264; fixed
-    ///   there by making the move additive-first).
+    /// at that point leaves. An absorbed write error is not that: it leaves memory ahead of disk,
+    /// and the open then goes on to act on it.
+    /// - `write_record`'s index move could leave a record that no STATE key names (audit 5 B2,
+    ///   D264, fixed there by making the move additive-first).
+    /// - Audit 5's B1 is the arena case: a free given back in memory before its record was
+    ///   durable. On the tree this lands on, D232 `52acba6` closes it. A free whose record fails
+    ///   to persist takes its range back, under the lock `reserve` holds, so it is a leak and not
+    ///   an alias. The narrowing rests on B2 and on the class, not on B1.
     ///
     /// A failed open exits without flushing either the catalog pool or the arena map, which is
     /// what a crash does.
@@ -349,13 +356,14 @@ impl TwoTierReaper {
         // `Reaping` is asked again at the next open.
         //
         // **Audit 5: READS only.** Audit 4's A1 absorbed every error type here, write errors
-        // included, as "the state a crash at that point leaves". That is false: an absorbed
-        // `free_arena` persist failure leaves memory ahead of the durable map (B1, D263), and the
-        // open then goes on to act on it. So the arm is `0e3c36a`'s again: a `Branch` error is a
-        // refusal, and anything else fails the open, exiting before either the catalog pool or
-        // the arena map is flushed, as a crash would. A failed READ about one slot inside the reap
-        // still reaches the first arm: `one_slot_read` makes it `Branch` at the read site, which
-        // is the one place that knows it was a read.
+        // included, as "the state a crash at that point leaves". An absorbed write error is not
+        // that: it leaves memory ahead of disk, and the open then goes on to act on it
+        // (`write_record`'s torn index move, audit 5 B2 / D264; the arena case, B1, is closed by
+        // D232 `52acba6` on the tree this lands on). So the arm is `0e3c36a`'s again: a `Branch`
+        // error is a refusal, and anything else fails the open, exiting before either the catalog
+        // pool or the arena map is flushed, as a crash would. A failed READ about one slot inside
+        // the reap still reaches the first arm: `one_slot_read` makes it `Branch` at the read
+        // site, which is the one place that knows it was a read.
         for b in interrupted {
             match self.reap(b) {
                 Ok(_) => done.push(b),
@@ -412,10 +420,12 @@ impl TwoTierReaper {
     /// # What fails the whole call (A1 of wall21 review audit 4, narrowed by audit 5)
     ///
     /// The candidate scan (`unreleased_reaped_candidates`, whose range scan is not about any one
-    /// slot), and a WRITE error in any slot's cascade or release. A failed READ about one slot —
-    /// its record, its liveness, a parent's record or an ancestor's liveness in its cascade — is
-    /// that slot's refusal whatever its cause, and the slot stays keyed. Audit 5 withdrew the
-    /// write half: an absorbed write error is not the state a crash leaves (B1, B2).
+    /// slot), and a WRITE error in any slot's cascade or release. A failed READ about one slot at
+    /// a site this sweep reaches — its record (the pre-read), and at the mapped sites its liveness,
+    /// a parent's record, and an ancestor's liveness in its cascade — is that slot's refusal
+    /// whatever its cause, and the slot stays keyed. Audit 5 withdrew the
+    /// write half: an absorbed write error is not the state a crash leaves (B2, D264; B1, the arena
+    /// case, is closed by D232 `52acba6` on the tree this lands on).
     ///
     /// # What it does per slot
     ///
@@ -862,20 +872,40 @@ impl TwoTierReaper {
 /// - A B-tree page failure is `Corruption` or `Io`, never `Branch`, so one bad leaf under one
 ///   slot failed every open.
 /// - Audit 4's A1 then absorbed every type, write errors included, which is not the state a crash
-///   leaves (B1: an absorbed `free_arena` persist failure lets a claim alias a range, D263).
+///   leaves: an absorbed write error leaves memory ahead of disk (audit 5 B2, D264). Audit 5's B1,
+///   the arena case, is closed by D232 `52acba6` on the tree this lands on.
 ///
 /// Only the read site knows it was a read, so the read site says so: a non-`Branch` error from one
 /// of these calls is wrapped into a `Branch` error that names the slot and keeps the cause at the
 /// END of its text, and a `Branch` error passes through unchanged. Writes are never wrapped.
 ///
-/// Applied at four sites: `reap`'s liveness question, `reclaim_slot`'s, and `detach_cascade`'s
-/// liveness question and parent-record read. NOT at `reap`'s own first `get_raw`: at open the
-/// resume reads the same record just before (a persistent fault is refused there), so a mapping
-/// behind it could not be tested; a transient fault between the two fails the open, the
-/// conservative direction. The steady-state lease scan sees the same change: a failed read at
-/// those sites is a counted refusal (`reap_if_still_expired` → `Refused`) instead of a scan error,
-/// and `scan_once` continues after either.
-fn one_slot_read<T>(id: u64, what: &str, read: Result<T, FerroError>) -> Result<T, FerroError> {
+/// **Applied at exactly six sites**, and nowhere else:
+/// - `reap`'s liveness question;
+/// - `reclaim_slot`'s;
+/// - `detach_cascade`'s liveness question;
+/// - `detach_cascade`'s parent-record read;
+/// - the slow path's two reads in `ArenaPageStore::retire_arenas_by_rule`: `page_birth` and the
+///   per-page `live_child_in_epoch_range` (audit 6 E1). Unmapped, one bad leaf there failed EVERY
+///   open, because the reap stopped before its flip and the record stayed `Reaping`.
+///
+/// **Not mapped, and why each fails at most ONE open (audit 6 E1):**
+/// - `reap`'s own first `get_raw`: the resume reads the same record just before, so a persistent
+///   fault is refused there, and a mapping behind it could not be tested.
+/// - `set_state`'s reads: a persistent fault is met first by a mapped read of the same data.
+/// - The drain's reads: the drain runs after the flip and the release, so no later resume asks
+///   again.
+///
+/// A transient fault at any of these fails the open, the conservative direction.
+///
+/// **The steady-state lease scan changes too, and not only in its report** (audit 6 corrected
+/// "only the report changes"). A mapped failure is `reap_if_still_expired` → `Refused`, after
+/// which `scan_once` moves on to the next candidate, where the `Err` it used to be stopped the
+/// scan.
+pub(crate) fn one_slot_read<T>(
+    id: u64,
+    what: &str,
+    read: Result<T, FerroError>,
+) -> Result<T, FerroError> {
     read.map_err(|e| match e {
         e @ FerroError::Branch(_) => e,
         e => FerroError::Branch(format!("could not read {what} of slot {id}: {e}")),

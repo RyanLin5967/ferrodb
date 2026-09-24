@@ -804,9 +804,10 @@ fn a_non_branch_error_at_open_is_that_slots_refusal() {
 }
 
 /// **Audit 5 (A1 narrowed to READS): a WRITE error inside a unit at open fails the open.** The
-/// wide A1 absorbed it as "a crash at that point", and audit 5 showed that is false twice: an
-/// absorbed `free_arena` persist failure leaves memory ahead of the durable map (B1, D263), and an
-/// absorbed `write_record` failure leaves a record no STATE key names (B2, D264). So a write error
+/// wide A1 absorbed it as "a crash at that point", and it is not one: an absorbed write error
+/// leaves memory ahead of disk. An absorbed `write_record` failure left a record that no STATE key
+/// names (B2, D264). Audit 5's B1, an absorbed `free_arena` persist failure, is closed by D232
+/// `52acba6` on the tree this lands on (audit 6 E2). So a write error
 /// inside a resumed reap (phase 1), or inside a swept slot's cascade (phase 2), must fail the open,
 /// as at `0e3c36a`. PRE-REGISTERED (lane §8.18): fails at phase 1's `expect_err` at `0c64402`.
 /// Kills M56 (phase 1) and M57 (phase 2).

@@ -265,10 +265,11 @@ pub trait BranchCatalog: Send + Sync {
     /// answer from the index alone, as `TableBranchCatalog` does.
     ///
     /// ⚠ **Not always the ids of `in_state` (audit 4 A6; this line said it was).**
-    /// `TableBranchCatalog`'s answer is a SUPERSET. It includes an id whose state key has no
-    /// record, which `in_state` skips, and an id whose record is now in another state, which
-    /// `in_state` returns anyway. So a caller re-reads each record and checks its state, as the
-    /// resume does (W3, A3).
+    /// `TableBranchCatalog`'s answer is a SUPERSET of `in_state`'s ids: it includes an id whose
+    /// state key has no record, and an id whose stale state key names a record now in another
+    /// state (a torn move, D264). `in_state` skips both; since wall21 review audit 6 E6 it
+    /// re-checks each record's state. So a caller of this method re-reads each record and checks
+    /// its state, as the resume does (W3, A3).
     fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
         Ok(self.in_state(state)?.into_iter().map(|r| r.branch_id.id).collect())
     }
