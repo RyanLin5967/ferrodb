@@ -17,13 +17,17 @@
 //!
 //!   branch_curve_writes [checkpoints,comma,separated] [threads] [byte_budget_gb]
 //!
-//! **READ-VS-N** (`bench/read_vs_n/PREREG.md`): `CURVE_ARMS=read,restart` switches to the
-//! PRODUCTION layout (the database is opened by the shipped binary's own `cli::open_database`, and
-//! each branch writes one row through `AgentRuntime::put_row`) and adds, at every checkpoint, arm 1
-//! (point-read cost against live N, with per-read census counters) and arm 3 (the full production
-//! open, timed in a fresh child process: this binary re-run as `--open-only <db>`). `CURVE_READ_K`
-//! sets reads per arm per thread count (default 16,384); `CURVE_FIRECHECK=<mode>` forces one guard
-//! to fire. Without `CURVE_ARMS` every line below runs the historical D61/D65 path unchanged.
+//! **READ-VS-N** (`bench/read_vs_n/PREREG.md`): `CURVE_ARMS=read,merge,restart` (any subset)
+//! switches to the PRODUCTION layout (the database is opened by the shipped binary's own
+//! `cli::open_database`, and each branch writes one row through `AgentRuntime::put_row`) and adds,
+//! at every checkpoint, arm 1 (point-read cost against live N, with per-read census counters),
+//! arm 2 axis (i) (K SQL `MERGE`s right after an open, so M is fixed while N grows) and arm 3 (the
+//! full production open, timed in a fresh child process: this binary re-run as
+//! `--open-only <db>`), then arm 2 axis (ii) after the last checkpoint (N fixed, M grows).
+//! `CURVE_READ_K` sets reads per arm per thread count (default 16,384); `CURVE_MERGE_K` merges per
+//! checkpoint (64); `CURVE_MERGE_M` axis (ii)'s M targets (256,1024,4096,16384);
+//! `CURVE_FIRECHECK=<mode>` forces one guard to fire. Without `CURVE_ARMS` every line below runs
+//! the historical D61/D65 path unchanged.
 //!
 //! **The byte budget is a refusal, not a tuning knob.** At 1 MiB/branch the 10⁶ point would need
 //! ~1 TiB, which no machine here has, and a benchmark that fills the disk takes the machine down
@@ -33,7 +37,8 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use ferrodb::agent_sql::runtime::{table_id, AgentRuntime};
+use ferrodb::agent_sql::dispatch::AgentOutput;
+use ferrodb::agent_sql::runtime::{merge_log_counters, table_id, AgentRuntime, StateSizes};
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::lease_thread::{scan_interval_from_env, CatalogLock};
 use ferrodb::branch::table_catalog::TableBranchCatalog;
@@ -45,7 +50,14 @@ use ferrodb::catalog::column::Value;
 use ferrodb::cli::cli::{open_database, OpenDatabase};
 use ferrodb::cow::page_header::PageType;
 use ferrodb::cow::{stamp_checksum, PageStore, PAGE_HEADER_SIZE};
+use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::index_scan::index_scan_counters;
+use ferrodb::execution::seq_scan::seq_scan_counters;
+use ferrodb::execution::session::Session;
+use ferrodb::parser::parser::Parser;
+use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
+use ferrodb::wal::log::FSYNC_CALLS;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::index_page::BPlusTreePage;
 
@@ -232,28 +244,25 @@ const PARENT_SCAN_INTERVAL: Duration = Duration::from_secs(86_400);
 #[derive(Clone, Copy, Debug)]
 struct Arms {
     read: bool,
+    merge: bool,
     restart: bool,
 }
 
 impl Arms {
-    /// `CURVE_ARMS=read,restart`. Refuses a name it does not know rather than running less than
-    /// was asked for, and refuses `merge`: arm 2 is not built (PREREG section 0).
+    /// `CURVE_ARMS=read,merge,restart`, any subset. Refuses a name it does not know rather than
+    /// running less than was asked for.
     fn from_env() -> Option<Arms> {
         let raw = std::env::var("CURVE_ARMS").ok()?;
-        let mut arms = Arms { read: false, restart: false };
+        let mut arms = Arms { read: false, merge: false, restart: false };
         for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match name {
                 "read" => arms.read = true,
+                "merge" => arms.merge = true,
                 "restart" => arms.restart = true,
-                "merge" => panic!(
-                    "CURVE_ARMS asks for `merge`, which is not built: arm 2 has no brief and no \
-                     pre-registration (bench/read_vs_n/PREREG.md section 0). Refusing rather than \
-                     running the other arms and letting the output look complete."
-                ),
-                other => panic!("CURVE_ARMS: unknown arm {other:?}; the arms are read, restart"),
+                other => panic!("CURVE_ARMS: unknown arm {other:?}; the arms are read, merge, restart"),
             }
         }
-        assert!(arms.read || arms.restart, "CURVE_ARMS={raw:?} names no arm");
+        assert!(arms.read || arms.merge || arms.restart, "CURVE_ARMS={raw:?} names no arm");
         Some(arms)
     }
 }
@@ -280,6 +289,16 @@ enum Fire {
     WrongArenas,
     /// H3: the parent expects one live branch more than it counted.
     WrongLive,
+    /// M1: every merge's branch is quarantined first, so it returns `Ok` having published nothing.
+    MergeQuarantined,
+    /// M2: axis (i) expects its batch to start at one applied entry, not zero.
+    WrongStart,
+    /// M3: the identity expects one visit more than the log held.
+    WrongVisits,
+    /// M4: the constant-delta check expects one op more than the first merge appended.
+    WrongDelta,
+    /// M5: the parent expects one live branch more after a merge batch than before it.
+    WrongLiveMerge,
 }
 
 impl Fire {
@@ -294,9 +313,16 @@ impl Fire {
             Ok("control-drift") => Fire::ControlDrift,
             Ok("wrong-arenas") => Fire::WrongArenas,
             Ok("wrong-live") => Fire::WrongLive,
+            Ok("merge-quarantined") => Fire::MergeQuarantined,
+            Ok("wrong-start") => Fire::WrongStart,
+            Ok("wrong-visits") => Fire::WrongVisits,
+            Ok("wrong-delta") => Fire::WrongDelta,
+            Ok("wrong-live-merge") => Fire::WrongLiveMerge,
             Ok(other) => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
-                 control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, wrong-live"
+                 control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
+                 wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
+                 wrong-live-merge"
             ),
         }
     }
@@ -811,6 +837,177 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
     }
 }
 
+// ---- ARM 2: MERGE against N and against M (PREREG amendment A3) --------------------------------
+
+/// The SQL table every merge publishes one NEW row into, created once on trunk.
+const MERGE_TABLE: &str = "m";
+/// Merges each axis-(ii) report averages: the last this many before its M target.
+const MERGE_BLOCK: usize = 64;
+
+/// One SQL statement, the way `run_cli`'s `execute_sql` runs it: parsed, then run under the
+/// statement lock with the database's own pool and transaction manager.
+fn exec_sql(db: &OpenDatabase, sess: &mut Session, sql: &str) -> Result<Outcome, String> {
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new())
+        .scan_tokens()
+        .map_err(|e| format!("{sql}: {e:?}"))?;
+    let mut parser = Parser::new(tokens);
+    let mut stmts = parser.parse();
+    if !parser.errors.is_empty() || stmts.is_empty() {
+        return Err(format!("{sql}: {:?}", parser.errors));
+    }
+    let mut cat = db.catalog.lock();
+    run(stmts.remove(0), &mut cat, db.bp.clone(), db.txn.clone(), sess).map_err(|e| format!("{sql}: {e}"))
+}
+
+/// What one `MERGE;` cost and did. Everything is bracketed around that statement ALONE: the
+/// session's `BEGIN` and `INSERT` are outside, and so are the `state_sizes` reads, which take the
+/// lock every statement takes.
+#[derive(Clone, Copy, Debug, Default)]
+struct MergeOne {
+    nanos: u128,
+    applied_to_target: bool,
+    before: StateSizes,
+    after: StateSizes,
+    attested_after: u64,
+    /// `highest_applied_seq`'s entries (Q1).
+    v_hi: u64,
+    /// `concurrent_op`'s reads through D86's index (Q3).
+    v_cell: u64,
+    seq_tuples: u64,
+    index_scans: u64,
+    fsyncs: u64,
+    census: ReadCensus,
+}
+
+/// One agent task: `BEGIN AGENT SESSION`, one INSERT of a row nobody has written, `MERGE;`.
+fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
+    let mut sess = Session::with_runtime(Arc::clone(&db.runtime));
+    exec_sql(db, &mut sess, &format!("BEGIN AGENT SESSION AS 'mc{id}';")).expect("begin");
+    exec_sql(db, &mut sess, &format!("INSERT INTO {MERGE_TABLE} VALUES ({id}, {id});"))
+        .expect("insert");
+    if fire == Fire::MergeQuarantined {
+        let b = sess.agent.as_ref().expect("an open agent session").branch;
+        db.runtime.quarantine(b, "READ-VS-N merge-quarantined fire check").expect("quarantine");
+    }
+    let before = db.runtime.state_sizes();
+    let (v0, c0) = merge_log_counters();
+    let seq0 = seq_scan_counters().1;
+    let ix0 = index_scan_counters().0;
+    let f0 = FSYNC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let census0 = this_thread();
+    let t = Instant::now();
+    let out = exec_sql(db, &mut sess, "MERGE;");
+    let nanos = t.elapsed().as_nanos();
+    let census = this_thread().since(&census0);
+    let fsyncs = FSYNC_CALLS.load(std::sync::atomic::Ordering::Relaxed) - f0;
+    let index_scans = index_scan_counters().0 - ix0;
+    let seq_tuples = seq_scan_counters().1 - seq0;
+    let (v1, c1) = merge_log_counters();
+    let after = db.runtime.state_sizes();
+    let applied_to_target =
+        matches!(&out, Ok(Outcome::Agent(AgentOutput::Merge(r))) if r.applied_to_target);
+    MergeOne {
+        nanos,
+        applied_to_target,
+        before,
+        after,
+        attested_after: db.runtime.attested_len() as u64,
+        v_hi: v1 - v0,
+        v_cell: c1 - c0,
+        seq_tuples,
+        index_scans,
+        fsyncs,
+        census,
+    }
+}
+
+/// The per-merge guards (PREREG A3: M1, M3, M4). `delta` holds the first merge's append count for
+/// the whole run, so M4 compares every merge against the same number.
+fn merge_guards(at: &str, one: &MergeOne, fire: Fire, delta: &mut Option<u64>, failures: &mut Vec<String>) {
+    if !one.applied_to_target {
+        failures.push(format!("M1 {at}: a MERGE did not reach the target, so it measured nothing"));
+        return;
+    }
+    let want_visits = one.before.applied as u64 + (fire == Fire::WrongVisits) as u64;
+    if one.v_hi != want_visits {
+        failures.push(format!(
+            "M3 {at}: highest_applied_seq visited {} entries of a {}-entry log",
+            one.v_hi, want_visits
+        ));
+    }
+    let appended = (one.after.applied - one.before.applied) as u64;
+    let first = *delta.get_or_insert(appended);
+    let want = first + (fire == Fire::WrongDelta) as u64;
+    if appended != want {
+        failures.push(format!("M4 {at}: this merge appended {appended} ops; the run's first appended {want}"));
+    }
+}
+
+/// One printed MERGE row: the per-merge MEANS of a batch (axis i) or of a block (axis ii).
+struct MergeRow {
+    axis: &'static str,
+    n: usize,
+    /// Merges published since the last open, at the end of the block.
+    m: usize,
+    ones: Vec<MergeOne>,
+}
+
+impl MergeRow {
+    fn mean(&self, f: impl Fn(&MergeOne) -> u64) -> f64 {
+        self.ones.iter().map(|o| f(o) as f64).sum::<f64>() / self.ones.len().max(1) as f64
+    }
+    fn ns_median(&self) -> f64 {
+        let mut v: Vec<u128> = self.ones.iter().map(|o| o.nanos).collect();
+        v.sort_unstable();
+        v.get(v.len() / 2).copied().unwrap_or(0) as f64
+    }
+}
+
+fn print_merge_header() {
+    println!(
+        "  MERGE axis        N        M  merges   ns/merge  ns median     V_hi   V_cell  d.applied  \
+         applied  captures   merges  versions  wkspaces  attested  seq tup  ix scans   fsyncs   \
+         c.desc  c.fault    c.att"
+    );
+}
+
+fn print_merge_row(r: &MergeRow) {
+    let last = r.ones.last().copied().unwrap_or_default();
+    println!(
+        "  MERGE {:>4} {:>8} {:>8} {:>7} {:>10.0} {:>10.0} {:>8.1} {:>8.2} {:>10.2} {:>8} {:>9} \
+         {:>8} {:>9} {:>9} {:>9} {:>8.2} {:>9.2} {:>8.2} {:>8.2} {:>8.3} {:>8.2}",
+        r.axis,
+        r.n,
+        r.m,
+        r.ones.len(),
+        r.mean(|o| o.nanos as u64),
+        r.ns_median(),
+        r.mean(|o| o.v_hi),
+        r.mean(|o| o.v_cell),
+        r.mean(|o| (o.after.applied - o.before.applied) as u64),
+        last.after.applied,
+        last.after.captures,
+        last.after.merges,
+        last.after.versions,
+        last.after.workspaces,
+        last.attested_after,
+        r.mean(|o| o.seq_tuples),
+        r.mean(|o| o.index_scans),
+        r.mean(|o| o.fsyncs),
+        r.mean(|o| o.census.descents),
+        r.mean(|o| o.census.faults),
+        r.mean(|o| o.census.attempts),
+    );
+}
+
+/// Close cleanly and reopen, so `State` — which lives in memory (`reopen_with_storage` builds
+/// `State::default()`) — starts empty: M = 0. Returns the new handles; the caller swaps them in.
+fn reopen_for_merges(db: OpenDatabase, db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
+    let (_, closed) = db.close();
+    closed.expect("close cleanly before a merge batch");
+    parent_open(db_path, failures)
+}
+
 /// `ln(b/a) / ln(nb/na)`: the local log-log slope between two checkpoints.
 fn slope(a: f64, b: f64, na: usize, nb: usize) -> f64 {
     (b / a).ln() / (nb as f64 / na as f64).ln()
@@ -826,6 +1023,13 @@ fn main() {
     let arms = Arms::from_env();
     let fire = Fire::from_env();
     let read_k: usize = std::env::var("CURVE_READ_K").ok().and_then(|v| v.parse().ok()).unwrap_or(16_384);
+    // Arm 2 (PREREG A3): K merges per checkpoint on axis (i), and the M targets of axis (ii).
+    let merge_k: usize = std::env::var("CURVE_MERGE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let merge_targets: Vec<usize> = std::env::var("CURVE_MERGE_M")
+        .unwrap_or_else(|_| "256,1024,4096,16384".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let checkpoints: Vec<usize> = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "1000,2000,4000,8000".into())
@@ -926,6 +1130,11 @@ fn main() {
     let mut read_rows: Vec<ReadRow> = Vec::new();
     let mut restart_rows: Vec<RestartRow> = Vec::new();
     let mut checkpoint_index = 0usize;
+    // Arm 2: every printed MERGE row, the next never-used row id, and the first merge's append
+    // count, which every later merge is held to (M4).
+    let mut merge_rows: Vec<MergeRow> = Vec::new();
+    let mut next_merge_row: i64 = 1;
+    let mut merge_delta: Option<u64> = None;
     if let (Some(arms), Some(rt), Some(statement_lock)) =
         (arms, hd.runtime.clone(), hd.statement_lock.clone())
     {
@@ -936,11 +1145,28 @@ fn main() {
                 .expect("seed trunk's row");
         }
         trunk_root = rt.root_of(BranchId::TRUNK).expect("trunk's root");
+        if arms.merge {
+            // Arm 2's target table, on trunk, through an ordinary session. Every merge publishes
+            // one new row into it (PREREG A3: an INSERT, not an UPDATE, so D178's scan is not on
+            // the path).
+            let mut plain = Session::with_runtime(Arc::clone(&rt));
+            exec_sql(
+                db.as_ref().expect("the production database is open"),
+                &mut plain,
+                &format!("CREATE TABLE {MERGE_TABLE} (id INTEGER NOT NULL, v INTEGER);"),
+            )
+            .expect("create the merge table");
+        }
         println!("READ-VS-N (bench/read_vs_n/PREREG.md). Built {}", ferrodb::build_provenance());
         println!(
-            "  arms: read={} restart={}   firecheck: {fire:?}   K = {read_k} reads per arm per thread \
-             count   read threads {READ_THREADS:?}   block {BLOCK}",
-            arms.read, arms.restart
+            "  arms: read={} merge={} restart={}   firecheck: {fire:?}   K = {read_k} reads per arm \
+             per thread count   read threads {READ_THREADS:?}   block {BLOCK}",
+            arms.read, arms.merge, arms.restart
+        );
+        println!(
+            "  merge arm: axis (i) {merge_k} merges per checkpoint, each after an open (M starts at 0); \
+             axis (ii) after the last checkpoint, M targets {merge_targets:?}, each reporting the last \
+             {MERGE_BLOCK} merges before it. One new row of table {MERGE_TABLE} per merge."
         );
         println!(
             "  layout: PRODUCTION, via ferrodb::cli::cli::open_database at {db_path_str}. Parent lease \
@@ -954,6 +1180,7 @@ fn main() {
         println!("  seed rule: splitmix64 from 0xD197<<48 ^ N<<16 ^ threads<<8 ^ thread");
         print_read_header();
         print_restart_header();
+        print_merge_header();
     }
 
     println!("D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. {threads} threads.");
@@ -1236,6 +1463,43 @@ fn main() {
                 print_restart_row(&row);
                 restart_rows.push(row);
             }
+            if arms.merge {
+                // Axis (i): N grows, M fixed. The batch must start on an EMPTY `State`, which
+                // lives in memory, so it runs right after an open: the restart arm's, or its own.
+                if !arms.restart {
+                    let open = db.take().expect("the production database is open");
+                    drop(hd);
+                    let reopened = reopen_for_merges(open, &db_path_str, &mut failures);
+                    hd = Handles::of(&reopened);
+                    db = Some(reopened);
+                }
+                let open = db.as_ref().expect("the production database is open");
+                let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
+                let start = open.runtime.state_sizes().applied;
+                if start != (fire == Fire::WrongStart) as usize {
+                    failures.push(format!(
+                        "M2 N={done}: the axis-(i) batch began with {start} applied entries, so M \
+                         was not held fixed"
+                    ));
+                }
+                let mut ones = Vec::with_capacity(merge_k);
+                for _ in 0..merge_k {
+                    let one = merge_cycle(open, next_merge_row, fire);
+                    next_merge_row += 1;
+                    merge_guards(&format!("axis i N={done}"), &one, fire, &mut merge_delta, &mut failures);
+                    ones.push(one);
+                }
+                let live_after = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
+                let want = live_before + (fire == Fire::WrongLiveMerge) as u64;
+                if live_after != want {
+                    failures.push(format!(
+                        "M5 N={done}: {live_after} live branches after the merge batch, {want} expected"
+                    ));
+                }
+                let row = MergeRow { axis: "i", n: done, m: ones.len(), ones };
+                print_merge_row(&row);
+                merge_rows.push(row);
+            }
             checkpoint_index += 1;
         }
 
@@ -1289,12 +1553,47 @@ fn main() {
             }
         }
     }
+    if arms.is_some_and(|a| a.merge) {
+        // ---- ARM 2, axis (ii): N fixed at the last checkpoint, M grows (PREREG A3) -------------
+        // One open, then merges up to each target. Nothing reopens in between, so `applied`,
+        // `captures` and `merges` only grow; each target reports the last MERGE_BLOCK merges.
+        let open = db.take().expect("the production database is open");
+        drop(hd);
+        let reopened = reopen_for_merges(open, &db_path_str, &mut failures);
+        hd = Handles::of(&reopened);
+        db = Some(reopened);
+        let open = db.as_ref().expect("the production database is open");
+        let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
+        let mut m_done = 0usize;
+        for &target in &merge_targets {
+            let mut block = Vec::new();
+            while m_done < target {
+                let one = merge_cycle(open, next_merge_row, fire);
+                next_merge_row += 1;
+                m_done += 1;
+                merge_guards(&format!("axis ii M={m_done}"), &one, fire, &mut merge_delta, &mut failures);
+                if m_done + MERGE_BLOCK > target {
+                    block.push(one);
+                }
+            }
+            let row = MergeRow { axis: "ii", n: done, m: m_done, ones: block };
+            print_merge_row(&row);
+            merge_rows.push(row);
+        }
+        let live_after = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
+        let want = live_before + (fire == Fire::WrongLiveMerge) as u64;
+        if live_after != want {
+            failures.push(format!(
+                "M5 axis ii: {live_after} live branches after {m_done} merges, {want} expected"
+            ));
+        }
+    }
     if let Some(arms) = arms {
         // D61's space verdict is about ITS layout. The production file also holds the SQL catalog
         // and a 32,736-page hole below the arena floor, so bytes/branch here is not its question.
         println!("(D61's space verdict is not printed: the production layout puts the arena above a");
         println!(" headroom region, so file bytes/branch is not the quantity that verdict judges.)");
-        read_vs_n_summary(arms, &read_rows, &restart_rows, fire, &mut failures, &mut ns_void);
+        read_vs_n_summary(arms, &read_rows, &restart_rows, &merge_rows, fire, &mut failures, &mut ns_void);
     }
     let code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
     if let Some(open) = db.take() {
@@ -1320,12 +1619,53 @@ fn read_vs_n_summary(
     arms: Arms,
     read_rows: &[ReadRow],
     restart_rows: &[RestartRow],
+    merge_rows: &[MergeRow],
     fire: Fire,
     failures: &mut Vec<String>,
     ns_void: &mut Vec<String>,
 ) {
     println!();
     println!("=== READ-VS-N SUMMARY ===================================================================");
+    if arms.merge {
+        // Arm 2. Axis (i) is read against N, axis (ii) against M; the slope columns are local
+        // log-log slopes from the previous row of the same axis.
+        for (axis, against) in [("i", "N"), ("ii", "M")] {
+            let rows: Vec<&MergeRow> = merge_rows.iter().filter(|r| r.axis == axis).collect();
+            println!("arm 2, axis ({axis}) — per-merge means, against {against}:");
+            println!("         N        M   ns/merge   slope     V_hi   slope(V_hi)   V_cell  captures  attested  seq tup  c.fault");
+            let mut prev: Option<(usize, f64, f64)> = None;
+            for r in &rows {
+                let x = if axis == "i" { r.n } else { r.m };
+                let (ns, vhi) = (r.mean(|o| o.nanos as u64), r.mean(|o| o.v_hi));
+                let (s_ns, s_v) = match prev {
+                    // A zero V_hi (the first rows of a batch) has no logarithm; say so, not NaN.
+                    Some((px, pns, pv)) if pv > 0.0 && vhi > 0.0 => (
+                        format!("{:>7.3}", slope(pns, ns, px, x)),
+                        format!("{:>13.3}", slope(pv, vhi, px, x)),
+                    ),
+                    Some((px, pns, _)) => (format!("{:>7.3}", slope(pns, ns, px, x)), format!("{:>13}", "-")),
+                    None => (format!("{:>7}", "-"), format!("{:>13}", "-")),
+                };
+                let last = r.ones.last().copied().unwrap_or_default();
+                println!(
+                    "  {:>8} {:>8} {:>10.0} {s_ns} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3}",
+                    r.n,
+                    r.m,
+                    ns,
+                    vhi,
+                    r.mean(|o| o.v_cell),
+                    last.after.captures,
+                    last.attested_after,
+                    r.mean(|o| o.seq_tuples),
+                    r.mean(|o| o.census.faults),
+                );
+                prev = Some((x, ns, vhi));
+            }
+            if rows.len() < 2 {
+                failures.push(format!("arm 2 axis ({axis}): {} row(s); one point is not a curve", rows.len()));
+            }
+        }
+    }
     if arms.read {
         for &t in &READ_THREADS {
             let rows: Vec<&ReadRow> = read_rows.iter().filter(|r| r.threads == t).collect();
