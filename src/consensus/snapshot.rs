@@ -1488,6 +1488,23 @@ impl SnapshotStore for PageStoreSnapshots {
             )));
         }
 
+        // **D212 (a') AMENDED 3, item 2 (review of `a71d3ed`, F3): a node with a REVERT history must
+        // hand its store to the install** (`with_history`), which replaces it with the sender's.
+        // Installed without it, the replaced database's history would stay beside the new rows, and
+        // the next checkpoint would declare it as theirs. Refused before anything is touched.
+        // ⚠ Stated: a store that has never written its file cannot be seen from here.
+        if self.history.is_none() {
+            let history = crate::wal::history::HistoryStore::path_for_database(&self.paths.page_file);
+            if history.exists() {
+                return Err(FerroError::Internal(format!(
+                    "{} is this node's REVERT history, and the install was not given its store \
+                     (`PageStoreSnapshots::with_history`); installing would leave the replaced \
+                     database's history beside the installed rows",
+                    history.display()
+                )));
+            }
+        }
+
         let dir = self.scratch.join(format!("install-{}", meta.last_round));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)
@@ -1616,11 +1633,10 @@ impl SnapshotStore for PageStoreSnapshots {
                 crate::wal::history::HistoryStore::records_through(&history, header.end_lsn)?;
             let (window, _) = crate::replication::decode_frames(header.start_lsn, &redo)?;
             let window: Vec<crate::wal::log::LogRecord> = window.into_iter().map(|(_, r)| r).collect();
-            records.extend(
-                crate::wal::history::committed_in(&window)?
-                    .into_iter()
-                    .filter(|r| r.commit_lsn < header.end_lsn),
-            );
+            // A transaction that began before the window cannot be reassembled from it and is dropped
+            // (`committed_in`): its record is in the shipped copy if it was pushed before the capture.
+            let (from_window, _began_before) = crate::wal::history::committed_in(&window)?;
+            records.extend(from_window.into_iter().filter(|r| r.commit_lsn < header.end_lsn));
             store.install(incarnation, floor, records)?;
         }
 

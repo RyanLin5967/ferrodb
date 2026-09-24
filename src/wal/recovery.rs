@@ -34,13 +34,20 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         }
     }
     // **AMENDED 3, item 10a: the store must be this database's.** The log declares its database's
-    // incarnation after every truncation (`TxnManager::declare_history`); a store that names another
-    // is refused here, before recovery writes anything. A log with no declaration (fresh, or never
-    // truncated since a store was attached) is not checked: stated, not covered.
+    // incarnation after every truncation and at the end of every open (`TxnManager::declare_history`);
+    // a store that names another is refused here, before recovery writes anything. Not checked,
+    // stated: a log written before this build, and a crash inside the open that first attaches a
+    // store, before its declaration is written.
     if let (Some(store), Some(declared)) =
         (txn.history_store(), crate::wal::history::declared_incarnation(&records))
     {
         store.adopt_or_check(declared)?;
+    }
+    // A log that holds nothing but incarnation declarations has nothing to recover (review of
+    // `a71d3ed`, F1): every truncation and every open writes one, and reading one as "recovered"
+    // would rebuild every index at every open.
+    if records.iter().all(|r| matches!(r.kind, RecKind::IncarnationDecl { .. })) {
+        return Ok(false);
     }
 
     // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
@@ -182,7 +189,15 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // F9; AMENDED 3, item 3). The open's checkpoint writes them. Each record carries its
     // transaction's `Commit` LSN (AMENDED 3, item 2); a transaction without one is not committed.
     // With no store attached, a log holding any was refused above (AMENDED 3, item 4).
-    let history = crate::wal::history::committed_in(&records)?;
+    let (history, dropped) = crate::wal::history::committed_in(&records)?;
+    if dropped > 0 {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: {dropped} committed transaction(s) in the log began before it, so their REVERT \
+             history cannot be read back; REVERT of those merges will be refused"
+        );
+    }
     if let Some(store) = txn.history_store() {
         store.enqueue(history);
     }
@@ -737,6 +752,12 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let mut dropped_tables: Vec<String> = dropped.into_iter().map(|(table, ..)| table).collect();
     dropped_tables.sort_unstable();
     dropped_tables.dedup();
+    // D212 (a') AMENDED 3, item 10a (review of `a71d3ed`, F5): the log this open leaves declares the
+    // history's incarnation, whether or not the checkpoint above truncated it. A log a pin kept, or a
+    // crash between a truncation and its declaration, would otherwise carry none, and the next open
+    // could not tell this database's history from another's. A log holding only declarations is not
+    // "recovered" (`recover`), so this costs the next open nothing.
+    txn.declare_history()?;
     Ok(OpenedDatabase {
         bp,
         wal,

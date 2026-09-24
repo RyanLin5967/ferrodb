@@ -205,6 +205,9 @@ struct StoreState {
     /// image, and declared into the log after every truncation (`TxnManager::declare_history`). 0
     /// until one is known: drawn at the first declaration, or adopted from the log's at the open.
     incarnation: u64,
+    /// The queued bytes past which the commit path next drains ([`HistoryStore::drain_if_due`]):
+    /// [`QUEUE_DRAIN_BYTES`], or double the queue after a failed attempt.
+    next_drain_at: usize,
     counters: HistoryCounters,
 }
 
@@ -302,6 +305,7 @@ impl HistoryStore {
             publishes_since_prune: held.saturating_sub(retention),
             floor,
             incarnation,
+            next_drain_at: QUEUE_DRAIN_BYTES,
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
         Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
@@ -517,10 +521,17 @@ impl HistoryStore {
     /// database's history. One full rewrite, under F3; on failure the store is unchanged, and the
     /// install's marker (`consensus::snapshot::install_marker`) refuses the node until it is re-seeded.
     /// The store takes the sender's incarnation (AMENDED 3, item 10a): the database is the sender's.
+    ///
+    /// Every installed record's Commit LSN becomes 0, "before this database's log": the LSNs it
+    /// carried are the sender's, and a later capture from this node compares against ITS `end_lsn`
+    /// (review of `a71d3ed`, F10). An image from a sender with no incarnation gets a fresh one here,
+    /// so no image this build writes carries 0 (F5).
     pub fn install(&self, incarnation: u64, floor: u64, records: Vec<HistoryRecord>) -> Result<(), FerroError> {
         let mut s = self.state.lock().unwrap();
+        let incarnation = if incarnation == 0 { fresh_incarnation() } else { incarnation };
         let mut kept: BTreeMap<u64, HistoryRecord> = BTreeMap::new();
-        for r in records.into_iter().filter(|r| r.hseq >= floor) {
+        for mut r in records.into_iter().filter(|r| r.hseq >= floor) {
+            r.commit_lsn = 0;
             kept.entry(r.hseq).or_insert(r);
         }
         let list: Vec<HistoryRecord> = kept.values().cloned().collect();
@@ -540,16 +551,42 @@ impl HistoryStore {
     }
 
     /// **Write `records` as the whole store at `path`**, for a restore with no store open (AMENDED 3,
-    /// item 2): one image, written through [`replace_atomically`].
+    /// item 2): one image, written through [`replace_atomically`], each record's Commit LSN set to 0
+    /// as [`HistoryStore::install`] sets it, and a fresh incarnation drawn when `incarnation` is 0.
+    /// Returns the incarnation written, which the restore declares into the restored log.
     pub fn write_image(
         path: &Path,
         incarnation: u64,
         floor: u64,
         records: &[HistoryRecord],
-    ) -> Result<(), FerroError> {
-        let image = encode_image(records, incarnation, floor)?;
+    ) -> Result<u64, FerroError> {
+        let incarnation = if incarnation == 0 { fresh_incarnation() } else { incarnation };
+        let records: Vec<HistoryRecord> =
+            records.iter().cloned().map(|r| HistoryRecord { commit_lsn: 0, ..r }).collect();
+        let image = encode_image(&records, incarnation, floor)?;
         replace_atomically(&OsFileOps, path, &image)
-            .map_err(|e| FerroError::Io(format!("writing {}: {e}", path.display())))
+            .map_err(|e| FerroError::Io(format!("writing {}: {e}", path.display())))?;
+        Ok(incarnation)
+    }
+
+    /// **The commit path's bounded drain, backing off while writes fail** (AMENDED 2, F7; review of
+    /// `a71d3ed`, F6). A drain when more than [`QUEUE_DRAIN_BYTES`] are queued. After a FAILED one,
+    /// the next attempt waits until the queue has doubled, so a store that keeps failing costs
+    /// O(queued bytes) in re-encoding over all attempts, not O(queued bytes) per commit. A success
+    /// resets the threshold. The failure itself is not the committing transaction's: the checkpoint
+    /// hook still refuses its truncation until a write succeeds.
+    pub fn drain_if_due(&self) -> Result<(), FerroError> {
+        let mut s = self.state.lock().unwrap();
+        let due = s.next_drain_at.max(QUEUE_DRAIN_BYTES);
+        if s.queued_bytes <= due {
+            return Ok(());
+        }
+        let result = self.drain_locked(&mut s);
+        s.next_drain_at = match &result {
+            Ok(()) => QUEUE_DRAIN_BYTES,
+            Err(_) => s.queued_bytes.saturating_mul(2),
+        };
+        result
     }
 }
 
@@ -731,13 +768,30 @@ pub(crate) fn declared_incarnation(records: &[crate::wal::log::LogRecord]) -> Op
 /// transaction with no `Commit` among them contributes nothing. Shared by the open's catch-up
 /// (`wal::recovery::recover`) and a snapshot install's re-queue of its redo window, so the two
 /// cannot disagree about what "committed" means.
-pub(crate) fn committed_in(records: &[crate::wal::log::LogRecord]) -> Result<Vec<HistoryRecord>, FerroError> {
+///
+/// **Only transactions whose `Begin` is among `records`** (review of `a71d3ed`, F4 and F9): a
+/// transaction that began before them may have parts before them too, so its record cannot be
+/// reassembled here. A snapshot's redo window starts wherever the sender's backup began, and a log
+/// whose truncation raced a transaction (the D253 hazard, closed by its fence) can hold the tail of
+/// one. Such a transaction's history is DROPPED, not refused: refusing would fail every open and
+/// every install for ever. The second value counts the transactions dropped, so a caller can say so.
+pub(crate) fn committed_in(
+    records: &[crate::wal::log::LogRecord],
+) -> Result<(Vec<HistoryRecord>, usize), FerroError> {
     use crate::wal::log::RecKind;
-    let commit_lsns: std::collections::HashMap<u64, u64> =
+    use std::collections::{HashMap, HashSet};
+    let commit_lsns: HashMap<u64, u64> =
         records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| (r.txn_id, r.lsn)).collect();
+    let begun: HashSet<u64> =
+        records.iter().filter(|r| matches!(r.kind, RecKind::Begin)).map(|r| r.txn_id).collect();
+    let mut dropped: HashSet<u64> = HashSet::new();
     let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
         .iter()
         .filter_map(|r| match (&r.kind, commit_lsns.get(&r.txn_id)) {
+            (RecKind::RevertHistory { .. }, Some(_)) if !begun.contains(&r.txn_id) => {
+                dropped.insert(r.txn_id);
+                None
+            }
             (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) => {
                 Some((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()))
             }
@@ -745,9 +799,9 @@ pub(crate) fn committed_in(records: &[crate::wal::log::LogRecord]) -> Result<Vec
         })
         .collect();
     if parts.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), dropped.len()));
     }
-    assemble(parts)
+    Ok((assemble(parts)?, dropped.len()))
 }
 
 /// **Reassemble tag-12 WAL parts into records**, for the open's catch-up.
@@ -1209,5 +1263,59 @@ mod tests {
         let s = open_in(&dir, 8);
         let kept: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
         assert_eq!(kept, [3, 4], "a pruned record came back from the log");
+    }
+
+    /// **Review of `a71d3ed`, F6.** While every write fails, the commit path's drain backs off: its
+    /// attempts grow with the log of the queue, not with the commits.
+    ///
+    /// Mutant: `drain_if_due` keeps its threshold at `QUEUE_DRAIN_BYTES` after a failure — one
+    /// attempt, re-encoding the whole queue, per commit past it.
+    #[test]
+    fn a_failing_store_is_retried_on_the_commit_path_only_as_the_queue_doubles() {
+        struct RenameFails;
+        impl FileOps for RenameFails {
+            fn write(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { OsFileOps.write(p, b) }
+            fn append(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { OsFileOps.append(p, b) }
+            fn sync_file(&self, p: &std::path::Path) -> std::io::Result<()> { OsFileOps.sync_file(p) }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected: every rename fails"))
+            }
+            fn sync_dir(&self, d: &std::path::Path) -> std::io::Result<()> { OsFileOps.sync_dir(d) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::open_with_ops(dir.path().join("f.history"), 8, Box::new(RenameFails)).unwrap();
+        let body = QUEUE_DRAIN_BYTES / 8;
+        for h in 1..=128u64 {
+            s.enqueue(vec![HistoryRecord { hseq: h, ordinal: h, commit_lsn: 0, body: vec![0; body] }]);
+            let _ = s.drain_if_due();
+        }
+        let failed = s.counters().failed_drains;
+        assert!(failed >= 1, "anti-vacuity: the queue never passed the threshold");
+        assert!(failed <= 6, "{failed} failed drains over 128 commits: the commit path retried at every commit");
+    }
+
+    /// **Review of `a71d3ed`, F4 and F9.** A committed transaction whose `Begin` is not among the
+    /// records (a snapshot's redo window that starts inside it, or a log whose truncation raced it)
+    /// is dropped and counted, not refused: refusing would fail every open or install for ever.
+    ///
+    /// Mutant: the `Begin` filter removed — `assemble` refuses part 1 without part 0.
+    #[test]
+    fn a_transaction_that_began_before_the_records_is_dropped_not_refused() {
+        use crate::wal::log::{LogRecord, RecKind};
+        let rec = |lsn: u64, txn_id: u64, kind: RecKind| LogRecord { lsn, prev_lsn: 0, txn_id, kind };
+        let part = |hseq: u64, part: u32| RecKind::RevertHistory { hseq, ordinal: hseq, part, last: true, bytes: vec![1] };
+        let records = vec![
+            // Txn 5's Begin and part 0 precede these records.
+            rec(10, 5, part(1, 1)),
+            rec(20, 5, RecKind::Commit),
+            rec(30, 6, RecKind::Begin),
+            rec(40, 6, part(2, 0)),
+            rec(50, 6, RecKind::Commit),
+        ];
+        let (history, dropped) =
+            committed_in(&records).expect("records starting inside a transaction were refused");
+        assert_eq!(dropped, 1, "the transaction that began before the records was not counted");
+        let got: Vec<(u64, u64)> = history.iter().map(|r| (r.hseq, r.commit_lsn)).collect();
+        assert_eq!(got, [(2, 50)]);
     }
 }

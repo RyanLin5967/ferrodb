@@ -92,8 +92,8 @@ fn an_install_carries_the_senders_revert_history() {
     );
 }
 
-/// [`engine_at`], with a REVERT history store attached and one page written, so a capture has an
-/// image to take (`backup::take` refuses a zero-page one).
+/// [`engine_at`], with a REVERT history store attached and one page written beyond the allocation
+/// bitmap, as `integration_cluster_snapshot.rs` seeds its engines before a capture.
 fn engine_with_history(dir: &Path, tag: &str, history: Arc<HistoryStore>) -> Box<PageStoreSnapshots> {
     let page_file = dir.join(format!("{tag}.db"));
     let file = std::fs::OpenOptions::new()
@@ -168,6 +168,11 @@ fn a_capture_ships_the_queued_history_and_nothing_past_its_end() {
 
     let hseqs = |s: &HistoryStore| s.records().iter().map(|r| r.hseq).collect::<Vec<u64>>();
     assert_eq!(hseqs(&held), [1, 2], "the receiver's history is not the sender's cut at end_lsn");
+    // Review of `a71d3ed`, F10: installed records sit before the receiver's own log.
+    assert!(
+        held.records().iter().all(|r| r.commit_lsn == 0),
+        "an installed record kept the sender's LSN, which the receiver's next capture would misread"
+    );
     let reopened = HistoryStore::open(dst.path().join("dst.db.history"), 8).unwrap();
     assert_eq!(hseqs(&reopened), [1, 2], "the installed history is not durable");
 }
@@ -235,6 +240,29 @@ fn an_install_requeues_the_redo_windows_committed_history() {
     std::fs::write(&spool, with_window.payload()).unwrap();
     to.install(&with_window.meta, &spool).expect("install failed");
 
+    // Installed records sit before the receiver's own log (review of `a71d3ed`, F10), so the
+    // window's Commit LSN is not what the store keeps.
     let got: Vec<(u64, u64)> = held.records().iter().map(|r| (r.hseq, r.commit_lsn)).collect();
-    assert_eq!(got, [(5, commit)], "the install did not take exactly the window's committed history");
+    assert_eq!(got, [(5, 0)], "the install did not take exactly the window's committed history");
+}
+
+/// **Review of `a71d3ed`, F3.** An install into a node that keeps a REVERT history, made without that
+/// store (`with_history`), is refused before anything is touched: it would leave the replaced
+/// database's history beside the installed rows.
+///
+/// Mutant: the install's store check removed — the install succeeds.
+#[test]
+fn an_install_without_the_nodes_history_store_is_refused() {
+    let src = tempfile::tempdir().unwrap();
+    let sent = HistoryStore::open(src.path().join("src.db.history"), 8).unwrap();
+    let mut from = engine_with_history(src.path(), "src", Arc::clone(&sent));
+    let dst = tempfile::tempdir().unwrap();
+    let mut to = engine_at(dst.path(), "dst");
+    HistoryStore::write_image(&dst.path().join("dst.db.history"), 0, 0, &[]).unwrap();
+    let at = SnapshotPoint { last_round: 1, last_term: 1, config: Config::new(IDS, 1, 0), base_digest: 0 };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    let err = to.install(&snap.meta, &spool).expect_err("an install left the node's own history in place");
+    assert!(err.to_string().contains("REVERT history"), "refused, but not for the history: {err}");
 }

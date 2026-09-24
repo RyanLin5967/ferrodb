@@ -283,8 +283,11 @@ pub fn restore(dir: &Path, dest: &Path) -> Result<BackupLabel, FerroError> {
 /// store's queue drained and its window copied (`HistoryStore::capture`) AFTER the label's `end_lsn`
 /// was read, so every record committed below it that had been pushed is in the copy. A record
 /// committed later rides along and is cut by [`restore_with_history`]. The one `capture` names as not
-/// covered (committed below `end_lsn`, not yet pushed) is missing here too; the replica's own log
-/// carries it once it streams past `start_lsn`, if its parts are in that range.
+/// covered (committed below `end_lsn`, not yet pushed) is missing here: REVERT of it is refused on the
+/// restored copy.
+///
+/// **A failed history write removes the label** (review of `a71d3ed`, F8), so the directory never
+/// looks like a complete backup without its history.
 pub fn take_with_history(
     bp: &Arc<BufferPoolManager>,
     wal: &Arc<WalManager>,
@@ -292,31 +295,59 @@ pub fn take_with_history(
     dir: &Path,
 ) -> Result<BackupHandle, FerroError> {
     let handle = take(bp, wal, dir)?;
-    let image = history.capture()?;
-    let path = dir.join(HISTORY_IMAGE);
-    let mut f = std::fs::File::create(&path)
-        .map_err(|e| FerroError::Io(format!("create {}: {e}", path.display())))?;
-    f.write_all(&image).map_err(|e| FerroError::Io(format!("write the backup's history: {e}")))?;
-    f.sync_all().map_err(|e| FerroError::Io(format!("fsync the backup's history: {e}")))?;
+    let written = history.capture().and_then(|image| {
+        let path = dir.join(HISTORY_IMAGE);
+        let mut f = std::fs::File::create(&path)
+            .map_err(|e| FerroError::Io(format!("create {}: {e}", path.display())))?;
+        f.write_all(&image).map_err(|e| FerroError::Io(format!("write the backup's history: {e}")))?;
+        f.sync_all().map_err(|e| FerroError::Io(format!("fsync the backup's history: {e}")))
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(dir.join(BACKUP_LABEL));
+        return Err(e);
+    }
     Ok(handle)
 }
 
-/// [`restore`], and the backup's REVERT history written to `history_dest` cut at the label's
+/// [`restore`], and the backup's REVERT history written to `<dest>.history` cut at the label's
 /// `end_lsn` (D212 (a') AMENDED 3, item 2): the history of exactly the rows the restored image holds
 /// once replay reaches `end_lsn`. A record committed later belongs to rows the image does not have,
-/// and a REVERT of it would invert writes that were never restored. A backup taken without history
-/// restores an EMPTY history, replacing whatever `history_dest` held: that belonged to the database
-/// being replaced.
-pub fn restore_with_history(dir: &Path, dest: &Path, history_dest: &Path) -> Result<BackupLabel, FerroError> {
+/// and a REVERT of it would invert writes that were never restored.
+///
+/// Review of `a71d3ed`, F2 and F8:
+/// - **Refuses a backup with no history** (one taken with [`take`], or whose history write failed):
+///   restoring it here would read a failure as a choice. Use [`restore`] for such a backup.
+/// - **Refuses a destination whose log holds records**: they are the replaced database's, and
+///   `open_recovered` would replay them over the restored pages.
+/// - **Creates `<dest>.wal` and declares the history's incarnation in it**, so the first
+///   `open_recovered` finds a log that is not fresh (a fresh one moves `<dest>.history` aside, item
+///   10b) and whose declaration matches the restored store (item 10a). The log is created BEFORE
+///   the history is written, so the move a fresh log makes takes only an earlier file.
+pub fn restore_with_history(dir: &Path, dest: &Path) -> Result<BackupLabel, FerroError> {
+    let bytes = std::fs::read(dir.join(HISTORY_IMAGE)).map_err(|e| {
+        FerroError::Io(format!(
+            "this backup carries no REVERT history ({e}); it was taken without one or its history write \
+             failed. Restore it with `restore` instead, which leaves the destination with no history"
+        ))
+    })?;
+    let mut wal_path = dest.as_os_str().to_os_string();
+    wal_path.push(".wal");
+    let wal_path = PathBuf::from(wal_path);
+    if std::fs::metadata(&wal_path).map(|m| m.len() > 0).unwrap_or(false) {
+        return Err(FerroError::Io(format!(
+            "{} holds a log, which belongs to the database this restore would replace; the first open \
+             would replay it over the restored pages. Move it away first",
+            wal_path.display()
+        )));
+    }
     let label = restore(dir, dest)?;
-    let bytes = match std::fs::read(dir.join(HISTORY_IMAGE)) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(FerroError::Io(format!("read the backup's history: {e}"))),
-    };
+    let wal = WalManager::new(wal_path)?;
     let (incarnation, floor, records) =
         crate::wal::history::HistoryStore::records_through(&bytes, label.end_lsn)?;
-    crate::wal::history::HistoryStore::write_image(history_dest, incarnation, floor, &records)?;
+    let history = crate::wal::history::HistoryStore::path_for_database(dest);
+    let incarnation = crate::wal::history::HistoryStore::write_image(&history, incarnation, floor, &records)?;
+    wal.append(0, 0, &crate::wal::log::RecKind::IncarnationDecl { incarnation })?;
+    wal.flush()?;
     Ok(label)
 }
 
@@ -591,10 +622,37 @@ mod tests {
         let dest = p.dir.join("restored.db");
         let dest_history = p.dir.join("restored.db.history");
         HistoryStore::write_image(&dest_history, 0, 0, &[rec(9, 0)]).unwrap();
-        restore_with_history(&out, &dest, &dest_history).unwrap();
+        restore_with_history(&out, &dest).unwrap();
 
         let restored = HistoryStore::open(&dest_history, 8).unwrap();
         let hseqs: Vec<u64> = restored.records().iter().map(|r| r.hseq).collect();
         assert_eq!(hseqs, [1, 2], "the restored history is not the primary's cut at end_lsn");
+
+        // Review of `a71d3ed`, F2: the first open's log is not fresh, so it does not move the restored
+        // history aside, and it declares the restored history's incarnation.
+        let reopened = WalManager::new(p.dir.join("restored.db.wal")).unwrap();
+        let hseqs: Vec<u64> =
+            HistoryStore::open(&dest_history, 8).unwrap().records().iter().map(|r| r.hseq).collect();
+        assert_eq!(hseqs, [1, 2], "opening the restored log moved the restored history aside");
+        let (mut lsn, end) = (
+            reopened.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            reopened.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let mut declared = 0;
+        while lsn < end {
+            let (r, next) = reopened.read_record(lsn).unwrap();
+            if matches!(r.kind, RecKind::IncarnationDecl { .. }) {
+                declared += 1;
+            }
+            lsn = next;
+        }
+        assert_eq!(declared, 1, "the restored log does not declare the restored history's incarnation");
+
+        // F8: a backup whose history is missing is refused, not restored as "no history".
+        std::fs::remove_file(out.join(HISTORY_IMAGE)).unwrap();
+        assert!(
+            restore_with_history(&out, &p.dir.join("again.db")).is_err(),
+            "a backup without its history was restored as one with none"
+        );
     }
 }

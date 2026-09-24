@@ -933,7 +933,7 @@ impl TxnManager {
     /// image or declaration). The open reads the last one back and refuses a store that names another
     /// (`HistoryStore::adopt_or_check`). Nothing without a store. Cost: one fixed-size record (a
     /// u64 payload) and one flush per truncation.
-    fn declare_history(&self) -> Result<(), FerroError> {
+    pub(crate) fn declare_history(&self) -> Result<(), FerroError> {
         let Some(store) = self.history.get() else { return Ok(()) };
         let incarnation = store.incarnation();
         self.wal.append(0, 0, &RecKind::IncarnationDecl { incarnation })?;
@@ -1015,9 +1015,7 @@ impl TxnManager {
                 // the log is safe (the open keys on `hseq`). A failed drain leaves the queue for the
                 // checkpoint hook, which refuses its truncation until a write succeeds; it is not
                 // this committed transaction's failure.
-                if store.queued_bytes() > crate::wal::history::QUEUE_DRAIN_BYTES {
-                    let _ = store.drain();
-                }
+                let _ = store.drain_if_due();
             }
         }
         // **D213: decided, so the space its deletes held for their undo is free now.** After the
