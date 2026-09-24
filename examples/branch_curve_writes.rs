@@ -18,12 +18,13 @@
 //!   branch_curve_writes [checkpoints,comma,separated] [threads] [byte_budget_gb]
 //!
 //! **READ-VS-N** (`bench/read_vs_n/PREREG.md`): `CURVE_ARMS=read,merge,restart` (any subset)
-//! switches to the PRODUCTION layout (the database is opened by the shipped binary's own
-//! `cli::open_database`, and each branch writes one row through `AgentRuntime::put_row`) and adds,
+//! switches to the PRODUCTION layout (the database is created by the shipped binary's own `run_cli`
+//! and reopened through D204's `open_recovered`, and each branch writes one row through
+//! `AgentRuntime::put_row`) and adds,
 //! at every checkpoint, arm 1 (point-read cost against live N, with per-read census counters),
 //! arm 2 axis (i) (K SQL `MERGE`s right after an open, so M is fixed while N grows) and arm 3 (the
-//! full production open, timed in a fresh child process: this binary re-run as
-//! `--open-only <db>`), then arm 2 axis (ii) after the last checkpoint (N fixed, M grows).
+//! full production open, timed in a fresh child process: this binary re-run as `--open-only <db>`,
+//! which calls `run_cli` itself), then arm 2 axis (ii) after the last checkpoint (N fixed, M grows).
 //! `CURVE_READ_K` sets reads per arm per thread count (default 16,384); `CURVE_MERGE_K` merges per
 //! checkpoint (64); `CURVE_MERGE_M` axis (ii)'s M targets (256,1024,4096,16384);
 //! `CURVE_FIRECHECK=<mode>` forces one guard to fire. Without `CURVE_ARMS` every line below runs
@@ -34,20 +35,22 @@
 //! with it. It stops at the budget and SAYS SO, naming the N it reached. "Stopped early on space" is
 //! the result, not a failure of the run — and if it does NOT stop early, that kills D31, which is
 //! the outcome D31's own falsifier asks for.
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use ferrodb::agent_sql::dispatch::AgentOutput;
 use ferrodb::agent_sql::runtime::{merge_log_counters, table_id, AgentRuntime, StateSizes};
 use ferrodb::branch::arena::ArenaPageStore;
-use ferrodb::branch::lease_thread::{scan_interval_from_env, CatalogLock};
+use ferrodb::branch::lease_thread::{passes_finished, CatalogLock, LeaseThread, RuntimeLock};
+use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::types::{BranchId, LeaseDeadline, PageId, ARENA_EXTENT_PAGES};
-use ferrodb::branch::BranchCatalog;
+use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::buffer::read_census::{this_thread, ReadCensus};
 use ferrodb::catalog::column::Value;
-use ferrodb::cli::cli::{open_database, OpenDatabase};
+use ferrodb::cli::cli::{last_open_report, run_cli};
 use ferrodb::cow::page_header::PageType;
 use ferrodb::cow::{stamp_checksum, PageStore, PAGE_HEADER_SIZE};
 use ferrodb::execution::executor::{run, Outcome};
@@ -57,7 +60,12 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
+use ferrodb::error::FerroError;
+use ferrodb::storage::db_lock::DbLock;
+use ferrodb::tel::DurableEffectLog;
 use ferrodb::wal::log::FSYNC_CALLS;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
+use ferrodb::wal::txn::TxnManager;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::index_page::BPlusTreePage;
 
@@ -419,8 +427,111 @@ fn catalog_height(cat: &TableBranchCatalog) -> u64 {
     }
 }
 
+/// **A COPY of `run_cli`'s open, for the PARENT'S SETUP only. Nothing it does is reported as a
+/// result.**
+///
+/// The lead's decision (PREREG A5): ONE open path. `wal::recovery::open_recovered`, D204's
+/// bootstrap, is called here, not re-spelled. The half after it — branch catalog, arena, `.tel`,
+/// runtime, `.provenance`, reaper, lease thread — exists as shipped code only inside `run_cli`, which
+/// is a REPL and hands out no handles, while arms 1 and 2 need handles. So the parent re-spells that
+/// half, in `run_cli`'s REOPEN form only: it refuses a database with no arena checkpoint, so every
+/// database this harness opens was CREATED by `run_cli` itself (the child; see [`run_child`]).
+///
+/// ⚠ Its blind spot, stated where it lives: when `run_cli` changes, this copy does not. The MEASURED
+/// open (arm 3) is the child running `run_cli`, so a drift cannot mismeasure the restart. What it can
+/// do is make arms 1 and 2 run on a runtime wired differently from the binary's. The steps and their
+/// order are `run_cli`'s as of `00f4c39`: diff the two when either moves.
+struct HarnessDb {
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    /// The per-statement lock, shared with the lease thread, as in `run_cli`.
+    catalog: Arc<CatalogLock>,
+    branches: Arc<TableBranchCatalog>,
+    store: Arc<ArenaPageStore>,
+    runtime: Arc<AgentRuntime>,
+    lease: LeaseThread,
+    arena_path: String,
+    /// This copy's own open time and lease start: printed as a warm-process comparison, never a
+    /// result.
+    total: Duration,
+    lease_start: Duration,
+    /// `passes_finished()` when this open began, so `wait_first_pass` scopes the process-wide count
+    /// to THIS open's lease thread.
+    passes_at_open: u64,
+    /// LAST, so every handle above is gone before the lock file is.
+    _lock: DbLock,
+}
+
+impl HarnessDb {
+    /// `run_cli`'s shutdown, in its order: stop the lease scan, checkpoint the WAL (which flushes the
+    /// pool), write the arena checkpoint.
+    fn close(self) -> Result<(), FerroError> {
+        let _ = self.lease.stop();
+        self.txn.checkpoint()?;
+        self.store.checkpoint(Path::new(&self.arena_path))
+    }
+}
+
+/// See [`HarnessDb`]. The reopen half of `run_cli`, with `interval` for the lease scan.
+fn harness_open(db_path: &str, interval: Duration) -> Result<HarnessDb, FerroError> {
+    let passes_at_open = passes_finished();
+    let t_total = Instant::now();
+    let lock = DbLock::acquire(Path::new(db_path))?;
+    let OpenedDatabase { bp, txn, catalog, .. } = open_recovered(Path::new(db_path), &lock)?;
+    let arena_path = format!("{db_path}.arena");
+    if !Path::new(&arena_path).exists() {
+        return Err(FerroError::Io(format!(
+            "{arena_path} is missing. This copy only REOPENS; the database must be created by \
+             run_cli (the harness's child) so that its layout is the binary's"
+        )));
+    }
+    // `run_cli` passes its trunk placeholder (1) here; it is consulted only for a FRESH catalog,
+    // which the check above rules out.
+    let branches = Arc::new(TableBranchCatalog::default_for_database(db_path, 1)?);
+    let store = Arc::new(ArenaPageStore::reopen_from_checkpoint(
+        bp.clone(),
+        branches.clone(),
+        Path::new(&arena_path),
+    )?);
+    store.checkpoint_to(std::path::PathBuf::from(&arena_path));
+    let reaper = Arc::new(TwoTierReaper::new(branches.clone(), store.clone()));
+    let effects = DurableEffectLog::default_for_database(db_path)?;
+    let runtime = Arc::new(
+        AgentRuntime::reopen_with_storage(
+            branches.clone() as Arc<dyn BranchCatalog>,
+            effects.clone(),
+            store.clone() as Arc<dyn PageStore>,
+        )?
+        .with_durable_provenance(format!("{db_path}.provenance"))?
+        .with_reaper(reaper.clone() as Arc<dyn Reaper>),
+    );
+    let catalog = Arc::new(CatalogLock::new(catalog));
+    let t = Instant::now();
+    let lease = LeaseThread::start(
+        reaper,
+        runtime.clone(),
+        catalog.clone() as Arc<dyn RuntimeLock>,
+        interval,
+    )?;
+    let lease_start = t.elapsed();
+    Ok(HarnessDb {
+        bp,
+        txn,
+        catalog,
+        branches,
+        store,
+        runtime,
+        lease,
+        arena_path,
+        total: t_total.elapsed(),
+        lease_start,
+        passes_at_open,
+        _lock: lock,
+    })
+}
+
 /// Everything the loop in `main` reads or writes through. In the production layout these are
-/// clones out of an [`OpenDatabase`] and are REPLACED after every restart.
+/// clones out of a [`HarnessDb`] and are REPLACED after every restart.
 struct Handles {
     cat_concrete: Arc<TableBranchCatalog>,
     cat: Arc<dyn BranchCatalog>,
@@ -431,7 +542,7 @@ struct Handles {
 }
 
 impl Handles {
-    fn of(db: &OpenDatabase) -> Handles {
+    fn of(db: &HarnessDb) -> Handles {
         Handles {
             cat_concrete: Arc::clone(&db.branches),
             cat: db.branches.clone() as Arc<dyn BranchCatalog>,
@@ -444,9 +555,9 @@ impl Handles {
 
 /// Wait for the lease thread's first pass to reach its end — the second full sweep, PREREG R3.
 /// `None` if it did not within `bound`.
-fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> Option<Duration> {
+fn wait_first_pass(db: &HarnessDb, bound: Duration) -> Option<Duration> {
     let t = Instant::now();
-    while db.lease.stats().finished == 0 {
+    while passes_finished() <= db.passes_at_open {
         if t.elapsed() > bound {
             return None;
         }
@@ -457,9 +568,9 @@ fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> Option<Duration> {
 
 /// Open the production database, wait out its first lease pass, and hand it back. Every open the
 /// PARENT does goes through here, so no timed window can overlap a sweep it started.
-fn parent_open(db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
-    let db = open_database(db_path, PARENT_SCAN_INTERVAL).expect("open the production database");
-    let bound = Duration::from_secs(60) + db.timings.lease_start * 10;
+fn parent_open(db_path: &str, failures: &mut Vec<String>) -> HarnessDb {
+    let db = harness_open(db_path, PARENT_SCAN_INTERVAL).expect("open the production database");
+    let bound = Duration::from_secs(60) + db.lease_start * 10;
     if wait_first_pass(&db, bound).is_none() {
         failures.push(format!(
             "the parent's first lease pass did not finish within {bound:?}; a sweep may overlap a \
@@ -688,29 +799,57 @@ impl RestartRow {
     }
 }
 
-/// The CHILD: a fresh process that opens the database exactly as the shipped binary does, times
-/// it, waits for the lease thread's first pass, closes cleanly, and prints ONE tagged line.
+/// The line the child prints on stderr once its lease thread's first pass has finished (D209: that
+/// pass repeats the open's full sweep). The parent holds `.exit` back until it sees it.
+const FIRST_PASS_MARKER: &str = "READ-VS-N FIRST-PASS-DONE";
+
+/// How long the parent waits for that line before sending `.exit` anyway, which H5 then reports.
+/// A bound, not an estimate.
+const CHILD_FIRST_PASS_BOUND: Duration = Duration::from_secs(1800);
+
+/// The CHILD: a fresh process that runs **the shipped binary's own entry point, `run_cli`**, on the
+/// database, and prints ONE tagged line of what that open cost.
 ///
-/// A fresh process because a real restart is one (D65 adversary, finding e): the parent has a
-/// large live heap and warm allocator. The OS page cache is warm either way — purging it needs
-/// root — so this is a WARM-CACHE restart, and PREREG says so.
+/// The lead's decision (PREREG A5): one open path, and the measured open is the shipped code, not
+/// a function extracted for the harness. `run_cli` times its own steps (`cli::OpenTimings`, the
+/// first four inside `open_recovered`) and leaves a [`last_open_report`] behind. Its REPL reads this
+/// process's stdin, which the parent holds until this process says, on stderr, that the lease
+/// thread's first pass has finished — so the second sweep (D209, PREREG R3) is inside the run and
+/// its visits are in `sweep_visits_at_close`. Then `.exit` arrives and `run_cli` shuts down exactly
+/// as it does for a user.
+///
+/// A fresh process because a real restart is one (D65 adversary, finding e). The OS page cache is
+/// warm either way — purging it needs root — so this is a WARM-CACHE restart, and PREREG says so.
 fn open_only_child(db_path: &str) -> ! {
-    let interval = scan_interval_from_env().expect("lease scan interval");
-    let c0 = this_thread();
-    let db = open_database(db_path, interval).expect("open the database");
-    let c = this_thread().since(&c0);
-    let t = db.timings;
-    let open_visits = db.reaper.open_sweep_visits();
-    let freed = db.reaper.open_sweep_freed();
-    let bound = Duration::from_secs(60) + t.lease_start * 10;
-    let first = wait_first_pass(&db, bound);
-    let visits_total = db.reaper.sweep_visits();
-    let descents_total = db.reaper.sweep_descents();
-    // Untimed positive control (PREREG H3): the database that opened is the populated one.
-    let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
-    let (_, closed) = db.close();
-    closed.expect("close the database cleanly");
+    let started = Instant::now();
+    let first_pass_at: Arc<std::sync::OnceLock<Instant>> = Arc::new(std::sync::OnceLock::new());
+    {
+        let first_pass_at = Arc::clone(&first_pass_at);
+        std::thread::spawn(move || loop {
+            if passes_finished() >= 1 {
+                let _ = first_pass_at.set(Instant::now());
+                eprintln!("{FIRST_PASS_MARKER}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        });
+    }
+    run_cli(db_path).expect("run_cli");
+    let r = last_open_report().expect("run_cli ran, but left no open report");
+    let t = r.timings;
+    // From the call into `run_cli` to the end of the first pass, less the open itself: the first
+    // pass's own time, plus the few microseconds `run_cli` spends before its lock (read the env).
+    let first_pass_us = first_pass_at
+        .get()
+        .map(|at| at.duration_since(started).saturating_sub(t.total).as_micros() as u64);
+    // Untimed positive control (PREREG H3), after `run_cli` has closed and released the lock: the
+    // database that opened is the populated one. `live_count` walks the Live span, O(N).
+    let live = TableBranchCatalog::open_sidecar(Path::new(&format!("{db_path}.branchcat")), 1)
+        .and_then(|c| c.live_count())
+        .map(|n| n as u64)
+        .unwrap_or(u64::MAX);
     let us = |d: Duration| d.as_micros() as u64;
+    let c = r.census;
     println!(
         "RESTART_RESULT total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
          rebuild_us={} branch_catalog_us={} arena_us={} effect_log_us={} runtime_us={} \
@@ -730,12 +869,12 @@ fn open_only_child(db_path: &str) -> ! {
         us(t.runtime),
         us(t.provenance),
         us(t.lease_start),
-        open_visits,
-        freed,
-        first.is_some() as u64,
-        first.map(us).unwrap_or(0),
-        visits_total,
-        descents_total,
+        r.open_sweep_visits,
+        r.open_sweep_freed,
+        first_pass_us.is_some() as u64,
+        first_pass_us.unwrap_or(0),
+        r.sweep_visits_at_close,
+        r.sweep_descents_at_close,
         live,
         c.descents,
         c.attempts,
@@ -750,14 +889,39 @@ fn open_only_child(db_path: &str) -> ! {
 }
 
 /// Run the child on `db_path` and parse its line. `Err` names what went wrong (PREREG H1).
+///
+/// Holds the child's stdin until its first-pass line arrives on stderr (every other stderr line is
+/// passed through), then sends `.exit`. If the line never comes within the bound, `.exit` goes
+/// anyway and the child reports `first_pass_done=0`, which H5 refuses.
 fn run_child(db_path: &str) -> Result<std::collections::HashMap<String, u64>, String> {
+    use std::io::{BufRead, BufReader, Write};
     let exe = std::env::current_exe().map_err(|e| format!("own path: {e}"))?;
-    let out = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("--open-only")
         .arg(db_path)
-        .stderr(std::process::Stdio::inherit())
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
+    let stderr = child.stderr.take().ok_or("no stderr pipe")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let relay = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line == FIRST_PASS_MARKER {
+                let _ = tx.send(());
+            } else {
+                eprintln!("{line}");
+            }
+        }
+    });
+    let _ = rx.recv_timeout(CHILD_FIRST_PASS_BOUND);
+    {
+        let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
+        stdin.write_all(b".exit\n").map_err(|e| format!("send .exit: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+    let _ = relay.join();
     if !out.status.success() {
         return Err(format!("child exited {:?}", out.status.code()));
     }
@@ -849,7 +1013,7 @@ const MERGE_BLOCK: usize = 64;
 
 /// One SQL statement, the way `run_cli`'s `execute_sql` runs it: parsed, then run under the
 /// statement lock with the database's own pool and transaction manager.
-fn exec_sql(db: &OpenDatabase, sess: &mut Session, sql: &str) -> Result<Outcome, String> {
+fn exec_sql(db: &HarnessDb, sess: &mut Session, sql: &str) -> Result<Outcome, String> {
     let tokens = Scanner::new(sql.chars().collect(), Vec::new())
         .scan_tokens()
         .map_err(|e| format!("{sql}: {e:?}"))?;
@@ -883,7 +1047,7 @@ struct MergeOne {
 }
 
 /// One agent task: `BEGIN AGENT SESSION`, one INSERT of a row nobody has written, `MERGE;`.
-fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
+fn merge_cycle(db: &HarnessDb, id: i64, fire: Fire) -> MergeOne {
     let mut sess = Session::with_runtime(Arc::clone(&db.runtime));
     exec_sql(db, &mut sess, &format!("BEGIN AGENT SESSION AS 'mc{id}';")).expect("begin");
     exec_sql(db, &mut sess, &format!("INSERT INTO {MERGE_TABLE} VALUES ({id}, {id});"))
@@ -1005,9 +1169,8 @@ fn print_merge_row(r: &MergeRow) {
 
 /// Close cleanly and reopen, so `State` — which lives in memory (`reopen_with_storage` builds
 /// `State::default()`) — starts empty: M = 0. Returns the new handles; the caller swaps them in.
-fn reopen_for_merges(db: OpenDatabase, db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
-    let (_, closed) = db.close();
-    closed.expect("close cleanly before a merge batch");
+fn reopen_for_merges(db: HarnessDb, db_path: &str, failures: &mut Vec<String>) -> HarnessDb {
+    db.close().expect("close cleanly before a merge batch");
     parent_open(db_path, failures)
 }
 
@@ -1053,17 +1216,22 @@ fn main() {
     // and either one makes the run exit 2.
     let mut failures: Vec<String> = Vec::new();
     let mut ns_void: Vec<String> = Vec::new();
-    // READ-VS-N's PRODUCTION LAYOUT (`CURVE_ARMS` set): the database is `curve.db`, opened by the
-    // shipped binary's own `open_database`. Otherwise the historical D61/D65 files, built by hand
-    // exactly as before.
+    // READ-VS-N's PRODUCTION LAYOUT (`CURVE_ARMS` set): the database is `curve.db`, created by
+    // `run_cli` itself and reopened by the parent's copy of its reopen half (`HarnessDb`).
+    // Otherwise the historical D61/D65 files, built by hand exactly as before.
     let db_path_str = dir.join("curve.db").to_str().expect("a UTF-8 temp path").to_string();
-    let mut db: Option<OpenDatabase> = None;
+    let mut db: Option<HarnessDb> = None;
     let (main_path, cat_path) = if arms.is_some() {
         (dir.join("curve.db"), dir.join("curve.db.branchcat"))
     } else {
         (dir.join("main.db"), dir.join("branches.branchcat"))
     };
     let mut hd = if arms.is_some() {
+        // CREATED by the shipped binary's own entry point, `run_cli`, run in a child, so the
+        // layout is the binary's; the parent's copy only ever reopens (see `HarnessDb`).
+        if let Err(why) = run_child(&db_path_str) {
+            panic!("run_cli could not create the database: {why}");
+        }
         let opened = parent_open(&db_path_str, &mut failures);
         let hd = Handles::of(&opened);
         db = Some(opened);
@@ -1172,9 +1340,10 @@ fn main() {
              {MERGE_BLOCK} merges before it. One new row of table {MERGE_TABLE} per merge."
         );
         println!(
-            "  layout: PRODUCTION, via ferrodb::cli::cli::open_database at {db_path_str}. Parent lease \
-             interval {PARENT_SCAN_INTERVAL:?}, first pass awaited before anything is timed; the \
-             restart child is a fresh process running the same open at the production interval."
+            "  layout: PRODUCTION at {db_path_str}: created by run_cli in a child; the parent reopens \
+             it with a copy of run_cli's reopen half over open_recovered (lease interval \
+             {PARENT_SCAN_INTERVAL:?}, first pass awaited before anything is timed); every restart \
+             is a fresh child running run_cli itself."
         );
         println!(
             "  workload: trunk row {ROW} = BigInt({TRUNK_VALUE}); each branch forks from trunk and \
@@ -1445,8 +1614,10 @@ fn main() {
             if arms.restart {
                 // Counted BEFORE the close, independently of anything the child reports (H2, H3).
                 let expect_arenas = hd.store.live_arenas().len() as u64;
-                let (_, closed) = db.take().expect("the production database is open").close();
-                closed.expect("close cleanly before the restart");
+                db.take()
+                    .expect("the production database is open")
+                    .close()
+                    .expect("close cleanly before the restart");
                 // Every handle into the files goes before the child opens them.
                 drop(hd);
                 let mut row = RestartRow { n: done, expect_arenas, expect_live: live, ..Default::default() };
@@ -1456,8 +1627,8 @@ fn main() {
                 }
                 // The parent's own reopen: the same open, in a warm process. A comparison only.
                 let reopened = parent_open(&db_path_str, &mut failures);
-                row.parent_total_us = reopened.timings.total.as_micros() as u64;
-                row.parent_lease_us = reopened.timings.lease_start.as_micros() as u64;
+                row.parent_total_us = reopened.total.as_micros() as u64;
+                row.parent_lease_us = reopened.lease_start.as_micros() as u64;
                 hd = Handles::of(&reopened);
                 db = Some(reopened);
                 if !row.child.is_empty() {
@@ -1600,8 +1771,7 @@ fn main() {
     }
     let code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
     if let Some(open) = db.take() {
-        let (_, closed) = open.close();
-        if let Err(e) = closed {
+        if let Err(e) = open.close() {
             println!("NOT A RESULT: the production database did not close cleanly at the end: {e}");
         }
     }
