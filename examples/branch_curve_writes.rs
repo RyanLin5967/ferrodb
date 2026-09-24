@@ -897,7 +897,7 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let load_end = load_1min_centi();
     let us = |d: Duration| d.as_micros() as u64;
     println!(
-        "RESTART_RESULT recovered={} stale={} total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
+        "RESTART_RESULT recovered={} stale={} total_us={} lock_us={} files_us={} floor_us={} recover_us={} sql_catalog_us={} \
          rebuild_us={} branch_catalog_us={} arena_us={} effect_log_us={} runtime_us={} \
          provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
@@ -908,6 +908,7 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
         us(t.total),
         us(t.lock),
         us(t.boot.files),
+        us(t.boot.floor),
         us(t.boot.recover),
         us(t.boot.catalog),
         us(t.boot.rebuild),
@@ -973,7 +974,7 @@ fn print_restart_header() {
     println!(
         "  RESTART       N   arenas   total ms  lease_st ms   arena ms  br_cat ms  recover ms  \
          tel ms  prov ms  open visits  1st-pass visits  1st-pass ms  c.desc/v  c.att/v  c.fault/v  \
-         freed  live  parent ms  lock ms  files ms  sqlcat ms  rebuild ms  runtime ms  descents  \
+         freed  live  parent ms  lock ms  files ms  floor ms  sqlcat ms  rebuild ms  runtime ms  descents  \
          wal B  tel B  prov B  m rows  recovered  stale"
     );
     println!("  RESTART-RAW N=<n> <the child's RESTART_RESULT line, verbatim: every field it measured>");
@@ -986,7 +987,7 @@ fn print_restart_row(r: &RestartRow) {
     let first_pass_visits = r.get("visits_total").saturating_sub(visits);
     println!(
         "  RESTART {:>8} {:>8} {:>10.3} {:>12.3} {:>10.3} {:>10.3} {:>11.3} {:>7.3} {:>8.3} {:>12} \
-         {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3} {:>8.3} {:>9.3} {:>9.3} \
+         {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3} {:>8.3} {:>9.3} {:>9.3} {:>9.3} \
          {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7} {:>10} {:>6}",
         r.n,
         r.expect_arenas,
@@ -1008,6 +1009,7 @@ fn print_restart_row(r: &RestartRow) {
         r.parent_total_us as f64 / 1000.0,
         ms("lock_us"),
         ms("files_us"),
+        ms("floor_us"),
         ms("sql_catalog_us"),
         ms("rebuild_us"),
         ms("runtime_us"),
