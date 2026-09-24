@@ -122,3 +122,69 @@ A compile failure here is a defect in the tests, not a red.
 "`integration_server_reaps` (all 9 pre-existing)" is wrong: it has **8** at `9aa6968` and 10 at
 `ea60cc4` (`git show 9aa6968:tests/integration_server_reaps.rs | grep -c '^#\[test\]'` → 8; the same
 on the working file → 10). No total above used the 9; the +2 for that target stands.
+
+## Amendment 2 — the lead's O(1) redesign, written before its fix commit
+
+The lead (review of `0dcbe93`) rejected the per-branch extension. `extend_leases_after` rewrites
+every live deadline and its DEADLINE key at every restart: O(live branches) writes at open, a
+branch-count wall added by a correctness fix. The replacement is a **virtual lease clock**,
+Chubby's stopped timer done as arithmetic:
+
+- `TableBranchCatalog` keeps ONE durable cumulative downtime offset `D`, in the same key as the
+  last-alive mark (`[0x08]` → `mark ‖ D`, 16 bytes).
+- Deadlines are stored as `v = lease − D`, and read back as `v + D`, saturating both ways.
+- `expired_before(now)` compares the stored `v` against `now − D`.
+- A resume does `D += downtime`, written in the same stage/durable as the mark. No record is
+  rewritten.
+- Existing catalogs have no mark, so `D = 0` and every stored deadline keeps its meaning exactly.
+
+**Red for it, committed first: `957e113`.** It adds the instrument
+`TableBranchCatalog::key_rewrites` and the test
+`table_catalog::f1_lease_grace::a_resume_writes_the_same_number_of_keys_whatever_the_number_of_live_branches`.
+
+| at | predicted | why |
+|---|---|---|
+| `957e113` (O(N) design) | **FAIL**: 31 keys for 10 branches vs 301 for 100 | INFERRED: 3 per branch (record, old DEADLINE key removed, new one written) + 1 mark |
+| the O(1) fix | PASS: 1 and 1 | only the `[0x08]` key is written |
+
+**What the fix commit changes in tests, and why each change is not a test being bent to pass:**
+
+| test | change | reason |
+|---|---|---|
+| A (`integration_server_reaps`, from `ea60cc4`) | the assertion `early.contains("1 live lease(s) extended")` is REMOVED | It pinned a count of rewritten leases. The O(1) design has no such count, and producing one would be an O(N) read at open. Its stated purpose ("the survival could be a scan that never ran") is still carried by `printed_downtime`, which panics without the resume line, and by the exact-deadline assertion `lease_deadline == deadline + downtime`, which is UNCHANGED and must still hold. Every other assertion in A is unchanged. |
+| `tree_keys` `deadlines_after_…`, `a_deadline_key_decodes_…` | DELETED, with the functions they test | Both functions existed only for the per-branch extension; nothing calls them now. |
+| `f1_lease_grace::a_resume_moves_exactly_…` | REPLACED by `a_resume_shifts_every_deadline_by_exactly_the_downtime_and_rewrites_no_record` | The old test asserted that leases at or before the mark, and quarantined ones, keep their value. Under the stopped timer EVERY stored deadline reads `downtime` later. Those that had expired stay expired (`D + v < now` iff `v < mark`), and that is asserted through `expired_before` at the same instants as before (4000, 4499, 4500), with the same answers. |
+| `f1_lease_grace::resuming_twice…`, `…clock_behind…` | the `Resumed` literal's `extended` field becomes `offset_millis` | The variant's field changed; the asserted downtimes (0, 0) are unchanged. |
+| `f1_lease_grace::…wrong_width…` | "8 bytes" → "16 bytes" | The value is now `mark ‖ D`. |
+| `f1_lease_grace::…survive_a_close_and_reopen…` | reads `alive_state()` = `(4000, 3000)` instead of `alive_mark()` = `4000` | Same value, plus the offset, which must also survive. |
+
+**New tests (+2):**
+- `a_lease_written_after_a_resume_reads_back_exactly_as_it_was_given`: `fork` and `renew_lease` both
+  store `lease − D`.
+- `an_offline_deadline_of_zero_still_reads_as_expired_after_downtime`: `:540`'s `expire_lease`
+  writes 0; stored as 0 (saturating), it reads back as `D`, which is expired at any real `now`.
+
+**Counts, per-target:** RED `ea60cc4` = base + 6. `957e113` = base + 21. FIX (O(1)) = base + 21
+(−2 tree_keys, +2 f1). New lib tests at FIX: `f1_lease_grace` 10, `lease_thread::tests::f1_*` 3,
+`cluster::tests::f2_*` 2, `tree_keys` 1.
+
+**Mutants, revised.** M1–M3 are replaced; M4–M8 are unchanged; M9–M13 are new.
+
+| mutant | must fail |
+|---|---|
+| M1 resume does not add the downtime to `D` | A, A', `a_resume_shifts…`, `…survive_a_close_and_reopen…`, the O(1) test (its premise `lease == 4500`) |
+| M2 `D += downtime + 1` | A (exact deadline), `a_resume_shifts…` |
+| M3 `expired_before` compares stored `v` against `now`, not `now − D` | A, A', `a_resume_shifts…` |
+| M9 `fork_staged` stores the caller's lease without subtracting `D` | `a_lease_written_after_a_resume…` |
+| M10 `renew_lease` stores without subtracting `D` | `a_lease_written_after_a_resume…`, `an_offline_deadline_of_zero…` |
+| M11 `get_raw` returns the stored `v` untranslated | A' (`moved > deadline`, and the reaper's re-read then expires it early), `a_resume_shifts…` |
+| M12 `D` not loaded at `open` | `…survive_a_close_and_reopen…` |
+| M13 reintroduce any per-branch write in `resume_leases` | the O(1) test |
+
+**Blind spot, new and the most important one:** any read path that returns a stored deadline
+without adding `D` compares a virtual deadline against a real clock, and that expires leases EARLY —
+the destructive direction. The fix translates at every `TableBranchCatalog` method that hands a
+record or a deadline out: `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `expired_before`,
+`enforced_lease`, `reparent`, and the child `fork_staged` returns. `a_resume_shifts…` asserts
+through `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `expired_before` and `enforced_lease`.
+A method added later is not covered by anything but review.
