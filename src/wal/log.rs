@@ -428,6 +428,37 @@ pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
 }
 
 impl RecKind {
+    /// **The heap page this record writes, as `(dir_root, page_id)`, or `None` if it writes none.**
+    ///
+    /// One exhaustive list with no `_ =>` arm, so a new record kind is a compile error (E0004) here
+    /// instead of a silent skip in each list that used to spell the heap kinds out by hand: recovery's
+    /// analysis and redo, `redo_one`'s page, and the replica applier's two loops. D268's
+    /// `HeapInitPage` had to be added to each of those by hand, and D250's `heap_root` (not on this
+    /// branch) still ends in `_ => None`, which skips it without a word until its merge calls this.
+    ///
+    /// A CLR answers for the record it carries, one level down, as redo applies it. No CLR carrying a
+    /// CLR is ever written, and redo has always skipped one, so it answers `None`.
+    pub fn heap_page(&self) -> Option<(u32, u32)> {
+        match self {
+            RecKind::HeapInsert { dir_root, page_id, .. }
+            | RecKind::HeapDelete { dir_root, page_id, .. }
+            | RecKind::HeapUpdate { dir_root, page_id, .. }
+            | RecKind::HeapRelease { dir_root, page_id, .. }
+            | RecKind::HeapInitPage { dir_root, page_id } => Some((*dir_root, *page_id)),
+            RecKind::Clr { redo, .. } => match redo.as_ref() {
+                RecKind::Clr { .. } => None,
+                carried => carried.heap_page(),
+            },
+            RecKind::Begin
+            | RecKind::Commit
+            | RecKind::Abort
+            | RecKind::TxnEnd
+            | RecKind::Checkpoint
+            | RecKind::Ddl { .. }
+            | RecKind::RunIdentity { .. } => None,
+        }
+    }
+
     pub fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), FerroError> {
         match self {
             RecKind::Begin => buffer.push(TAG_BEGIN),

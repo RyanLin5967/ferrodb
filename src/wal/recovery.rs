@@ -49,25 +49,14 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             }
             _ => {}
         }
-        match &rec.kind {
-            RecKind::Commit | RecKind::TxnEnd => {
-                ended.insert(rec.txn_id);
-                if matches!(rec.kind, RecKind::Commit) {
-                    committed.insert(rec.txn_id);
-                }
+        if matches!(rec.kind, RecKind::Commit | RecKind::TxnEnd) {
+            ended.insert(rec.txn_id);
+            if matches!(rec.kind, RecKind::Commit) {
+                committed.insert(rec.txn_id);
             }
-            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. }
-            | RecKind::HeapRelease { dir_root, page_id, .. } | RecKind::HeapInitPage { dir_root, page_id } => {
-                touched.insert((*dir_root, *page_id));
-            }
-            RecKind::Clr { redo, .. } => {
-                if let RecKind::HeapInsert { dir_root, page_id, ..} | RecKind::HeapDelete { dir_root, page_id, ..} | 
-                RecKind::HeapUpdate { dir_root, page_id, .. } = redo.as_ref() {
-                    touched.insert((*dir_root, *page_id));
-                }
-            }
-            _ => {}
         }
+        // The pages redo below writes, from the one exhaustive list redo uses too.
+        touched.extend(rec.kind.heap_page());
     }
     // F4: the counter is a leader-granted range now, not an atomic. The call is the same
     // statement it always was -- "at least this much was issued" -- and is still monotone; it
@@ -106,12 +95,8 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
     // came from a CLR (D213).
     for rec in &records {
-        match &rec.kind {
-            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
-            | RecKind::HeapRelease { .. } | RecKind::HeapInitPage { .. } | RecKind::Clr { .. } => {
-                redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
-            }
-            _ => {}
+        if rec.kind.heap_page().is_some() {
+            redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
         }
     }
 
@@ -207,10 +192,9 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
         RecKind::Clr { redo, .. } => (redo.as_ref(), true),
         other => (other, false),
     };
-    let page_id = match op {
-        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..}
-        | RecKind::HeapRelease { page_id, .. } | RecKind::HeapInitPage { page_id, .. } => *page_id,
-        _ => return Ok(())
+    // From `kind`, not `op`: a CLR carrying a CLR writes no page, and `heap_page` says so.
+    let Some((_, page_id)) = kind.heap_page() else {
+        return Ok(());
     };
     let frame_i = bp.fetch_page(page_id)?;
     let mut frame = bp.frame_write(frame_i);
@@ -262,7 +246,16 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
         RecKind::HeapUpdate { slot, new, .. } => page.update(*slot as usize, Tuple::new(new.to_vec()))?,
         // The page selection above already made it empty; only its LSN moves.
         RecKind::HeapInitPage { .. } => {}
-        _ => unreachable!()
+        // `heap_page` named a page, so `op` is one of the kinds above. Listed rather than `_`, so a
+        // new kind is a compile error here too.
+        RecKind::Begin
+        | RecKind::Commit
+        | RecKind::Abort
+        | RecKind::TxnEnd
+        | RecKind::Checkpoint
+        | RecKind::Ddl { .. }
+        | RecKind::RunIdentity { .. }
+        | RecKind::Clr { .. } => unreachable!(),
     }
     page.lsn = lsn;
     frame.data = page.serialize()?;

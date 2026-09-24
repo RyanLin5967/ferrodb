@@ -735,21 +735,7 @@ impl ReplicaApplier {
         // an empty page first. Found by the test, which is why this mirrors `recover()` rather
         // than being a second answer to one question.
         for (_, rec) in &checked {
-            let touched = match &rec.kind {
-                crate::wal::log::RecKind::HeapInsert { page_id, .. }
-                | crate::wal::log::RecKind::HeapDelete { page_id, .. }
-                | crate::wal::log::RecKind::HeapUpdate { page_id, .. }
-                | crate::wal::log::RecKind::HeapRelease { page_id, .. }
-                | crate::wal::log::RecKind::HeapInitPage { page_id, .. } => Some(*page_id),
-                crate::wal::log::RecKind::Clr { redo, .. } => match redo.as_ref() {
-                    crate::wal::log::RecKind::HeapInsert { page_id, .. }
-                    | crate::wal::log::RecKind::HeapDelete { page_id, .. }
-                    | crate::wal::log::RecKind::HeapUpdate { page_id, .. } => Some(*page_id),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(page_id) = touched {
+            if let Some((_, page_id)) = rec.kind.heap_page() {
                 if self.bp.disk_manager.read(page_id).is_err() {
                     self.bp.disk_manager.write(
                         page_id,
@@ -768,16 +754,8 @@ impl ReplicaApplier {
         // commit freeing a retired slot: without it this replica would keep the bytes occupied,
         // and the primary's later inserts into them would find no room here (D213).
         for (rec_lsn, rec) in &checked {
-            match &rec.kind {
-                crate::wal::log::RecKind::HeapInsert { .. }
-                | crate::wal::log::RecKind::HeapDelete { .. }
-                | crate::wal::log::RecKind::HeapUpdate { .. }
-                | crate::wal::log::RecKind::HeapRelease { .. }
-                | crate::wal::log::RecKind::HeapInitPage { .. }
-                | crate::wal::log::RecKind::Clr { .. } => {
-                    crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, &rec.kind)?;
-                }
-                _ => {}
+            if rec.kind.heap_page().is_some() {
+                crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, &rec.kind)?;
             }
         }
 
