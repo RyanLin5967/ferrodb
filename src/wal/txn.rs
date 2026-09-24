@@ -6,6 +6,12 @@ use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
 use crate::wal::history::{HistoryRecord, HistoryStore};
 
+/// See [`TxnManager::park_next_history_push`].
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static HISTORY_PUSH_PARK: Mutex<Option<(u64, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>> =
+    Mutex::new(None);
+
 /// Commits between automatic checkpoints.
 ///
 /// Overridable by `FERRODB_CHECKPOINT_INTERVAL` **so that tests can make truncation constant
@@ -268,6 +274,34 @@ impl TxnManager {
         })
     }
 
+    /// **Test-only: park this manager's next `commit` immediately before its history push**, so a
+    /// test can run a checkpoint at exactly that point (AMENDED 3, item 7). Keyed by this manager's
+    /// id, so a parallel test's commits never park.
+    #[cfg(test)]
+    pub(crate) fn park_next_history_push(
+        &self,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *HISTORY_PUSH_PARK.lock().unwrap() = Some((self.id, arrived.clone(), resume.clone()));
+        (arrived, resume)
+    }
+
+    #[cfg(test)]
+    fn park_before_history_push(&self) {
+        let parked = {
+            let mut p = HISTORY_PUSH_PARK.lock().unwrap();
+            match p.as_ref() {
+                Some((id, _, _)) if *id == self.id => p.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, arrived, resume)) = parked {
+            arrived.wait();
+            resume.wait();
+        }
+    }
+
     /// Called by `recover` when it finds committed history records and no store is attached.
     pub(crate) fn note_unstored_history(&self, records: u64) {
         self.unstored_history.fetch_add(records, Ordering::SeqCst);
@@ -278,13 +312,14 @@ impl TxnManager {
         self.history.get().cloned()
     }
 
-    /// **D212 (a') — write a REVERT history record into transaction `txn_id`'s log, now.**
+    /// **D212 (a') — bind a REVERT history record to transaction `txn_id`.**
     ///
-    /// Appended as `RecKind::RevertHistory` parts chained to the transaction, so its `Commit`
-    /// decides for the rows and the history together. The record itself is also held here, and
-    /// [`TxnManager::commit`] moves it onto the store's queue right after the `Commit` flush —
-    /// before `TxnEnd` and before the automatic checkpoint `commit` may run, whose hook then writes
-    /// it to the store before truncating the log. An abort drops it.
+    /// Held here, and written by [`TxnManager::commit`] FROM this binding, as `RunIdentity` is
+    /// (AMENDED 3, item 6): one copy of the bytes, so the log and the store cannot disagree. `commit`
+    /// appends it as `RecKind::RevertHistory` parts just before the `RunIdentity`/`Commit` pair, so the
+    /// `Commit` decides for the rows and the history together, and moves it onto the store's queue
+    /// right after the `Commit` flush — before the transaction leaves `att`, before `TxnEnd`, and
+    /// before the automatic checkpoint `commit` may run. An abort drops it.
     ///
     /// Refuses when no store is attached (the record would be written to the log and never kept)
     /// and for a transaction that is not active.
@@ -294,6 +329,18 @@ impl TxnManager {
                 "cannot bind REVERT history to txn {txn_id}: no history store is attached"
             )));
         }
+        if !self.att_read().contains_key(&txn_id) {
+            return Err(FerroError::Txn(format!(
+                "cannot bind REVERT history to txn {txn_id}: it is not active"
+            )));
+        }
+        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
+        Ok(())
+    }
+
+    /// Append `record` to `txn_id`'s log as `RevertHistory` parts of at most
+    /// [`crate::wal::log::REVERT_HISTORY_PART_BYTES`] each.
+    fn append_history(&self, txn_id: u64, record: &HistoryRecord) -> Result<(), FerroError> {
         let parts: Vec<&[u8]> = if record.body.is_empty() {
             vec![&record.body[..]]
         } else {
@@ -317,7 +364,6 @@ impl TxnManager {
                 },
             )?;
         }
-        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
         Ok(())
     }
 
@@ -696,21 +742,32 @@ impl TxnManager {
         // **Immediately before the `Commit`, with no append between them.** See `bind_run` for what
         // any other position costs. Read rather than removed, so a failed append leaves the binding
         // intact for the abort that follows.
+        // D212 (a'): the history records bound to it, written from the binding (read, not taken, so
+        // a failed append leaves them for the abort that follows), ahead of the identity pair.
+        let history = self.history_bindings.lock().unwrap().get(&txn_id).cloned();
+        for record in history.iter().flatten() {
+            self.append_history(txn_id, record)?;
+        }
         let bound = self.run_bindings.lock().unwrap().get(&txn_id).cloned();
         if let Some(run) = bound {
             self.append_chained(txn_id, &RecKind::RunIdentity { run })?;
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
         self.wal.flush_up_to(commit_lsn)?;
-        // **D212 (a'): onto the store's queue HERE — the `Commit` is durable, and nothing has yet
-        // run that can truncate the log.** The automatic checkpoint below, and any explicit one
-        // (refused while this transaction is still in `att`), drains the queue into the store
-        // before its truncation. Queued any later, that checkpoint would discard the record's only
-        // copy while its rows became durable.
+        // **D212 (a'): onto the store's queue HERE — the `Commit` is durable, and the transaction is
+        // still in `att`, so no checkpoint can have truncated the log under it (AMENDED 3, item 7:
+        // "push before `att` lets go").** The automatic checkpoint below, and any explicit one, drains
+        // the queue into the store before its truncation. Queued after this transaction left `att`, a
+        // checkpoint in between could discard the record's only copy while its rows became durable.
         // Taken out first, so no other transaction's commit or abort waits on this map while a
         // bounded drain below fsyncs.
+        #[cfg(test)]
+        self.park_before_history_push();
         let bound = self.history_bindings.lock().unwrap().remove(&txn_id);
-        if let Some(records) = bound {
+        if let Some(mut records) = bound {
+            for r in &mut records {
+                r.commit_lsn = commit_lsn;
+            }
             if let Some(store) = self.history.get() {
                 store.enqueue(records);
                 // AMENDED 2, F7: an idle open transaction blocks every checkpoint, so the queue is

@@ -82,10 +82,12 @@ pub fn retention_from_env() -> Result<u64, FerroError> {
 
 const MAGIC: u32 = 0x4652_4831; // "FRH1"
 const IMAGE_VERSION: u8 = 1;
-/// `MAGIC | VERSION | count`.
-const IMAGE_HEADER: usize = 4 + 1 + 4;
-/// `hseq | ordinal | len` in front of a body, `crc32` behind it.
-const RECORD_FRAME: usize = 8 + 8 + 4 + 4;
+/// `MAGIC | VERSION | floor | count`.
+const IMAGE_HEADER: usize = 4 + 1 + 8 + 4;
+/// An image's bytes beyond its records: the header and the trailing checksum.
+pub const IMAGE_OVERHEAD: usize = IMAGE_HEADER + 4;
+/// `hseq | ordinal | commit_lsn | len` in front of a body, `crc32` behind it.
+pub const RECORD_FRAME: usize = 8 + 8 + 8 + 4 + 4;
 
 /// One record of REVERT's history, as the store holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,10 @@ pub struct HistoryRecord {
     /// The publish ordinal for a publish, strictly increasing across publishes; 0 for anything
     /// else (a REVERT's marker). Retention counts publishes by it.
     pub ordinal: u64,
+    /// The LSN of its transaction's `Commit` record (AMENDED 3, item 2): what an install or restore
+    /// compares with the image's `end_lsn`, so a store never holds history for rows the database it
+    /// sits beside does not have. Set by `TxnManager::commit` and by the open's catch-up; 0 before.
+    pub commit_lsn: u64,
     /// Opaque here; see `agent_sql::revert_store`.
     pub body: Vec<u8>,
 }
@@ -110,6 +116,7 @@ impl HistoryRecord {
         let start = out.len();
         out.extend_from_slice(&self.hseq.to_be_bytes());
         out.extend_from_slice(&self.ordinal.to_be_bytes());
+        out.extend_from_slice(&self.commit_lsn.to_be_bytes());
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&self.body);
         let crc = crc32(&out[start..]);
@@ -168,6 +175,11 @@ struct StoreState {
     image_written: bool,
     /// Publishes drained since the last prune (or held beyond `W` at open).
     publishes_since_prune: u64,
+    /// **The prune floor** (AMENDED 3, item 3): the lowest `hseq` the last prune kept, persisted in
+    /// the image. A committed record below it is one the window has already dropped, so the open's
+    /// catch-up must not bring it back from a log that outlived `W` merges (a pin, a kept
+    /// truncation): that would grow the file with the log, and put merges past the window back.
+    floor: u64,
     counters: HistoryCounters,
 }
 
@@ -237,9 +249,9 @@ impl HistoryStore {
             ));
         }
         let path = path.into();
-        let (window, read) = match std::fs::read(&path) {
+        let ((floor, window), read) = match std::fs::read(&path) {
             Ok(bytes) => (load(&bytes)?, bytes.len() as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ((0, BTreeMap::new()), 0),
             Err(e) => {
                 return Err(FerroError::Io(format!("reading {}: {e}", path.display())));
             }
@@ -251,6 +263,7 @@ impl HistoryStore {
             queued_bytes: 0,
             image_written: false,
             publishes_since_prune: held.saturating_sub(retention),
+            floor,
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
         Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
@@ -277,7 +290,9 @@ impl HistoryStore {
     pub fn enqueue(&self, records: Vec<HistoryRecord>) {
         let mut s = self.state.lock().unwrap();
         for r in records {
-            if !s.holds(r.hseq) {
+            // Below the floor: pruned already (AMENDED 3, item 3). Absent and at or above it:
+            // missing, and queued wherever it falls.
+            if r.hseq >= s.floor && !s.holds(r.hseq) {
                 s.queued_bytes += RECORD_FRAME + r.body.len();
                 s.queue.insert(r.hseq, r);
             }
@@ -331,11 +346,12 @@ impl HistoryStore {
                 .cloned()
                 .collect();
             kept.sort_by_key(|r| r.hseq);
-            encode_image(&kept).and_then(|image| {
+            let floor = if prune { cut } else { s.floor };
+            encode_image(&kept, floor).and_then(|image| {
                 replace_atomically(&*self.ops, &self.path, &image)
                     .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))
             })
-            .map(|()| Some(kept))
+            .map(|()| Some((kept, floor)))
         } else {
             let mut tail = Vec::new();
             s.queue.values().try_for_each(|r| r.encode_into(&mut tail)).and_then(|()| {
@@ -351,8 +367,9 @@ impl HistoryStore {
                 s.counters.failed_drains += 1;
                 Err(e)
             }
-            Ok(Some(kept)) => {
+            Ok(Some((kept, floor))) => {
                 s.window = kept.into_iter().map(|r| (r.hseq, r)).collect();
+                s.floor = floor;
                 s.queue.clear();
                 s.queued_bytes = 0;
                 s.image_written = true;
@@ -395,7 +412,7 @@ fn window_start(s: &StoreState, retention: u64) -> u64 {
     }
 }
 
-fn encode_image(records: &[HistoryRecord]) -> Result<Vec<u8>, FerroError> {
+fn encode_image(records: &[HistoryRecord], floor: u64) -> Result<Vec<u8>, FerroError> {
     let count = u32::try_from(records.len()).map_err(|_| FerroError::Unrepresentable {
         what: "a REVERT history image's record count".to_string(),
         len: records.len(),
@@ -404,6 +421,7 @@ fn encode_image(records: &[HistoryRecord]) -> Result<Vec<u8>, FerroError> {
     let mut out = Vec::with_capacity(IMAGE_HEADER + 4);
     out.extend_from_slice(&MAGIC.to_be_bytes());
     out.push(IMAGE_VERSION);
+    out.extend_from_slice(&floor.to_be_bytes());
     out.extend_from_slice(&count.to_be_bytes());
     for r in records {
         r.encode_into(&mut out)?;
@@ -427,6 +445,7 @@ fn take_record(bytes: &[u8], at: usize) -> Result<Option<(HistoryRecord, usize)>
     let mut i = 0usize;
     let hseq = take_u64(rest, &mut i)?;
     let ordinal = take_u64(rest, &mut i)?;
+    let commit_lsn = take_u64(rest, &mut i)?;
     let len = take_u32(rest, &mut i)? as usize;
     let Some(total) = len.checked_add(RECORD_FRAME).filter(|t| *t <= rest.len()) else {
         return Ok(None);
@@ -435,14 +454,14 @@ fn take_record(bytes: &[u8], at: usize) -> Result<Option<(HistoryRecord, usize)>
     if crc32(&rest[..total - 4]) != stored {
         return Err(corrupt(format!("the record at byte {at} fails its checksum")));
     }
-    let body = rest[20..20 + len].to_vec();
-    Ok(Some((HistoryRecord { hseq, ordinal, body }, at + total)))
+    let body = rest[RECORD_FRAME - 4..RECORD_FRAME - 4 + len].to_vec();
+    Ok(Some((HistoryRecord { hseq, ordinal, commit_lsn, body }, at + total)))
 }
 
 /// Load a whole `<db>.history`: the image, then every intact tail record behind it — the arena's
 /// rule (`ArenaPageStore::replay_tail`): a torn LAST record is dropped, a checksum failure with
 /// more bytes behind it is corruption and refused.
-fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
+fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError> {
     let mut at = 0usize;
     let magic = take_u32(bytes, &mut at).map_err(|_| corrupt("too short for an image".into()))?;
     if magic != MAGIC {
@@ -454,6 +473,7 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
             "image version {version} was written by another build (this one reads {IMAGE_VERSION})"
         )));
     }
+    let floor = take_u64(bytes, &mut at)?;
     let count = take_u32(bytes, &mut at)? as usize;
     let mut out: Vec<HistoryRecord> = Vec::new();
     for i in 0..count {
@@ -482,8 +502,9 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
                 let total = bytes.len() - at;
                 // Whole and failing, as the LAST record: a torn append whose length field
                 // survived. Anything behind it makes it corruption.
-                let len = if total >= 20 {
-                    u32::from_be_bytes(bytes[at + 16..at + 20].try_into().unwrap()) as usize
+                let len = if total >= RECORD_FRAME - 4 {
+                    let l = at + RECORD_FRAME - 8;
+                    u32::from_be_bytes(bytes[l..l + 4].try_into().unwrap()) as usize
                 } else {
                     0
                 };
@@ -500,23 +521,23 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
     for r in out {
         by_hseq.entry(r.hseq).or_insert(r);
     }
-    Ok(by_hseq)
+    Ok((floor, by_hseq))
 }
 
 /// **Reassemble tag-11 WAL parts into records**, for the open's catch-up.
 ///
 /// A record larger than one WAL part is split across parts `0, 1, ..` of its transaction, the last
-/// marked. `parts` is every `(txn, hseq, ordinal, part, last, bytes)` of the transactions that
-/// COMMITTED, in log order; parts of different records may interleave, and are told apart by
-/// `(txn, hseq)`. A record whose parts do not run `0, 1, ..` to one marked last is refused. The
+/// marked. `parts` is every `(txn, commit_lsn, hseq, ordinal, part, last, bytes)` of the
+/// transactions that COMMITTED, in log order; parts of different records may interleave, and are
+/// told apart by `(txn, hseq)`. A record whose parts do not run `0, 1, ..` to one marked last is refused. The
 /// result is in `hseq` order, which is what [`HistoryStore::enqueue`] keys on.
 pub fn assemble(
-    parts: Vec<(u64, u64, u64, u32, bool, Vec<u8>)>,
+    parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)>,
 ) -> Result<Vec<HistoryRecord>, FerroError> {
     // (txn, record so far, the last part appended to it)
     let mut open: Vec<(u64, HistoryRecord, u32)> = Vec::new();
     let mut done: Vec<HistoryRecord> = Vec::new();
-    for (txn, hseq, ordinal, part, last, bytes) in parts {
+    for (txn, commit_lsn, hseq, ordinal, part, last, bytes) in parts {
         let at = match open.iter().position(|(t, r, _)| *t == txn && r.hseq == hseq) {
             None => {
                 if part != 0 {
@@ -524,7 +545,7 @@ pub fn assemble(
                         "txn {txn}'s history record {hseq} starts at part {part}, not 0"
                     )));
                 }
-                open.push((txn, HistoryRecord { hseq, ordinal, body: bytes }, 0));
+                open.push((txn, HistoryRecord { hseq, ordinal, commit_lsn, body: bytes }, 0));
                 open.len() - 1
             }
             Some(i) => {
@@ -555,7 +576,7 @@ mod tests {
     use super::*;
 
     fn rec(hseq: u64, ordinal: u64) -> HistoryRecord {
-        HistoryRecord { hseq, ordinal, body: format!("record {hseq}").into_bytes() }
+        HistoryRecord { hseq, ordinal, commit_lsn: 100 + hseq, body: format!("record {hseq}").into_bytes() }
     }
 
     fn open_in(dir: &tempfile::TempDir, retention: u64) -> Arc<HistoryStore> {
@@ -651,15 +672,18 @@ mod tests {
     #[test]
     fn parts_reassemble_in_order_and_a_missing_part_is_refused() {
         let whole = assemble(vec![
-            (5, 1, 1, 0, false, b"ab".to_vec()),
-            (5, 1, 1, 1, true, b"cd".to_vec()),
-            (6, 2, 0, 0, true, b"m".to_vec()),
+            (5, 90, 1, 1, 0, false, b"ab".to_vec()),
+            (6, 95, 2, 0, 0, true, b"m".to_vec()),
+            (5, 90, 1, 1, 1, true, b"cd".to_vec()),
         ])
         .unwrap();
-        assert_eq!(whole[0], HistoryRecord { hseq: 1, ordinal: 1, body: b"abcd".to_vec() });
-        assert_eq!(whole[1].hseq, 2);
-        assert!(assemble(vec![(5, 1, 1, 1, true, b"cd".to_vec())]).is_err());
-        assert!(assemble(vec![(5, 1, 1, 0, false, b"ab".to_vec())]).is_err());
+        assert_eq!(
+            whole[0],
+            HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 90, body: b"abcd".to_vec() }
+        );
+        assert_eq!((whole[1].hseq, whole[1].commit_lsn), (2, 95));
+        assert!(assemble(vec![(5, 90, 1, 1, 1, true, b"cd".to_vec())]).is_err());
+        assert!(assemble(vec![(5, 90, 1, 1, 0, false, b"ab".to_vec())]).is_err());
     }
 
     /// A filesystem that fails the next `append` or `rename` it is told to, and otherwise is the
@@ -818,7 +842,7 @@ mod tests {
         assert_eq!((c.rewrites, c.appends), (1, 5), "a queued record was written by both drains");
         let whole = std::fs::read(&path).unwrap();
         let framed: usize = s.records().iter().map(|r| RECORD_FRAME + r.body.len()).sum();
-        assert_eq!(whole.len(), IMAGE_HEADER + 4 + framed, "the file holds a record twice");
+        assert_eq!(whole.len(), IMAGE_OVERHEAD + framed, "the file holds a record twice");
     }
 
     /// **AMENDED 2, F9.** The open re-queues by membership: a committed record the file lacks is
@@ -899,5 +923,31 @@ mod tests {
         txn.checkpoint().unwrap();
         assert_eq!(parts_in_log(), 0, "anti-vacuity: a checkpoint that wrote the store truncates");
         assert_eq!(store.records(), vec![rec(1, 1)]);
+    }
+
+    /// **AMENDED 3, item 3.** A pruned record the log still holds is not brought back by the open's
+    /// catch-up: the prune floor is in the image, and membership applies only at or above it.
+    ///
+    /// Mutant: `enqueue` ignores the floor — the pruned record is queued, rewritten, and back.
+    #[test]
+    fn a_pruned_record_is_not_resurrected_by_the_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_in(&dir, 2);
+        for h in 1..=4 {
+            s.enqueue(vec![rec(h, h)]);
+            s.drain().unwrap();
+        }
+        let kept: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(kept, [3, 4], "fixture: W = 2 keeps the newest two publishes");
+        drop(s);
+        // Reopened with a wider window, so no prune can hide a resurrection by pruning it again.
+        let s = open_in(&dir, 8);
+        // The log outlived the window: the catch-up offers every committed record again.
+        s.enqueue((1..=4).map(|h| rec(h, h)).collect());
+        s.drain().unwrap();
+        drop(s);
+        let s = open_in(&dir, 8);
+        let kept: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(kept, [3, 4], "a pruned record came back from the log");
     }
 }
