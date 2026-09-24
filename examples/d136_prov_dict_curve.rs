@@ -56,7 +56,6 @@ use ferrodb::provenance::{
 };
 use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::tel::{EffectLog, MemEffectLog};
-use ferrodb::wal::txn::TxnManager;
 
 /// Writes inside one agent session. Three, as D129, so the fixture is the one whose breaking
 /// point is being turned into a curve rather than a differently-shaped workload.

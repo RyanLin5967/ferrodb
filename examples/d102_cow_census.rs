@@ -64,7 +64,6 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
-use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::wal::txn::TxnManager;
 

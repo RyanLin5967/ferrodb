@@ -63,7 +63,6 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
-use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
 const ROWS: i64 = 2000;
