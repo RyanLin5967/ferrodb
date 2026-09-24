@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::buffer::buffer_pool::BufferPoolManager;
-use crate::catalog::catalog_page::{CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry};
+use crate::catalog::catalog_page::{
+    refuse_unless_encodable, CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry,
+};
 use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::HeapFileManager;
@@ -157,18 +159,26 @@ impl Catalog {
         // both halves are false, because `system_views::view_for` yields to the real table. The
         // honest answer there is the one above: the table already exists.
         crate::catalog::system_views::reject_view_name_collision(&name)?;
-        let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
-        let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
-        let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
-        let entry = TableEntry {
+        // **Asked of the encoder BEFORE the three allocations below** (D254). An entry the catalog
+        // cannot write is refused by `persist` too, but only after these pages exist, and nothing
+        // frees them: the undo below removes the entry, not its pages. The roots are placeholders
+        // here; they are fixed-width, so the real ones cannot change the answer.
+        let mut entry = TableEntry {
             name: name.clone(),
-            first_directory_page_id: hfm.first_directory_page_id,
+            first_directory_page_id: 0,
             schema,
-            primary_index_root: primary.root_page_id.load(Ordering::Relaxed),
-            time_travel_root: tt_heap.first_directory_page_id, 
+            primary_index_root: 0,
+            time_travel_root: 0,
             indexes: Vec::new(),
             fulltext_indexes: Vec::new()
         };
+        refuse_unless_encodable(&entry)?;
+        let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
+        let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
+        let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
+        entry.first_directory_page_id = hfm.first_directory_page_id;
+        entry.primary_index_root = primary.root_page_id.load(Ordering::Relaxed);
+        entry.time_travel_root = tt_heap.first_directory_page_id;
         self.tables.insert(name.clone(), entry);
         // Undo: the table never existed if it could not be written down.
         self.persist_or_undo(|c| {
@@ -227,6 +237,13 @@ impl Catalog {
                     entry.schema.columns.iter()
                         .map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
                 )))?;
+
+            // Asked of the encoder BEFORE the tree is allocated (D254): the entry with this index,
+            // under a placeholder root. `persist` would refuse it too, but after the tree's pages
+            // exist, and the undo below pops the record, not the pages.
+            let mut with_index = entry.clone();
+            with_index.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: 0 });
+            refuse_unless_encodable(&with_index)?;
 
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
@@ -297,6 +314,11 @@ impl Catalog {
                     entry.schema.columns[col_index].data_type
                 )));
             }
+
+            // Asked of the encoder BEFORE the tree is allocated (D254), as in `create_index`.
+            let mut with_index = entry.clone();
+            with_index.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: 0 });
+            refuse_unless_encodable(&with_index)?;
 
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
@@ -481,6 +503,16 @@ impl Catalog {
         // reproducible at all.
         let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
         sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        // **Every entry is asked of the encoder before any page is written** (D254). The loop below
+        // places entries with `has_space` and `break`s at the first that does not fit. An entry
+        // larger than an EMPTY page fits none, so the loop never advances past it: it linked a fresh
+        // page per turn until allocation refused, and each turn rewrote the current page holding
+        // only the entries sorted before it, which truncated the catalog's image. An encoder refusal
+        // on a later page likewise left the earlier pages rewritten. Asking first means `persist`
+        // refuses with every page as it was, and `persist_or_undo` undoes cleanly.
+        for entry in &sorted {
+            refuse_unless_encodable(entry)?;
+        }
         let mut iter = sorted.into_iter().peekable();
 
         loop {

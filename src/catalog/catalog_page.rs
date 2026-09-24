@@ -385,12 +385,19 @@ impl CatalogPage {
     
 }
 
-/// Refuse an entry the catalog page format cannot hold, **by asking the encoder itself** (D249).
+/// Refuse an entry the catalog page format cannot hold, **by asking the encoder itself** (D249,
+/// D254).
 ///
-/// For a caller that has to know BEFORE it changes anything whether an entry will persist. `ALTER`
-/// decides everything in `Catalog::plan_alters` and only then rewrites the heap, and a refusal that
-/// first arrives at `persist`, after the rewrite, can neither be undone (the rows are already in the
-/// new shape) nor left in memory (every later `persist` would re-serialize it and refuse too).
+/// For a caller that has to know BEFORE it changes anything whether an entry will persist:
+///
+/// - `ALTER` decides everything in `Catalog::plan_alters` and only then rewrites the heap. A refusal
+///   that first arrives at `persist`, after the rewrite, can neither be undone (the rows are already
+///   in the new shape) nor left in memory (every later `persist` would re-serialize it and refuse
+///   too) (D249).
+/// - `create_table`, `create_index` and `create_fulltext_index` ask it before they allocate their
+///   pages, which nothing would free after a refusal (D254).
+/// - `Catalog::persist` asks it of every entry before it writes any page, because an entry no page
+///   can hold used to send its placement loop round for ever, truncating the catalog's image (D254).
 ///
 /// **It is not a second length check.** It runs `serialize`, the single authority the header above
 /// describes, so a change to any guard in there changes this answer with it, and nothing here can
