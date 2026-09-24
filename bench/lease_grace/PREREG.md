@@ -116,3 +116,9 @@ A compile failure here is a defect in the tests, not a red.
   are one stage/durable by construction and no test injects a crash inside `durable`.
 - **Cost at scale.** `resume_leases` is O(live branches) writes in one fsync at every start.
   UNMEASURED; no arm at 10⁶ exists.
+
+## Amendment 1 — before the fix commit
+
+"`integration_server_reaps` (all 9 pre-existing)" is wrong: it has **8** at `9aa6968` and 10 at
+`ea60cc4` (`git show 9aa6968:tests/integration_server_reaps.rs | grep -c '^#\[test\]'` → 8; the same
+on the working file → 10). No total above used the 9; the +2 for that target stands.
