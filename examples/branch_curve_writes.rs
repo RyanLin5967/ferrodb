@@ -2434,7 +2434,8 @@ fn read_vs_n_summary(
                 "  T={t}: `slope(branch)` and `slope(ratio)` span the previous row to this one (N {}). \
                  The CLASS is the verdict script's OLS over the saturated segment (d.fault >= 0.9): BOUNDED \
                  only when the raw and ratio slopes are both < 0.3, INCONCLUSIVE when they disagree (A15.2). \
-                 KNEE is ratio(1e6)/ratio(256) at T=1 (A15.1); raw ns, RESIDENT and T8DIR are reported.",
+                 KNEE is conjunctive at T=1: HELD only when the raw knee and ratio(1e6)/ratio(256) are both in \
+                 [4, 25], INCONCLUSIVE when they disagree (A16.1). RESIDENT and T8DIR are reported.",
                 rows.iter().map(|r| r.n.to_string()).collect::<Vec<_>>().join(" -> ")
             );
             // G7: the control's ns across N. It cannot depend on N, so if it moved, the box did.
@@ -2473,12 +2474,13 @@ fn read_vs_n_summary(
         // merge-OFF control, since after D216 a merge-on log still holds re-appended declarations.
         // `recover`, `rebuild` and `m rows` size it. A9.1: warmth is `child net` (total less recover
         // and rebuild, which only the child pays before D216) against `parent total`.
-        // A14.2: the load flag (D65's L2). Every reading in the run, start and end, sets the median
-        // (the upper one for an even count, as every median here); a row is flagged when its larger
-        // reading exceeds 1.5 × that median. A flag, never a guard: the slopes it qualifies are
-        // reported, not judged.
+        // A14.2: the load flag (D65's L2). The readings of the counted rows, start and end, set the
+        // median (the upper one for an even count, as every median here); a row is flagged when its
+        // larger reading exceeds 1.5 × that median. A flag, never a guard: the slopes it qualifies
+        // are reported, not judged.
         //
-        // A15.6: ONE rule with the verdict script, whose `rrows` leaves out H6 rows. An H6 open
+        // A15.6: which rows are counted is ONE rule with the verdict script, whose `rrows` leaves out
+        // H6 rows. An H6 open
         // rebuilt for the stale-index marker and is NOT A RESULT for every arm-3 value, so it sets
         // no baseline and carries no flag. (`stale` absent reads as u64::MAX, which H6 also takes.)
         let is_h6 = |r: &RestartRow| r.get("stale") != 0;
@@ -2570,7 +2572,7 @@ fn read_vs_n_summary(
             println!("  L2: no row was counted.");
         } else if !unavailable.is_empty() || !partly.is_empty() {
             println!(
-                "  L2 is incomplete: UNAVAILABLE (unguarded) at N={unavailable:?}; one reading only at \
+                "  L2 is incomplete: UNAVAILABLE (no load reading) at N={unavailable:?}; one reading only at \
                  N={partly:?}; L2 = 1 at N={flagged:?}. No clean-load statement is made for this run."
             );
         } else if flagged.is_empty() {
