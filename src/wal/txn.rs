@@ -3545,20 +3545,51 @@ use super::*;
     /// `Commit` alone as ended. At `79483ff` the `TxnEnd` append's `?` returned `Err` before the
     /// transaction left `att`: every checkpoint was then refused for the life of the process, the
     /// caller read "not committed", and a ROLLBACK appended an `Abort` after the durable `Commit`.
+    ///
+    /// Review 8 (lane §21.20): F1, the failure is counted exactly once; F2, a bound run and a primary
+    /// write, so every map the commit must clear holds the transaction, and the premise names the
+    /// append that failed.
     #[test]
     fn a_commit_whose_txn_end_cannot_be_written_still_ends_the_transaction() {
+        use crate::catalog::column::Value;
+        use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
+
         let (bp, wal, txn, _dir) = setup();
+        let tree = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap();
         let mut heap = HeapFileManager::new(bp.clone()).unwrap();
         let t = txn.begin().unwrap();
         heap.set_transaction(txn.clone(), t);
-        heap.insert(Tuple::new(vec![1; 40])).unwrap();
-        // No retired slot and no bound run, so the commit appends `Commit`, then `TxnEnd`.
-        wal.fail_next_append.store(2, Ordering::SeqCst);
+        txn.bind_run(t, a_run(1, "restock-agent")).unwrap();
+        txn.record_primary_write(t, tree.root_cell(), Value::Integer(5), None);
+        let rid = heap.insert(Tuple::new(vec![1; 40])).unwrap();
+        tree.upsert(Value::Integer(5), rid).unwrap();
+        // No retired slot, so the commit appends `RunIdentity`, `Commit`, then `TxnEnd`: the third fails.
+        wal.fail_next_append.store(3, Ordering::SeqCst);
+        let failures = txn_end_failures();
         txn.commit(t).unwrap_or_else(|e| panic!("a transaction whose Commit is durable was reported as not committed: {e}"));
-        assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the TxnEnd append was not the one that failed");
+        assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the countdown was not consumed");
+        let mine: Vec<RecKind> = walk_log(&wal).into_iter().filter(|r| r.txn_id == t).map(|r| r.kind).collect();
+        assert!(
+            mine.iter().any(|k| matches!(k, RecKind::RunIdentity { .. })) && mine.iter().any(|k| matches!(k, RecKind::Commit)),
+            "premise: the RunIdentity or the Commit is missing, so an earlier append was the one that failed: {mine:?}"
+        );
+        assert!(
+            !mine.iter().any(|k| matches!(k, RecKind::TxnEnd)),
+            "premise: a TxnEnd was written, so the injected failure hit another append"
+        );
+        // Under pgserver this counter is the only lasting trace of the event. Only this test moves it.
+        assert_eq!(txn_end_failures(), failures + 1, "the failed TxnEnd was not counted exactly once");
         assert!(
             !txn.att.lock().unwrap().contains_key(&t),
             "the committed transaction stayed active, so every checkpoint and DDL is refused"
+        );
+        assert!(
+            txn.run_bindings.lock().unwrap().get(&t).is_none(),
+            "the committed transaction's run binding outlived it"
+        );
+        assert!(
+            txn.index_undo.lock().unwrap().get(&t).is_none(),
+            "the committed transaction's index-undo list outlived it: an abort under a reissued id would undo committed work"
         );
         assert!(txn.abort(t).is_err(), "a ROLLBACK of the committed transaction was accepted");
         assert!(
@@ -3566,6 +3597,69 @@ use super::*;
             "an Abort was appended after the durable Commit"
         );
         txn.checkpoint().unwrap_or_else(|e| panic!("a checkpoint was refused after the commit: {e}"));
+    }
+
+    /// **Review 8's F3 (lane §21.20 test T9): a rollback whose `TxnEnd` cannot be written still ends
+    /// the transaction.** Once the undo walk has finished, every undo is on its page and logged as a
+    /// CLR, so the rollback HAS happened: recovery's undo of a loser whose undos are all CLRs follows
+    /// their `undo_next` to the `Begin` and changes nothing. At `5966573` the `TxnEnd` append's `?`
+    /// answered `Err` before the transaction left `att`. It stayed `Aborting`, and the callers that
+    /// never retry (autocommit's `roll_back_failed_statement`, MERGE's publish, `apply_dml`) left every
+    /// checkpoint and DDL refused until a reopen.
+    #[test]
+    fn a_rollback_whose_txn_end_cannot_be_written_still_ends_the_transaction() {
+        let (bp, wal, txn, _dir) = setup();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t1 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let a = heap.insert(Tuple::new(vec![7; 40])).unwrap();
+        txn.commit(t1).unwrap();
+
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        txn.bind_run(t2, a_run(1, "restock-agent")).unwrap();
+        let b = heap.insert(Tuple::new(vec![9; 40])).unwrap();
+        heap.delete(a).unwrap();
+        assert!(
+            txn.retired.lock().unwrap().get(&t2).is_some_and(|r| !r.is_empty()),
+            "premise: the delete retired no slot"
+        );
+        // The abort appends `Abort`, a CLR for the delete, a CLR for the insert, then `TxnEnd`: the
+        // fourth fails.
+        wal.fail_next_append.store(4, Ordering::SeqCst);
+        txn.abort(t2).unwrap_or_else(|e| panic!("a rollback whose undo walk finished was reported as failed: {e}"));
+        assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the countdown was not consumed");
+        let mine: Vec<RecKind> = walk_log(&wal).into_iter().filter(|r| r.txn_id == t2).map(|r| r.kind).collect();
+        let count = |f: fn(&RecKind) -> bool| mine.iter().filter(|k| f(k)).count();
+        assert_eq!(count(|k| matches!(k, RecKind::Abort)), 1, "premise: not one Abort for the rollback: {mine:?}");
+        assert_eq!(count(|k| matches!(k, RecKind::Clr { .. })), 2, "premise: the undo walk did not finish: {mine:?}");
+        assert_eq!(
+            count(|k| matches!(k, RecKind::TxnEnd)),
+            0,
+            "premise: a TxnEnd was written, so the injected failure hit another append"
+        );
+        assert_eq!(heap.read(a).unwrap().data, vec![7; 40], "premise: the rolled-back delete was not undone");
+        assert!(heap.read(b).is_err(), "premise: the rolled-back insert was not undone");
+        assert!(
+            !txn.att.lock().unwrap().contains_key(&t2),
+            "the rolled-back transaction stayed active (Aborting), so every checkpoint and DDL is refused until a reopen"
+        );
+        assert!(
+            txn.retired.lock().unwrap().get(&t2).is_none(),
+            "the rolled-back transaction's retired slots outlived it"
+        );
+        assert!(
+            txn.run_bindings.lock().unwrap().get(&t2).is_none(),
+            "the rolled-back transaction's run binding outlived it"
+        );
+        assert!(txn.abort(t2).is_err(), "a second ROLLBACK of the ended transaction was accepted");
+        assert!(txn.commit(t2).is_err(), "a COMMIT of the rolled-back transaction was accepted");
+        assert_eq!(
+            walk_log(&wal).iter().filter(|r| r.txn_id == t2 && matches!(r.kind, RecKind::Abort)).count(),
+            1,
+            "a second Abort was appended for the ended transaction"
+        );
+        txn.checkpoint().unwrap_or_else(|e| panic!("a checkpoint was refused after the rollback: {e}"));
     }
 
     /// **Review 7's F4 (lane §21.16 test F4): a `Retry` after a SUCCESSFUL read records what the page
