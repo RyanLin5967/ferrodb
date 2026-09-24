@@ -1,14 +1,13 @@
-use std::{fs::OpenOptions, io, path::Path, sync::Arc};
+use std::{io, path::Path, sync::Arc};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use crate::execution::executor::run;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
-use crate::wal::log::WalManager;
-use crate::wal::recovery::{rebuild_indexes, recover};
+use crate::wal::recovery::{open_recovered, BootTimings, OpenedDatabase};
 use crate::wal::txn::TxnManager;
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::TableBranchCatalog;
@@ -18,7 +17,6 @@ use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
 use crate::storage::db_lock::DbLock;
 use crate::tel::DurableEffectLog;
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
 /// Placeholder root recorded for trunk before a real tree exists. `AgentRuntime::with_storage`
 /// replaces it with a page it allocates; `reopen_with_storage` refuses if the recorded root does
@@ -56,11 +54,10 @@ fn arena_headroom() -> u32 {
 pub struct OpenTimings {
     /// `DbLock::acquire`.
     pub lock: Duration,
-    /// The main file, its pool, the WAL, and `recover` — plus the index rebuild and checkpoint when
-    /// recovery replayed anything.
-    pub recover: Duration,
-    /// `Catalog::open`, or `Catalog::create` for a new database.
-    pub sql_catalog: Duration,
+    /// `wal::recovery::open_recovered`'s own steps — the file and pool, `recover`, the catalog, and
+    /// the index rebuild — timed inside it (D204: it is the one open path, so its steps are timed
+    /// there rather than here).
+    pub boot: BootTimings,
     /// `TableBranchCatalog::default_for_database`: the `{db}.branchcat` sidecar.
     pub branch_catalog: Duration,
     /// `ArenaPageStore::reopen_from_checkpoint` (or `new`), plus arming `checkpoint_to`.
@@ -82,7 +79,9 @@ pub struct OpenTimings {
 /// A database opened the way the shipped binary opens one, holding everything a session needs.
 ///
 /// Built only by [`open_database`], which is `run_cli`'s open sequence moved into a function so
-/// that the binary and READ-VS-N's restart arm run the SAME code. Closing it cleanly is
+/// that the binary and READ-VS-N's restart arm run the SAME code. Its first half is
+/// `wal::recovery::open_recovered` — D204's one bootstrap, which every binary calls and
+/// `tests/open_path_allowlist.rs` enforces — and this adds only what the CLI builds on top of it. Closing it cleanly is
 /// [`OpenDatabase::close`]; dropping it without closing is an unclean shutdown as far as the files
 /// are concerned — the case `checkpoint_to` and `resume_interrupted_reaps` exist for.
 pub struct OpenDatabase {
@@ -136,30 +135,12 @@ pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, 
     let t = Instant::now();
     let lock = DbLock::acquire(Path::new(db_path))?;
     timings.lock = t.elapsed();
-
-    let t = Instant::now();
-    let existed = Path::new(db_path).exists();
-    let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
-    let dm = Arc::new(DiskManager::new(file)?);
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal.clone());
-    let recovered = recover(&txn)?;
-    timings.recover = t.elapsed();
-    let t = Instant::now();
-    let mut catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
-    } else {
-        Catalog::create(bp.clone())?
-    };
-    timings.sql_catalog = t.elapsed();
-    if recovered {
-        let t = Instant::now();
-        rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
-        timings.recover += t.elapsed();
-    }
+    // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
+    // function every binary opens through. It times its own steps and hands them back
+    // (`BootTimings`), so they are measured where they run and not re-spelled here.
+    let OpenedDatabase { bp, txn, catalog, timings: boot, .. } =
+        open_recovered(Path::new(db_path), &lock)?;
+    timings.boot = boot;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`

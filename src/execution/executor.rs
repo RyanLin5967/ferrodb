@@ -446,19 +446,11 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 };
                 let view = match txn.snapshot_of(txn_id) {
                     Ok(snapshot) => Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id }),
-                    Err(e) => {
-                        txn.abort(txn_id)?;
-                        session.current = None;
-                        return Err(e)
-                    }
+                    Err(e) => return Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                 };
                 let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id)), view) {
                     Ok(p) => p,
-                    Err(e) => {
-                        txn.abort(txn_id)?;
-                        session.current = None;
-                        return Err(e);
-                    }
+                    Err(e) => return Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                 };
                 match planned {
                     // No author is attached here, and that is not an omission. DML inside an
@@ -472,15 +464,51 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                             if implicit { txn.commit(txn_id)? };
                             return Ok(Outcome::Affected(count))
                         }
-                        Err(e) => {
-                            txn.abort(txn_id)?;
-                            session.current = None;
-                            Err(e)
-                        }
+                        Err(e) => Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                     },
                     Plan::Read(_) => unreachable!()
                 }
             }
+        }
+    }
+}
+
+/// Roll back the transaction a failed statement ran in, and return the error the caller reports.
+/// D205 (the fresh-context adversary's C1).
+///
+/// This was `txn.abort(id)?; session.current = None; return Err(e)` at three sites. It had two
+/// faults, both reached when `abort` returned `Err`:
+/// - the `?` skipped the reset, so the session kept its transaction id;
+/// - the abort's error replaced the statement's, so the user saw how the cleanup went and not why
+///   the statement failed.
+///
+/// At `c21eaff`, `abort` returned an index-undo error AFTER the transaction had ended, so the
+/// session was left holding a dead id. Now:
+/// - **the abort ended the transaction** (always, unless its heap undo failed; an index-undo
+///   failure is counted in `wal::txn::INDEX_UNDO_FAILURES`, not returned): the session lets go
+///   of it, and the statement's own error is returned UNCHANGED, variant included;
+/// - **the heap undo failed, so the transaction is still open** (`TxnManager::abort`'s C2 note):
+///   the session KEEPS the id, so `ROLLBACK` can resume the undo from its CLRs. Dropping it would
+///   orphan an `Aborting` transaction, which blocks every checkpoint for the life of the process.
+///   The statement's message comes first in the returned error, which also says the rollback did
+///   not finish. Returning the statement's error alone would let the user carry on inside a
+///   transaction they believe was rolled back.
+fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
+    match txn.abort(txn_id) {
+        Ok(()) => {
+            session.current = None;
+            e
+        }
+        Err(abort_err) => {
+            let resume = if session.current == Some(txn_id) {
+                "run ROLLBACK to resume it"
+            } else {
+                "recovery finishes it when the database is next opened"
+            };
+            FerroError::Txn(format!(
+                "{e} (and the rollback that followed did not finish: {abort_err}; the transaction \
+                 is still open, so {resume})"
+            ))
         }
     }
 }

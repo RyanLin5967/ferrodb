@@ -712,15 +712,18 @@ fn open_only_child(db_path: &str) -> ! {
     closed.expect("close the database cleanly");
     let us = |d: Duration| d.as_micros() as u64;
     println!(
-        "RESTART_RESULT total_us={} lock_us={} recover_us={} sql_catalog_us={} branch_catalog_us={} \
-         arena_us={} effect_log_us={} runtime_us={} provenance_us={} lease_start_us={} \
+        "RESTART_RESULT total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
+         rebuild_us={} branch_catalog_us={} arena_us={} effect_log_us={} runtime_us={} \
+         provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
          descents_total={} live={} c_desc={} c_att={} c_opt={} c_omiss={} c_lat={} c_fetch={} \
          c_fault={} c_hop={}",
         us(t.total),
         us(t.lock),
-        us(t.recover),
-        us(t.sql_catalog),
+        us(t.boot.files),
+        us(t.boot.recover),
+        us(t.boot.catalog),
+        us(t.boot.rebuild),
         us(t.branch_catalog),
         us(t.arena),
         us(t.effect_log),

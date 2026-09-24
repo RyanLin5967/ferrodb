@@ -22,6 +22,13 @@
 //! `end_ts` decides: zero means the row is still live and this is an `Update`; non-zero means the
 //! version was killed and this is a `Delete`.
 //!
+//! **1b. A reused primary key is an MVCC `HeapUpdate` too.** `DELETE k; INSERT k` writes the new
+//! row into the dead version's slot so that older snapshots can still reach the old version through
+//! the index (`execution::insert`). The record's OLD image is then dead and its new image is live,
+//! and that is an `Insert`: the consumer applied the `Delete` when it committed. If the new row has
+//! to relocate, the dead image leaves its slot as a `HeapDelete`. That is bookkeeping, counted in
+//! [`Decoded::internal`] like the time-travel records below.
+//!
 //! **2. Half the records are internal MVCC traffic.** An update also writes the superseded version
 //! into the table's separate `time_travel_root` heap. Those `HeapInsert`s are not user-visible
 //! changes — emitting them would double-count every update as an insert as well — but they are not
@@ -296,7 +303,8 @@ pub struct Decoded {
     /// Schema changes seen, in log order: `(lsn, table, change)`.
     pub schema_changes: Vec<(u64, String, SchemaChange)>,
     /// Records that belong to a table's time-travel heap: superseded versions archived by MVCC.
-    /// Correctly not emitted, and correctly not an error.
+    /// Also a reused key's dead version leaving its slot when the new row relocates (point 1b of
+    /// the module doc). Correctly not emitted, and correctly not an error.
     pub internal: usize,
     /// Transactions that rolled back. Their changes are correctly absent.
     pub aborted: BTreeSet<u64>,
@@ -854,6 +862,14 @@ impl LogicalDecoder {
                         }
                     }
                 }
+                // A dead version being relocated: a reused key's new row did not fit the dead
+                // version's slot, and `HeapFileManager::update` logs the move as a delete of the
+                // slot's current bytes. Those bytes were already deleted, and the consumer was told
+                // when that DELETE committed. No other writer logs a `HeapDelete` of a dead image:
+                // DELETE never relocates (it rewrites the same bytes with a new `end_ts`), and an
+                // UPDATE never writes over a dead head (its scan yields only versions visible to it,
+                // and `check_write_conflict` refuses a head whose deleter it cannot see).
+                RecKind::HeapDelete { old, .. } if Self::is_dead(old) => out.internal += 1,
                 RecKind::HeapDelete { dir_root, old, .. } => match Self::row_in(&tables, *dir_root, old) {
                     RowResult::Row(table, columns, old) => staged
                         .entry(txn)
@@ -866,12 +882,20 @@ impl LogicalDecoder {
                     // Decided BEFORE the images are turned into values, because it is a property of
                     // the version header rather than of the columns.
                     let killed = Self::is_dead(new);
+                    // The mirror image: a dead version replaced by a live one under the same key.
+                    // That is a reused primary key written into its dead version's slot
+                    // (`execution::insert`), and the consumer has already applied the DELETE.
+                    let revived = !killed && Self::is_dead(old);
                     match (Self::row_in(&tables, *dir_root, old), Self::row_in(&tables, *dir_root, new)) {
                         (RowResult::Row(table, columns, old), RowResult::Row(_, _, new)) => {
                             let op = if killed {
                                 // A SQL DELETE. Reporting it as an update would leave a consumer
                                 // holding a row the database no longer has.
                                 ChangeOp::Delete { old }
+                            } else if revived {
+                                // Reporting it as an update would tell a consumer to modify a
+                                // row it has already deleted.
+                                ChangeOp::Insert { new }
                             } else {
                                 ChangeOp::Update { old, new }
                             };
@@ -1545,6 +1569,86 @@ mod tests {
         w2.append(1, 0, &RecKind::Commit).unwrap();
         let out2 = decode_all(&decoder(), &w2);
         assert_eq!(out2.events[0].op.name(), "UPDATE", "a live update was relabelled");
+    }
+
+    /// **A `HeapUpdate` whose OLD image is dead and whose NEW image is live is an INSERT.**
+    ///
+    /// That is the record a reused primary key writes once the new row goes into the dead
+    /// version's slot, which is how an older snapshot's index lookup reaches the old version (the
+    /// reused-key gap, `tests/reused_key_old_snapshot.rs`). The consumer already received the
+    /// DELETE of the old row. Reported as an UPDATE, the feed tells it to modify a row it has
+    /// already deleted. `integration_cdc_key_reuse` pins the same thing end to end.
+    #[test]
+    fn a_heap_update_that_revives_a_dead_version_is_an_insert() {
+        let (_d, w) = wal("revive");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 0,
+                old: dead_tuple_bytes(3, 30),
+                new: tuple_bytes(3, Some(31)),
+            },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.events.len(), 1, "one reused key must be one event: {:?}", out.events);
+        assert_eq!(
+            out.events[0].op,
+            ChangeOp::Insert { new: vec![Value::Integer(3), Value::Integer(31)] },
+            "a dead version brought back under its key was reported as {} rather than an insert",
+            out.events[0].op.name()
+        );
+    }
+
+    /// **Relocating a dead version is bookkeeping, not a second DELETE.**
+    ///
+    /// When a reused key's new row does not fit in the dead version's slot,
+    /// `HeapFileManager::update` relocates it and logs a `HeapDelete` of the slot's current bytes,
+    /// then a `HeapInsert` of the new row. The current bytes are the dead version, which the
+    /// consumer already saw deleted.
+    ///
+    /// The second half is the anti-vacuity: a `HeapDelete` of a LIVE image (an ordinary UPDATE
+    /// that relocated) must still be emitted. It asserts only that it is emitted and not counted
+    /// as bookkeeping. It does not pin the kind it is emitted as.
+    #[test]
+    fn relocating_a_dead_version_is_bookkeeping_not_a_second_delete() {
+        let (_d, w) = wal("relocate_dead");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: dead_tuple_bytes(3, 30) })
+            .unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)) },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(
+            out.events.len(),
+            1,
+            "a relocated dead version leaked into the feed beside the insert: {:?}",
+            out.events
+        );
+        assert_eq!(out.events[0].op, ChangeOp::Insert { new: vec![Value::Integer(3), Value::Integer(31)] });
+        assert_eq!(out.internal, 1, "the relocated dead version was not counted as bookkeeping");
+        assert!(out.is_complete(), "bookkeeping made the decode look incomplete: {out:?}");
+
+        let (_d2, w2) = wal("relocate_live");
+        w2.append(1, 0, &RecKind::Begin).unwrap();
+        w2.append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: tuple_bytes(3, Some(30)) })
+            .unwrap();
+        w2.append(1, 0, &RecKind::Commit).unwrap();
+        let out2 = decode_all(&decoder(), &w2);
+        assert_eq!(out2.internal, 0, "a HeapDelete of a LIVE image was swallowed as bookkeeping");
+        assert_eq!(out2.events.len(), 1, "a HeapDelete of a LIVE image was not emitted: {out2:?}");
     }
 
     /// Records against a table's time-travel heap are MVCC bookkeeping: not emitted, and not an
