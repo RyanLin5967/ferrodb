@@ -693,9 +693,7 @@ impl TwoTierReaper {
             // them. Lock order: `in_flight` before the catalog's and the store's locks, and a
             // guard takes `in_flight` while holding neither.
             let held = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-            if held.contains_key(&arena) {
-                continue;
-            }
+            // MUTANT (fire-check only, never land): held arenas are not skipped.
             // Recorded after this pass took the residue: a guard on a statement thread failed
             // and recorded it just now. The next residue pass collects it. Counting it here would
             // name a recorded producer as an unrecorded one. Lock order `in_flight` then
