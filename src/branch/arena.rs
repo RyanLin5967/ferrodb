@@ -410,6 +410,16 @@ pub struct ArenaPageStore {
     /// full image rewrite, exactly as [`Self::pending_version`] does for the pending-free log. One
     /// rewrite per burst of reuse, not one per pop — the flag stays set until a persist happens.
     recycled_reissued: AtomicBool,
+    /// **D183 tail replay: an OBSERVING counter, compiled into test builds only.** Counts the
+    /// pending-free log entries [`Self::replay_tail`] visited. That is every element a scan of the
+    /// log walks, plus every entry a record carries.
+    ///
+    /// Per store, not process-wide, so parallel tests in the lib binary cannot add to each other's
+    /// window. Read it before and after one `restore` to scope it to one replay. It is bumped
+    /// where the work happens, never computed from a `len()` after the fact. See
+    /// `frontier/lane_d183_tail_replay.md` in artie-research.
+    #[cfg(test)]
+    replay_pending_visits: AtomicU64,
 }
 
 /// **D81 — the append-only tail, and what this process is allowed to assume about the file.**
@@ -688,6 +698,8 @@ impl ArenaPageStore {
             }),
             pending_version: AtomicU64::new(0),
             recycled_reissued: AtomicBool::new(false),
+            #[cfg(test)]
+            replay_pending_visits: AtomicU64::new(0),
         })
     }
 
@@ -2103,6 +2115,13 @@ impl ArenaPageStore {
         Ok(())
     }
 
+    /// Pending-free log entries tail replay has visited over this store's life. The unit is
+    /// defined on the `replay_pending_visits` field.
+    #[cfg(test)]
+    pub(crate) fn replay_pending_visits(&self) -> u64 {
+        self.replay_pending_visits.load(Ordering::SeqCst)
+    }
+
     /// `(full rewrites, tail appends)` this store has performed against its armed path.
     ///
     /// The whole of D81 stated as two integers: what used to be one rewrite per claim should now
@@ -2341,6 +2360,8 @@ impl ArenaPageStore {
                     // `free_arena` drops this arena's parked entries too, and so must replay:
                     // a pending entry naming a freed extent would send `drain_pending` looking
                     // for pages in a range that has already gone back on the free list.
+                    #[cfg(test)]
+                    self.replay_pending_visits.fetch_add(st.pending.len() as u64, Ordering::SeqCst);
                     st.pending.retain(|p| p.arena_id != arena);
                     // `shadow_base` and `current` need no repair. `shadow_base` is not persisted
                     // at all (see its doc: a cold map only shortens chains), and `current` is
@@ -2390,6 +2411,9 @@ impl ArenaPageStore {
                     // earlier park, which is also the first to reach the log. Keeping the later
                     // one instead would make a restarted database release a page on a different
                     // rule than the running one does.
+                    #[cfg(test)]
+                    self.replay_pending_visits
+                        .fetch_add((st.pending.len() + parked.len()) as u64, Ordering::SeqCst);
                     let mut seen: std::collections::HashSet<(PageId, ArenaId)> =
                         st.pending.iter().map(|p| (p.page_id, p.arena_id)).collect();
                     for e in parked {
@@ -2422,6 +2446,8 @@ impl ArenaPageStore {
                 }
                 {
                     let mut st = self.state.lock().unwrap();
+                    #[cfg(test)]
+                    self.replay_pending_visits.fetch_add(log.len() as u64, Ordering::SeqCst);
                     log.retain(|p| st.extents.contains_key(&p.arena_id));
                     st.pending = log;
                     Self::apply_arena_sections(&mut c, &mut st)?;
@@ -2457,6 +2483,9 @@ impl ArenaPageStore {
                     // records, so the file order equals the memory order. `retire_arenas_by_rule`
                     // did not do that until the fix its own comment now describes, and that was
                     // the defect. Idempotence here is a second line, not the guarantee.
+                    #[cfg(test)]
+                    self.replay_pending_visits
+                        .fetch_add((st.pending.len() + n) as u64, Ordering::SeqCst);
                     st.pending.retain(|p| !removed.contains(&(p.page_id, p.arena_id)));
                     Self::apply_arena_sections(&mut c, &mut st)?;
                 }
