@@ -306,6 +306,13 @@ pub struct LeaseStats {
     pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
+    /// Passes that reached the END of `scan_once`, the D88 orphan sweep included.
+    ///
+    /// `scans` cannot say that: it is counted before the orphan sweep runs, and a pass that
+    /// refused or failed early reaches neither. READ-VS-N's restart arm waits on this to know the
+    /// lease thread's first pass — a second full sweep, see `TwoTierReaper::open_sweep_visits` —
+    /// has finished, rather than guessing from elapsed time. Observing only.
+    pub finished: u64,
 }
 
 #[derive(Default)]
@@ -317,6 +324,7 @@ struct Counters {
     refused_scans: AtomicU64,
     refused_branches: AtomicU64,
     failed: AtomicU64,
+    finished: AtomicU64,
 }
 
 impl Counters {
@@ -329,6 +337,7 @@ impl Counters {
             refused_scans: self.refused_scans.load(Ordering::SeqCst),
             refused_branches: self.refused_branches.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
+            finished: self.finished.load(Ordering::SeqCst),
         }
     }
 }
@@ -784,6 +793,8 @@ fn scan_once(
              at open by `resume_interrupted_reaps`, and the cadence retries."
         ));
     }
+    // Last statement of the pass, so a reader that sees it knows the sweep above is over.
+    counters.finished.fetch_add(1, Ordering::SeqCst);
 }
 
 fn join_ids(ids: &[BranchId]) -> String {

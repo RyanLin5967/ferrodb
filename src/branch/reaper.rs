@@ -128,6 +128,8 @@ pub struct TwoTierReaper {
     /// until the next open. A non-zero reading here after a clean close is that producer saying so
     /// out loud, instead of a 60-second full scan quietly hiding it.
     open_sweep_freed: AtomicU64,
+    /// Arenas the full sweep at open examined. Observing only; see [`Self::open_sweep_visits`].
+    open_sweep_visits: AtomicU64,
     /// **D127.** Branch reaps this reaper declined to decide. See [`ReapOutcome::Refused`].
     ///
     /// Counted at the one site that produces a refusal rather than at each caller, because there
@@ -148,6 +150,7 @@ impl TwoTierReaper {
             sweep_visits: AtomicU64::new(0),
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
+            open_sweep_visits: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
         }
     }
@@ -155,6 +158,20 @@ impl TwoTierReaper {
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
     pub fn open_sweep_freed(&self) -> u64 {
         self.open_sweep_freed.load(Ordering::Relaxed)
+    }
+
+    /// Arenas the open-time full sweep examined — its share of [`Self::sweep_visits`], and nothing
+    /// else's.
+    ///
+    /// **READ-VS-N, arm 3.** `sweep_visits` alone cannot answer "what did the OPEN pay": the lease
+    /// thread that `LeaseThread::start` spawns runs its first pass immediately, and that pass ends
+    /// in `collect_orphans_if_due`, whose gate is still at `ORPHAN_SWEEP_NEVER` because the open
+    /// sweep calls [`Self::collect_orphaned_extents`] directly and stamps nothing. So a second full
+    /// sweep begins while the caller of `start` is reading the counter. This one is taken inside
+    /// [`Self::resume_interrupted_reaps`], before that thread exists, so nothing else can be
+    /// sweeping. Observing only: nothing reads it to decide anything.
+    pub fn open_sweep_visits(&self) -> u64 {
+        self.open_sweep_visits.load(Ordering::Relaxed)
     }
 
     /// **D127.** Reaps this reaper refused to decide, over its whole life.
@@ -225,8 +242,13 @@ impl TwoTierReaper {
         //
         // O(live_arenas) once per open, against O(branches x live_arenas) per lease scan before
         // D40.
+        let visits_before = self.sweep_visits.load(Ordering::Relaxed);
         let freed_at_open = self.collect_orphaned_extents()?;
         self.open_sweep_freed.store(freed_at_open as u64, Ordering::Relaxed);
+        self.open_sweep_visits.store(
+            self.sweep_visits.load(Ordering::Relaxed) - visits_before,
+            Ordering::Relaxed,
+        );
         Ok(done)
     }
 
