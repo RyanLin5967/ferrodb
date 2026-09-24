@@ -388,3 +388,26 @@ has a registered prediction: **they pass**.
 - `d249_alter_encodable` has **6** tests, and the lib gains U1 and U2. **Per-target: 2579 (measured) + 8 = 2587.**
 - **R2 at `0369d88`** (predicted): `d249_alter_encodable` **5 passed, 1 failed (ST)**. A33 and AI pass there,
   because the pre-check is present.
+
+---
+
+## Amendment 5 — amendment 4's changes recorded; the D249 mutant tree named (nothing built)
+
+| commit | what |
+|---|---|
+| `547de64` | amendment 4 |
+| `c5e57b8` | `AlterPlan.read`, the entry as read, replaces `checked`. `apply_plan` refuses unless `live == read`, with nothing overwritten, and its blind spot is stated. The doc names both refusals (G4) |
+| `e6af639` | A9 renamed to `an_added_ninth_column_the_catalog_cannot_hold_is_refused_and_wedges_nothing`, and its row message cut (G5). ST asserts `Constraint` containing "changed since" |
+| `bed42db` | E5 re-anchored on `if self.require_table(&table)? != &read`; E1–E5 cut from `e6af639`, each passing `git apply --check`. E1, E2 and E4 have the same edits as before |
+
+- **Code at `c5e57b8`** (comment lines filtered from `git diff 27dd0a1 c5e57b8 -- src/catalog/alter.rs`):
+  - the field and its initialiser: `read: entry.clone()`;
+  - the destructured name;
+  - the old 13-line rebuild-and-compare block, replaced by a 6-line `if … != &read { return Err(Constraint) }`.
+- **Test lines changed at `e6af639`:** A9's fn name and one message line; ST's `assert!(applied.is_err(), …)`,
+  replaced by a `match` that requires the staleness `Constraint`. The ST change strengthens an assertion and does
+  not weaken one.
+- **Counts at `bed42db`:** `d249_alter_encodable` has 6 tests, and `git diff 9aa6968 bed42db` adds 8 `#[test]` and
+  removes 0 (READ). **Per-target: 2587.**
+- **The D249 mutant tree is `bed42db`** (this commit's parent carries no code change after it; amendment 4's G1
+  table applies to it). It does not contain D254's fix.
