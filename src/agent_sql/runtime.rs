@@ -5852,14 +5852,41 @@ impl AgentRuntime {
                 }
             }
         }
+        // **D199's seal route (ledger D199, 09:25Z): every exit attests a reap THIS call performed.**
+        //
+        // The reap can flip the record to `Reaped` durably and then fail: `TwoTierReaper::reap`
+        // flips before its fallible detach and drain, and a reaper-less arm that detaches after
+        // its flip (wall21's order) does the same. An attestation placed after `?` was skipped on
+        // exactly those exits, and the log then called a reaped branch live. It cannot be placed
+        // right after the flip instead, because with a reaper the flip is inside `Reaper::reap`.
+        // So the reap runs in `retire`, and the attestation follows it on every exit, `Ok` or `Err`.
+        //
+        // **Only the call that flipped this generation attests.** The record is read BEFORE the
+        // reap: if it is not this branch's live generation, this call cannot flip it (a retried
+        // seal; a branch the lease already took) and attests nothing. After the reap, a bumped
+        // generation means the flip landed here, because `set_state` flips a generation once.
+        // Together with the log's own key (a `Reap` removes the head, and a second one is refused)
+        // that makes the attestation exactly once. The epoch comes from the record read before the
+        // reap, as it always did (D103: the reap can recycle the slot).
+        let before = self
+            .branches
+            .get_raw(branch.id)
+            .ok()
+            .filter(|r| r.generation == branch.generation && r.state != BranchState::Reaped);
+        let retired = self.retire(branch);
+        if let Some(before) = before {
+            self.attest_this_calls_reap(branch, before.fork_epoch, published);
+        }
+        retired
+    }
+
+    /// The reap half of [`Self::seal`]. It writes no attestation: `seal` attests after it on every
+    /// exit, including an `Err` that comes after the durable `Reaped` flip (D199's seal route).
+    fn retire(&self, branch: BranchId) -> Result<(), FerroError> {
         // With a reaper attached, retiring a branch means reclaiming it: the reaper does
         // everything below AND frees the extents this branch allocated, which nothing else will.
         // It is the same call the lease scan makes, so a branch that is merged and a branch that
         // was walked away from end in exactly the same state.
-        // **D103 — read the fork epoch BEFORE anything reaps.** The reap bumps the id slot's
-        // generation, so `get(branch)` afterwards is a hard error and the epoch would be
-        // unavailable exactly where the attestation needs it.
-        let fork_epoch = self.branches.get(branch).ok().map(|r| r.fork_epoch);
         if let Some(reaper) = &self.reaper {
             reaper.reap(branch)?;
             // `with_reaper` cannot check that the reaper was built over this runtime's catalog —
@@ -5877,23 +5904,6 @@ impl AgentRuntime {
                         rec.state
                     )));
                 }
-            }
-            // **This arm has to attest too, and it did not.** `seal` returns early when a reaper
-            // is attached, so an attestation placed only at the end of the fallback arm is
-            // silently absent on every runtime built with `with_reaper` — which is the production
-            // shape — and the gap reads exactly like "no branch was ever reaped": a missing entry
-            // is indistinguishable from a lifecycle event that never happened. Found by reading
-            // the control flow after the wiring was written; pinned by
-            // `integration_branch_attestation::a_reap_through_an_attached_reaper_is_attested_too`,
-            // which fails with `left: [Fork], right: [Fork, Reap]` when this call is removed.
-            //
-            // Two call sites rather than one because the alternative — restructuring the early
-            // return — changes the control flow of the reap path itself, which is not a thing to
-            // do as a side effect of adding an attestation.
-            //
-            // A refusal is counted, not returned: the reap has happened. See the fallback arm.
-            if let Some(epoch) = fork_epoch {
-                let _ = self.attest_reap(branch, epoch, published);
             }
             return Ok(());
         }
@@ -5921,23 +5931,34 @@ impl AgentRuntime {
             }
         }
         self.branches.set_state(branch, record.state, BranchState::Reaped)?;
-        // **D103 — attested after the state change lands**, for the same reason the merge entry is
-        // appended after its commit: a record of a reap that did not happen is worse than none.
-        // The entry seals this branch's chain, and it carries whether the branch's writes were
-        // published, because "merged" and "abandoned" are different facts about a retired branch
-        // and the record must not conflate them.
-        //
-        // The reaper arm above carries the same call; see the note there for why there are two.
-        //
-        // **Wall #19: a refusal is counted, NOT returned.** The catalog reap above has committed,
-        // and an `Err` from `seal` would report a reap that happened as one that did not. The log
-        // refuses only a branch with no live attested head: one it never saw forked (a branch
-        // forked outside `begin_session_as`, or before a restart). Writing its reap would root
-        // the entry at genesis as the branch's first, which `verify_chain` reports as
-        // `DanglingBranch`, so the reap of a branch outside the log's scope leaves no entry and
-        // `attestation_refusals` counts it.
-        let _ = self.attest_reap(branch, record.fork_epoch, published);
         Ok(())
+    }
+
+    /// **D199's seal route:** attest the reap `seal`'s own call performed, whatever `retire`
+    /// returned. `fork_epoch` is the branch's, from the record read before the reap.
+    ///
+    /// - The record now shows a bumped generation: the flip landed in this call. Attested, with a
+    ///   refusal counted rather than returned (wall #19): the reap has happened, and an `Err`
+    ///   would report it as one that did not. The log refuses only a branch with no live head, one
+    ///   it never saw forked; writing its reap would root the entry at genesis, which
+    ///   `verify_chain` reports as `DanglingBranch`. The entry carries `published`, because
+    ///   "merged" and "abandoned" are different facts about a retired branch.
+    /// - The generation did not move: the reap failed before its flip, or the reaper is built over
+    ///   another catalog. Nothing to attest.
+    /// - The record cannot be read: counted if the branch still holds a head, never guessed (D199).
+    fn attest_this_calls_reap(&self, branch: BranchId, fork_epoch: Epoch, published: bool) {
+        match self.branches.get_raw(branch.id) {
+            Ok(after) if after.generation > branch.generation => {
+                let _ = self.attest_reap(branch, fork_epoch, published);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let mut h = self.attested.lock().unwrap();
+                if h.head_of(branch).is_some() {
+                    h.count_refusal();
+                }
+            }
+        }
     }
 
     // ---- REVERT ----------------------------------------------------------------------------
