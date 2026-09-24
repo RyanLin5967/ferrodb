@@ -15,6 +15,12 @@
 //! The parser has no `CROSS JOIN` and no comma FROM list, so `ON TRUE` is the only way to write a
 //! cross product here; refusing it made a cross product unwritable below 13 relations.
 //!
+//! Placing a one-relation conjunct on a leaf that is a LEFT JOIN needs the rule for which side of
+//! an outer join a filter may go below, and `optimizer::push` — the WHERE pushdown — did not have
+//! it: `a LEFT JOIN b ON a.id = b.id WHERE b.v = 5` filtered b below the left join and returned
+//! the NULL-extended rows the WHERE must exclude. D255 fixes that too, and both placements now
+//! share it.
+//!
 //! Every assertion is on the ANSWER, compared as a sorted row set, except where a test says it is
 //! pinning a plan and why. `tests/d64_expression_depth.rs` also writes `ON 1` and `ON 1 = 1`, but it
 //! only parses — it never reaches the planner — so it is not a control for any of this. The
@@ -224,6 +230,10 @@ fn a_join_with_no_linking_conjunct_is_a_cross_product() {
     let mut db = ab();
     assert_eq!(db.rows("SELECT a.id, b.id FROM a JOIN b ON 1 = 1;"), all_ab_pairs());
     assert_eq!(db.rows("SELECT a.id, b.id FROM a JOIN b ON TRUE;"), all_ab_pairs());
+    // A TRUE that reads no column is dropped, not kept as a no-op filter over every output row:
+    // `ON TRUE` plans exactly as the left-deep path always planned it.
+    let plan = db.explain("EXPLAIN SELECT a.id, b.id FROM a JOIN b ON TRUE;");
+    assert!(!plan.contains("Filter"), "`ON TRUE` left a filter in the plan:\n{plan}");
     // A one-relation conjunct and nothing linking: b filtered, then crossed with a.
     let filtered: Rows = all_ab_pairs().into_iter().filter(|p| p[1] != Some(2)).collect();
     assert_eq!(filtered.len(), 6, "fixture: b holds v = 5 at ids 1 and 3");
@@ -231,8 +241,13 @@ fn a_join_with_no_linking_conjunct_is_a_cross_product() {
 }
 
 /// `Filter`, `NestedLoopJoin` and `HashJoin` all keep a row only when its predicate is
-/// `Boolean(true)`, so a bare `1` keeps nothing, in WHERE and in ON alike. The law pinned is that
-/// `a JOIN b ON p` answers exactly as `a JOIN b ON TRUE WHERE p` does.
+/// `Boolean(true)`, so a bare `1` keeps nothing, in WHERE and in ON alike. What is pinned is that
+/// `a JOIN b ON p` answers as `a JOIN b ON TRUE WHERE p` does for a SINGLE-conjunct `p`.
+///
+/// ⚠ Not for a compound `p` with a non-boolean conjunct. `AND` refuses a non-boolean operand
+/// (`logical`), while a filter holding the conjunct alone just drops the row, and which of the two
+/// a conjunct meets depends on where placement puts it — in WHERE as in ON, since pushdown splits
+/// conjuncts too. Only a binder type check settles that, and it is not D255's.
 ///
 /// ⚠ Past 12 relations this CHANGES an answer that planned at 9aa6968: the `1` was dropped there and
 /// the cross product came back.
@@ -323,8 +338,9 @@ fn a_conjunct_over_three_relations_is_applied_when_no_pair_is_linked() {
 /// Two components, each linked inside and not to the other. The cheapest plan joins each component
 /// and crosses the two results last; this pins that the search can SEE that plan.
 ///
-/// This is the one assertion here on a plan rather than an answer, and it rests on the cost model,
-/// worked by hand from `cost_model.rs` (50 rows a table, ids unique, ANALYZEd): the bushy root
+/// The plan assertion rests on the cost model — as do the plan assertions in the TRUE-folding,
+/// index-selection and connected-chain tests — worked by hand from `cost_model.rs` (50 rows a
+/// table, ids unique, ANALYZEd): the bushy root
 /// `(w⋈x)×(y⋈z)` costs 4.5 + 4.5 + 25 = 34, and every root that is a join on a predicate costs 83
 /// (`((w⋈x)×y)⋈z` = 31 + 1.5 + 50.5). A search that only crosses when a whole level is empty never
 /// builds the bushy root.
@@ -369,21 +385,31 @@ fn a_one_relation_conjunct_reaches_index_selection() {
     assert!(plan.contains("Index scan on b"), "`b.id = 3` did not reach b's access path:\n{plan}");
 
     // With a WHERE conjunct on b as well, pushed down onto b's scan first: the two must become ONE
-    // filter, or the planner sees a filter over a filter and never considers the index.
-    let q = "SELECT a.id FROM a JOIN b ON a.id = b.id AND b.id = 3 WHERE b.v > 0;";
-    assert_eq!(db.rows(q), r(&[&[3]]));
-    let plan = db.explain(&format!("EXPLAIN {q}"));
-    assert!(plan.contains("Index scan on b"), "the ON and WHERE filters on b were not merged:\n{plan}");
+    // filter, or the planner sees a filter over a filter and never considers the index. And the
+    // merge must KEEP the WHERE conjunct: b's row 3 has v = 5, so `b.v = 6` must empty the answer.
+    for (where_, want) in [("b.v = 5", r(&[&[3]])), ("b.v = 6", Rows::new())] {
+        let q = format!("SELECT a.id FROM a JOIN b ON a.id = b.id AND b.id = 3 WHERE {where_};");
+        assert_eq!(db.rows(&q), want, "WHERE {where_}: the merge lost a conjunct");
+        let plan = db.explain(&format!("EXPLAIN {q}"));
+        assert!(plan.contains("Index scan on b"), "WHERE {where_}: the ON and WHERE filters on b were not merged:\n{plan}");
+    }
 }
 
-/// The leaf a one-relation conjunct reads can be a LEFT JOIN. The filter goes OVER it: pushed into
-/// the nullable side it would stop excluding the NULL-extended row, which is (2, NULL, 2) here.
-#[test]
-fn a_one_relation_conjunct_over_a_left_join_filters_after_the_left_join() {
+/// la = (1,0) (2,0); lb = (1,5) (2,6); lc = (1,0) (2,7).
+fn left_join_db() -> Db {
     let mut db = Db::new();
     db.table("la", &[(1, 0), (2, 0)]);
     db.table("lb", &[(1, 5), (2, 6)]);
-    db.table("lc", &[(1, 0), (2, 0)]);
+    db.table("lc", &[(1, 0), (2, 7)]);
+    db
+}
+
+/// The leaf a one-relation conjunct reads can be a LEFT JOIN, here `la LEFT JOIN lb`, relation 0.
+#[test]
+fn a_one_relation_conjunct_over_a_left_join_filters_after_the_left_join() {
+    let mut db = left_join_db();
+    // On the NULLABLE side the filter must stay above the left join. Pushed into lb it would only
+    // thin lb, and la's row 2 would come back NULL-extended as (2, NULL, 2).
     assert_eq!(
         db.rows(
             "SELECT la.id, lb.id, lc.id FROM la LEFT JOIN lb ON la.id = lb.id \
@@ -391,6 +417,58 @@ fn a_one_relation_conjunct_over_a_left_join_filters_after_the_left_join() {
         ),
         r(&[&[1, 1, 1]]),
     );
+    // A relation AFTER the 4-column leaf: lc starts at column 4, not at 2 × its position, so this
+    // is the arm that sees a leaf-local remap computed from the wrong offset.
+    assert_eq!(
+        db.rows(
+            "SELECT la.id, lc.id FROM la LEFT JOIN lb ON la.id = lb.id \
+             JOIN lc ON la.id = lc.id AND lc.v = 7;"
+        ),
+        r(&[&[2, 2]]),
+    );
+    // On the PRESERVED side it may go below the left join, σp(la ⟕ lb) = σp(la) ⟕ lb, and it
+    // should: that is what reaches la's primary-key index.
+    let q = "SELECT la.id FROM la LEFT JOIN lb ON la.id = lb.id JOIN lc ON la.id = lc.id AND la.id = 2;";
+    assert_eq!(db.rows(q), r(&[&[2]]));
+    let plan = db.explain(&format!("EXPLAIN {q}"));
+    assert!(plan.contains("Index scan on la"), "`la.id = 2` did not reach la through the left join:\n{plan}");
+}
+
+/// The same rule for WHERE, which `optimizer::push` used to break: it routed a conjunct by its
+/// columns alone, so a WHERE on the nullable side of a LEFT JOIN went below it and let the
+/// NULL-extended rows through — `[1, 2]` here instead of `[1]`.
+#[test]
+fn a_where_conjunct_on_the_nullable_side_of_a_left_join_filters_after_it() {
+    let mut db = left_join_db();
+    assert_eq!(
+        db.rows("SELECT la.id FROM la LEFT JOIN lb ON la.id = lb.id WHERE lb.v = 5;"),
+        r(&[&[1]]),
+        "la's row 2 has no lb row with v = 5; NULL = 5 is not true, so it must not come back"
+    );
+    // The preserved side still goes down, to the index.
+    let q = "SELECT la.id FROM la LEFT JOIN lb ON la.id = lb.id WHERE la.id = 2;";
+    assert_eq!(db.rows(q), r(&[&[2]]));
+    let plan = db.explain(&format!("EXPLAIN {q}"));
+    assert!(plan.contains("Index scan on la"), "a preserved-side WHERE stopped reaching la's index:\n{plan}");
+}
+
+/// §1.3's third property: a query every relation of which is linked is searched exactly as before
+/// D255 — no cross-product candidate at all. Here one would WIN on cost, so a search that admitted
+/// it would show it. Worked by hand from `cost_model.rs`, no statistics (cb is costed at 1,000 rows):
+/// ca and cc are 1-row primary-key index scans (13 each); every plan through the links costs
+/// 41 + 13 + 0.1 = 54.1, while `ca × cc` first and then cb on both keys costs 26.01 + 18 + 10 =
+/// 54.01, because the two-key join is estimated at one row.
+#[test]
+fn a_connected_join_is_never_planned_with_a_cross_product() {
+    let mut db = Db::new();
+    db.table("ca", &[(1, 0), (2, 0)]);
+    db.table("cb", &[(1, 1), (2, 1), (3, 2)]);
+    db.table("cc", &[(1, 0), (2, 0)]);
+    let q = "SELECT ca.id, cb.id, cc.id FROM ca JOIN cb ON ca.id = cb.v AND ca.id = 1 \
+             JOIN cc ON cb.v = cc.id AND cc.id = 1;";
+    assert_eq!(db.rows(q), r(&[&[1, 1, 1], &[1, 2, 1]]));
+    let plan = db.explain(&format!("EXPLAIN {q}"));
+    assert!(!plan.contains("(on true)"), "a linked query was planned through a cross product:\n{plan}");
 }
 
 /// POSITIVE CONTROL — passes at 9aa6968 and must keep passing. The left-deep path at d66's width
