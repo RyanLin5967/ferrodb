@@ -1178,3 +1178,59 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
          Live-only and resume_interrupted_reaps runs at open, not per tick."
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D209 — an open sweeps the live arenas ONCE.
+// -------------------------------------------------------------------------------------------
+
+/// **D209.** `start` runs `resume_interrupted_reaps`, which ends in the full O(live arenas)
+/// orphan sweep, and then spawns the thread, whose first pass runs at once and ends in
+/// `collect_orphans_if_due`. The open's sweep stamped nothing, so that gate still read
+/// `ORPHAN_SWEEP_NEVER` and the same sweep ran again straight after it: every open paid for its
+/// orphan sweep twice, and at 10^6 branches one sweep is tens of seconds (read-vs-n PREREG R5).
+///
+/// Observed only through counters that exist without the fix — `sweep_visits`,
+/// `open_sweep_visits` and `LeaseStats::finished` — so this compiles against the unfixed tree and
+/// fails there, with the first pass's visits equal to the open's.
+///
+/// It refuses to pass vacuously in both directions. The open must have visited arenas, because a
+/// sweep over nothing repeats nothing. And the first pass must have FINISHED: `finished` is raised
+/// after `collect_orphans_if_due` returns, so a thread that has not reached its sweep yet cannot
+/// read as one that skipped it. `NEVER` as the interval makes that first pass the only one, which
+/// `stop`'s `finished == 1` then confirms.
+#[test]
+fn d209_an_open_sweeps_the_live_arenas_once_not_twice() {
+    let f = fixture();
+    // Three live branches that own extents, so the open sweep has at least three arenas to visit.
+    for _ in 0..3 {
+        branch_with_pages(&f, FAR_FUTURE, 2);
+    }
+    let before = f.reaper.sweep_visits();
+
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the lease thread's first pass to finish", || lease.stats().finished >= 1);
+    let stats = lease.stop();
+
+    let at_open = f.reaper.open_sweep_visits();
+    let first_pass = f.reaper.sweep_visits() - before - at_open;
+    assert!(
+        at_open >= 3,
+        "the open swept {at_open} arenas over three live branches with pages, so there was no \
+         sweep for the first pass to repeat and this test proves nothing"
+    );
+    assert_eq!(stats.finished, 1, "exactly one pass must have run under a {NEVER:?} interval");
+    assert_eq!(stats.reaped, 0, "fixture: nothing had expired, so no reap may add visits");
+    assert_eq!(
+        first_pass, 0,
+        "the lease thread's first pass visited {first_pass} arenas right after the open had \
+         visited {at_open}: the open's full orphan sweep did not stamp the cadence, so \
+         `collect_orphans_if_due` read ORPHAN_SWEEP_NEVER and repeated the whole O(live arenas) \
+         sweep (D209)"
+    );
+}
