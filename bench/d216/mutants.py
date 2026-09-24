@@ -200,6 +200,12 @@ MUTANTS = [
      ".filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());\n",
      ".filter(|e| e.commit_lsn >= c).map(|e| e.lsn).max());\n",
      [STREAM], [S + "every_commit_a_refusal_holds_back_keeps_its_rows"], "KILL"),
+    # The one-detector item: the snapshot install asks `Truncation`; this mutant ignores the answer.
+    ("M34_install_ignores_a_kept_log", "src/consensus/snapshot.rs",
+     "        if let crate::wal::log::Truncation::Kept { oldest_pin, .. } = self.wal.truncate(0)? {\n",
+     "        if let crate::wal::log::Truncation::Kept { oldest_pin, .. } = { let _ = self.wal.truncate(0)?; crate::wal::log::Truncation::Truncated } {\n",
+     [("--test", "integration_cluster_snapshot", "an_install_under_a_wal_pin_is_refused_and_names_the_pin")],
+     ["an_install_under_a_wal_pin_is_refused_and_names_the_pin"], "KILL"),
     ("M33_gap_fill_covers_to_the_cursor", "src/replication/logical.rs",
      "                history.covered_through = scanned_to;\n",
      "                history.covered_through = from_lsn;\n                let _ = scanned_to;\n",
