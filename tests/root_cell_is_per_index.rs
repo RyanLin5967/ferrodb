@@ -580,8 +580,9 @@ fn highest_page_across_a_drop_after_lag(lag: bool) -> (u32, u32) {
 /// **T12, review 2's C4: DROP TABLE frees every tree from its CELL, so a record that lags frees the
 /// live tree and not the stale leaf it names.**
 ///
-/// A lagging record names the pre-split root, which is now the tree's LEFTMOST LEAF, and freeing a
-/// leaf frees that one page. So a DROP from the records leaked every other page of all three trees.
+/// A lagging record names the pre-split root, which is now the new root's left child. In this
+/// fixture every tree is one level deep, so that child is the LEFTMOST LEAF, and freeing a leaf frees
+/// that one page. So a DROP from the records leaked every other page of all three trees.
 /// The control is the same schedule with no lag. It must hold at the base and with the fix; if it
 /// does not, something else is leaking and the second arm cannot be read.
 ///

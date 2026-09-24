@@ -189,8 +189,9 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     let mut rebuilt: Vec<(String, Option<IndexTree<String>>, u32)> = Vec::new();
     for name in names {
         // Every old tree is freed from its LIVE root, its shared cell (D208 review 2, C4), as
-        // `drop_table` frees. A record that lags its cell names the pre-split page, now the leftmost
-        // leaf, and freeing that leaks the rest of the tree. At `open_recovered`, the one production
+        // `drop_table` frees. A record that lags its cell names the pre-split page, now the new
+        // root's left child (a leaf or an internal node, by the tree's depth), and freeing from it
+        // leaks the rest of the tree. At `open_recovered`, the one production
         // caller, `Catalog::open` has just seeded every cell from these records, so the two agree.
         // A live caller (the tests) can hold a lagging record. So the index records are caught up
         // from their cells and the primary's live root is read before the entry is borrowed

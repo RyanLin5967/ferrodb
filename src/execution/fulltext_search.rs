@@ -249,7 +249,9 @@ impl FullTextSearch {
         // SHARED root cells (D53), the posting tree's included (D215). It used to be opened from the
         // RECORD with a private cell, and the record is the copy a reader's cached snapshot lets go
         // stale: a root move does not move the schema epoch, so the snapshot is kept. After a
-        // split the recorded page is the leftmost leaf. D58's right walk repairs a descent that
+        // split the recorded page is the new root's left child (a leaf, or an internal node when the
+        // recorded root was deeper), so a descent from it ends on a leaf in the tree's left part.
+        // D58's right walk repairs a descent that
         // lands up to 64 leaves short (`read_leaf_for`'s `RIGHT_WALK`), so a small drift is
         // harmless. Past that, the descent falls back to the latched path, which does not walk
         // right, and the scan for a later token meets a smaller one on the next leaf and stops. The

@@ -190,8 +190,9 @@ impl Catalog {
     /// The root a tree IS at: its shared cell's value, or the record for a tree the catalog never
     /// gave a cell. **One source of truth** (D208 review 2, C4): every statement descends the cell,
     /// and a record can LAG it. An INSERT that split a root through the shared handle and then
-    /// failed before its root sync leaves the record on the pre-split page, which is now the tree's
-    /// leftmost leaf. Anything that reads a whole tree from its root must read it from here.
+    /// failed before its root sync leaves the record on the pre-split page. That page is now the new
+    /// root's LEFT CHILD: a leaf if the tree was one level deep, an internal node if it was deeper
+    /// (D208 review 3, C3). Anything that reads a whole tree from its root must read it from here.
     pub(crate) fn live_root(&self, table: &str, index: Option<IndexTree<&str>>, recorded: u32) -> u32 {
         self.root_cell(table, index).map_or(recorded, |cell| cell.load(Ordering::Acquire))
     }
@@ -496,8 +497,9 @@ impl Catalog {
     /// where those pages are.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
         // Every tree is freed from its LIVE root, its shared cell, and not from the record (D208
-        // review 2, C4). A record that lags its cell names the pre-split page, which is now the
-        // leftmost leaf. Freeing that frees one page and leaks the rest of the tree
+        // review 2, C4). A record that lags its cell names the pre-split page, which is now the new
+        // root's left child (a leaf if the tree was one level deep, an internal node otherwise; D208
+        // review 3, C3). Freeing from it frees that left part and leaks the rest of the tree
         // (`tests/root_cell_is_per_index.rs`, T12).
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;
