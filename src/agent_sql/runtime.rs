@@ -777,8 +777,8 @@ pub struct RebaseReport {
     /// main move the snapshot without moving it.
     pub fork_seq_after: u64,
     /// Staged rows whose base image differs at the new instant, by table name and row id. A staged
-    /// row whose key could not be recovered, or whose table is gone, is listed here too: its base
-    /// cannot be shown to hold.
+    /// row whose table is gone is listed here too: its base cannot be shown to hold. A row whose key
+    /// no image names is looked up by row id in a scan of its table instead (see `rebase_validate`).
     pub moved_rows: Vec<(String, RowId)>,
     /// Exact read premises that moved: `(table, row, version read, version now)`.
     pub moved_premises: Vec<(TableId, RowId, u64, u64)>,
@@ -850,8 +850,8 @@ struct RebaseValidation {
 /// first (what the row held at the pin), then this branch's own `RowCreate` for a row it inserted,
 /// then the staged image itself — but only when that image still hashes to the row's id, because an
 /// UPDATE on a branch may assign column 0 (`Workspace::unprobeable_rows`). `None` when no image
-/// names the key, e.g. an insert-then-delete this branch inherited from its parent; the caller
-/// treats that as "cannot be shown to hold".
+/// names the key, e.g. an insert-then-delete this branch inherited from its parent; the caller then
+/// finds the row by id in one scan of its table, since the id cannot be turned back into a key.
 fn rebase_key(
     base: Option<&Vec<Value>>,
     staged: &RowState,
@@ -3720,7 +3720,9 @@ impl AgentRuntime {
     /// between the old pin and now**:
     ///
     /// 1. every staged row's base image equals the row's image at the new instant (a point lookup
-    ///    through the new snapshot, as `evaluate_merge` does it, so the cost is O(staged · log N));
+    ///    through the new snapshot, as `evaluate_merge` does it, so the cost is O(staged · log N);
+    ///    a row whose key no image names — an inherited insert-then-delete — is found by row id in
+    ///    one scan of its table, so that rare case costs O(table) once per table);
     /// 2. every exact read premise names the version visible at the new instant — the comparison
     ///    the read-premise gate makes at MERGE, over the same `captures` read-sets. Scan premises are
     ///    approximate there and are not checked here either;
@@ -3823,18 +3825,36 @@ impl AgentRuntime {
         let mut moved_rows: Vec<(String, RowId)> = Vec::new();
         {
             let read = ctx.read();
+            // Tables read whole at the new instant, keyed by row id — once per table per REBASE, and
+            // only for a staged row no image names the key of (`rebase_key` returned `None`: an
+            // insert-then-delete inherited from a parent, or a row whose column 0 an UPDATE moved).
+            // The row id is a one-way hash, so a row with no key can only be found by id, and only
+            // a scan can do that. It used to be counted as moved instead, which left a child holding
+            // an inherited insert-then-delete unable to rebase for ever: the staged entry never goes.
+            let mut by_id: BTreeMap<String, BTreeMap<u64, Vec<Value>>> = BTreeMap::new();
             for ((t, r), staged) in rows.iter() {
                 let (tbl, row) = (TableId(*t), RowId(*r));
                 let name = tables.get(t).cloned().unwrap_or_default();
                 let base: Option<Vec<Value>> = base_rows.get(&(*t, *r)).cloned().flatten();
-                let key = rebase_key(base.as_ref(), staged, &ops, tbl, row);
-                let holds = match (key, read.catalog.get_table(&name)) {
-                    (Some(k), Some(_)) => {
-                        self.row_at(&read, &name, (*t, *r), &k, Arc::clone(&new_at))? == base
-                    }
-                    // No key to look it up by, or its table is gone: the base cannot be shown to
-                    // hold, and refusing is the direction that cannot lie.
-                    _ => false,
+                let holds = if read.catalog.get_table(&name).is_none() {
+                    // Its table is gone: the base cannot be shown to hold, and refusing is the
+                    // direction that cannot lie.
+                    false
+                } else {
+                    let now = match rebase_key(base.as_ref(), staged, &ops, tbl, row) {
+                        Some(k) => self.row_at(&read, &name, (*t, *r), &k, Arc::clone(&new_at))?,
+                        None => {
+                            if !by_id.contains_key(&name) {
+                                let all = scan_table_where(&name, None, None, &read, Arc::clone(&new_at))?;
+                                by_id.insert(
+                                    name.clone(),
+                                    all.into_iter().map(|img| (row_id_of(&img).0, img)).collect(),
+                                );
+                            }
+                            by_id.get(&name).and_then(|rows_now| rows_now.get(r)).cloned()
+                        }
+                    };
+                    now == base
                 };
                 if !holds {
                     moved_rows.push((name, row));
