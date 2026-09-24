@@ -804,3 +804,91 @@ The lane report's FAN-QUEUE row carries this as its re-run instruction.
      "not computable" (two points).
    * **Refusal.** If no axis-(ii) merge checkpointed under the pin, it prints NOT A RESULT naming that. So it is not
      in the (f) list, whose M targets stop at 128.
+
+**A12, 2026-09-24, before any build or run. Review 4 of `1b8676b..e4094cc` (artie-research
+`frontier/read_vs_n_review4.md` @ `a696181`) returned SOUND-WITH-CAVEATS. E2's seam is sound. The lead's decisions on
+R1–R5, and what changes:**
+
+1. **R1: the replay's O(M) is judged on an INTEGER, not the clock.**
+   * **Withdrawn:** A11.3's judged verdict on the time fit (`a > 0` and `a_hi / a_lo` in [0.5, 2.0]). It has no
+     noise floor. Review 4's Monte Carlo of its arithmetic:
+     * under a CONSTANT excess it says "linear" 10% of the time, and it can never say "constant";
+     * at a replay-to-jitter ratio of 2, it calls an exactly linear replay "not linear" 37% of the time.
+   * **Judged:** `replay_bytes`, printed raw on each axis-(ii) `CKPT` line, against `runs`.
+     * `replay_bytes` is the WAL bytes appended after the checkpoint's truncation: `next_lsn − base_lsn` read once
+       the MERGE returns. That is everything `replay_schema` and `replay_runs` appended, and nothing else. It prints
+       "-" when the base did not move (no truncation: a pin).
+     * Control flow fixes the count, so no load can move it.
+   * **b, derived from the encoder** (READ `wal/log.rs` `WalManager::append` and `RecKind::serialize`,
+     `provenance/mod.rs` `RunEntity`, `agent_sql/runtime.rs` `begin_session_as_staged`):
+     * frame = 4 length + 8 lsn + 8 prev_lsn + 8 txn_id + kind + 4 CRC = 32 + kind;
+     * kind `RunIdentity` = 1 tag + 4 `prov_id` (u32) + (2 + 12) agent id + (2 + 9) run id `<unnamed>` + (2 + 11)
+       model `unspecified` + (2 + 11) version `unspecified` + 32 prompt hash (all-zero, no PROMPT) + 8 `started_at` +
+       8 parent id + 4 generation = **108**;
+     * **b = 140 bytes per retained run.**
+   * **The agent id is now fixed-width, `mc` + 10 digits** (`mc{id:010}`), so every declaration encodes to the same
+     size. Under `mc{id}` the size grew with the id's digit count, and the line could not be exact.
+   * **a** is the retained DDL records. **At this tree it is 0:**
+     * axis (ii) starts at `reopen_for_merges`, whose fresh `TxnManager` has an empty `schema_log`, and nothing
+       refills it at open (ledger D227);
+     * no merge here logs DDL (INFERRED: the publish logs DDL only for a schema rewrite, `runtime.rs` near
+       `ctx.txn.log_ddl(record)`).
+   * **Pre-registered:** `replay_bytes = 140 · runs` exactly, at every truncating checkpoint. The printed bytes fit
+     reads slope = 140.000, intercept = 0.0, max |residual| = 0.0.
+     * At the default M targets: 64 `CKPT` lines, `runs` = 256, 512, …, 16384 (runs = M, INFERRED: one declaration
+       per merge, none refilled).
+     * Any residual is a finding: a record of another size entered the replay.
+     * If D227's fix merges first, the intercept becomes the retained DDL's constant size. The slope of 140 and the
+       zero residual stand.
+   * **Reported, never judged: the time fit.** Excess against `runs`, over all points and over each half, each with
+     `a ± SE(a)`, `c` and the residual sd.
+2. **R2: A11.1's E4 bullet is RETRACTED. So is review 3 §1's premise that `rebuild_us` was an independent check.**
+   * **Why.** `rebuild_us` is timed inside `if recovered || stale` (`recovery.rs` in `open_recovered` at
+     `e4094cc`; the same gate at `a46b7d1:src/wal/recovery.rs:458`). So it is a consequence of `recovered`, not a
+     check on it. "`recovered = 0` with `rebuild_us ≥ 1,000`, a finding against D216" could come only from the
+     D205 marker, and nothing judged it.
+   * **D216's AFTER half stays judged on `recovered = 0` alone, BECAUSE the flag is the rebuild's gate.** A
+     regression that still rebuilds must set it to 1, or trip the marker.
+   * **Residual-work checks (reported):** `recover_us ≤ 5,000` (A11.1), and `child net ms` against `m rows`.
+   * **The marker is WIRED rather than deleted: guard H6.**
+     * Before its open, the child reads `stale_indexes_marker(<db>.wal)`, the engine's own path helper, before the
+       open can remove it. It prints `stale` (0/1) on its `RESTART_RESULT` line and in the RESTART row.
+     * H6 is NOT A RESULT when `stale` is not 0. Nothing in this harness rolls back, so a marker means an index undo
+       failed in the parent, and that restart's rebuild is D205's, not a clean restart's.
+     * **In-path fire `stale-marker`:** before the FIRST restart, the parent writes the marker file
+       (`mark_indexes_stale` writes it, and `open_recovered` reads only whether it exists) and asserts that it
+       exists.
+     * **Expected:** rc = 2, H6 at the first checkpoint only (the child's open removes the marker after
+       rebuilding), and no other guard.
+   * `OpenDatabase::recovered`'s doc now says the flag is the rebuild's gate, not something the rebuild's time
+     checks.
+3. **R3: a fire mode whose arm is off is refused at startup, whatever the arm.**
+   * `Fire::needs` maps every mode to its arm. It is an exhaustive `match` with no `_` arm, so a new mode cannot
+     compile without naming one. The mapping:
+     * read: G2–G7's modes;
+     * merge: M1–M6's modes;
+     * restart: H1–H6's modes;
+     * any: G1's `extra-branch`, because every arm set checks it.
+   * `Fire::refusal` returns the reason, and `main` panics with it before anything is created. It covers three
+     cases: no `CURVE_ARMS`; the arm is off; `orphan-extent` with merge on (A9.2, moved here).
+   * **The check that the refusal fires is run (f0).** Five commands, each expected to exit 101 with its refusal text
+     and to create no run directory:
+     * `pinned-checkpoint` with `read` (the case review 4 found);
+     * `wrong-page` with `merge`;
+     * `child-locked` with `read,merge`;
+     * `wrong-visits` with `CURVE_ARMS` unset;
+     * `orphan-extent` with `merge,restart`.
+   * The negative control is (f) itself: every mode runs with its arm on.
+4. **R4: both fits' x is `runs`** (`retained_runs` after the merge, the replay's input), not `m_done`. Each `CKPT` line
+   prints both. `CkptPoint.m`'s doc no longer calls it "the run declarations it re-appended".
+5. **R5:**
+   * Each half's range is printed (`runs a..=b, n points`). For an odd n, the middle point belongs to the upper half.
+   * A11.6's "the fit prints not computable (two points)" was imprecise. At two points each half has one point and
+     prints "not computable". The all-points time fit prints the exact two-point line with SE "-".
+   * In (f2), under the pin, no checkpoint truncates. So every `replay_bytes` is "-", and the bytes fit prints "not
+     computable (0 truncating checkpoints)".
+6. **Counts.**
+   * Fire modes: 21. `stale-marker` is new.
+   * The (f) list on the (e) command has 19 of them: all except `orphan-extent` (its own restart-only run) and
+     `pinned-checkpoint` ((f2)).
+   * New `#[test]`s over `9aa6968`: still 41.
