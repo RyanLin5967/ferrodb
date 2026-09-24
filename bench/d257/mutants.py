@@ -12,7 +12,7 @@ Run from the worktree root. Restoring is the caller's job: `git checkout SUBJECT
 import subprocess
 import sys
 
-SUBJECT = "e11a3b1"
+SUBJECT = "edc34a9"
 H = "src/storage/heap_file_manager.rs"
 U = "src/execution/update.rs"
 
@@ -60,6 +60,11 @@ MUTANTS = {
             "        self.buffer_pool_manager.unpin_page(page_id, true);\n"
             "        self.update_directory_entry(page_id, page.get_free_space_end() - page.get_free_space_start())?;\n",
         ),
+    ],
+    # The refusal narrowed to below 65532 (review 1 R6c): the u16-boundary lengths reach
+    # `try_from` and get `Internal`, which names the limit but is not the refusal.
+    "MG_narrowed_refusal": [
+        (H, GUARD, "        if tuple_len > MAX_TUPLE_SIZE && tuple_len < 65532 {\n"),
     ],
     # The refusal is the old error again: nothing names the limit.
     "MF_old_error": [
