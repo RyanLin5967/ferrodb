@@ -329,6 +329,11 @@ pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
 pub struct BootTimings {
     /// The file, the buffer pool, the WAL and the transaction manager.
     pub files: Duration,
+    /// **D239's floor read, kept out of `files` (READ-VS-N, PREREG A19).** D239 adds
+    /// `ArenaPageStore::reserve_persisted_floor` between the disk manager and the buffer pool: it
+    /// reads and checksums the whole `{db}.arena` image, O(arena extents), where `files` is flat.
+    /// ZERO until that call is merged here; the merge times it and subtracts it from `files`.
+    pub floor: Duration,
     /// [`recover`]: redo and undo of the heap records.
     pub recover: Duration,
     /// `Catalog::open`, or `Catalog::create` for a new file.
