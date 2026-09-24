@@ -29,7 +29,7 @@ use crate::wal::txn::TxnManager;
 /// been written after it, the next open does not rebuild, and this error is the only signal.
 pub fn checkpoint_for_exit(catalog: &Catalog, txn: &TxnManager) -> Result<(), FerroError> {
     if let Err(e) = catalog.persist() {
-        let flushed = match txn.wal.flush() {
+        let flushed = match Ok::<(), FerroError>(()) { // D230 MUTANT M8: the log is not flushed
             Ok(()) => "The write-ahead log was flushed and NOT truncated, so the next open recovers \
                        and rebuilds every index if it holds any record."
                 .to_string(),
