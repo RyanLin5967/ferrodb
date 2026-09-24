@@ -6330,8 +6330,9 @@ impl AgentRuntime {
                 let records = store.records();
                 let (hseq, ordinal, publish) = revert_store::find_publish(&records, merge_id)?
                     .ok_or_else(|| earlier_run_not_in_history(merge_id, store.retention()))?;
-                // The store may still hold a merge the window has left — up to `W/8` publishes wait
-                // for the next prune, and the open can bring back a pruned record the log kept.
+                // The store may still hold a merge the window has left: up to `W/8` publishes wait
+                // for the next prune. (A pruned record does not come back: the open's catch-up
+                // re-queues only records at or above the store's persisted floor, AMENDED 3, item 3.)
                 // Refused by ordinal, exactly as for this run's merges.
                 if last_ordinal.saturating_sub(ordinal) >= store.retention() {
                     return Err(outside_window(merge_id, store.retention()));

@@ -33,13 +33,16 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             )));
         }
     }
-    // **AMENDED 3, item 10a: the store must be this database's.** For a store that holds history,
-    // the log declares its incarnation after every truncation and at an open that finds none
-    // (`TxnManager::declare_history`); a store that names another is refused here, before recovery
-    // writes anything. Not checked, stated: a log with no declaration — written before this build,
-    // or cut by a crash between a truncation and its declaration, whose next open then declares the
-    // store it finds — and a history file copied from a fork of this database, which shares its
-    // incarnation by construction.
+    // **AMENDED 3, item 10a: the store must be this database's.** For every attached store, with or
+    // without history (review of `c9d1e6e`, F1), the log declares its incarnation after every
+    // truncation and at an open that finds none (`TxnManager::declare_history`); a store that names
+    // another is refused here, before recovery writes anything. Not checked, stated: a log with no
+    // declaration — written before this build, or cut by a crash between a truncation and its
+    // declaration, whose next open then declares the store it finds; a history file copied from a
+    // fork of this database, which shares its incarnation by construction; and a plain
+    // `replication::backup::restore` over a path whose earlier database had history, whose log and
+    // store both still name that database, so the restored rows inherit its history (the history
+    // twin of the limit `start_fresh_quarantine` states for plain `restore`).
     if let (Some(store), Some(declared)) =
         (txn.history_store(), crate::wal::history::declared_incarnation(&records))
     {

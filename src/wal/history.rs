@@ -316,13 +316,6 @@ impl HistoryStore {
         &self.path
     }
 
-    /// Whether this store holds any history, durable or queued. A store that holds none has nothing
-    /// to protect, so the log carries no incarnation for it (review of `0d3fbb9`, N2).
-    pub fn holds_history(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        !s.window.is_empty() || !s.queue.is_empty()
-    }
-
     /// The window `W`, in publishes.
     pub fn retention(&self) -> u64 {
         self.retention

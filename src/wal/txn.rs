@@ -174,6 +174,10 @@ pub struct TxnManager {
     /// decision 3: the stderr line is printed when this CHANGES (owed, then clear again), not at every
     /// checkpoint that keeps the log. `DEFERRED_CHECKPOINTS` counts every one.
     keeping_log: std::sync::atomic::AtomicBool,
+    /// Whether the last checkpoint kept the log because REVERT's history could not be written to its
+    /// store (D212 (a') AMENDED 3, item 1). The stderr line is printed when this CHANGES, as for
+    /// [`TxnManager::keeping_log`] (review of `c9d1e6e`, F2); `DEFERRED_CHECKPOINTS` counts every one.
+    keeping_log_for_history: std::sync::atomic::AtomicBool,
     /// Owed releases that are page/log MISMATCHES whose quarantine record could not be written, so
     /// they stay owed (review 3's decision 6). Review 4's finding 4: a DROP must not discard one of
     /// these, because its truncation would remove the only record of it; see
@@ -492,7 +496,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), history_declared: std::sync::atomic::AtomicBool::new(false) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), keeping_log_for_history: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), history_declared: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
@@ -940,13 +944,15 @@ impl TxnManager {
     /// (`HistoryStore::adopt_or_check`). Nothing without a store. Cost: one fixed-size record (a
     /// u64 payload) and one flush per truncation.
     ///
-    /// **Only for a store that holds history** (review of `0d3fbb9`, N2): an empty store has nothing
-    /// to protect, and a declaration would leave a log that is otherwise empty with a record.
+    /// **For every attached store, whether or not it holds history** (review of `c9d1e6e`, F1; the
+    /// lead's decision). A database that has never published still declares its own incarnation, so
+    /// a history file copied in beside it is refused at its next open instead of being declared as
+    /// its own. Review of `0d3fbb9`'s N2 limited this to a store holding history, because the
+    /// declaration leaves a log that is otherwise empty with one record: `recover` reads a log of
+    /// declarations alone as nothing to recover, and `tests/wal_format_upgrade.rs`'s header-only
+    /// premise is the lane's ⚖ for it.
     pub(crate) fn declare_history(&self) -> Result<(), FerroError> {
         let Some(store) = self.history.get() else { return Ok(()) };
-        if !store.holds_history() {
-            return Ok(());
-        }
         let incarnation = store.incarnation();
         self.wal.append(0, 0, &RecKind::IncarnationDecl { incarnation })?;
         self.wal.flush()?;
@@ -1982,7 +1988,8 @@ impl TxnManager {
     ///
     /// A kept log is counted in `DEFERRED_CHECKPOINTS`. The stderr line is printed only when the
     /// log-keeping state CHANGES: once when a checkpoint first keeps the log, and once when one
-    /// truncates again (review 3's decision 3).
+    /// truncates again (review 3's decision 3). REVERT's history has its own state and its own pair of
+    /// lines, printed the same way (D212 (a'), review of `c9d1e6e`, F2).
     fn checkpoint_or_keep_held(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
         use std::io::Write;
         let owed = if retry { self.retry_pending_releases_held() } else { self.owed_releases() };
@@ -2001,13 +2008,23 @@ impl TxnManager {
         if let Some(store) = self.history.get() {
             if let Err(e) = store.drain() {
                 DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+                if !self.keeping_log_for_history.swap(true, Ordering::SeqCst) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: checkpoints now flush every page but keep the log: REVERT's history could \
+                         not be written to {} ({e}); it stays queued, every checkpoint retries it, and this \
+                         is printed again when a write succeeds",
+                        store.path().display()
+                    );
+                }
+                return Ok(CheckpointOutcome::KeptForHistory);
+            }
+            if self.keeping_log_for_history.swap(false, Ordering::SeqCst) {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "ferrodb: a checkpoint flushed every page but kept the log: REVERT's history could not \
-                     be written to {} ({e}); it stays queued, and the next checkpoint retries",
+                    "ferrodb: REVERT's history is written to {} again",
                     store.path().display()
                 );
-                return Ok(CheckpointOutcome::KeptForHistory);
             }
         }
         if owed > 0 {
