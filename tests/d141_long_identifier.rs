@@ -123,11 +123,12 @@ fn a_refused_create_table_does_not_wedge_the_next_one() {
 
 /// A refusal is repeatable, not a slow leak.
 ///
-/// `Catalog::persist` returns through `?` without unpinning the catalog page it fetched, so every
-/// refusal leaks one pin — a pre-existing shape on every error path there, which D141 made
-/// reachable from ordinary SQL for the first time. This bounds what that costs: if the leak
-/// mattered, several hundred refusals would break the pool or the page, and the ordinary statement
-/// at the end would not get through.
+/// `Catalog::persist` used to return through `?` without unpinning the catalog page it fetched, so
+/// every refusal leaked one pin — a pre-existing shape on every error path there, which D141 made
+/// reachable from ordinary SQL for the first time. D230 review 8 (R8-1) now releases the pin on every
+/// error path, since a pinned page cannot be freed. This still bounds what repeated refusals cost:
+/// several hundred must leave the pool and the page working, and the ordinary statement at the end
+/// must get through.
 #[test]
 fn many_refused_statements_leave_the_database_working() {
     let mut db = Db::new();

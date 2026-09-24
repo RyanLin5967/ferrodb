@@ -1696,11 +1696,15 @@ impl TxnManager {
     ///   `9aa6968` too (lane §21.6, `rollback-review4` and the D216 lane). New pins are held off
     ///   (`WalManager::fence_pins`) from this check through the truncation, so none can land between.
     /// - a poisoned log, whose flush is refused, so the checkpoint would fail after the drop.
+    /// - an owed catalog persist (D230 review 7, F-B): every checkpoint keeps the log while one is
+    ///   owed, so the DROP's truncation would hang on its own persist, which runs after its frees.
     ///
     /// **Stated:** while one table owes a release that never succeeds, or a reader stays pinned
-    /// behind the log's end, no OTHER table can be dropped. A checkpoint that fails after the drop
-    /// for a reason not visible beforehand (an I/O error in the flush or the truncation) still leaves
-    /// the dropped table's records in the log: D229, whose deferred frees retire this interim rule.
+    /// behind the log's end, no OTHER table can be dropped; and while a catalog persist is owed, no
+    /// table can be dropped (under D249's ALTER wedge, that is until a restart). A checkpoint that
+    /// fails after the drop for a reason not visible beforehand (an I/O error in the flush or the
+    /// truncation) still leaves the dropped table's records in the log: D229, whose deferred frees
+    /// retire this interim rule.
     pub fn drop_checkpointed<T>(
         &self,
         frees: &[u32],
@@ -3585,7 +3589,8 @@ use super::*;
     /// **D230 review 7, F-D: a refusal `persist_or_undo` undid does not leave a persist owed.** The
     /// undo restores the in-memory records, and the persist after it rewrites the pages from them, so
     /// the debt is cleared. Without that, one over-long `CREATE TABLE` (D141) would keep every later
-    /// log until some other persist happened to succeed, which DML-only traffic never does.
+    /// log until some other persist happened to succeed, which only a statement that moves a root
+    /// does.
     #[test]
     fn an_undone_catalog_refusal_does_not_leave_a_persist_owed() {
         let (bp, _wal, txn, mut catalog, _owned, _dir) = table_to_drop();

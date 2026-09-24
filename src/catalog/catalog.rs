@@ -518,65 +518,77 @@ impl Catalog {
         loop {
             let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
 
-            let mut page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                CatalogPage::deserialize(frame.data)?
-            };
+            // D230 review 8 (R8-1): every `?` in this step used to return with the page still pinned,
+            // one leaked pin per refusal (`tests/d141_long_identifier.rs` bounded its cost). A pinned
+            // page cannot be freed, so a later `drop_table`, or a persist that orphans the page, then
+            // failed with `PagePinned`. The step runs as a closure and the pin is released whatever
+            // it returned. The page is dirty only if the step wrote it, which is its last act.
+            let step = (|| -> Result<(u32, u32, bool), FerroError> {
+                let mut page = {
+                    let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                    CatalogPage::deserialize(frame.data)?
+                };
 
-            page.entries.clear();
-            page.num_entries = 0;
+                page.entries.clear();
+                page.num_entries = 0;
 
-            while let Some(entry) = iter.peek() {
-                if page.has_space(entry) {
-                    page.add_entry(iter.next().unwrap().clone())?;
-                } else {
-                    break;
-                }
-            }
-
-            let has_more = iter.peek().is_some();
-            let mut orphan_head = 0;
-            if has_more {
-                if page.next_catalog_page == 0 {
-                    let new_id = self.buffer_pool.new_page()?;
-                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
-                    // zero-filled page, and the next turn of this loop deserializes whatever is at
-                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
-                    // with format byte 0. That used to parse as an accidentally-empty page because
-                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
-                    // is between initialising the page here and teaching the format allowlist to
-                    // accept all-zeroes, which would let a genuinely corrupt page through.
-                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
-                    {
-                        let mut frame = self.buffer_pool.frame_write(frame_i);
-                        frame.data = CatalogPage::new(new_id).serialize()?;
+                while let Some(entry) = iter.peek() {
+                    if page.has_space(entry) {
+                        page.add_entry(iter.next().unwrap().clone())?;
+                    } else {
+                        break;
                     }
-                    self.buffer_pool.unpin_page(new_id, true);
-                    page.next_catalog_page = new_id;
                 }
-            } else {
-                orphan_head = page.next_catalog_page;
-                page.next_catalog_page = 0;
-            }
 
-            let next = page.next_catalog_page;
+                let has_more = iter.peek().is_some();
+                let mut orphan_head = 0;
+                if has_more {
+                    if page.next_catalog_page == 0 {
+                        let new_id = self.buffer_pool.new_page()?;
+                        // Stamp it as an empty catalog page before linking it. `new_page` hands back a
+                        // zero-filled page, and the next turn of this loop deserializes whatever is at
+                        // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
+                        // with format byte 0. That used to parse as an accidentally-empty page because
+                        // byte 0 was never read; now that the byte is the format stamp (B8), the choice
+                        // is between initialising the page here and teaching the format allowlist to
+                        // accept all-zeroes, which would let a genuinely corrupt page through.
+                        let new_frame = self.buffer_pool.fetch_page(new_id)?;
+                        let stamped = CatalogPage::new(new_id).serialize();
+                        if let Ok(bytes) = &stamped {
+                            let mut frame = self.buffer_pool.frame_write(new_frame);
+                            frame.data = *bytes;
+                        }
+                        self.buffer_pool.unpin_page(new_id, stamped.is_ok());
+                        stamped?;
+                        page.next_catalog_page = new_id;
+                    }
+                } else {
+                    orphan_head = page.next_catalog_page;
+                    page.next_catalog_page = 0;
+                }
 
-            {
-                let mut frame = self.buffer_pool.frame_write(frame_i);
-                frame.data = page.serialize()?;
-            }
-            self.buffer_pool.unpin_page(curr_page_id, true);
+                let next = page.next_catalog_page;
+                let bytes = page.serialize()?;
+                {
+                    let mut frame = self.buffer_pool.frame_write(frame_i);
+                    frame.data = bytes;
+                }
+                Ok((next, orphan_head, has_more))
+            })();
+            self.buffer_pool.unpin_page(curr_page_id, step.is_ok());
+            let (next, orphan_head, has_more) = step?;
 
             if !has_more {
                 let mut free_id = orphan_head;
                 while free_id != 0 {
                     let frame_i = self.buffer_pool.fetch_page(free_id)?;
-                    let next_orphan = {
+                    let decoded = {
                         let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                        CatalogPage::deserialize(frame.data)?.next_catalog_page
+                        CatalogPage::deserialize(frame.data)
                     };
-
+                    // Released before the decode's `?`, for the same reason as above (R8-1).
                     self.buffer_pool.unpin_page(free_id, false);
+                    let next_orphan = decoded?.next_catalog_page;
                     self.buffer_pool.delete_page(free_id)?;
                     free_id = next_orphan;
                 }
