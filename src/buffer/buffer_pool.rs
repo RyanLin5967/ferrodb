@@ -1864,6 +1864,10 @@ mod tests {
     /// The N1 tests share `fault_hooks`' two global slots, so they run one at a time.
     static N1_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// How long a seam may take to be reached. A seam that is never reached (a mutant that
+    /// removes it) fails the test here instead of hanging the run.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
     fn n1_pool(tag: &str) -> (Arc<BufferPoolManager>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("ferro-bp-n1-{}-{}.db", std::process::id(), tag));
         let _ = std::fs::remove_file(&path);
@@ -1941,7 +1945,7 @@ mod tests {
                 (i, pins, byte)
             })
         };
-        arrived_rx.recv().expect("the fault never reached its seam");
+        arrived_rx.recv_timeout(PATIENCE).expect("the fault never reached its seam");
         // The claim scans from here, so the set's frames come first.
         bp.free_hint.store(0, Ordering::Relaxed);
         let freer = {
@@ -1949,11 +1953,11 @@ mod tests {
             let set = set.to_vec();
             std::thread::spawn(move || bp.free_pages(&set))
         };
-        open_rx.recv().expect("free_pages never reached its seam");
+        open_rx.recv_timeout(PATIENCE).expect("free_pages never reached its seam");
         // The window: pass 1 is done and pass 2 has not begun.
         let probe_pinned = bp.pin_if_labelled(set_frames[0], set[0]).is_some();
         release_tx.send(()).unwrap();
-        filled_rx.recv().expect("the fault never filled its frame");
+        filled_rx.recv_timeout(PATIENCE).expect("the fault never filled its frame");
         resume_tx.send(()).unwrap();
         let free_result = freer.join().unwrap();
         let (fault_frame, fault_pins, fault_byte) = faulter.join().unwrap();
