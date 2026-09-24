@@ -79,9 +79,10 @@ const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 /// branch the catalog cannot answer for must not cost every *other* expired branch its
 /// reclamation, and a reaper that stopped on the first oddity would be strictly worse than the bug
 /// this row fixes. [`Self::Refused`] is therefore an `Ok`-shaped outcome, not an `Err`: the caller
-/// records it and moves to the next candidate. Only a non-`Branch` error still aborts — in the
-/// steady-state sweep. At open, since wall21 review audit 4 A1, every per-slot error is a refusal
-/// whatever its type (`resume_interrupted_reaps`).
+/// records it and moves to the next candidate. Only a non-`Branch` error still aborts. Since
+/// wall21 review audit 5, a failed READ about one slot inside a reap is a `Branch` error whatever
+/// its cause (`one_slot_read`), so what still aborts is a WRITE error: at open it fails the
+/// open (`resume_interrupted_reaps`).
 ///
 /// ⚠ **Absorbing is not excusing.** Now that every refusal is an I/O error or a corrupt catalog,
 /// the sweep continuing is exactly why the count and the reason have to reach a reader — the
@@ -213,20 +214,34 @@ impl TwoTierReaper {
     /// ⚠ **W6 (wall21 review audit 3): "every" was false since C2a.** Each of these is a counted
     /// refusal ([`Self::refused_reaps`], reasons in [`Self::open_slot_refusals`]), and the open
     /// goes on:
-    /// - a resumed reap that errs, of ANY error type (C2a; A1 of audit 4);
+    /// - a resumed reap that fails on a `Branch` error: a check, or a failed READ about one slot,
+    ///   which `one_slot_read` makes `Branch` whatever its cause (C2a; A1 of audit 4, narrowed
+    ///   to reads by audit 5);
     /// - a `Reaping` id whose record cannot be read, of any error type (W3, A1);
     /// - a `Reaping` STATE key whose record is in another state, which is never reaped (A3).
     ///
+    /// **A WRITE error inside a resumed reap fails the whole call, as at `0e3c36a` (audit 5).**
+    /// Audit 4's A1 absorbed those too, arguing that a unit stopped part-way is the state a crash
+    /// at that point leaves. That is false twice:
+    /// - `free_arena` gives an extent back in memory before its free record is durable, so an
+    ///   absorbed persist failure lets a later claim alias a range the durable map still gives to
+    ///   the owner (B1, D263);
+    /// - `write_record`'s index move could leave a record no STATE key names (B2, D264; fixed
+    ///   there by making the move additive-first).
+    ///
+    /// A failed open exits without flushing either the catalog pool or the arena map, which is
+    /// what a crash does.
+    ///
     /// So an `Ok` does NOT mean no half-reaped branch is left, and where a declined one is left
     /// depends on where it stopped (audit 4 A6 corrected this list):
-    /// - before its `Reaped` flip: still `Reaping`, charged with its extents, and resumed again at
-    ///   the next open;
+    /// - before its `Reaped` flip: still `Reaping` and named by its STATE key (D264 keeps a torn
+    ///   flip in a STATE span), charged with its extents, and resumed again at the next open;
     /// - in its cascade, after the flip: `Reaped`, its extents freed or their pages parked, and
     ///   its slot retried by this open's sweep if the flip keyed it;
     /// - in its drain, after `release_id`: released, with its pending pages left for a later drain.
     ///
-    /// Only the enumeration (`ids_in_state`), the sweep's candidate scan and the orphan collector
-    /// can still fail the whole call.
+    /// What fails the whole call: the enumeration (`ids_in_state`), a WRITE error inside a resumed
+    /// reap or a swept slot, the sweep's candidate scan, and the orphan collector.
     ///
     /// `reap` marks the record `Reaping` durably *before* it frees anything, precisely so that a
     /// crash in the middle leaves evidence rather than a leak. Without this call that evidence is
@@ -265,6 +280,13 @@ impl TwoTierReaper {
         // corruption-class (a torn flush; a record-less key whose id a later fork mints, since
         // `write_record_new` removes no stale key), and the answer must not be the destructive
         // one. `TableBranchCatalog::unreleased_reaped_candidates` re-checks state the same way.
+        //
+        // **B5 (audit 5), a known consequence of A3:** a `Reaped` record whose STATE(Reaping) key
+        // survived is refused and counted here at every open. That is a torn flip, which since
+        // D264's additive-first `write_record` is the ONLY shape a torn flip leaves, or a torn
+        // flush. It frees nothing: the sweep still releases the slot if the flip keyed it. It
+        // stops only when the id is recycled and that branch is reaped (its flip out of `Reaping`
+        // removes the key, B4). Until then `refused_reaps` stays non-zero on such a catalog.
         let mut resume_refusals: Vec<String> = Vec::new();
         let mut interrupted: Vec<BranchRecord> = Vec::new();
         for id in self.catalog.ids_in_state(BranchState::Reaping)? {
@@ -326,21 +348,22 @@ impl TwoTierReaper {
         // The sweep below finishes whatever of it the flip left releasable, and a record still
         // `Reaping` is asked again at the next open.
         //
-        // **A1 (audit 4): of ANY error type**, which is wider than a failed read. A write error
-        // inside one reap is absorbed too. A reap that stops part-way leaves exactly the state a
-        // crash at that point leaves, and `reap` is built to resume from that state (it is
-        // re-entrant, see above). Telling a read from a write inside `reap` and its cascade would
-        // need a typed error that does not exist. The cost: a disk that fails every write turns
-        // every resumed reap into a refusal, the open still succeeds, and the next write fails at
-        // its own site. The steady-state lease scan is unchanged and still propagates a
-        // non-`Branch` error.
+        // **Audit 5: READS only.** Audit 4's A1 absorbed every error type here, write errors
+        // included, as "the state a crash at that point leaves". That is false: an absorbed
+        // `free_arena` persist failure leaves memory ahead of the durable map (B1, D263), and the
+        // open then goes on to act on it. So the arm is `0e3c36a`'s again: a `Branch` error is a
+        // refusal, and anything else fails the open, exiting before either the catalog pool or
+        // the arena map is flushed, as a crash would. A failed READ about one slot inside the reap
+        // still reaches the first arm: `one_slot_read` makes it `Branch` at the read site, which
+        // is the one place that knows it was a read.
         for b in interrupted {
             match self.reap(b) {
                 Ok(_) => done.push(b),
-                Err(e) => {
+                Err(e @ FerroError::Branch(_)) => {
                     resume_refusals.push(format!("resumed reap of {b}: {e}"));
                     let _ = self.refuse(e);
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -386,11 +409,13 @@ impl TwoTierReaper {
     /// release whose read or write failed, which keys its slot (C1, W1, W2), and a resumed reap
     /// the open declined after its flip (C2a, W3).
     ///
-    /// # What fails the whole call (A1, wall21 review audit 4)
+    /// # What fails the whole call (A1 of wall21 review audit 4, narrowed by audit 5)
     ///
-    /// Only the candidate scan (`unreleased_reaped_candidates`, whose range scan is not about any
-    /// one slot). Every per-slot step — the record read, the liveness question, the cascade, the
-    /// release — is that slot's refusal, whatever the error type, and the slot stays keyed.
+    /// The candidate scan (`unreleased_reaped_candidates`, whose range scan is not about any one
+    /// slot), and a WRITE error in any slot's cascade or release. A failed READ about one slot —
+    /// its record, its liveness, a parent's record or an ancestor's liveness in its cascade — is
+    /// that slot's refusal whatever its cause, and the slot stays keyed. Audit 5 withdrew the
+    /// write half: an absorbed write error is not the state a crash leaves (B1, B2).
     ///
     /// # What it does per slot
     ///
@@ -455,11 +480,12 @@ impl TwoTierReaper {
                 }
                 Ok(None) => {}
                 // D127's rule: one slot the catalog cannot answer for must not stop an open, and
-                // the refusal is kept with its reason rather than rounded to a count. A1 (audit 4):
-                // of ANY error type, for the reason `resume_interrupted_reaps` gives for a resumed
-                // reap. This slot's step is its liveness, its cascade and its release, and a stop
-                // part-way is the state the next open's sweep starts from anyway.
-                Err(e) => refusals.push(format!("slot {id}: {e}")),
+                // the refusal is kept with its reason rather than rounded to a count. Audit 5:
+                // READS only, as for a resumed reap. `one_slot_read` makes a failed read at the
+                // read sites of this slot's liveness and cascade `Branch`, and a write error (a
+                // detach; `release_id` swallows its own) fails the open.
+                Err(e @ FerroError::Branch(_)) => refusals.push(format!("slot {id}: {e}")),
+                Err(e) => return Err(e),
             }
         }
         self.open_slots_reclaimed.store(released.len() as u64, Ordering::Relaxed);
@@ -470,7 +496,8 @@ impl TwoTierReaper {
     /// One slot of [`Self::reclaim_unreleased_slots`]: `None` if it is pinned and must stay,
     /// otherwise the ancestors its cascade released beside it.
     fn reclaim_slot(&self, rec: &BranchRecord) -> Result<Option<Vec<u64>>, FerroError> {
-        if self.catalog.has_live_children(rec.branch_id.id)? {
+        let id = rec.branch_id.id;
+        if one_slot_read(id, "the liveness", self.catalog.has_live_children(id))? {
             return Ok(None);
         }
         let ancestors = self.detach_from_parent(rec)?;
@@ -827,6 +854,34 @@ impl TwoTierReaper {
     }
 }
 
+/// **Audit 5 (wall21 review): a failed READ about one slot is a `Branch` error, whatever its cause.**
+///
+/// At open, a `Branch` error inside a unit is that unit's refusal and anything else fails the
+/// open (`resume_interrupted_reaps`). The split used to be by type alone, and it was wrong both
+/// ways:
+/// - A B-tree page failure is `Corruption` or `Io`, never `Branch`, so one bad leaf under one
+///   slot failed every open.
+/// - Audit 4's A1 then absorbed every type, write errors included, which is not the state a crash
+///   leaves (B1: an absorbed `free_arena` persist failure lets a claim alias a range, D263).
+///
+/// Only the read site knows it was a read, so the read site says so: a non-`Branch` error from one
+/// of these calls is wrapped into a `Branch` error that names the slot and keeps the cause at the
+/// END of its text, and a `Branch` error passes through unchanged. Writes are never wrapped.
+///
+/// Applied at four sites: `reap`'s liveness question, `reclaim_slot`'s, and `detach_cascade`'s
+/// liveness question and parent-record read. NOT at `reap`'s own first `get_raw`: at open the
+/// resume reads the same record just before (a persistent fault is refused there), so a mapping
+/// behind it could not be tested; a transient fault between the two fails the open, the
+/// conservative direction. The steady-state lease scan sees the same change: a failed read at
+/// those sites is a counted refusal (`reap_if_still_expired` → `Refused`) instead of a scan error,
+/// and `scan_once` continues after either.
+fn one_slot_read<T>(id: u64, what: &str, read: Result<T, FerroError>) -> Result<T, FerroError> {
+    read.map_err(|e| match e {
+        e @ FerroError::Branch(_) => e,
+        e => FerroError::Branch(format!("could not read {what} of slot {id}: {e}")),
+    })
+}
+
 /// **The cascade of [`TwoTierReaper::detach_from_parent`], shared.** D201's second step: the
 /// runtime's reaper-less `seal` arm walks the same cascade, so a subtree in which nothing is alive
 /// is unlinked from its live ancestors whether or not a reaper is attached — otherwise it stays in
@@ -856,7 +911,8 @@ pub(crate) fn detach_cascade(
     // and `…::a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator`.
     let mut ancestors: Vec<u64> = Vec::new();
     loop {
-        if catalog.has_live_children(cur.branch_id.id)? {
+        let cur_id = cur.branch_id.id;
+        if one_slot_read(cur_id, "the liveness", catalog.has_live_children(cur_id))? {
             break;
         }
         let Some(parent) = cur.parent_id else { break };
@@ -872,7 +928,7 @@ pub(crate) fn detach_cascade(
         // then returned `Ok`, the caller released the originator and removed the only key, and
         // every reaped ancestor above was stranded. Propagated, the reap fails before that
         // release and the originator stays on the UNRELEASED span for the next sweep.
-        let prec = catalog.get_raw(parent.id)?;
+        let prec = one_slot_read(parent.id, "the record", catalog.get_raw(parent.id))?;
         if prec.state != BranchState::Reaped {
             break;
         }
@@ -1002,7 +1058,8 @@ impl Reaper for TwoTierReaper {
         // asked of the caller that already has it.
         let own_arenas: BTreeSet<ArenaId> = rec.arenas.iter().copied().collect();
 
-        if !self.catalog.has_live_children(rec.branch_id.id)? {
+        let own = rec.branch_id.id;
+        if !one_slot_read(own, "the liveness", self.catalog.has_live_children(own))? {
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
             // it can see a page born inside its own extents.
             for arena in rec.arenas.iter().copied() {

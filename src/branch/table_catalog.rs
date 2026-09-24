@@ -796,33 +796,59 @@ impl TableBranchCatalog {
     ///
     /// ⚠ **D126 made the RECORD key's rewrite atomic. It did NOT make this method atomic, and the
     /// difference is worth stating so the guarantee is not over-read.** The state and deadline
-    /// index keys are not rewritten in place, they MOVE: `remove_if_present(old)` below, then
-    /// `upsert(new)` a few lines later. Between those two a branch is in NEITHER state span and
-    /// neither deadline span, and `live_count`, `in_state` and `expired_before` scan exactly those
-    /// spans without the `logical` lock. No per-key primitive can close that window — the two keys
-    /// are different keys, in general on different pages — so it needs multi-key exclusion or an
-    /// ordering argument, and it is a separate row. The direction it fails in is benign for the
-    /// reaper (`expired_before` missing an entry means "not expired yet", and
-    /// `reap_if_still_expired` re-reads the record anyway), which is why it is noted here rather
-    /// than treated as the same defect.
+    /// index keys are not rewritten in place, they MOVE, and the two keys are different keys, in
+    /// general on different pages, so no per-key primitive can make the move atomic. There is no
+    /// journal, and an error returns before the caller's `stage`, while whatever was already
+    /// written stays in the pool, where any later `durable` flushes it.
+    ///
+    /// **D264 (wall21 review audit 5, B2): so the move is ADDITIVE-FIRST.** The new STATE key, the
+    /// RECORD and the new DEADLINE key are written first, and only then are the old index keys
+    /// removed. This used to remove STATE(old) first, so an error before the RECORD upsert left a
+    /// record that NO state key named. A `Reaping` one torn that way was never resumed (the resume
+    /// enumerates the STATE span), never offered, never expired, and its parent read it as a live
+    /// child for ever. Now every error or crash point leaves at least one STATE key:
+    /// - before the RECORD is written: the record is in its OLD state, with both keys, so a
+    ///   `Reaping` one is still resumed;
+    /// - after it: the record is in its NEW state, and the old key is stale. A stale `Reaping` key
+    ///   on a `Reaped` record is audit 5's B5 shape: the resume refuses it (A3), and the sweep
+    ///   releases the slot if it is keyed.
+    ///
+    /// An old key EQUAL to its new key is never removed, since removing it after the upsert would
+    /// delete the new one: `set_root`, `put` and a `renew_lease` that keeps its deadline rewrite
+    /// with the state unchanged. The cost of the order is a torn DEADLINE move, which now leaves a
+    /// stale EXTRA key instead of none. None meant the branch never expired. An extra key is
+    /// filtered by `expired_before`'s re-check, at one key read per scan, until the branch is next
+    /// rewritten out of `Live`. And the unlocked readers (`live_count`, `in_state`,
+    /// `expired_before`) can see a branch in BOTH spans mid-move where they used to see it in
+    /// NEITHER, so `live_count` can over-count by one instead of under-counting; the reaper
+    /// re-reads the record either way.
+    ///
+    /// ⚠ Merge note: D233, D235, lease-grace and D244 also touch this method. At every merge, keep
+    /// the order: no `remove_if_present(&keys::state(` before `upsert(keys::record(`.
     fn write_record(
         &self,
         rec: &BranchRecord,
         old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
-        if let Some(prev) = old {
-            self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
-            if Self::in_deadline_index(prev.state(), prev.branch_id()) {
-                self.remove_if_present(&keys::deadline(
-                    prev.lease_deadline().0,
-                    prev.branch_id().id,
-                ))?;
-            }
-        }
+        let new_state = keys::state(rec.state.as_u8(), rec.branch_id.id);
+        let new_deadline = Self::in_deadline_index(rec.state, rec.branch_id)
+            .then(|| keys::deadline(rec.lease_deadline.0, rec.branch_id.id));
+        self.upsert(new_state.clone(), Vec::new())?;
         self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.upsert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
-        if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+        if let Some(k) = &new_deadline {
+            self.upsert(k.clone(), Vec::new())?;
+        }
+        if let Some(prev) = old {
+            let old_state = keys::state(prev.state().as_u8(), prev.branch_id().id);
+            if old_state != new_state {
+                self.remove_if_present(&old_state)?;
+            }
+            if Self::in_deadline_index(prev.state(), prev.branch_id()) {
+                let old_deadline = keys::deadline(prev.lease_deadline().0, prev.branch_id().id);
+                if new_deadline.as_ref() != Some(&old_deadline) {
+                    self.remove_if_present(&old_deadline)?;
+                }
+            }
         }
         match &rec.envelope {
             Some(e) => self.upsert(keys::envelope(rec.branch_id.id), e.serialize())?,

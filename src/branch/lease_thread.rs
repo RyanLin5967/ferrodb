@@ -29,13 +29,15 @@
 //! for the life of the file. [`LeaseThread::start`] therefore runs
 //! [`TwoTierReaper::resume_interrupted_reaps`] on the **calling** thread, before it spawns
 //! anything, and returns a catalog-wide error to the caller rather than letting it disappear into
-//! a background thread nobody is reading. One reap or slot the catalog cannot answer for is NOT
-//! such an error (D127; C2a and W3 of the wall21 review audits; A1 of audit 4, whatever the
-//! error's type): it is declined, printed here with its reason, and asked again at every open,
-//! so one bad record cannot stop the database from opening. A fault that persists is refused at
-//! every open until it is repaired, and nothing in the engine repairs it (audit 4 A2). Only the
-//! enumerations that find the work are catalog-wide. (This rule said "returns its error" until
-//! audit 3 W6.)
+//! a background thread nobody is reading. One reap or slot the catalog cannot READ is NOT such an
+//! error (D127; C2a and W3 of the wall21 review audits; A1 of audit 4 for any cause of a failed
+//! read): it is declined, printed here with its reason, and asked again at every open, so one bad
+//! record cannot stop the database from opening. A WRITE error inside a reap or a swept slot IS
+//! such an error and fails the open (audit 5: an absorbed write error is not the state a crash
+//! leaves). A fault that persists is refused at every open until what it names is repaired. For
+//! a missing or undecodable record nothing in the engine repairs it (audit 4 A2); a stale
+//! `Reaping` key is removed by its branch's own next reap (audit 5 B4). (This rule said "returns
+//! its error" until audit 3 W6.)
 //!
 //! **2. Never reap inside a merge.** A merge is an optimistic read of a branch followed by a
 //! publication into its parent (`DESIGN.md` §4). Reaping the branch in that window frees its
@@ -397,7 +399,8 @@ impl LeaseThread {
     /// This said it did, which has been false since C2a: a resumed reap the catalog cannot answer
     /// for, (W3) a `Reaping` record that cannot be read, and (audit 4 A3) a `Reaping` key whose
     /// record is in another state are each declined and counted (`TwoTierReaper::refused_reaps`),
-    /// whatever the error's type (A1), and the open goes on.
+    /// when what failed was a read (A1, narrowed to reads by audit 5), and the open goes on. A
+    /// write error inside one of them fails the open.
     ///
     /// `reaper` is a concrete [`TwoTierReaper`] rather than a `dyn Reaper` because
     /// `resume_interrupted_reaps` is an inherent method: the trait carries only the steady-state
@@ -780,9 +783,18 @@ fn scan_once(
             // never one atomic step with the reap.
             let forgotten = runtime.forget_reaped_branches();
             counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
+            // Wall21 review audit 5 corrected this line. It said "whatever it had already freed
+            // is durable and `reap` is re-entrant, so the next scan resumes rather than
+            // double-freeing". Both halves were false:
+            // - `free_arena` gives an extent back in memory BEFORE its free record is durable, so
+            //   after a failed persist the in-memory free is NOT durable, and a later claim can
+            //   take a range the durable map still gives to the owner. That is D263, the arena-side
+            //   fix, routed separately; the scan continuing is what lets a claim reach it.
+            // - `expired_before` holds only `Live` branches, so a branch left `Reaping` is resumed
+            //   by the next OPEN, not by the next scan.
             out(format!(
-                "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
-                 is re-entrant, so the next scan resumes rather than double-freeing. \
+                "lease: scan failed: {e}. A branch it left `Reaping` is resumed at the next \
+                 open, not by the next scan (only `Live` branches are scan candidates). \
                  {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
                  does not report which branches it had already reaped."
             ));
@@ -832,7 +844,8 @@ fn open_refusal_line(why: &str) -> String {
          names is repaired"
     } else if why.starts_with("interrupted reap of slot ") {
         "did not resume an interrupted reap. This is refused again at every open until what the \
-         reason names is repaired, and nothing in the engine repairs it"
+         reason names is repaired: nothing in the engine rewrites a missing or undecodable \
+         record, and a stale `Reaping` key goes only when that branch is next reaped"
     } else {
         "a resumed reap stopped part-way. What it finished stays done, and the rest is retried \
          where it was left: a record still `Reaping` by the next open, a keyed `Reaped` slot by \
