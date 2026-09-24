@@ -2581,6 +2581,9 @@ fn read_vs_n_summary(
         let counted = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
         if counted == 0 {
             println!("  L2: no row was counted.");
+        } else if counted < 2 {
+            // A18.8: one row's larger reading is its own median, so L2 cannot fire on it.
+            println!("  L2: not judged (fewer than two counted rows).");
         } else if !unavailable.is_empty() || !partly.is_empty() {
             println!(
                 "  L2 is incomplete: UNAVAILABLE (no load reading) at N={unavailable:?}; one reading only at \
