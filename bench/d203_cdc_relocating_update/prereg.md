@@ -87,3 +87,72 @@ at `9aa6968` (`DELETE` + `INSERT`) and after `delete-insert-lookup` `4296723` me
 New target `d203_cdc_relocating_update`: **3 passed**. Lib: **+7** unit tests, all passing.
 `integration_cdc_key_reuse` stays green (its reuse is a `HeapUpdate` DELETE then a `HeapInsert`, never a
 live `HeapDelete`). No existing test is edited.
+
+## Amendment 1 (append-only, before the tests it describes): the fresh review's caveats C1–C4
+
+Source: `artie-research/frontier/d203_review.md` @ `d4743c3` (fresh context, read-only, SOUND-WITH-CAVEATS).
+Quiet mode still holds; everything below is UNBUILT.
+
+### C1 — the M5 row above is WRONG, corrected here
+
+The table above says M5 (the mark is never cleared by the transaction's next record) is killed by U4.
+**It is not.** U4 puts a live `HeapUpdate` between the halves. The fused path requires the popped change
+to be a `Delete`, and a popped `Update` is not one, so that check rejects U4's shape without the mark's
+clearing ever mattering. Two guards enforce "the next record", and U4 tests only the second.
+
+The escaping mutant is a real defect. In `BEGIN; UPDATE (relocates row 1); DELETE row 2; INSERT (2, ..);
+COMMIT;`, a mark left over from the relocation meets `Delete(2)`, which a killed `HeapUpdate` staged. The
+INSERT would then fuse it into an UPDATE, and that is exactly the E63 reuse the integration control
+protects.
+
+**New test U8** `a_mark_does_not_outlive_the_next_record`, on the hand-built log `[live HeapDelete 5]
+[killed HeapUpdate 6][HeapInsert 6]`, must decode as `DELETE 5, DELETE 6, INSERT 6`.
+- It PASSES at `036cca9` and after, since the rule clears the mark.
+- **M5 must fail U8.** U4 passes under M5, and the M5 → U4 row above is withdrawn.
+
+### C2 — the DELETE-LSN stamp is load-bearing; new test U9 and mutant M9
+
+The fused UPDATE carries the `HeapDelete`'s LSN. That matters because `Decoded::open_from` (the minimum
+staged LSN) is what `FeedStreamer::pump` clamps its cursor to. With the insert's LSN, a transaction open
+at a batch boundary would clamp the cursor past its `HeapDelete`, and the next pump would emit a lone
+INSERT.
+
+**New test U9** `a_pair_open_at_the_end_of_a_range_holds_the_cursor_at_the_delete`:
+- `Begin`, `HeapDelete` (its LSN kept from `append`), `HeapInsert`, and no `Commit`. Expect
+  `open_from == Some(delete_lsn)` and no events.
+- Then `Commit` is appended and the log decoded again. Expect one `UPDATE` with `lsn == delete_lsn`.
+- It PASSES at `036cca9` and after.
+
+**M9** — the fused event stamped with the insert's LSN (`lsn` instead of `at`) — **must fail U9.**
+
+### C4 — match the table by `dir_root`, not by name; new test U10 (RED first)
+
+At `036cca9` the pair is matched by table NAME. **New test U10**
+`a_same_named_table_at_another_dir_root_is_not_paired` builds a decoder with two `dir_root`s (7 and 12)
+under the one name `inventory`, then logs `[live HeapDelete 5 at 7][HeapInsert 5 at 12]`.
+- **At the tests commit it FAILS** (the name check fuses them into an UPDATE).
+- After the change, where the mark records the delete's `dir_root` and the insert must carry the same
+  one, it PASSES.
+
+M3 is redefined as "the `dir_root` comparison removed", and it must fail U3 and U10.
+
+The stale `ChangeEvent::lsn` doc and the unlabelled Postgres claim in the module doc (now RECALLED) are
+fixed in the same commit.
+
+### C3 — make the premise a compile error, not a comment
+
+`HeapFileManager::delete` becomes `#[cfg(test)]`. Every caller is in a `#[cfg(test)]` module:
+`heap_file_manager.rs` `mod tests` (from :416), `wal/recovery.rs` (from :278), `wal/txn.rs` (from
+:1130). There are none in `tests/`, `examples/` or `benches/`.
+- `d126_atomic_upsert.rs`'s `t.delete(..)` is a B+tree `Tree`, not a heap (READ, `git grep`).
+
+Expected: lib, every test target and every example compile unchanged. A production caller of a
+physical heap delete, which could log a live `HeapDelete` that is not a relocation, now fails to compile
+outside tests. Fire-check once compute is allowed: add `heap.delete(rid)` to any non-test function and
+confirm `cargo build` refuses it.
+
+### Counts, replacing the ones above
+
+- `d203_cdc_relocating_update`: **3 passed**, as before.
+- Lib: **+10** unit tests (U1–U10), all passing at the head.
+- At the tests commit of this amendment, U10 FAILS and U8 and U9 pass.
