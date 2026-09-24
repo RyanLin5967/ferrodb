@@ -1348,12 +1348,19 @@ impl BufferPoolManager {
     /// earlier bits clear with every frame still resident; the caller's quarantine and durable
     /// intent are what make that safe. A dirty frame is discarded: its page is being freed.
     ///
-    /// Still holding the page-table write lock across the bitmap writes, so no thread can fault a
-    /// page in between the check and the free. page_table -> bitmap_lock is the only order.
+    /// A page being faulted in owns no frame yet, so the pin check cannot see it: `in_transit` is
+    /// checked too, and held to the end, as `invalidate_all` holds it, so no fault can start in the
+    /// middle (D237's `free_pages` had this check; D229's had the batch write). The page-table write
+    /// lock is held across the check and the bitmap writes, so no pin can land between them either.
+    /// Lock order: `in_transit -> arc_cache -> page_table -> frame`, and page_table -> bitmap_lock.
     pub fn free_pages(&self, pages: &[u32]) -> Result<(), FerroError> {
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.
         let _pool = enter_pool();
+        let transit = self.in_transit.lock().unwrap();
+        if pages.iter().any(|page_id| transit.contains(page_id)) {
+            return Err(FerroError::PagePinned);
+        }
         let mut pt = self.page_table.write().unwrap();
         let mut resident = Vec::new();
         for &page_id in pages {
