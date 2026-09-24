@@ -589,6 +589,11 @@ fn scan_once(
     counters: &Counters,
     out: &dyn Fn(String),
 ) {
+    // D265's unit-test seam: a no-op outside `cargo test`. One line on purpose, because
+    // `tests/open_path_allowlist.rs` stops reading a file at a bare `#[cfg(test)]` line, and this
+    // sits in the middle of production code it must still read.
+    #[cfg(test)] scan_seam::fire(reaper);
+
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
     counters.attempts.fetch_add(1, Ordering::SeqCst);
@@ -862,6 +867,56 @@ fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
 fn report(msg: String) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
+/// **D265's test seam, compiled into unit tests only.** A scan whose reaper sits at an armed
+/// address panics once, first thing, so a test can kill ONE lease thread and no other in the same
+/// test binary. Placed last so the open-path tripwire, which stops at the first bare
+/// `#[cfg(test)]` line, still reads every line of production code above it.
+#[cfg(test)]
+pub(crate) mod scan_seam {
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::branch::TwoTierReaper;
+
+    /// `(reaper address, fired)`.
+    static ARMED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+
+    fn addr(reaper: &TwoTierReaper) -> usize {
+        reaper as *const TwoTierReaper as usize
+    }
+
+    /// Arm `reaper`'s next scan to panic, once.
+    pub(crate) fn arm(reaper: &TwoTierReaper) {
+        let a = addr(reaper);
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        armed.retain(|&(x, _)| x != a);
+        armed.push((a, false));
+    }
+
+    /// Whether `reaper`'s armed scan has panicked.
+    pub(crate) fn fired(reaper: &TwoTierReaper) -> bool {
+        let a = addr(reaper);
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|&(x, f)| x == a && f)
+    }
+
+    /// Called first thing in `scan_once`.
+    pub(super) fn fire(reaper: &TwoTierReaper) {
+        let a = addr(reaper);
+        let fire = {
+            let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+            match armed.iter_mut().find(|e| e.0 == a && !e.1) {
+                Some(e) => {
+                    e.1 = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if fire {
+            panic!("D265 test seam: this reaper's lease scan panics");
+        }
+    }
 }
 
 #[cfg(test)]

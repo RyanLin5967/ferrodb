@@ -1178,3 +1178,43 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
          Live-only and resume_interrupted_reaps runs at open, not per tick."
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D265: a scan thread that panicked must say so, and the shipped close must fail on it.
+// -------------------------------------------------------------------------------------------
+
+/// **D265 (a).** A lease scan thread that panicked says so in what `stop()` returns. Before the
+/// fix its final counters read exactly like a healthy thread's, and the panic surfaced only as one
+/// stderr line at shutdown. Read through `Debug`, so this compiles against the API before the
+/// `panicked` field exists (red first).
+#[test]
+fn a_scan_thread_that_panicked_says_so_in_its_stats() {
+    let f = fixture();
+    scan_seam::arm(&f.reaper);
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("the armed scan to panic", || scan_seam::fired(&f.reaper));
+    let done = lease.stop();
+    assert!(
+        format!("{done:?}").contains("panicked: true"),
+        "a dead scan thread's final stats read as a healthy thread's: {done:?}"
+    );
+}
+
+/// **D265 (b).** The shipped close errs when its lease thread died, so `run_cli` exits non-zero
+/// instead of printing "bye bye" over a database that stopped reaping for the rest of the process.
+#[test]
+fn the_shipped_close_errs_when_its_lease_thread_died() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d265.db");
+    let db = crate::cli::cli::open_database(path.to_str().unwrap(), BRISK).unwrap();
+    scan_seam::arm(&db.reaper);
+    wait_for("the armed scan to panic", || scan_seam::fired(&db.reaper));
+    let (stats, closed) = db.close();
+    assert!(closed.is_err(), "a close whose lease thread died returned Ok: {stats:?}");
+}
