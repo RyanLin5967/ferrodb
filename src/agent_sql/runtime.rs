@@ -9181,7 +9181,8 @@ mod tests {
         }
         let row = vec![Value::Integer(1), Value::Integer(10)];
         let read = |shape: AccessShape, purpose: ReadPurpose| {
-            rt.record_read(b, TableId(1), shape, &[(RowId(1), row.clone())], None, None, purpose, Some(3))
+            let matched = [(RowId(1), row.clone())];
+            rt.record_read(b, TableId(1), shape, &matched, None, None, purpose, Some(3))
         };
         assert!(
             read(AccessShape::FullScan, ReadPurpose::Inspection).is_ok(),
