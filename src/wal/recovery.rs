@@ -599,4 +599,103 @@ use super::*;
             Ok(_) => panic!("after the crash, a second row 1 was ADMITTED"),
         }
     }
+
+    /// **D205, the choice between the two copies: the rebuild REPOINTS the cells it finds, and
+    /// never replaces them.**
+    ///
+    /// `b9a0a75` closed the hole with `reseed_root_cells`: clear the map and re-create every cell.
+    /// That is correct only while no handle holds a clone of a cell, because a handle that does
+    /// keeps an `Arc` nobody updates any more: two root pointers for one tree, which is the D53
+    /// defect itself. Its doc stated that precondition; nothing enforced it. Storing the fresh root
+    /// into the EXISTING cell has no precondition. Every holder of the `Arc` sees the new root, and
+    /// D53's invariant (one cell per tree for the life of the process) is kept.
+    ///
+    /// So this holds a cell across `rebuild_indexes`, as a live handle would, and requires that it
+    /// is still THE cell afterwards and names the rebuilt tree. FAILS under the clear-and-resync
+    /// form (`d81f080`) at `ptr_eq`. Passes under store-in-place.
+    #[test]
+    fn a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them() {
+        use crate::execution::executor::run;
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("held.db");
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+        let held = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+
+        rebuild_indexes(&mut o.catalog, &o.bp).unwrap();
+
+        let now = o.catalog.root_cell("t", None).expect("the rebuild left no cell for t");
+        assert!(
+            Arc::ptr_eq(&held, &now),
+            "the rebuild REPLACED t's cell, so a handle holding the old one now has a private root pointer (D53)"
+        );
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            "the cell a handle holds does not name the tree the rebuild built"
+        );
+    }
+
+    /// **D205, the second route to the same drift: the shape of the rebuilt tree.** Ported from
+    /// `b9a0a75`'s `crash_rebuild_reseeds_the_shared_root_cells` (W4(c), never merged) and adapted
+    /// to this branch's `open_recovered`.
+    ///
+    /// The DROP test above puts a free page BELOW a one-leaf tree. This one needs no DROP. Two
+    /// tables of 400 rows each give multi-level trees, and a multi-level tree's final root is a page
+    /// allocated late in the refill, so it differs from the pre-crash root by construction. The
+    /// second table starts from an allocator the first has already churned. It passes at `d81f080`
+    /// and fails when the rebuild stops repointing the cells (mutant Q1).
+    #[test]
+    fn a_crash_rebuild_of_multi_level_trees_leaves_every_cell_on_its_new_root() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        fn exec(sql: &str, o: &mut OpenedDatabase) -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+
+        const ROWS: i64 = 400;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("shape.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for t in ["t", "u"] {
+                exec(&format!("CREATE TABLE {t} (id INTEGER NOT NULL, name VARCHAR(16));"), &mut o);
+                for i in 0..ROWS {
+                    exec(&format!("INSERT INTO {t} VALUES ({i}, 'r{i}');"), &mut o);
+                }
+            }
+            // No checkpoint and no clean close: the reopen below takes the recovery path.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
+        for t in ["t", "u"] {
+            let record = o.catalog.get_table(t).unwrap().primary_index_root;
+            let cell = o.catalog.root_cell(t, None).expect("a cell per loaded table").load(Ordering::SeqCst);
+            assert_eq!(cell, record, "table '{t}': the cell names page {cell}, a freed tree; the rebuilt one is page {record}");
+        }
+        for t in ["t", "u"] {
+            match exec(&format!("SELECT name FROM {t} WHERE id = {};", ROWS - 1), &mut o) {
+                Outcome::Rows(rows) => assert_eq!(rows.len(), 1, "table '{t}': point lookup after crash recovery"),
+                _ => panic!("table '{t}': expected rows"),
+            }
+        }
+    }
 }
