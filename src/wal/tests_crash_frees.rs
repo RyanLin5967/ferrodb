@@ -1360,7 +1360,7 @@ fn a_drop_whose_mutation_fails_frees_nothing_until_the_next_open_completes_it() 
     let m = Machine::boot(fixture(), None);
     let pages;
     {
-        let mut d = m.open().expect("open the fixture");
+        let d = m.open().expect("open the fixture");
         pages = pages_of(&d.o, "t").expect("walk t");
         let e = d.o.catalog.get_table("t").expect("t").clone();
         let record = DdlRecord {
