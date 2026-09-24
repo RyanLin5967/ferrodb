@@ -2669,3 +2669,59 @@ fn every_send_the_transport_refuses_is_counted() {
     t.send(&beat(2)).unwrap();
     assert_eq!((t.unencodable(), t.unaddressable(), t.sent()), (1, 2, 1));
 }
+
+// ---------------------------------------------------------------------------------------------
+// D224 — the first frame after the peer idle-closed the link. Written red against 1b8d290.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt() {
+    // **D224.** Followers send each other nothing while a leader holds, so the receiver closes each
+    // follower-to-follower connection after `idle_deadline`, and the sender does not see it: it
+    // never reads its socket. Its next frame is written into the closed connection and lost with no
+    // number attached. Only the frame after that fails, is counted, and makes it redial. When the
+    // leader dies, that first frame is a survivor's campaign, so failover waits for a later round.
+    //
+    // Here A's link to B carries one frame and then goes silent until B closes it. A single send
+    // must then arrive.
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_millis(300);
+    let (a, b) = pair(opts);
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    };
+
+    a.send(&msg(1)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 1, "the link never carried its first frame");
+
+    // Silence, until B has closed A's connection. `live_inbound_conns` falls only once the close
+    // has been made: the slot's guard drops after `conn_loop`'s final `shutdown`. So when it reads
+    // 0, B's FIN has been sent. A's is the only link B accepts.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && (b.idle_closed() == 0 || b.live_inbound_conns() > 0) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        b.idle_closed() >= 1 && b.live_inbound_conns() == 0,
+        "B never closed A's idle link, so this test exercises nothing"
+    );
+
+    // The campaign frame, sent exactly once.
+    a.send(&msg(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = None;
+    while Instant::now() < deadline && got.is_none() {
+        got = b.recv_timeout(Duration::from_millis(20)).map(|m| m.term);
+    }
+    assert_eq!(
+        got,
+        Some(2),
+        "a frame sent once, after the peer idle-closed the link, never arrived (A counted \
+         lost_in_flight={}): it was written into a closed connection and lost uncounted",
+        a.lost_in_flight()
+    );
+    assert_eq!(a.lost_in_flight(), 0, "the frame arrived, but a loss was counted on the way");
+}
