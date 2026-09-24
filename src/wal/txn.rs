@@ -3380,6 +3380,84 @@ use super::*;
         assert!(recorded.lines().any(|l| l.starts_with(&key)), "the quarantine does not record `{key}`:\n{recorded}");
     }
 
+    /// **Review 6's caveat 1 (lane §21.14 test 1): a retry that fails before it reads the page does not
+    /// let a DROP discard an unrecorded mismatch.** At `ed6e901` the `Retry` arm removed the
+    /// `unrecorded` entry on any retryable failure, including one that comes before the slot is looked
+    /// at (the seam, `fetch_page`, `Page::deserialize`). One such failure in the DROP's own retry let
+    /// its count pass, and the DROP discarded the mismatch and truncated the only record of it: review
+    /// 4's finding 4, back. The entry now keeps the line it could not write, a `Retry` writes that line,
+    /// and the entry leaves only once it is written. So the DROP is refused while the quarantine is
+    /// unwritable, and goes ahead once it is writable, although the page still cannot be read.
+    #[test]
+    fn a_retry_that_fails_before_reading_the_page_does_not_let_a_drop_discard_an_unrecorded_mismatch() {
+        let (_bp, _wal, txn, t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        let ran = std::cell::Cell::new(false);
+        FAIL_RELEASES.with(|f| f.set(1));
+        let refused = txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        });
+        assert_eq!(FAIL_RELEASES.with(|f| f.replace(0)), 0, "premise: the DROP's retry did not meet the injected failure");
+        let e = match refused {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "one release retry that failed before reading the page let the DROP discard a mismatch it \
+                 could not record, and truncate the log that held the only record of it"
+            ),
+        };
+        assert!(!ran.get(), "the DROP ran its mutation before it was refused: {e}");
+        assert!(e.to_string().contains("quarantine"), "the DROP was refused, but not for the unrecorded mismatch: {e}");
+
+        std::fs::remove_dir(&quarantine).unwrap();
+        FAIL_RELEASES.with(|f| f.set(u32::MAX));
+        let written = txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        });
+        FAIL_RELEASES.with(|f| f.set(0));
+        written.unwrap_or_else(|e| {
+            panic!(
+                "the DROP was refused although the mismatch's last observation could be written, so a page \
+                 that cannot be read would block the DROP for good: {e}"
+            )
+        });
+        assert!(ran.get(), "the DROP answered Ok without running its mutation");
+        let recorded = std::fs::read_to_string(&quarantine).expect("the mismatch was never written to the quarantine");
+        let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+        assert!(recorded.lines().any(|l| l.starts_with(&key)), "the quarantine does not record `{key}`:\n{recorded}");
+    }
+
+    /// **Review 6's caveat 2 (lane §21.14 test 2): a fresh log whose quarantine could not be moved
+    /// moves it at the next open.** At `ed6e901` the fresh header was written and synced before the
+    /// move, so a failed move left a 24-byte log that no later open counts as fresh, and the earlier
+    /// database's quarantine stayed current for good. The move now comes first: until it succeeds the
+    /// log stays empty, and every open retries it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_log_whose_quarantine_could_not_be_moved_moves_it_at_the_next_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("x.wal");
+        let quarantine = dir.path().join("x.wal.release-quarantine");
+        std::fs::write(&wal_path, b"").unwrap();
+        std::fs::write(&quarantine, "txn=5 dir_root=3 page=7 slot=1 found=live error=an earlier database's mismatch\n").unwrap();
+        let set_mode = |mode: u32| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(0o555);
+        let refused = WalManager::new(wal_path.clone());
+        set_mode(0o755);
+        assert!(
+            refused.is_err(),
+            "premise failed: a read-only directory did not refuse the move (running as root?), so nothing here is tested"
+        );
+        let _wal = WalManager::new(wal_path).expect("the second open of the log failed");
+        assert!(
+            !quarantine.exists(),
+            "a log whose first open could not move the earlier quarantine aside never moved it: the earlier \
+             database's file stays current, and a colliding record of the new one is taken as already recorded"
+        );
+    }
+
     /// **Review 4's finding 5: a truncation a pin cancelled is not a truncation.** `WalManager::truncate`
     /// keeps the log, and answers `Ok`, while a pin is below its end. At `8d492bf` the checkpoint then
     /// behaved as if it had truncated: it counted no deferral, and it re-appended the schema into the
