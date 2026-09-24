@@ -511,3 +511,127 @@ nothing its tests exercise except the refactored `message_body`, and no mutant t
 
 **Run G4 at the tip:** `consensus::replicate::tests_replicate::` gives **57 passed**, and
 `consensus::transport::tests::` gives **57 passed**. Per-target: **2593**.
+
+---
+
+## Amendment 8 — D223 (the re-review of `dd9d1e1..5a86ad8`), written BEFORE its fix (nothing built)
+
+Source: `artie-research frontier/d207_rereview.md` @ `66901bf`, verdict SOUND-WITH-CAVEATS. The lead verified R1,
+and R1 and R2 are one hazard, now ledger row **D223**.
+
+The ruling:
+
+- one admission check, at proposal, before both the in-memory append and the disk;
+- it equals the wire's own limits, taken from the encoder;
+- `Transport::send` counts its refusals.
+
+It also asked for the corrections listed below.
+
+### Red tests at **`cb1b287`** (they compile against `5a86ad8`; additions only)
+
+| key | test | module |
+|---|---|---|
+| **T1** | `a_membership_the_wire_cannot_carry_is_refused_at_proposal_and_never_reaches_the_log` (1025 learners) | `consensus::replicate::tests_replicate::` |
+| **T2** | `a_wal_batch_one_byte_over_a_frame_is_refused_at_proposal_and_one_at_the_limit_is_admitted`, with the boundary as literals: budget 8,388,531, WalBatch overhead 29 | same |
+| **T3** | `the_largest_entry_one_frame_can_carry_is_storable_and_reads_back` | `consensus::log::tests_log::` |
+
+Counts: tests_replicate goes from 57 to **59**, and tests_log from 48 to **49**. Neither file has a `#[cfg]` or a macro.
+
+### Run R5 — RED at `cb1b287`
+
+- **replicate module: 57 passed, 2 failed.**
+  - T1 fails at `after == before`, with **left 1, right 0**: `on_propose` appends anything.
+  - T2's at-limit case passes. Its one-byte-over case fails at `after == before`, with **left 1, right 0**.
+- **log module: 48 passed, 1 failed.** T3 panics with **`TooLarge { bytes: 8388539, limit: 8384512 }`**. The disk
+  frame is 4 + 8 + 8 + (1 + 8 + 4 + 8,388,502) + 4 = 8,388,539, and `MAX_ENTRY_BYTES` = 8,388,608 − 4096.
+
+### The fix, as it will be made
+
+- **`transport::admit_entry(&Entry)`** encodes the entry with `encode_entry` and refuses in two cases:
+  - the encoder refuses it, with the encoder's own error (a configuration over `MAX_CONFIG_NODES`, a name over
+    u16, ...);
+  - its length is over `append_entries_budget()`.
+
+  Every limit it applies is the encoder's own.
+- **`on_propose`** builds the candidate entry and calls `admit_entry` **before** `append_own_entry`. A refusal goes
+  out as `Action::Refuse`, the same channel `NotLeader` uses, and neither the tail nor the disk sees the entry.
+  - `append_own_entry`'s other caller is the election `NoOp`, one byte, which is always admissible; its doc will say
+    so.
+  - A follower's entries come from a frame the wire already carried.
+- **The disk: `MAX_ENTRY_BYTES` becomes `MAX_FRAME_BYTES`.**
+  - A disk frame is `24 + payload`, and a wire entry is `16 + command`. The command equals the disk payload for
+    every kind except `Catalog`, where it is 13 bytes longer (re-review R3, READ).
+  - So a disk frame is at most the wire entry + 8.
+  - Anything one frame can carry, even unsigned (at most `MAX_FRAME_BYTES` − 45 on the wire), therefore has a disk
+    frame of at most `MAX_FRAME_BYTES` − 37.
+  - The disk then never refuses what the wire delivered, whether through admission or from a peer.
+  - The read bound `MAX_FRAME` = `MAX_ENTRY_BYTES` + 64 follows with it.
+  - `snapshot.rs`'s `MAX_SIDECAR_BYTES` (32 × `MAX_ENTRY_BYTES`) grows by 128 KiB. It is a receive ceiling, checked
+    the same way on both sides.
+- **Is the disk's own check now redundant, and should it stay? It stays, and it is not a second guard on the same
+  condition.**
+  - Admission binds at the wire's limit, which is 8,388,531 bytes of wire entry.
+  - The disk check binds at a disk frame over 8 MiB, which is **strictly above anything any frame can carry** (37
+    bytes of margin, unsigned). So it can never fire on an admitted or delivered entry, and cannot mask admission's
+    mutants.
+  - What it still guards is the log format's own pairing: a frame the log writes must be one its scan will read
+    back (`MAX_FRAME`), for any caller of `RoundLog::append`.
+  - Its mutants are killed at its own layer by the landed `an_entry_too_large_for_the_transport_is_refused_at_append`,
+    which is written against the constant symbolically and still holds.
+  - Removing it would let a direct caller write a frame the recovery scan refuses as corrupt: durable, and unreadable.
+- **`Transport::send` counts every refusal:**
+  - a new `unencodable` counter, for an encode refusal (this is the lead's ask);
+  - a new `unaddressable` counter, for a send to itself or to a node with no address;
+  - a stopped transport is already counted in `refused_after_stop`.
+
+  With these, the comment beside `node.rs:742` ("counted by the transport") becomes true for every `Err`, and it will
+  name the counters.
+
+### Test changes, registered here before they are made
+
+- **E**: pin `probe_body == 4_194_439` (45 + 4,194,333 + 29 + 32) as a literal premise (re-review R4).
+- **Q**: fix the stale comment at `tests_transport.rs` ~2530 ("capped by count and nothing else"); comment only (R5).
+- **New post-fix test T4** in the transport module, `every_send_the_transport_refuses_is_counted`:
+  - an Append with a 1025-member configuration raises `unencodable()` by 1;
+  - a send to itself and a send to an unconfigured node raise `unaddressable()` by 2;
+  - `sent()` stays 0.
+- **New post-fix test T5** in the replicate module, `an_entry_that_fits_no_frame_is_still_offered_alone`:
+  - a leader seeded **around admission** (through `seed`, as a driver bug or a pre-D223 log would do) with a
+    1025-learner Membership entry;
+  - asserts `entries_from(1).len() == 1`;
+  - this kills M27.
+
+### Corrections to the record (append-only; the lines above stand as written)
+
+- **Amendment 6's "at most 21 bytes longer"** (PREREG ~line 451) **is 13.** The page-id roots are u32 (READ
+  `wal/log.rs:164-165`, `:397-398`), so it is 4 + 1 + 8. As whole entries, a `Catalog` wire entry is the disk frame
+  + 5, and everything else is the disk frame − 8. The conclusion stood: 4,014 bytes spare against the old disk
+  limit.
+- **Amendment 6's M27 row** (PREREG ~line 491, "the rule never binds on legal input") **was false.** Before D223, a
+  1025-learner Membership was admitted by `on_propose` and the disk alike. `entry_wire_len` returns `usize::MAX`
+  for it, so the at-least-one rule bound. M27 survived only because no test existed. After D223 it cannot bind on
+  anything that went through proposal, but it can on an entry placed around admission, and T5 kills it.
+- The same false claim sits in `replicate.rs:214-215` and will be corrected in the fix.
+
+### Run G5 — GREEN at the fix
+
+| module | tests | predicted |
+|---|---|---|
+| replicate | 60 | all pass: 59 + T5 |
+| log | 49 | all pass |
+| transport | 58 on macOS (57 elsewhere) | all pass: 57 + T4 |
+
+Per-target on macOS: **2598** = 2593 + T1 + T2 + T3 + T4 + T5.
+
+### Mutants for D223 (cut from the fix; predicted)
+
+| mutant | what it puts back | fails | modules run |
+|---|---|---|---|
+| M28 `admission_removed` | `on_propose` appends without admitting | T1, T2 (over case) | replicate |
+| M29 `admission_cut_one_early` | `>=` for `>` in `admit_entry` | T2 (at-limit case refused) | replicate |
+| M30 `admission_swallows_encoder_error` | an encoder refusal treated as admissible | T1 | replicate |
+| M31 `disk_limit_below_wire` | `MAX_ENTRY_BYTES` back to `MAX_FRAME_BYTES − 4096` | T3 | log |
+| M32 `unencodable_uncounted` | no count on an encode refusal | T4 | transport |
+| M33 `unaddressable_uncounted` | no count on the two addressing refusals | T4 | transport |
+| M34 `entry_wire_len_short` | `entry_wire_len` reports one byte less (the re-review asked for a mutant here) | E (one byte over: 2 entries), T3 (its premise `entry_wire_len == 8,388,531`) | replicate + log |
+| M27 (re-cut) | no at-least-one rule | **T5** (was: survives) | replicate |
