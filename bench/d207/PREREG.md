@@ -148,3 +148,40 @@ guard that cannot fire and blocks landing.
 - Per-target suite: `VERIFY_MODE=per-target tools/verify-suite.sh d207`. Predicted **2589 passed,
   0 failed** on macOS: main's 2579 plus the ten tests above. The 2579 is the lead's measurement at
   `9aa6968` (FAN-QUEUE #9). I have not reproduced it, so it is INFERRED here.
+
+---
+
+## Amendment 2 — the rest of 207d362 that the lead scoped in, written BEFORE its fix (nothing built)
+
+Lead decision (2026-09-24): port three more items, red first. (1) Refuse `idle_deadline = 0` and
+`max_inbound_conns = 0` at bind. (2) The cap-full backoff. (3) The lost wakeup at the two redial
+waits. **Not** the `inbox_bytes ≥ MAX_FRAME_BYTES` floor, which is a decision for Ryan.
+
+Red tests at **`2466ffc`**, added on top of `196f9aa`; additions only (`138 0`). The module has 59
+`#[test]` there, one of them macOS-only, so it runs **59 on macOS** and 58 on Linux and Windows.
+
+| key | test |
+|---|---|
+| K | `a_zero_idle_deadline_is_refused_at_bind` |
+| L | `a_connection_cap_of_zero_is_refused_at_bind` |
+| P | `refusals_at_a_full_cap_are_paced_by_the_poll_interval` |
+| W | `a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay` |
+
+### Run R2 — RED at `2466ffc` (the D207 fix present, these four items not)
+
+Same instrument. Predicted on macOS: **compiles; 55 passed, 4 failed**, rc=101.
+
+| key | predicted failure |
+|---|---|
+| K | the `Ok` arm: "a zero idle_deadline was accepted at bind" |
+| L | the `Ok` arm: "a max_inbound_conns of zero was accepted at bind" |
+| P | `c1 - c0 == 8` passes. `took >= 700ms` fails, with `took` **under 300 ms**. Unpaced, the 8 refusals finish within one or two 100 ms accept polls of the last connect. INFERRED bound: a loaded box could stretch it, and past 700 ms P would pass on this tree. That would be a missed red, never a false one, and is read as "re-run on a quieter box". |
+| W | shutdown takes **between 30 s and 31 s**: the whole `reconnect_delay`. The `< 10 s` assertion fails |
+
+### Run G2 — GREEN at the fix
+
+Predicted: **compiles; 59 passed, 0 failed** on macOS (58 elsewhere). K and L are refused by name.
+P: all 8 are refused, and `took` ≥ 700 ms (guaranteed by the sleeps, and load can only add to it).
+W: shutdown returns in **under 1 s**: the dial sees the stop flag within one 5 ms poll, and the
+sender then leaves without waiting. J and CAP each take about 20 x 5 ms longer, well inside their
+deadlines.
