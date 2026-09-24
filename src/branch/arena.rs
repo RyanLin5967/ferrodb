@@ -5714,6 +5714,336 @@ mod tests {
         let _ = std::fs::remove_file(&armed);
     }
 
+    // ---- D183 de-dup at push: one entry per (page, arena), in memory and in the file ----------------
+    //
+    // Lane AMENDMENT 2, from `frontier/catalog_root_and_park_adversary.md` §B1-B5 @ `a4b48ea`. Hardening,
+    // not a live double free (the adversary refuted that, B2): a page parked twice is decided twice.
+
+    /// A parent with `pages` pages, a live child that pins every one of them, and the parent published
+    /// `Reaping`, which is what `reap` does before it retires anything. Returns the record `reap` reads.
+    fn reaping_parent_pinned_by_a_child(h: &Harness, pages: usize) -> BranchRecord {
+        use crate::branch::types::BranchState;
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..pages {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        assert_eq!(rec.state, BranchState::Reaping, "fixture: the parent is not Reaping");
+        rec
+    }
+
+    /// The pending-free log in order. Reads it through `iter`, so it means the same thing whatever
+    /// type holds the log.
+    fn pending_of(store: &ArenaPageStore) -> Vec<PendingFree> {
+        store.state.lock().unwrap().pending.iter().copied().collect()
+    }
+
+    fn free_epochs(store: &ArenaPageStore) -> Vec<Epoch> {
+        pending_of(store).iter().map(|p| p.free_epoch).collect()
+    }
+
+    /// ⭐ **A resumed reap parks each page ONCE, in memory and in the file.**
+    ///
+    /// `reap` publishes `Reaping`, then `retire_arenas_by_rule` parks every pinned page. If the
+    /// `Reaping -> Reaped` flip never happens (an `Err` after the retire, or a crash), the resumed `reap`
+    /// draws a NEW free epoch and retires again. `allocated_pages` still lists a parked page, because
+    /// parking does not recycle it, so at `bfe55a8` every page was parked a second time. Memory held
+    /// `[K(e1), K(e2)]` while the tail replayed first-wins to `[K(e1)]`, so the store and its own file
+    /// disagreed.
+    ///
+    /// This is the in-process resume: a second `reap` of a branch still `Reaping`, as a `seal` retry does.
+    /// The restart resume is the next test.
+    #[test]
+    fn a_resumed_reap_parks_each_page_once_in_memory_and_in_the_replayed_file() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-resumed-reap-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-resumed-reap-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        // An image of the fixture, so the tail below holds the two retires and nothing else.
+        h.store.checkpoint(&armed).unwrap();
+
+        let e1 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e1).unwrap();
+        assert_eq!(
+            free_epochs(&h.store),
+            vec![e1; PAGES],
+            "fixture: the first retire did not park every page"
+        );
+        let e2 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e2).unwrap();
+        assert_eq!(
+            free_epochs(&h.store),
+            vec![e1; PAGES],
+            "the resumed retire parked pages that were already pending (the copies free at {e2:?}); \
+             the first entry for a page must stay the only one"
+        );
+
+        // Ask the artifact: each retire wrote its record, so the replay has the second one to apply.
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed),
+            vec![ArenaPageStore::TAIL_PAGES_PARKED; 2],
+            "fixture: the tail does not hold exactly one parked record per retire"
+        );
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        assert_eq!(free_epochs(&from_tail), vec![e1; PAGES], "fixture: the replay is not first-wins");
+        h.store.checkpoint(&control).unwrap();
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from its own file is not the store that wrote it"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// The resume the adversary traced first (B1 steps 1-6): the retire parks, the process dies before
+    /// the `Reaped` flip, and the next open restores the file, re-arms it (`reopen_from_checkpoint` ends
+    /// in `checkpoint_to`) and resumes the reap with a new free epoch. At `bfe55a8` the resumed store held
+    /// every page twice, and so did every image it wrote.
+    #[test]
+    fn a_reap_resumed_after_a_restart_parks_each_page_once() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-restart-resume-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        let e1 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e1).unwrap();
+
+        // The flip to `Reaped` never happened. A new process opens the file.
+        let resumed = h.fresh_store();
+        assert!(resumed.restore(&armed).unwrap());
+        resumed.checkpoint_to(armed.clone());
+        assert_eq!(
+            free_epochs(&resumed),
+            vec![e1; PAGES],
+            "fixture: the first retire's parks are not in the file"
+        );
+
+        resumed.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(
+            free_epochs(&resumed),
+            vec![e1; PAGES],
+            "the reap resumed after a restart parked every page a second time"
+        );
+        let reopened = h.fresh_store();
+        assert!(reopened.restore(&armed).unwrap());
+        assert_eq!(
+            free_epochs(&reopened),
+            vec![e1; PAGES],
+            "the file the resumed reap wrote parks every page a second time"
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// The crash-free shape (B1): the owner freed a page while it was live, and a live child pinned it,
+    /// so `free_page` parked it at e_f. Reaping the owner on the slow path then decided that page again.
+    /// Still pinned, it was parked a second time at `bfe55a8`.
+    #[test]
+    fn a_retire_does_not_repark_a_page_its_owner_already_parked() {
+        use crate::branch::types::BranchState;
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let pages: Vec<PageId> = (0..PAGES)
+            .map(|_| h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap())
+            .collect();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let e_f = h.catalog.next_epoch();
+        h.store.free_page(pages[0], e_f).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: the child pins the freed page, so it parks");
+
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        let log = pending_of(&h.store);
+        assert_eq!(log.len(), PAGES, "the retire parked a page its owner had already parked: {log:?}");
+        let p0: Vec<Epoch> =
+            log.iter().filter(|p| p.page_id == pages[0]).map(|p| p.free_epoch).collect();
+        assert_eq!(p0, vec![e_f], "the page freed first must keep the entry its own free made");
+    }
+
+    /// **A page already pending is decided by its entry, not again by the retire.** At `bfe55a8` the
+    /// retire RELEASED such a page when it found it unpinned, while its entry stayed in the log: one page
+    /// both pending and recycled. B2 shows the second release is a no-op today; B3 says what makes it
+    /// one, and that the statement lock is part of it.
+    ///
+    /// Shape: a live child `c0` forked BEFORE the pages are born, so it pins none of them and keeps the
+    /// parent's reap on the slow path. Child `c` pins them all, so `free_page(p0)` parks p0. `c` is then
+    /// flipped `Reaped` with no drain behind it, which is exactly what a drain refused by an unreadable
+    /// owner record leaves (D124: it puts the entry back and returns `Err`). The retire finds all four
+    /// pages unpinned. It releases three; p0 belongs to its entry, and the next drain releases it.
+    #[test]
+    fn a_retire_leaves_a_page_already_pending_to_its_entry() {
+        use crate::branch::types::BranchState;
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let birth = h.catalog.next_epoch();
+        let pages: Vec<PageId> = (0..PAGES)
+            .map(|_| h.store.alloc_for(parent.branch_id, PageType::Heap, birth).unwrap())
+            .collect();
+        let c = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let e_f = h.catalog.next_epoch();
+        h.store.free_page(pages[0], e_f).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: c pins the freed page, so it must be parked");
+        h.catalog.set_state(c.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        h.catalog.set_state(c.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        let (log, both) = {
+            let st = h.store.state.lock().unwrap();
+            let log: Vec<PendingFree> = st.pending.iter().copied().collect();
+            let both: Vec<PageId> = log
+                .iter()
+                .filter(|p| st.recycled.get(&p.arena_id).is_some_and(|r| r.contains(&p.page_id)))
+                .map(|p| p.page_id)
+                .collect();
+            (log, both)
+        };
+        assert_eq!(
+            both,
+            Vec::<PageId>::new(),
+            "the retire released a page that was still in the pending-free log: it is now recycled \
+             AND parked, and the next drain releases it a second time"
+        );
+        assert_eq!(released, (PAGES - 1) as u32, "fixture: the three pages nobody freed are unpinned");
+        assert_eq!(
+            log.iter().map(|p| (p.page_id, p.free_epoch)).collect::<Vec<_>>(),
+            vec![(pages[0], e_f)],
+            "the pending page's own entry must be the one that decides it"
+        );
+    }
+
+    /// The drain's window (B1, the adversary's in-process shape seen from the drain): a drain takes the
+    /// whole log, the owner's retire runs again before the drain puts anything back, and the drain then
+    /// puts back every entry it found still pinned. At `bfe55a8` the log held every page twice. Today the
+    /// statement lock keeps a retire out of that window; the log must not depend on it.
+    #[test]
+    fn a_drain_that_meets_a_park_of_a_key_it_took_restates_the_whole_log() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-drain-window-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-drain-window-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), PAGES, "fixture: the drain took nothing");
+        // The drain holds every entry, so nothing is pending and every page parks again.
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), PAGES, "fixture: the retire did not park into the drained log");
+        h.store.put_pending(taken).unwrap();
+        assert_eq!(
+            h.store.pending_len(),
+            PAGES,
+            "the drain put back entries for pages the retire had just parked again"
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from its own file is not the store that wrote it"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// A REPLACED record written before de-dup at push can carry a key twice, because it restated a
+    /// memory log that held one twice. Replayed, the log keeps the FIRST entry for each key, the rule
+    /// every push now keeps, so a store opened from an old file holds what a store running today would.
+    #[test]
+    fn a_replaced_record_carrying_duplicates_replays_to_the_first_of_each() {
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let entry = |page: PageId, free: u64| PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(free),
+            owner,
+        };
+        let (x, w, x_again) = (entry(11, 2), entry(12, 2), entry(11, 5));
+        let mut p = h.store.live_page_count().unwrap().to_be_bytes().to_vec();
+        p.extend_from_slice(&3u32.to_be_bytes());
+        for e in [&x, &w, &x_again] {
+            ArenaPageStore::encode_pending_entry(&mut p, e);
+        }
+        p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+        let tail = ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PENDING_REPLACED, &p);
+
+        let applied = h.store.replay_tail(&tail).unwrap();
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        assert_eq!(
+            pending_of(&h.store),
+            vec![x, w],
+            "a REPLACED record's second entry for a key survived the replay"
+        );
+    }
+
+    /// **Parking a page that is already pending changes nothing, so it owes the file nothing.** An
+    /// unrecorded push bumps `pending_version`, which makes the next persist a full image rewrite. A push
+    /// that skipped must not: the same rule `take_pending` keeps for a drain that took nothing.
+    #[test]
+    fn a_second_park_of_a_page_already_pending_changes_nothing_and_owes_no_rewrite() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-second-park-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let page = h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: the child pins the page, so it must be parked");
+        // A claim brings the file level with memory again: that park forced it to rewrite.
+        let c = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(c.branch_id).unwrap();
+
+        let (r0, a0) = h.store.persist_counters();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+        let d = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(d.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.pending_len(), 1, "a second park of a page already pending added an entry");
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the claim after a park that changed nothing rewrote the image ({} rewrites, {} appends)",
+            r1 - r0,
+            a1 - a0
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
     #[test]
     fn checkpoint_round_trips_through_a_file() {
         let h = Harness::new();
