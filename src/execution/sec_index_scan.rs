@@ -18,12 +18,45 @@ pub struct SecondaryIndexScan {
     pub view: Arc<ReadView>,
     pub tt_heap: HeapFileManager,
     pub col_index: usize,
+    /// **D187 — drop an entry whose indexed value is NULL, because this scan is bounded.**
+    ///
+    /// `insert.rs` posts `(vals[col].clone(), vals[0].clone())` unconditionally, so a NULL indexed
+    /// value gets an index entry like any other, and `type_rank` sorts it below everything. The
+    /// upper-bound test below is `&sec > u`, and `Null > Integer(5)` is **false**, so the entry is
+    /// never "past" the bound and this scan yields it — a row SQL excludes, because `NULL < 5` is
+    /// UNKNOWN.
+    ///
+    /// See [`crate::execution::index_scan::IndexScan::skip_nulls`] for why this is a flag and not
+    /// an unconditional skip; the primary scan carries the identical field for the identical
+    /// reason, and the rule is stated once, there.
+    ///
+    /// ⚠ The check sits BEFORE the bound arms, not inside one, and the reason is worth stating
+    /// because it is not symmetry — it is the opposite.
+    ///
+    /// **The two arms depend on `type_rank` in OPPOSITE DIRECTIONS.** The upper arm is EXPOSED
+    /// because `Null > u` is false, so a NULL is never "past" the bound. A lower bound is PROTECTED
+    /// by the same fact wearing the other sign: the tree descent seeks the first key `>= lower` and
+    /// NULL sorts beneath it, and D179's `sec_lower` arm reaches the same outcome because
+    /// `Null <= l` is true. D179 chose that `<=` for an unrelated stated reason and it covers NULL
+    /// by accident.
+    ///
+    /// ⇒ **So anyone reordering `type_rank` breaks exactly ONE of the two, and nothing says which.**
+    /// A NULL that stopped sorting below every literal would leave the lower arm silently admitting
+    /// NULLs while the upper arm kept working. Putting the test ahead of both arms is what makes
+    /// that reordering safe: neither arm has to know about NULL, this one check does, and a third
+    /// arm added later inherits it. (Verified against d179-sec-index by reading its arm, and
+    /// confirmed independently by that lane.)
+    pub skip_nulls: bool,
     /// D181 — index entries pulled, flushed once in `Drop`. Not `pub`: see `IndexScan::examined`.
     examined: u64,
 }
 
 impl SecondaryIndexScan {
     /// The only way to build one, so `examined` cannot start at anything but zero.
+    ///
+    /// `skip_nulls` is a PARAMETER and not a post-construction assignment on purpose: this
+    /// doc says `new` is the only way to build one, and a field set afterwards would weaken
+    /// exactly that invariant for the flag that decides whether NULL rows are yielded.
     ///
     /// `sec_lower`/`sec_upper` are the bounds in the COLUMN's value space; `scanner` must already
     /// have been opened at `optimizer::secondary_scan_start(&sec_lower)`.
@@ -38,8 +71,9 @@ impl SecondaryIndexScan {
         view: Arc<ReadView>,
         tt_heap: HeapFileManager,
         col_index: usize,
+        skip_nulls: bool,
     ) -> Self {
-        Self { heap, scanner, primary_index, schema, sec_lower, sec_upper, view, tt_heap, col_index, examined: 0 }
+        Self { heap, scanner, primary_index, schema, sec_lower, sec_upper, view, tt_heap, col_index, skip_nulls, examined: 0 }
     }
 }
 
@@ -84,7 +118,26 @@ impl Executor for SecondaryIndexScan {
                 Err(e) => return Some(Err(e))
             };
             // D181 — counted where the tree yielded it, before any check can discard it.
+            //
+            // ⛔ THIS INCREMENT MUST STAY ABOVE THE NULL SKIP BELOW. NEVER MOVE IT UNDER.
+            //
+            // `examined` is an entries-PULLED count. Put it below the skip and it under-counts by
+            // exactly the number of NULL entries dropped: the same work reported as a smaller
+            // number — a fabricated improvement, in the direction the author is hoping for. D181
+            // and D187 both insert at this line and NEITHER IS WRONG ALONE; the defect exists only
+            // in the resolution. Found by a trial merge before either landed.
+            //
+            // ✅ ENFORCED BY `tests/d187_null_skip_is_counted.rs`, which reads INDEX_SCAN_ENTRIES
+            // over 500 NULL entries on a plan it proves is this scan, and fails if they go uncounted.
+            // No D181/D179 counter fixture can catch the swap — none puts a NULL in an indexed
+            // column, so the skip never fires under them and their arms read the same either way.
             self.examined += 1;
+            // D187 — see `skip_nulls`. Ahead of the bound arms, and `continue` rather than
+            // `return None`: NULL entries are a PREFIX of the tree, so stopping here would truncate
+            // the scan before it reached a single real row.
+            if self.skip_nulls && matches!(sec, Value::Null) {
+                continue;
+            }
             let past = match &self.sec_upper {
                 Bound::Included(u) => &sec > u,
                 Bound::Excluded(u) => &sec >= u,

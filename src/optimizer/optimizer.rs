@@ -59,6 +59,14 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let schema = entry.schema.clone();
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
             let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
+            // D187 — does this scan compare anything against a bound? If it does, an entry whose
+            // indexed value is NULL is not in the answer, because that comparison is UNKNOWN and an
+            // UNKNOWN row is excluded. If it does not, there is nothing to be UNKNOWN about and the
+            // NULL entries belong. Computed here, before either bound is moved into the scanner,
+            // and handed to whichever scan is built — the rule is one sentence and both scans get
+            // the same one. See `IndexScan::skip_nulls`.
+            let skip_nulls =
+                !matches!(lower, Bound::Unbounded) || !matches!(upper, Bound::Unbounded);
             if column == 0 {
                 // SHARED root cell (D53). The point-lookup path every indexed read takes was
                 // missed when D53 wired plan::open_table: a private cell here means an index scan
@@ -68,7 +76,7 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                     None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp),
                 };
                 let scanner = tree.range_scan(lower, upper)?;
-                return Ok(Box::new(IndexScan::new(heap, scanner, schema, view, tt_heap)))
+                return Ok(Box::new(IndexScan::new(heap, scanner, schema, view, tt_heap, skip_nulls)))
             }
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
@@ -81,12 +89,16 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
                 None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
             };
 
+            // ⭐ D179 SUPERSEDES D187 HERE, and this is not a merge of two equals: d187 called
+            // `secondary_scan_lower(&lower)` and had to `ok_or_else` on an unsupported bound. D179
+            // replaced that with `secondary_scan_start`, which cannot fail. d187 keeps only its
+            // `skip_nulls` argument; its scanner-opening line is deliberately dropped.
             // D179 — the scanner is opened at the START KEY, which is not the bound. `Excluded(v)`
             // opens at `(v, Null)` like `Included(v)` does and the exclusion is applied by
             // `SecondaryIndexScan::next`, which skips the leading `sec == v` run. Both bounds are
             // handed to the executor unchanged for that reason.
             let scanner = sec_tree.range_scan(secondary_scan_start(&lower), Bound::Unbounded)?;
-            Ok(Box::new(SecondaryIndexScan::new(heap, scanner, primary_index, schema, lower, upper, view, tt_heap, column)))
+            Ok(Box::new(SecondaryIndexScan::new(heap, scanner, primary_index, schema, lower, upper, view, tt_heap, column, skip_nulls)))
         }
         PhysicalPlan::HashJoin { left, right, on, join_type, left_keys, right_keys, right_width } => {
             let left_exec = lower(*left, catalog, bp.clone(), view.clone())?;
