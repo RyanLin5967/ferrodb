@@ -269,3 +269,74 @@ and the old assertion pinned exactly the forging D206 forbids.
 A record that ALREADY holds a forged `u64::MAX` — written by a build before this fix, with an
 over-long lease — cannot be told from an explicit "never", and stays un-reapable, exactly as it is
 today. Nothing rewrites it.
+
+## Amendment 5 — the lead's review of `6fc317b`: D206 (already landed) and the stored deadline as a type. Written before the type commit.
+
+**Item 1, D206, is already in the tree.** The lead's message crossed with the addendum-2 work:
+- `c3f62ab` red: `31364b3`'s test ported, plus two more tests.
+- `c8a7c39`: amendment 4.
+- `a34b92c` fix: `from_now`, `try_from_now`, `v + D`, the downtime offset, and renewals (a
+  renewal's deadline comes from `from_now` or is the caller's explicit value; `u64::MAX` is a
+  fixed point).
+- Mutants M16–M19.
+
+Nothing further is committed for it here.
+
+**Item 2: the stored deadline becomes a type.** All changes are in `src/branch/table_catalog.rs`
+(plus one doc line in `record.rs`). A new private module `stored` holds:
+- `StoredDeadline(u64)`;
+- `StoredCore(CoreRecord)`;
+- `StoredRecord(BranchRecord)`.
+
+Their fields are private to that module, not to the file. There is no `Deref` and no raw accessor.
+The only conversions are `outward(D)` (→ `LeaseDeadline` / `CoreRecord` / `BranchRecord`) and
+`inward(D)`. What the rest of the catalog sees:
+- `core()` returns `StoredCore` and `hydrate()` returns `StoredRecord`.
+- `write_record` / `write_record_new` take a `Writable`: a `StoredRecord` borrowed as is, or a
+  `BranchRecord` translated inward. The second is safe because a `BranchRecord` in this file can
+  only ever be on the lease clock.
+- The DEADLINE-index key and the expiry span are built inside `stored`, so the raw value never
+  leaves it.
+
+The measured width, from the count before the change: `self.core(` 20, `self.hydrate(` 9,
+`self.write_record(` 6, `write_record_new` 1, `deserialize_core(` 3, `.lease_deadline` 8. That is
+47 production sites, all in this one file.
+
+**No pre-existing test is edited.** `d10_guard`'s `cat.write_record_new(&rec)` and
+`serial_section_profile`'s `cat.write_record(&child, None)` still pass a `BranchRecord`; `Writable`
+accepts it.
+
+**One of my own assertions changes** (`a_resume_shifts_every_deadline…`, from `6fc317b`):
+- Before: `c.core(..).lease_deadline() == LeaseDeadline(1_500)`.
+- After: `c.core(..).deadline() == c.to_stored(LeaseDeadline(4_500))`.
+- A `StoredCore` has no `lease_deadline()`, which is the point of the change. The new form asserts
+  the same stored value (1500 at `D = 3000`), and the byte-identity assertion above it is unchanged.
+
+**New test (+1):** `f1_lease_grace::reparent_hands_its_record_out_on_the_lease_clock`. `reparent` was
+the one outward path translated but not asserted.
+- Predicted PASS at the type commit, and it would also pass at `a34b92c`: it is coverage, not a
+  red.
+- Its discriminating power is against a wrong translation, e.g. `outward` applied twice. An omitted
+  one no longer compiles.
+
+**Counts, per-target:** base + 26. The lib filter
+`cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
+→ **20** (12 + 3 + 3 + 1 + 1).
+
+**Mutants, new — compile-level, each must FAIL TO COMPILE (`cargo check --lib --tests`) with E0308:**
+
+| mutant | expected error |
+|---|---|
+| M20 `get_raw` returns `self.hydrate(rec)` without `self.outward(..)` | expected `BranchRecord`, found `StoredRecord` |
+| M21 `enforced_lease` returns `.then_some(rec.deadline())` | expected `LeaseDeadline`, found `StoredDeadline` |
+| M22 `renew_lease` does `rec.set_deadline(lease)` without `self.to_stored` | expected `StoredDeadline`, found `LeaseDeadline` |
+| M23 `expired_before` pushes `rec` instead of `self.outward_core(rec)` | expected `CoreRecord`, found `StoredCore` |
+
+A mutant that COMPILES means the type is not doing its job, and that is a failure of this
+amendment's claim.
+
+**What the type does NOT stop** (stated, not solved):
+- Code inside `mod stored` can do anything with `.0`. It is about 200 lines, reviewed as a unit.
+- `Writable for BranchRecord` means someone could build a `BranchRecord` by hand with a virtual
+  deadline and write it. No path in the file does; the rule is at the trait.
+- `put` (cfg(test)) is one such path by design, and translates.
