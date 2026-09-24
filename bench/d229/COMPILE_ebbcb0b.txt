@@ -1,0 +1,130 @@
+# 2026-09-24T21:47:02Z HEAD=ebbcb0b dirty=0
+# cmd: lockrun d229 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-run --lib --test d229_allocation_sites --test open_path_allowlist --test lock_order_allowlist --test d53_private_root_allowlist --test integration_cluster_snapshot --test integration_cli_row_authorship_durability --example pgserver
+2026-09-24T21:47:07Z d229 acquiring (5s poll), pid 13853
+2026-09-24T21:47:07Z d229 ACQUIRED: 13853 d229 2026-09-24T21:47:07Z
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded getrandom v0.3.4
+  Downloaded wait-timeout v0.2.1
+  Downloaded unarray v0.1.4
+  Downloaded fnv v1.0.7
+  Downloaded cfg-if v1.0.4
+  Downloaded rand_xorshift v0.4.0
+  Downloaded fastrand v2.4.1
+  Downloaded quick-error v1.2.3
+  Downloaded bit-vec v0.8.0
+  Downloaded errno v0.3.14
+  Downloaded rand_chacha v0.9.0
+  Downloaded rusty-fork v0.3.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded autocfg v1.5.1
+  Downloaded rand_core v0.9.5
+  Downloaded once_cell v1.21.4
+  Downloaded tempfile v3.27.0
+  Downloaded bitflags v2.11.1
+  Downloaded num-traits v0.2.19
+  Downloaded getrandom v0.4.2
+  Downloaded rand v0.9.5
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.56
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.186
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling getrandom v0.3.4
+   Compiling rustix v1.1.4
+   Compiling getrandom v0.4.2
+   Compiling zerocopy v0.8.56
+   Compiling autocfg v1.5.1
+   Compiling bitflags v2.11.1
+   Compiling fastrand v2.4.1
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d229.noindex)
+   Compiling once_cell v1.21.4
+   Compiling fnv v1.0.7
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling bit-set v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling errno v0.3.14
+   Compiling wait-timeout v0.2.1
+   Compiling rand_core v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling tempfile v3.27.0
+   Compiling rusty-fork v0.3.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/wal/tests_crash_frees.rs:1363:13
+     |
+1363 |         let mut d = m.open().expect("open the fixture");
+     |             ----^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 4 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.46s
+  Executable unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+  Executable tests/d229_allocation_sites.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d229_allocation_sites-641602daf994cb3f)
+  Executable tests/d53_private_root_allowlist.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d53_private_root_allowlist-d8a9d394116a5ead)
+  Executable tests/integration_cli_row_authorship_durability.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cli_row_authorship_durability-e7d5b225a5855114)
+  Executable tests/integration_cluster_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_snapshot-350a4148b9c71550)
+  Executable tests/lock_order_allowlist.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/lock_order_allowlist-5152dbc136567be8)
+  Executable tests/open_path_allowlist.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/open_path_allowlist-90e05e65c99afb1a)
+  Executable unittests examples/pgserver.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver-befc562c1491503b)
+2026-09-24T21:47:32Z d229 rc=0
+2026-09-24T21:47:32Z d229 released (owner matched)
+# rc=0 end=2026-09-24T21:47:32Z
