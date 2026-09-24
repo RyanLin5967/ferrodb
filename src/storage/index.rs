@@ -1654,11 +1654,32 @@ mod tests {
     ///
     /// **Its premises (review 2 G5), so that it cannot pass without having raced anything:** the
     /// writers start only after each reader has finished one pass, so both readers are running
-    /// while the writers work; each reader finishes at least one pass; and pages allocated minus
-    /// pages reachable by descent must GROW over the run. Nothing frees a tree page, so that growth
-    /// is exactly the pages the run unlinked.
+    /// while the writers work; each reader finishes at least one pass; at least one reader pass
+    /// began after all four writers had started and ended before the last one finished (review 3
+    /// L1: the pass premise alone could not fail, because the writers wait for it); and pages
+    /// allocated minus pages reachable by descent must GROW over the run. Nothing frees a tree page,
+    /// so that growth is exactly the pages the run unlinked. (After D225 merges, `release_unpublished`
+    /// frees a refused split's pages. They were never reachable, and each is allocated and freed
+    /// within the split, so they cancel out of the difference.)
+    ///
+    /// **It fails, and never hangs, when a thread errs** (review 3 H2). A writer whose `insert` or
+    /// `delete` returns `Err` panics. Its panic is collected by `join`, `done` is set by a guard on
+    /// every exit of the scope's body so the readers stop, and the panic is re-raised after the scope.
+    /// A reader that dies releases the writers' start gate through its own guard. Every wait is
+    /// bounded by one 60 s deadline, so no thread spins for ever.
     #[test]
     fn unlinks_racing_refills_and_readers_lose_no_key() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::time::{Duration, Instant};
+
+        /// Sets its flag when dropped, so the flag is set on every exit, a panic included.
+        struct SetOnDrop<'a>(&'a AtomicBool);
+        impl Drop for SetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
         const KEYS: i32 = 240;
         const WRITERS: i32 = 4;
         const ROUNDS: i32 = 6;
@@ -1667,19 +1688,33 @@ mod tests {
         for i in (0..KEYS).filter(|&i| stable(i)) {
             tree.insert(wide(i), Value::Integer(i)).unwrap();
         }
-        let done = std::sync::atomic::AtomicBool::new(false);
-        let first_passes = std::sync::atomic::AtomicUsize::new(0);
-        let passes = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let done = AtomicBool::new(false);
+        let abort = AtomicBool::new(false);
+        let first_passes = AtomicUsize::new(0);
+        let passes = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let writers_started = AtomicUsize::new(0);
+        let writers_finished = AtomicUsize::new(0);
+        let overlapped = AtomicUsize::new(0);
         let unreachable_before = allocated_pages(&tree) - reachable_pages(&tree);
 
-        std::thread::scope(|s| {
+        let joined: Vec<std::thread::Result<()>> = std::thread::scope(|s| {
+            // Set on every exit of this body, so the readers stop whether the writers finished or
+            // panicked. Dropped after the joins below, not before: the readers read while any writer runs.
+            let _done = SetOnDrop(&done);
             let writers: Vec<_> = (0..WRITERS)
                 .map(|w| {
-                    let (tree, first_passes) = (&tree, &first_passes);
+                    let (tree, first_passes, abort) = (&tree, &first_passes, &abort);
+                    let (started, finished) = (&writers_started, &writers_finished);
                     s.spawn(move || {
                         while first_passes.load(Ordering::Acquire) < 2 {
+                            if abort.load(Ordering::Acquire) {
+                                return; // a reader died before its first pass ended; its panic fails the test
+                            }
+                            assert!(Instant::now() < deadline, "the readers finished no first pass within 60 s");
                             std::thread::yield_now();
                         }
+                        started.fetch_add(1, Ordering::AcqRel);
                         let mine: Vec<i32> = (0..KEYS).filter(|&i| !stable(i) && i % WRITERS == w).collect();
                         for r in 0..ROUNDS {
                             for &i in &mine {
@@ -1694,37 +1729,56 @@ mod tests {
                         for &i in mine.iter().filter(|&&i| i % 2 == 0) {
                             tree.insert(wide(i), Value::Integer(i)).unwrap();
                         }
+                        finished.fetch_add(1, Ordering::AcqRel);
                     })
                 })
                 .collect();
             for r in 0..2 {
-                let (tree, done, first_passes, passes) = (&tree, &done, &first_passes, &passes);
-                s.spawn(move || loop {
-                    for i in 0..KEYS {
-                        let got = tree.search(&wide(i)).unwrap();
-                        if stable(i) {
-                            assert_eq!(got, Some(Value::Integer(i)), "untouched key {i} missed by a concurrent reader");
-                        } else if let Some(v) = got {
-                            assert_eq!(v, Value::Integer(i), "key {i} read the wrong value");
+                let (tree, done, abort, first_passes, passes) = (&tree, &done, &abort, &first_passes, &passes);
+                let (started, finished, overlapped) = (&writers_started, &writers_finished, &overlapped);
+                s.spawn(move || {
+                    // Set on every exit, so a reader that dies in its first pass releases the start gate.
+                    let _abort = SetOnDrop(abort);
+                    loop {
+                        let all_started = started.load(Ordering::Acquire) == WRITERS as usize;
+                        for i in 0..KEYS {
+                            let got = tree.search(&wide(i)).unwrap();
+                            if stable(i) {
+                                assert_eq!(got, Some(Value::Integer(i)), "untouched key {i} missed by a concurrent reader");
+                            } else if let Some(v) = got {
+                                assert_eq!(v, Value::Integer(i), "key {i} read the wrong value");
+                            }
                         }
-                    }
-                    if passes[r].fetch_add(1, Ordering::AcqRel) == 0 {
-                        first_passes.fetch_add(1, Ordering::AcqRel);
-                    }
-                    if done.load(Ordering::Acquire) {
-                        break;
+                        if all_started && finished.load(Ordering::Acquire) < WRITERS as usize {
+                            overlapped.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if passes[r].fetch_add(1, Ordering::AcqRel) == 0 {
+                            first_passes.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "reader {r}: the writers had not finished within 60 s");
                     }
                 });
             }
-            for w in writers {
-                w.join().unwrap();
-            }
-            done.store(true, Ordering::Release);
+            writers.into_iter().map(|w| w.join()).collect()
         });
+        // Every thread has stopped. A writer's `Err` now fails the test with its own message.
+        for result in joined {
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
 
         for (r, n) in passes.iter().enumerate() {
             assert!(n.load(Ordering::Acquire) >= 1, "premise: reader {r} finished no pass");
         }
+        assert!(
+            overlapped.load(Ordering::Acquire) >= 1,
+            "premise: no reader pass began after all {WRITERS} writers had started and ended before the last \
+             one finished, so the readers raced no write"
+        );
         let unreachable_after = allocated_pages(&tree) - reachable_pages(&tree);
         assert!(
             unreachable_after > unreachable_before,
@@ -1948,7 +2002,13 @@ mod tests {
         });
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(refused) => assert!(refused, "an unlink whose prev is its next was not refused"),
-            Err(_) => panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on its own latch"),
+            // Review 3 L7: a panicked worker is not a self-wait, and the message says which it was.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on its own latch")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the unlink of page {mid} panicked before returning")
+            }
         }
     }
 
