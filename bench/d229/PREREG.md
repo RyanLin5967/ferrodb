@@ -162,3 +162,7 @@ pending at the next open. D229's replay must free none of the re-created table's
   so a page is reached while its bit is clear.
 - **Blind spot:** the identity is the heap's first directory page. An intent whose OTHER pages a new table took, at a
   different root, would be freed under it. The quarantine and A4 are what exclude that; no check at replay does.
+
+**Amendment 6 (after `cb648be`).** `cb648be` adds amendment 5's test, unchanged from its registration. The GREEN phase
+and mutant base is `cb648be`: `wal::recovery::tests_crash_frees::` **14 run, 14 passed**, predicted. `lane_d229_run.sh`
+carries 10 mutants (M1, M2, M4-M7, M9-M11, M13), one site each at `cb648be` (PATTERNS_ONLY).
