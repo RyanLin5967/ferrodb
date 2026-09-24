@@ -437,6 +437,14 @@ impl FeedStreamer {
             (None, Some(_)) => emitted_max,
             (None, None) => decoded.walked_to.max(emitted_max),
         };
+        // The fourth part's other half (found under D252): never past a refused transaction's first
+        // row, exactly as never past an open one's. With transactions interleaved, a commit below the
+        // refused one can END above the refused one's rows; a cursor there replays the refused
+        // `Commit` with nothing staged, and the row is lost under a clean report
+        // (`a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it`).
+        let refused_from = refused_commit
+            .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn == c).map(|e| e.lsn).min());
+        let next = refused_from.map_or(next, |first| next.min(first));
 
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
         // does, it errors rather than writing a denied column, which is the right way round.
