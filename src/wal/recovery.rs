@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -18,6 +18,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         return Ok(false);
     }
 
+    // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
+    // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
+    let legacy = wal.is_legacy();
     let mut max_txn = 0u64;
     let mut last_lsn = HashMap::new();
     // The earliest record each transaction still has in the retained log. For a loser this is its
@@ -26,6 +29,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // to start from to see everything this transaction did.
     let mut first_lsn: HashMap<u64, u64> = HashMap::new();
     let mut ended: HashSet<u64> = HashSet::new();
+    let mut committed: HashSet<u64> = HashSet::new();
+    // D213: per transaction, the slots its forward deletes retired and no `HeapRelease` has freed.
+    let mut owed: HashMap<u64, Vec<RetiredSlot>> = HashMap::new();
     let mut touched = HashSet::new();
     // analysis
     for rec in &records {
@@ -33,10 +39,25 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         last_lsn.insert(rec.txn_id, rec.lsn);
         first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
         match &rec.kind {
+            RecKind::HeapDelete { dir_root, page_id, slot, .. } if !legacy => {
+                owed.entry(rec.txn_id).or_default().push(RetiredSlot { dir_root: *dir_root, page_id: *page_id, slot: *slot });
+            }
+            RecKind::HeapRelease { page_id, slot, .. } => {
+                if let Some(slots) = owed.get_mut(&rec.txn_id) {
+                    slots.retain(|r| (r.page_id, r.slot) != (*page_id, *slot));
+                }
+            }
+            _ => {}
+        }
+        match &rec.kind {
             RecKind::Commit | RecKind::TxnEnd => {
                 ended.insert(rec.txn_id);
+                if matches!(rec.kind, RecKind::Commit) {
+                    committed.insert(rec.txn_id);
+                }
             }
-            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. } => {
+            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. }
+            | RecKind::HeapRelease { dir_root, page_id, .. } => {
                 touched.insert((*dir_root, *page_id));
             }
             RecKind::Clr { redo, .. } => {
@@ -74,13 +95,14 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         }
     }
 
-    // redo
+    // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
+    // came from a CLR (D213).
     for rec in &records {
         match &rec.kind {
-            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. } => {
-                redo_one(bp, rec.lsn, &rec.kind)?;
+            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
+            | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
+                redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
             }
-            RecKind::Clr { redo, .. } => redo_one(bp, rec.lsn, redo)?,
             _ => {}
         }
     }
@@ -122,6 +144,24 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             Err(e) => return Err(e)
         }
     }
+
+    // D213: finish the releases a crash cut off. A committed transaction's retired slots are freed
+    // by `HeapRelease` records written after its `Commit`, and those wait in the log buffer for the
+    // next flush. A crash in between leaves the slots retired, and nothing else would ever free
+    // them. AFTER the directory repair (the adversary's F3): the directory is not logged, so a page
+    // added since the last checkpoint is listed only once the repair has run, and each release
+    // tells the directory its page's new free space. Before it, that update found no entry and was
+    // counted and printed as a failed release. Ascending id, for the reason the losers are sorted.
+    // A release that fails here waits in the pending list, and the checkpoint `open_recovered` would
+    // run is skipped, so the log keeps the record of it (F2).
+    let mut owed: Vec<(u64, Vec<RetiredSlot>)> = owed
+        .into_iter()
+        .filter(|(id, slots)| committed.contains(id) && !slots.is_empty())
+        .collect();
+    owed.sort_unstable_by_key(|(id, _)| *id);
+    for (id, slots) in owed {
+        txn.finish_releases(id, &slots);
+    }
     Ok(true)
 }
 
@@ -131,13 +171,35 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
 ///
 /// Idempotent by page LSN: a record whose LSN is at or below the page's is skipped, which is what
 /// makes a re-sent overlap after a reconnect harmless.
+///
+/// `kind` is the record as logged. A `Clr` is passed WHOLE, not unwrapped: a `HeapDelete` inside a
+/// CLR frees its slot, while the same record outside one retires it (D213).
+///
+/// **A replica applies with version-3 meaning** (`wal::log::VERSION`). A primary on this binary
+/// never ships a version-2 record: it replays and upgrades an older log before any transaction
+/// runs, and the upgrade truncates the older records away. A replica on this binary fed by a
+/// primary BEFORE D213 is a mixed-build pair. That primary's forward deletes free, while this
+/// replica retires them. The first later insert into those bytes is refused here and the batch
+/// fails, so the pair stops rather than diverging silently. The handshake does not refuse the
+/// pair: that needs `REPL_VERSION` bumped, which is a lead decision (lane §19).
 pub fn apply_redo(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
-    redo_one(bp, lsn, kind)
+    redo_one(bp, lsn, kind, true)
 }
 
-fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
-    let page_id = match kind {
-        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..} => *page_id,
+/// `retire_forward_deletes` is false only for a log written before D213 (`WalManager::is_legacy`),
+/// where a forward `HeapDelete` freed its slot at once.
+fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forward_deletes: bool) -> Result<(), FerroError> {
+    // A CLR is redone as the record it carries, with one difference that is the CLR's own. Its
+    // `HeapDelete` undoes an insert, so it FREES the slot. A forward `HeapDelete` RETIRES it, as the
+    // delete did when it ran: its transaction may still roll back, and if it committed, a
+    // `HeapRelease` later in the log frees it (D213).
+    let (op, compensation) = match kind {
+        RecKind::Clr { redo, .. } => (redo.as_ref(), true),
+        other => (other, false),
+    };
+    let page_id = match op {
+        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..}
+        | RecKind::HeapRelease { page_id, .. } => *page_id,
         _ => return Ok(())
     };
     let frame_i = bp.fetch_page(page_id)?;
@@ -154,8 +216,11 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
         bp.unpin_page(page_id, false);
         return Ok(());
     }
-    match kind {
-        RecKind::HeapDelete { slot, ..} => page.delete(*slot as usize)?,
+    match op {
+        RecKind::HeapDelete { slot, ..} if compensation => page.delete(*slot as usize)?,
+        RecKind::HeapDelete { slot, ..} if !retire_forward_deletes => page.delete(*slot as usize)?,
+        RecKind::HeapDelete { slot, ..} => page.retire(*slot as usize)?,
+        RecKind::HeapRelease { slot, .. } => page.release(*slot as usize)?,
         RecKind::HeapInsert { slot, tuple, ..} => {
             if (*slot as usize) == page.slot_arr.len() {
                 let s = page.insert(Tuple::new(tuple.clone()))?;
@@ -357,7 +422,9 @@ pub struct OpenedDatabase {
 ///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
 ///    there because the rebuilt trees and the catalog page are then on disk, so the log that
 ///    produced them has nothing left to say; without it, the next open would replay the same
-///    records and rebuild every tree again (reasoning from `b9a0a75`).
+///    records and rebuild every tree again (reasoning from `b9a0a75`). Step 4 also runs when a
+///    marker says an earlier rollback's index undo failed (`TxnManager::mark_indexes_stale`), even
+///    if the log is empty.
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
@@ -401,9 +468,42 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     } else {
         Catalog::create(bp.clone())?
     };
-    if recovered {
+    // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
+    // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
+    // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
+    // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
+    let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
+    let stale = marker.exists();
+    // F1: a log written before D213 has just been replayed with its own meaning. The checkpoint
+    // rewrites it as version 3. Until then `TxnManager::begin_locked` refuses a transaction and
+    // `WalManager::append` refuses the two records whose meaning changed, so it runs even for such a
+    // log with nothing in it.
+    let legacy = wal.is_legacy();
+    if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
+    }
+    if recovered || stale || legacy {
+        use std::io::Write;
+        // Review 2's N1 (the lead's decision): the checkpoint ALWAYS runs, and always flushes every
+        // page. The rebuild above freed the old trees and reallocated their pages on disk, so a
+        // skipped flush left the next open reading a zeroed root. Only the truncation is refused
+        // while a release is still owed (F2): the log is then the only record of it.
+        let owed = txn.checkpoint_keeping_owed()?;
+        if owed > 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: {owed} release(s) owed by committed transactions could not be finished; \
+                 every page is flushed, the log is kept, and the next checkpoint or open retries them"
+            );
+        } else if stale {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
+                    marker.display()
+                );
+            }
+        }
     }
     Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
 }
@@ -590,18 +690,23 @@ use super::*;
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("crash.db");
+        let pre_crash_root;
         {
             let lock = DbLock::acquire(&db).unwrap();
             let mut o = open_recovered(&db, &lock).unwrap();
             for sql in [
                 "CREATE TABLE a (id INTEGER NOT NULL, v INTEGER);",
                 "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                // A secondary tree too, so the structural check covers more than primary cells
+                // (a gap the re-adversary named).
+                "CREATE INDEX iv ON t (v);",
                 "INSERT INTO t VALUES (0, 0);",
                 "DROP TABLE a;",
                 "INSERT INTO t VALUES (1, 10);",
             ] {
                 exec(sql, &mut o).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
             }
+            pre_crash_root = o.catalog.get_table("t").unwrap().primary_index_root;
             // The crash: every handle is dropped with no checkpoint and no flush. `BufferPoolManager`
             // has no `Drop`, so the last insert's pages die here and only its WAL records survive.
         }
@@ -611,18 +716,33 @@ use super::*;
         assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
         let tables: Vec<String> = o.catalog.tables.keys().cloned().collect();
         assert!(tables.contains(&"t".to_string()), "premise failed: table t did not survive: {tables:?}");
+        // The premise the re-adversary asked for: the rebuilt root really MOVED. If the rebuild handed
+        // back the pre-crash page, cell == record would hold whether or not the cells were repointed.
+        assert_ne!(
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            pre_crash_root,
+            "premise failed: t's rebuilt root is its pre-crash page, so the structural check cannot fail"
+        );
         for name in &tables {
-            let record = o.catalog.get_table(name).unwrap().primary_index_root;
-            let cell = o
-                .catalog
-                .root_cell(name, None)
-                .expect("Catalog::open seeds a cell for every table it loads")
-                .load(Ordering::SeqCst);
-            assert_eq!(
-                cell, record,
-                "table '{name}': the shared root cell names page {cell}, the tree the rebuild FREED; \
-                 the rebuilt tree is at page {record}"
-            );
+            let entry = o.catalog.get_table(name).unwrap();
+            // Each index by KIND as well as column (D208): a B-tree and a full-text index on one
+            // column are two trees with two cells.
+            let mut trees: Vec<(Option<IndexTree<String>>, u32)> = vec![(None, entry.primary_index_root)];
+            trees.extend(entry.indexes.iter().map(|i| (Some(IndexTree::Secondary(i.column_name.clone())), i.root_page_id)));
+            trees.extend(entry.fulltext_indexes.iter().map(|i| (Some(IndexTree::FullText(i.column_name.clone())), i.root_page_id)));
+            assert!(trees.len() >= 2 || name != "t", "premise failed: t lost its secondary index");
+            for (column, record) in trees {
+                let cell = o
+                    .catalog
+                    .root_cell(name, column.as_ref().map(|i| i.borrowed()))
+                    .expect("Catalog::open seeds a cell for every tree it loads")
+                    .load(Ordering::SeqCst);
+                assert_eq!(
+                    cell, record,
+                    "table '{name}', tree {column:?}: the shared root cell names page {cell}, a tree the \
+                     rebuild FREED; the rebuilt tree is at page {record}"
+                );
+            }
         }
 
         match exec("SELECT id, v FROM t WHERE id = 1;", &mut o).unwrap() {
@@ -737,5 +857,123 @@ use super::*;
                 _ => panic!("table '{t}': expected rows"),
             }
         }
+    }
+
+    /// **C1, made true: after an index undo fails, the NEXT OPEN rebuilds the indexes, even when
+    /// the log it opens is empty.**
+    ///
+    /// `open_recovered` rebuilds when `recover` replays something. `recover` returns `false` for an
+    /// empty log, and a clean restart can leave one: `schema_log` is filled only by `log_ddl` in the
+    /// running process, so a checkpoint in a process that ran no DDL re-declares nothing (the
+    /// re-adversary's C1 correction). So "the next open rebuilds every tree" was false exactly when
+    /// it was needed, and an entry that a failed index undo left on a freed slot would have outlived
+    /// the restart. The fix is a durable marker beside the log (`<db>.wal.stale-indexes`), which
+    /// `open_recovered` honours and then removes.
+    ///
+    /// FAILS at `d7891d5` at "left no marker". The failure is forced with a recorded write whose root
+    /// is past end-of-file, as in `txn.rs`'s C1 test.
+    #[test]
+    fn a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty() {
+        use crate::execution::executor::run;
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stale.db");
+        let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+                let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+                let mut p = Parser::new(tokens);
+                let mut stmts = p.parse();
+                run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                    .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+        }
+        {
+            // A second "process": it recovers and rebuilds, and its own checkpoint re-declares
+            // nothing, because it ran no DDL.
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let t = o.txn.begin().unwrap();
+            o.txn.record_primary_write(t, Arc::new(std::sync::atomic::AtomicU32::new(1_000_000)), Value::Integer(5), None);
+            o.txn.abort(t).expect("the transaction ended, so its abort reports success");
+            assert!(marker.exists(), "a failed index undo left no marker, so a clean restart would not rebuild");
+            o.txn.checkpoint().unwrap();
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
+        assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
+    }
+
+    /// **Review 2's N1, on the path its red test cannot reach: a release that fails RETRYABLY at open.**
+    ///
+    /// `tests/owed_release_at_open_reopens.rs` stages a page/log mismatch, which since review 2's Q3
+    /// is dropped rather than kept pending, so it no longer reaches the open's owed branch. Here the
+    /// release fails as an I/O error would (the thread-local `wal::txn::FAIL_RELEASES`), twice: once in
+    /// recovery's `finish_releases`, once in the checkpoint's retry. So open #1 owes it, and must still
+    /// FLUSH every page while keeping the log. At `368d0e1` it skipped the flush, and open #2 then
+    /// walked a root the rebuild had already zeroed on disk. Its red is mutant-only: the seam is new.
+    #[test]
+    fn an_open_whose_release_fails_retryably_flushes_so_the_next_open_rebuilds_cleanly() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        use crate::wal::txn::FAIL_RELEASES;
+
+        fn exec(sql: &str, o: &mut OpenedDatabase, s: &mut Session) -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+        fn by_key(o: &mut OpenedDatabase, id: i32) -> Vec<Vec<Value>> {
+            match exec(&format!("SELECT id, note FROM notes WHERE id = {id};"), o, &mut Session::new()) {
+                Outcome::Rows(r) => r,
+                _ => panic!("SELECT did not return rows"),
+            }
+        }
+        let note = |id: i32, text: &str| vec![Value::Integer(id), Value::Varchar(text.to_string())];
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("owed_io.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let mut main = Session::new();
+            // Row 2 (3934 B), then row 1 (35 B), the lowest tuple; T1 relocates row 1 and commits.
+            exec("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));", &mut o, &mut main);
+            exec(&format!("INSERT INTO notes VALUES (2, '{}');", "x".repeat(3900)), &mut o, &mut main);
+            exec("INSERT INTO notes VALUES (1, 'a');", &mut o, &mut main);
+            let mut t1 = Session::new();
+            exec("BEGIN;", &mut o, &mut t1);
+            exec(&format!("UPDATE notes SET note = '{}' WHERE id = 1;", "y".repeat(200)), &mut o, &mut t1);
+            exec("COMMIT;", &mut o, &mut t1);
+            // The crash: the commit's HeapRelease is still in the log buffer, and is lost.
+        }
+
+        // Open #1 owes the release and fails it twice (finish_releases, then the checkpoint's retry).
+        FAIL_RELEASES.with(|f| f.set(2));
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("open #1 failed");
+            assert!(o.recovered, "premise: open #1 replayed nothing, so no rebuild ran");
+            assert_eq!(FAIL_RELEASES.with(|f| f.get()), 0, "premise: the injected failures were not both consumed");
+            // The log was kept, not truncated: the checkpoint found the release still owed. A
+            // truncating checkpoint in a process that ran no DDL leaves the header alone (24 bytes).
+            assert!(
+                std::fs::metadata(&o.wal.path).unwrap().len() > 24,
+                "premise: open #1's checkpoint truncated the log, so no release was owed"
+            );
+            // Dropped without another checkpoint: open #1's own is all that reached disk.
+        }
+        FAIL_RELEASES.with(|f| f.set(0));
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("open #2 failed after an open whose owed release failed");
+        assert_eq!(by_key(&mut o, 1), vec![note(1, &"y".repeat(200))], "row 1 is not reachable by key after open #2");
+        assert_eq!(by_key(&mut o, 2), vec![note(2, &"x".repeat(3900))], "row 2 is not reachable by key after open #2");
     }
 }

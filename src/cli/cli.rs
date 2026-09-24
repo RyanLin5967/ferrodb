@@ -202,10 +202,18 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    txn.checkpoint()?;
+    // Review 2's C2 (the lead's decision): the WAL checkpoint's result is HELD, not returned at once.
+    // It refuses while a release is owed (F2), and returning then skipped the arena checkpoint below,
+    // so the branch tree written this session became unreachable. The arena checkpoint runs whatever
+    // the WAL's returned, and the WAL's error is reported after it.
+    let wal_checkpoint = txn.checkpoint();
     // Persist where the arena starts and what it has allocated. Without this the next open finds
     // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
     store.checkpoint(Path::new(&arena_path))?;
+    if let Some(line) = crate::wal::txn::failure_counters_line() {
+        eprintln!("{line}");
+    }
+    wal_checkpoint?;
     println!("bye bye");
     Ok(())
 }
