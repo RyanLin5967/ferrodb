@@ -1524,8 +1524,12 @@ impl SnapshotStore for PageStoreSnapshots {
         // dedupe key has no incarnation, so a line of the replaced database would make a colliding
         // mismatch of the installed one look already recorded. Before the truncation, so a failure
         // leaves the install unfinished (its marker stays) rather than the old file current.
-        crate::wal::txn::start_fresh_quarantine(&self.wal.path).map_err(|e| {
-            FerroError::Wal(format!("the install could not move the replaced database's release quarantine aside ({e})"))
+        // Its DROP intent goes with it (D229 review 2's F11): it names the replaced database's pages, and
+        // the next open would free them under the installed one. One fresh-database transition.
+        crate::wal::txn::start_fresh_database(&self.wal.path).map_err(|e| {
+            FerroError::Wal(format!(
+                "the install could not move the replaced database's release quarantine and drop intent aside ({e})"
+            ))
         })?;
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         self.wal.truncate(0)?;

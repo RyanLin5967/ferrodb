@@ -503,6 +503,12 @@ impl Catalog {
     ///
     /// Refuses a page two of the table's structures name: freeing it for this table would free it
     /// under its other owner too.
+    ///
+    /// **Blind spot, stated (D229 review 2's R6): an alias ACROSS tables is not refused.** Only this
+    /// table's structures are walked, and no page records its owner (a heap page stores its own id, a
+    /// tree node nothing of its table). A check would need every other table walked, O(database pages),
+    /// or an owner stamp in every page header, a format change. Neither fits within a DROP's O(table
+    /// pages).
     pub fn table_pages(&self, name: &str) -> Result<Vec<u32>, FerroError> {
         let entry = self.require_table(name)?;
         let mut pages = BTreeSet::new();

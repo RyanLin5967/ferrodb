@@ -1897,9 +1897,11 @@ fn a_rebuilding_open_makes_its_trigger_durable_before_its_first_free() {
 /// node, under a live row.
 ///
 /// The page is one the file already holds as zeros (taken, zero-written, freed and synced first), so
-/// redo starts it from an empty page. A page past the durable end of the file would fail the redo's
-/// read instead, and a page holding a dropped table's stale bytes would be redone onto them: both are
-/// outside this test (the second is recorded in the lane as a finding).
+/// redo starts it from an empty page. A page holding a dropped table's stale bytes would be redone onto
+/// them, which is outside this test (recorded in the lane as a finding). This doc used to say a page
+/// past the durable end of the file would fail redo's read: false, since `recover` restores every page
+/// the log names whose read fails as an empty page before redo (ledger D267, retracted; PREREG
+/// amendment 16).
 ///
 /// Mutant-only red: M15 skips the reset's `set_allocated`.
 #[test]

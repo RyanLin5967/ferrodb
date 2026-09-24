@@ -2340,7 +2340,8 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
 /// ids, so an earlier database's quarantine would make a colliding record of the new one look
 /// already recorded. The earlier file is moved aside to [`aside_path`], not deleted: it is evidence.
 ///
-/// Called where a new incarnation starts at this path, BEFORE anything marks it started:
+/// Called, through [`start_fresh_database`], where a new incarnation starts at this path, BEFORE
+/// anything marks it started:
 /// - `WalManager::with_storage`, before it writes a fresh log's header (review 6's caveat 2), so a
 ///   failed move leaves the log empty and the next open tries again;
 /// - the consensus snapshot install, before it discards the replaced database's log (review 6's F6).
@@ -2350,8 +2351,30 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
 /// (`replication::backup::restore` on its own) does not carry the quarantine and does not move it, so
 /// the file left at the path is the REPLACED database's.
 pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
-    let current = release_quarantine(wal_path);
-    match std::fs::symlink_metadata(&current) {
+    move_aside(&release_quarantine(wal_path))
+}
+
+/// **A new database at this path: every file beside the log that describes the replaced one goes
+/// aside** (D229 review 2's F11). The one fresh-database transition, called by a fresh log
+/// (`WalManager::with_storage` at length 0) and by the snapshot install, so neither can move one of
+/// these and keep the other:
+/// - the release quarantine ([`start_fresh_quarantine`], review 6's F6);
+/// - D229's drop intent (`wal::free_intent`). It names page ids of the REPLACED database. The next open
+///   would adopt it, find its table absent from the new catalog, and free those ids after its
+///   checkpoint, which may be live pages of the new database.
+///
+/// Moved, not deleted: both are evidence. In this order, and idempotent: a retry after a failure finds
+/// the quarantine already gone and moves the intent. The quarantine's stated restore gap (an in-place
+/// `replication::backup::restore` outside the install moves neither) holds for the intent too.
+pub(crate) fn start_fresh_database(wal_path: &Path) -> std::io::Result<()> {
+    start_fresh_quarantine(wal_path)?;
+    move_aside(&free_intent::intent_path(wal_path))
+}
+
+/// Move `current` to an unused [`aside_path`] and sync its directory; nothing to do when it does not
+/// exist.
+fn move_aside(current: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(current) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
         Ok(_) => {}
@@ -2360,11 +2383,11 @@ pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::fs::rename(&current, aside_path(&current, nanos))?;
-    sync_directory_of(&current)
+    std::fs::rename(current, aside_path(current, nanos))?;
+    sync_directory_of(current)
 }
 
-/// Where [`start_fresh_quarantine`] moves `current`: the first of `<current>.before-<nanos>`,
+/// Where [`move_aside`] moves `current`: the first of `<current>.before-<nanos>`,
 /// `<current>.before-<nanos>-1`, `-2`, ... that does not exist. Review 6's finding 5: a clock before
 /// 1970 gives `nanos == 0` every time, and `rename` silently replaces an existing target, which would
 /// lose the earlier copy. The check and the rename are one window, closed by the single-writer
