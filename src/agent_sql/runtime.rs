@@ -7983,4 +7983,111 @@ mod tests {
              over-reports rather than corrupts, so it must not be refused"
         );
     }
+
+    /// **D194 step 4 — REBASE refuses, retryably, when the branch or main moves between its phases.**
+    ///
+    /// `rebase` is `rebase_validate` then `rebase_commit`, and the commit re-checks the workspace and
+    /// main's merge clock before it re-pins. This test calls the two phases itself and lands a change
+    /// between them on the same thread, so the interleaving is forced rather than raced: no sleep, no
+    /// second thread, no timing. The only test-only code is this test; the split is production code.
+    ///
+    /// ⚠ No red state exists for it — the re-check shipped with REBASE. What shows it discriminates
+    /// is the pre-registered fire-check (`bench/d194_fork_snapshot/rebase_prereg.md`, Amendment 2 A):
+    /// forcing the re-check to `true` must fail the two `moved while` cases and leave the `sealed`
+    /// case passing, because that one is the workspace-existence check on a different line.
+    #[test]
+    fn rebase_is_refused_retryably_when_the_branch_or_main_moves_between_its_phases() {
+        use crate::execution::executor::run;
+        use crate::execution::session::Session;
+
+        fn same(a: &Option<Arc<Snapshot>>, b: &Option<Arc<Snapshot>>) -> bool {
+            match (a, b) {
+                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        fn parse(sql: &str) -> Stmt {
+            let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+                .scan_tokens()
+                .unwrap();
+            let mut p = crate::parser::parser::Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+            stmts.remove(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("rebase_race.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let wal =
+            Arc::new(crate::wal::log::WalManager::new(dir.path().join("rebase_race.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = Session::with_runtime(rt.clone());
+        for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            if let Err(e) = run(parse(sql), &mut catalog, bp.clone(), txn.clone(), &mut main) {
+                panic!("{sql}: {e}");
+            }
+        }
+        let branch = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        let pin = || {
+            let state = rt.state.lock().unwrap();
+            let ws = &state.workspaces[&branch];
+            let out = (ws.fork_seq, ws.fork_snapshot.clone(), ws.rows.len());
+            out
+        };
+
+        // The control: nothing between the phases, so the commit re-pins.
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        let report = rt.rebase_commit(v).unwrap();
+        assert!(report.rebased, "nothing moved between the phases, yet: {report:?}");
+
+        // Main's merge clock moves between the phases — exactly what a publish's reservation does.
+        let before = pin();
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        rt.state.lock().unwrap().apply_seq += 1;
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("moved while REBASE was validating"), "wrong refusal: {err}");
+        let after = pin();
+        assert_eq!(after.0, before.0, "a refused commit moved fork_seq");
+        assert!(same(&after.1, &before.1), "a refused commit moved the snapshot");
+
+        // The branch stages a write between the phases.
+        let before = pin();
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        let touched = rt.write(&mut ctx, branch, parse("UPDATE t SET v = 11 WHERE id = 1;")).unwrap();
+        assert_eq!(touched, 1, "fixture: the write between the phases staged nothing");
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("moved while REBASE was validating"), "wrong refusal: {err}");
+        let after = pin();
+        assert_eq!(after.0, before.0, "a refused commit moved fork_seq");
+        assert!(same(&after.1, &before.1), "a refused commit moved the snapshot");
+        assert_eq!(after.2, before.2 + 1, "the write that landed between the phases was lost");
+
+        // The branch is abandoned between the phases.
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        rt.abandon(branch).unwrap();
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("was sealed while REBASE was validating"), "wrong refusal: {err}");
+    }
 }
