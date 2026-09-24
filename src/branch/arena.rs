@@ -1788,11 +1788,7 @@ impl ArenaPageStore {
             self.space.give_back(start, pages);
             if let Err(e) = self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload) {
                 self.space.take_back(start, pages);
-                persist.quarantine.push(QuarantinedRange {
-                    start,
-                    pages,
-                    epoch: crate::cluster::epoch(),
-                });
+                // MUTANT (fire-check only, never land): a failed free's range is lost, as at 0831887.
                 return Err(e);
             }
         }
