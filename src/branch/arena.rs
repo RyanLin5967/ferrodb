@@ -1796,7 +1796,7 @@ impl ArenaPageStore {
         let written = match self.checkpoint_with(&OsFileOps, &p) {
             Ok(written) => written,
             Err(e) => {
-                self.recycled_reissued.store(true, Ordering::SeqCst);
+                // MUTANT (fire-check only, never land): a failed rewrite leaves the flag cleared.
                 return Err(e);
             }
         };
