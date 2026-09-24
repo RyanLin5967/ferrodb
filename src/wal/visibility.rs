@@ -1,6 +1,29 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, tuple::{Tuple, VersionHeader}}, wal::txn::ReadView};
 
+/// **D194 new-wall audit, term 2: how far back a read had to walk.** This is every
+/// `tt_heap.read` that `resolve_visibility` made, meaning one per version the view could not see.
+/// For a branch reading through its pin, that is one per version committed to the row since the
+/// pin. Read it twice and subtract to scope it to one statement.
+///
+/// ⚠ **ONE atomic add per CALL THAT HOPPED, not one per hop.** A read that sees the head pays
+/// nothing extra: every read of main as it stands, and every pinned read of a row nothing has
+/// touched since the pin. A hopping row pays one add whatever its chain length. So the instrument
+/// adds a constant per row and cannot create the slope in hops it exists to measure. That is the
+/// rule `OURS_SCAN_EXAMINED` states in `agent_sql/runtime.rs`.
+pub static VISIBILITY_HOPS: AtomicU64 = AtomicU64::new(0);
+
 pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
+    let mut hops = 0u64;
+    let out = walk_back(view, tt_heap, head, &mut hops);
+    if hops > 0 {
+        VISIBILITY_HOPS.fetch_add(hops, Ordering::Relaxed);
+    }
+    out
+}
+
+fn walk_back(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple, hops: &mut u64) -> Result<Option<Tuple>, FerroError> {
     let mut current = head;
     loop {
         let h = current.version_header()?;
@@ -8,7 +31,10 @@ pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tupl
             return Ok(Some(current));
         }
         match h.prev() {
-            Some((page, slot)) => current = tt_heap.read(RecordId::new(page, slot))?,
+            Some((page, slot)) => {
+                *hops += 1;
+                current = tt_heap.read(RecordId::new(page, slot))?
+            }
             None => return Ok(None),
         }
     }

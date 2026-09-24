@@ -942,6 +942,44 @@ pub struct DiffCost {
     pub skipped_subtrees: usize,
 }
 
+/// **D194 new-wall audit, term 1 — what `State::version_history` may forget.**
+///
+/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]).
+/// Every live pin is at or above the OLDEST one, so for each row everything older than the newest
+/// entry at or below that oldest pin is unreachable. With no live pin, everything older than the
+/// row's newest entry is: a pin taken from then on is at or above `apply_seq`, which no published
+/// `begin_ts` exceeds. The one pin that does NOT start at `apply_seq` is a child's, inherited from a
+/// live parent, and its value is already in `pins`.
+///
+/// All three fields are derived from `workspaces` and `version_history`, and they change only
+/// through `State`'s own methods. None holds per-branch state that a statement can write.
+#[derive(Default)]
+struct HistoryRetention {
+    /// `fork_seq` -> the number of LIVE workspaces pinned there (`fork_snapshot` is `Some`). The
+    /// oldest pin is the first key: O(log n) per publish. A scan of `workspaces` would do the same
+    /// job at O(open sessions) under the lock every statement takes.
+    ///
+    /// Maintained at every place a pin enters or leaves: `insert_workspace` (including its eviction
+    /// of a recycled slot), `remove_workspace`, [`State::pin`] (a lazy pin) and [`State::repin`].
+    /// Debug builds re-derive it by brute force at each of those places ([`State::audit_pins`]), as
+    /// they do `txn_refs`.
+    pins: BTreeMap<u64, u32>,
+    /// Every row whose history holds two or more entries, keyed `(second-oldest entry, tbl, row)`.
+    /// A row can lose its oldest entry exactly when that key is at or below the horizon. So when the
+    /// oldest pin leaves, draining this from the front finds every row that now holds something
+    /// unreachable, and no other row: O(log n) per entry freed, each entry freed once. Without it,
+    /// freeing would wait for each row's next publish, and a row nobody writes again would keep
+    /// everything published while the pin lived.
+    trimmable: BTreeSet<(u64, u32, u64)>,
+    /// The highest horizon any trim has used. It never decreases, and every live pin is at or above
+    /// it: a new pin starts at `apply_seq`, and an inherited one is already live.
+    ///
+    /// So a read whose `seen_through` is below it went through a pin that was released while the
+    /// read ran. That happens when the branch is re-pinned by `REBASE` or sealed from another
+    /// connection between `visible_rows_where` and `record_read`. The history may no longer hold the
+    /// version that read saw, so `record_read` refuses it rather than recording a wrong one.
+    exact_from: u64,
+}
 
 #[derive(Default)]
 struct State {
@@ -1028,7 +1066,14 @@ struct State {
     /// history. Recording `versions`' latest instead would name a version the reader never saw —
     /// and the premise check at merge would then compare that version against itself and pass a
     /// branch whose read main had moved past. Written only by [`State::publish_version`].
+    ///
+    /// **Bounded by the oldest live pin** (the D194 new-wall audit; `retention` says how). It held
+    /// every `begin_ts` ever published — one `u64` per applied op, never freed — while the only
+    /// entries a read can ask for are the newest at or below some live pin. A row keeps what the
+    /// oldest live pin reads and everything above it; with no live pin, its newest entry alone.
     version_history: std::collections::HashMap<(u32, u64), Vec<u64>>,
+    /// What `version_history` may forget, found without scanning. See [`HistoryRetention`].
+    retention: HistoryRetention,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.
     ///
@@ -1109,11 +1154,20 @@ impl State {
     /// `integration_capability_envelope` pins the number of. What it writes is the two fork
     /// fields and nothing else — no row, no schema edit, nothing the envelope governs — and every
     /// reader of a branch's view comes through here rather than each taking its own `get_mut`.
+    ///
+    /// A LAZY pin (the branch had none) enters `retention.pins` here. A branch that already had one
+    /// was indexed when its workspace was inserted.
     fn pin(&mut self, branch: BranchId, txn: &TxnManager) -> Option<(Arc<Snapshot>, u64)> {
         let apply_seq = self.apply_seq;
         let ws = self.workspaces.get_mut(&branch)?;
+        let lazy = ws.fork_snapshot.is_none();
         let at = ws.pin(apply_seq, txn);
-        Some((at, ws.fork_seq))
+        let seq = ws.fork_seq;
+        if lazy {
+            self.add_pin(seq);
+            self.audit_pins();
+        }
+        Some((at, seq))
     }
 
     /// **D194 step 4 — the one door that MOVES a pin (`REBASE`).** Sets `fork_snapshot` and
@@ -1125,30 +1179,142 @@ impl State {
     /// the pin being replaced — which is what keeps `base_rows` the fork-point image by construction
     /// across the move. It is the second workspace mutator D194 adds beside [`State::pin`], and
     /// `integration_capability_envelope` counts it.
+    ///
+    /// Moving the pin moves it in `retention.pins` too. If the pin being replaced was the oldest,
+    /// the horizon rises and whatever only it could read is freed now.
     fn repin(&mut self, branch: BranchId, at: Arc<Snapshot>, seq: u64) -> bool {
-        match self.workspaces.get_mut(&branch) {
-            Some(ws) => {
-                ws.fork_snapshot = Some(at);
-                ws.fork_seq = seq;
-                true
-            }
-            None => false,
+        let Some(ws) = self.workspaces.get_mut(&branch) else { return false };
+        let replaced = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
+        ws.fork_snapshot = Some(at);
+        ws.fork_seq = seq;
+        // Add before drop, so a re-pin to the same seq never passes through "no pin at all".
+        self.add_pin(seq);
+        if let Some(old) = replaced {
+            self.drop_pin(old);
         }
+        self.reclaim_history();
+        self.audit_pins();
+        true
     }
 
     /// Record a published row version: in `versions`, which the premise check reads as "now", and
     /// in `version_history`, which a pinned read looks its version up in. The only writer of
     /// either, so the two cannot disagree — the same reason `push_applied` is the only writer of
     /// `applied` and its index.
+    ///
+    /// The row's history is trimmed against the current horizon on the way out, so a merge loop
+    /// with no live pin holds one entry per row. The work is O(log n) in the pins and the index,
+    /// plus O(log H) for the insert position. The insert is an append whenever versions arrive in
+    /// sequence order.
     fn publish_version(&mut self, v: VersionRef) {
         let key = (v.tbl.0, v.row.0);
+        self.unindex_history(key);
         let history = self.version_history.entry(key).or_default();
         let at = history.partition_point(|&s| s < v.begin_ts);
         if history.get(at) != Some(&v.begin_ts) {
             history.insert(at, v.begin_ts);
         }
         self.versions.insert(key, v);
+        let horizon = self.history_horizon();
+        self.trim_history(key, horizon);
     }
+
+    /// The horizon a trim may use, and `retention.exact_from` raised to match. The horizon is the
+    /// oldest live pin, or `u64::MAX` when there is none, which keeps each row's newest entry
+    /// only.
+    ///
+    /// With no pin, the floor is `apply_seq`, not `u64::MAX`. Every pin taken from then on is at or
+    /// above it, and the newest entry, which is all such a trim keeps, answers that pin exactly.
+    fn history_horizon(&mut self) -> u64 {
+        let oldest = self.retention.pins.keys().next().copied();
+        let floor = oldest.unwrap_or(self.apply_seq);
+        self.retention.exact_from = self.retention.exact_from.max(floor);
+        oldest.unwrap_or(u64::MAX)
+    }
+
+    /// Take one row out of `retention.trimmable`. It goes back in via `trim_history`, which is how
+    /// the index stays keyed by the row's CURRENT second-oldest entry.
+    fn unindex_history(&mut self, key: (u32, u64)) {
+        if let Some(&second) = self.version_history.get(&key).and_then(|h| h.get(1)) {
+            self.retention.trimmable.remove(&(second, key.0, key.1));
+        }
+    }
+
+    /// Drop one row's entries that no pin at or above `horizon` can be answered from: everything
+    /// older than the newest entry at or below it. Then index the row again. The row must already
+    /// be out of `trimmable` (see `unindex_history`).
+    ///
+    /// After this the row's second-oldest entry, if any, is above `horizon`, which is what makes
+    /// `reclaim_history`'s drain terminate.
+    fn trim_history(&mut self, key: (u32, u64), horizon: u64) {
+        let Some(history) = self.version_history.get_mut(&key) else { return };
+        let keep_from = history.partition_point(|&s| s <= horizon).saturating_sub(1);
+        history.drain(..keep_from);
+        if let Some(&second) = history.get(1) {
+            self.retention.trimmable.insert((second, key.0, key.1));
+        }
+    }
+
+    /// Free every entry that only a departed pin could read. Called wherever the oldest pin can
+    /// rise: a pinned workspace removed, or a pin moved.
+    ///
+    /// Each drained row loses at least its oldest entry. So the cost is O(log n) per entry freed,
+    /// paid once per entry, and a seal that did not raise the horizon drains nothing.
+    fn reclaim_history(&mut self) {
+        let horizon = self.history_horizon();
+        while let Some(&(second, tbl, row)) = self.retention.trimmable.first() {
+            if second > horizon {
+                break;
+            }
+            self.retention.trimmable.pop_first();
+            self.trim_history((tbl, row), horizon);
+        }
+    }
+
+    /// A live workspace became pinned at `seq`.
+    fn add_pin(&mut self, seq: u64) {
+        *self.retention.pins.entry(seq).or_insert(0) += 1;
+    }
+
+    /// A live workspace stopped being pinned at `seq`.
+    fn drop_pin(&mut self, seq: u64) {
+        match self.retention.pins.get_mut(&seq) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.retention.pins.remove(&seq);
+            }
+            // Loud in debug, and a no-op in release. An over-count keeps history longer than
+            // needed. An under-count lets the horizon pass a live pin. Then `exact_from` passes it
+            // too, and every read through that pin is refused. That is loud, but it is still wrong.
+            None => debug_assert!(false, "pin underflow at fork_seq {seq}"),
+        }
+    }
+
+    /// Re-derive `retention.pins` by brute force and compare, and check the invariant that the
+    /// `exact_from` refusal rests on: no live pin sits below it. Debug builds only. It is capped
+    /// like [`State::audit_txn_refs`], for the same reason, and with the same blind spot.
+    #[cfg(debug_assertions)]
+    fn audit_pins(&self) {
+        if self.workspaces.len() > AUDIT_FULL_MAX {
+            return;
+        }
+        let mut want: BTreeMap<u64, u32> = BTreeMap::new();
+        for ws in self.workspaces.values().filter(|w| w.fork_snapshot.is_some()) {
+            *want.entry(ws.fork_seq).or_insert(0) += 1;
+        }
+        assert_eq!(self.retention.pins, want, "pins disagree with a scan of workspaces");
+        if let Some(&oldest) = want.keys().next() {
+            assert!(
+                oldest >= self.retention.exact_from,
+                "a live pin at {oldest} sits below the history floor {}: reads through it would be \
+                 refused",
+                self.retention.exact_from
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn audit_pins(&self) {}
 
     /// **D194.** The published version of a row that a read SAW, or `None` if it saw none.
     ///
@@ -1156,6 +1322,11 @@ impl State {
     /// read through a branch's pinned snapshot, which saw exactly the versions published at or
     /// below that seq — so the newest of those — and `None` for a read of main as it stood, which
     /// saw the latest.
+    ///
+    /// ⚠ Exact only for `seen_through >= retention.exact_from`. Below that, the history may have
+    /// dropped the version, and the answer comes back "none". Every live pin is at or above the
+    /// floor. [`AgentRuntime::record_read`] refuses a read whose pin was released while it ran
+    /// before calling this. `rebase_commit` passes `apply_seq` itself.
     fn version_seen(&self, tbl: TableId, row: RowId, seen_through: Option<u64>) -> Option<VersionRef> {
         let latest = self.versions.get(&(tbl.0, row.0)).copied()?;
         let Some(through) = seen_through else { return Some(latest) };
@@ -1207,12 +1378,27 @@ impl State {
             .collect();
         let olds: Vec<Workspace> =
             displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        // A pinned workspace enters `retention.pins` with the workspace. The pins of displaced
+        // workspaces leave in the same call, and anything only they could read is freed.
+        let pinned_at = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
         self.workspaces.insert(branch, ws);
+        if let Some(seq) = pinned_at {
+            self.add_pin(seq);
+        }
+        let mut released = false;
         for old in olds {
             self.drop_txn_refs(&old);
+            if old.fork_snapshot.is_some() {
+                self.drop_pin(old.fork_seq);
+                released = true;
+            }
             forget_captures_unless_published(self, &old);
         }
+        if released {
+            self.reclaim_history();
+        }
         self.audit_txn_refs();
+        self.audit_pins();
     }
 
     /// Re-derive `txn_refs` by brute force and compare. Debug builds only.
@@ -1291,10 +1477,18 @@ impl State {
     /// The references are released **before** the caller inspects the result, which is what makes
     /// `capture_is_protected` a question about the workspaces that REMAIN — the same thing the
     /// scan meant when it ran after `BTreeMap::remove` had already taken this one out.
+    ///
+    /// A pinned workspace takes its pin out of `retention.pins`. If that was the oldest pin, the
+    /// history only it could read is freed here. Freeing does not wait for each row's next publish.
     fn remove_workspace(&mut self, branch: &BranchId) -> Option<Workspace> {
         let ws = self.workspaces.remove(branch)?;
         self.drop_txn_refs(&ws);
+        if ws.fork_snapshot.is_some() {
+            self.drop_pin(ws.fork_seq);
+            self.reclaim_history();
+        }
         self.audit_txn_refs();
+        self.audit_pins();
         Some(ws)
     }
 
@@ -2146,6 +2340,32 @@ impl AgentRuntime {
             .collect()
     }
 
+    /// **D194 new-wall audit, term 3: what the live branches' pinned snapshots retain.** Returns
+    /// `(pinned live branches, distinct snapshots among them, active txn ids those snapshots hold)`.
+    ///
+    /// "Distinct" means distinct `Arc`s, because that is what memory is. Two things already share
+    /// one: a child holds its parent's `Arc`, and forks on one thread with no `TxnManager`
+    /// transaction begun or ended between them share `read_snapshot_cached`'s. Each distinct
+    /// snapshot holds the active set as it was when the snapshot was taken. That set counts SQL
+    /// transactions in flight, not branches, because an agent's txn ids never enter the manager's
+    /// table.
+    ///
+    /// This is an instrument. It costs O(live branches) under the state lock, so no statement path
+    /// calls it.
+    pub fn fork_snapshot_census(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let mut distinct: std::collections::HashSet<*const Snapshot> =
+            std::collections::HashSet::new();
+        let (mut pinned, mut ids) = (0, 0);
+        for s in state.workspaces.values().filter_map(|ws| ws.fork_snapshot.as_ref()) {
+            pinned += 1;
+            if distinct.insert(Arc::as_ptr(s)) {
+                ids += s.active.len();
+            }
+        }
+        (pinned, distinct.len(), ids)
+    }
+
     /// Exit criterion 9: which agent + run + model wrote a given row.
     ///
     /// Answers for a row in the shared tables — that is, one some merge published — and keeps
@@ -2704,6 +2924,32 @@ impl AgentRuntime {
                 )))
             }
         };
+        // **A read whose pin was released while it ran REFUSES. It does not record a version it
+        // may not have seen.** (D194 new-wall audit.)
+        //
+        // `seen_through` was taken with the pin, under an earlier acquisition of this lock. An agent's
+        // own-branch `SELECT` runs on the shared read path (`executor::try_run_read`), so a `REBASE`
+        // or an `ABANDON` of the branch it read, from another connection, can land between that
+        // acquisition and this one. Once that pin is gone, `version_history` may have trimmed the
+        // version this read saw. `version_seen` would then answer "none", and `begin_ts 0` would be
+        // recorded for a row the read did see. The premise check would still catch that row, because
+        // it moved. `REVERT` would not: the edge to the merge that published what the read saw would
+        // be gone. `retention.exact_from` is the resulting state that says so. Every live pin is at
+        // or above it, so a read below it went through a pin that no longer exists.
+        //
+        // Only an INSPECTION records versions. A row-targeting read records a region and its
+        // `observed_at`, and neither needs the history.
+        let released = seen_through
+            .filter(|&f| purpose == ReadPurpose::Inspection && f < state.retention.exact_from);
+        if let Some(f) = released {
+            return Err(FerroError::Branch(format!(
+                "the snapshot this read went through (main as of apply-seq {f}) was released while \
+                 this read ran: {reader}, or the branch it read AS OF, was re-pinned by REBASE or \
+                 sealed from another connection. The versions it saw can no longer be named, and a \
+                 read that retained the wrong ones would be worse than none. Nothing was retained. \
+                 Retry."
+            )));
+        }
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
         // real observation rather than a null: `state.versions` is written only when a merge
         // PUBLISHES, so a row nobody has merged yet genuinely has no version to name.
@@ -8414,5 +8660,22 @@ mod tests {
              pin live between merges: it grows with merges, not with rows"
         );
         assert!(h40 <= rows, "{h40} history entries for {rows} published rows");
+    }
+
+    /// **The pin audit has to be able to FAIL at a door**, in the way `txn_refs`' audit is shown to
+    /// above. An under-count is simulated by reaching past the doors and forgetting a live pin.
+    /// That is the mistake the doors exist to prevent, and left alone it would let the horizon pass
+    /// a live pin.
+    ///
+    /// It names `retention`, so it cannot compile against `0570fe8`, and it landed with the field.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pins disagree with a scan")]
+    fn version_history_pin_audit_fires_on_a_desynchronised_index() {
+        let mut st = State::default();
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, 0));
+        assert_eq!(st.retention.pins.get(&0), Some(&1), "fixture: the pin was not indexed");
+        st.retention.pins.clear();
+        st.insert_workspace(BranchId::new(8, 0), ws("b_8", 101, &[]));
     }
 }
