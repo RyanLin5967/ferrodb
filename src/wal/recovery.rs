@@ -404,4 +404,179 @@ use super::*;
         let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
         assert!(tree.search(&Value::Integer(1)).unwrap().is_some());
     }
+
+    // ---- D253: a checkpoint's truncation must not discard what was appended in its window ------
+    //
+    // `checkpoint()` checks the attach table through a short hold and releases it before
+    // `checkpoint_locked` flushes, syncs and truncates, and `truncate` discards the WHOLE log. So a
+    // second thread can begin, write and commit inside that window, and the truncation removes its
+    // records (`frontier/truncate_race_adversary.md` @ `e288e3b` in artie-research). Production
+    // cannot reach it today: every appender runs under pgwire's catalog mutex or on the CLI's single
+    // thread. These tests have no such lock. They aim the second thread with the checkpoint's test
+    // pause points, so the schedule is exact rather than timed.
+
+    /// Hand the next checkpoint a pause at `slot` that reports it has arrived and then waits to be
+    /// released. Returns the arrival signal and the release.
+    fn park_checkpoint_at(
+        slot: &crate::wal::txn::CheckpointPause,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived_tx, arrived) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        *slot.lock().unwrap() = Some(Box::new(move || {
+            arrived_tx.send(()).unwrap();
+            // A dropped sender also releases, so a failing test thread cannot wedge this one.
+            let _ = released.recv();
+        }));
+        (arrived, release)
+    }
+
+    /// Shape (a): an acknowledged COMMIT between the checkpoint's page flush and its truncation.
+    /// Its page change reached no disk, because it came after `flush_all`, so only its records can
+    /// bring it back after a crash, and at `9aa6968` the truncation discarded them.
+    #[test]
+    fn a_commit_that_lands_inside_a_checkpoint_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, before, during);
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            // CONTROL: committed before the checkpoint, so its page exists and the checkpoint's
+            // `flush_all` writes it. It must survive at every commit.
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            before = heap.insert(Tuple::new(vec![1])).unwrap();
+            txn.commit(t).unwrap();
+
+            let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+            let a = {
+                let txn = txn.clone();
+                std::thread::spawn(move || txn.checkpoint())
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("fixture: the checkpoint never reached the point before its truncation");
+
+            // Thread B, with no statement lock: begin, write the same page, commit. Acknowledged.
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::open(dir_root, bp.clone());
+            heap.set_transaction(txn.clone(), t);
+            during = heap.insert(Tuple::new(vec![2])).unwrap();
+            txn.commit(t).unwrap();
+            assert!(
+                txn.commits_since_checkpoint.load(Ordering::SeqCst) > 0,
+                "premise failed: B's commit ran a checkpoint of its own (is FERRODB_CHECKPOINT_INTERVAL \
+                 set?), which flushes its page and erases the red. This run is VOID"
+            );
+
+            release.send(()).unwrap();
+            a.join().unwrap().expect("the checkpoint failed");
+            // The crash: everything dropped here, and nothing flushes the pool on drop.
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        recover(&txn).unwrap();
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        assert_eq!(
+            heap.read(before).expect("control: the row committed before the checkpoint is gone").data,
+            vec![1],
+            "control: the row committed before the checkpoint changed"
+        );
+        match heap.read(during) {
+            Ok(row) => assert_eq!(row.data, vec![2], "the row committed inside the window changed"),
+            Err(e) => panic!(
+                "the commit acknowledged inside the checkpoint's window is gone after a crash: the \
+                 truncation discarded its records, and its page never reached the disk ({e})"
+            ),
+        }
+    }
+
+    /// Shape (b): a transaction that begins and writes as the checkpoint starts, and never commits.
+    /// The checkpoint's `flush_all` writes its UNCOMMITTED page change, so after a crash only its
+    /// records let recovery undo it, and at `9aa6968` the truncation discarded them.
+    ///
+    /// This one also pins WHERE the fence is taken. A transaction that begins after `checkpoint`
+    /// releases the attach table and before `checkpoint_locked` runs appends BELOW any sample
+    /// taken inside `checkpoint_locked`, so only a sample taken under the attach-table hold sees
+    /// that anything moved.
+    #[test]
+    fn an_uncommitted_write_made_as_a_checkpoint_starts_is_undone_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, before);
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            before = heap.insert(Tuple::new(vec![1])).unwrap();
+            txn.commit(t).unwrap();
+
+            let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_at_entry);
+            let a = {
+                let txn = txn.clone();
+                std::thread::spawn(move || txn.checkpoint())
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("fixture: the checkpoint never reached its first step");
+
+            // Thread B: begin and write, and never commit. The checkpoint then flushes the page.
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::open(dir_root, bp.clone());
+            heap.set_transaction(txn.clone(), t);
+            heap.insert(Tuple::new(vec![2])).unwrap();
+
+            release.send(()).unwrap();
+            a.join().unwrap().expect("the checkpoint failed");
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        recover(&txn).unwrap();
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            heap.read(before).expect("control: the row committed before the checkpoint is gone").data,
+            vec![1],
+            "control: the row committed before the checkpoint changed"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "an uncommitted row is durable after a crash: the checkpoint wrote its page and the \
+             truncation discarded the records recovery needed to undo it"
+        );
+    }
+
+    /// NEGATIVE CONTROL: a checkpoint with nothing appended in its window truncates, exactly as
+    /// before. Without it a fix that kept the log on every checkpoint would pass the two tests
+    /// above and grow the log for ever.
+    #[test]
+    fn a_checkpoint_with_nothing_appended_in_its_window_still_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, rid);
+        {
+            let (bp, wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            rid = heap.insert(Tuple::new(vec![3])).unwrap();
+            txn.commit(t).unwrap();
+
+            let base = wal.base_lsn.load(Ordering::SeqCst);
+            assert!(
+                base < wal.next_lsn.load(Ordering::SeqCst),
+                "premise failed: the log holds nothing to discard, so a checkpoint already ran at \
+                 COMMIT (is FERRODB_CHECKPOINT_INTERVAL set?). This run is VOID"
+            );
+            txn.checkpoint().unwrap();
+            let (new_base, end) =
+                (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst));
+            assert!(new_base > base, "the checkpoint kept the log ({base} -> {new_base})");
+            assert_eq!(new_base, end, "the checkpoint did not restart the log at its end");
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        recover(&txn).unwrap();
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        assert_eq!(heap.read(rid).unwrap().data, vec![3], "the checkpointed row is gone");
+    }
 }
