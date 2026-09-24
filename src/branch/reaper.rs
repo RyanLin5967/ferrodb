@@ -136,6 +136,13 @@ pub struct TwoTierReaper {
     /// to bump is a counter the next caller forgets. `scan_once` additionally *reports* the text;
     /// this is the floor that makes a refusal impossible to drop entirely, whoever asked for it.
     refused_reaps: AtomicU64,
+    /// **D200.** Id slots the last open-time sweep gave back. See
+    /// [`TwoTierReaper::reclaim_unreleased_slots`].
+    open_slots_reclaimed: AtomicU64,
+    /// **D200.** Slots that sweep declined to decide, with the reason each one carried. D127's rule
+    /// applied here: a refusal is absorbed so one bad slot cannot stop an open, and it is kept
+    /// WITH its text, because a count alone is a number nobody can act on.
+    open_slot_refusals: Mutex<Vec<String>>,
 }
 
 impl TwoTierReaper {
@@ -149,12 +156,25 @@ impl TwoTierReaper {
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
+            open_slots_reclaimed: AtomicU64::new(0),
+            open_slot_refusals: Mutex::new(Vec::new()),
         }
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
     pub fn open_sweep_freed(&self) -> u64 {
         self.open_sweep_freed.load(Ordering::Relaxed)
+    }
+
+    /// **D200.** Id slots the last open-time sweep gave back. Zero on a catalog no reap ever left
+    /// a slot in, and zero on every open after the first that found some.
+    pub fn open_slots_reclaimed(&self) -> u64 {
+        self.open_slots_reclaimed.load(Ordering::Relaxed)
+    }
+
+    /// **D200.** Why the last open-time sweep declined each slot it could not decide.
+    pub fn open_slot_refusals(&self) -> Vec<String> {
+        self.open_slot_refusals.lock().unwrap().clone()
     }
 
     /// **D127.** Reaps this reaper refused to decide, over its whole life.
@@ -182,6 +202,11 @@ impl TwoTierReaper {
     /// `reap` is re-entrant, which is what makes resuming safe: freeing an already-freed extent
     /// returns zero, the interval rule over an extent that has gone finds no pages, and detaching
     /// from a parent that has already forgotten this child is a no-op.
+    ///
+    /// **D200:** it then gives back id slots earlier reaps left reaped and unreleased
+    /// ([`Self::reclaim_unreleased_slots`]; count and refusals in [`Self::open_slots_reclaimed`]
+    /// and [`Self::open_slot_refusals`]). They are NOT in the returned list, which stays "reaps
+    /// resumed".
     pub fn resume_interrupted_reaps(&self) -> Result<Vec<BranchId>, FerroError> {
         let mut interrupted: Vec<BranchRecord> = self
             .catalog
@@ -212,6 +237,10 @@ impl TwoTierReaper {
             done.push(b);
         }
 
+        // **D200 — AFTER the resumes**, which finish their own cascades and releases, so this
+        // sees only slots no reap will ever come back for.
+        self.reclaim_unreleased_slots()?;
+
         // **D40 — this is where the crash-orphan collector belongs.**
         //
         // A crash is the only producer of an extent charged to a branch that no longer exists at
@@ -230,6 +259,88 @@ impl TwoTierReaper {
         Ok(done)
     }
 
+    /// **D200.** Give back every id slot an earlier reap left `Reaped`, with nothing alive below
+    /// it, and never released. Idempotent: on a catalog that has none it writes nothing.
+    ///
+    /// # Who leaves one
+    ///
+    /// Before D200 the cascade in [`Self::detach_from_parent`] released no ancestor, so every
+    /// pruned interior branch kept its slot for good. Since D200 it does, and what can still leave
+    /// one is a crash inside a reap's tail: after the `Reaped` flip, before the detach and release
+    /// that follow it. The record is not `Reaping` by then, so resuming cannot see it.
+    ///
+    /// # What it does per slot
+    ///
+    /// A reap's tail, exactly. A slot with anything alive below it is a D16 pin and is kept.
+    /// Otherwise it is detached from its parent, the cascade climbs through reaped ancestors
+    /// releasing each ([`Self::detach_from_parent`]), and the slot itself is released. Deepest
+    /// first, like every other reap order here, so a child's detach empties its parent's span
+    /// before the parent is asked.
+    ///
+    /// # Cost at open
+    ///
+    /// - The candidate query: one range scan of the `Reaped` STATE span and one of the FREE_ID
+    ///   span, merged in memory, plus one point lookup per slot in the first and not the second
+    ///   (`TableBranchCatalog::unreleased_reaped_candidates`). Never a scan of every record.
+    ///   ⚠ Still O(Reaped records) per open: D1's falsifier ("open is not O(1)") names exactly
+    ///   this for a DERIVED free list. It is paid here as recovery work, as
+    ///   `collect_orphaned_extents` pays O(live arenas) at open, and it stays bounded: a released
+    ///   slot is recycled by the next fork, and a recycled slot leaves the span.
+    /// - Per candidate: one record read and one liveness question. A healthy catalog's only
+    ///   candidates are its pinned reaped interiors, whose questions the witness cache answers
+    ///   after the first walk under each chain.
+    /// - Writes: none on a healthy catalog. Per leaked slot, one detach and one release, each a
+    ///   group-committed sync, and only once.
+    fn reclaim_unreleased_slots(&self) -> Result<(), FerroError> {
+        let mut refusals = Vec::new();
+        let mut candidates: Vec<BranchRecord> = Vec::new();
+        for id in self.catalog.unreleased_reaped_candidates()? {
+            match self.catalog.get_raw(id) {
+                Ok(rec) if rec.state == BranchState::Reaped && !rec.branch_id.is_trunk() => {
+                    candidates.push(rec)
+                }
+                // Recycled, or never reaped: a candidate list is allowed to be a superset.
+                Ok(_) => {}
+                Err(e @ FerroError::Branch(_)) => refusals.push(format!("slot {id}: {e}")),
+                Err(e) => return Err(e),
+            }
+        }
+        candidates.sort_by(|a, b| b.depth.cmp(&a.depth).then(b.fork_epoch.cmp(&a.fork_epoch)));
+        let mut released: BTreeSet<u64> = BTreeSet::new();
+        for rec in candidates {
+            let id = rec.branch_id.id;
+            // Already given back by a deeper candidate's cascade.
+            if released.contains(&id) {
+                continue;
+            }
+            match self.reclaim_slot(&rec) {
+                Ok(Some(ancestors)) => {
+                    released.insert(id);
+                    released.extend(ancestors);
+                }
+                Ok(None) => {}
+                // D127's rule: one slot the catalog cannot answer for must not stop an open, and
+                // the refusal is kept with its reason rather than rounded to a count.
+                Err(e @ FerroError::Branch(_)) => refusals.push(format!("slot {id}: {e}")),
+                Err(e) => return Err(e),
+            }
+        }
+        self.open_slots_reclaimed.store(released.len() as u64, Ordering::Relaxed);
+        *self.open_slot_refusals.lock().unwrap() = refusals;
+        Ok(())
+    }
+
+    /// One slot of [`Self::reclaim_unreleased_slots`]: `None` if it is pinned and must stay,
+    /// otherwise the ancestors its cascade released beside it.
+    fn reclaim_slot(&self, rec: &BranchRecord) -> Result<Option<Vec<u64>>, FerroError> {
+        if self.catalog.has_live_children(rec.branch_id.id)? {
+            return Ok(None);
+        }
+        let ancestors = self.detach_from_parent(rec)?;
+        self.catalog.release_id(rec.branch_id.id);
+        Ok(Some(ancestors))
+    }
+
     /// Remove this branch's fork epoch from its parent's live-children array. This is the single
     /// event that can make a parked page reclaimable, which is why `reap` always follows it with
     /// a `drain_pending`.
@@ -239,7 +350,10 @@ impl TwoTierReaper {
     /// in `table_catalog::has_live_children` was fixed and this one, which the cap bounded in
     /// exactly the same way, was not. A chain of reaped ancestors is precisely what the cascade
     /// below walks, and precisely what MCTS pruning produces.
-    fn detach_from_parent(&self, rec: &BranchRecord) -> Result<(), FerroError> {
+    ///
+    /// Returns the ANCESTORS whose id slots the cascade released (D200) — never `rec` itself,
+    /// which its caller releases.
+    fn detach_from_parent(&self, rec: &BranchRecord) -> Result<Vec<u64>, FerroError> {
         // **D16 — DO NOT DETACH A BRANCH THAT STILL HAS LIVE CHILDREN.**
         //
         // Its entry under its own parent is the ONLY thing linking that subtree to the
@@ -270,19 +384,32 @@ impl TwoTierReaper {
         // reap. A witness now answers them in one lookup; see
         // `TableBranchCatalog::has_live_children`.
         let mut cur = rec.clone();
+        let mut released = Vec::new();
         loop {
             if self.catalog.has_live_children(cur.branch_id.id)? {
-                return Ok(());
+                return Ok(released);
             }
-            let Some(parent) = cur.parent_id else { return Ok(()) };
+            let Some(parent) = cur.parent_id else { return Ok(released) };
             // One call rather than get/mutate/put. The old shape silently did nothing against any
             // catalog that keeps the live set in an index instead of inside the record - see
             // `BranchCatalog::detach_child`.
             self.catalog.detach_child(parent.id, cur.fork_epoch)?;
 
+            // **D200 — an ancestor the cascade detaches gets its id slot back HERE, or never.**
+            // Its own reap asked `release_id` while it was still pinned, and that refused; nothing
+            // else ever asks again (`release_id` has no other production caller, and the only
+            // other reaped-id sweep was `migrate_from`). So every pruned interior kept its slot for
+            // good. It is `Reaped` with nothing alive below it at this point, and `release_id`
+            // re-checks both. AFTER the detach, not before: a slot recycled while its old CHILD
+            // entry still named it would pin the old parent through the new branch.
+            if cur.branch_id.id != rec.branch_id.id {
+                self.catalog.release_id(cur.branch_id.id);
+                released.push(cur.branch_id.id);
+            }
+
             match self.catalog.get_raw(parent.id) {
                 Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
-                _ => return Ok(()),
+                _ => return Ok(released),
             }
         }
     }

@@ -1529,6 +1529,9 @@ impl BranchCatalog for TableBranchCatalog {
         // parked under this branch's name. Errors are swallowed to match the inherent method's
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
+        // ⚠ D200: "recoverable" was FALSE until the open-time sweep existed — nothing ever asked
+        // again. It is true now: `TwoTierReaper::reclaim_unreleased_slots` finds the slot at the
+        // next open through `unreleased_reaped_candidates` below.
         let reusable = match (self.core(id), self.has_live_children(id)) {
             (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
             _ => false,
@@ -1543,6 +1546,36 @@ impl BranchCatalog for TableBranchCatalog {
                 let _ = self.durable(seq);
             }
         }
+    }
+
+    /// **D200.** A merge of two key spans, never a scan of every record: the `Reaped` STATE span
+    /// (ascending id) against the FREE_ID span (complemented, so descending; sorted here). Every
+    /// survivor's record is then read once, so a STATE key that outlived its state cannot put a
+    /// recycled, live slot on the list.
+    fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
+        let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
+        let reaped = self.ids_in_span(lo, hi)?;
+        let (flo, fhi) = keys::whole_group(keys::tag::FREE_ID);
+        let mut free: Vec<u64> = Vec::new();
+        for entry in self.tree.range_scan(Bound::Included(flo), Bound::Excluded(fhi))? {
+            let (k, _) = entry?;
+            if let Some(id) = keys::free_id_from_key(&k) {
+                free.push(id);
+            }
+        }
+        free.sort_unstable();
+        let mut out = Vec::new();
+        for id in reaped {
+            if id == 0 || free.binary_search(&id).is_ok() {
+                continue;
+            }
+            if let Some(rec) = self.core(id)? {
+                if rec.state() == BranchState::Reaped {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn attach_child(

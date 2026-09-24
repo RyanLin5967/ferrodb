@@ -407,6 +407,21 @@ impl LeaseThread {
                 forgotten
             ));
         }
+        // D200: `resume_interrupted_reaps` also gave back id slots earlier reaps had left behind.
+        // Said out loud, like the resumes above, and a refusal with its reason (D127).
+        let reclaimed = reaper.open_slots_reclaimed();
+        if reclaimed > 0 {
+            report(format!(
+                "lease: gave back {reclaimed} id slot(s) that earlier reaps left reaped and never \
+                 released (D200)"
+            ));
+        }
+        for why in reaper.open_slot_refusals() {
+            report(format!(
+                "lease: did not decide whether to give back an id slot, which stays reserved until \
+                 the next open: {why}"
+            ));
+        }
 
         let counters = Arc::new(Counters::default());
         let halt = Arc::new(Halt { stopping: Mutex::new(false), wake: Condvar::new() });

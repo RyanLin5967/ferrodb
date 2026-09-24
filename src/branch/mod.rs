@@ -349,6 +349,18 @@ pub trait BranchCatalog: Send + Sync {
     /// never released.
     fn release_id(&self, id: u64);
 
+    /// **D200.** Id slots that may hold a `Reaped` record whose slot is not on the free list: the
+    /// candidates `TwoTierReaper`'s open-time sweep re-checks and, where nothing below them is
+    /// alive, releases.
+    ///
+    /// **Candidates, not answers.** A superset is correct, because the sweep re-reads each record
+    /// and `release_id` re-checks both of its conditions. The default is every `Reaped` record,
+    /// exact about state and blind to the free list; a catalog that keeps its free list as keys
+    /// should answer with a range query instead, as `TableBranchCatalog` does.
+    fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
+        Ok(self.in_state(BranchState::Reaped)?.into_iter().map(|r| r.branch_id.id).collect())
+    }
+
     /// Add one child to `parent_id`'s live set.
     ///
     /// The counterpart of [`Self::detach_child`], and it exists for the same reason. The case that
