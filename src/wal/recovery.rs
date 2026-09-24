@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{atomic_file::{FileOps, OsFileOps}, db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{agent_sql::runtime::AgentRuntime, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{atomic_file::{FileOps, OsFileOps}, db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -560,10 +560,28 @@ pub struct OpenedDatabase {
     pub catalog: Catalog,
     /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
     pub recovered: bool,
-    /// The tables whose DROP the log records and this open completed (D250). A caller that keeps
-    /// per-table state outside the catalog forgets it for each, as the executor does after a DROP:
-    /// the CLI and pgserver call `AgentRuntime::forget_table` (B9, D250 review 1's F7).
-    pub completed_drops: Vec<String>,
+    /// The tables whose DROP the log records and this open completed (D250). PRIVATE, so no entry
+    /// point can name it: [`OpenedDatabase::attach_runtime`] is its only consumer (lane §3.7).
+    completed_drops: Vec<String>,
+}
+
+impl OpenedDatabase {
+    /// **The one door an agent runtime comes through onto an opened database** (D250 review 1's F7,
+    /// the lead's ruling, the same "one function both call" rule as D204). It forgets the provenance
+    /// of every table whose DROP this open completed, as the executor does after a DROP (B9,
+    /// `AgentRuntime::forget_table`), so a table later created under the name does not inherit the
+    /// dropped one's authors. The list is private to this module, so an entry point cannot run the
+    /// forget itself and cannot leave it out; `tests/open_path_allowlist.rs` checks that both
+    /// production entry points build their runtime through here. It lives in the WAL module because
+    /// a door in `agent_sql::runtime` would need the list `pub(crate)`, which the CLI could read.
+    ///
+    /// `&self` and no drain: every runtime attached to one open forgets the same tables.
+    pub fn attach_runtime(&self, runtime: AgentRuntime) -> Arc<AgentRuntime> {
+        for table in &self.completed_drops {
+            runtime.forget_table(table);
+        }
+        Arc::new(runtime)
+    }
 }
 
 /// The heap a record writes, as its directory root: a `Heap*` record's own, or the one a CLR redoes.
@@ -1453,6 +1471,11 @@ use super::*;
 
     /// Every heap `(dir_root, page)` the retained log writes, looking through a CLR to what it redoes.
     fn heap_writes(wal: &WalManager) -> Vec<(u32, u32)> {
+        heap_writes_at(wal).into_iter().map(|(dir, page, _)| (dir, page)).collect()
+    }
+
+    /// [`heap_writes`], with the LSN of the record that writes each.
+    fn heap_writes_at(wal: &WalManager) -> Vec<(u32, u32, u64)> {
         fn heap_page(kind: &RecKind) -> Option<(u32, u32)> {
             match kind {
                 RecKind::HeapInsert { dir_root, page_id, .. }
@@ -1468,7 +1491,7 @@ use super::*;
         let end = wal.next_lsn.load(Ordering::SeqCst);
         while lsn < end {
             let (rec, next) = wal.read_record(lsn).unwrap();
-            out.extend(heap_page(&rec.kind));
+            out.extend(heap_page(&rec.kind).map(|(dir, page)| (dir, page, lsn)));
             lsn = next;
         }
         out
@@ -1685,8 +1708,8 @@ use super::*;
             o.catalog.get_table("t").is_none(),
             "the next open did not complete the logged DROP: recovery skipped the table's records and left it in the catalog"
         );
-        // Lane §3.5 (review 1's F7): the open names the DROP it completed, so the entry points forget
-        // the table's provenance as the executor's DROP does.
+        // Lane §3.5 (review 1's F7): the open names the DROP it completed, so `attach_runtime` forgets
+        // the table's provenance as the executor's DROP does (lane §3.7, test 11).
         assert_eq!(o.completed_drops, vec!["t".to_string()], "the open did not report the DROP it completed");
     }
 
@@ -1891,5 +1914,228 @@ use super::*;
         let o = open_recovered(&db, &lock).expect("the open after the re-create failed");
         assert!(o.catalog.get_table("t").is_some(), "the new `t`, on another root, was forgotten as if it were the dropped one");
         assert!(o.catalog.get_table("keep").is_some(), "the table whose index took the dropped root is gone");
+    }
+
+    /// **D250, the F2 residual the lead accepted (lane §3.7 test 10): an EMPTY table re-created at the
+    /// dropped root by a CREATE whose sync failed is forgotten by the next open, and its pages leak.**
+    /// After the DROP's record the log holds no `CreateTable` (the CREATE failed before logging it) and
+    /// no heap record, so nothing tells the new table from the dropped one. The CREATE was reported
+    /// failed, and no committed row is lost (a committed row is test 7). What this pins is that the
+    /// forget frees nothing: a failed CREATE's catalog entry names pages that are not known to be its
+    /// own, because the catalog page and the bitmap page are separate writes, so a free could hit
+    /// another owner. A guard at `f3f75af`, killed by FREEm. Only the three roots are probed; another
+    /// page the CREATE allocated is not, which weakens the probe and cannot falsify it.
+    #[test]
+    fn an_empty_table_recreated_at_the_dropped_root_by_a_failed_create_is_forgotten_and_its_pages_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated_empty.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            let root = catalog.get_table("t").unwrap().first_directory_page_id;
+            run_sql("DROP TABLE t;", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the CREATE failed, but not at its sync: {e}"),
+                Ok(_) => panic!("premise failed: the CREATE's checkpoint did not fail"),
+            }
+            armed.store(false, Ordering::SeqCst);
+            let e = catalog.get_table("t").expect("premise failed: the failed CREATE left no table in the running catalog");
+            let owned = vec![e.first_directory_page_id, e.time_travel_root, e.primary_index_root];
+            assert_eq!(owned[0], root, "premise failed: the re-created table did not land on the dropped root");
+            assert_eq!(owned.iter().collect::<HashSet<_>>().len(), 3, "premise failed: the re-created table's roots are not three pages: {owned:?}");
+            // The crash: every handle goes, and nothing was written into the re-created table.
+            owned
+        };
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after the failed re-create failed");
+        assert!(
+            o.catalog.get_table("t").is_none(),
+            "premise failed: the empty re-created `t` survived the open, so the residual whose pages this probes is gone"
+        );
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP");
+        // `allocate` hands out the lowest clear bit, so every free page below the high-water mark comes
+        // out before the first page at or above it.
+        let high = o.bp.disk_manager.high_water().unwrap();
+        for _ in 0..=high {
+            let next = o.bp.disk_manager.allocate().unwrap();
+            assert!(
+                !owned.contains(&next),
+                "page {next}, a root of the table the open forgot ({owned:?}), was handed out: the forget freed it"
+            );
+            if next >= high {
+                return;
+            }
+        }
+        panic!("`allocate` handed out more pages below the high-water mark {high} than there are");
+    }
+
+    /// **D250 review 1's F7, the lead's door (lane §3.7 test 11): a runtime attached to an open that
+    /// completed a DROP forgets that table's provenance, and no other table's.** The executor's DROP
+    /// forgets a table's row authors (B9); a DROP the next open completed never reached the executor,
+    /// so `OpenedDatabase::attach_runtime` forgets them for every runtime built on the open. Red only
+    /// under ATTm: it needs the door.
+    #[test]
+    fn a_runtime_attached_to_an_open_that_completed_a_drop_forgets_that_tables_provenance_and_no_other() {
+        use crate::{agent_sql::runtime::table_id, branch::types::BranchId, provenance::{ProvId, RunEntity}};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("half_drop_provenance.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO keep VALUES (1, 10);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (1, 10);",
+            ] {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            let record = {
+                let e = o.catalog.get_table("t").expect("t");
+                crate::wal::txn::DdlRecord {
+                    op: DdlOp::DropTable,
+                    table: "t".into(),
+                    dir_root: e.first_directory_page_id,
+                    time_travel_root: e.time_travel_root,
+                    columns: Vec::new(),
+                }
+            };
+            // D229: the DROP names its table's pages first, as the executor does.
+            let pages = o.catalog.table_pages("t").expect("t's pages");
+            let err = o
+                .txn
+                .drop_checkpointed(record, pages, || Err::<(), _>(FerroError::Internal("injected: the drop failed before it freed anything".into())))
+                .expect_err("premise failed: the DROP succeeded although its mutation failed");
+            assert!(err.to_string().contains("injected"), "premise failed: the DROP failed, but not in its mutation: {err}");
+            // The crash: every handle goes, with the DROP's record durable and the catalog unchanged.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after a half-done DROP failed");
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP of `t`");
+        assert!(o.catalog.get_table("keep").is_some(), "premise failed: `keep` did not survive the open");
+
+        let runtime = AgentRuntime::new();
+        let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+        let author = runtime.provenance().intern(&run).unwrap();
+        for table in ["t", "keep"] {
+            runtime.provenance().stamp_row(table_id(table).0, 1, author).unwrap();
+            assert_eq!(
+                runtime.provenance().row_author(table_id(table).0, 1).unwrap(),
+                author,
+                "premise failed: row 1 of `{table}` was not attributed before the runtime was attached"
+            );
+        }
+        let runtime = o.attach_runtime(runtime);
+        assert_eq!(
+            runtime.provenance().row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "a runtime attached to the open still names an author for `t`, whose DROP the open completed: a \
+             table created under the name later would inherit the dropped one's authors"
+        );
+        assert_eq!(
+            runtime.provenance().row_author(table_id("keep").0, 1).unwrap(),
+            author,
+            "attaching the runtime forgot the authors of `keep`, which was never dropped"
+        );
+    }
+
+    /// **D250, the D229 merge review's finding 3 (lane §3.8 test 13): after a pinned DROP whose freed
+    /// pages a new table took, and a crash, the new table holds only its own row.** Test 1's hazard is
+    /// a freed page that was never flushed. On the D229 tree every page is flushed before the free, so
+    /// redo would skip the dropped table's records by page LSN, skip or no skip. REUSE is the hazard
+    /// both trees share: `new_page` writes a zero page (LSN 0) to disk when it hands a page out, so the
+    /// dropped table's records apply to it whatever was flushed before the free. Here `u` takes `t`'s
+    /// freed heap page and its time-travel page under the pin, and nothing flushes `u`'s writes before
+    /// the crash. `u` holds ONE row, so a replayed `t` row cannot hide under it. A sibling of test 1,
+    /// which keeps its own assertions. A guard on this branch; killed by SKIPm, TTm, CLRm and LSNm on
+    /// d250 alone and on the D229 merge (INFERRED).
+    #[test]
+    fn after_a_pinned_drop_whose_freed_pages_a_new_table_took_and_a_crash_the_new_table_holds_only_its_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pinned_drop_reused.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            for id in 1..=3 {
+                ok(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut o);
+            }
+            ok("UPDATE t SET v = 11 WHERE id = 1;", &mut o);
+            let mut s = Session::new();
+            for sql in ["BEGIN;", "INSERT INTO t VALUES (7, 70);", "ROLLBACK;"] {
+                run_sql_in(sql, &mut o.catalog, &o.bp, &o.txn, &mut s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            assert!(has_clr(&o.wal), "premise: the rolled-back INSERT left no CLR");
+            let (t_heap, t_tt) = {
+                let e = o.catalog.get_table("t").unwrap();
+                (e.first_directory_page_id, e.time_travel_root)
+            };
+            let base = o.wal.base_lsn.load(Ordering::SeqCst);
+            let pin = o.wal.pin(base).expect("pin the log at its base");
+            // Every record of `t` is below this, and every record of `u` above it.
+            let dropped_at = o.wal.next_lsn.load(Ordering::SeqCst);
+            ok("DROP TABLE t;", &mut o);
+            ok("CREATE TABLE u (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            ok("INSERT INTO u VALUES (101, 1010);", &mut o);
+            ok("UPDATE u SET v = 1011 WHERE id = 101;", &mut o);
+            assert_eq!(o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+            let (u_heap, u_tt) = {
+                let e = o.catalog.get_table("u").unwrap();
+                (e.first_directory_page_id, e.time_travel_root)
+            };
+            let writes = heap_writes_at(&o.wal);
+            // The pages `u` writes that `t`'s records also write, and that are older on disk than the
+            // first of those records: redo without the skip would apply `t`'s records to each.
+            let exposed = |t_root: u32, u_root: u32| -> Vec<u32> {
+                let mut pages: Vec<u32> = writes
+                    .iter()
+                    .filter(|(d, _, at)| *d == u_root && *at > dropped_at)
+                    .map(|(_, p, _)| *p)
+                    .filter(|p| {
+                        let first_of_t =
+                            writes.iter().filter(|(d, q, at)| *d == t_root && q == p && *at < dropped_at).map(|(_, _, at)| *at).min();
+                        let on_disk = o.bp.disk_manager.read(*p).unwrap();
+                        let disk_lsn = u64::from_be_bytes(on_disk[11..19].try_into().unwrap());
+                        first_of_t.is_some_and(|first| disk_lsn < first)
+                    })
+                    .collect();
+                pages.sort_unstable();
+                pages.dedup();
+                pages
+            };
+            assert!(
+                !exposed(t_heap, u_heap).is_empty(),
+                "premise failed: no heap page of `u` is one `t`'s records write and would take them on disk, so \
+                 redo without the skip meets nothing here: {writes:?}"
+            );
+            assert!(
+                !exposed(t_tt, u_tt).is_empty(),
+                "premise failed: no time-travel page of `u` is one `t`'s time-travel records write and would take \
+                 them on disk: {writes:?}"
+            );
+            drop(pin);
+            // The crash: every handle goes, and nothing flushed `u`'s writes.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock)
+            .unwrap_or_else(|e| panic!("the open after a pinned DROP whose pages were reused failed: redo replayed the dropped table onto `u`'s pages: {e}"));
+        assert!(o.catalog.get_table("t").is_none(), "the dropped table came back");
+        let mut rows = |sql: &str| match run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}")) {
+            crate::execution::executor::Outcome::Rows(rows) => rows,
+            _ => panic!("`{sql}` did not return rows"),
+        };
+        let only = vec![vec![Value::Integer(101), Value::Integer(1011)]];
+        assert_eq!(rows("SELECT id, v FROM u;"), only, "`u` after the reopen: a row of the dropped `t` was replayed into it, or its own was lost");
+        assert_eq!(rows("SELECT id, v FROM u WHERE id = 101;"), only, "`u` by key after the reopen");
     }
 }

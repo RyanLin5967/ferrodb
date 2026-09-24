@@ -549,6 +549,36 @@ fn both_production_entry_points_open_through_the_shared_function() {
     }
 }
 
+/// D250 review 1's F7, the lead's ruling (lane `lane_d250_drop_logged.md` §3.7 test 12): a DROP the
+/// open completed must also be forgotten by the agent runtime (B9), and that forget is unskippable
+/// only if each production entry point builds its runtime through `OpenedDatabase::attach_runtime`,
+/// the one door that runs it. The list is private to `wal::recovery`, so an entry point cannot run
+/// the loop itself; what this catches is one that wraps its runtime in an `Arc` on its own and never
+/// reaches the door, or that names the list at all.
+#[test]
+fn both_production_entry_points_build_their_runtime_through_the_opened_database() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for entry in ENTRY_POINTS {
+        let code = production_text(&std::fs::read_to_string(root.join(entry)).unwrap_or_else(|e| {
+            panic!("{entry} is not where this test expects an entry point: {e}")
+        }));
+        let t = tokens(&code);
+        let doors = (1..t.len())
+            .filter(|&k| punct(&t, k - 1, '.') && ident(&t, k) == Some("attach_runtime") && punct(&t, k + 1, '('))
+            .count();
+        assert_eq!(
+            doors, 1,
+            "{entry} calls `.attach_runtime(` {doors} times, not once: a runtime built without it keeps the \
+             provenance of every table whose DROP the open completed"
+        );
+        assert!(
+            !(0..t.len()).any(|k| ident(&t, k) == Some("completed_drops")),
+            "{entry} names `completed_drops`: the list belongs to `OpenedDatabase::attach_runtime`, and an \
+             entry point that reads it has a way round the door"
+        );
+    }
+}
+
 #[test]
 fn the_shared_function_recovers_and_then_rebuilds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

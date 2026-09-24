@@ -151,8 +151,10 @@ pub struct TxnManager {
     /// Owed releases that are page/log MISMATCHES whose quarantine record could not be written, so
     /// they stay owed (review 3's decision 6). Review 4's finding 4: a DROP must not discard one of
     /// these, because its truncation would remove the only record of it; see
-    /// [`TxnManager::drop_checkpointed`].
-    unrecorded: Mutex<Vec<(u64, RetiredSlot)>>,
+    /// [`TxnManager::drop_checkpointed`]. Each keeps the quarantine line it could not write (review
+    /// 6's caveat 1): a retry that fails before it can look at the slot writes that line, and the
+    /// entry leaves only once a line for it is written or the slot is released.
+    unrecorded: Mutex<Vec<(u64, RetiredSlot, String)>>,
     /// **The DROP intents not yet carried out (D229 (a)),** in the order they were recorded. The
     /// durable copy is the intent file beside the log (`wal::free_intent`); every change to this
     /// list is written there first. Each intent's pages are quarantined in the `DiskManager` for
@@ -234,7 +236,7 @@ pub fn release_mismatches() -> u64 {
     RELEASE_MISMATCHES.load(Ordering::Relaxed)
 }
 
-/// Checkpoints that did not truncate the log, since process start. Two kinds are counted:
+/// Checkpoints that did not truncate the log, since process start. Three kinds are counted:
 /// - checkpoints that flushed every page and synced, but KEPT the log because releases are owed.
 ///   Any caller counts: the automatic trigger, a DDL, an open, or an explicit `checkpoint`, which
 ///   also returns its refusal.
@@ -268,7 +270,9 @@ pub fn free_failures() -> u64 {
 /// F4: "a pin kept the log" must not read as "truncated", which is what a bare `Ok(0)` said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckpointOutcome {
-    /// The log was truncated.
+    /// The log was truncated. **Residual, stated at the detector in `checkpoint_or_keep_held`:** an
+    /// empty log that gets an append between that detector's reads and `truncate` can be kept by a pin
+    /// and still answer this.
     Truncated,
     /// The log was KEPT for this many releases still owed (F2).
     KeptForOwed(usize),
@@ -1260,7 +1264,7 @@ impl TxnManager {
         match self.release_one(txn_id, &r) {
             Ok(page) => {
                 // Review 5's F3: released after all, so no longer an unrecorded mismatch.
-                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
+                self.unrecorded.lock().unwrap().retain(|(t, s, _)| (*t, *s) != (txn_id, r));
                 self.tell_directory(&r, &page);
                 false
             }
@@ -1268,12 +1272,15 @@ impl TxnManager {
                 // Review 3's decision 6: the durable record first, the drop after. See
                 // `RELEASE_MISMATCHES`.
                 let quarantine = release_quarantine(&self.wal.path);
-                let key = format!("txn={txn_id} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+                let key = mismatch_key(txn_id, &r);
                 let line = format!("{key}found={found} error={e}\n");
                 if let Err(qe) = append_once_durably(&quarantine, &key, &line) {
+                    // Review 6's caveat 1: the line is kept with the entry, the latest observation
+                    // replacing an earlier one, so a later retry can write it without the page.
                     let mut unrecorded = self.unrecorded.lock().unwrap();
-                    if !unrecorded.contains(&(txn_id, r)) {
-                        unrecorded.push((txn_id, r));
+                    match unrecorded.iter().position(|(t, s, _)| (*t, *s) == (txn_id, r)) {
+                        Some(i) => unrecorded[i].2 = line,
+                        None => unrecorded.push((txn_id, r, line)),
                     }
                     drop(unrecorded);
                     if first {
@@ -1289,7 +1296,7 @@ impl TxnManager {
                     }
                     return true;
                 }
-                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
+                self.unrecorded.lock().unwrap().retain(|(t, s, _)| (*t, *s) != (txn_id, r));
                 RELEASE_MISMATCHES.fetch_add(1, Ordering::Relaxed);
                 let _ = writeln!(
                     std::io::stderr(),
@@ -1303,9 +1310,34 @@ impl TxnManager {
                 false
             }
             Err(ReleaseError::Retry(e)) => {
-                // Review 5's F3 (the lead's decision): a retryable failure is not a mismatch now, so
-                // the entry leaves `unrecorded`; the release stays owed.
-                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
+                // Review 6's caveat 1 (the lead's decision, narrowing review 5's F3): a retryable
+                // failure can come before the slot is looked at (the seam, `fetch_page`,
+                // `Page::deserialize`), so it says nothing new about the slot, and an unrecorded
+                // mismatch's last observation still stands. It is written now, from the line kept with
+                // the entry, and the entry leaves only once that write succeeds. The release stays owed
+                // either way. Not counted in `RELEASE_MISMATCHES`, which counts a mismatch when it is
+                // dropped.
+                let stored = self
+                    .unrecorded
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(t, s, _)| (*t, *s) == (txn_id, r))
+                    .map(|(_, _, line)| line.clone());
+                if let Some(line) = stored {
+                    let quarantine = release_quarantine(&self.wal.path);
+                    if append_once_durably(&quarantine, &mismatch_key(txn_id, &r), &line).is_ok() {
+                        self.unrecorded.lock().unwrap().retain(|(t, s, _)| (*t, *s) != (txn_id, r));
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "ferrodb: slot {} of page {} could not be read again ({e}); its earlier page/log \
+                             mismatch is now recorded in {}, and the release stays owed",
+                            r.slot,
+                            r.page_id,
+                            quarantine.display()
+                        );
+                    }
+                }
                 if first {
                     RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
                     let _ = writeln!(
@@ -1659,7 +1691,7 @@ impl TxnManager {
         }
         // Review 4's finding 4: the retry above was this DROP's attempt to record them.
         let unrecorded =
-            self.unrecorded.lock().unwrap().iter().filter(|(_, r)| frees.contains(&r.dir_root)).count();
+            self.unrecorded.lock().unwrap().iter().filter(|(_, r, _)| frees.contains(&r.dir_root)).count();
         if unrecorded > 0 {
             return Err(FerroError::Wal(format!(
                 "DROP refused: {unrecorded} page/log mismatch(es) on this table could not be written to the \
@@ -2281,6 +2313,11 @@ pub(crate) fn write_stale_indexes_marker(wal_path: &Path, why: &str) -> std::io:
     sync_directory_of(&path)
 }
 
+/// A mismatch's line in the quarantine starts with this, and `append_once_durably` records each once.
+fn mismatch_key(txn_id: u64, r: &RetiredSlot) -> String {
+    format!("txn={txn_id} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot)
+}
+
 /// Where a failed index undo leaves its marker: beside the log, `<wal path>.stale-indexes`. D205's
 /// C1 correction. `wal::recovery::open_recovered` rebuilds every tree when it finds one.
 pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
@@ -2292,10 +2329,17 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
 /// **Review 5's F6: a fresh log starts a fresh quarantine.** The dedupe key (`append_once_durably`)
 /// has no database incarnation, and a database created again at the same path reissues transaction
 /// ids, so an earlier database's quarantine would make a colliding record of the new one look
-/// already recorded. The earlier file is moved aside to `<quarantine>.before-<nanoseconds>`, not
-/// deleted: it is evidence. `WalManager::with_storage` calls this when it writes a fresh log's
-/// header. Stated: a database restored together with its non-empty log keeps its quarantine, which is
-/// that incarnation's own.
+/// already recorded. The earlier file is moved aside to [`aside_path`], not deleted: it is evidence.
+///
+/// Called where a new incarnation starts at this path, BEFORE anything marks it started:
+/// - `WalManager::with_storage`, before it writes a fresh log's header (review 6's caveat 2), so a
+///   failed move leaves the log empty and the next open tries again;
+/// - the consensus snapshot install, before it discards the replaced database's log (review 6's F6).
+///
+/// **Stated, not covered:** a database restored together with its non-empty log keeps its quarantine,
+/// which is that incarnation's own. An in-place restore outside the install
+/// (`replication::backup::restore` on its own) does not carry the quarantine and does not move it, so
+/// the file left at the path is the REPLACED database's.
 pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
     let current = release_quarantine(wal_path);
     match std::fs::symlink_metadata(&current) {
@@ -2307,15 +2351,29 @@ pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let mut aside = current.as_os_str().to_os_string();
-    aside.push(format!(".before-{nanos}"));
-    std::fs::rename(&current, PathBuf::from(aside))?;
+    std::fs::rename(&current, aside_path(&current, nanos))?;
     sync_directory_of(&current)
+}
+
+/// Where [`start_fresh_quarantine`] moves `current`: the first of `<current>.before-<nanos>`,
+/// `<current>.before-<nanos>-1`, `-2`, ... that does not exist. Review 6's finding 5: a clock before
+/// 1970 gives `nanos == 0` every time, and `rename` silently replaces an existing target, which would
+/// lose the earlier copy. The check and the rename are one window, closed by the single-writer
+/// `DbLock` every open holds.
+fn aside_path(current: &Path, nanos: u128) -> PathBuf {
+    let named = |n: u32| {
+        let mut aside = current.as_os_str().to_os_string();
+        aside.push(if n == 0 { format!(".before-{nanos}") } else { format!(".before-{nanos}-{n}") });
+        PathBuf::from(aside)
+    };
+    (0..).map(named).find(|p| std::fs::symlink_metadata(p).is_err()).expect("an unused name below u32::MAX")
 }
 
 /// Where a release that can never succeed is recorded before it is dropped: beside the log,
 /// `<wal path>.release-quarantine`, one line per release. Review 3's decision 6; see
-/// [`RELEASE_MISMATCHES`]. Nothing reads it back: it is evidence for a person, and it only grows.
+/// [`RELEASE_MISMATCHES`]. It is evidence for a person. It is read back only to record each mismatch
+/// once (`append_once_durably`, review 4's finding 3), and a new incarnation at the path moves it aside
+/// ([`start_fresh_quarantine`]); otherwise it only grows.
 pub fn release_quarantine(wal_path: &Path) -> PathBuf {
     let mut path = wal_path.as_os_str().to_os_string();
     path.push(".release-quarantine");
@@ -3645,6 +3703,112 @@ use super::*;
         let recorded = std::fs::read_to_string(&quarantine).expect("the DROP's retry did not record the mismatch");
         let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
         assert!(recorded.lines().any(|l| l.starts_with(&key)), "the quarantine does not record `{key}`:\n{recorded}");
+    }
+
+    /// **Review 6's caveat 1 (lane §21.14 test 1): a retry that fails before it reads the page does not
+    /// let a DROP discard an unrecorded mismatch.** At `ed6e901` the `Retry` arm removed the
+    /// `unrecorded` entry on any retryable failure, including one that comes before the slot is looked
+    /// at (the seam, `fetch_page`, `Page::deserialize`). One such failure in the DROP's own retry let
+    /// its count pass, and the DROP discarded the mismatch and truncated the only record of it: review
+    /// 4's finding 4, back. The entry now keeps the line it could not write, a `Retry` writes that line,
+    /// and the entry leaves only once it is written. So the DROP is refused while the quarantine is
+    /// unwritable, and goes ahead once it is writable, although the page still cannot be read.
+    #[test]
+    fn a_retry_that_fails_before_reading_the_page_does_not_let_a_drop_discard_an_unrecorded_mismatch() {
+        let (_bp, _wal, txn, t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        let ran = std::cell::Cell::new(false);
+        // D250 (lane `lane_d250_drop_logged.md` §2): `drop_checkpointed` takes the DROP's record, as in
+        // `a_drop_refuses_to_discard_a_mismatch_it_could_not_record`.
+        let record = || DdlRecord {
+            op: DdlOp::DropTable,
+            table: "raw".into(),
+            dir_root: r.dir_root,
+            time_travel_root: r.dir_root,
+            columns: Vec::new(),
+        };
+        FAIL_RELEASES.with(|f| f.set(1));
+        // D229: the pages the DROP would free; this raw heap's are not what the test is about.
+        let refused = txn.drop_checkpointed(record(), Vec::new(), || {
+            ran.set(true);
+            Ok(())
+        });
+        assert_eq!(FAIL_RELEASES.with(|f| f.replace(0)), 0, "premise: the DROP's retry did not meet the injected failure");
+        let e = match refused {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "one release retry that failed before reading the page let the DROP discard a mismatch it \
+                 could not record, and truncate the log that held the only record of it"
+            ),
+        };
+        assert!(!ran.get(), "the DROP ran its mutation before it was refused: {e}");
+        assert!(e.to_string().contains("quarantine"), "the DROP was refused, but not for the unrecorded mismatch: {e}");
+
+        std::fs::remove_dir(&quarantine).unwrap();
+        FAIL_RELEASES.with(|f| f.set(u32::MAX));
+        let written = txn.drop_checkpointed(record(), Vec::new(), || {
+            ran.set(true);
+            Ok(())
+        });
+        FAIL_RELEASES.with(|f| f.set(0));
+        written.unwrap_or_else(|e| {
+            panic!(
+                "the DROP was refused although the mismatch's last observation could be written, so a page \
+                 that cannot be read would block the DROP for good: {e}"
+            )
+        });
+        assert!(ran.get(), "the DROP answered Ok without running its mutation");
+        let recorded = std::fs::read_to_string(&quarantine).expect("the mismatch was never written to the quarantine");
+        let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+        assert!(recorded.lines().any(|l| l.starts_with(&key)), "the quarantine does not record `{key}`:\n{recorded}");
+    }
+
+    /// **Review 6's caveat 2 (lane §21.14 test 2): a fresh log whose quarantine could not be moved
+    /// moves it at the next open.** At `ed6e901` the fresh header was written and synced before the
+    /// move, so a failed move left a 24-byte log that no later open counts as fresh, and the earlier
+    /// database's quarantine stayed current for good. The move now comes first: until it succeeds the
+    /// log stays empty, and every open retries it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_log_whose_quarantine_could_not_be_moved_moves_it_at_the_next_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("x.wal");
+        let quarantine = dir.path().join("x.wal.release-quarantine");
+        std::fs::write(&wal_path, b"").unwrap();
+        std::fs::write(&quarantine, "txn=5 dir_root=3 page=7 slot=1 found=live error=an earlier database's mismatch\n").unwrap();
+        let set_mode = |mode: u32| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(0o555);
+        let refused = WalManager::new(wal_path.clone());
+        set_mode(0o755);
+        assert!(
+            refused.is_err(),
+            "premise failed: a read-only directory did not refuse the move (running as root?), so nothing here is tested"
+        );
+        let _wal = WalManager::new(wal_path).expect("the second open of the log failed");
+        assert!(
+            !quarantine.exists(),
+            "a log whose first open could not move the earlier quarantine aside never moved it: the earlier \
+             database's file stays current, and a colliding record of the new one is taken as already recorded"
+        );
+    }
+
+    /// **Review 6's finding 5 (lane §21.14 test 4): a moved quarantine never replaces an earlier copy.**
+    /// A clock before 1970 gives every move the name `.before-0`, and `rename` silently replaces an
+    /// existing target, so the earlier copy, the evidence the move exists to keep, would be lost.
+    #[test]
+    fn a_moved_quarantine_never_replaces_an_earlier_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join("x.wal.release-quarantine");
+        let earlier = dir.path().join("x.wal.release-quarantine.before-0");
+        std::fs::write(&earlier, "the earlier copy\n").unwrap();
+        let aside = aside_path(&q, 0);
+        assert_ne!(aside, q, "the quarantine would be moved onto itself");
+        assert_ne!(
+            aside, earlier,
+            "a second move at the same clock reading takes the earlier copy's name, and the rename would replace it"
+        );
+        assert!(std::fs::symlink_metadata(&aside).is_err(), "the name chosen for the move is already taken: {}", aside.display());
     }
 
     /// **Review 4's finding 5: a truncation a pin cancelled is not a truncation.** `WalManager::truncate`
