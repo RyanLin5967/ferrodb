@@ -132,6 +132,14 @@ pub enum Clock {
     /// dependence on scheduling, moved from the clock to the network. Collected between turns,
     /// every message takes exactly one turn.
     ///
+    /// **And the transport's idle close is switched off** (`Node::start` says why): it is the one
+    /// wall clock left on the delivery path. What remains on the wall is connection setup: a dial
+    /// retried every `reconnect_delay`, and a handshake the receiver gives up on after
+    /// `handshake_deadline`. Frames wait in the sender's queue until a connection exists, so setup
+    /// can delay a turn; a receiver that gives up on a handshake the dialler already finished loses
+    /// the dialler's first frame uncounted, which a harness waiting for delivery refuses by name.
+    /// Neither can change what a turn does.
+    ///
     /// ⛔ **Never a server's clock.** The objection in
     /// `a_tick_is_delivered_on_the_clock_and_missed_ticks_are_caught_up` still holds for any
     /// process that polls its own node: a driver that ticks once per poll makes every timeout a
@@ -425,11 +433,22 @@ impl<A: Applier> Node<A> {
             store.check_ready()?;
         }
 
+        // **The transport's idle close is the one wall clock left on a pumped node's delivery
+        // path, so it is switched off there.** It closes a connection that has been quiet for
+        // `idle_deadline` of wall time, and a turn-driven cluster leaves connections quiet for as
+        // long as its test likes — two followers under a stable leader never speak to each other.
+        // The next frame written into a closed connection dies without being counted, and the
+        // harness waiting for it refuses the turn. How long a pause lasted is exactly the fact
+        // `Clock::Pumped` exists to keep from deciding anything.
+        let mut transport = opts.transport;
+        if opts.clock == Clock::Pumped {
+            transport.idle_deadline = Duration::MAX;
+        }
         let net = match opts.signing_key {
             Some(key) => {
-                Transport::from_listener_with_key(self_id, listener, opts.peers, opts.transport, key)?
+                Transport::from_listener_with_key(self_id, listener, opts.peers, transport, key)?
             }
-            None => Transport::from_listener(self_id, listener, opts.peers, opts.transport)?,
+            None => Transport::from_listener(self_id, listener, opts.peers, transport)?,
         };
         let now = Instant::now();
         let floor = log.snapshot_round();

@@ -1389,7 +1389,7 @@ impl Fleet {
     /// `elect`, `settle_to`, `hold_leader` and every test loop), and `FleetSeam::pump` (and so
     /// `ClusterAgents::pump_until`, which is the merge's and the fork's wait). `Node::poll` is the
     /// only producer of `Event::Tick`, it is reached only through `NodeReplicator::pump`, and the
-    /// two loops below are the only callers of that in this file.
+    /// loop below is the only caller of that in this file.
     fn turn(&self) -> Result<(), FerroError> {
         self.deliver()?;
         for r in &self.reps {
@@ -1405,27 +1405,42 @@ impl Fleet {
     /// to how fast the socket threads ran, and the election is a function of the machine again —
     /// by way of the network rather than the clock.
     ///
+    /// **A frame the transport counts as lost refuses the turn at once.** Which frame a full queue
+    /// or a broken write takes is the scheduler's choice, so a turn taken without it is a replay
+    /// that is no longer a function of the turns. A healthy localhost fleet loses none.
+    ///
     /// **Its one wall-clock read is a failure bound, and it cannot choose an outcome:** running
     /// out returns an error naming the unbalanced counts, and the turn is not taken. A frame lost
     /// without being counted is the case that reaches it — see `Frames` for the two such losses.
+    ///
+    /// It follows that this harness cannot model a node that has died: frames to it never settle.
+    /// That is `Scripted`'s job here, and `tests/integration_consensus_failover.rs`'s for real.
     fn deliver(&self) -> Result<(), FerroError> {
         let t0 = std::time::Instant::now();
         loop {
-            let (mut sent, mut settled) = (0u64, 0u64);
+            let (mut sent, mut received, mut lost) = (0u64, 0u64, 0u64);
             for r in &self.reps {
                 let f = r.with_node(|n| n.frames());
                 sent += f.sent;
-                settled += f.received + f.lost;
+                received += f.received;
+                lost += f.lost;
             }
-            if sent == settled {
+            if lost > 0 {
+                return Err(FerroError::Internal(format!(
+                    "the fleet's transports counted {lost} frame(s) lost of {sent} sent. Which \
+                     frames a full queue or a broken connection takes is the scheduler's choice, \
+                     so a turn taken without them would no longer be a function of the turns"
+                )));
+            }
+            if sent == received {
                 break;
             }
             if t0.elapsed() > DELIVERY_DEADLINE {
                 return Err(FerroError::Internal(format!(
-                    "the fleet sent {sent} frames and has accounted for {settled} (received or \
-                     counted lost) after {} ms. Taking the next turn without the rest would make \
-                     it depend on when they arrive, which is the dependence the pumped clock \
-                     exists to remove, so the turn is refused instead",
+                    "the fleet sent {sent} frames and has received {received} after {} ms, with \
+                     none counted lost. Taking the next turn without the rest would make it \
+                     depend on when they arrive, which is the dependence the pumped clock exists \
+                     to remove, so the turn is refused instead",
                     t0.elapsed().as_millis()
                 )));
             }
@@ -1589,7 +1604,8 @@ impl Replicated for FleetSeam {
 fn on_three_real_nodes_only_the_merge_reaches_a_quorum() {
     // The database is built *before* the cluster is asked who leads: creating files and running
     // DDL takes long enough to starve a driver nobody is turning, and a leader deposed by its own
-    // peers because the test was busy is not a finding.
+    // peers because the test was busy is not a finding. (Since D73 the cluster's clock is its
+    // turns, so this order no longer matters; it is kept because it is still the natural one.)
     let mut db = Db::new();
     db.seed();
 
