@@ -772,13 +772,21 @@ impl WalManager {
     ///
     /// **D253.** A checkpoint may discard the log only up to what its page flush covers. It reads
     /// `next_lsn` as the FENCE in the same critical section in which it finds no transaction
-    /// attached (`TxnManager::checkpoint`). So every record below the fence belongs to a
-    /// transaction that had already ended, and the checkpoint's `flush_all`, which runs after
-    /// that, wrote its pages. Anything appended since may belong to a transaction whose page change
-    /// the flush missed (a commit acknowledged inside the window), or whose uncommitted change it
-    /// wrote (a transaction that began inside it). Discarding those records loses the one or leaves
-    /// the other impossible to undo. If the end has moved, this keeps the whole log, exactly as a
-    /// pin does: the checkpoint succeeds and reclaims nothing this time.
+    /// attached (`TxnManager::checkpoint`). So every record below the fence either belongs to a
+    /// transaction that had already ended, whose pages the checkpoint's later `flush_all` writes,
+    /// or is a txn-0 declaration, which is discarded as it always was and re-appended from the
+    /// retained lists. Anything appended since may belong to a transaction whose page change the
+    /// flush missed (a commit acknowledged inside the window), or whose uncommitted change it wrote
+    /// (a transaction that began inside it). Discarding those records loses the one or leaves the
+    /// other impossible to undo. If the end has moved, this keeps the whole log, exactly as a pin
+    /// does: the checkpoint succeeds and reclaims nothing this time.
+    ///
+    /// **The cost is the pin's, and it is stated here for the same reason.** Writers that never
+    /// pause across a checkpoint's window keep every checkpoint from truncating, so the log grows
+    /// without bound, and each kept checkpoint still re-appends every retained declaration. No
+    /// production entry point reaches that at `9aa6968` (every appender runs under one statement
+    /// lock or one thread), and D216's re-declare-by-answer is what removes the duplicate appends.
+    /// Losing an acknowledged commit is the alternative.
     ///
     /// Checked under the buffer lock, where `next_lsn` cannot move, and after `flush`, so an append
     /// that lands between that flush and this lock (the D236 review's W5) is caught by the same

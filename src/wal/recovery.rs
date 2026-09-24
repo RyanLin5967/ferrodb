@@ -579,4 +579,20 @@ use super::*;
         let heap = HeapFileManager::open(dir_root, bp.clone());
         assert_eq!(heap.read(rid).unwrap().data, vec![3], "the checkpointed row is gone");
     }
+
+    /// CONTROL for the DDL path: `ddl_checkpointed` reads its fence AFTER its body, so a record the
+    /// body appends is discarded exactly as before D253 and the checkpoint still truncates. Read
+    /// before the body, the fence would keep the log at every DDL checkpoint.
+    #[test]
+    fn a_ddl_checkpoint_whose_body_appends_still_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_bp, wal, txn) = setup(dir.path());
+        let appended = txn.ddl_checkpointed(|| wal.append(0, 0, &RecKind::Begin)).unwrap();
+        let (base, end) = (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst));
+        assert!(
+            base > appended,
+            "the DDL checkpoint kept the record its own body appended (base {base}, record at {appended})"
+        );
+        assert_eq!(base, end, "the DDL checkpoint did not restart the log at its end");
+    }
 }

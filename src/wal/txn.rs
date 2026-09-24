@@ -347,20 +347,22 @@ impl TxnManager {
             // Claimed before this returns, so the resume point is never *published* unclaimed. See
             // `SnapshotHandoff::pin` for what leaving this to the caller cost.
             //
-            // **It is not claimed from the moment it exists, and the gap is real rather than
-            // theoretical.** The `Begin` above went in under the `att` lock, which was then
-            // released; the pin is taken here, without it. A concurrent `checkpoint` samples
-            // `att.is_empty()` and *drops that lock before truncating*, so one that found the table
-            // empty a moment before this reader was inserted can truncate in between - and then
-            // this `pin` fails. It is tempting to write that a checkpoint cannot truncate while a
-            // transaction is open; it is not true as written, because the check and the truncation
-            // are not one critical section.
+            // **It is not claimed from the moment it exists.** The `Begin` above went in under the
+            // `att` lock, which was then released; the pin is taken here, without it. Before D253 a
+            // concurrent `checkpoint` that found the table empty a moment before this reader was
+            // inserted could truncate in between, and this `pin` then failed, because the check and
+            // the truncation were not one critical section.
             //
-            // Which is precisely why the failure below closes the reader instead of returning `?`.
-            // The race is narrow, its outcome is a clean refusal the caller can retry, and the
-            // alternative - holding `att` across a checkpoint's flush, page writes and fsync - buys
-            // atomicity here at the cost of blocking every begin and commit on disk IO. The error
-            // path is the cheaper correct answer; it just has to not leak.
+            // **D253 closed that for every checkpoint.** `checkpoint` reads its fence in the same
+            // hold as the emptiness check, so this reader's `Begin` lands above the fence and the
+            // truncation keeps the log (`WalManager::truncate_fenced`); `ddl_checkpointed` excludes
+            // the `Begin` outright. What can still discard the log under this reader is the
+            // UNFENCED `WalManager::truncate`: the consensus snapshot install discards on purpose.
+            //
+            // So the failure below still closes the reader instead of returning `?`: it is the
+            // defence for that path and for a failed `flush`, its outcome is a clean refusal the
+            // caller can retry, and it just has to not leak. Holding `att` across a checkpoint's
+            // flush, page writes and fsync was the alternative, and the fence made it unnecessary.
             self.wal.pin(resume_lsn)
         })();
 
@@ -872,7 +874,10 @@ impl TxnManager {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
         let out = f()?;
-        // D253: the attach table is held throughout, so the fence can be read here, after `f`.
+        // D253: the attach table is held throughout, so the fence is read here, AFTER `f`. Records
+        // `f` appends are then below it and discarded exactly as before (a retained declaration is
+        // re-appended by `replay_schema`). Read before `f`, they would keep the log at every DDL
+        // checkpoint. `a_ddl_checkpoint_whose_body_appends_still_truncates` pins this.
         let fence = self.wal.next_lsn.load(Ordering::SeqCst);
         self.checkpoint_locked(fence)?;
         Ok(out)
