@@ -3520,6 +3520,53 @@ mod tests {
         assert_eq!(readable.arena_owner(a), None, "control: the orphan is collected when it reads");
     }
 
+    /// **D232, review 2 F3: a drain releases a parked page only into an extent the entry's own
+    /// branch holds.** `reap` filters `record.arenas` by the store's owner, but the pending-free
+    /// log is older than that filter. A database where a slow-path reap once ran over an aliased
+    /// key holds durable entries naming Y's extent under X, and the first drain after X's pinning
+    /// children die released Y's live page onto Y's recycled list. The entry is planted in the
+    /// shape that reap left it, beside one of X's own as the control.
+    #[test]
+    fn d232_a_drain_releases_no_parked_page_into_another_branchs_extent() {
+        use crate::branch::record::PendingFree;
+        let (h, reaper) = setup();
+        let x =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let own = write_pages(&h, x, 1)[0];
+        let xa = h.catalog.get(x).unwrap().arenas[0];
+        let y =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        write_pages(&h, y, 1);
+        let ya = h.catalog.get(y).unwrap().arenas[0];
+        let y_pages = h.store.allocated_pages(ya);
+        assert!(!y_pages.is_empty(), "fixture: Y's extent holds no page");
+        assert!(h.store.allocated_pages(xa).contains(&own), "fixture: X's page is not in xa");
+
+        let free_epoch = h.catalog.next_epoch();
+        let parked = |page_id: PageId, arena_id: ArenaId| PendingFree {
+            page_id,
+            arena_id,
+            birth_epoch: Epoch(0),
+            free_epoch,
+            owner: x,
+        };
+        h.store.put_pending(vec![parked(y_pages[0], ya), parked(own, xa)]).unwrap();
+        reaper.drain_pending().unwrap();
+
+        assert_eq!(
+            h.store.allocated_pages(ya),
+            y_pages,
+            "D232 review 2 F3: a drain released a page of arena {ya}, which the store charges to \
+             live branch Y, because a parked entry named it under X"
+        );
+        assert_eq!(reaper.foreign_arenas_skipped(), 1, "the foreign entry was not counted");
+        assert_eq!(h.store.pending_len(), 0, "the foreign entry is still parked");
+        assert!(
+            !h.store.allocated_pages(xa).contains(&own),
+            "control: X's own parked page was not released, so the drain proves nothing"
+        );
+    }
+
             }
         };
     }

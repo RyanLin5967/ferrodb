@@ -5554,4 +5554,117 @@ mod tests {
         assert_eq!(h.store.arena_owner(a), None, "the extent is still there");
         assert!(!h.store.free_arena_if_present(a).unwrap(), "an absent extent reported a free");
     }
+
+    /// **D232, review 2 F1: a claim folded into a full rewrite counts its own pages.**
+    /// `alloc_arena` added the extent's pages to `reserved_pages` only after its persist. An
+    /// appended claim record carries the count and replay adds it, so that shape restored
+    /// correctly; a claim written as a full rewrite serialised `reserved` without its own extent,
+    /// and the restore came back short. The first persist after arming is always a rewrite, and
+    /// that is the claim here.
+    #[test]
+    fn d232_a_claim_written_as_a_full_rewrite_counts_its_own_pages() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-reserved-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.store.alloc_arena(x).unwrap();
+        assert_eq!(h.store.persist_counters(), (1, 0), "fixture: the claim was not a rewrite");
+        assert!(h.store.reserved_page_count() > 0, "fixture: the claim reserved nothing");
+
+        let restored = h.fresh_store();
+        assert!(restored.restore(&path).unwrap(), "fixture: nothing was restored");
+        assert_eq!(
+            restored.reserved_page_count(),
+            h.store.reserved_page_count(),
+            "D232 review 2 F1: the claim's full rewrite wrote `reserved` without the claim's own \
+             extent"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **D232, review 2 F1, the other half: a claim whose record fails to persist reserves
+    /// nothing.** The pages are now counted before the persist, so the H2b path that takes the
+    /// extent back out of the map has to take them back out of the count as well.
+    #[test]
+    fn d232_a_claim_whose_record_fails_to_persist_reserves_nothing() {
+        let h = Harness::new();
+        let (blocker, target) = d232_blocked_path("reserved");
+        h.store.checkpoint_to(target);
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let before = h.store.reserved_page_count();
+
+        h.store.alloc_arena(x).expect_err("fixture: the claim's record must fail to persist");
+
+        assert_eq!(
+            h.store.reserved_page_count(),
+            before,
+            "D232 review 2 F1: a claim that failed to persist, and left the map, still counts its \
+             pages as reserved"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D232, review 2 F5 (ledger D248): after a failed rewrite the next persist is still a
+    /// rewrite.** `persist_full_locked` cleared `recycled_reissued` before writing and returned on
+    /// the write's error with the flag still clear and `image_bytes` unchanged. The next persist
+    /// then appended behind an image that still lists the reused page as recycled, which the
+    /// flag's own doc calls a live page freed rather than a leak. The rewrite is made to fail with
+    /// a directory where its temporary goes: that refuses the write for anyone, root included, and
+    /// leaves the armed file and the tail accounting exactly as they were.
+    #[test]
+    fn d232_after_a_failed_rewrite_the_next_persist_is_still_a_rewrite() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d248-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d248-c-{}.bin", std::process::id()));
+        let staging = crate::storage::atomic_file::temp_path(&armed).unwrap();
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        let _ = std::fs::remove_dir(&staging);
+        h.store.checkpoint_to(armed.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let p1 = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        h.store.release_page(p1, arena);
+        // The recycled list made durable, and the tail accounting reset to this image.
+        h.store.checkpoint(&armed).unwrap();
+        let reused = h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(2)).unwrap();
+        assert_eq!(reused, p1, "fixture: the allocation did not come from the recycled list");
+
+        // The reuse makes the next persist a rewrite, and that rewrite fails.
+        std::fs::create_dir(&staging).unwrap();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(x.branch_id).expect_err("fixture: the rewrite must fail");
+        std::fs::remove_dir(&staging).unwrap();
+
+        let (r0, a0) = h.store.persist_counters();
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(y.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "D248: after a failed rewrite the next persist APPENDED ({} rewrites, {} appends) \
+             behind an image that still lists the reused page as recycled",
+            r1 - r0,
+            a1 - a0
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_file = h.fresh_store();
+        assert!(from_file.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_file.state_bytes(),
+            from_image.state_bytes(),
+            "D248: after the failed rewrite the durable map is not the live one"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
 }
