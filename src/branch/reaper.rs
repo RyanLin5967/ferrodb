@@ -436,11 +436,17 @@ impl TwoTierReaper {
         // So the residue drain is ADDITIVE, not a replacement: it returns work an early return had
         // dropped on the floor, promptly and at O(residue). The full scan keeps its own job.
         //
-        // ⚠ AND THE WALL D83 SET OUT TO REMOVE IS STILL THERE. The O(live arenas) scan still runs
-        // inside the per-statement lock. That is NOT this function's defect to fix — it is W4's
-        // open half, the outer `RuntimeLock` held across the whole of `scan_once`
-        // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
-        // lock, and no landed change touches it.
+        // ⚠ CORRECTED (wall #21 lane). This used to say the O(live arenas) scan "still runs inside
+        // the per-statement lock", held "across the whole of `scan_once`
+        // (`lease_thread.rs:399-407`)", and that "no landed change touches it". All three were true
+        // when D83 wrote them (a0609f1) and false within the hour. D88 (dffc3a4) moved this call
+        // out of `reap_expired` into `lease_thread::scan_once`, AFTER the statement lock is
+        // released (the "D88: the orphan sweep runs OUTSIDE the statement lock" block there).
+        // D98 (45dde48) then stopped `scan_once` holding that lock across the sweep at all: it is
+        // taken per `REAP_CHUNK` group of reaps. The cited lines now hold `LeaseThread::start`'s
+        // resume. What is left is the cost, not the stall: O(live arenas) once per
+        // `ORPHAN_SWEEP_INTERVAL_MS`, on the lease thread, taking the page store's and the branch
+        // catalog's own locks and never the statement lock.
         // ⛔ **D128 SITE 3 — AND ITS FIX ALREADY EXISTED TWENTY LINES AWAY, UNUSED HERE.** This
         // was a bare `mem::take` followed by TWO `?`. Either one returning dropped the whole
         // deferred set on the floor: those arenas are then never swept by the cheap residue path,
@@ -589,7 +595,8 @@ impl TwoTierReaper {
 /// `live_child_in_epoch_range`, `put_pending`, and the sweep itself. Any of them returns early and
 /// the set is dropped on the floor: work that was already identified, then forgotten. That is the
 /// residue the 60-second full scan existed to mop up, and the full scan cost O(live arenas)
-/// **inside the per-statement lock**.
+/// **inside the per-statement lock** — until D88 moved it outside that lock (see the corrected
+/// note in [`TwoTierReaper::collect_orphans_if_due`]); the O(live arenas) cost itself remains.
 ///
 /// A match on the error would fix today's three escapes and silently miss the fourth `?` somebody
 /// adds next year — the guard is the same "make it unrepresentable, do not document it" rule the
