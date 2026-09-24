@@ -1559,7 +1559,9 @@ impl TxnManager {
     ///
     /// **D271: CREATE [FULLTEXT] INDEX runs only its ATTACH here.** Its O(rows) backfill runs first,
     /// outside, into a tree no record names (`Catalog::build_index`), so the hold covers the O(1)
-    /// attach and the checkpoint and never the backfill. A refusal here frees that tree
+    /// attach and the checkpoint and never the backfill. The checkpoint still flushes and syncs the
+    /// pages the backfill dirtied, so a `begin` can wait on that write: at most the pool's frames,
+    /// however many rows the table has. A refusal here frees that tree
     /// (`execution::executor::attach_built_index`). Until D271 those statements attached first and
     /// then called a checkpoint that refused while another session's transaction was open: A8's
     /// shape, for indexes.

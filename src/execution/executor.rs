@@ -490,6 +490,44 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
     }
 }
 
+/// **D271: the second half of CREATE [FULLTEXT] INDEX.** Attach the tree the statement built, and
+/// checkpoint, as ONE unit under [`TxnManager::ddl_checkpointed`], whose hold on the transaction
+/// table then covers the O(1) attach and the checkpoint and not the O(rows) backfill before it.
+/// The checkpoint still flushes and syncs the pages the backfill dirtied, so the hold does cover
+/// that write: at most the pool's frames, however many rows the table has.
+///
+/// If the unit fails and the attach handed the tree back, the tree is freed and the statement errs
+/// with nothing left behind. That happens when another session's transaction is open, which
+/// `ddl_checkpointed` refuses before running the attach at all. The shape this replaces attached
+/// first and checkpointed after, so another session's open transaction made the statement answer
+/// `Err` over an index that the next checkpoint made durable
+/// (`tests/d271_create_index_refused_leaves_nothing.rs`).
+///
+/// If the attach's persist failed, the tree stays allocated and the error says so: a catalog page
+/// in the pool may already name it ([`Catalog::attach_index`]). If the attach succeeded and only
+/// the checkpoint after it failed, the index stays: it is attached and in use, which is what
+/// `ddl_checkpointed` gives CREATE TABLE too.
+fn attach_built_index(
+    catalog: &mut Catalog,
+    txn: &TxnManager,
+    built: crate::catalog::catalog::BuiltIndex,
+) -> Result<Outcome, FerroError> {
+    // Held outside the unit, so a unit refused before its closure runs still has the tree to free.
+    let mut unattached = Some(built);
+    let unit = txn.ddl_checkpointed(|| {
+        let built = unattached.take().expect("ddl_checkpointed runs its closure at most once");
+        catalog.attach_index(built).map_err(|(e, back)| {
+            unattached = back;
+            e
+        })
+    });
+    match (unit, unattached) {
+        (Ok(()), _) => Ok(Outcome::Ok),
+        (Err(e), Some(built)) => Err(catalog.discard_after(e, built)),
+        (Err(e), None) => Err(e),
+    }
+}
+
 /// Roll back the transaction a failed statement ran in, and return the error the caller reports.
 /// D205 (the fresh-context adversary's C1).
 ///
@@ -518,37 +556,6 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
 ///   (`tests/undo_refused_is_held.rs`). Since D213 an undo never needs room it could lose, so what can
 ///   still refuse one is an I/O error, a failed log append, or a page that disagrees with the log;
 ///   see `TxnManager::abort`.
-/// **D271: the second half of CREATE [FULLTEXT] INDEX.** Attach the tree the statement built, and
-/// checkpoint, as ONE unit under [`TxnManager::ddl_checkpointed`], whose hold on the transaction
-/// table then covers the O(1) attach and the checkpoint and not the O(rows) backfill before it.
-///
-/// If the unit fails before the attach succeeded, the tree is freed and the statement errs with
-/// nothing left behind. That happens when another session's transaction is open, which
-/// `ddl_checkpointed` refuses before running the attach at all, or when the attach's own persist
-/// fails, which undoes its record. The shape this replaces attached first and checkpointed after,
-/// so another session's open transaction made the statement answer `Err` over an index that the
-/// next checkpoint made durable (`tests/d271_create_index_refused_leaves_nothing.rs`).
-///
-/// If the attach succeeded and only the checkpoint after it failed, the index stays: it is
-/// attached and in use, which is what `ddl_checkpointed` gives CREATE TABLE too.
-fn attach_built_index(
-    catalog: &mut Catalog,
-    txn: &TxnManager,
-    built: crate::catalog::catalog::BuiltIndex,
-) -> Result<Outcome, FerroError> {
-    let mut attached = false;
-    let unit = txn.ddl_checkpointed(|| {
-        catalog.attach_index(&built)?;
-        attached = true;
-        Ok(())
-    });
-    match unit {
-        Ok(()) => Ok(Outcome::Ok),
-        Err(e) if !attached => Err(catalog.discard_after(e, built)),
-        Err(e) => Err(e),
-    }
-}
-
 fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
     match txn.abort(txn_id) {
         Ok(()) => {

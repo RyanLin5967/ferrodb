@@ -7,27 +7,35 @@
 //! would have stayed allocated in the on-disk bitmap with nothing naming them.
 //!
 //! Now the tree is built unattached, and the attach runs with the checkpoint as one unit under
-//! `TxnManager::ddl_checkpointed`. A unit that fails before the attach frees the tree.
+//! `TxnManager::ddl_checkpointed`. A unit refused before the attach persisted frees the tree. After
+//! a failed persist the tree is KEPT, because a catalog page in the buffer pool may already name it.
 //!
 //! - **T1, T2:** another session's `BEGIN` is open, and CREATE [FULLTEXT] INDEX must fail. After
-//!   that session ends and the database checkpoints and reopens, there must be no index and no page
-//!   left allocated.
-//! - **T3, T4:** at the catalog level, `create_index` / `create_fulltext_index` whose attach's
-//!   persist fails must free the tree it built.
+//!   that session ends and the database checkpoints, no page may be left allocated. After a reopen
+//!   there must be no index.
+//! - **T3, T4:** at the catalog level, a `create_index` / `create_fulltext_index` whose persist
+//!   fails AFTER writing catalog page 1 into the pool must keep the tree that page names, and say
+//!   so. Lane §9 withdrew the first T3/T4, which pinned the opposite.
 //!
 //! # The instrument
 //!
 //! `DiskManager::bitmap_high_water()`: one past the highest page the on-disk bitmap marks
-//! allocated. `free_page` clears the bit on disk at once, and a fresh database allocates in order,
-//! so a tree left allocated at the top reads as a higher mark. Blind spot, stated: an equal mark
-//! proves every page came back only while no page below the mark is free, which holds here because
-//! nothing below the table's pages is freed before the measurement. The same instrument as
+//! allocated. `free_page` clears the bit on disk at once (`DiskManager::deallocate`), and
+//! `allocate` hands out the lowest free bit, so a database that has freed nothing allocates in
+//! order and a tree left allocated at the top reads as a higher mark. Blind spot, stated: an equal
+//! mark proves every page came back only while no page below the mark is free, which holds here
+//! because nothing below the table's pages is freed before the measurement. The same instrument as
 //! `tests/d222_index_root_after_backfill.rs`.
+//!
+//! T1 and T2 read the mark BEFORE the reopen. A reopen after any DDL recovers and rebuilds every
+//! index (D216: every checkpoint re-appends the process's DDL to the log), and the rebuild frees and
+//! reallocates their pages, which moves the mark.
 //!
 //! # Red evidence
 //!
-//! Base API only (SQL, `Catalog`'s public fields and methods), so this file compiles at the base
-//! `340fbf8` (#16 `fe2fd84` with D222 merged), where every test fails at its named assertion.
+//! Base API only (SQL, `Catalog`'s public fields and methods, the buffer pool's frames), so this
+//! file compiles at the base `340fbf8` (#16 `fe2fd84` with D222 merged). There every test fails at
+//! its named assertion: T1 and T2 at red 1, T3 and T4 at red 2.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -35,6 +43,7 @@ use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
+use ferrodb::catalog::catalog_page::{CatalogPage, TableEntry};
 use ferrodb::catalog::column::Value;
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
@@ -75,13 +84,17 @@ impl Kind {
         }
     }
 
-    /// The root of this kind's index on `t.v`, as `catalog` records it, if there is one.
-    fn root(self, catalog: &Catalog) -> Option<u32> {
-        let t = catalog.get_table("t").expect("table t");
+    /// The root of this kind's index on `v`, as the table record `t` says, if there is one.
+    fn root_in(self, t: &TableEntry) -> Option<u32> {
         match self {
             Kind::BTree => t.indexes.iter().find(|i| i.column_name == "v").map(|i| i.root_page_id),
             Kind::FullText => t.fulltext_indexes.iter().find(|i| i.column_name == "v").map(|i| i.root_page_id),
         }
+    }
+
+    /// The root of this kind's index on `t.v`, as `catalog` records it, if there is one.
+    fn root(self, catalog: &Catalog) -> Option<u32> {
+        self.root_in(catalog.get_table("t").expect("table t"))
     }
 
     /// `catalog.create_index` or `catalog.create_fulltext_index`, called directly.
@@ -99,8 +112,8 @@ struct Db {
     txn: Arc<TxnManager>,
 }
 
-/// Open `dir`'s database as `cli::run_cli` does at `9aa6968`, and say whether it recovered.
-fn open(dir: &Path) -> (Db, bool) {
+/// Open `dir`'s database as `cli::run_cli` does at `9aa6968`.
+fn open(dir: &Path) -> Db {
     let path = dir.join("d271.db");
     let existed = path.exists();
     let file = OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
@@ -118,7 +131,7 @@ fn open(dir: &Path) -> (Db, bool) {
         rebuild_indexes(&mut catalog, &bp).expect("rebuild the indexes");
         txn.checkpoint().expect("checkpoint after the rebuild");
     }
-    (Db { catalog, bp, txn }, recovered)
+    Db { catalog, bp, txn }
 }
 
 impl Db {
@@ -134,6 +147,25 @@ impl Db {
 
     fn high_water(&self) -> u32 {
         self.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap")
+    }
+
+    /// Catalog page 1 as the BUFFER POOL holds it, which is what the next checkpoint writes.
+    fn pool_catalog_page_one(&self) -> CatalogPage {
+        let first = self.catalog.first_catalog_page_id;
+        let i = self.bp.fetch_page(first).expect("fetch catalog page 1");
+        let data = self.bp.frames[i].read().unwrap().data;
+        self.bp.unpin_page(first, false);
+        CatalogPage::deserialize(data).expect("catalog page 1 in the pool")
+    }
+
+    /// Point catalog page 1's `next_catalog_page`, in the pool, at `page`.
+    fn point_the_catalog_tail_at(&self, page: u32) {
+        let first = self.catalog.first_catalog_page_id;
+        let i = self.bp.fetch_page(first).expect("fetch catalog page 1");
+        let mut cat = CatalogPage::deserialize(self.bp.frames[i].read().unwrap().data).expect("catalog page 1");
+        cat.next_catalog_page = page;
+        self.bp.frame_write(i).data = cat.serialize().expect("serialize catalog page 1");
+        self.bp.unpin_page(first, true);
     }
 }
 
@@ -166,7 +198,7 @@ fn assert_the_build_has_pages_to_leak(d: &mut Db, kind: Kind) {
 /// T1, T2: another session's `BEGIN` is open while CREATE [FULLTEXT] INDEX runs.
 fn refused_under_another_sessions_transaction(kind: Kind) {
     let dir = tempfile::tempdir().unwrap();
-    let (mut a, _) = open(dir.path());
+    let mut a = open(dir.path());
     table_t(&mut a, kind);
     let before = a.high_water();
 
@@ -184,21 +216,17 @@ fn refused_under_another_sessions_transaction(kind: Kind) {
     a.sql_in(&mut other, "ROLLBACK;").expect("the other session's ROLLBACK");
     // The clean exit: any checkpoint after the refusal is what made the refused index durable.
     a.txn.checkpoint().expect("the checkpoint at exit");
+    // Read before the reopen: the reopen recovers and rebuilds (D216), which moves the mark.
+    let after = a.high_water();
     drop(a);
 
-    let (mut d, recovered) = open(dir.path());
-    assert!(
-        !recovered,
-        "premise failed: the reopen found a log to replay and rebuilt, which would not show what the refused \
-         statement left"
-    );
+    let mut d = open(dir.path());
     assert_eq!(
         kind.root(&d.catalog),
         None,
         "the refused `{}` is in the reopened catalog: it answered Err over an index a later checkpoint made durable",
         kind.create()
     );
-    let after = d.high_water();
     assert_eq!(
         after,
         before,
@@ -219,23 +247,28 @@ fn a_create_fulltext_index_refused_for_another_sessions_transaction_leaves_no_in
     refused_under_another_sessions_transaction(Kind::FullText);
 }
 
-/// T3, T4: the attach's persist fails. `first_catalog_page_id` points at `t`'s primary root, a
-/// B+tree page that every persist refuses (D230's T3 injection).
-fn attach_persist_fails(kind: Kind) {
+/// T3, T4: the attach's persist fails AFTER it wrote catalog page 1 into the pool. Page 1's
+/// `next_catalog_page` points at `t`'s primary root, so to `persist` that page is an orphan tail,
+/// which it frees after writing page 1; `CatalogPage::deserialize` refuses the B+tree page there.
+fn attach_persist_fails_after_writing(kind: Kind) {
     let dir = tempfile::tempdir().unwrap();
-    let (mut a, _) = open(dir.path());
+    let mut a = open(dir.path());
     table_t(&mut a, kind);
     let before = a.high_water();
+    assert_eq!(
+        a.pool_catalog_page_one().next_catalog_page,
+        0,
+        "premise failed: the catalog is more than one page, so the injection would replace a live page"
+    );
 
-    let page_one = a.catalog.first_catalog_page_id;
-    a.catalog.first_catalog_page_id = a.catalog.get_table("t").expect("t").primary_index_root;
+    a.point_the_catalog_tail_at(a.catalog.get_table("t").expect("t").primary_index_root);
     let refused = kind
         .create_directly(&mut a.catalog)
         .err()
-        .unwrap_or_else(|| panic!("premise failed: the {kind:?} create succeeded although every persist fails"));
-    a.catalog.first_catalog_page_id = page_one;
+        .unwrap_or_else(|| panic!("premise failed: the {kind:?} create succeeded although its persist cannot free the tail"))
+        .to_string();
     assert!(
-        refused.to_string().contains("catalog page format"),
+        refused.contains("catalog page format"),
         "premise failed: the {kind:?} create was refused for another reason than its persist: {refused}"
     );
     assert_eq!(
@@ -243,22 +276,36 @@ fn attach_persist_fails(kind: Kind) {
         None,
         "premise failed: the refused {kind:?} create left its record in memory"
     );
-    let after = a.high_water();
-    assert_eq!(
-        after,
-        before,
-        "the {kind:?} create whose persist failed left {} page(s) allocated that nothing names",
-        after.saturating_sub(before)
+    let page_one = a.pool_catalog_page_one();
+    let named = kind
+        .root_in(page_one.entries.iter().find(|e| e.name == "t").expect("premise failed: t is not on catalog page 1"))
+        .unwrap_or_else(|| {
+            panic!("premise failed: the failed persist did not write catalog page 1 naming the {kind:?} index, so nothing names the tree")
+        });
+    assert!(
+        named >= before,
+        "premise failed: catalog page 1 names root {named}, below the mark {before} the build allocated from"
+    );
+
+    let mark = a.high_water();
+    assert!(
+        named < mark,
+        "catalog page 1 in the pool names the {kind:?} root {named}, which the failed create freed (mark {mark}): the \
+         next checkpoint makes a catalog naming free pages durable"
+    );
+    assert!(
+        refused.contains("stays allocated"),
+        "the {kind:?} create whose persist failed kept its tree without saying so: {refused}"
     );
     assert_the_build_has_pages_to_leak(&mut a, kind);
 }
 
 #[test]
-fn a_create_index_whose_catalog_persist_fails_frees_the_tree_it_built() {
-    attach_persist_fails(Kind::BTree);
+fn a_create_index_whose_persist_fails_after_writing_the_catalog_keeps_the_tree_it_names() {
+    attach_persist_fails_after_writing(Kind::BTree);
 }
 
 #[test]
-fn a_create_fulltext_index_whose_catalog_persist_fails_frees_the_tree_it_built() {
-    attach_persist_fails(Kind::FullText);
+fn a_create_fulltext_index_whose_persist_fails_after_writing_the_catalog_keeps_the_tree_it_names() {
+    attach_persist_fails_after_writing(Kind::FullText);
 }

@@ -65,7 +65,6 @@ pub struct Catalog {
     epoch: u64,
 }
 
-
 /// Which list of its table a [`BuiltIndex`] joins when it is attached (D271).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltIndexKind {
@@ -76,10 +75,12 @@ pub enum BuiltIndexKind {
 }
 
 /// **D271: an index tree built from its table's heap and not yet attached to the catalog.** Made
-/// by [`Catalog::build_index`] or [`Catalog::build_fulltext_index`]; consumed by
-/// [`Catalog::attach_index`] and, if that is refused, [`Catalog::discard_index`], which frees its
-/// pages. Until it is attached no record names the tree, so a dropped `BuiltIndex` whose tree was
-/// not discarded leaks its pages: the holder must attach or discard it.
+/// by [`Catalog::build_index`] or [`Catalog::build_fulltext_index`], and consumed by
+/// [`Catalog::attach_index`], which hands it back only when it refused before persisting anything;
+/// [`Catalog::discard_index`] then frees its pages. Until it is attached no record names the tree,
+/// so a dropped `BuiltIndex` whose tree was not discarded leaks its pages: the holder must attach
+/// or discard it.
+#[must_use = "an unattached index tree's pages stay allocated until it is attached or discarded"]
 #[derive(Debug)]
 pub struct BuiltIndex {
     table: String,
@@ -234,8 +235,9 @@ impl Catalog {
 
     // create a secondary B+ tree, push an IndexInfo onto the table, persist
     //
-    // D271: build the tree unattached, then attach it; a failed attach frees what was built.
-    // `execution::executor` does the two steps itself, so that only the attach runs under
+    // D271: build the tree unattached, then attach it; an attach refused before it persisted frees
+    // what was built (`attach_or_discard`). `execution::executor` does the two steps itself, so that
+    // only the attach runs under
     // `TxnManager::ddl_checkpointed` (see `build_index`).
     pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
         let built = self.build_index(table, column)?;
@@ -306,20 +308,34 @@ impl Catalog {
     /// **D271: attach a [`BuiltIndex`] to its table.** Push the record (refusing a second index
     /// of the same kind on the column), persist, seed the shared root cells and bump the epoch: the
     /// O(1) second half of CREATE [FULLTEXT] INDEX, which the executor runs inside
-    /// `TxnManager::ddl_checkpointed`. A failed persist undoes the push, so on `Err` nothing is
-    /// attached and the caller still owns the tree.
-    pub fn attach_index(&mut self, built: &BuiltIndex) -> Result<(), FerroError> {
-        let entry = self.tables.get_mut(&built.table).ok_or(FerroError::KeyNotFound)?;
+    /// `TxnManager::ddl_checkpointed`. On `Err` nothing is attached in memory: a failed persist
+    /// undoes the push.
+    ///
+    /// **The tree comes back only when no persist ran** (`Err((e, Some(built)))`): the table is
+    /// gone, or the column already has an index of this kind. The caller may then free it with
+    /// [`Catalog::discard_index`]. **After a failed persist the tree is KEPT** (`Err((e, None))`),
+    /// allocated, and the error says so. `persist` writes the catalog into the buffer pool page by
+    /// page and can fail after writing one that names this root: fetching the next page of the
+    /// chain, allocating one, or freeing an orphan tail after the last page is written. The undo
+    /// runs only in memory, so that pool page stays, and the next checkpoint (anyone's) makes it
+    /// durable. A freed tree would leave the durable catalog naming pages that `allocate` hands out
+    /// next. A kept one is a bounded leak on a path that is already an error, and a crash-restart
+    /// rebuild frees it if the durable catalog names it
+    /// (`tests/d271_create_index_refused_leaves_nothing.rs`, T3 and T4).
+    pub fn attach_index(&mut self, built: BuiltIndex) -> Result<(), (FerroError, Option<BuiltIndex>)> {
+        let Some(entry) = self.tables.get_mut(&built.table) else {
+            return Err((FerroError::KeyNotFound, Some(built)));
+        };
         match built.kind {
             BuiltIndexKind::Secondary => {
                 if entry.indexes.iter().any(|ind| ind.column_name == built.column) {
-                    return Err(FerroError::IndexAlreadyExists);
+                    return Err((FerroError::IndexAlreadyExists, Some(built)));
                 }
                 entry.indexes.push(IndexInfo { column_name: built.column.clone(), root_page_id: built.root });
             }
             BuiltIndexKind::FullText => {
                 if entry.fulltext_indexes.iter().any(|ind| ind.column_name == built.column) {
-                    return Err(FerroError::IndexAlreadyExists);
+                    return Err((FerroError::IndexAlreadyExists, Some(built)));
                 }
                 entry.fulltext_indexes.push(FullTextIndexInfo { column_name: built.column.clone(), root_page_id: built.root });
             }
@@ -329,7 +345,7 @@ impl Catalog {
         // refused by the encoder exactly as a table name is.
         let table = built.table.clone();
         let kind = built.kind;
-        self.persist_or_undo(|c| {
+        if let Err(e) = self.persist_or_undo(|c| {
             if let Some(e) = c.tables.get_mut(&table) {
                 match kind {
                     BuiltIndexKind::Secondary => {
@@ -340,7 +356,16 @@ impl Catalog {
                     }
                 }
             }
-        })?;
+        }) {
+            return Err((
+                FerroError::Io(format!(
+                    "{e}; the index tree it had built (root page {}) stays allocated, because a catalog \
+                     page in the buffer pool may already name it",
+                    built.root
+                )),
+                None,
+            ));
+        }
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -349,16 +374,19 @@ impl Catalog {
     }
 
     /// **D271: free every page of a [`BuiltIndex`] that was never attached.** Only for a tree no
-    /// record names: an attached one is freed by `drop_table`.
+    /// record names, which is what [`Catalog::attach_index`] hands back: an attached one is freed
+    /// by `drop_table`.
     pub fn discard_index(&self, built: BuiltIndex) -> Result<(), FerroError> {
         BPlusTreeManager::<(Value, Value), ()>::open(built.root, self.buffer_pool.clone()).free_all()
     }
 
-    /// Attach `built`, or free it if the attach fails, so a refused create leaves no pages (D271).
+    /// Attach `built`. If the attach refused before persisting, free it, so a refused create leaves
+    /// no pages; after a failed persist it stays allocated (D271, [`Catalog::attach_index`]).
     fn attach_or_discard(&mut self, built: BuiltIndex) -> Result<(), FerroError> {
-        match self.attach_index(&built) {
+        match self.attach_index(built) {
             Ok(()) => Ok(()),
-            Err(e) => Err(self.discard_after(e, built)),
+            Err((e, Some(built))) => Err(self.discard_after(e, built)),
+            Err((e, None)) => Err(e),
         }
     }
 
