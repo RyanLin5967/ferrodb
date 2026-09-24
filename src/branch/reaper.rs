@@ -94,6 +94,10 @@ pub enum ReapOutcome {
     /// Its lease is no longer expired: the deadline moved between the candidate query and the
     /// re-read inside the lock. Routine, and deliberately reported nowhere — the branch is
     /// healthy and there is nothing for an operator to do.
+    ///
+    /// Since C2b (D198) also the answer for a branch whose lease the reaper no longer ENFORCES by
+    /// the time of the re-read — quarantined in between, say: `enforced_lease` answers `None`, and
+    /// leaving the branch alone is just as routine.
     NotExpired,
     /// **The reaper declined to decide, and this is why.** Nothing was freed, so nothing is lost;
     /// the branch keeps its pages and the next sweep asks again — but since D126 there is no
@@ -879,11 +883,24 @@ impl TwoTierReaper {
         branch: BranchId,
         now_millis: u64,
     ) -> Result<ReapOutcome, FerroError> {
-        match self.catalog.get_raw(branch.id) {
-            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => {
+        // **C2b (D198) — the re-check asks the catalog's REFUSED predicate, not a raw read.** It
+        // read `get_raw(..).lease_deadline`, which answers on any catalog; `enforced_lease` is the
+        // reaper's own predicate (`Live`, non-trunk, on the lease clock) and is REFUSED by a catalog
+        // that holds a last-alive mark and has not resumed in this process (C2). Before this, both
+        // callers were protected only by having asked the refused `expired_candidates` first — the
+        // calling convention C2 removed one level up.
+        match self.catalog.enforced_lease(branch) {
+            // No longer a lease the reaper enforces — e.g. quarantined between the candidate query
+            // and this re-check. The raw read would have reaped it on its long-expired deadline;
+            // leaving it is the same answer as a lease that moved, and just as routine.
+            Ok(None) => return Ok(ReapOutcome::NotExpired),
+            Ok(Some(deadline)) if !deadline.is_expired_at(now_millis) => {
                 return Ok(ReapOutcome::NotExpired)
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            // **C2b: an unresumed marked catalog's refusal arrives here**, and is a D127 refusal
+            // like any other — counted, and printed with the catalog's reason.
+            //
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
             // from the read. ⚠ This used to add "including the momentary miss
