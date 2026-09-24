@@ -3800,8 +3800,13 @@ impl AgentRuntime {
     /// `get(..).is_err()` cannot tell them apart. What can is the generation: `mark_reaped` bumps
     /// it in the same step that sets `Reaped` (all three catalogs land `Reaped` through it), a
     /// `Reaping` record keeps it, and recycling the slot only moves it further. So "landed" is
-    /// `get_raw(id).generation > branch.generation`, read before the log is locked. A `get_raw`
-    /// error reads as "not landed": the branch is left for a later visit rather than guessed at.
+    /// `get_raw(id).generation > branch.generation`, read before the log is locked.
+    ///
+    /// **An unreadable record is counted, not guessed** (the lead's review of `d95a1e7`). If
+    /// `get_raw` fails, nothing is written, because guessing "landed" could attest a reap still in
+    /// flight. If the log still holds the branch open, a refusal is counted
+    /// ([`Self::attestation_refusals`]), because reading the failure as "not landed" and moving on
+    /// would hide the gap. A later visit that can read the record attests it.
     ///
     /// **Exactly once, keyed by the log (rules 2 and 3).** A reap removes the branch's head
     /// (wall #19), so the head is the idempotency key. It is checked and the `Reap` appended under
@@ -3823,15 +3828,25 @@ impl AgentRuntime {
     /// Called with neither `state` nor the catalog held (the leaf-lock rule on
     /// [`AgentRuntime::attested`]). Every catalog read finishes before the log is locked.
     fn attest_landed_reaps(&self, candidates: &[BranchId]) {
-        let landed: Vec<BranchId> = candidates
-            .iter()
-            .copied()
-            .filter(|b| self.branches.get_raw(b.id).is_ok_and(|r| r.generation > b.generation))
-            .collect();
-        if landed.is_empty() {
+        let mut landed: Vec<BranchId> = Vec::new();
+        let mut unreadable: Vec<BranchId> = Vec::new();
+        for &b in candidates {
+            match self.branches.get_raw(b.id) {
+                Ok(r) if r.generation > b.generation => landed.push(b),
+                // Still `Reaping`: left for a later visit.
+                Ok(_) => {}
+                Err(_) => unreadable.push(b),
+            }
+        }
+        if landed.is_empty() && unreadable.is_empty() {
             return;
         }
         let mut h = self.attested.lock().unwrap();
+        for branch in unreadable {
+            if h.head_of(branch).is_some() {
+                h.count_refusal();
+            }
+        }
         for branch in landed {
             // `None` exactly when there is no live head: already sealed, or never forked here.
             // Skipped, not refused. This is the exactly-once key.

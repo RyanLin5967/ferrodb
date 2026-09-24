@@ -957,10 +957,19 @@ impl AttestedHistory {
         Ok(self.push(HistoryEntry { prev, branch, content_cid, epoch, op }))
     }
 
-    /// Count a refused write and return it. The one place [`Self::refused`] moves.
+    /// Count a refused write and return it.
     fn refuse(&mut self, why: AppendRefused) -> Result<Attestation, AppendRefused> {
-        self.refused += 1;
+        self.count_refusal();
         Err(why)
+    }
+
+    /// Count a lifecycle event that was NOT recorded, whether this log refused the write or the
+    /// caller could not establish the entry's facts. The second case is D199: a reaped branch
+    /// whose catalog record could not be read, so whether its reap had landed was unknown and the
+    /// caller wrote nothing rather than guess. Observing only: nothing reads it to decide. **The
+    /// one place [`Self::refused`] moves.**
+    pub fn count_refusal(&mut self) {
+        self.refused += 1;
     }
 
     /// Append one already-built entry verbatim. **The single append path**, called by
