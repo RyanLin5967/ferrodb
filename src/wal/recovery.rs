@@ -1023,10 +1023,13 @@ use super::*;
     /// state a failed index undo leaves, too: an entry for a row that is not there. Returns the
     /// planted entry.
     fn d216_plant_tracer(db: &Path, root: u32, key: i32) -> RecordId {
-        use crate::storage::index_page::BPlusTreeLeafPage;
+        use crate::storage::index_page::{BPlusTreeLeafPage, BPLUS_LEAF_TYPE};
         let file = OpenOptions::new().read(true).write(true).open(db).unwrap();
         let dm = DiskManager::new(file).unwrap();
-        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::deserialize(dm.read(root).unwrap()).unwrap();
+        let bytes = dm.read(root).unwrap();
+        assert_eq!(bytes[0], BPLUS_LEAF_TYPE, "premise failed: t's primary root is not a leaf");
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::deserialize(bytes).unwrap();
+        assert!(!leaf.vals.is_empty(), "premise failed: t's root leaf is empty, so no heap page to aim the tracer at");
         assert!(!leaf.key_arr.contains(&Value::Integer(key)), "premise failed: key {key} is already in t's tree");
         let tracer = RecordId::new(leaf.vals[0].page_id, 999);
         leaf.insert_entry(Value::Integer(key), tracer);
@@ -1103,7 +1106,8 @@ use super::*;
     ///
     /// `replay_runs` re-declares every run at the head of the new log, as `replay_schema` does for
     /// DDL, so a process that served one attributed MERGE also left a non-empty log at a clean
-    /// close. The middle process here runs no DDL, so the log it leaves holds run declarations only.
+    /// close. The middle process here runs no DDL, so the log it leaves holds declarations only: the
+    /// run, and (since D227) the table its open re-declared.
     ///
     /// ⚖ Amended in this lane before landing: the log-bounds assertion is withdrawn, and a tracer
     /// added, for the reasons given on `a_clean_restart_after_ddl_does_not_rebuild_the_indexes`.
@@ -1145,6 +1149,47 @@ use super::*;
             "the open rebuilt t's primary tree after a clean close: the tracer planted on disk is gone (D216)"
         );
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 1;"), vec![vec![Value::Integer(10)]], "a lookup by key");
+    }
+
+    /// **D216 — the open still checkpoints a log of declarations, so a previous process's run
+    /// declarations do not outlive it.**
+    ///
+    /// D216 stopped the REBUILD for such a log, not the checkpoint, and this pins the difference. A
+    /// provenance store kept in memory (pgserver's) hands out slot ids from 1 again after a restart.
+    /// An old declaration of slot 1 left in the log beside a new binding of slot 1 to another actor
+    /// is a range `LogicalDecoder` refuses whole. The open's checkpoint discards the old
+    /// declarations before this process can bind anything. It re-declares only what this process
+    /// retained: the catalog's tables (D227), and runs once an entry point declares its store's
+    /// (`TxnManager::declare_runs_of`), which `open_recovered` alone does not.
+    ///
+    /// Passes at `00f4c39`, where the open rebuilt and checkpointed every non-empty log, and must
+    /// keep passing: an open that skipped the checkpoint without a rebuild fails it.
+    #[test]
+    fn the_open_discards_a_previous_processs_run_declarations() {
+        use crate::{branch::types::BranchId, provenance::{ProvId, RunEntity}};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("slots.db");
+        d216_cleanly_closed(&db);
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let run = RunEntity::new(ProvId(1), "restock-agent", "run-1", "a-model", "v1", [0u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+            o.txn.declare_run(run).unwrap();
+            o.txn.checkpoint().unwrap();
+            assert!(
+                d216_log(&o.wal).iter().any(|(_, txn, kind)| *txn == 0 && matches!(kind, RecKind::RunIdentity { .. })),
+                "premise failed: the clean close declared no run"
+            );
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        let log = d216_log(&o.wal);
+        assert!(
+            !log.iter().any(|(_, _, kind)| matches!(kind, RecKind::RunIdentity { .. })),
+            "the previous process's run declaration outlived the open, so a store that reuses its slot would contradict it: {log:?}"
+        );
     }
 
     /// **D216 — a log with transactions but no data records rebuilds nothing, and recovery still
@@ -1557,7 +1602,7 @@ use super::*;
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("declared.db");
-        d216_cleanly_closed(&db);
+        let closed = d216_cleanly_closed(&db);
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
@@ -1572,6 +1617,14 @@ use super::*;
             at_open,
             vec![vec![("id".to_string(), DataType::Integer, false), ("v".to_string(), DataType::Integer, true)]],
             "the open's checkpoint did not declare t exactly once, with the shape CREATE TABLE gave it"
+        );
+        // Without this the declaration above could be the clean close's own, left in place by an
+        // open that took no checkpoint (the D216 re-adversary's fourth-round finding). A checkpoint
+        // moves the base to where the log ended, and this open appended nothing before taking one.
+        assert_eq!(
+            d216_bounds(&o.wal).0,
+            closed.bounds.1,
+            "premise failed: the open did not checkpoint the log the clean close left, so the declaration found is not its own"
         );
 
         o.txn.checkpoint().unwrap();
@@ -1610,7 +1663,10 @@ use super::*;
         let lock = DbLock::acquire(&db).unwrap();
         let o = open_recovered(&db, &lock).unwrap();
         assert!(!o.recovered, "premise failed: an empty log gave recovery work");
-        assert!(!marker.exists(), "the marker survived an open over an empty log, so the rebuild it asks for did not run");
+        assert!(
+            !marker.exists(),
+            "the marker survived an open over an empty log: the open did not take the checkpoint after which it removes the marker"
+        );
     }
 
     /// **D216 adversary F3: transaction id 0 is never handed out.**
