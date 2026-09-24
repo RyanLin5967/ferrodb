@@ -675,7 +675,8 @@ impl TwoTierReaper {
             return Ok(0);
         }
         let cursor = ArenaId(self.slice_cursor.load(Ordering::SeqCst));
-        let end = ArenaId(self.rotation_end.load(Ordering::SeqCst));
+        // MUTANT (fire-check only, never land): no fixed rotation end; chase the top id.
+        let end = ArenaId(u32::MAX);
         let mut slice = self.store.live_arenas_between(cursor, end, limit);
         if slice.is_empty() {
             // The rotation is over, or none has begun. The next one covers every arena live now;
