@@ -192,7 +192,7 @@ fn an_added_column_whose_name_the_catalog_cannot_hold_is_refused_and_wedges_noth
 /// under eight. `deserialize` checks no length either. The test that pins the placement is the
 /// 33-column one below.
 #[test]
-fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten() {
+fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_and_wedges_nothing() {
     let mut db = Db::new();
     db.exec(
         "CREATE TABLE t (id INTEGER NOT NULL, c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER, \
@@ -219,7 +219,7 @@ fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_re
             rows,
             vec![want],
             "ADD COLUMN (ninth) was refused, but the row no longer reads back under the old eight \
-             columns: it was rewritten under nine, whose null bitmap is a byte wider (I19)"
+             columns"
         ),
         Ok(_) => panic!("SELECT after the refusal returned something other than rows"),
         Err(e) => panic!(
@@ -353,8 +353,14 @@ fn a_plan_held_across_a_change_to_its_own_table_is_refused() {
     // The table changes while the plan is held: an index on the column the plan renames.
     db.catalog.create_index("t", "v").unwrap();
 
-    let applied = db.catalog.apply_plan(plan, &db.txn);
-    assert!(applied.is_err(), "a plan made before the table changed was applied anyway");
+    match db.catalog.apply_plan(plan, &db.txn) {
+        Err(FerroError::Constraint(msg)) => assert!(
+            msg.contains("changed since"),
+            "the stale plan was refused, but not by the staleness check: {msg}"
+        ),
+        Err(e) => panic!("the stale plan was refused for some other reason: {e:?}"),
+        Ok(_) => panic!("a plan made before the table changed was applied anyway"),
+    }
     let entry = db.catalog.get_table("t").expect("the table is still there");
     assert!(
         entry.schema.columns.iter().any(|c| c.name == "v") && entry.indexes.iter().any(|ix| ix.column_name == "v"),
