@@ -97,12 +97,13 @@ impl TableBranchCatalog {
     /// `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }` — an LSN exists only for a heap page (0)
     /// and a B+tree internal/leaf page (2, 3). This page's first four bytes are
     /// [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the `_ => 0` arm.
-    /// Until D216 the gate then did nothing. Since D216 an LSN of 0 makes it flush the WHOLE log
-    /// first, which orders this page after every WAL record, and still orders nothing that matters
-    /// here: neither this page nor the tree it names is logged, so there is no record for either
-    /// to wait on. B+tree pages never set an LSN, and index structure is not logged at all, because
-    /// `wal::recovery::rebuild_indexes` frees every index tree and builds a fresh one from the
-    /// heap. There is no ordering here for a gate to provide.
+    /// Until D216 the gate then did nothing. Since D216 an LSN of 0 makes it flush the log up to
+    /// where the log's end was when the page last changed (`Frame::wal_mark`). That still does
+    /// nothing here: `open_sidecar`'s pool has no WAL attached, so the gate returns at once, and on
+    /// a pool with one, neither this page nor the tree it names is logged, so there is no record
+    /// for either to wait on. B+tree pages never set an LSN, and index structure is not logged at
+    /// all, because `wal::recovery::rebuild_indexes` frees every index tree and builds a fresh one
+    /// from the heap. There is no ordering here for a gate to provide.
     ///
     /// ⇒ What the fixed page buys is the single-write sentence above, and nothing more.
     /// **Do not build a durability argument on the WAL gate.**
