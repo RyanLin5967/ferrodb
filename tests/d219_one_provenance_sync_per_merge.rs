@@ -10,9 +10,15 @@
 //! `ProvenanceStore::sync_counts().row_authors`, read immediately before and after the `MERGE`
 //! statement. It counts the fsyncs that made logical row authorship durable, which are exactly the
 //! syncs `record_applied` issues. The executor's physical `(page, slot)` stamps are counted apart,
-//! in `stamps`, and are deliberately NOT asserted here: they are one sync per published version on
-//! the publish loop, outside the `state` lock and outside this row. They appear in the failure
+//! in `stamps`, and are deliberately NOT asserted by the first test: they are one sync per
+//! published version on the publish loop, outside the `state` lock. They appear in its failure
 //! message so a reader sees the whole bill.
+//!
+//! **The second test asserts them.** D219's exit is ONE provenance sync per MERGE whatever δ is,
+//! physical and logical together, so
+//! `every_provenance_sync_a_merge_issues_is_one_whatever_delta_is` reads `total()` — every sync the
+//! store issued inside the MERGE, whatever it carried — and adds the one physical-stamp path the
+//! publish loop does not own: an ALTER's rewrite re-stamping the rows it moves.
 //!
 //! # Pre-registered, from reading the source at `9aa6968`, before this file was ever run
 //!
@@ -254,6 +260,123 @@ fn a_merge_makes_its_row_authorship_durable_with_one_sync_whatever_delta_is() {
         measured.iter().all(|m| m.during.row_authors == 1),
         "a MERGE must make its row authorship durable with exactly ONE sync, whatever δ is. \
          Measured, per MERGE statement:\n  {}",
+        table.join("\n  ")
+    );
+}
+
+/// **D219's whole exit: EVERY provenance sync a MERGE issues is ONE, whatever δ is** — the
+/// publish loop's physical stamps, the stamps an ALTER's rewrite writes for the rows it moves, and
+/// the row authorship, together.
+///
+/// The test above asserts `row_authors` only, and at `80ff247` it passes while every MERGE still
+/// pays one sync per published version on the publish loop. This one asserts `total()`.
+///
+/// # Pre-registered at `80ff247`, from the source, before this test was ever run
+///
+/// | arm                        | versions published | ops | all syncs per MERGE at `80ff247` | after |
+/// |----------------------------|--------------------|-----|----------------------------------|-------|
+/// | packed insert d=41         | 41                 | 41  | 42 (41 stamps + 1 authorship)    | 1     |
+/// | schema only (ADD COLUMN)   | 0                  | 0   | m, one per moved attributed row  | 1     |
+/// | insert d=1                 | 1                  | 1   | 2                                | 1     |
+/// | insert d=16                | 16                 | 16  | 17                               | 1     |
+/// | update d=4 ×2 cols         | 4                  | 8   | 5                                | 1     |
+///
+/// **m = 41 is predicted and NOT asserted.** The rewrite stamps only rows that MOVE pages and
+/// already carry attribution. 41 rows of `(INTEGER, 60-character VARCHAR)` fill exactly one heap
+/// page — the packing `integration_alter_refusal_safety.rs` uses to force relocation — and are
+/// attributed because a MERGE published them. `Page::update` grows a tuple only into fresh
+/// contiguous space, heap pages are never compacted, and ADD COLUMN widens every row, so every row
+/// should relocate. What IS asserted is that at least two `Stamp` records appeared in the file
+/// across the schema merge: with fewer, the arm could not tell one sync from one per row, and it
+/// says so instead of passing.
+#[test]
+fn every_provenance_sync_a_merge_issues_is_one_whatever_delta_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let prov = dir.path().join("d219-all.provenance");
+    let mut db = Db::with_provenance(&prov);
+    let mut setup = db.session();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(120));", &mut setup);
+    let stamp_records =
+        || DurableProvenanceStore::open(&prov).expect("reopen the provenance file").recovery().stamps;
+
+    let mut frames = 0usize;
+    let mut measured = Vec::new();
+
+    let pad = "y".repeat(60);
+    let packed: Vec<i64> = (1..=41).collect();
+    let writes: Vec<String> =
+        packed.iter().map(|id| format!("INSERT INTO t VALUES ({id}, '{pad}');")).collect();
+    measured.push(merge_arm(
+        &mut db,
+        &prov,
+        "packed insert d=41",
+        "packed-41",
+        &writes,
+        &packed,
+        41,
+        &mut frames,
+    ));
+
+    let before_rewrite = stamp_records();
+    measured.push(merge_arm(
+        &mut db,
+        &prov,
+        "schema only (rewrite)",
+        "alter-1",
+        &["ALTER TABLE t ADD COLUMN w VARCHAR(10);".to_string()],
+        &[],
+        0,
+        &mut frames,
+    ));
+    let rewritten = stamp_records() - before_rewrite;
+    assert!(
+        rewritten >= 2,
+        "the schema merge's rewrite wrote {rewritten} Stamp record(s). The fixture needs at least two \
+         moved, attributed rows, or this arm cannot tell one sync from one per moved row"
+    );
+
+    let insert_arms = [("insert d=1", "ins-1", 1001i64, 1usize), ("insert d=16", "ins-16", 2001, 16)];
+    for (arm, run_id, first, n) in insert_arms {
+        let ids: Vec<i64> = (first..first + n as i64).collect();
+        let writes: Vec<String> =
+            ids.iter().map(|id| format!("INSERT INTO t VALUES ({id}, 'x', 'z');")).collect();
+        measured.push(merge_arm(&mut db, &prov, arm, run_id, &writes, &ids, n, &mut frames));
+    }
+    let updated: Vec<i64> = (1..=4).collect();
+    let writes: Vec<String> = updated
+        .iter()
+        .map(|id| format!("UPDATE t SET v = 'u', w = 'u' WHERE id = {id};"))
+        .collect();
+    measured.push(merge_arm(
+        &mut db,
+        &prov,
+        "update d=4 x2 cols",
+        "upd-4",
+        &writes,
+        &updated,
+        2 * updated.len(),
+        &mut frames,
+    ));
+
+    let table: Vec<String> = measured
+        .iter()
+        .map(|m| {
+            format!(
+                "{:<22} rows={:<3} ops={:<3} all syncs={:<3} (stamps={} row_authors={})",
+                m.arm,
+                m.rows,
+                m.ops,
+                m.during.total(),
+                m.during.stamps,
+                m.during.row_authors
+            )
+        })
+        .collect();
+    assert!(
+        measured.iter().all(|m| m.during.total() == 1),
+        "a MERGE must make ALL of its provenance — physical stamps, rewrite stamps and row \
+         authorship — durable with exactly ONE sync, whatever δ is. The schema merge moved \
+         {rewritten} attributed row(s). Measured, per MERGE statement:\n  {}",
         table.join("\n  ")
     );
 }
