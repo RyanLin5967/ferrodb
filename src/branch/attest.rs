@@ -794,8 +794,10 @@ pub struct AttestedHistory {
     /// every branch ever seen, beside a `by_branch: HashMap<BranchId, Vec<usize>>` holding the
     /// position of every entry of every branch, so this struct's per-branch part grew with
     /// branches ever forked and with every event, not with branches alive. Nothing needs either
-    /// after a reap. A reaped branch is never again written to (the catalog makes its id a hard
-    /// error, and `LogBranchCatalog::fork` refuses it as a parent through `check_readable`).
+    /// after a reap. A reaped branch is never again written to: the catalog makes its id a hard
+    /// error and `LogBranchCatalog::fork` refuses it as a parent through `check_readable`, and
+    /// [`Self::append`] / [`Self::append_fork`] refuse it again here ([`AppendRefused`]), because
+    /// without its head the only link on hand is genesis.
     /// Every reader of its history goes through `entries`: the chain walks, both proofs,
     /// `verify_against`, and the runtime's `attested_entries`. The only reader of `by_branch` was
     /// `verify_branch`, which used one element per key and now finds it with a reverse scan
@@ -879,17 +881,17 @@ impl AttestedHistory {
     /// its ancestry instead of stopping at its own first entry, and therefore what lets a third
     /// party be shown that a row-version descends from a particular state of trunk.
     ///
-    /// If the parent has no history yet, its genesis is used — a log that begins mid-life is a real
-    /// situation and refusing it here would only push the caller into faking an entry.
+    /// Trunk alone may be forked from before it has a head: it is the one branch that begins
+    /// without a `Fork`, so its first link is genesis.
     ///
-    /// ⚠ **Precondition, enforced by the caller's catalog and not here: `parent` is not reaped.**
-    /// Since wall #19 a reaped branch has no head, so a fork from one would take the genesis
-    /// branch above and name no ancestry, and [`Self::verify_chain`] cannot tell that from a log
-    /// that began mid-life, because a `Fork` entry does not carry its parent's id. **Blind spot,
-    /// stated rather than hidden:** this struct cannot see the catalog, so it cannot refuse. The
-    /// one production caller, `AgentRuntime::attest_fork`, runs only after
-    /// `BranchCatalog::fork_staged` accepted the parent, and `LogBranchCatalog::fork` refuses a
-    /// reaped parent through `BranchRecord::check_readable`.
+    /// ⛔ **Refused ([`AppendRefused::NoLiveParent`]) for any other parent with no live head**
+    /// (wall #19). That parent was reaped, or this log never saw it forked, and either way the
+    /// child's first link would have to be invented. This used to fall back to genesis, as "a log
+    /// that begins mid-life". Once a reap started removing heads, that same fallback gave a fork
+    /// from a reaped parent an ancestry of nothing, and [`Self::verify_chain`] cannot see it,
+    /// because a `Fork` entry does not carry its parent's id. The catalog already refuses a reaped
+    /// parent (`LogBranchCatalog::fork` → `BranchRecord::check_readable`), and this refuses it
+    /// again at the only layer that knows what the log holds.
     pub fn append_fork(
         &mut self,
         child: BranchId,
@@ -897,16 +899,23 @@ impl AttestedHistory {
         epoch: Epoch,
         content_cid: ContentId,
     ) -> Result<Attestation, AppendRefused> {
-        let prev = self.heads.get(&parent).copied().unwrap_or_else(Attestation::genesis);
+        let prev = match self.heads.get(&parent).copied() {
+            Some(head) => head,
+            None if parent.is_trunk() => Attestation::genesis(),
+            None => return self.refuse(AppendRefused::NoLiveParent { parent }),
+        };
         Ok(self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork }))
     }
 
     /// Record any non-fork operation on `branch`, linked to that branch's own head.
     ///
-    /// ⚠ **`branch` must not be reaped** (wall #19). A reaped branch has no head, so an entry
-    /// appended to it after its `Reap` links to genesis. Unlike a fork from a reaped parent, that
-    /// one is not silent: [`Self::verify_chain`] rebuilds each branch's head from the entries and
-    /// reports a [`TamperFinding::BrokenLink`] at the new entry.
+    /// ⛔ **Refused ([`AppendRefused::NoLiveHead`]) for a non-trunk branch with no live head**
+    /// (wall #19): a reap sealed it, or this log never saw it forked. It used to link to genesis.
+    /// After a reap that rooted the new entry at the start of history, and cut the reaped
+    /// branch's ancestry walk at that entry: `verify_branch` answered `Ok(1)` and the reap, with
+    /// everything before it, dropped out of the walk. **A `Reap` on trunk is refused too**
+    /// ([`AppendRefused::TrunkReap`]): trunk's exemption from beginning with a `Fork` would
+    /// otherwise reopen the same hole for trunk.
     pub fn append(
         &mut self,
         branch: BranchId,
@@ -914,8 +923,21 @@ impl AttestedHistory {
         op: BranchOp,
         content_cid: ContentId,
     ) -> Result<Attestation, AppendRefused> {
-        let prev = self.heads.get(&branch).copied().unwrap_or_else(Attestation::genesis);
+        if op == BranchOp::Reap && branch.is_trunk() {
+            return self.refuse(AppendRefused::TrunkReap);
+        }
+        let prev = match self.heads.get(&branch).copied() {
+            Some(head) => head,
+            None if branch.is_trunk() => Attestation::genesis(),
+            None => return self.refuse(AppendRefused::NoLiveHead { branch }),
+        };
         Ok(self.push(HistoryEntry { prev, branch, content_cid, epoch, op }))
+    }
+
+    /// Count a refused write and return it. The one place [`Self::refused`] moves.
+    fn refuse(&mut self, why: AppendRefused) -> Result<Attestation, AppendRefused> {
+        self.refused += 1;
+        Err(why)
     }
 
     /// Append one already-built entry verbatim. **The single append path**, called by

@@ -3759,8 +3759,9 @@ impl AgentRuntime {
     /// Record a reap, sealing the branch's chain.
     ///
     /// The content is the branch's own head at this moment, so the terminal entry commits to the
-    /// entire history being closed: a later attempt to extend a reaped branch's chain has to
-    /// contend with an entry that already named the end.
+    /// entire history being closed. A later attempt to extend a reaped branch's chain is refused
+    /// by the log (`AppendRefused::NoLiveHead`, wall #19); so is the reap of a branch the log
+    /// never saw forked, which has no chain to close.
     fn attest_reap(
         &self,
         branch: BranchId,
