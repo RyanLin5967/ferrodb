@@ -181,52 +181,6 @@ pub fn scan_table_seq_tuples() -> u64 {
     SCAN_TABLE_SEQ_TUPLES.load(AtomicOrdering::Relaxed)
 }
 
-/// **Entries of `State::applied` the merge path visits — READ-VS-N arm 2.** Same rationale as the
-/// counters above: integers do not move when the box is loaded.
-///
-/// `VISITED` is `highest_applied_seq`'s pass: the one walk over the WHOLE never-pruned log on the
-/// merge path (`publish_evaluation_as` calls it once per merge, under the state lock). Wall #18's
-/// side note says that is Θ(M²) over M merges; this is the instrument that can show it, counted by
-/// the entries the iterator actually yielded rather than by `applied.len()`, so it cannot agree with
-/// a model of the function instead of the function.
-///
-/// `CELL_INDEX_VISITED` is what `concurrent_op` reads through D86's index instead: the
-/// `partition_point` probes plus the entries returned. It is the control — the part of the log a
-/// merge SHOULD touch — so the two together say whether a merge's log cost follows its own cells
-/// or the log's length.
-///
-/// Observing only: one relaxed add per call, never per entry, and nothing reads them to decide
-/// anything. Process-wide, like every counter here, so a test that asserts on them must own its
-/// test binary.
-pub static MERGE_APPLIED_VISITED: AtomicU64 = AtomicU64::new(0);
-pub static MERGE_CELL_INDEX_VISITED: AtomicU64 = AtomicU64::new(0);
-
-/// `(applied_visited, cell_index_visited)` since process start. Read twice and subtract.
-pub fn merge_log_counters() -> (u64, u64) {
-    (
-        MERGE_APPLIED_VISITED.load(AtomicOrdering::Relaxed),
-        MERGE_CELL_INDEX_VISITED.load(AtomicOrdering::Relaxed),
-    )
-}
-
-/// How many entries `State`'s never-pruned collections hold right now. **READ-VS-N arm 2, observing
-/// only** — see [`AgentRuntime::state_sizes`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StateSizes {
-    /// `State::applied`, the published-op log.
-    pub applied: usize,
-    /// `State::captures`, one per agent task, kept after a publish.
-    pub captures: usize,
-    /// `State::merges`, one per published merge.
-    pub merges: usize,
-    /// `State::versions`, one per published row.
-    pub versions: usize,
-    /// `State::workspaces`, the open agent sessions.
-    pub workspaces: usize,
-    /// `State::published_txns`.
-    pub published_txns: usize,
-}
-
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///
@@ -1522,6 +1476,22 @@ impl AgentRuntime {
         match &self.storage {
             Some(rows) => Ok(Some(rows.tree().store().live_page_count()?)),
             None => Ok(None),
+        }
+    }
+
+    /// The sizes of `State`'s growing collections, read under the state lock. **Observing only —
+    /// READ-VS-N arm 2** (`bench/read_vs_n/PREREG.md` A3): the merge arm reads it either side of a
+    /// `MERGE` to show which of them a merge grows. Takes the lock every statement takes, so a
+    /// caller that times anything must read it outside the timed window.
+    pub fn state_sizes(&self) -> StateSizes {
+        let state = self.state.lock().unwrap();
+        StateSizes {
+            applied: state.applied.len(),
+            captures: state.captures.len(),
+            merges: state.merges.len(),
+            versions: state.versions.len(),
+            workspaces: state.workspaces.len(),
+            published_txns: state.published_txns.len(),
         }
     }
 
@@ -3718,22 +3688,6 @@ impl AgentRuntime {
     /// Entries in the log. The size half of a published `(size, root)` witness.
     pub fn attested_len(&self) -> usize {
         self.attested.lock().unwrap().len()
-    }
-
-    /// The sizes of `State`'s growing collections, read under the state lock. **Observing only —
-    /// READ-VS-N arm 2** (`bench/read_vs_n/PREREG.md` A3): the merge arm reads it either side of a
-    /// `MERGE` to show which of them a merge grows. Takes the lock every statement takes, so a
-    /// caller that times anything must read it outside the timed window.
-    pub fn state_sizes(&self) -> StateSizes {
-        let state = self.state.lock().unwrap();
-        StateSizes {
-            applied: state.applied.len(),
-            captures: state.captures.len(),
-            merges: state.merges.len(),
-            versions: state.versions.len(),
-            workspaces: state.workspaces.len(),
-            published_txns: state.published_txns.len(),
-        }
     }
 
     /// Record a fork. The child's `prev` is the **parent's** head, which is what makes a
@@ -6360,6 +6314,53 @@ fn blind_writes_of(
         .filter(|(t, r)| !looked_at.contains(&(*t, *r)) && !scanned_tables.contains(t))
         .map(|(t, r)| (TableId(*t), RowId(*r)))
         .collect()
+}
+
+/// **Entries of `State::applied` the merge path visits — READ-VS-N arm 2.** Same rationale as
+/// `OURS_SCAN_*` and `SCAN_TABLE_*` at the top of this file: integers do not move when the box is
+/// loaded. Kept here, beside the function it counts.
+///
+/// `VISITED` is `highest_applied_seq`'s pass: the one walk over the WHOLE never-pruned log on the
+/// merge path (`publish_evaluation_as` calls it once per merge, under the state lock). Wall #18's
+/// side note says that is Θ(M²) over M merges; this is the instrument that can show it, counted by
+/// the entries the iterator actually yielded rather than by `applied.len()`, so it cannot agree with
+/// a model of the function instead of the function.
+///
+/// `CELL_INDEX_VISITED` is what `concurrent_op` reads through D86's index instead: the
+/// `partition_point` probes plus the entries returned. It is the control — the part of the log a
+/// merge SHOULD touch — so the two together say whether a merge's log cost follows its own cells
+/// or the log's length.
+///
+/// Observing only: one relaxed add per call, never per entry, and nothing reads them to decide
+/// anything. Process-wide, like every counter here, so a test that asserts on them must own its
+/// test binary.
+pub static MERGE_APPLIED_VISITED: AtomicU64 = AtomicU64::new(0);
+pub static MERGE_CELL_INDEX_VISITED: AtomicU64 = AtomicU64::new(0);
+
+/// `(applied_visited, cell_index_visited)` since process start. Read twice and subtract.
+pub fn merge_log_counters() -> (u64, u64) {
+    (
+        MERGE_APPLIED_VISITED.load(AtomicOrdering::Relaxed),
+        MERGE_CELL_INDEX_VISITED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// How many entries `State`'s never-pruned collections hold right now. **READ-VS-N arm 2, observing
+/// only** — see [`AgentRuntime::state_sizes`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateSizes {
+    /// `State::applied`, the published-op log.
+    pub applied: usize,
+    /// `State::captures`, one per agent task, kept after a publish.
+    pub captures: usize,
+    /// `State::merges`, one per published merge.
+    pub merges: usize,
+    /// `State::versions`, one per published row.
+    pub versions: usize,
+    /// `State::workspaces`, the open agent sessions.
+    pub workspaces: usize,
+    /// `State::published_txns`.
+    pub published_txns: usize,
 }
 
 /// The highest version sequence any merge has already handed out, read from the record of what was
