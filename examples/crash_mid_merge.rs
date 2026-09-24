@@ -39,8 +39,27 @@ fn main() {
     let _db_lock = ferrodb::storage::db_lock::DbLock::acquire(std::path::Path::new(&path))
         .unwrap_or_else(|e| { eprintln!("crash_mid_merge: {e}"); std::process::exit(1); });
 
-    // The one open path the CLI and pgserver use (D204), so recovery is the real one. This comment
-    // said "same opening sequence the CLI uses" while the code skipped the CLI's index rebuild.
+    // ─── MEASUREMENT CHANGE, D204 ────────────────────────────────────────────────────────────────
+    // This harness is the instrument behind `tests/integration_crash_safety.rs`, so the change is
+    // stated here and not only in a commit message.
+    //
+    // BEFORE: it opened the file itself, ran `recover`, and never rebuilt an index. `let _ =
+    // recovered;` discarded the one signal that a rebuild was owed. The comment above it read
+    // "Same opening sequence the CLI uses, so recovery is the real one", and that was false: the
+    // CLI rebuilt.
+    //
+    // AFTER: `open_recovered`, the function the CLI and pgserver also call. A phase that opens a
+    // database whose log is not empty (`merge` and `read`, never a first `seed`) now rebuilds every
+    // index from the recovered heap and checkpoints, before it runs anything.
+    //
+    // WHAT THAT CAN MOVE, by reading the source (not by a run): nothing the test reads.
+    // - `read` reports `SELECT id, qty FROM inventory;`, a sequential scan, so its STATE does not
+    //   depend on the trees.
+    // - `merge`'s `UPDATE … WHERE id = k` does read the primary index. `seed` already ended in
+    //   `flush_all`, so those trees were on disk before; now they are rebuilt from the same rows.
+    // - The checkpoint truncates the log before the merge begins, so `read`'s recovery replays only
+    //   the merge's own records: less to redo, and the same open transaction to undo.
+    // ─────────────────────────────────────────────────────────────────────────────────────────────
     let OpenedDatabase { bp, txn, mut catalog, .. } = open_recovered(Path::new(&path), &_db_lock)
         .unwrap_or_else(|e| panic!("crash_mid_merge: {e}"));
 

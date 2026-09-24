@@ -11,9 +11,11 @@
 //! (`tests/pgserver_crash_rebuilds_indexes.rs`). Now there is one function,
 //! `wal::recovery::open_recovered`, and this test keeps it the only way in:
 //!
-//! - no file under `src/` or `examples/` calls `recover(` or `Catalog::open(` except
-//!   `src/wal/recovery.rs`, which defines the sequence. `Catalog::open(` is here as well because a
-//!   binary that opens a catalog without recovering at all is the same hazard, one step earlier;
+//! - nothing under `src/` or `examples/` calls `recover(` or `Catalog::open(` outside the BODY of
+//!   `open_recovered` in `src/wal/recovery.rs`. Not even the rest of that file: a second sequence
+//!   written beside the first is the same drift as one written in an example. `Catalog::open(` is
+//!   here as well because a binary that opens a catalog without recovering at all is the same
+//!   hazard, one step earlier;
 //! - both production entry points, `src/cli/cli.rs` and `examples/pgserver.rs`, call
 //!   `open_recovered(`. Without this floor, deleting every opener would pass;
 //! - `open_recovered`'s own body calls `recover(` and THEN `rebuild_indexes(`.
@@ -32,13 +34,16 @@
 //!
 //! # If this fails
 //!
-//! You opened a database without `open_recovered`. Call it instead. If a binary genuinely must not
-//! rebuild, add it to `ALLOWED` with the reason, and expect that reason to be read.
+//! You opened a database without `open_recovered`. Call it instead. There is deliberately no
+//! per-file exemption list. A binary that genuinely must not rebuild needs a change to the shared
+//! function, reviewed as one, not a second way in.
 
 use std::path::{Path, PathBuf};
 
-/// The only file that may run recovery or open a catalog directly.
-const ALLOWED: &[&str] = &["src/wal/recovery.rs"];
+/// The shared function, and the file it lives in. Its body is the only text where `recover(` and
+/// `Catalog::open(` may appear.
+const SHARED_FILE: &str = "src/wal/recovery.rs";
+const SHARED_FN: &str = "pub fn open_recovered(";
 
 /// Production entry points. Each must open through the shared function.
 const ENTRY_POINTS: &[&str] = &["src/cli/cli.rs", "examples/pgserver.rs"];
@@ -104,6 +109,17 @@ fn open_sites(code: &str) -> Vec<String> {
     sites
 }
 
+/// `(everything else, the shared function's body)` for a file's production text. The body runs
+/// from `pub fn open_recovered(` to the first `}` at column 0 after it. Panics if the function is
+/// gone, because every assertion that uses this would otherwise pass against an empty body.
+fn split_shared_body(code: &str) -> (String, String) {
+    let start = code
+        .find(SHARED_FN)
+        .unwrap_or_else(|| panic!("`{SHARED_FN}` is not in {SHARED_FILE}: renamed or moved"));
+    let len = code[start..].find("\n}\n").expect("unterminated open_recovered") + 3;
+    (format!("{}{}", &code[..start], &code[start + len..]), code[start..start + len].to_string())
+}
+
 fn rel(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
 }
@@ -117,16 +133,16 @@ fn only_the_open_path_runs_recovery_or_opens_a_catalog() {
     assert!(files.len() > 20, "walked src/ and examples/ and found {} .rs files: the walk is broken", files.len());
 
     let mut offenders = Vec::new();
-    let mut allowed_sites = 0;
+    let mut shared_sites = 0;
     for f in &files {
         let name = rel(root, f);
-        let code = production_text(&std::fs::read_to_string(f).unwrap());
-        let sites = open_sites(&code);
-        if ALLOWED.contains(&name.as_str()) {
-            allowed_sites += sites.len();
-        } else {
-            offenders.extend(sites.into_iter().map(|s| format!("{name}: {s}")));
+        let mut code = production_text(&std::fs::read_to_string(f).unwrap());
+        if name == SHARED_FILE {
+            let (outside, inside) = split_shared_body(&code);
+            shared_sites = open_sites(&inside).len();
+            code = outside;
         }
+        offenders.extend(open_sites(&code).into_iter().map(|s| format!("{name}: {s}")));
     }
     assert!(
         offenders.is_empty(),
@@ -134,12 +150,12 @@ fn only_the_open_path_runs_recovery_or_opens_a_catalog() {
          run with index trees the recovered heap no longer matches:\n  {}",
         offenders.join("\n  ")
     );
-    // Anti-vacuity: the allowed file really does call both, so a renamed function cannot turn every
-    // site into zero and this test into a clean bill of health.
+    // Anti-vacuity: the shared function really does hold both calls, so a renamed function cannot
+    // turn every site into zero and this test into a clean bill of health.
     assert!(
-        allowed_sites >= 2,
-        "found {allowed_sites} call(s) of `recover(`/`Catalog::open(` in src/wal/recovery.rs outside its \
-         tests; `open_recovered` should hold one of each. The scanner or the function has moved"
+        shared_sites >= 2,
+        "found {shared_sites} call(s) of `recover(`/`Catalog::open(` inside `open_recovered`; it should \
+         hold one of each. The scanner or the function has moved"
     );
 }
 
@@ -160,12 +176,7 @@ fn both_production_entry_points_open_through_the_shared_function() {
 #[test]
 fn the_shared_function_recovers_and_then_rebuilds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let code = production_text(&std::fs::read_to_string(root.join("src/wal/recovery.rs")).unwrap());
-    let start = code
-        .find("pub fn open_recovered(")
-        .expect("`pub fn open_recovered(` is not in src/wal/recovery.rs: renamed or moved");
-    let body = &code[start..];
-    let body = &body[..body.find("\n}\n").expect("unterminated open_recovered")];
+    let (_, body) = split_shared_body(&production_text(&std::fs::read_to_string(root.join(SHARED_FILE)).unwrap()));
     let recovered = body.find("recover(&").expect("open_recovered does not call recover");
     let rebuilt = body.find("rebuild_indexes(").expect("open_recovered does not call rebuild_indexes");
     assert!(recovered < rebuilt, "open_recovered rebuilds the indexes BEFORE recovering the heap they are built from");
@@ -192,4 +203,10 @@ fn the_scanner_catches_a_bare_opener_and_ignores_everything_else() {
         1,
         "the cut at #[cfg(test)] is wrong: it must count the call before it and none after"
     );
+
+    // The shared file is not exempt as a whole: a second sequence beside `open_recovered` counts.
+    let file = "pub fn recover(t: &T) -> R {\n}\npub fn open_recovered(p: &Path) -> R {\n    let r = recover(&t)?;\n    let c = Catalog::open(bp, 1)?;\n}\nfn second_way_in() {\n    recover(&t);\n}\n";
+    let (outside, inside) = split_shared_body(&production_text(file));
+    assert_eq!(open_sites(&inside).len(), 2, "the shared body's two calls were not both found");
+    assert_eq!(open_sites(&outside).len(), 1, "a recover( call beside the shared function was not counted");
 }
