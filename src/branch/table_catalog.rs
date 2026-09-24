@@ -341,12 +341,29 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
-    /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
-    /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
-    /// earlier would let the group's leader mark work durable whose pages were never written.
-    fn stage(&self) -> Result<u64, FerroError> {
-        self.publish_root()?;
-        Ok(self.commit_group.ticket())
+    /// Run one mutation under `logical`, publish the root **on every exit**, then take a commit
+    /// ticket. Every mutator goes through here — D244.
+    ///
+    /// A root split stores the new root into the tree's cell the moment it happens, whatever the
+    /// mutation does next. The ticket used to be taken by a `stage()` after the mutator's LAST `?`,
+    /// so a fault after a split returned without publishing: page 1 kept naming the old root, and
+    /// another writer's `durable()` or an eviction could put the split pages on disk without it.
+    /// The next open then searched for the header key under the old root, which never holds it
+    /// after a split, and refused. So the body runs as a closure, `publish_root` runs whatever the
+    /// body returned, and the body's error is returned first: the shape D230 gives the write
+    /// executors.
+    ///
+    /// The ticket is taken LAST: its meaning is "everything up to here is in the pool", and taking
+    /// it earlier would let the group's leader mark work durable whose pages were never written.
+    /// The lock is released on return, before the caller's `durable`, so concurrent writers share
+    /// one fsync instead of queueing for private ones (see `group_commit`).
+    fn mutate<T>(&self, body: impl FnOnce() -> Result<T, FerroError>) -> Result<(T, u64), FerroError> {
+        let _g = self.logical.lock().unwrap();
+        let out = body();
+        let published = self.publish_root();
+        let out = out?;
+        published?;
+        Ok((out, self.commit_group.ticket()))
     }
 
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
@@ -395,7 +412,7 @@ impl TableBranchCatalog {
             return Ok(());
         }
         let root = self.tree.root_page_id.load(Ordering::SeqCst);
-        if self.published_root.swap(root, Ordering::SeqCst) == root {
+        if self.published_root.load(Ordering::SeqCst) == root {
             return Ok(());
         }
         let frame_i = self.pool.fetch_page(header_page)?;
@@ -406,6 +423,10 @@ impl TableBranchCatalog {
             f.data[4..8].copy_from_slice(&root.to_be_bytes());
         }
         self.pool.unpin_page(header_page, true);
+        // D244: recorded as published only once page 1 holds it. This was a `swap` before the
+        // fetch, so one failed fetch of page 1 marked the root published without writing it, every
+        // later call returned early, and the header stayed stale until the next root split.
+        self.published_root.store(root, Ordering::SeqCst);
         Ok(())
     }
 
@@ -869,13 +890,10 @@ impl TableBranchCatalog {
     /// from reaching for a whole-record write instead of naming the field it means.
     #[cfg(test)]
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
-        let old = self.core(record.branch_id.id)?;
-        self.write_record(record, old.as_ref())?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            let old = self.core(record.branch_id.id)?;
+            self.write_record(record, old.as_ref())
+        })?;
         self.durable(seq)
     }
 }
@@ -926,48 +944,47 @@ impl BranchCatalog for TableBranchCatalog {
         // The lock covers every TREE MUTATION and nothing else. It is dropped before the fsync, so
         // concurrent forkers share one disk round-trip instead of queueing for private ones. See
         // `group_commit` for why the ticket is taken last.
-        let (child, seq) = {
-            let _g = self.logical.lock().unwrap();
+        let (child, seq) = self.mutate(|| {
 
-        // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
-        // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
-        // its envelope hands the child `None` - which is the UNGOVERNED default. The child of a
-        // governed branch would then be free to write anything: a capability escape.
-        //
-        // `core()` deliberately leaves the envelope empty because it lives in its own key span.
-        // That is exactly why reading a parent through it here was wrong.
-        let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
-        parent_core.check_readable(parent)?;
-        // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
-        // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the parent,
-        // x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope is still
-        // loaded, and that is not optional: a parent read without it hands the child `None`, which
-        // is the UNGOVERNED default and was a shipped capability escape (339e405).
-        let parent_envelope = self.envelope_bytes(parent.id)?;
+            // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
+            // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
+            // its envelope hands the child `None` - which is the UNGOVERNED default. The child of a
+            // governed branch would then be free to write anything: a capability escape.
+            //
+            // `core()` deliberately leaves the envelope empty because it lives in its own key span.
+            // That is exactly why reading a parent through it here was wrong.
+            let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
+            parent_core.check_readable(parent)?;
+            // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
+            // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the parent,
+            // x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope is still
+            // loaded, and that is not optional: a parent read without it hands the child `None`, which
+            // is the UNGOVERNED default and was a shipped capability escape (339e405).
+            let parent_envelope = self.envelope_bytes(parent.id)?;
 
-        // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
-        // generation comes from the slot's history, never from zero — a reused id whose generation
-        // restarted would make a stale handle look current.
-        let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
-        let recycled = self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .next()
-            .transpose()?
-            .and_then(|(k, _)| keys::free_id_from_key(&k));
+            // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
+            // generation comes from the slot's history, never from zero — a reused id whose generation
+            // restarted would make a stale handle look current.
+            let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
+            let recycled = self
+                .tree
+                .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
+                .next()
+                .transpose()?
+                .and_then(|(k, _)| keys::free_id_from_key(&k));
 
-        // `reused` decides which writer runs below, and it is the whole safety condition for
-        // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
-        // deadline keys, so its keys are NOT new.
-        let (child_num, generation, reused) = match recycled {
-            Some(id) => {
-                self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
-                (id, slot_gen, true)
-            }
-            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
-        };
-        let child_id = BranchId::new(child_num, generation);
+            // `reused` decides which writer runs below, and it is the whole safety condition for
+            // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
+            // deadline keys, so its keys are NOT new.
+            let (child_num, generation, reused) = match recycled {
+                Some(id) => {
+                    self.remove_if_present(&keys::free_id(id))?;
+                    let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
+                    (id, slot_gen, true)
+                }
+                None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
+            };
+            let child_id = BranchId::new(child_num, generation);
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
@@ -988,10 +1005,10 @@ impl BranchCatalog for TableBranchCatalog {
             self.tree
                 .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
             self.write_header()?;
-            // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
-            // point necessarily covers this fork.
-            (child, self.stage()?)
-        };
+            // `mutate` takes the ticket after this returns: every mutation above is then in the
+            // pool, so an fsync issued after that point necessarily covers this fork.
+            Ok(child)
+        })?;
         // ⛔ NOT durable yet. The sync that covers `seq` is the caller's to await, and the whole
         // point of handing it back rather than doing it here is that the caller may be holding a
         // lock WIDER than `logical` -- over pgwire it holds `ServerContext::catalog()` for the
@@ -1019,30 +1036,28 @@ impl BranchCatalog for TableBranchCatalog {
         // no new lock-order edge. The whole read-modify-write is inside it: what this writes back
         // is a record read microseconds ago under the same lock, not the snapshot its caller took
         // before copying up to 256 MiB of pages.
-        let _g = self.logical.lock().unwrap();
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        core.check_readable(branch)?;
-        let depth = self
-            .core(parent.id)?
-            .ok_or(BranchError::NotFound(parent))?
-            .depth()
-            .saturating_add(1);
-        let old = core.clone();
-        // HYDRATED, for `set_root`'s reason: `write_record` makes the arena span match the record
-        // it is given, so writing back a core record would delete every extent the branch owns —
-        // including any a concurrent writer claimed, which is the leak D13b's re-read existed to
-        // prevent and this method inherits the duty of. (D13b's caller was `collapse`, deleted by
-        // D63; the duty is a property of this write, not of that caller.)
-        let mut rec = self.hydrate(core)?;
-        rec.parent_id = Some(parent);
-        rec.fork_epoch = fork_epoch;
-        rec.depth = depth;
-        rec.root_page_id = root;
-        self.write_record(&rec, Some(&old))?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let (rec, seq) = self.mutate(|| {
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            core.check_readable(branch)?;
+            let depth = self
+                .core(parent.id)?
+                .ok_or(BranchError::NotFound(parent))?
+                .depth()
+                .saturating_add(1);
+            let old = core.clone();
+            // HYDRATED, for `set_root`'s reason: `write_record` makes the arena span match the record
+            // it is given, so writing back a core record would delete every extent the branch owns —
+            // including any a concurrent writer claimed, which is the leak D13b's re-read existed to
+            // prevent and this method inherits the duty of. (D13b's caller was `collapse`, deleted by
+            // D63; the duty is a property of this write, not of that caller.)
+            let mut rec = self.hydrate(core)?;
+            rec.parent_id = Some(parent);
+            rec.fork_epoch = fork_epoch;
+            rec.depth = depth;
+            rec.root_page_id = root;
+            self.write_record(&rec, Some(&old))?;
+            Ok(rec)
+        })?;
         self.durable(seq)?;
         Ok(rec)
     }
@@ -1057,17 +1072,15 @@ impl BranchCatalog for TableBranchCatalog {
         // without touching the record. The narrowing is compared against what is IN FORCE under
         // the lock, not against a snapshot the caller read — two restrictions racing now leave the
         // narrower one standing instead of whichever wrote last.
-        let _g = self.logical.lock().unwrap();
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        core.check_readable(branch)?;
-        if let Some(current) = self.envelope_bytes(branch.id)? {
-            current.permits(&envelope)?;
-        }
-        self.upsert(keys::envelope(branch.id), envelope.serialize())?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            core.check_readable(branch)?;
+            if let Some(current) = self.envelope_bytes(branch.id)? {
+                current.permits(&envelope)?;
+            }
+            self.upsert(keys::envelope(branch.id), envelope.serialize())?;
+            Ok(())
+        })?;
         self.durable(seq)
     }
 
@@ -1077,73 +1090,73 @@ impl BranchCatalog for TableBranchCatalog {
         expect: BranchState,
         to: BranchState,
     ) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
-        // second half of every reap, and `check_readable` refuses `Reaping` outright.
-        if core.generation() != branch.generation {
-            return Err(BranchError::Reaped {
-                requested: branch,
-                current_generation: core.generation(),
+        let (wrote, seq) = self.mutate(|| {
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
+            // second half of every reap, and `check_readable` refuses `Reaping` outright.
+            if core.generation() != branch.generation {
+                return Err(BranchError::Reaped {
+                    requested: branch,
+                    current_generation: core.generation(),
+                }
+                .into());
             }
-            .into());
-        }
-        if core.state() != expect {
-            return Err(BranchError::UnexpectedState {
-                branch,
-                expected: expect,
-                actual: core.state(),
+            if core.state() != expect {
+                return Err(BranchError::UnexpectedState {
+                    branch,
+                    expected: expect,
+                    actual: core.state(),
+                }
+                .into());
             }
-            .into());
-        }
-        if expect == to {
-            // Nothing to write, and it keeps a second `set_state(.., Reaped)` from bumping the
-            // generation twice.
-            return Ok(());
-        }
-        let old = core.clone();
-        // HYDRATED: `write_record` rewrites the arena span from the record it is handed, so a core
-        // record would silently drop every extent this branch owns.
-        let mut rec = self.hydrate(core)?;
-        if to == BranchState::Reaped {
-            // Generation bumped, arenas cleared. The cleared list is load-bearing here rather than
-            // cosmetic: `write_record` reconciles the arena span against the record, so this is
-            // what removes the ARENA keys of a branch whose extents the reaper has just returned.
-            rec.mark_reaped();
+            if expect == to {
+                // Nothing to write, and it keeps a second `set_state(.., Reaped)` from bumping the
+                // generation twice.
+                return Ok(false);
+            }
+            let old = core.clone();
+            // HYDRATED: `write_record` rewrites the arena span from the record it is handed, so a core
+            // record would silently drop every extent this branch owns.
+            let mut rec = self.hydrate(core)?;
+            if to == BranchState::Reaped {
+                // Generation bumped, arenas cleared. The cleared list is load-bearing here rather than
+                // cosmetic: `write_record` reconciles the arena span against the record, so this is
+                // what removes the ARENA keys of a branch whose extents the reaper has just returned.
+                rec.mark_reaped();
+            } else {
+                rec.state = to;
+            }
+            self.write_record(&rec, Some(&old))?;
+            Ok(true)
+        })?;
+        if wrote {
+            self.durable(seq)
         } else {
-            rec.state = to;
+            Ok(())
         }
-        self.write_record(&rec, Some(&old))?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
-        self.durable(seq)
     }
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
-        // HYDRATED, not core. `core` returns a record whose `arenas` is empty, and `write_record`
-        // makes the arena span match the record it is given - so writing back a core record
-        // DELETES every arena the branch owns. The page store records an arena by appending to
-        // this field and calling `put`; a `set_root` afterwards then silently threw it away, and
-        // the reaper frees exactly `record.arenas`, so nothing was ever returned.
-        //
-        // `LogBranchCatalog::set_root` reads through `get`, which returns a whole record. Two
-        // implementations of one trait method must do the same thing.
-        // The core is read FIRST and kept as `old`: `write_record` only ever consults an old
-        // record for its state and deadline index keys, so cloning the hydrated record -- arenas
-        // and all -- to hand it over was copying a vector nobody read.
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        core.check_readable(branch)?;
-        let old = core.clone();
-        let mut rec = self.hydrate(core)?;
-        rec.root_page_id = root;
-        self.write_record(&rec, Some(&old))?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            // HYDRATED, not core. `core` returns a record whose `arenas` is empty, and `write_record`
+            // makes the arena span match the record it is given - so writing back a core record
+            // DELETES every arena the branch owns. The page store records an arena by appending to
+            // this field and calling `put`; a `set_root` afterwards then silently threw it away, and
+            // the reaper frees exactly `record.arenas`, so nothing was ever returned.
+            //
+            // `LogBranchCatalog::set_root` reads through `get`, which returns a whole record. Two
+            // implementations of one trait method must do the same thing.
+            // The core is read FIRST and kept as `old`: `write_record` only ever consults an old
+            // record for its state and deadline index keys, so cloning the hydrated record -- arenas
+            // and all -- to hand it over was copying a vector nobody read.
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            core.check_readable(branch)?;
+            let old = core.clone();
+            let mut rec = self.hydrate(core)?;
+            rec.root_page_id = root;
+            self.write_record(&rec, Some(&old))?;
+            Ok(())
+        })?;
         self.durable(seq)
     }
 
@@ -1313,24 +1326,24 @@ impl BranchCatalog for TableBranchCatalog {
         if id == 0 {
             return;
         }
-        let _g = self.logical.lock().unwrap();
         // Refuse while the slot still has live children - that set decides the fate of pages
         // parked under this branch's name. Errors are swallowed to match the inherent method's
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
-        let reusable = match (self.core(id), self.has_live_children(id)) {
-            (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
-            _ => false,
-        };
-        if reusable {
-            let _ = self.upsert(keys::free_id(id), Vec::new());
-            // Same as the others: release the lock before the fsync. Errors stay swallowed
-            // to match the log catalog's signature -- a failure here leaks an id slot,
-            // which is recoverable, while propagating would abort a reap midway.
-            if let Ok(seq) = self.stage() {
-                drop(_g);
-                let _ = self.durable(seq);
+        let staged = self.mutate(|| {
+            let reusable = match (self.core(id), self.has_live_children(id)) {
+                (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
+                _ => false,
+            };
+            if reusable {
+                let _ = self.upsert(keys::free_id(id), Vec::new());
             }
+            Ok(reusable)
+        });
+        // Same as the others: `mutate` released the lock before this fsync, and errors stay
+        // swallowed for the reason above.
+        if let Ok((true, seq)) = staged {
+            let _ = self.durable(seq);
         }
     }
 
@@ -1340,40 +1353,36 @@ impl BranchCatalog for TableBranchCatalog {
         fork_epoch: Epoch,
         child_id: u64,
     ) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
-        // **D124 — refuse to CREATE an entry that can never resolve.** The value written here is
-        // a child branch id, and both resolvers (`child_liveness`, `live_child_at`) later ask
-        // that child's own record whether the entry is a pin. An entry naming a branch that was
-        // never published can never answer, so it is refused at the only place in the API that
-        // can create one; `fork` writes the record before the child key under this same lock, so
-        // it cannot create one either.
-        //
-        // ⚠ This removes the PERMANENT form. The transient one — a record missing for the length
-        // of an `upsert` on a perfectly healthy branch — was never preventable here, and is now
-        // gone at its source: D126 made `upsert` an in-place replace under one latch hold. The
-        // resolvers still refuse a dangling entry, for the residual reasons in `dangling_child`.
-        //
-        // One extra point lookup, and it is free where it matters: `migrate_from` is the only
-        // production caller (D63 deleted `collapse`) and it already writes every record before it
-        // attaches anything, precisely so this resolution can succeed.
-        if self.core(child_id)?.is_none() {
-            return Err(BranchError::NotFound(BranchId::new(child_id, 0)).into());
-        }
-        self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            // **D124 — refuse to CREATE an entry that can never resolve.** The value written here is
+            // a child branch id, and both resolvers (`child_liveness`, `live_child_at`) later ask
+            // that child's own record whether the entry is a pin. An entry naming a branch that was
+            // never published can never answer, so it is refused at the only place in the API that
+            // can create one; `fork` writes the record before the child key under this same lock, so
+            // it cannot create one either.
+            //
+            // ⚠ This removes the PERMANENT form. The transient one — a record missing for the length
+            // of an `upsert` on a perfectly healthy branch — was never preventable here, and is now
+            // gone at its source: D126 made `upsert` an in-place replace under one latch hold. The
+            // resolvers still refuse a dangling entry, for the residual reasons in `dangling_child`.
+            //
+            // One extra point lookup, and it is free where it matters: `migrate_from` is the only
+            // production caller (D63 deleted `collapse`) and it already writes every record before it
+            // attaches anything, precisely so this resolution can succeed.
+            if self.core(child_id)?.is_none() {
+                return Err(BranchError::NotFound(BranchId::new(child_id, 0)).into());
+            }
+            self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
+            Ok(())
+        })?;
         self.durable(seq)
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
-        let _g = self.logical.lock().unwrap();
-        let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let (removed, seq) = self.mutate(|| {
+            let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
+            Ok(removed)
+        })?;
         self.durable(seq)?;
         Ok(removed)
     }
@@ -1394,34 +1403,31 @@ impl BranchCatalog for TableBranchCatalog {
         // caller of `publish_root()` (:331-333), so an `upsert` that happened to split the tree's
         // root left the header page naming the OLD root, after which a reopen came back on a
         // perfectly valid B+tree of an older state. Measured: 0 of 64 arenas survived a reopen.
+        // (`stage()` has since been replaced by `mutate`, which publishes on every exit: D244.)
         //
         // The generation check is the same story: `get_mut`-by-id alone let a STALE handle whose
         // slot had been recycled attach an arena to the slot's new occupant.
-        let _g = self.logical.lock().unwrap();
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        core.check_readable(branch)?;
-        self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            core.check_readable(branch)?;
+            self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
+            Ok(())
+        })?;
         self.durable(seq)
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
-        let _g = self.logical.lock().unwrap();
-        // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
-        // back would delete the branch's.
-        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        core.check_readable(branch)?;
-        let old = core.clone();
-        let mut rec = self.hydrate(core)?;
-        rec.lease_deadline = lease;
-        self.write_record(&rec, Some(&old))?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
+        let ((), seq) = self.mutate(|| {
+            // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
+            // back would delete the branch's.
+            let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            core.check_readable(branch)?;
+            let old = core.clone();
+            let mut rec = self.hydrate(core)?;
+            rec.lease_deadline = lease;
+            self.write_record(&rec, Some(&old))?;
+            Ok(())
+        })?;
         self.durable(seq)
     }
 
@@ -1437,21 +1443,19 @@ impl BranchCatalog for TableBranchCatalog {
         // Under the logical lock so the read-modify-write cannot lose a concurrent charge, and so
         // it cannot discard a `set_root` or `renew_lease` that landed in the window: only the
         // envelope key is written back, never a whole stale record.
-        let _g = self.logical.lock().unwrap();
-        let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
-        rec.check_readable(branch)?;
-        let mut env = self.envelope_bytes(branch.id)?.ok_or_else(|| {
-            FerroError::Branch(format!(
-                "{branch} has no capability envelope; refusing to charge {n} row-writes against a \
-                 policy that no longer exists"
-            ))
+        let ((), seq) = self.mutate(|| {
+            let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+            rec.check_readable(branch)?;
+            let mut env = self.envelope_bytes(branch.id)?.ok_or_else(|| {
+                FerroError::Branch(format!(
+                    "{branch} has no capability envelope; refusing to charge {n} row-writes against a \
+                     policy that no longer exists"
+                ))
+            })?;
+            env.charge(n)?;
+            self.upsert(keys::envelope(branch.id), env.serialize())?;
+            Ok(())
         })?;
-        env.charge(n)?;
-        self.upsert(keys::envelope(branch.id), env.serialize())?;
-        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
-        // holding every other writer out for a disk round-trip. See `group_commit`.
-        let seq = self.stage()?;
-        drop(_g);
         self.durable(seq)
     }
 }
