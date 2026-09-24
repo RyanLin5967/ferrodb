@@ -2825,6 +2825,38 @@ mod tests {
         assert_eq!(ids, sorted, "scan came back out of branch-id order");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **D233 review F5, ledger D243: fork must never reuse a slot whose record is not `Reaped`.**
+    /// Red first against `0eda6ca`.
+    ///
+    /// `release_id` writes a FREE_ID key only for a `Reaped` record, so a FREE_ID over any other
+    /// record is stale. The catalog tree has no WAL, and a torn flush can leave one: a fork that
+    /// reused the id became durable and its FREE_ID removal did not, or an unlink of the FREE_ID
+    /// leaf was torn and left a key that the chain still lists. `fork` popped the span's head and
+    /// reused it without looking, overwriting a live branch's record. Here a FREE_ID key is planted
+    /// over a Live record. The next fork must mint a fresh id and leave that record byte-identical.
+    #[test]
+    fn fork_never_reuses_a_free_id_whose_record_is_live() {
+        let (c, p, _pool) = cat("stale-free-id");
+        let live = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        assert!(
+            c.core(live.id).unwrap().unwrap().state() == BranchState::Live,
+            "premise: the planted slot's record is Live"
+        );
+        c.tree.upsert(keys::free_id(live.id), Vec::new()).unwrap();
+        let before = c.tree.search(&keys::record(live.id)).unwrap().expect("premise: the record exists");
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_ne!(child.branch_id.id, live.id, "fork reused id {} whose record is Live", live.id);
+        assert_eq!(
+            c.tree.search(&keys::record(live.id)).unwrap(),
+            Some(before),
+            "fork rewrote the Live record of branch {}",
+            live.id
+        );
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
