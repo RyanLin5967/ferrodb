@@ -79,11 +79,13 @@
 //! `Stamp` naming a run the file never declared means the file disagrees with itself, and guessing
 //! which half is right would produce confident wrong attribution.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::branch::group_commit::CommitGroup;
 use crate::branch::types::BranchId;
 use crate::error::FerroError;
 use crate::provenance::store::MemProvenanceStore;
@@ -164,6 +166,26 @@ pub struct DurableProvenanceStore {
     poisoned: AtomicBool,
     /// fsyncs issued, by record kind: the instrument behind [`ProvenanceStore::sync_counts`].
     syncs: SyncCounters,
+    /// **D246: the group commit behind [`ProvenanceStore::await_run`]**, `branch/group_commit.rs`'s
+    /// own, reused rather than copied.
+    ///
+    /// Its tickets are RECORD NUMBERS: every pending record takes one when it is written, under
+    /// `file`'s lock, so `requested` is always the number of queued records written so far. A
+    /// ticket being durable says that record and every one before it are on disk. A synchronous
+    /// append marks everything it wrote durable (`covered_all`), so a fork whose run record a
+    /// MERGE's sync already carried pays nothing more.
+    group: CommitGroup,
+    /// A second descriptor on the same file, for the sync `await_run` issues OUTSIDE `file`'s lock.
+    /// An fsync is per file, not per descriptor, so it covers every write made through `file`.
+    sync_handle: File,
+    /// **Test-only: hold `await_run`'s group sync in flight until the test releases it.** The first
+    /// sender is told the sync has been reached; the sync waits on the receiver (up to 30 s). One-shot.
+    ///
+    /// Without it, "the sync is not issued under the lock every staged write needs" cannot be
+    /// observed: an fsync of a few bytes returns before any other thread can be seen waiting on it.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) sync_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// **Test-only: make the next append fail once.**
     ///
     /// `append_locked` cannot fail on its own in any test — it writes a few dozen bytes to a temp
@@ -194,6 +216,9 @@ impl DurableProvenanceStore {
             .map_err(|e| FerroError::Provenance(e.to_string()))?
             .len();
 
+        let sync_handle = file
+            .try_clone()
+            .map_err(|e| FerroError::Provenance(format!("open {}: {e}", path.display())))?;
         let mem = MemProvenanceStore::new();
         let recovery = if len == 0 {
             let mut header = [0u8; HEADER_SIZE as usize];
@@ -210,11 +235,20 @@ impl DurableProvenanceStore {
 
         Ok(DurableProvenanceStore {
             mem,
-            file: Mutex::new(Appender { file, pending: Vec::new() }),
+            file: Mutex::new(Appender {
+                file,
+                pending: Vec::new(),
+                queued: 0,
+                run_seqs: HashMap::new(),
+            }),
             path,
             recovery,
             poisoned: AtomicBool::new(false),
             syncs: SyncCounters::default(),
+            group: CommitGroup::default(),
+            sync_handle,
+            #[cfg(test)]
+            sync_gate: Mutex::new(None),
             #[cfg(test)]
             fail_next_append: AtomicBool::new(false),
         })
@@ -504,15 +538,43 @@ impl DurableProvenanceStore {
         bodies: &[&[u8]],
         issued_by: &AtomicU64,
     ) -> Result<(), FerroError> {
+        let written_pending = out.pending.len();
+        if !self.write_locked(out, written_pending, bodies)? {
+            return Ok(());
+        }
+        out.file
+            .sync_data()
+            .map_err(|e| FerroError::Provenance(e.to_string()))?;
+        // Cleared only once the sync has RETURNED OK, and counted only then: a failed sync made
+        // nothing durable. A failure leaves the store poisoned by the caller, so nothing can append
+        // after the records it lost.
+        out.pending.clear();
+        issued_by.fetch_add(1, Ordering::Relaxed);
+        // D246: the pending records just written take their numbers now, and this sync covered
+        // them and every record written before them, including any an `await_run` wrote whose own
+        // group sync is still in flight. Sound because every ticket is taken under this lock, which
+        // is held from the write above to here, so no ticket can be handed out during the sync.
+        self.group.tickets(written_pending as u64);
+        self.group.covered_all();
+        Ok(())
+    }
+
+    /// Write the first `n` PENDING records and then every body, each as its own framed record, in
+    /// ONE write and with NO sync. Returns whether anything was written.
+    ///
+    /// Neither `pending` nor the group is touched: whether the write is covered by a sync issued
+    /// here under the lock (`append_all_locked`) or by a group sync outside it (`await_run`) is the
+    /// caller's decision, and so is when the records leave `pending`.
+    fn write_locked(&self, out: &Appender, n: usize, bodies: &[&[u8]]) -> Result<bool, FerroError> {
         // One-shot, and it disarms itself, so a test can fail exactly the append it means to.
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::SeqCst) {
             return Err(FerroError::Provenance("injected provenance append failure".into()));
         }
         let all: Vec<&[u8]> =
-            out.pending.iter().map(Vec::as_slice).chain(bodies.iter().copied()).collect();
+            out.pending[..n].iter().map(Vec::as_slice).chain(bodies.iter().copied()).collect();
         if all.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         // Checked BEFORE the write, so a body this file's reader could not decode is refused rather
         // than appended: replay stops the whole open on an unknown tag.
@@ -535,15 +597,77 @@ impl DurableProvenanceStore {
         }
         pwrite_all(&out.file, &frames, end)
             .map_err(|e| FerroError::Provenance(format!("append to {}: {e}", self.path.display())))?;
-        out.file
-            .sync_data()
-            .map_err(|e| FerroError::Provenance(e.to_string()))?;
-        // Cleared only once the sync has RETURNED OK, and counted only then: a failed sync made
-        // nothing durable. A failure leaves the store poisoned by the caller, so nothing can append
-        // after the records it lost.
-        out.pending.clear();
-        issued_by.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// The group sync behind `await_run`, issued by `CommitGroup::wait_durable`'s leader OUTSIDE the
+    /// file lock, and booked under `runs`: everything `await_run` writes is run records.
+    fn sync_runs(&self) -> Result<(), FerroError> {
+        // A store that has refused a write does not vouch for anything written since, and a failed
+        // fsync is NOT retried by the next waiter the group makes leader: a second fsync can report
+        // success for pages the kernel already dropped after the first failed. So every waiter is
+        // refused instead.
+        self.refuse_if_poisoned()?;
+        #[cfg(test)]
+        {
+            let gate = self.sync_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
+        if let Err(e) = self.sync_handle.sync_data() {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(FerroError::Provenance(format!("sync {}: {e}", self.path.display())));
+        }
+        self.syncs.runs.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// `intern` and `intern_pending` as far as the record: the in-memory intern, and the new run's
+    /// record body, or `None` for a repeat. **Call it with the file lock held and the poison flag
+    /// checked**, so the index and the file cannot disagree about which runs exist.
+    fn intern_locked(&self, run: &RunEntity) -> Result<(ProvId, Option<Vec<u8>>), FerroError> {
+        // ⛔ EVERYTHING THAT CAN REFUSE IS ENCODED BEFORE ANYTHING IS MUTATED, and the order is
+        // the correctness argument rather than a style choice.
+        //
+        // D154 gave `wal::log::write_str` a length guard, which made this function able to return
+        // early for the first time. `self.mem.intern` below is a MUTATION. With the encode after
+        // it — where it used to sit, and where a comment of mine claimed "the refusal costs
+        // nothing here" — a refused run stayed in memory and never reached the file, so
+        // `run_count`/`runs` answered for a run that disappears on the next `open`. Measured, not
+        // reasoned about: `tests/d154_length_prefix_refusal.rs
+        // ::the_durable_provenance_store_refuses_a_run_it_cannot_encode` failed 1 != 0 on exactly
+        // that, and the claim that it cost nothing was wrong.
+        //
+        // Moving the encode earlier is NOT a second guard — it is the same guard, ahead of the
+        // state it would otherwise have to undo. Nothing needs rolling back if nothing changed.
+        //
+        // ⚠ It costs one ~96-byte encode on the REPEAT path, which previously allocated nothing.
+        // That is per transaction, not per row, behind a file lock and a mutex that both dwarf it.
+        // Stated rather than hidden, because it is a real if small regression on the common path.
+        let mut tail = Vec::with_capacity(96);
+        write_str(&mut tail, &run.agent_id, "an agent id")?;
+        write_str(&mut tail, &run.run_id, "a run id")?;
+        write_str(&mut tail, &run.model, "a model name")?;
+        write_str(&mut tail, &run.model_version, "a model version")?;
+        tail.extend_from_slice(&run.prompt_hash);
+        tail.extend_from_slice(&run.started_at.to_be_bytes());
+        tail.extend_from_slice(&run.parent_branch.id.to_be_bytes());
+        tail.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
+
+        let before = self.mem.run_count();
+        let id = self.mem.intern(run)?;
+        if self.mem.run_count() == before {
+            // A repeat. `intern` is a lookup in that case, so there is nothing new to record.
+            return Ok((id, None));
+        }
+
+        let mut body = Vec::with_capacity(tail.len() + 5);
+        body.push(TAG_RUN);
+        body.extend_from_slice(&id.0.to_be_bytes());
+        body.extend_from_slice(&tail);
+        Ok((id, Some(body)))
     }
 
     /// Refuse further writes once the file has fallen behind the index. See [`Self::poisoned`].
@@ -628,8 +752,16 @@ enum Frame {
 #[derive(Debug)]
 struct Appender {
     file: File,
-    /// Bodies `stamp_pending` applied to the index and has not written. In index order.
+    /// Bodies `stamp_pending` and `intern_pending` applied to the index and nobody has written yet.
+    /// In index order.
     pending: Vec<Vec<u8>>,
+    /// Records ever queued in `pending`. `pending[i]` is record number
+    /// `queued - pending.len() + 1 + i`, so every record numbered at or below
+    /// `queued - pending.len()` has been written. That count is also the group's `requested`.
+    queued: u64,
+    /// D246: the record number of each run `intern_pending` queued whose durability `await_run`
+    /// has not yet seen. Removed once seen, so it holds the forks in flight, not every run.
+    run_seqs: HashMap<ProvId, u64>,
 }
 
 /// Refuse a body whose tag this file's reader cannot decode: replay would stop the whole file there.
@@ -672,64 +804,118 @@ impl SyncCounters {
 
 impl ProvenanceStore for DurableProvenanceStore {
     fn intern(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
-        // The file lock is taken FIRST and held across BOTH the in-memory intern and the append,
-        // so two threads cannot both observe "this run is new" and both write it, and no stamp can
-        // slip between a run being interned and its record reaching the file. Lock order is
-        // file -> mem, everywhere.
+        let id = {
+            // The file lock is taken FIRST and held across BOTH the in-memory intern and the
+            // append, so two threads cannot both observe "this run is new" and both write it, and
+            // no stamp can slip between a run being interned and its record reaching the file. Lock
+            // order is file -> mem, everywhere.
+            let mut file = self.file.lock().unwrap();
+            // Checked UNDER the lock, and that is the fix for a race rather than tidiness. Checked
+            // before taking it, a writer that had already passed the check could be sitting on
+            // `file.lock()` while another thread's append failed and poisoned the store; it would
+            // then acquire the lock and append anyway, producing exactly the file the poison flag
+            // exists to prevent — a `Stamp` naming a run whose `Run` record never landed, which the
+            // next `open` must refuse whole. Check-then-act on shared state, which is the shape
+            // that has produced six separate defects in this codebase.
+            self.refuse_if_poisoned()?;
+            let (id, body) = self.intern_locked(run)?;
+            match body {
+                Some(body) => {
+                    if let Err(e) = self.append_locked(&mut file, &body, &self.syncs.runs) {
+                        self.poisoned.store(true, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                    return Ok(id);
+                }
+                None if !file.run_seqs.contains_key(&id) => return Ok(id),
+                None => id,
+            }
+        };
+        // D246: a repeat of a run an `intern_pending` queued and nobody has awaited yet. This
+        // method returns a DURABLE run, so it awaits the record, outside the file lock, which
+        // `await_run` takes itself.
+        self.await_run(id)?;
+        Ok(id)
+    }
+
+    /// **D246: a run interned in the index NOW and written LATER, by `await_run`.**
+    ///
+    /// Everything `intern` refuses is refused here, at the same moment. Only the record waits: it
+    /// joins `pending` with a number, and `run_seqs` remembers the number until `await_run` has
+    /// seen it durable. Any durable write before that carries it anyway, in order: the pending
+    /// records go first in every append.
+    fn intern_pending(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
         let mut file = self.file.lock().unwrap();
-        // Checked UNDER the lock, and that is the fix for a race rather than tidiness. Checked
-        // before taking it, a writer that had already passed the check could be sitting on
-        // `file.lock()` while another thread's append failed and poisoned the store; it would then
-        // acquire the lock and append anyway, producing exactly the file the poison flag exists to
-        // prevent — a `Stamp` naming a run whose `Run` record never landed, which the next `open`
-        // must refuse whole. Check-then-act on shared state, which is the shape that has produced
-        // six separate defects in this codebase.
+        // Under the lock; see `intern` for the race that checking it first opened.
         self.refuse_if_poisoned()?;
-
-        // ⛔ EVERYTHING THAT CAN REFUSE IS ENCODED BEFORE ANYTHING IS MUTATED, and the order is
-        // the correctness argument rather than a style choice.
-        //
-        // D154 gave `wal::log::write_str` a length guard, which made this function able to return
-        // early for the first time. `self.mem.intern` below is a MUTATION. With the encode after
-        // it — where it used to sit, and where a comment of mine claimed "the refusal costs
-        // nothing here" — a refused run stayed in memory and never reached the file, so
-        // `run_count`/`runs` answered for a run that disappears on the next `open`. Measured, not
-        // reasoned about: `tests/d154_length_prefix_refusal.rs
-        // ::the_durable_provenance_store_refuses_a_run_it_cannot_encode` failed 1 != 0 on exactly
-        // that, and the claim that it cost nothing was wrong.
-        //
-        // Moving the encode earlier is NOT a second guard — it is the same guard, ahead of the
-        // state it would otherwise have to undo. Nothing needs rolling back if nothing changed.
-        //
-        // ⚠ It costs one ~96-byte encode on the REPEAT path, which previously allocated nothing.
-        // That is per transaction, not per row, behind a file lock and a mutex that both dwarf it.
-        // Stated rather than hidden, because it is a real if small regression on the common path.
-        let mut tail = Vec::with_capacity(96);
-        write_str(&mut tail, &run.agent_id, "an agent id")?;
-        write_str(&mut tail, &run.run_id, "a run id")?;
-        write_str(&mut tail, &run.model, "a model name")?;
-        write_str(&mut tail, &run.model_version, "a model version")?;
-        tail.extend_from_slice(&run.prompt_hash);
-        tail.extend_from_slice(&run.started_at.to_be_bytes());
-        tail.extend_from_slice(&run.parent_branch.id.to_be_bytes());
-        tail.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
-
-        let before = self.mem.run_count();
-        let id = self.mem.intern(run)?;
-        if self.mem.run_count() == before {
-            // A repeat. `intern` is a lookup in that case, so there is nothing new to record.
-            return Ok(id);
-        }
-
-        let mut body = Vec::with_capacity(tail.len() + 5);
-        body.push(TAG_RUN);
-        body.extend_from_slice(&id.0.to_be_bytes());
-        body.extend_from_slice(&tail);
-        if let Err(e) = self.append_locked(&mut file, &body, &self.syncs.runs) {
-            self.poisoned.store(true, Ordering::SeqCst);
-            return Err(e);
+        let (id, body) = self.intern_locked(run)?;
+        if let Some(body) = body {
+            file.pending.push(body);
+            file.queued += 1;
+            let seq = file.queued;
+            file.run_seqs.insert(id, seq);
         }
         Ok(id)
+    }
+
+    /// **D246: make a run's record durable with a group-committed sync issued outside the lock.**
+    ///
+    /// Under the file lock: if the record is still pending, write it, with every pending record
+    /// ahead of it, and take their tickets. No sync is issued there. Then, with the lock RELEASED,
+    /// wait in `CommitGroup::wait_durable`: one waiter leads and syncs, and every record written
+    /// before its sync began is covered. So forks completing together share one sync, and a fork
+    /// being staged meanwhile (which needs this lock under pgwire's catalog guard) never waits on
+    /// the disk.
+    ///
+    /// **Only RUN records are ever left written-but-unsynced**, and that is what keeps `flush`'s
+    /// "nothing pending, nothing to do" true for the stamps it answers for. The records ahead of
+    /// this run's are written here only while they are all run records, which is every case the
+    /// SQL shapes produce: a MERGE queues its stamps under the catalog guard and makes them durable
+    /// before releasing it, so no stamp is pending when a fork completes behind the guard. When a
+    /// stamp IS queued ahead (the embedded API, with no guard serialising writers), the pending
+    /// records are written and synced here under the lock instead, as any other append would.
+    fn await_run(&self, id: ProvId) -> Result<(), FerroError> {
+        let seq = {
+            // Not `unwrap`: `ForkDurability`'s `Drop` calls this, and a panic in a drop that runs
+            // during unwinding aborts the process.
+            let mut file = self.file.lock().map_err(|_| {
+                FerroError::Provenance(format!(
+                    "{}: the provenance lock was poisoned by a panicking writer; refusing to sync",
+                    self.path.display()
+                ))
+            })?;
+            let Some(&seq) = file.run_seqs.get(&id) else {
+                // Interned by `intern`, recovered from the file, or already seen durable here.
+                return Ok(());
+            };
+            let written = file.queued - file.pending.len() as u64;
+            if seq > written {
+                self.refuse_if_poisoned()?;
+                let runs_ahead =
+                    file.pending.iter().take_while(|b| b.first() == Some(&TAG_RUN)).count();
+                if runs_ahead as u64 >= seq - written {
+                    // Every pending run record at the head of the queue, not just this one: a fork
+                    // staged behind this one rides the same sync instead of paying its own.
+                    if let Err(e) = self.write_locked(&file, runs_ahead, &[]) {
+                        self.poisoned.store(true, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                    file.pending.drain(..runs_ahead).for_each(drop);
+                    self.group.tickets(runs_ahead as u64);
+                } else if let Err(e) = self.append_all_locked(&mut file, &[], &self.syncs.runs) {
+                    self.poisoned.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
+            seq
+        };
+        self.group.wait_durable(seq, || self.sync_runs())?;
+        // Durable, so the number is no longer needed. Removed here, which is what keeps this map
+        // the size of the forks in flight rather than of every run ever interned.
+        if let Ok(mut file) = self.file.lock() {
+            file.run_seqs.remove(&id);
+        }
+        Ok(())
     }
 
     fn lookup(&self, id: ProvId) -> Result<RunEntity, FerroError> {
@@ -778,6 +964,7 @@ impl ProvenanceStore for DurableProvenanceStore {
         self.refuse_if_poisoned()?;
         self.mem.stamp(rid, id)?;
         file.pending.push(stamp_body(rid, id));
+        file.queued += 1;
         Ok(())
     }
 
@@ -1592,6 +1779,161 @@ mod tests {
         assert!(
             literal > interned * 20,
             "literal {literal} vs interned {interned} — the interning claim did not survive"
+        );
+    }
+
+    // ---- D246 §6.1: a fork's run record, group-committed outside the lock ----------------------
+    //
+    // Pre-registered in `bench/d246/PREREG.md` A2 (U1-U4). They name `intern_pending`,
+    // `await_run` and `sync_gate`, which do not exist before the fix, so they can only go red under
+    // a mutant (M7-M10), never at the red commit.
+
+    /// The run a fork's staging queued, awaited on another thread with its sync held in flight.
+    /// Returns the store, the awaiting thread, and the sender that releases the sync.
+    #[allow(clippy::type_complexity)]
+    fn a_run_sync_in_flight(
+        path: &Path,
+        run_id: &str,
+    ) -> (
+        std::sync::Arc<DurableProvenanceStore>,
+        ProvId,
+        std::thread::JoinHandle<Result<(), FerroError>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::{mpsc, Arc};
+        let s = Arc::new(DurableProvenanceStore::open(path).unwrap());
+        let a = s.intern_pending(&run("fork", run_id)).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *s.sync_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let awaiting = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.await_run(a))
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("await_run never reached its sync");
+        (s, a, awaiting, release_tx)
+    }
+
+    /// **U1: the sync is not issued under the lock every staged write needs.** Under pgwire's
+    /// catalog guard, a fork's staging takes this store's file lock (`intern_pending`), and so does
+    /// a MERGE's publish loop (`stamp_pending`). If `await_run` held that lock across its fsync,
+    /// every statement behind the guard would wait on another fork's disk round-trip: S5 again, one
+    /// lock further down.
+    #[test]
+    fn a_runs_group_sync_does_not_hold_the_lock_every_staged_write_needs() {
+        use std::sync::{mpsc, Arc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let (s, _a, awaiting, release) = a_run_sync_in_flight(&path, "run-a");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let stager = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                let b = s.intern_pending(&run("fork", "run-b"));
+                let stamped = b.as_ref().ok().map(|b| s.stamp_pending(rid(1, 0), *b));
+                let _ = done_tx.send(());
+                (b, stamped)
+            })
+        };
+        let staged_meanwhile = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        release.send(()).unwrap();
+        awaiting.join().unwrap().expect("await_run of the first run");
+        let (b, stamped) = stager.join().unwrap();
+        let b = b.expect("intern_pending of the second run");
+        stamped.expect("the stamp was not attempted").expect("stamp_pending");
+        assert!(
+            staged_meanwhile,
+            "staging a run and queueing a stamp waited for another run's fsync to finish: the sync \
+             holds the lock every staged write needs"
+        );
+
+        s.await_run(b).expect("await_run of the second run");
+        s.flush().expect("flush the stamp");
+        assert_eq!(DurableProvenanceStore::open(&path).unwrap().run_count(), 2);
+    }
+
+    /// **U2: a record written but not yet synced is not durable.** A repeat run's fork awaits a run
+    /// whose record another fork has already WRITTEN, with that fork's sync still in flight. It must
+    /// wait for that sync, not return because nothing is pending, and it must share it rather than
+    /// issue its own.
+    #[test]
+    fn a_second_await_of_a_run_already_written_waits_for_its_sync() {
+        use std::sync::{mpsc, Arc};
+        let dir = tempfile::tempdir().unwrap();
+        let (s, a, first, release) = a_run_sync_in_flight(&dir.path().join("prov.log"), "run-a");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                let r = s.await_run(a);
+                let _ = done_tx.send(());
+                r
+            })
+        };
+        // Structurally safe: the right code cannot return until `release`, which is sent after this
+        // window, so a loaded box can only make a wrong implementation look right, never the reverse.
+        let returned_early = done_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        release.send(()).unwrap();
+        first.join().unwrap().expect("the first await_run");
+        second.join().unwrap().expect("the second await_run");
+        assert!(
+            !returned_early,
+            "a second await_run returned while the sync covering the run was still in flight: that \
+             fork would be acknowledged with a run a crash could lose"
+        );
+        assert_eq!(
+            s.sync_counts().runs,
+            1,
+            "the second await issued a sync of its own instead of sharing the one in flight"
+        );
+    }
+
+    /// **U3: a run a synchronous append already carried costs its await nothing.** A MERGE's
+    /// row-author sync writes every pending record first, so a fork staged before it has its run
+    /// record synced by the merge. The fork's `complete()` must see that, not issue another sync.
+    #[test]
+    fn a_run_a_synchronous_append_already_carried_costs_its_await_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        let a = s.intern_pending(&run("fork", "run-a")).unwrap();
+        s.stamp_row(7, 1, a).expect("the synchronous append");
+        assert_eq!(
+            DurableProvenanceStore::open(&path).unwrap().run_count(),
+            1,
+            "premise: the synchronous append did not carry the pending run record"
+        );
+        let before = s.sync_counts();
+        s.await_run(a).expect("await_run");
+        assert_eq!(
+            s.sync_counts(),
+            before,
+            "await_run synced a run record a synchronous append had already made durable"
+        );
+    }
+
+    /// **U4: `intern` still returns a DURABLE run**, including a repeat of a run whose record an
+    /// `intern_pending` queued and nobody has awaited yet.
+    #[test]
+    fn interning_a_run_whose_record_is_pending_makes_it_durable_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        let a = s.intern_pending(&run("fork", "run-a")).unwrap();
+        assert_eq!(
+            DurableProvenanceStore::open(&path).unwrap().run_count(),
+            0,
+            "premise: intern_pending wrote the record at once, so this test proves nothing"
+        );
+        assert_eq!(s.intern(&run("fork", "run-a")).unwrap(), a, "a repeat intern is a lookup");
+        assert_eq!(
+            DurableProvenanceStore::open(&path).unwrap().run_count(),
+            1,
+            "intern returned a run whose record was still pending"
         );
     }
 }

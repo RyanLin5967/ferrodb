@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::branch::types::BranchId;
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
-use crate::provenance::ProvId;
+use crate::provenance::{ProvId, ProvenanceStore};
 use crate::tel::ids::TxnId;
 
 /// A fork that has happened in memory and **has not reached the disk yet**, plus the one call that
@@ -56,12 +56,26 @@ use crate::tel::ids::TxnId;
 ///
 /// The safe spelling for anyone not holding a wider lock remains `AgentRuntime::begin_session_as`,
 /// which completes it for you.
+///
+/// # D246: the run's record rides the same value
+///
+/// A fork that brings a NEW run also owes that run's provenance record. `intern` used to sync it
+/// inside `begin_session_as_staged`, under `state` and inside pgwire's catalog guard, so every
+/// statement waited behind one fsync per new run. Once pgserver opened the durable store (D246),
+/// that was the same serialisation this type removed for the fork, reached through the provenance
+/// store. So the run is interned PENDING (`ProvenanceStore::intern_pending`), and the obligation
+/// to make it durable travels here: `complete()` awaits it after the fork's own sync,
+/// group-committed outside the store's lock (`ProvenanceStore::await_run`), and `Drop` discharges
+/// it like the fork's.
 #[must_use = "a staged fork is not durable until `complete()` is called. Dropping it falls back to \
               a private, ungrouped fsync -- correct, but it forfeits the batching this type exists \
               for. NOTE: every current call site binds, so this lint cannot be relied on."]
 pub struct ForkDurability {
     pub(crate) branches: Arc<dyn BranchCatalog>,
     pub(crate) seq: Option<u64>,
+    /// The run this fork interned PENDING, and the store that owes its record (D246). Set on the
+    /// line after the intern, so every later exit awaits it.
+    pub(crate) run: Option<(Arc<dyn ProvenanceStore>, ProvId)>,
 }
 
 /// How many staged forks have been made durable by `Drop` rather than by an explicit
@@ -86,24 +100,45 @@ impl ForkDurability {
         // fallback counter is not touched. The error is returned to the caller, which is the whole
         // reason to prefer this over letting `Drop` do it: `Drop` cannot report one.
         let seq = self.seq.take();
-        self.branches.await_fork_durable(seq)
+        let run = self.run.take();
+        let forked = self.branches.await_fork_durable(seq);
+        // Awaited even when the fork's own sync failed: the run is in the store's index either
+        // way, and its record must not be left for whichever later write happens to carry it.
+        let interned = match run {
+            Some((store, prov)) => store.await_run(prov),
+            None => Ok(()),
+        };
+        forked.and(interned)
     }
 }
 
 impl Drop for ForkDurability {
     fn drop(&mut self) {
-        let Some(seq) = self.seq.take() else { return };
-        FALLBACK_SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // ⚠ STATED BLIND SPOT: a failure here cannot be reported — `Drop` has nowhere to put it.
-        // That is strictly better than not syncing at all, and it is only reachable on a path that
-        // already forgot `complete()`. On the normal path `complete()` returns the error.
-        let _ = self.branches.await_fork_durable(Some(seq));
+        if let Some(seq) = self.seq.take() {
+            FALLBACK_SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // ⚠ STATED BLIND SPOT: a failure here cannot be reported — `Drop` has nowhere to put
+            // it. That is strictly better than not syncing at all, and it is only reachable on a
+            // path that already forgot `complete()`. On the normal path `complete()` returns the
+            // error.
+            let _ = self.branches.await_fork_durable(Some(seq));
+        }
+        // D246: the run's record, discharged the same way. [`fallback_syncs`] counts only the
+        // fork's ticket, which every staged fork on a table catalog carries, so a forgotten
+        // `complete()` there is counted once. On a catalog that does not split (no ticket) this
+        // await is not counted. `await_run` refuses a poisoned file lock rather than panicking
+        // on it, so this is safe during unwinding.
+        if let Some((store, prov)) = self.run.take() {
+            let _ = store.await_run(prov);
+        }
     }
 }
 
 impl std::fmt::Debug for ForkDurability {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ForkDurability").field("seq", &self.seq).finish()
+        f.debug_struct("ForkDurability")
+            .field("seq", &self.seq)
+            .field("run", &self.run.as_ref().map(|(_, prov)| *prov))
+            .finish()
     }
 }
 

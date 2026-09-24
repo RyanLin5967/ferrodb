@@ -30,7 +30,8 @@ pub mod version_graph;
 pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub mod tree_keys;
-mod group_commit;
+// `pub(crate)` since D246: the durable provenance store group-commits a fork's run record with it.
+pub(crate) mod group_commit;
 pub mod table_catalog;
 pub use table_catalog::TableBranchCatalog;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};

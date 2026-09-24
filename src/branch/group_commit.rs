@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use crate::error::FerroError;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct GroupState {
     /// Tickets handed out. Incremented under the caller's logical lock, after its mutations.
     requested: u64,
@@ -40,7 +40,7 @@ struct GroupState {
 }
 
 /// Shared commit point for one catalog.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct CommitGroup {
     state: Mutex<GroupState>,
     wake: Condvar,
@@ -60,9 +60,35 @@ impl CommitGroup {
 
     /// Take a ticket. **Call this under the logical lock, after the last mutation**, never on entry.
     pub(crate) fn ticket(&self) -> u64 {
+        self.tickets(1)
+    }
+
+    /// Take `n` tickets at once and return the last. The same rule as [`Self::ticket`]: under the
+    /// caller's lock, after every write the tickets stand for.
+    ///
+    /// For a caller whose tickets are record SEQUENCE numbers rather than one per operation: the
+    /// durable provenance store takes one per record it writes, so "ticket `s` is durable" says
+    /// that record `s` and every record before it are on disk (D246).
+    pub(crate) fn tickets(&self, n: u64) -> u64 {
         let mut st = self.state.lock().unwrap();
-        st.requested += 1;
+        st.requested += n;
         st.requested
+    }
+
+    /// Record that a sync issued OUTSIDE [`Self::wait_durable`] covered every ticket handed out so
+    /// far, and wake whoever waits on them.
+    ///
+    /// ⛔ **Sound only for a caller that holds, across its write, its sync and this call, the one
+    /// lock under which EVERY ticket is taken.** Then no ticket can be handed out between the sync
+    /// starting and this line, so "every ticket so far" names only work that was written before the
+    /// sync began. Called anywhere else, a ticket taken during the sync would be claimed by it,
+    /// which is exactly the ordering this module exists to forbid.
+    pub(crate) fn covered_all(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.requested > st.durable {
+            st.durable = st.requested;
+            self.wake.notify_all();
+        }
     }
 
     /// Block until a successful fsync has covered `seq`. **Call this after RELEASING the logical

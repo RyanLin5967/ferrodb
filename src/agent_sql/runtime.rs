@@ -1645,8 +1645,12 @@ impl AgentRuntime {
         // ticket as a bare `Option<u64>` across the body instead (as the first version did) means
         // the next `?` anyone adds silently recreates a staged fork that nothing ever syncs, with
         // no compiler signal and no test signal.
-        let durability =
-            ForkDurability { branches: Arc::clone(&self.branches), seq: fork_seq_ticket };
+        let mut durability = ForkDurability {
+            branches: Arc::clone(&self.branches),
+            seq: fork_seq_ticket,
+            // Set on the line after the intern below, which is the first moment there is a run.
+            run: None,
+        };
         let branch = record.branch_id;
 
         let run = run_id.unwrap_or("<unnamed>").to_string();
@@ -1691,14 +1695,22 @@ impl AgentRuntime {
         // `prompt_hash`, so re-beginning one run under a different prompt is refused here rather
         // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
-        // A plain `?` again, deliberately. `intern` refusing a re-intern whose actor tuple
+        // A plain `?` again, deliberately. The store refusing a re-intern whose actor tuple
         // disagrees is the one reachable failure after the fork has been staged, and it used to
         // need a hand-written recovery arm here. It does not any more: `durability` was built on
         // the line after `fork_staged`, so this `?` drops it and `Drop` discharges the sync. That
         // is the difference between an invariant maintained at every call site and one maintained
         // by the type — and the reason to prefer the second is that this `?` is exactly the shape
         // of the next edit someone makes to this function.
-        let prov = self.prov_store.intern(&RunEntity::new(
+        //
+        // **D246: PENDING, not durable, for the same reason the fork is staged.** This line runs
+        // under `state` and, over pgwire, inside the catalog guard. `intern` synced a new run's
+        // record right here, so every statement on the server waited behind one fsync per new run.
+        // `intern_pending` puts the run in the index with every guard `intern` applies and queues
+        // its record, and the line after it hands the record to `durability`. `complete()`, called
+        // after the guard is released, awaits one group-committed sync for it. A refusal queues
+        // nothing, so this `?` leaves no record owed.
+        let prov = self.prov_store.intern_pending(&RunEntity::new(
             ProvId::NONE,
             agent_id,
             run.clone(),
@@ -1708,7 +1720,8 @@ impl AgentRuntime {
             started,
             parent,
         ))?;
-        // No second copy of the entity is kept here, because `intern` is ITSELF first-wins: it
+        durability.run = Some((Arc::clone(&self.prov_store), prov));
+        // No second copy of the entity is kept here, because the intern is ITSELF first-wins: it
         // returns the existing `ProvId` when `same_actor` holds and leaves the stored entity
         // untouched, so the store already holds the record this used to mirror into `State::runs`
         // — including the first `started_at`. That property is load-bearing and survives the move:
@@ -5133,6 +5146,25 @@ impl AgentRuntime {
             for record in records {
                 ctx.txn.log_ddl(record)?;
             }
+        }
+
+        // **D246 A3: the run's provenance record is durable BEFORE the log is told the run exists.**
+        //
+        // `bind_run` below declares this run's slot to the WAL, and the publish commit makes that
+        // declaration durable. Until D246 §6.1 the provenance file always had the run by then,
+        // because `intern` synced it at `BEGIN`. Now a fork's run record is pending until the
+        // fork's `complete()`, and pgwire releases the catalog guard before calling it, so another
+        // connection can MERGE `b_N` inside that window. Without this line, that merge would commit
+        // the slot to the log and write the run record only in the provenance sync after the
+        // commit. A crash between the two leaves the log declaring a slot the reopened store
+        // issues again to the next new run: D246's defect by another door.
+        //
+        // Placed before the reservation so a refusal leaks nothing. For every run whose `BEGIN`
+        // completed, which is every ordinary merge, it is a map lookup under the provenance
+        // store's lock and touches no disk. Only a merge inside that window waits on a disk,
+        // and that wait is the one the invariant requires.
+        if !snapshot.prov.is_none() {
+            self.provenance().await_run(snapshot.prov)?;
         }
 
         // **Reserve the version sequence BEFORE the rows become visible.**

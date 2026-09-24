@@ -290,6 +290,16 @@ impl ProvenanceStore for MemProvenanceStore {
         Ok(())
     }
 
+    /// Nothing to defer: this store has no file, so a pending intern is an ordinary one.
+    fn intern_pending(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+        self.intern(run)
+    }
+
+    /// Nothing is ever pending here, so every run is as durable as this store makes anything.
+    fn await_run(&self, _id: ProvId) -> Result<(), FerroError> {
+        Ok(())
+    }
+
     /// This store refuses a write only when its lock was poisoned by a panicking writer.
     fn check_writable(&self) -> Result<(), FerroError> {
         if self.inner.is_poisoned() {

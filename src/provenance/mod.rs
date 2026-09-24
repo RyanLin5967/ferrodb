@@ -190,6 +190,31 @@ pub trait ProvenanceStore: Send + Sync {
     /// than panic inside the `Drop`s that call this).
     fn flush(&self) -> Result<(), FerroError>;
 
+    /// Intern a run in the index NOW, with every guard `intern` applies, so a refused re-intern is
+    /// refused here, and leave its durable record PENDING until [`Self::await_run`].
+    ///
+    /// **D246.** `BEGIN AGENT SESSION` interned through `intern`, which syncs a new run's record,
+    /// inside `begin_session_as_staged`: under the runtime's `state` lock and inside pgwire's
+    /// catalog guard, so every statement on the server waited behind that fsync. This is the half
+    /// that belongs under the guard; `await_run` is the half that does not.
+    ///
+    /// A caller that interns through this must call `await_run` for the returned id before it tells
+    /// anyone the run exists. `ForkDurability` is the value that makes that hold on every exit, and
+    /// it is the only intended way in.
+    fn intern_pending(&self, run: &RunEntity) -> Result<ProvId, FerroError>;
+
+    /// Return once run `id`'s record is durable. That is at once when it already is (a run interned
+    /// by `intern`, recovered from the file, or made durable by an earlier call), and otherwise after
+    /// writing it and awaiting a sync that covers it.
+    ///
+    /// **Call it outside any wide lock.** The durable store writes pending run records under its
+    /// file lock and waits for their sync OUTSIDE it, group-committed: forks completing together
+    /// share one sync, and a fork being staged meanwhile does not wait for it.
+    ///
+    /// A publish calls it too, before the log is told the run exists (`bind_run`): the WAL must
+    /// never declare a slot the provenance file could lose (D246 A3).
+    fn await_run(&self, id: ProvId) -> Result<(), FerroError>;
+
     /// Refuse NOW if this store would refuse a write now.
     ///
     /// For a caller about to make a change it cannot undo and will have to record here afterwards:
@@ -301,7 +326,8 @@ pub trait ProvenanceStore: Send + Sync {
 /// under `stamps`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncCounts {
-    /// Syncs that made a newly interned run durable. A repeat intern is a lookup and syncs nothing.
+    /// Syncs that made a newly interned run durable: `intern`'s own, and since D246 the sync
+    /// `await_run` issues for pending run records. A repeat intern is a lookup and syncs nothing.
     pub runs: u64,
     /// Syncs issued by `stamp`, and by `flush` of pending physical stamps.
     pub stamps: u64,

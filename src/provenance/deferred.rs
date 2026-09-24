@@ -150,6 +150,14 @@ impl ProvenanceStore for Deferred {
         self.0.flush()
     }
 
+    fn intern_pending(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+        self.0.intern_pending(run)
+    }
+
+    fn await_run(&self, id: ProvId) -> Result<(), FerroError> {
+        self.0.await_run(id)
+    }
+
     fn check_writable(&self) -> Result<(), FerroError> {
         self.0.check_writable()
     }
