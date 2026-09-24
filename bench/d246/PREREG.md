@@ -272,3 +272,37 @@ It now asserts that `await_run(synced)` is `Ok`: a durable run is vouched for ev
 - **Latency coupling, stated rather than measured.** `sync_runs`' post-fsync lock waits behind any in-lock fsync in flight, such as a MERGE's `record_applied` under the catalog guard. So a fork's `complete()`, which runs outside the guard, can wait one extra provenance fsync. No statement inside the guard waits on the group.
 
 **U-test outcomes at the new fix:** U1–U8 hold. U8 holds at `a7127cd` too (see R2-D5). U5 stays **RED at `a7127cd`**.
+
+## A4d (2026-09-24T13:40Z): the third fresh review of `c485fbe..689276f` and D219 `1c226d8..cd0302c`
+
+The review found no BLOCKER and three DEFECTs. Its checks of every other A4c and D219 A2 prediction matched by reading. The mutants, the `REQUIRE` lists and the hang-freedom all held.
+
+### R3-D1: A4c wrongly withdrew A4's U8 prediction at `a7127cd`
+
+The red step runs the test text committed at `a7127cd`. That is A4's version of U8, whose second half is `s.await_run(synced).expect_err(...)`. `efd3541`'s `await_run` returns `Ok` for a run absent from `run_seqs`, so **U8 FAILS at `a7127cd`**, on that second half, exactly as A4 said. A4c's "U8 now holds at `a7127cd`" confused that commit's text with the current one. It is withdrawn, and `run.sh`'s comment is restored ("U5 and U8 FAIL").
+
+### R3-D2: R2-D5 reopens D219 F5 on this branch — recorded, not fixed
+
+At `312301c`, the plan-phase await's top-of-function poison check refused every MERGE with a run on a poisoned store before the schema apply. That closed D219 F5 incidentally. R2-D5 moved the check to where it stops a write, so at `2e554e8` a durable run is vouched for. A MERGE with an ADD COLUMN on an unattributed table plus a published row then:
+1. applies and logs its schema;
+2. refuses at the first publish stamp.
+
+That is F5, exactly as on D219's own tip. **The lead ruled F5 "pre-existing, record it as known"** (D219 review 7), and this branch's net state equals D219's. So it is recorded here, in lane §6, and in the message to the lead.
+
+The fix, if wanted: one `self.provenance().check_writable()?` in the plan phase when the merge will publish anything with a run. That is D219 A1's rule applied to MERGE, and it keeps R2-D5's benefit for merges that publish nothing.
+
+### R3-D3: two comments still described the shared file description
+
+`sync_runs`' post-check comment and U5's doc have been rewritten for A4c's own description:
+- the check's two jobs are stated;
+- the remaining blind spot is stated in the code. On a kernel that reports a writeback error once per FILE (Linux < 4.13; others unverified), the leader's fsync can consume an in-lock writer's error. That is M31, a survivor.
+
+### NITs, fixed
+
+- `alter.rs`: D219's test doc now names both tests that reach the restamp with a refusing store, including D246's N-5 test.
+- `SyncCounts`: the doc states that a group sync refused by its post-fsync check is not booked.
+- `run.sh`: every step records cargo's own rc on its own line before a 97 or 98 refusal overrides it.
+- `run.sh`: every mutant step lists the pre-registered killers it must collect, as `<filter>+<test>...` into `REQUIRE`. The spec parsing was fire-checked with a stubbed `step`.
+- D219's runner gains the zero-collected refusal (D219 `1dfe13f`), fire-checked with a stub `cargo`.
+
+**Not changed:** no test condition changed, and no src code outside comments changed in A4d.
