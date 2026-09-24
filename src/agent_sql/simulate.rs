@@ -68,7 +68,9 @@ use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 
 use crate::agent_sql::gate::{AssertionResult, GateOutcome};
-use crate::agent_sql::runtime::{AgentRuntime, ExecCtx, MergeEvaluation, DEFAULT_LEASE_MILLIS};
+use crate::agent_sql::runtime::{
+    AgentRuntime, ExecCtx, MergeEvaluation, RunIdentity, DEFAULT_LEASE_MILLIS,
+};
 use crate::branch::types::{BranchId, LeaseDeadline};
 use crate::error::FerroError;
 use crate::parser::parser::{Expr, Stmt};
@@ -425,8 +427,15 @@ impl AgentRuntime {
                 None => format!("<unnamed>/{}", c.name),
             };
             let model = plan.model.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
-            let session =
-                self.begin_session_with_model(&plan.agent_id, Some(&run), model, base)?;
+            // Pinned (D194), so every candidate reads the base as of this loop — the property
+            // step 3 claims ("scored against the identical base") now holds for their READS too,
+            // not only for the evaluation. With no transaction begun or ended between iterations
+            // they share one snapshot `Arc`.
+            let session = self.begin_session_pinned(
+                RunIdentity { agent_id: &plan.agent_id, run_id: Some(&run), model, prompt: None },
+                base,
+                &ctx.txn,
+            )?;
             self.branches()
                 .renew_lease(session.branch, LeaseDeadline::from_now(plan.lease_millis))?;
             forked.push((i, session));

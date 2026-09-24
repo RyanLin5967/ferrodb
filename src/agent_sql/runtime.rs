@@ -89,7 +89,7 @@ use crate::tel::ids::{ColId, RowId, TableId, TxnId};
 use crate::tel::merge::{ConflictKind, ConflictReport, MergeOutcome, MergePolicy};
 use crate::tel::op::{Delta, Op, OpKind};
 use crate::tel::EffectLog;
-use crate::wal::txn::{ReadView, TxnManager};
+use crate::wal::txn::{ReadView, Snapshot, TxnManager};
 
 /// Default lease on an agent branch. Leases are non-cooperative: expiry does not require the
 /// client to call anything (DESIGN.md exit criterion 8).
@@ -370,7 +370,36 @@ struct Workspace {
     txn: TxnId,
     /// Apply-sequence of the target at fork time. Anything applied after this is concurrent with
     /// us, which is what makes the three-way comparison well defined.
+    ///
+    /// **D194: it names the same instant as `fork_snapshot`, and the two move together.** An op at
+    /// or below this seq is treated by the merge as already in this branch's base, so it must be
+    /// in the snapshot the branch reads; one above it is "theirs", so it must not. A child forked
+    /// from a live branch inherits BOTH from its parent, and a lazy pin (see `fork_snapshot`)
+    /// re-reads this one at the moment it pins. Inheriting the snapshot but taking a fresh seq
+    /// would put every op published between the parent's fork and the child's outside the child's
+    /// view AND outside "theirs": `concurrent_op` would never see them, and a cell the child moved
+    /// with an `Add` would compose against a partial record of what the target did.
     fork_seq: u64,
+    /// **D194 — the shared tables as this branch sees them: main AS OF the fork.**
+    ///
+    /// Every read of the base on this branch's behalf goes through this snapshot rather than
+    /// main's current one, so main's commits after the fork never show through and two reads on
+    /// one branch agree. It is plain snapshot isolation over the MVCC the tables already have:
+    /// an UPDATE left the old version on the row's `prev` chain in the time-travel heap, and a
+    /// DELETE stamped `end_ts` in place, so an old snapshot resolves both (`resolve_visibility`).
+    /// Nothing reclaims either today, which is what makes an arbitrarily old pin readable.
+    ///
+    /// Shared, not copied: forks with no transaction begun or ended between them get the same
+    /// `Arc` from `read_snapshot_cached`, and a child forked from a live branch holds its parent's.
+    ///
+    /// **`None` is a branch forked with no transaction manager in hand** — `begin_session`,
+    /// `begin_session_as` and the cluster `fork` take none, and several callers have no database
+    /// at all. Such a branch is pinned by [`Workspace::pin`] at its FIRST read, by whoever reads
+    /// it, and from then on exactly as if it had been pinned at fork. ⚠ The blind spot, stated
+    /// here rather than discovered: main's commits between that fork and that first read ARE
+    /// visible to it. Every production door — `BEGIN AGENT SESSION` (SQL and pgwire) and
+    /// `SIMULATE` — forks through `begin_session_pinned*` and never leaves this `None`.
+    fork_snapshot: Option<Arc<Snapshot>>,
     /// The branch's root page at fork time.
     ///
     /// `set_root` moves the branch's live root on every copy-on-write write, so the fork point is
@@ -399,6 +428,12 @@ struct Workspace {
     /// the probe first shipped, and the first fix (a counter for (a) alone) missed (b).
     unprobeable_rows: u64,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
+    ///
+    /// **True by construction since D194**, and only since: every image that reaches this map
+    /// (`stage_all`'s `insert_if_absent` of `Staged::before`) was read through `fork_snapshot`,
+    /// which does not move, so "at first touch" and "at the fork" are the same image. Before it,
+    /// first touch read main's CURRENT state, and a row main changed between the fork and the
+    /// first touch recorded the later image as the fork-point one.
     base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
     ///
@@ -437,6 +472,22 @@ struct Workspace {
 impl Workspace {
     fn key(tbl: TableId, row: RowId) -> (u32, u64) {
         (tbl.0, row.0)
+    }
+
+    /// **D194.** The snapshot this branch reads the shared tables through, pinning it now if the
+    /// branch was forked without one. Idempotent: once pinned, `apply_seq` and `txn` are ignored.
+    ///
+    /// Called only under the `State` lock, with `apply_seq` read under that same lock, so the
+    /// seq and the snapshot a lazy pin records describe one instant — the same pairing the fork
+    /// itself makes. See `fork_seq` for why they must never be taken apart.
+    fn pin(&mut self, apply_seq: u64, txn: &TxnManager) -> Arc<Snapshot> {
+        if let Some(s) = &self.fork_snapshot {
+            return Arc::clone(s);
+        }
+        let s = txn.read_snapshot_cached();
+        self.fork_seq = apply_seq;
+        self.fork_snapshot = Some(Arc::clone(&s));
+        s
     }
 }
 
@@ -854,6 +905,15 @@ struct State {
     /// Reservations over bounded cells, so an overdraw fails when it is written.
     escrow: EscrowLedger,
     versions: BTreeMap<(u32, u64), VersionRef>,
+    /// **D194.** Every `begin_ts` a row's entry in `versions` has held, ascending.
+    ///
+    /// `versions` answers "which version does main hold NOW", which was also "which version did a
+    /// branch read" for as long as a branch read main as of now. Since a branch reads as of its
+    /// fork, the version it saw is the newest one at or below its `fork_seq`, and that needs the
+    /// history. Recording `versions`' latest instead would name a version the reader never saw —
+    /// and the premise check at merge would then compare that version against itself and pass a
+    /// branch whose read main had moved past. Written only by [`State::publish_version`].
+    version_history: std::collections::HashMap<(u32, u64), Vec<u64>>,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.
     ///
@@ -924,6 +984,37 @@ impl State {
             .get(&(tbl.0, row.0, col.0))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Record a published row version: in `versions`, which the premise check reads as "now", and
+    /// in `version_history`, which a pinned read looks its version up in. The only writer of
+    /// either, so the two cannot disagree — the same reason `push_applied` is the only writer of
+    /// `applied` and its index.
+    fn publish_version(&mut self, v: VersionRef) {
+        let key = (v.tbl.0, v.row.0);
+        let history = self.version_history.entry(key).or_default();
+        let at = history.partition_point(|&s| s < v.begin_ts);
+        if history.get(at) != Some(&v.begin_ts) {
+            history.insert(at, v.begin_ts);
+        }
+        self.versions.insert(key, v);
+    }
+
+    /// **D194.** The published version of a row that a read SAW, or `None` if it saw none.
+    ///
+    /// `seen_through` is what [`AgentRuntime::visible_rows_where`] reports: `Some(fork_seq)` for a
+    /// read through a branch's pinned snapshot, which saw exactly the versions published at or
+    /// below that seq — so the newest of those — and `None` for a read of main as it stood, which
+    /// saw the latest.
+    fn version_seen(&self, tbl: TableId, row: RowId, seen_through: Option<u64>) -> Option<VersionRef> {
+        let latest = self.versions.get(&(tbl.0, row.0)).copied()?;
+        let Some(through) = seen_through else { return Some(latest) };
+        if latest.begin_ts <= through {
+            return Some(latest);
+        }
+        let history = self.version_history.get(&(tbl.0, row.0))?;
+        let at = history.partition_point(|&s| s <= through);
+        (at > 0).then(|| VersionRef { begin_ts: history[at - 1], ..latest })
     }
 
     /// Insert a workspace, taking the txn references it holds. One of the two doors into
@@ -1595,9 +1686,14 @@ impl AgentRuntime {
     /// The full form: fork a branch and intern the run under everything the caller declared
     /// about it, the prompt included.
     ///
-    /// This is the only one of the three with a body; the other two are the shapes that predate
-    /// [`RunIdentity`] and delegate here. One body is the point — a second copy of the interning
-    /// sequence is how the `[0u8; 32]` this row exists to remove survived being fixed once.
+    /// The other two are the shapes that predate [`RunIdentity`] and delegate here, and every
+    /// fork door ends in the one body, `fork_session_staged`. One body is the point — a second
+    /// copy of the interning sequence is how the `[0u8; 32]` this row exists to remove survived
+    /// being fixed once.
+    ///
+    /// **D194: this takes no transaction manager, so the branch is pinned at its first read, not
+    /// here** — see `Workspace::fork_snapshot`. A caller that has one uses
+    /// [`AgentRuntime::begin_session_pinned`].
     pub fn begin_session_as(
         &self,
         id: RunIdentity<'_>,
@@ -1606,6 +1702,36 @@ impl AgentRuntime {
         let (session, durability) = self.begin_session_as_staged(id, parent)?;
         durability.complete()?;
         Ok(session)
+    }
+
+    /// **D194 — fork a branch that reads main AS OF THIS INSTANT, plus its own edits.**
+    ///
+    /// `base` is the database's transaction manager; the branch's snapshot is taken from it under
+    /// the same lock that records `fork_seq`, so the two describe one instant. Forking from a live
+    /// branch inherits that branch's snapshot and seq instead — the child sees exactly its
+    /// parent's view — and pins the parent first if it had not been read yet. Durable on return,
+    /// as [`AgentRuntime::begin_session_as`] is.
+    pub fn begin_session_pinned(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: &TxnManager,
+    ) -> Result<AgentSession, FerroError> {
+        let (session, durability) = self.begin_session_pinned_staged(id, parent, base)?;
+        durability.complete()?;
+        Ok(session)
+    }
+
+    /// [`AgentRuntime::begin_session_pinned`], stopping one step short of durable, exactly as
+    /// [`AgentRuntime::begin_session_as_staged`] does and under the same rule: only while holding
+    /// a lock wider than the runtime's own. This is the door `BEGIN AGENT SESSION` uses.
+    pub fn begin_session_pinned_staged(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: &TxnManager,
+    ) -> Result<(AgentSession, ForkDurability), FerroError> {
+        self.fork_session_staged(id, parent, Some(base))
     }
 
     /// `begin_session_as`, **stopping one step short of durable.**
@@ -1630,6 +1756,17 @@ impl AgentRuntime {
         &self,
         id: RunIdentity<'_>,
         parent: BranchId,
+    ) -> Result<(AgentSession, ForkDurability), FerroError> {
+        self.fork_session_staged(id, parent, None)
+    }
+
+    /// The one fork body. `base` is `None` only for the doors that take no transaction manager;
+    /// see `Workspace::fork_snapshot` for what that leaves unpinned and when it is pinned.
+    fn fork_session_staged(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: Option<&TxnManager>,
     ) -> Result<(AgentSession, ForkDurability), FerroError> {
         let RunIdentity { agent_id, run_id, model, prompt } = id;
         if agent_id.trim().is_empty() {
@@ -1719,7 +1856,23 @@ impl AgentRuntime {
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
-        let fork_seq = state.apply_seq;
+        // **D194 — the instant this branch reads main at.** Taken here, under the lock that also
+        // reads `apply_seq`, so the snapshot and `fork_seq` are one instant (see `fork_seq` for
+        // why they may never come from two). A fork from a live branch takes its parent's pair
+        // rather than a fresh one: the child's view IS the parent's view, and a fresh seq beside
+        // an inherited snapshot would hide from the merge every op published in between. If that
+        // parent was itself forked with no manager and has not been read, forking a child is the
+        // moment it is pinned — otherwise the two would pin separately, at different instants.
+        let apply_seq = state.apply_seq;
+        let (fork_seq, fork_snapshot) = match state.workspaces.get_mut(&parent) {
+            Some(p) => {
+                if let Some(txn) = base {
+                    p.pin(apply_seq, txn);
+                }
+                (p.fork_seq, p.fork_snapshot.clone())
+            }
+            None => (apply_seq, base.map(|txn| txn.read_snapshot_cached())),
+        };
         // Forking from a branch that is itself an open agent task: the child's visible state *is*
         // the parent's state at fork time, uncommitted rows included, exactly as the child's root
         // page is the parent's root page. Taking a snapshot rather than a link is what keeps the
@@ -1766,6 +1919,7 @@ impl AgentRuntime {
                 prov,
                 txn,
                 fork_seq,
+                fork_snapshot,
                 fork_root: record.root_page_id,
                 rows,
                 unprobeable_rows,
@@ -2168,20 +2322,48 @@ impl AgentRuntime {
         alias: Option<&str>,
         raw: Option<&Expr>,
         bound: Option<&BoundExpr>,
-    ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
+    ) -> Result<(Vec<(RowId, Vec<Value>)>, Option<u64>), FerroError> {
         debug_assert_eq!(
             raw.is_some(),
             bound.is_some(),
             "raw and bound must be the same predicate in two forms, or the two sides of the \
              overlay are filtered differently"
         );
-        let base = scan_table_where(table, alias, raw, ctx)?;
+        // **D194 — the base is read AS OF THE BRANCH'S FORK, not as of now.** This read main's
+        // CURRENT snapshot (`read_snapshot_cached`) on every statement, so every commit to main
+        // after the fork showed through the branch and two SELECTs on one branch could disagree.
+        // It now reads through the workspace's `fork_snapshot`; the overlay below is untouched, so
+        // the D55 commutation argument above is too — only WHICH base it overlays has changed.
+        //
+        // Taken under the same lock acquisition as the staged map, so a branch pinned lazily here
+        // (`Workspace::pin`) pairs its snapshot with `apply_seq` read under that lock. A branch
+        // with no live workspace — `AS OF BRANCH` on a merged or abandoned one — has no fork to
+        // be as of, and reads main as it stands, as it always did.
+        //
+        // The second value returned is `fork_seq` when the base was read through a pin, so the
+        // read-set can record what this read saw (`record_read`, `State::version_seen`).
+        let (at, seen_through, staged) = match branch {
+            Some(b) => {
+                let mut state = self.state.lock().unwrap();
+                let apply_seq = state.apply_seq;
+                match state.workspaces.get_mut(&b) {
+                    // D57 item 1 below: the clone is taken under the lock.
+                    Some(ws) => {
+                        let at = ws.pin(apply_seq, &ctx.txn);
+                        (at, Some(ws.fork_seq), Some((ws.rows.clone(), ws.unprobeable_rows)))
+                    }
+                    None => (ctx.txn.read_snapshot_cached(), None, None),
+                }
+            }
+            None => (ctx.txn.read_snapshot_cached(), None, None),
+        };
+        let base = scan_table_where(table, alias, raw, ctx, at)?;
         let tbl = table_id(table);
         let mut rows: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         for r in base {
             rows.insert(row_id_of(&r).0, r);
         }
-        if let Some(b) = branch {
+        {
             // **D57.** This used to hold the State mutex and iterate EVERY staged row on the
             // branch — all tables — per statement: ~11.5 ns per staged row per read, ×8 at D27's
             // measured 4,000 staged rows (`bench/d57_staged_curve_before.txt`), and the whole
@@ -2205,10 +2387,6 @@ impl AgentRuntime {
             // 3. Every other predicate walks only THIS table's prefix of the key space, which is
             //    the honest floor for a non-key predicate — the same reason the base table needs
             //    an index for one.
-            let staged = {
-                let state = self.state.lock().unwrap();
-                state.workspaces.get(&b).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
-            };
             if let Some((staged, unprobeable_rows)) = staged {
                 let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
@@ -2250,7 +2428,7 @@ impl AgentRuntime {
                 }
             }
         }
-        Ok(rows.into_iter().map(|(k, v)| (RowId(k), v)).collect())
+        Ok((rows.into_iter().map(|(k, v)| (RowId(k), v)).collect(), seen_through))
     }
 
     /// Execute a single-table SELECT against a branch's visible state, recording the read-set.
@@ -2290,7 +2468,7 @@ impl AgentRuntime {
         };
         let (proj, _out) = binder.bind_projection(columns.clone(), &scope)?;
 
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             ctx,
             Some(branch),
             &from.name,
@@ -2316,6 +2494,7 @@ impl AgentRuntime {
                 where_clause.as_ref(),
                 bound_where.as_ref(),
                 ReadPurpose::Inspection,
+                seen_through,
             )?;
         }
 
@@ -2339,6 +2518,7 @@ impl AgentRuntime {
     /// inspection or a write statement addressing its own rows ([`ReadPurpose`]).
     ///
     /// Refuses when the reading session is gone, rather than retaining nothing and reporting success.
+    #[allow(clippy::too_many_arguments)]
     fn record_read(
         &self,
         reader: BranchId,
@@ -2348,6 +2528,7 @@ impl AgentRuntime {
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
         purpose: ReadPurpose,
+        seen_through: Option<u64>,
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
         // **A read whose session is gone REFUSES; it does not report success while retaining
@@ -2385,10 +2566,15 @@ impl AgentRuntime {
         // and the first `seq` is 1, so a sentinel of 1 collided with the very first publish and the
         // premise check silently compared equal. Absence is already the signal; it does not need a
         // number, and any number picked here is one a real stamp can eventually reach.
+        //
+        // **D194: the version the read SAW, not the one main holds now.** A read through a branch's
+        // pinned snapshot saw main as of the fork, so a row published since shows its OLDER
+        // version to that read — and recording the newer one would make the premise check at
+        // merge compare it against itself and pass. `State::version_seen` names the older one.
         let versions: Vec<VersionRef> = matched
             .iter()
             .map(|(rid, _)| {
-                state.versions.get(&(tbl.0, rid.0)).copied().unwrap_or(VersionRef {
+                state.version_seen(tbl, *rid, seen_through).unwrap_or(VersionRef {
                     tbl,
                     row: *rid,
                     rid: RecordId { page_id: 0, slot_num: 0 },
@@ -2406,7 +2592,11 @@ impl AgentRuntime {
         // itself, a scan would come out depending on the write that landed AT that seq — a write it
         // could not have seen — and every scan would then be a dependent of the merge immediately
         // preceding it, which is the same under-reporting failure with the sign flipped.
-        let observed_at = state.apply_seq + 1;
+        //
+        // **D194: a read through a pinned snapshot saw the clock as of the pin**, so its high water
+        // mark is `fork_seq + 1`, not `apply_seq + 1`. The latter would name as a dependency every
+        // merge published between the fork and this read — writes the read could not see.
+        let observed_at = seen_through.unwrap_or(state.apply_seq) + 1;
         let summary = predicate_summary(tbl, where_clause, bound_where, matched.len() as u64);
         // `or_insert_with`, never `if let Some`. A read that finds no capture and retains nothing
         // silently is indistinguishable from a read that had nothing to retain, and that is the
@@ -2445,6 +2635,7 @@ impl AgentRuntime {
     /// already validates the cells a branch wrote against the target's current image with a witness
     /// per cell, and adding a second staleness mechanism on top of it would promote a resolvable
     /// cell merge into a hard `Retry`. What varies is the [`ReadPurpose`].
+    #[allow(clippy::too_many_arguments)]
     fn record_write_scan(
         &self,
         branch: BranchId,
@@ -2453,6 +2644,7 @@ impl AgentRuntime {
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
+        seen_through: Option<u64>,
     ) -> Result<(), FerroError> {
         let purpose = match access_shape(where_clause, schema) {
             // `WHERE <pk> = <literal>`: the statement named the row, it did not look at anything.
@@ -2468,6 +2660,7 @@ impl AgentRuntime {
             where_clause,
             bound_where,
             purpose,
+            seen_through,
         )
     }
 
@@ -2678,7 +2871,7 @@ impl AgentRuntime {
         // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
         // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
         // between the two paths. What changes is how many rows reach it, never which ones pass.
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
@@ -2731,6 +2924,7 @@ impl AgentRuntime {
             &matched,
             where_clause.as_ref(),
             bound_where.as_ref(),
+            seen_through,
         )?;
         let touched = staged.len();
         self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
@@ -2809,6 +3003,7 @@ impl AgentRuntime {
                 Some(&pk_pred),
                 Some(&bound_pk),
             )?
+            .0
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
@@ -2862,7 +3057,7 @@ impl AgentRuntime {
         // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
         // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
         // between the two paths. What changes is how many rows reach it, never which ones pass.
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
@@ -2901,6 +3096,7 @@ impl AgentRuntime {
             &matched,
             where_clause.as_ref(),
             bound_where.as_ref(),
+            seen_through,
         )?;
         let n = staged.len();
         self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
@@ -3537,11 +3733,21 @@ impl AgentRuntime {
         // Resolved up front, because `CherryTarget::row_image` takes no context and must not do
         // I/O per call. The set is bounded by the selection, so this stays O(picked).
         let mut images: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
-        {
-            let state = self.state.lock().unwrap();
-            let ws = state.workspaces.get(&onto).ok_or_else(|| {
+        // **D194 — a BRANCH READ, so it reads as of `onto`'s fork.** These images are what the
+        // target branch sees: `row_image` is documented as "the target's current image of a row",
+        // the pick compares each op's before-image against it, and `commit_all` stages it as the
+        // row's `before` — which is what lands in `base_rows`. Reading main's current state here
+        // would both judge the pick against rows the branch cannot see and plant a non-fork-point
+        // image in `base_rows`. Contrast `evaluate_merge`, which decides what to write to main and
+        // reads main as it stands.
+        let at = {
+            let mut state = self.state.lock().unwrap();
+            let apply_seq = state.apply_seq;
+            let ws = state.workspaces.get_mut(&onto).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {onto}"))
             })?;
+            let at = ws.pin(apply_seq, &ctx.txn);
+            let ws = &*ws;
             for key in &rows_touched {
                 match ws.rows.get(key) {
                     Some(RowState::Present(v)) => {
@@ -3557,7 +3763,8 @@ impl AgentRuntime {
                     }
                 }
             }
-        }
+            at
+        };
         // Rows the branch has never touched are read from the shared tables, by point lookup
         // against the primary key carried in the op's own before-image. A scan here would make a
         // pick of three cells cost O(table), which is the defect D69 removed from `merge`.
@@ -3578,7 +3785,7 @@ impl AgentRuntime {
                 operator: TokenType::Equal,
                 right: Box::new(value_expr(&before)),
             };
-            for row in scan_table_where(&op.table, None, Some(&pred), &ctx.read())? {
+            for row in scan_table_where(&op.table, None, Some(&pred), &ctx.read(), Arc::clone(&at))? {
                 if row_id_of(&row).0 == key.1 {
                     images.insert(*key, row);
                 }
@@ -3910,14 +4117,31 @@ impl AgentRuntime {
         }
 
         // Both workspaces, taken together under one lock so they describe the same instant.
-        let (src, tgt, policy) = {
-            let state = self.state.lock().unwrap();
-            let src = state.workspaces.get(&source).ok_or_else(|| {
-                FerroError::Branch(format!("no agent session on branch {source}"))
-            })?;
-            let tgt = state.workspaces.get(&target).ok_or_else(|| {
-                FerroError::Branch(format!("no agent session on branch {target}"))
-            })?;
+        //
+        // **D194: and the target's view, pinned.** A row only the source touched is staged onto
+        // the target with `before` = what the TARGET sees of it, and that `before` is what lands
+        // in the target's `base_rows`. Taking it from the source's `base_rows` is right only when
+        // the two read main at the same instant — true for two children of one live parent, which
+        // share their parent's snapshot, and false for two trunk forks with a commit between them.
+        // `same_view` says which; when it is false the target's image is looked up through its own
+        // snapshot, below.
+        let (src, tgt, policy, tgt_at, same_view) = {
+            let mut state = self.state.lock().unwrap();
+            if !state.workspaces.contains_key(&source) {
+                return Err(FerroError::Branch(format!("no agent session on branch {source}")));
+            }
+            let apply_seq = state.apply_seq;
+            let tgt_at = state
+                .workspaces
+                .get_mut(&target)
+                .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {target}")))?
+                .pin(apply_seq, &ctx.txn);
+            let src = &state.workspaces[&source];
+            let tgt = &state.workspaces[&target];
+            let same_view = src
+                .fork_snapshot
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &tgt_at) || (s.high_water == tgt_at.high_water && s.active == tgt_at.active));
             (
                 SiblingSide {
                     rows: src.rows.clone(),
@@ -3936,6 +4160,8 @@ impl AgentRuntime {
                     base_shapes: tgt.base_shapes.clone(),
                 },
                 state.policy.clone(),
+                tgt_at,
+                same_view,
             )
         };
 
@@ -3982,8 +4208,18 @@ impl AgentRuntime {
             let on_target = match tgt.rows.get(&(*t, *r)) {
                 Some(RowState::Present(v)) => Some(v.clone()),
                 Some(RowState::Deleted) => None,
-                // The target never touched this row, so it still sees the fork point's image.
-                None => base.clone(),
+                // The target never touched this row, so it sees the image its own snapshot has —
+                // which is the source's fork-point image when the two share a view (D194).
+                None if same_view => base.clone(),
+                None => match base.as_ref().or(match after {
+                    RowState::Present(v) => Some(v),
+                    RowState::Deleted => None,
+                }) {
+                    Some(img) => self.row_at(&ctx.read(), &table, (*t, *r), &img[0], Arc::clone(&tgt_at))?,
+                    // Neither side has an image: a delete of a row the source never saw. Nothing
+                    // below reads `on_target` for that arm.
+                    None => None,
+                },
             };
             let mut applied_ops: Vec<Op> = Vec::new();
             let mut discarded = Vec::new();
@@ -4062,7 +4298,8 @@ impl AgentRuntime {
                             // three-way merge rather than a replay. `concurrent_op` cannot answer
                             // here: it reads `state.applied`, the log of what has been PUBLISHED,
                             // and a sibling has published nothing.
-                            let theirs = self.sibling_op(&tgt, tbl, row, col, b, idx);
+                            let theirs =
+                                self.sibling_op(&tgt, tbl, row, col, b, idx, on_target.as_ref());
                             let cell = CellMerge {
                                 tbl,
                                 row,
@@ -4227,6 +4464,7 @@ impl AgentRuntime {
     /// has been PUBLISHED to the shared tables. A sibling branch has published nothing, so asking
     /// it returns `None` for every cell and the merge degenerates to a replay of the source over
     /// the target — no conflict ever detected. The sibling's frame is where its writes are.
+    #[allow(clippy::too_many_arguments)]
     fn sibling_op(
         &self,
         tgt: &SiblingSide,
@@ -4235,6 +4473,7 @@ impl AgentRuntime {
         col: ColId,
         base: &[Value],
         idx: usize,
+        on_target: Option<&Vec<Value>>,
     ) -> Option<OpKind> {
         let ops: Vec<OpKind> = ours_ops_on_cell(&tgt.ops, tbl, row, col);
         if !ops.is_empty() {
@@ -4243,12 +4482,46 @@ impl AgentRuntime {
         // The target moved the cell without an op recorded against it — a whole-row write, for
         // instance. The move is still real, so it is reported as the assignment it amounts to
         // rather than dropped, which would read as "the sibling did not touch this cell".
-        match tgt.rows.get(&(tbl.0, row.0)) {
-            Some(RowState::Present(v)) if v.get(idx) != base.get(idx) => {
-                v.get(idx).cloned().map(OpKind::Assign)
-            }
+        //
+        // Read from `on_target`, the image the target SEES, rather than from its staged rows
+        // alone (D194): a row the target never touched still differs from the source's base when
+        // the target forked after main moved it, and that move is just as real.
+        match on_target {
+            Some(v) if v.get(idx) != base.get(idx) => v.get(idx).cloned().map(OpKind::Assign),
             _ => None,
         }
+    }
+
+    /// **D194.** One row of the shared tables as the snapshot `at` has it, found by primary key —
+    /// a point lookup, as `evaluate_merge` and `cherry_pick` do it, so the cost is O(log N) and
+    /// never a scan. `key` is the row's `(table id, row id)`, checked against what comes back
+    /// because the planner's pushdown is a hint, not a filter.
+    fn row_at(
+        &self,
+        ctx: &ReadCtx,
+        table: &str,
+        key: (u32, u64),
+        pk: &Value,
+        at: Arc<Snapshot>,
+    ) -> Result<Option<Vec<Value>>, FerroError> {
+        let entry = ctx
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| FerroError::Bind(format!("unknown table: {table}")))?;
+        let pk_col = entry
+            .schema
+            .columns
+            .first()
+            .map(|c| c.name.clone())
+            .ok_or_else(|| FerroError::Bind(format!("'{table}' has no columns")))?;
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::ColumnRef { table: None, column: pk_col }),
+            operator: TokenType::Equal,
+            right: Box::new(value_expr(pk)),
+        };
+        Ok(scan_table_where(table, None, Some(&pred), ctx, at)?
+            .into_iter()
+            .find(|row| row_id_of(row).0 == key.1))
     }
 
     /// **Score a merge without performing it.**
@@ -4484,7 +4757,13 @@ impl AgentRuntime {
                         operator: TokenType::Equal,
                         right: Box::new(value_expr(&key)),
                     };
-                    for row in scan_table_where(name, None, Some(&pred), &ctx.read())? {
+                    // **CURRENT, deliberately (D194).** This is the merge deciding what to write
+                    // to main, so it reads main as it stands: `now` in the three-way comparison
+                    // below, against `base_rows` (the fork) and the branch's own `after`. Reading
+                    // the branch's `fork_snapshot` here would make `now == base` for every row and
+                    // publish over every concurrent write as if there had been none.
+                    let now = ctx.txn.read_snapshot_cached();
+                    for row in scan_table_where(name, None, Some(&pred), &ctx.read(), now)? {
                         current.insert((t, row_id_of(&row).0), row);
                     }
                 }
@@ -5407,7 +5686,7 @@ impl AgentRuntime {
                     rid: RecordId { page_id: 0, slot_num: 0 },
                     begin_ts: seq,
                 };
-                state.versions.insert((op.tbl.0, op.row.0), v);
+                state.publish_version(v);
                 // **The valued writes a scan's retained region is checked against.** One per COLUMN
                 // of each image, because `PredicateSummary::covers` matches a write only against the
                 // column its predicate names: a summary over `qty` cannot see a write recorded
@@ -6759,8 +7038,12 @@ fn apply_dml_in(
 
 /// Every row of a table as the shared (merged) state has it.
 /// Every row of `table`, unfiltered. The callers that diff, merge and sweep want exactly that.
+///
+/// **As main stands NOW** (D194): its callers are the merge's assertion scan and `REVERT`'s undo,
+/// both of which are about to write the shared tables and must see what is there. A branch's
+/// view is never read through this; see `AgentRuntime::visible_rows_where`.
 pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
-    scan_table_where(table, None, None, ctx)
+    scan_table_where(table, None, None, ctx, ctx.txn.read_snapshot_cached())
 }
 
 /// The rows of `table` that satisfy `where_clause`, with the predicate PUSHED INTO THE PLANNER.
@@ -6779,15 +7062,24 @@ pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroEr
 /// path: bind it, and pick the index. Nothing is invented; the predicate was simply never
 /// handed over. `alias` must match the statement's, or the planner cannot bind a qualified
 /// column reference in the predicate.
+///
+/// # `at` — which moment of main is read (D194)
+///
+/// Every caller names it, and there is deliberately no default: the two answers are both right
+/// somewhere and wrong everywhere else, and a default is how the branch read path read main AS OF
+/// NOW for as long as it did. A read ON A BRANCH'S BEHALF passes the branch's pinned
+/// `fork_snapshot` (`visible_rows_where`, `cherry_pick`'s images of the target branch). A read
+/// that DECIDES WHAT TO WRITE TO main passes main's current snapshot — D59's
+/// `read_snapshot_cached`, one Acquire load when no transaction has begun or ended since this
+/// thread last asked (`evaluate_merge`, `scan_table`).
 pub fn scan_table_where(
     table: &str,
     alias: Option<&str>,
     where_clause: Option<&Expr>,
     ctx: &ReadCtx,
+    at: Arc<Snapshot>,
 ) -> Result<Vec<Vec<Value>>, FerroError> {
-    // D59: the cached snapshot — one Acquire load when no transaction has begun or ended
-    // since this thread last asked. `read_snapshot` remains the uncached truth.
-    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot_cached(), txn_id: 0 });
+    let view = Arc::new(ReadView { snapshot: at, txn_id: 0 });
     let stmt = Stmt::Select {
         from: TableRef::plain(table.to_string(), alias.map(|a| a.to_string())),
         columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],
@@ -7043,6 +7335,7 @@ mod tests {
             prov: ProvId::NONE,
             txn: TxnId(txn),
             fork_seq: 0,
+            fork_snapshot: None,
             fork_root: 0,
             // D27 made these structurally shared (`PersistentMap` / `Arc<Vec>`). None of them is
             // read by `txn_refs_of`, which is why the index survived that change untouched — only

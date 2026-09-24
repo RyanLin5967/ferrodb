@@ -448,7 +448,12 @@ pub fn run_agent_stmt_staged(
             // there is no route by which a prompt becomes a durable copy of what it contained.
             // STAGED: everything but the fsync, which leaves through `pending` so it can be
             // awaited once the caller has dropped its statement-wide catalog guard.
-            let (s, durability) = runtime.begin_session_as_staged(
+            //
+            // PINNED (D194): the branch reads main as of THIS statement for the rest of its life,
+            // not as of whichever statement it happens to be running. The transaction manager is
+            // in hand here, so there is no reason to leave the pin to the branch's first read and
+            // let main's commits in between show through.
+            let (s, durability) = runtime.begin_session_pinned_staged(
                 crate::agent_sql::runtime::RunIdentity {
                     agent_id: &agent_id,
                     run_id: run_id.as_deref(),
@@ -456,6 +461,7 @@ pub fn run_agent_stmt_staged(
                     prompt: prompt.as_deref(),
                 },
                 parent,
+                &ctx.txn,
             )?;
             *pending = Some(durability);
             session.agent = Some(s.clone());

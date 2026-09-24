@@ -479,3 +479,50 @@ fn a_commuting_divergence_is_recovered_through_the_by_cell_index() {
         "the picked Add did not compose onto the target's value"
     );
 }
+
+/// **D194: a pick reads the target branch AS OF ITS FORK, so it lands on the row the branch sees.**
+///
+/// B forks before A publishes. B therefore still sees row 1 at A's witness (qty 100), and picking
+/// A's `+5` onto B is the natural case the test above has to arrange by hand: the target holds
+/// exactly the value the op was computed from. Reading the target's image from main as it stands
+/// instead — 105, with A's op already in it — made the witness disagree with the target, and the
+/// fallback `Assign(105)` refused the pick.
+///
+/// The image the pick reads also becomes the staged row's `before`, which is what lands in
+/// `base_rows`. So B's changeset must report the fork-point row (100) as the row's before-image:
+/// `base_rows` is the fork-point value by construction only if every door that stages reads
+/// through the pin.
+#[test]
+fn a_pick_reads_the_target_branch_as_of_its_fork() {
+    let mut db = Db::new();
+    db.seed(); // inventory (1, 100, 10), (2, 200, 20)
+
+    let (b, _sb) = db.agent("agent-b");
+
+    let (a, mut sa) = db.agent("agent-a");
+    db.ok("UPDATE inventory SET qty = qty + 5 WHERE id = 1;", &mut sa);
+    db.merge(a);
+    assert_eq!(db.cell("inventory", "qty", None, 1), Some(105), "fixture: A did not publish");
+    assert_eq!(db.cell("inventory", "qty", Some(b), 1), Some(100), "B does not read as of its fork");
+    let add_five = db.seq_from(Some(a), "inventory", 1, 1);
+
+    let rt = db.rt();
+    let (bp, txn) = (db.bp.clone(), db.txn.clone());
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let result = rt.cherry_pick(&mut ctx, a, &[add_five], b).unwrap();
+    assert!(
+        result.is_applied(),
+        "a pick onto a branch that still holds the op's witness was refused: {:?}",
+        result.refusal().map(|r| r.kinds())
+    );
+    let cs = rt.diff(&mut ctx, b).unwrap();
+    drop(ctx);
+
+    assert_eq!(db.cell("inventory", "qty", Some(b), 1), Some(105), "100 + 5 did not land on B");
+    assert_eq!(cs.rows.len(), 1, "one row picked, {} rows in B's changeset", cs.rows.len());
+    assert_eq!(
+        cs.rows[0].before,
+        Some(vec![Value::Integer(1), Value::Integer(100), Value::Integer(10)]),
+        "B's before-image for the picked row is not the row as B forked it"
+    );
+}

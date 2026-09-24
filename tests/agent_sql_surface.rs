@@ -410,6 +410,133 @@ fn pairs(r: Vec<Vec<Value>>) -> Vec<(i32, i32)> {
     v
 }
 
+/// **D194: the snapshot is taken AT THE FORK, not at the branch's first read.**
+///
+/// The test above stages an UPDATE before main moves, so a pin taken lazily at the branch's first
+/// read would satisfy it too. Here the branch runs nothing at all until main has moved, and its
+/// first statement must still see main as of `BEGIN AGENT SESSION`. The point lookups go through
+/// the primary index rather than a sequential scan, so an old version has to be reached through
+/// the `prev` chain (row 1) and through a version whose `end_ts` a later DELETE stamped (row 2).
+#[test]
+fn a_branch_is_pinned_at_its_fork_not_at_its_first_read() {
+    let mut db = Db::new();
+    db.seed(); // (1, 20), (2, 5)
+    let mut main = db.session();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+
+    db.ok("UPDATE inventory SET qty = 99 WHERE id = 1;", &mut main);
+    db.ok("INSERT INTO inventory VALUES (4, 40);", &mut main);
+    db.ok("DELETE FROM inventory WHERE id = 2;", &mut main);
+    let on_main = pairs(rows(db.ok("SELECT id, qty FROM inventory;", &mut main)));
+    assert_eq!(on_main, vec![(1, 99), (4, 40)], "fixture: main did not move as written");
+
+    // The branch's first statement of any kind.
+    let seen = pairs(rows(db.ok("SELECT id, qty FROM inventory;", &mut a)));
+    assert_eq!(seen, vec![(1, 20), (2, 5)], "the branch was pinned at its first read, not at its fork");
+
+    for (id, want) in [(1, Some(20)), (2, Some(5)), (4, None)] {
+        let got = rows(db.ok(&format!("SELECT qty FROM inventory WHERE id = {id};"), &mut a));
+        let got = got.first().map(|r| r[0].clone());
+        assert_eq!(
+            got,
+            want.map(Value::Integer),
+            "a point lookup of row {id} on the branch disagrees with the branch's own scan"
+        );
+    }
+}
+
+/// **D194: a nested task inherits its parent's fork INSTANT — the snapshot and the seq together.**
+///
+/// The child's view is its parent's view, so it reads main as of the PARENT's fork. The merge then
+/// has to count everything published since that instant as concurrent. Were the child to inherit
+/// the snapshot but take a fresh `fork_seq`, main's decrement would be outside the child's view
+/// and outside "theirs" at once: the merge would see the target moved with no op to explain it,
+/// read that as an opaque `Assign`, and refuse an increment that commutes with a decrement.
+#[test]
+fn a_nested_task_reads_its_parents_fork_and_composes_with_what_main_published_since() {
+    let mut db = Db::new();
+    db.seed(); // (1, 20), (2, 5)
+    let mut parent = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'planner' RUN 'r1';", &mut parent);
+
+    // Another agent publishes a decrement to main AFTER the parent forked.
+    let mut other = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'other' RUN 'r2';", &mut other);
+    db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut other);
+    assert!(report(db.ok("MERGE;", &mut other)).applied_to_target);
+    assert_eq!(qty_of(&mut db, 1), 15, "fixture: the concurrent decrement did not land");
+
+    // The child forks from the parent now. SQL allows one session per connection, so a nested
+    // fork goes through the runtime with an explicit parent, as the test above this one does.
+    let parent_branch = parent.agent.as_ref().unwrap().branch;
+    let child = db.runtime.begin_session("sub", Some("r3"), parent_branch).unwrap();
+    let child_branch = child.branch;
+    let sql = format!("SELECT qty FROM inventory AS OF BRANCH {} WHERE id = 1;", child.branch_name);
+    let mut c = db.session();
+    c.agent = Some(child);
+
+    // Looked at from OUTSIDE the child, deliberately: a point read by the child itself would be a
+    // retained premise, and main has moved that row since the parent forked, so the read-premise
+    // gate would hold the merge below for a reason that is not the one under test.
+    let mut observer = db.session();
+    let seen = rows(db.ok(&sql, &mut observer));
+    assert_eq!(seen[0][0], Value::Integer(20), "the child did not read as of its parent's fork");
+
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 1;", &mut c);
+    let merged = report(db.ok("MERGE;", &mut c));
+    assert!(
+        merged.applied_to_target,
+        "the child's increment commutes with main's decrement, but the merge did not publish: {} \
+         (quarantine reason: {:?})",
+        merged,
+        db.runtime.quarantine_reason(child_branch)
+    );
+    assert_eq!(qty_of(&mut db, 1), 16, "20 - 5 + 1: the two effects did not compose");
+}
+
+/// **D194: a scan through the pin depends only on what the pin could see.**
+///
+/// A read-set carries the point on the runtime's version clock it observed, and REVERT's
+/// dependency graph names a reader as dependent on a merge whose version is below that point. B
+/// forks before `m_1` publishes and scans after it; B saw row 1 as 20, not `m_1`'s 15, so reverting
+/// `m_1` takes nothing out from under B and must not halt on it. Stamping B's scan with the clock
+/// as of the READ would name `m_1` as a dependency of a scan that could not see it.
+#[test]
+fn a_scan_through_the_pin_is_not_a_dependent_of_a_merge_it_could_not_see() {
+    let mut db = Db::new();
+    db.seed(); // (1, 20), (2, 5)
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r2';", &mut b);
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut a);
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+    assert_eq!(qty_of(&mut db, 1), 15, "fixture: m_1 did not publish");
+
+    // A range scan retains a predicate region, and row 1 is inside it at both values.
+    let seen = pairs(rows(db.ok("SELECT id, qty FROM inventory WHERE qty >= 0;", &mut b)));
+    assert_eq!(seen, vec![(1, 20), (2, 5)], "B did not scan as of its fork");
+    db.ok("UPDATE inventory SET qty = qty + 2 WHERE id = 2;", &mut b);
+    let second = report(db.ok("MERGE;", &mut b));
+    assert!(second.applied_to_target, "{}", second);
+    assert_eq!(qty_of(&mut db, 2), 7);
+
+    let mut main = db.session();
+    let plan = match agent(db.ok("REVERT MERGE m_1;", &mut main)) {
+        AgentOutput::Revert(p) => p,
+        other => panic!("expected a revert plan, got {}", other),
+    };
+    assert!(
+        !plan.is_blocked(),
+        "the revert halted on a scan that read main as of before m_1: {:?}",
+        plan
+    );
+    assert_eq!(qty_of(&mut db, 1), 20, "m_1 was not reverted");
+    assert_eq!(qty_of(&mut db, 2), 7, "B's merge was taken out by a revert it did not depend on");
+}
+
 // ---- exit criterion 4: DIFF is structured ---------------------------------------------------
 
 #[test]
