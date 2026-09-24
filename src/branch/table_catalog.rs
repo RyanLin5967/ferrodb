@@ -4068,6 +4068,290 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ---- review 3 (D198): the clocks, the downgrade, and the evidence ----------------------------
+
+    /// The magic `main`'s `TableBranchCatalog::open` accepts, and nothing else (`table_catalog.rs:133`
+    /// at `9aa6968`). A literal, so that no expectation here comes from the subject.
+    const MAIN_MAGIC: u32 = 0xFE44_0B01;
+
+    /// The header page's magic as it is ON DISK — what a `main` binary would read first.
+    fn magic_on_disk(path: &std::path::Path) -> u32 {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(path).unwrap();
+        let at = SIDECAR_HEADER_PAGE as u64 * crate::storage::disk_manager::PAGE_SIZE as u64;
+        f.seek(SeekFrom::Start(at)).unwrap();
+        let mut b = [0u8; 4];
+        f.read_exact(&mut b).unwrap();
+        u32::from_be_bytes(b)
+    }
+
+    /// Overwrite the header page's magic on disk, as a flush that never reached that page would
+    /// have left it.
+    fn write_magic_on_disk(path: &std::path::Path, magic: u32) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let at = SIDECAR_HEADER_PAGE as u64 * crate::storage::disk_manager::PAGE_SIZE as u64;
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&magic.to_be_bytes()).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    /// The wall clock, read by the test itself: the clock an OS stamps a file's mtime with.
+    fn wall_now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// **Review 3, C1: the FirstStart credit must be the file's WALL-clock age.** `mtime` is a wall
+    /// stamp; `now` is the lease clock, which lags the wall clock by the host's sleep (F2). With
+    /// the lease clock `S` behind the wall at both the last write and the resume, `now − mtime` is
+    /// short by `S`, and a lease with less than `S` left is reaped at the first start. The fixture
+    /// is on the WALL clock: the OS-stamped mtime is `S` ahead of the lease reading the lease was
+    /// written against (via `cluster::wall_step`, this thread's wall clock). Red against `1ec2deb`.
+    #[test]
+    fn a_first_start_credits_the_files_wall_clock_age_even_when_the_lease_clock_lags_it() {
+        use crate::cluster::wall_step;
+        const S: u64 = 2 * HOUR;
+        let path = sidecar("lagging-lease-clock");
+        // Anchor the lease clock unstepped; from here this thread's wall clock runs S ahead of it.
+        let t = LeaseDeadline::now_millis();
+        let _slept = wall_step::by(S as i64);
+        // An hour left — less than S — when the file was last written, at wall time t + S.
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(t + HOUR)).unwrap().branch_id
+        };
+        age_file(&path, t + S);
+        // Three hours pass with nothing running, on both clocks.
+        let now = t + 3 * HOUR;
+        let _later = wall_step::by((S + 3 * HOUR) as i64);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let w0 = wall_now_millis() + S + 3 * HOUR;
+        c.resume_leases(now).unwrap();
+        let w1 = wall_now_millis() + S + 3 * HOUR;
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "the first start credited the lease clock's reading against a wall-clock mtime, short by \
+             the {S} ms the lease clock lags: a lease with an hour left was expired (review 3, C1)"
+        );
+        let (lo, hi) = (t + HOUR + (w0 - (t + S)), t + HOUR + (w1 - (t + S)) + 1_000);
+        assert!(
+            (lo..=hi).contains(&lease.0),
+            "credited {} ms; the file's wall-clock age was between {} and {} ms",
+            lease.0 - (t + HOUR),
+            w0 - (t + S),
+            w1 - (t + S)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Review 3, C2 / SCALE-DESIGN "D198 addendum 2": a downgrade must refuse.** Once a deadline
+    /// is stored at `D > 0` it is `lease − D`, and a `main` binary — which ignores `[0x08]` — would
+    /// read it `D` early. `main` refuses any header magic but `0xFE44_0B01`, so a catalog that has
+    /// left `D = 0` must carry another one on disk before its first such deadline. Red against
+    /// `1ec2deb`, which never changes the magic.
+    #[test]
+    fn a_catalog_whose_offset_leaves_zero_is_refused_by_the_old_binary_magic_check() {
+        let path = sidecar("downgrade");
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap();
+            c.record_lease_alive(1_000).unwrap();
+            c.resume_leases(4_000).unwrap(); // D = 3000
+            // The first deadline stored in virtual time with D > 0.
+            c.fork(BranchId::TRUNK, LeaseDeadline(10_000)).unwrap();
+        }
+        assert_ne!(
+            magic_on_disk(&path),
+            MAIN_MAGIC,
+            "a catalog holding a deadline stored at D = 3000 still carries the magic main opens: a \
+             downgraded binary would read that lease 3000 ms early"
+        );
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_eq!(re.alive_state().unwrap(), Some((4_000, 3_000)), "this branch must still open it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The control: a catalog that never leaves `D = 0` stores lease time as lease time, and stays
+    /// downgradable. Green against `1ec2deb` too.
+    #[test]
+    fn a_catalog_that_never_leaves_offset_zero_keeps_the_magic_main_opens() {
+        let path = sidecar("magic-zero");
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap();
+            c.resume_leases(5_000).unwrap(); // a fresh file: FirstStart, D = 0
+            c.record_lease_alive(6_000).unwrap();
+            c.resume_leases(6_000).unwrap(); // resumed at its own mark: downtime 0, D = 0
+            c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        }
+        assert_eq!(magic_on_disk(&path), MAIN_MAGIC, "a D = 0 catalog lost the magic main opens");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The crash the addendum names: the `[0x08]` record with `D > 0` reached disk and the header
+    /// page did not. A reopen must put the new magic on disk before anything can store a deadline
+    /// at that `D`. Red against `1ec2deb`.
+    #[test]
+    fn an_offset_on_disk_beside_the_old_magic_is_switched_at_open() {
+        let path = sidecar("torn-magic");
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+            c.record_lease_alive(1_000).unwrap();
+            c.resume_leases(4_000).unwrap(); // D = 3000
+            b
+        };
+        write_magic_on_disk(&path, MAIN_MAGIC);
+
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_ne!(
+            magic_on_disk(&path),
+            MAIN_MAGIC,
+            "a catalog opened with D = 3000 on disk left the magic main opens in place"
+        );
+        assert_eq!(lease(&re, b), 4_500, "and it must read its leases on the offset it holds");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Review 3, C5.** A migration whose SOURCE mtime cannot be read has no evidence of the outage,
+    /// so its first start credits nothing. It must not fall back to the NEW file's own mtime, which
+    /// is this process's write and says nothing. The mtime is made unreadable by putting it before
+    /// 1970, which `file_mtime_millis` rejects; the premise is checked. Red against `1ec2deb`.
+    #[test]
+    fn a_migration_whose_source_time_cannot_be_read_credits_nothing() {
+        let dir = std::env::temp_dir().join(format!("ferro-f1-nosrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        let legacy = dir.join("legacy.db.branches");
+        {
+            let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
+            log.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+        }
+        let f = std::fs::OpenOptions::new().write(true).open(&legacy).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)).unwrap();
+        drop(f);
+        assert!(
+            file_mtime_millis(&legacy).is_none(),
+            "premise: the source's mtime must be unreadable, or this test is about nothing"
+        );
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let resumed = c.resume_leases(LeaseDeadline::now_millis()).unwrap();
+        assert!(
+            matches!(resumed, LeaseResume::FirstStart { .. }),
+            "an unreadable SOURCE time was replaced by the new file's own (review 3, C5): {resumed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a legacy log holding one live lease `lease`, stamped `mtime`, in a fresh directory.
+    fn legacy_log(tag: &str, lease: u64, mtime: u64) -> (std::path::PathBuf, BranchId) {
+        let dir = std::env::temp_dir().join(format!("ferro-f1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("legacy.db.branches");
+        let b = {
+            let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
+            log.fork(BranchId::TRUNK, LeaseDeadline(lease)).unwrap().branch_id
+        };
+        age_file(&legacy, mtime);
+        (dir, b)
+    }
+
+    /// **Review 3, C6.** A crash between the switchover's two renames leaves the legacy log beside a
+    /// finished catalog. Either file may be the better evidence, so the credit is taken from the
+    /// EARLIER of the two — the larger, conservative credit. Here the catalog is older than the
+    /// log. Red against `1ec2deb`, which prefers the log unconditionally.
+    #[test]
+    fn an_interrupted_switchover_credits_from_the_earlier_of_the_source_and_the_catalog() {
+        let t = LeaseDeadline::now_millis();
+        let lapsed = t - 3 * HOUR / 2; // inside a two-hour outage, not inside a one-hour one
+        let (dir, b) = legacy_log("switchover", lapsed, t - HOUR);
+        let db = dir.join("legacy.db");
+        let cat = dir.join("legacy.db.branchcat");
+        let retired = dir.join("legacy.db.branches.pre-table");
+        let legacy = dir.join("legacy.db.branches");
+        drop(TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap());
+        // The crash between the renames: the log is back beside the finished catalog.
+        std::fs::rename(&retired, &legacy).unwrap();
+        age_file(&cat, t - 2 * HOUR);
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("the migrated branch is live");
+        assert!(
+            !lease.is_expired_at(now),
+            "the switchover credited the later of its two file times (the log's hour) instead of the \
+             earlier (the catalog's two hours): a lease that lapsed 1.5 h ago was charged (C6)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Review 3, C4.** After a completed migration the evidence of the outage before it is the
+    /// retired `{db}.branches.pre-table`, whose mtime the rename kept. A catalog that was then
+    /// written again without ever resuming — by an embedder, say — must still be credited from
+    /// the earlier. Red against `1ec2deb`, which never looks at the retired log.
+    #[test]
+    fn a_catalog_migrated_and_never_resumed_is_credited_from_the_retired_log() {
+        let t = LeaseDeadline::now_millis();
+        let lapsed = t - HOUR / 2;
+        let (dir, b) = legacy_log("pretable", lapsed, t - HOUR);
+        let db = dir.join("legacy.db");
+        let cat = dir.join("legacy.db.branchcat");
+        drop(TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap());
+        // Written again five minutes ago, never resumed.
+        age_file(&cat, t - 5 * 60 * 1_000);
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("the migrated branch is live");
+        assert!(
+            !lease.is_expired_at(now),
+            "credited only since the catalog's own last write; the retired log said an hour (C4)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Review 3, C4: the evidence must survive a failed first start.** A first D198 start can
+    /// write the catalog before it resumes — `AgentRuntime::with_storage`'s trunk `set_root`,
+    /// `resume_interrupted_reaps` — and then fail. The next start reads that write's mtime and
+    /// charges the outage before it. Red against `1ec2deb`.
+    #[test]
+    fn the_first_start_evidence_survives_a_start_that_wrote_and_failed_before_resuming() {
+        let path = sidecar("failed-first-start");
+        let t = LeaseDeadline::now_millis();
+        let lapsed_in_outage = t - HOUR / 2;
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+        };
+        age_file(&path, t - HOUR);
+        {
+            // A first start that writes durably and then fails before its resume.
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.set_root(BranchId::TRUNK, 1).unwrap();
+        }
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "the failed start's own write replaced the file's evidence, and the hour before it was \
+             charged (review 3, C4)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
