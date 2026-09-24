@@ -1093,3 +1093,149 @@ Nothing new is registered for it.
 - `f1_lease_grace` → **39** (+1 at `78ed41c`, +2 at `1d64b36`).
 - **base + 56**.
 - The lib filter of amendment 10 → **50** (39 + 5 + 3 + 1 + 1 + 1).
+
+## Amendment 13 — review 5 (`frontier/lease_review5.md` @ `adcce16`): the head did not compile. Written before the fix.
+
+Nothing here has been run (quiet mode).
+
+### B1, and what it says about amendments 11–12
+
+`fdd2d23` changed `FirstStartEvidence::file` to `Option<FileWallStamp>` and left
+`first_start_credit`'s `file_mtime: e.file` feeding `FirstStartCredit::file_mtime: Option<u64>`. That
+is E0308 at `fdd2d23`, `a678a61` and `cbc51df`.
+
+**Every GREEN prediction of amendment 12 (§7 7e, 7f, 8, 9, M58–M62) was void from the moment it was
+written.** The lane's own row says a compile error on the clean tree fails the pre-registration, and
+it does.
+
+The fix below is `file_mtime: e.file.map(FileWallStamp::millis)`. Then comes a hunk-by-hunk,
+field-by-field re-check of `git diff 012f65c` against the struct and function definitions. The record
+of that check is appended below the fix, as an amendment-13 addendum.
+
+### Committed so far, with predictions
+
+| commit | test | at that commit | after the fix | kills |
+|---|---|---|---|---|
+| `1dad3a6` | `f1_lease_grace::a_lagging_writer_over_an_evidence_bearing_catalog_keeps_its_leases_across_the_next_start` | does not compile (B1) | PASS: soft mark on `L_w ≈ t`, credit `1 h + S + 10 s`, the lease keeps `LEFT + 1 h − ε` | M58b |
+| `1dad3a6` | `f1_lease_grace::an_unresumed_writers_accrued_downtime_is_fixed_at_its_open_not_at_its_commit` | does not compile (B1) | PASS: credited in `[(a0 − m) + (now − b1), (a1 − m) + (now − b0)]` | M64 |
+
+Both are mutant killers, not reds: the code already behaves as they assert.
+
+### The fixes that follow
+
+**B1.** `file_mtime: e.file.map(FileWallStamp::millis)`.
+
+**C3, the raw stamp.**
+- `FileWallStamp::millis()` stays crate-private, with exactly TWO consumers, both named in its doc:
+  - `first_start_credit`, for the startup report's `file_mtime`;
+  - the `#[cfg(test)]` `file_mtime_millis`, which is the C5 test's premise.
+- Every arithmetic consumer goes through a new `lease_scale_age_millis(lease_now)`, whose doc carries
+  R2, or through `wall_age_millis()`. That covers `owed_at_open`, `resume_credit`'s lease half, and the
+  migration.
+- The claim is scoped to "no single call returns a wall reading". `s.millis() + s.wall_age_millis()`
+  IS one, for any stamp. So the guard is a TEST, not the type:
+  - **M58b** is the re-spelled M58, stamping the soft mark with the wall clock through a stamp the
+    catalog holds;
+  - `1dad3a6`'s first test kills it.
+
+**C1a, the wording.** "Lease terms only" (`FirstStartEvidence`'s doc, `owed_at_open`'s, the migration's
+comment) becomes "lease-scale terms: the mtime is the lease reading of a writer whose lease clock was
+the wall clock (R2)".
+
+**C1b, a stated residual.** R2 is scoped to a writer whose lease clock was the wall clock: every
+pre-D198 build, and so every `.branches` log a pre-D198 build wrote. A `.branches` log that a D198
+build wrote (`LogBranchCatalog::open`, the documented embedder path) breaks R2.
+- The migration's `L_mig − m`, and the migrating resume's wall half, are then short by that writer's
+  lag at its last append. That is E1, for a writer that never soft-marks. It is never below `D = 0`.
+- **No soft mark is added to `LogBranchCatalog`.** The reasons:
+  1. `LogBranchCatalog` has no restart grace at all (`resume_leases` is the trait's `NoMark`). Every
+     restart of a log-backed database already charges its whole outage, so the migration moment is
+     the least of its under-credits.
+  2. Its log format is length-prefixed `BranchRecord`s, and `main`'s `replay` refuses any other entry
+     (READ `main:src/branch/catalog.rs:263–284`). An in-log mark would make every D198-written log
+     unopenable by `main`.
+  3. A sidecar mark file costs a second write per append, and cannot be emulated in-process: the OS
+     stamps the log with the real wall clock, not `wall_step`'s. A red test would therefore need the
+     sidecar itself.
+- **No red test is added for C1b.** There is no fix for it to turn green. A pin that asserts the
+  under-credit would enshrine the defect, so the residual is stated instead. This departs from the
+  lead's "add a red test", and is reported as such.
+
+**C1c.** R1 is corrected. `lag` is not non-decreasing on macOS: `Instant` is `CLOCK_UPTIME_RAW`, which
+drifts against the NTP-disciplined wall by the oscillator's error, in either direction, with no step.
+R1 is used only for `m ≥ s.mark`, so its failure over-credits only: the file half exceeds the soft
+half by `|lag|`.
+
+**C1d, stated.** A torn first commit (C5(a)) also loses up to the torn writer's own lag: the file
+half is `L − m`, with `m` stamped by the wall while that writer's lease clock lagged. It is never
+below `D = 0`.
+
+**C1e, stated.** Open as a cluster member, then `leave()`: `standalone_lease_millis()` is `None` at
+the open, so `first_start_owed = 0`, and the soft marks written after `leave()` carry nothing accrued.
+- The pre-open outage is dropped. That is under the policy, never below `D = 0`.
+- It is a change from `012f65c`, which computed the wall age there. It is embedder-only: members use
+  `LogBranchCatalog`.
+
+**C4, the over-credit routes, completed.** Amendment 12's "each is bounded only by a physical
+interval" was false for route 1 below. All are over-credits:
+
+| route | bounded by |
+|---|---|
+| a writer's idle tail after its last commit | that tail |
+| the resumer's own lag (the wall half at the resume) | its host sleep since its anchor |
+| leases GRANTED by an unresumed writer receive the whole `accrued` outage | the pre-writer outage |
+| a stale soft mark after D198 → `main` → D198, or through a D198 cluster-member interlude (members write none) | that whole interlude |
+| a read-only opener's uptime | its run |
+| **a forward wall step, or a wrong wall clock, between processes or after the resumer's anchor** | **the step: not a physical interval (an RTC reset forward by a year credits a year)** |
+| a resumed process that never heartbeats | its uptime |
+| **an unresumed writer that later resumes ITSELF**: `resume_leases` credits from the evidence taken at its OPEN, so its own run between open and resume is credited, and leases it refused as expired at `D = 0` come back | that run |
+| an embedder continuing after a failed mark `durable`: `[0x08]` stays in the tree, and a later commit persists it | the interval to that later commit |
+| an mtime rewound by a restore that preserves mtimes | the rewind |
+
+**Why the stale soft mark cannot be bounded.** `[0x09]` carries no age. A bound built from `m − s.mark`
+would reopen E1: a writer whose lease clock lagged by `S` legitimately leaves `m ≈ s.mark + S`, which
+is indistinguishable from a stale mark followed by a later writer that left no soft mark. The only
+limiter is addendum 2's gate: the route exists only while `D = 0`.
+
+**The doc sentence "nothing credits an unresumed writer's own run"** becomes "nothing credits an
+unresumed writer's own run to the NEXT process". A writer that later resumes itself credits its own
+run, as in the table.
+
+The `SoftMark` doc's "once `[0x08]` exists this key is never written or read again" becomes "never
+READ once `[0x08]` is on disk". A commit racing the mark's own `durable` may still write one, and the
+next open ignores it (review 5 Q4).
+
+**C5.** The migration syncs the directory after EACH rename, not once after both. One sync after
+both does not order them: a filesystem that persisted the retirement and not the publish would leave
+neither file, and the next open would create a fresh empty catalog (pre-existing at `9aa6968`). That
+is one more fsync, once in a catalog's life. M63 (either sync removed) remains a registered survivor.
+
+**C6, the ratio definition.** Amendment 12 said "the ratio of median staged-fork time". The harness
+computed the upper median over rounds of the per-round ratio `median(unmarked)/median(marked)`. Both
+are made to say the same thing:
+- **the statistic is the median over rounds of the per-round ratio of medians.** Pairing within a
+  round cancels drift between rounds.
+- The harness's even-count median is changed from the upper middle element to the mean of the two
+  middle elements.
+- The predicted intervals are unchanged.
+
+**T.** The accrual test's name ends `…and_its_own_run_is_not_credited`. Its doc now hands that clause,
+scoped to the NEXT process, to two tests:
+- `the_soft_mark_is_the_last_commit_…`: where the mark sits (M50);
+- `1dad3a6`'s `…accrued_downtime_is_fixed_at_its_open_not_at_its_commit`: what it carries (M64).
+
+The name is kept: renaming it would break every earlier amendment's reference.
+
+### New mutants
+
+| mutant | must fail |
+|---|---|
+| M58b the soft mark stamped with the wall clock via a stamp the catalog holds: `mark: self.first_start.and_then(\|e\| e.file).map_or(now, \|f\| f.millis() + f.wall_age_millis())` | `a_lagging_writer_over_an_evidence_bearing_catalog_…` (the lease expires) |
+| M64 `accrued` recomputed at each commit from the open's evidence (`e.owed_at_open(now)` in `record_soft_mark`) | `…accrued_downtime_is_fixed_at_its_open_not_at_its_commit` (credit ≥ `hi + 1000 − commit time`) |
+| M65 one directory sync after both renames (`fdd2d23`'s) | **SURVIVES** (a power cut, and a reordering filesystem). Registered, with M63. |
+
+### Counts, per-target
+
+- `f1_lease_grace` → **41** (+2 at `1dad3a6`).
+- **base + 58**.
+- The lib filter → **52** (41 + 5 + 3 + 1 + 1 + 1).
