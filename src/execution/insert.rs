@@ -37,9 +37,40 @@
 //!   duplicate. Measured with the removal commented out: `INSERT (1,10); DELETE id=1; INSERT (1,99);
 //!   INSERT (1,777)` left both `1 | 99` and `1 | 777` live.
 //!
-//! Removing the entry orphans nothing. The deleted version stays in the heap where a sequential scan
-//! still finds it and `ReadView::visible` still filters it, and nothing needs the index to reach an
-//! old version: there is no temporal `AS OF <timestamp>` in this SQL surface, only `AS OF BRANCH`.
+//! ⛔ **SUPERSEDED — this paragraph said:** *"Removing the entry orphans nothing. The deleted version
+//! stays in the heap where a sequential scan still finds it and `ReadView::visible` still filters
+//! it, and nothing needs the index to reach an old version: there is no temporal `AS OF
+//! <timestamp>` in this SQL surface, only `AS OF BRANCH`."* The last clause was false. An explicit
+//! transaction's snapshot IS a temporal read. See the next section.
+//!
+//! # The reused key must keep its old version reachable from the index
+//!
+//! The E63 fix wrote the new row into a NEW slot, repointed the index at it, and gave it no `prev`.
+//! A reader whose snapshot predates the reuse then disagreed with itself: its sequential scan found
+//! the dead version's slot, still live for it, and its lookup by key landed on the new slot, which
+//! it cannot see, with nowhere to go. `WHERE id = k` returned nothing while `SELECT *` returned
+//! the row. `UPDATE`/`DELETE ... WHERE id = k` affected 0 rows where the same statement by scan
+//! raised a write conflict. `SecondaryIndexScan` resolves through the primary index and lost the
+//! row the same way. Found by the D194 lane (artie-research
+//! `frontier/lane_d194_fork_snapshot.md` §6.1). Pinned by `tests/reused_key_old_snapshot.rs`.
+//!
+//! So the new version now goes INTO the dead version's slot, with `prev` pointing at a
+//! time-travel copy of the dead version. That is UPDATE's mechanism, and the index entry stays
+//! where it was. A lookup lands on the new head and walks `prev` to the old version exactly as it
+//! does after an UPDATE. The heap holds one slot per key, so a scan cannot yield the old version
+//! twice.
+//!
+//! One line differs from UPDATE, and it is load-bearing. UPDATE stamps the archived version's
+//! `end_ts` with its own id, because that version was live. A reused key's dead version is already
+//! ended by its DELETE, and it is archived **verbatim**. Re-stamping it with the inserter's id
+//! would make it live again for any reader that saw the DELETE commit but not the INSERT.
+//! `a_reader_that_saw_the_delete_does_not_see_the_old_row_come_back` fails if that is done.
+//!
+//! The WAL record changes, and the change feed must not. The table's record for a reuse is now a
+//! `HeapUpdate` whose old image is dead and whose new image is live. When the new row does not fit
+//! and relocates, it is a `HeapDelete` of the dead image followed by a `HeapInsert`.
+//! `replication::logical` decodes the `HeapUpdate` as an INSERT and counts the dead `HeapDelete` as
+//! bookkeeping. Both rules read the version headers, as the DELETE rule already does.
 //!
 //! The B+tree does not rebalance on delete (`handle_underflow` is unimplemented and never called), so
 //! this can leave a sparse leaf. Sparse is correct; the alternative was a key that could not be
@@ -77,6 +108,9 @@ pub struct Insert {
     /// entry outlives the row: DELETE stamps `end_ts` on the version in place and leaves the entry
     /// pointing at it. So a deleted primary key could never be reused.
     pub view: std::sync::Arc<crate::wal::txn::ReadView>,
+    /// Where a reused key's dead version is archived, so the new version's `prev` can reach it.
+    /// Opened and logged exactly as `Update::tt_heap` is.
+    pub tt_heap: HeapFileManager,
 }
 
 impl Modify for Insert {
@@ -110,6 +144,7 @@ impl Modify for Insert {
         // in place and leaves the entry alone, so `search` finding a key does NOT mean the key is
         // taken. Asking the index alone made a deleted primary key unusable forever, and said so
         // with "use UPDATE to change the existing row" when there was no row to update.
+        let mut reused: Option<(RecordId, Tuple)> = None;
         if let Some(existing) = self.primary_index.search(&vals[0])? {
             let head = self.heap.read(existing)?;
             let h = head.version_header()?;
@@ -127,31 +162,63 @@ impl Modify for Insert {
                     self.schema.columns.first().map(|c| c.name.as_str()).unwrap_or("?")
                 )))
             }
-            // The key is free, but the stale entry must be REPLACED rather than shadowed:
-            // `insert_entry` appends, it does not overwrite, so leaving it would put two entries
-            // for one key in a unique index and `search` would return whichever binary search
-            // landed on. The deleted version itself stays in the heap, where a sequential scan
-            // still finds it and resolves it as invisible - nothing needs the index to reach it,
-            // because there is no temporal `AS OF` in the SQL surface, only `AS OF BRANCH`.
-            //
-            // ⛔ **D126 — the `delete` that used to sit here has MOVED INTO the `upsert` below.**
-            // It was `primary_index.delete(&vals[0])` here and `primary_index.insert(..)` after
-            // the heap write, with `delete` dropping the leaf write latch on return: the primary
-            // key was absent from the index for the whole of a heap insert, and `search` descends
-            // with no latch at all. A concurrent point lookup on that key got "no such row" for a
-            // row that exists. Same defect the branch catalog had, same fix: one `upsert`, one
-            // page write, no window. See `BPlusTreeManager::upsert`.
+            // The key is free. Its dead version is where the new one goes: into the same slot,
+            // with `prev` linking back to it, so the index entry that already points here reaches
+            // both (module doc, "The reused key must keep its old version reachable"). Writing a
+            // NEW slot instead, as this did until the reused-key fix, left the entry pointing at a
+            // version no older snapshot can see, with nothing behind it.
+            reused = Some((existing, head));
         }
-        let tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
-        let rid = self.heap.insert(tuple)?;
+        let mut tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
+        // What the primary entry holds before this statement: nothing for a new key, the dead
+        // version's slot for a reuse. It is what a rollback must put back (D202).
+        let entry_before = reused.as_ref().map(|(dead_rid, _)| *dead_rid);
+        let (rid, index_moved) = match reused {
+            Some((dead_rid, dead)) => {
+                // Archived VERBATIM: its `end_ts` is its deleter's and must stay so. UPDATE
+                // re-stamps the version it archives because that version was live; this one is
+                // not, and re-stamping it with this transaction's id would revive it for every
+                // reader that saw the DELETE commit and not this INSERT.
+                let tt_rid = self.tt_heap.insert(dead)?;
+                tuple.data[16..20].copy_from_slice(&tt_rid.page_id.to_be_bytes());
+                tuple.data[20..22].copy_from_slice(&tt_rid.slot_num.to_be_bytes());
+                // In place when the new row fits the dead row's page, which leaves the index
+                // untouched. Otherwise `update` relocates it and the entry has to follow, exactly
+                // as it does for a relocated UPDATE.
+                let rid = self.heap.update(dead_rid, tuple)?;
+                (rid, rid != dead_rid)
+            }
+            None => (self.heap.insert(tuple)?, true),
+        };
         if let Some((prov, id)) = &self.author {
             prov.stamp(rid, *id)?;
         }
-        // `upsert`, not `insert`: this both writes a brand-new key and REPLACES the stale entry
-        // of a primary key freed by a committed DELETE (the branch above). `insert` cannot do the
-        // second -- it appends -- and delete-then-insert could, but only through a window in which
-        // the key is absent to every lockless reader. D126.
-        self.primary_index.upsert(vals[0].clone(), rid)?;
+        // `upsert`, not `insert`, and only when the row is somewhere the index does not already
+        // say. A brand-new key needs its entry written. A reused key whose new row relocated needs
+        // its entry REPLACED: `insert` cannot do that because it appends, and delete-then-insert
+        // could, but only through a window in which the key is absent to every lockless reader.
+        //
+        // ⛔ **D126 — the `delete` that used to sit in the reuse branch above MOVED INTO this
+        // `upsert`.** It was `primary_index.delete(&vals[0])` there and `primary_index.insert(..)`
+        // after the heap write, with `delete` dropping the leaf write latch on return: the primary
+        // key was absent from the index for the whole of a heap insert, and `search` descends with
+        // no latch at all. A concurrent point lookup on that key got "no such row" for a row that
+        // exists. Same defect the branch catalog had, same fix: one `upsert`, one page write, no
+        // window. See `BPlusTreeManager::upsert`.
+        //
+        // A reuse written in place writes no index page at all. The relocating case keeps the
+        // window a relocated UPDATE already has: `HeapFileManager::update` frees the old slot
+        // before this line repoints the entry.
+        if index_moved {
+            // **D202 — recorded before the write, so a rollback can take it back.** Index pages are
+            // not logged, and before this a rolled-back INSERT left its key pointing at the slot
+            // `undo_insert` freed: the key then failed every lookup and every INSERT with
+            // `SlotDeleted`. See `TxnManager::record_primary_write`.
+            if let Some(txn) = &self.heap.txn {
+                txn.record_primary_write(self.heap.txn_id, self.primary_index.root_cell(), vals[0].clone(), entry_before);
+            }
+            self.primary_index.upsert(vals[0].clone(), rid)?;
+        }
         // **E66 — the same de-duplication UPDATE needs, on the path E63 opened.**
         //
         // DELETE leaves a secondary entry behind on purpose (see `execution::update`: an older

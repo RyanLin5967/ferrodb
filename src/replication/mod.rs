@@ -738,7 +738,8 @@ impl ReplicaApplier {
             let touched = match &rec.kind {
                 crate::wal::log::RecKind::HeapInsert { page_id, .. }
                 | crate::wal::log::RecKind::HeapDelete { page_id, .. }
-                | crate::wal::log::RecKind::HeapUpdate { page_id, .. } => Some(*page_id),
+                | crate::wal::log::RecKind::HeapUpdate { page_id, .. }
+                | crate::wal::log::RecKind::HeapRelease { page_id, .. } => Some(*page_id),
                 crate::wal::log::RecKind::Clr { redo, .. } => match redo.as_ref() {
                     crate::wal::log::RecKind::HeapInsert { page_id, .. }
                     | crate::wal::log::RecKind::HeapDelete { page_id, .. }
@@ -758,16 +759,18 @@ impl ReplicaApplier {
         }
 
         // Only now apply. Redo is idempotent by page LSN, so an overlap re-sent after a reconnect
-        // is skipped rather than applied twice.
+        // is skipped rather than applied twice. A `Clr` goes in whole, because `apply_redo` frees a
+        // slot for a CLR's `HeapDelete` and retires it for a forward one. `HeapRelease` is the
+        // commit freeing a retired slot: without it this replica would keep the bytes occupied,
+        // and the primary's later inserts into them would find no room here (D213).
         for (rec_lsn, rec) in &checked {
             match &rec.kind {
                 crate::wal::log::RecKind::HeapInsert { .. }
                 | crate::wal::log::RecKind::HeapDelete { .. }
-                | crate::wal::log::RecKind::HeapUpdate { .. } => {
+                | crate::wal::log::RecKind::HeapUpdate { .. }
+                | crate::wal::log::RecKind::HeapRelease { .. }
+                | crate::wal::log::RecKind::Clr { .. } => {
                     crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, &rec.kind)?;
-                }
-                crate::wal::log::RecKind::Clr { redo, .. } => {
-                    crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, redo)?;
                 }
                 _ => {}
             }

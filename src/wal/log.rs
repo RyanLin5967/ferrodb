@@ -1,4 +1,4 @@
-use std::{fs::OpenOptions, mem::take, path::PathBuf, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::OpenOptions, mem::take, path::PathBuf, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}};
 
 use crate::{
     branch::types::BranchId,
@@ -10,7 +10,24 @@ use crate::{
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
-const VERSION: u32 = 2;
+/// **The log format this binary writes: 3 since D213.** In it a forward `HeapDelete` RETIRES its
+/// slot and a `HeapRelease` (tag 11) frees it after the commit (`storage::heap_page::RETIRED`).
+///
+/// Version 2 is every log written before D213. The records are the same bytes, but a forward
+/// `HeapDelete` FREED its slot at once, and there is no `HeapRelease`. Replaying such a log with
+/// version-3 meaning failed the open whenever a committed insert had landed in a committed
+/// relocation's bytes (the adversary's F1 on `115f0b7`, `frontier/rollback_adversary.md`). So
+/// the version travels with the log. A version-2 log is replayed with version-2 meaning, then
+/// checkpointed (`wal::recovery::open_recovered`), which rewrites its header as version 3. Until
+/// then no transaction may begin on it (`TxnManager::begin`), and the log itself refuses the two
+/// records whose meaning changed, a top-level `HeapDelete` and a `HeapRelease` ([`WalManager::append`],
+/// review 2's Q5), so no record with version-3 meaning can be written into a log labelled version 2.
+///
+/// A binary before D213 refuses a version-3 log ("incorrect wal version") instead of misreading
+/// it, which also makes a downgrade a clean refusal (the adversary's F6).
+const VERSION: u32 = 3;
+/// The one older format this binary still opens. See [`VERSION`].
+const LEGACY_VERSION: u32 = 2;
 const INITIAL_LSN: u64 = 1;
 const MIN_FRAME: usize = 33;
 
@@ -51,6 +68,10 @@ pub struct WalManager {
     pub header_txn_id: u64,
     /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
     pins: Mutex<std::collections::BTreeMap<u64, u64>>,
+    /// Taken shared by every new pin ([`WalManager::pin`], [`WalManager::pin_durable`]) and
+    /// exclusively by [`WalManager::fence_pins`]. Lock order: `pin_fence`, then `pins`, then
+    /// `buffer`, then `file`.
+    pin_fence: std::sync::RwLock<()>,
     next_pin_id: AtomicU64,
     /// **Test-only: make the next [`WalManager::append`] fail once.**
     ///
@@ -64,6 +85,13 @@ pub struct WalManager {
     /// a lever for the unit tests in this crate and nothing else.
     #[cfg(test)]
     pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
+    /// The format this log was written in: [`VERSION`], or [`LEGACY_VERSION`] until a truncation
+    /// rewrites the header.
+    format: AtomicU32,
+    /// **Set once, never cleared: the log refuses every write** ([`WalManager::poison`]). The
+    /// reason is kept for the refusal's message.
+    poisoned: AtomicBool,
+    poison_reason: Mutex<Option<String>>,
 }
 
 /// A claim on the log from `lsn` onwards. Released on drop.
@@ -149,6 +177,18 @@ pub enum RecKind {
     HeapInsert { dir_root: u32, page_id: u32, slot: u16, tuple: Vec<u8> },
     HeapDelete { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8> }, 
     HeapUpdate { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8>, new: Vec<u8> },
+    /// **D213: a committed transaction frees a slot its delete RETIRED.** Tag 11, the next free
+    /// number, so every older record keeps its meaning.
+    ///
+    /// A logged `HeapDelete` no longer frees its slot: it retires it, so the bytes stay occupied
+    /// and a rollback restores the tuple in place (`storage::heap_page::RETIRED`). This record is
+    /// the commit's release of those bytes, written by `TxnManager::commit` after the `Commit`
+    /// record is durable, in the same transaction. Redo and a replica apply it like any other page
+    /// change, gated by the page's LSN. Without it a replica, or recovery after a crash, would keep
+    /// the slot retired while the primary's later inserts used its bytes, and replaying those
+    /// inserts would find no room. It carries no row, so it is not a change-feed event, and nothing
+    /// ever undoes it: its transaction has committed.
+    HeapRelease { dir_root: u32, page_id: u32, slot: u16 },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
     Checkpoint,
     /// A schema change, logged so the change feed can carry it.
@@ -365,6 +405,12 @@ impl RecKind {
                 buffer.extend_from_slice(&(new.len() as u32).to_be_bytes());
                 buffer.extend_from_slice(new);
             }
+            RecKind::HeapRelease { dir_root, page_id, slot } => {
+                buffer.push(11);
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&page_id.to_be_bytes());
+                buffer.extend_from_slice(&slot.to_be_bytes());
+            }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
                 buffer.push(9);
                 // Tags 0 and 1 keep their meaning and their position, so every DDL record already
@@ -532,6 +578,13 @@ impl RecKind {
                     ),
                 })
             }
+            11 => {
+                let mut at = 1usize;
+                let dir_root = take_u32(bytes, &mut at)?;
+                let page_id = take_u32(bytes, &mut at)?;
+                let slot = take_u16(bytes, &mut at)?;
+                Ok(RecKind::HeapRelease { dir_root, page_id, slot })
+            }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
                 let undo_next = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
@@ -555,7 +608,7 @@ impl WalManager {
     pub fn with_storage(file: Arc<dyn Storage>, path: PathBuf) -> Result<Self, FerroError> {
         let len = file.len().map_err(|e| FerroError::Wal(e.to_string()))?;
 
-        let (base_lsn, header_txn_id) = if len == 0 {
+        let (base_lsn, header_txn_id, format) = if len == 0 {
             let mut header = [0u8; HEADER_SIZE];
             header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
@@ -563,19 +616,24 @@ impl WalManager {
             header[16..24].copy_from_slice(&1u64.to_be_bytes());
             pwrite_all(&*file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
-            (INITIAL_LSN, 1u64)
+            // A fresh log is a new database at this path: its quarantine starts fresh too (review 5's F6).
+            crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
+                FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
+            })?;
+            (INITIAL_LSN, 1u64, VERSION)
         } else {
             let mut header = [0u8; HEADER_SIZE];
             pread_all(&*file, &mut header, 0)?;
             if u32::from_be_bytes(header[0..4].try_into().unwrap()) != MAGIC {
                 return Err(FerroError::Wal("incorrect magic".into()));
             }
-            if u32::from_be_bytes(header[4..8].try_into().unwrap()) != VERSION {
+            let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+            if version != VERSION && version != LEGACY_VERSION {
                 return Err(FerroError::Wal("incorrect wal version".into()));
             }
             let base = u64::from_be_bytes(header[8..16].try_into().unwrap());
             let txn_hwn = u64::from_be_bytes(header[16..24].try_into().unwrap());
-            (base, txn_hwn)
+            (base, txn_hwn, version)
         };
         let valid_end = scan_valid_end(&*file, base_lsn, len)?;
         let file_end = HEADER_SIZE as u64 + (valid_end - base_lsn);
@@ -583,9 +641,83 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1),
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), pin_fence: std::sync::RwLock::new(()), next_pin_id: AtomicU64::new(1),
             #[cfg(test)]
-            fail_next_append: std::sync::atomic::AtomicBool::new(false)})
+            fail_next_append: std::sync::atomic::AtomicBool::new(false),
+            format: AtomicU32::new(format), poisoned: AtomicBool::new(false), poison_reason: Mutex::new(None)})
+    }
+
+    /// The format this log is in: 3, or 2 for a log written before D213 that has not been
+    /// checkpointed since. See [`VERSION`].
+    pub fn format_version(&self) -> u32 {
+        self.format.load(Ordering::SeqCst)
+    }
+
+    /// Whether this log was written before D213: a forward `HeapDelete` in it FREED its slot.
+    pub fn is_legacy(&self) -> bool {
+        self.format_version() == LEGACY_VERSION
+    }
+
+    /// **Fail-stop: from now on the log refuses every append and every flush.** The adversary's F4(i)
+    /// on `115f0b7`, and the lead's decision.
+    ///
+    /// Called when a transaction's `Commit` record could not be flushed (`TxnManager::commit`). The
+    /// bytes may or may not be on disk, and a failed flush puts them back in the buffer, so a later
+    /// flush could still make that `Commit` durable. Anything written after it is then built on an
+    /// outcome nobody knows: a ROLLBACK would log an Abort after a `Commit` that later lands, and
+    /// recovery would redo both. So nothing is written after it. The database must be reopened, and
+    /// recovery decides from what actually reached disk. This is PostgreSQL's answer to an fsync
+    /// failure (it PANICs), for the same reason.
+    ///
+    /// Reads are not refused while the pages they need are resident. The undecided transaction is
+    /// still in the active set, so no other snapshot sees its rows. A page write is refused only if it
+    /// needs a flush, because `flush_up_to` does not flush for an LSN that is already durable; so once
+    /// eviction picks a dirty page past the durable end, the fetch that needed the frame fails too.
+    ///
+    /// **It also marks every index stale** (review 2's C3, the lead's decision): the reopen is this
+    /// function's whole contract, and index pages are not logged. If the undecided transaction's
+    /// records never reached disk and the log holds nothing else, the reopen replays nothing and would
+    /// not rebuild, so an index page flushed with that transaction's entries would name slots the heap
+    /// never got. The marker makes `open_recovered` rebuild every tree.
+    pub fn poison(&self, why: &str) {
+        use std::io::Write;
+        {
+            let mut reason = self.poison_reason.lock().unwrap();
+            if reason.is_some() {
+                return;
+            }
+            *reason = Some(why.to_string());
+        }
+        self.poisoned.store(true, Ordering::SeqCst);
+        let marked = crate::wal::txn::write_stale_indexes_marker(&self.path, &format!("the log was poisoned: {why}"));
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: the log refuses every write from now on ({why}); reopen the database{}",
+            match marked {
+                Ok(()) => ", and every index is rebuilt then".to_string(),
+                Err(e) => format!(
+                    "; the marker that makes that open rebuild every index could not be written ({e})"
+                ),
+            }
+        );
+    }
+
+    /// Why this log refuses writes, once it does. See [`WalManager::poison`].
+    pub fn poisoned(&self) -> Option<String> {
+        if !self.poisoned.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.poison_reason.lock().unwrap().clone()
+    }
+
+    fn refuse_if_poisoned(&self) -> Result<(), FerroError> {
+        match self.poisoned() {
+            None => Ok(()),
+            Some(why) => Err(FerroError::Wal(format!(
+                "the log refuses every write since {why}; reopen the database, and recovery decides \
+                 from what reached disk"
+            ))),
+        }
     }
 
     /// Pin the log at its current durable frontier, and return where that turned out to be.
@@ -597,8 +729,10 @@ impl WalManager {
     /// pin was added to prevent, reintroduced by the fix for it. [`WalManager::truncate`] takes
     /// the same lock, so there is no gap to land in.
     ///
-    /// Lock order is pins -> buffer -> file, matching `truncate`.
+    /// Lock order is `pin_fence` (shared), then pins -> buffer -> file. `truncate` takes pins -> buffer
+    /// -> file, and a DROP holds the fence exclusively around its check and its truncation.
     pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
+        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let lsn = self.flushed_lsn.load(Ordering::SeqCst);
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
@@ -612,6 +746,7 @@ impl WalManager {
     /// built on records that are gone, and silently moving the pin forward would hand it a
     /// plausible-looking claim over the wrong range.
     pub fn pin(self: &std::sync::Arc<Self>, lsn: u64) -> Result<WalPin, FerroError> {
+        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let base = self.base_lsn.load(Ordering::SeqCst);
         if lsn < base {
@@ -622,6 +757,21 @@ impl WalManager {
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
         pins.insert(id, lsn);
         Ok(WalPin { wal: std::sync::Arc::clone(self), id, lsn })
+    }
+
+    /// Hold every NEW pin off until the returned guard is dropped. Pins already held stay, and can
+    /// still be released.
+    ///
+    /// For a caller whose decision rests on "no pin is below the log's end" and that must still
+    /// hold at its [`WalManager::truncate`]: `truncate` keeps the log, and answers `Ok`, while any pin
+    /// is below the end. A DROP is that caller (`TxnManager::drop_checkpointed`, lane §21.6). It
+    /// checks [`WalManager::min_pinned_lsn`] and truncates under one guard, so a pin cannot land
+    /// between the two, which is the check-then-act shape [`WalManager::pin_durable`] warns about.
+    /// A pin that waited is taken against the truncated log, as if it had arrived after the
+    /// checkpoint: one below the new base is refused, as it always was. Never take a pin while
+    /// holding this guard: a pin waits on it.
+    pub fn fence_pins(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.pin_fence.write().unwrap()
     }
 
     /// The oldest LSN any pin still needs, if there are any.
@@ -700,6 +850,19 @@ impl WalManager {
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::SeqCst) {
             return Err(FerroError::Wal("injected append failure".into()));
+        }
+        self.refuse_if_poisoned()?;
+        // **Review 2's Q5: the log itself refuses the two records whose meaning changed, while it
+        // is version 2.** A top-level `HeapDelete` RETIRES its slot since D213 and FREED it before,
+        // and a `HeapRelease` did not exist. `TxnManager::begin_locked` already refuses a transaction
+        // on such a log, but that guard cannot see a direct `append`. Everything else means the same
+        // in both formats, including a `Clr` carrying a `HeapDelete` (an undone insert frees in both),
+        // so recovery's undo of a version-2 log's losers is unaffected.
+        if self.is_legacy() && matches!(kind, RecKind::HeapDelete { .. } | RecKind::HeapRelease { .. }) {
+            return Err(FerroError::Wal(format!(
+                "this log was written before D213 (format {LEGACY_VERSION}), where this record means \
+                 something else; it takes one only after open_recovered has replayed and upgraded it"
+            )));
         }
         let mut buffer = self.buffer.lock().unwrap();
         let lsn = self.next_lsn.load(Ordering::SeqCst);
@@ -826,6 +989,8 @@ impl WalManager {
         file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
         file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
         file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
+        // Every record of the older format is gone with the truncation, so the log is version 3 now.
+        self.format.store(VERSION, Ordering::SeqCst);
         
         self.base_lsn.store(next, Ordering::SeqCst);
         buffer.bytes.clear();
@@ -854,6 +1019,7 @@ impl WalManager {
         // The cost is that appends block for the duration of an fsync, because `append` also takes
         // the buffer lock. That is the honest price of a single-buffer WAL, and a faster log that
         // lies about durability is not a better one.
+        self.refuse_if_poisoned()?;
         let mut buffer = self.buffer.lock().unwrap();
         if buffer.bytes.is_empty() {
             return Ok(());
@@ -1194,6 +1360,19 @@ mod tests {
     fn deserialize_rejects_empty_and_unknown_tag() {
         assert!(RecKind::deserialize(&[]).is_err());
         assert!(RecKind::deserialize(&[99]).is_err());
+    }
+
+    /// **D213: `HeapRelease` round-trips under tag 11, and a truncated one is refused.** Tag 11 is
+    /// the next free number, so the older tags checked below keep their meaning.
+    #[test]
+    fn a_heap_release_round_trips_under_its_own_tag() {
+        let kind = RecKind::HeapRelease { dir_root: 7, page_id: 42, slot: 3 };
+        let mut buf = Vec::new();
+        kind.serialize(&mut buf).unwrap();
+        assert_eq!(buf[0], 11, "HeapRelease is not tag 11");
+        assert_eq!(buf.len(), 11, "a HeapRelease is its tag plus a u32, a u32 and a u16");
+        assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        assert!(RecKind::deserialize(&buf[..10]).is_err(), "a truncated HeapRelease decoded");
     }
 
     /// **The additive-tag discipline, for tag 10.**
