@@ -630,17 +630,30 @@ impl Handles {
     }
 }
 
+/// How the lease thread's first pass ended (A22.6): it finished, it did not within the bound, or the
+/// thread died (D265), which a bound would otherwise wait out and misreport as a slow pass.
+enum FirstPass {
+    Done(Duration),
+    TimedOut,
+    Died,
+}
+
 /// Wait for the lease thread's first pass to reach its end — the second full sweep, PREREG R3.
-/// `None` if it did not within `bound`.
-fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> Option<Duration> {
+fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> FirstPass {
     let t = Instant::now();
-    while db.lease.stats().finished == 0 {
+    loop {
+        let stats = db.lease.stats();
+        if stats.finished > 0 {
+            return FirstPass::Done(t.elapsed());
+        }
+        if stats.panicked {
+            return FirstPass::Died;
+        }
         if t.elapsed() > bound {
-            return None;
+            return FirstPass::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    Some(t.elapsed())
 }
 
 /// Open the production database, wait out its first lease pass, and hand it back. Every open the
@@ -648,11 +661,18 @@ fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> Option<Duration> {
 fn parent_open(db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
     let db = open_database(db_path, PARENT_SCAN_INTERVAL).expect("open the production database");
     let bound = Duration::from_secs(60) + db.timings.lease_start * 10;
-    if wait_first_pass(&db, bound).is_none() {
-        failures.push(format!(
+    match wait_first_pass(&db, bound) {
+        FirstPass::Done(_) => {}
+        FirstPass::TimedOut => failures.push(format!(
             "the parent's first lease pass did not finish within {bound:?}; a sweep may overlap a \
              timed window"
-        ));
+        )),
+        // A22.6: not PARENT_PASS, whose "a sweep may overlap" is false for a dead thread.
+        FirstPass::Died => failures.push(
+            "LEASE (the parent's open): the lease thread died on its first pass (D265); nothing is \
+             reaped for the rest of this open"
+                .into(),
+        ),
     }
     db
 }
@@ -929,7 +949,11 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let open_visits = db.reaper.open_sweep_visits();
     let freed = db.reaper.open_sweep_freed();
     let bound = Duration::from_secs(60) + t.lease_start * 10;
-    let first = wait_first_pass(&db, bound);
+    // A22.6: a thread that died is reported by its LEASE fields below, not as a slow first pass.
+    let first = match wait_first_pass(&db, bound) {
+        FirstPass::Done(d) => Some(d),
+        FirstPass::TimedOut | FirstPass::Died => None,
+    };
     let visits_total = db.reaper.sweep_visits();
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
@@ -1104,7 +1128,8 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
             r.get("freed")
         ));
     }
-    if r.get("first_pass_done") != 1 {
+    // A22.6: a child whose lease thread died reports it as LEASE below; H5 would name a slow pass.
+    if r.get("first_pass_done") != 1 && r.get("lease_panicked") == 0 {
         failures.push(format!("H5 {at}: the lease thread's first pass did not finish in its bound"));
     }
     // H6 (A12.2): the one thing besides `recovered` that makes the child's open rebuild. Nothing in
