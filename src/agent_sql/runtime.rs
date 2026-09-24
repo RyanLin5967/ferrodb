@@ -5030,6 +5030,18 @@ impl AgentRuntime {
         // plus once per altered table whose rewrite moved an attributed row.
         let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
         let prov = Arc::clone(provenance.stamper());
+        // **A merge that will stamp asks the store FIRST (PREREG A3, review 7 F5).** Every write
+        // this merge publishes is stamped or recorded by `record_applied` (whose `ProvId::NONE`
+        // clears an author, which is a write too), so a store already refusing writes would refuse
+        // this merge at its first publish stamp, after the schema below had been installed and
+        // logged. `plan_alters` asks only for a rewrite that will re-stamp an attributed row, so a
+        // merge whose altered tables carry none was not asked at all. Asked here, before any table
+        // is planned, the refusal leaves nothing behind (E82). A merge that publishes nothing is
+        // not asked: it writes no provenance (D219 F1's rule for ALTER). Advisory, as the trait
+        // says: a store that starts refusing after this line is refused at the write.
+        if !pending.is_empty() {
+            prov.check_writable()?;
+        }
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
         for (i, report) in schema_reports.iter().enumerate() {
             if report.to_apply.is_empty() {
