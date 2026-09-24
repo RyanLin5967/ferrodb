@@ -506,7 +506,7 @@ type LoggedDrop = (String, u32, u32, u64);
 ///   that way, and never altered, is still forgotten: its CREATE was reported failed, and no
 ///   committed row is lost (accepted by the lead, lane §3.7).
 fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Result<(Vec<LoggedDrop>, Vec<String>), FerroError> {
-    let mut drops: HashMap<u32, (String, u32, u64)> = HashMap::new();
+    let mut drops: Vec<LoggedDrop> = Vec::new();
     let mut created: HashMap<u32, u64> = HashMap::new();
     let mut written: HashMap<u32, u64> = HashMap::new();
     let end = wal.next_lsn.load(Ordering::SeqCst);
@@ -515,7 +515,7 @@ fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Resul
         let (rec, next) = wal.read_record(lsn)?;
         match &rec.kind {
             RecKind::Ddl { op: DdlOp::DropTable, table, dir_root, time_travel_root, .. } => {
-                drops.insert(*dir_root, (table.clone(), *time_travel_root, rec.lsn));
+                drops.push((table.clone(), *dir_root, *time_travel_root, rec.lsn));
             }
             RecKind::Ddl { dir_root, .. } => {
                 created.insert(*dir_root, rec.lsn);
@@ -529,8 +529,9 @@ fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Resul
         lsn = next;
     }
     let later = |map: &HashMap<u32, u64>, root: &u32, at: &u64| map.get(root).is_some_and(|&l| l > *at);
-    let mut drops: Vec<LoggedDrop> =
-        drops.into_iter().map(|(dir_root, (table, tt_root, at))| (table, dir_root, tt_root, at)).collect();
+    // Review 2's R2-1: the last per root. The log is read in LSN order, so a later record replaces.
+    let last: HashMap<u32, LoggedDrop> = drops.into_iter().map(|d| (d.1, d)).collect();
+    let mut drops: Vec<LoggedDrop> = last.into_values().collect();
     drops.sort_by_key(|(_, _, _, at)| *at);
     let missed = drops
         .iter()
