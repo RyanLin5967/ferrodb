@@ -513,6 +513,53 @@ impl From<TamperFinding> for FerroError {
     }
 }
 
+/// Why [`AttestedHistory::append`] or [`AttestedHistory::append_fork`] wrote nothing.
+///
+/// **Wall #19.** Every branch but trunk begins with a `Fork`, so a non-trunk branch with no live
+/// head is one of two things: a branch this log never saw forked, or one a `Reap` sealed. An entry
+/// for it needs a `prev` the log does not have, and the only value on hand is genesis. Writing
+/// that would root the entry at the start of history, cut a reaped branch's ancestry walk at its
+/// reap (`verify_branch` → `Ok(1)`), and give a fork from a sealed parent an ancestry of nothing.
+/// So the writer refuses rather than invent a link, and counts the refusal
+/// ([`AttestedHistory::refused`]).
+///
+/// [`AttestedHistory::load_untrusted`] does not come through here, on purpose: a verifier has to
+/// be able to load exactly the shapes this refuses to write, or it cannot report them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendRefused {
+    /// `branch` is not trunk and has no live head.
+    NoLiveHead { branch: BranchId },
+    /// A fork's `parent` is not trunk and has no live head.
+    NoLiveParent { parent: BranchId },
+    /// A `Reap` on trunk. Trunk is the one branch allowed to begin without a `Fork`, so sealing
+    /// it would reopen, for trunk, the hole the other two variants close.
+    TrunkReap,
+}
+
+impl Display for AppendRefused {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppendRefused::NoLiveHead { branch } => write!(
+                f,
+                "branch {branch} has no live attested head: this log never saw it forked, or a \
+                 reap sealed it, and an entry for it would have to invent its predecessor"
+            ),
+            AppendRefused::NoLiveParent { parent } => write!(
+                f,
+                "cannot attest a fork from {parent}: it has no live attested head (never forked \
+                 in this log, or reaped), so the child's ancestry would be invented"
+            ),
+            AppendRefused::TrunkReap => write!(f, "trunk is never reaped"),
+        }
+    }
+}
+
+impl From<AppendRefused> for FerroError {
+    fn from(r: AppendRefused) -> FerroError {
+        FerroError::Branch(format!("attestation refused: {r}"))
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Proofs — the types a third party receives
 // ---------------------------------------------------------------------------------------------
@@ -758,6 +805,10 @@ pub struct AttestedHistory {
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
     /// quadratic, which is the difference between a benchmark that runs and one that does not.
     levels: Vec<Vec<[u8; 32]>>,
+    /// How many [`Self::append`] / [`Self::append_fork`] calls this log refused. An observing
+    /// counter: nothing reads it to decide anything. It exists because a refusal the runtime does
+    /// not propagate (a merge or reap that already committed) must still leave a trace.
+    refused: u64,
 }
 
 impl Default for AttestedHistory {
@@ -768,7 +819,17 @@ impl Default for AttestedHistory {
 
 impl AttestedHistory {
     pub fn new() -> Self {
-        AttestedHistory { entries: Vec::new(), heads: HashMap::new(), levels: Vec::new() }
+        AttestedHistory {
+            entries: Vec::new(),
+            heads: HashMap::new(),
+            levels: Vec::new(),
+            refused: 0,
+        }
+    }
+
+    /// How many writes this log has refused. See [`AppendRefused`].
+    pub fn refused(&self) -> u64 {
+        self.refused
     }
 
     pub fn len(&self) -> usize {
@@ -835,9 +896,9 @@ impl AttestedHistory {
         parent: BranchId,
         epoch: Epoch,
         content_cid: ContentId,
-    ) -> Attestation {
+    ) -> Result<Attestation, AppendRefused> {
         let prev = self.heads.get(&parent).copied().unwrap_or_else(Attestation::genesis);
-        self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork })
+        Ok(self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork }))
     }
 
     /// Record any non-fork operation on `branch`, linked to that branch's own head.
@@ -852,9 +913,9 @@ impl AttestedHistory {
         epoch: Epoch,
         op: BranchOp,
         content_cid: ContentId,
-    ) -> Attestation {
+    ) -> Result<Attestation, AppendRefused> {
         let prev = self.heads.get(&branch).copied().unwrap_or_else(Attestation::genesis);
-        self.push(HistoryEntry { prev, branch, content_cid, epoch, op })
+        Ok(self.push(HistoryEntry { prev, branch, content_cid, epoch, op }))
     }
 
     /// Append one already-built entry verbatim. **The single append path**, called by
@@ -1203,7 +1264,7 @@ impl AttestedHistory {
     /// reads this cannot silently stop seeing a new per-branch collection.
     #[cfg(test)]
     fn per_branch_elements(&self) -> usize {
-        let AttestedHistory { entries: _, heads, levels: _ } = self;
+        let AttestedHistory { entries: _, heads, levels: _, refused: _ } = self;
         heads.len()
     }
 }
@@ -1233,9 +1294,11 @@ mod tests {
     /// A log of `n` entries on one branch forked from trunk, plus the entries.
     fn linear_log(n: usize) -> AttestedHistory {
         let mut h = AttestedHistory::new();
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(1), cid(0));
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(1), cid(0))
+            .expect("a legitimate append must not be refused");
         for i in 1..n {
-            h.append(bid(1, 0), Epoch(i as u64 + 1), BranchOp::Commit, cid(i as u64));
+            h.append(bid(1, 0), Epoch(i as u64 + 1), BranchOp::Commit, cid(i as u64))
+                .expect("a legitimate append must not be refused");
         }
         h
     }
@@ -1348,7 +1411,8 @@ mod tests {
         let mut h = AttestedHistory::new();
         assert_eq!(h.root(), empty_root(), "empty log");
         for i in 0..300usize {
-            h.append(bid(1, 0), Epoch(i as u64), BranchOp::Commit, cid(i as u64));
+            h.append(BranchId::TRUNK, Epoch(i as u64), BranchOp::Commit, cid(i as u64))
+                .expect("trunk may append without a fork");
             let n = h.len();
             assert_eq!(
                 h.root(),
@@ -1624,12 +1688,18 @@ mod tests {
     #[test]
     fn an_honest_history_verifies() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3));
-        h.append_fork(bid(2, 0), bid(1, 0), Epoch(4), cid(4));
-        h.append(bid(2, 0), Epoch(5), BranchOp::RowVersion, cid(5));
-        h.append(bid(1, 0), Epoch(6), BranchOp::Commit, cid(6));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(2, 0), bid(1, 0), Epoch(4), cid(4))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(2, 0), Epoch(5), BranchOp::RowVersion, cid(5))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(6), BranchOp::Commit, cid(6))
+            .expect("a legitimate append must not be refused");
         h.verify_chain().expect("an honest history must verify");
 
         // Ancestry: branch 2's walk crosses two forks and reaches genesis.
@@ -1689,16 +1759,19 @@ mod tests {
     fn verification_does_not_fire_on_legitimate_histories() {
         // A deterministic spread of branch shapes: linear, wide fan-out, deep chains, reaps.
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
         let mut epoch = 2u64;
         for parent in 0..8u64 {
             for child in 0..8u64 {
                 let id = parent * 8 + child + 1;
-                h.append_fork(bid(id, 0), bid(parent, 0), Epoch(epoch), cid(epoch));
+                h.append_fork(bid(id, 0), bid(parent, 0), Epoch(epoch), cid(epoch))
+                    .expect("a legitimate append must not be refused");
                 epoch += 1;
                 for k in 0..4 {
                     let op = if k % 2 == 0 { BranchOp::RowVersion } else { BranchOp::Commit };
-                    h.append(bid(id, 0), Epoch(epoch), op, cid(epoch));
+                    h.append(bid(id, 0), Epoch(epoch), op, cid(epoch))
+                        .expect("a legitimate append must not be refused");
                     epoch += 1;
                 }
             }
@@ -1794,9 +1867,12 @@ mod tests {
     #[test]
     fn replaying_a_fork_entry_cannot_truncate_a_branchs_ancestry() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3))
+            .expect("a legitimate append must not be refused");
         let honest_steps = h.verify_branch(bid(1, 0)).expect("control");
 
         let mut forged: Vec<HistoryEntry> = h.entries().to_vec();
@@ -1865,12 +1941,16 @@ mod tests {
     #[test]
     fn a_recycled_id_slot_does_not_inherit_the_reaped_branchs_chain() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(7, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(7, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3))
+            .expect("a legitimate append must not be refused");
 
         // Generation 1 takes over the slot and writes without ever being forked.
-        h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4));
+        h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4))
+            .expect("a legitimate append must not be refused");
         let last = *h.entries().last().unwrap();
         assert_ne!(
             last.prev, reap_att,
@@ -1970,7 +2050,8 @@ mod tests {
         let mut epoch = 1u64;
         let mut live_heads: Vec<(BranchId, Attestation)> = Vec::new();
         for j in 1..=L {
-            let att = h.append_fork(bid(j, 0), BranchId::TRUNK, Epoch(epoch), cid(epoch));
+            let att = h.append_fork(bid(j, 0), BranchId::TRUNK, Epoch(epoch), cid(epoch))
+                .expect("a legitimate append must not be refused");
             live_heads.push((bid(j, 0), att));
             epoch += 1;
         }
@@ -1978,10 +2059,14 @@ mod tests {
         let mut mid_elements = 0usize;
         let mut last_merge: Option<Attestation> = None;
         for i in 1..=N {
-            h.append_fork(worker(i), BranchId::TRUNK, Epoch(epoch), cid(epoch));
-            last_merge =
-                Some(h.append(BranchId::TRUNK, Epoch(epoch + 1), BranchOp::Merge, cid(epoch + 1)));
-            h.append(worker(i), Epoch(epoch + 2), BranchOp::Reap, cid(epoch + 2));
+            h.append_fork(worker(i), BranchId::TRUNK, Epoch(epoch), cid(epoch))
+                .expect("a legitimate append must not be refused");
+            last_merge = Some(
+                h.append(BranchId::TRUNK, Epoch(epoch + 1), BranchOp::Merge, cid(epoch + 1))
+                    .expect("a legitimate append must not be refused"),
+            );
+            h.append(worker(i), Epoch(epoch + 2), BranchOp::Reap, cid(epoch + 2))
+                .expect("a legitimate append must not be refused");
             epoch += 3;
             if i == MID {
                 mid_head = Some(h.head());

@@ -50,7 +50,8 @@ use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId};
 use crate::branch::attest::{
-    AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry, InclusionProof, TreeHead,
+    AppendRefused, AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry,
+    InclusionProof, TreeHead,
 };
 use crate::branch::cherry::{
     cherry_pick as cherry_pick_ops, CherryLog, CherryResult, CherryTarget, CherryWrite, OpSelector,
@@ -1270,6 +1271,12 @@ pub struct AgentRuntime {
     /// does NOT prove"). Across a restart this answers nothing; within one process an operator who
     /// records [`AgentRuntime::attestation_head`] can later prove the log was only appended to.
     /// Persisting it is a separate decision about where roots are published, not a wiring detail.
+    ///
+    /// **Scope (wall #19): the branches this log saw forked, plus trunk.** The log refuses to write
+    /// an entry for any other branch rather than root it at genesis: a fork from such a parent
+    /// fails its `BEGIN AGENT SESSION`, and a merge into, or reap of, such a branch commits with
+    /// no entry and is counted by [`AgentRuntime::attestation_refusals`]. A lease-expiry reap does
+    /// not reach this log at all (`lane_wall19_attested.md` F1).
     attested: Mutex<AttestedHistory>,
 }
 
@@ -1671,6 +1678,12 @@ impl AgentRuntime {
         // hash, which is not `prompt_digest("")` and must never become it: "no prompt was declared"
         // and "the prompt was empty" are different facts about a run.
         let prompt_hash = prompt.map(prompt_digest).unwrap_or([0u8; 32]);
+        //
+        // **Wall #19: a refusal ends the session here, with a plain `?`.** The log refuses a fork
+        // from a non-trunk parent with no live attested head (never forked in this log, or
+        // reaped), because the child's first link would have to be invented. Nothing an agent can
+        // see exists yet: the fork is only staged, and `durability` discharges it on this `?`
+        // exactly as it does for the `intern` refusal below.
         self.attest_fork(
             branch,
             parent,
@@ -1679,7 +1692,7 @@ impl AgentRuntime {
             &run,
             (model_name, model_version),
             &prompt_hash,
-        );
+        )?;
 
         let mut state = self.state.lock().unwrap();
         state.next_txn += 1;
@@ -1692,7 +1705,8 @@ impl AgentRuntime {
         // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
         // A plain `?` again, deliberately. `intern` refusing a re-intern whose actor tuple
-        // disagrees is the one reachable failure after the fork has been staged, and it used to
+        // disagrees is one of the two reachable failures after the fork has been staged (the
+        // other is the attestation refusal above, since wall #19), and it used to
         // need a hand-written recovery arm here. It does not any more: `durability` was built on
         // the line after `fork_staged`, so this `?` drops it and `Drop` discharges the sync. That
         // is the difference between an invariant maintained at every call site and one maintained
@@ -3677,6 +3691,14 @@ impl AgentRuntime {
         self.attested.lock().unwrap().len()
     }
 
+    /// Lifecycle events the attested log refused to record (wall #19; see
+    /// [`crate::branch::attest::AppendRefused`]). A refused fork also fails its
+    /// `BEGIN AGENT SESSION`; a refused merge or reap does not fail its operation, because that
+    /// operation had already committed, so this count is where those refusals show.
+    pub fn attestation_refusals(&self) -> u64 {
+        self.attested.lock().unwrap().refused()
+    }
+
     /// Record a fork. The child's `prev` is the **parent's** head, which is what makes a
     /// verification walk of a child continue into the ancestry it forked from.
     ///
@@ -3694,7 +3716,7 @@ impl AgentRuntime {
         run_id: &str,
         model: (&str, &str),
         prompt_hash: &[u8; 32],
-    ) {
+    ) -> Result<(), FerroError> {
         let mut buf = Vec::with_capacity(96);
         for part in [agent_id.as_bytes(), run_id.as_bytes(), model.0.as_bytes(), model.1.as_bytes()]
         {
@@ -3702,7 +3724,8 @@ impl AgentRuntime {
             buf.extend_from_slice(part);
         }
         buf.extend_from_slice(prompt_hash);
-        self.attested.lock().unwrap().append_fork(child, parent, epoch, ContentId::of(&buf));
+        self.attested.lock().unwrap().append_fork(child, parent, epoch, ContentId::of(&buf))?;
+        Ok(())
     }
 
     /// Record a published merge on the branch it published INTO, committing to the row images it
@@ -3711,7 +3734,12 @@ impl AgentRuntime {
     /// O(delta): only the rows this merge published are folded in, each length-prefixed. A merge
     /// that published nothing still gets an entry — "this merge landed and wrote no rows" is a
     /// fact worth being unable to erase.
-    fn attest_merge(&self, into: BranchId, epoch: Epoch, images: &PublishedImages) {
+    fn attest_merge(
+        &self,
+        into: BranchId,
+        epoch: Epoch,
+        images: &PublishedImages,
+    ) -> Result<(), AppendRefused> {
         let mut buf = Vec::with_capacity(images.post.len() * 32);
         buf.extend_from_slice(&(images.post.len() as u64).to_be_bytes());
         for ((tbl, row), vals) in &images.post {
@@ -3724,7 +3752,8 @@ impl AgentRuntime {
             buf.extend_from_slice(&(enc.len() as u64).to_be_bytes());
             buf.extend_from_slice(&enc);
         }
-        self.attested.lock().unwrap().append(into, epoch, BranchOp::Merge, ContentId::of(&buf));
+        self.attested.lock().unwrap().append(into, epoch, BranchOp::Merge, ContentId::of(&buf))?;
+        Ok(())
     }
 
     /// Record a reap, sealing the branch's chain.
@@ -3732,13 +3761,19 @@ impl AgentRuntime {
     /// The content is the branch's own head at this moment, so the terminal entry commits to the
     /// entire history being closed: a later attempt to extend a reaped branch's chain has to
     /// contend with an entry that already named the end.
-    fn attest_reap(&self, branch: BranchId, epoch: Epoch, published: bool) {
+    fn attest_reap(
+        &self,
+        branch: BranchId,
+        epoch: Epoch,
+        published: bool,
+    ) -> Result<(), AppendRefused> {
         let mut h = self.attested.lock().unwrap();
         let head = h.head_of(branch).unwrap_or_else(Attestation::genesis);
         let mut buf = Vec::with_capacity(33);
         buf.extend_from_slice(&head.0);
         buf.push(u8::from(published));
-        h.append(branch, epoch, BranchOp::Reap, ContentId::of(&buf));
+        h.append(branch, epoch, BranchOp::Reap, ContentId::of(&buf))?;
+        Ok(())
     }
 
     // ---- D103: ancestry, and the merge it makes possible ------------------------------------
@@ -5241,7 +5276,15 @@ impl AgentRuntime {
         // O(delta), and the one place on the branch lifecycle where a content commitment is
         // affordable. See the field docs on `AgentRuntime::attested` for why fork and commit get
         // no such commitment.
-        self.attest_merge(into, self.branches.next_epoch(), &images);
+        //
+        // **Wall #19: a refusal here is counted, NOT propagated, and `seal` runs regardless.** The
+        // publish has committed, so an `Err` would report a merge that landed as one that failed,
+        // and a `?` would skip `seal` and leave a published branch live with its staged rows —
+        // one retry away from publishing them twice. The log refuses only a non-trunk target with
+        // no live attested head, i.e. one it never saw forked (a live catalog target cannot be
+        // reaped in the log, because `attest_reap` runs after the catalog reap). Such a merge is
+        // outside the log's scope: no entry is written, and `attestation_refusals` counts it.
+        let _ = self.attest_merge(into, self.branches.next_epoch(), &images);
         self.seal(from, true)?;
 
         Ok(MergeReport {
@@ -5755,8 +5798,10 @@ impl AgentRuntime {
             // Two call sites rather than one because the alternative — restructuring the early
             // return — changes the control flow of the reap path itself, which is not a thing to
             // do as a side effect of adding an attestation.
+            //
+            // A refusal is counted, not returned: the reap has happened. See the fallback arm.
             if let Some(epoch) = fork_epoch {
-                self.attest_reap(branch, epoch, published);
+                let _ = self.attest_reap(branch, epoch, published);
             }
             return Ok(());
         }
@@ -5791,7 +5836,15 @@ impl AgentRuntime {
         // and the record must not conflate them.
         //
         // The reaper arm above carries the same call; see the note there for why there are two.
-        self.attest_reap(branch, record.fork_epoch, published);
+        //
+        // **Wall #19: a refusal is counted, NOT returned.** The catalog reap above has committed,
+        // and an `Err` from `seal` would report a reap that happened as one that did not. The log
+        // refuses only a branch with no live attested head: one it never saw forked (a branch
+        // forked outside `begin_session_as`, or before a restart). Writing its reap would root
+        // the entry at genesis as the branch's first, which `verify_chain` reports as
+        // `DanglingBranch`, so the reap of a branch outside the log's scope leaves no entry and
+        // `attestation_refusals` counts it.
+        let _ = self.attest_reap(branch, record.fork_epoch, published);
         Ok(())
     }
 
