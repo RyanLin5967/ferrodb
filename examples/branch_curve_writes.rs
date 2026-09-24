@@ -309,9 +309,12 @@ enum Fire {
     /// H1: the parent HOLDS `{db}.lock` while the child opens, so the child's `DbLock::acquire`
     /// refuses and it exits non-zero.
     ChildLocked,
-    /// H2: the child reports the reaper's REAL `sweep_visits()`, read after the first pass (both
-    /// sweeps, ~2(N+1)), in place of `open_sweep_visits()`.
-    WrongSweepRead,
+    /// H2 (PREREG A8): after the parent counts live arenas, it claims ONE more real extent, for
+    /// trunk, so the child's OPEN sweep visits one arena the parent did not count. It replaces
+    /// `wrong-sweep-read`, which read the shared counter after the first lease pass and so could not
+    /// fire once D209 stops that pass from sweeping again. The open sweep, which this touches, is
+    /// the same with and without D209.
+    ExtraExtent,
     /// H4: before each restart, a real fork claims an empty extent and is then marked `Reaped` —
     /// the D40 crash-orphan shape — so the child's open sweep frees it.
     OrphanExtent,
@@ -347,14 +350,14 @@ impl Fire {
             "wrong-live-merge" => Fire::WrongLiveMerge,
             "extra-branch" => Fire::ExtraBranch,
             "child-locked" => Fire::ChildLocked,
-            "wrong-sweep-read" => Fire::WrongSweepRead,
+            "extra-extent" => Fire::ExtraExtent,
             "orphan-extent" => Fire::OrphanExtent,
             "no-cluster-time" => Fire::NoClusterTime,
             other => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
-                 wrong-live-merge, extra-branch, child-locked, wrong-sweep-read, orphan-extent, \
+                 wrong-live-merge, extra-branch, child-locked, extra-extent, orphan-extent, \
                  no-cluster-time"
             ),
         }
@@ -749,8 +752,6 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let bound = Duration::from_secs(60) + t.lease_start * 10;
     let first = wait_first_pass(&db, bound);
     let visits_total = db.reaper.sweep_visits();
-    // H2's in-path fire: the REAL shared counter, read after the first pass — both sweeps.
-    let open_visits = if fire == Fire::WrongSweepRead { visits_total } else { open_visits };
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
     let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
@@ -1549,6 +1550,19 @@ fn main() {
                 }
                 // Counted BEFORE the close, independently of anything the child reports (H2, H3).
                 let expect_arenas = hd.store.live_arenas().len() as u64;
+                // H2's in-path fire (A8): one more REAL extent, claimed for trunk AFTER that count.
+                // The parent has just reopened (or, at the first checkpoint, trunk's one-page first
+                // extent is full), so `arena_for` must claim a new extent — asserted, so a fire that
+                // injected nothing panics instead of passing unfired. Trunk is live: H3, H4 and G1
+                // cannot see it.
+                if fire == Fire::ExtraExtent {
+                    hd.store.arena_for(BranchId::TRUNK).expect("extra-extent fire: claim an extent");
+                    assert_eq!(
+                        hd.store.live_arenas().len() as u64,
+                        expect_arenas + 1,
+                        "extra-extent fire: arena_for reused trunk's extent, so H2 has nothing to see"
+                    );
+                }
                 let (_, closed) = db.take().expect("the production database is open").close();
                 closed.expect("close cleanly before the restart");
                 // Every handle into the files goes before the child opens them.
@@ -1573,7 +1587,6 @@ fn main() {
                 });
                 let is_last = checkpoints.last() == Some(&target);
                 let child_fire = match fire {
-                    Fire::WrongSweepRead => "wrong-sweep-read",
                     Fire::NoClusterTime if is_last => "no-cluster-time",
                     _ => "none",
                 };
