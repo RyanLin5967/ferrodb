@@ -657,8 +657,9 @@ impl SoftMark {
 ///   credit is then short by that writer's lag at its last append, never below 0 (review 5, C1b; a
 ///   stated residual — the log catalog has no restart grace at all). **Nor** a file or log last
 ///   written by a cluster member (`main`'s members included): its leases are on the replicated-tick
-///   scale, not a lag-0 wall clock (review 6, C1; unreachable today — nothing proposes a
-///   `LeaseTick`).
+///   scale, not a lag-0 wall clock, so the file-time credit is off by the tick's offset from the
+///   wall at that writer's last write — in EITHER direction (review 6 C1, review 7 W3; unreachable
+///   today — nothing proposes a `LeaseTick`).
 /// - **R3** `m ≤ W(last moment its writer was alive)`, and every soft mark is written in a commit,
 ///   so the file is never older, on `W`, than its last soft mark.
 /// - **R4** `s.mark ≤ L_w(last moment w was alive)`.
@@ -674,7 +675,9 @@ impl SoftMark {
 /// writer's own lag, the file half being `L − m` with `m` stamped by the wall while its lease clock
 /// lagged (review 5, C1d); and an open on a cluster member followed by `leave()`, which records
 /// `first_start_owed = 0`, so the pre-open outage is dropped (review 5, C1e). **Over it, without
-/// bound**: every route in PREREG amendment 13's table.
+/// bound**: every route in PREREG amendment 13's table. **Either direction**: a file or log last
+/// written by a cluster member (R2's last exception), off by the tick's offset from the wall —
+/// over when the tick ran ahead, under (never below 0) when it ran behind.
 ///
 /// An ACCRUAL, not a frozen stamp: nothing here credits an unresumed writer's own run to the NEXT
 /// process. A writer that later resumes ITSELF credits its own run since its open: its resume uses
