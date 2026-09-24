@@ -461,3 +461,72 @@ fn a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrit
         m.during.total()
     );
 }
+
+/// **Each altered table's rewrite stamps are durable before the NEXT table's rewrite begins.**
+///
+/// A merge that alters two tables rewrites them one after the other, and the buffer pool can write
+/// the first table's rewritten pages, and the catalog page that makes them reachable, to the
+/// database file by eviction while the second is still being rewritten. A process abort keeps what
+/// was written. So the first table's moved-row stamps must be durable by the end of ITS rewrite,
+/// not only by the schema phase's final heap flush: otherwise an abort during the second rewrite
+/// reopens the first table cleanly altered and its moved rows unattributed. Found by the third D219
+/// review (F1).
+///
+/// # Pre-registered, from the source, before this test was ever run
+///
+/// Two packed tables, `t` and `u` (41 rows each, published by one MERGE, so attributed); then one
+/// MERGE staging two UPDATEs on each and an ADD COLUMN on each.
+///
+/// | tree | `stamps` | `row_authors` | `total()` |
+/// |---|---|---|---|
+/// | `bf10eec`, stamps eager | m_t + m_u + 4 | 1 | m_t + m_u + 5 (m = 41 each, predicted) |
+/// | `882e475`, every stamp deferred to the final sync | 0 | 1 | 1 |
+/// | `eff03e8`, one flush after both rewrites | 1 | 1 | 2: RED, one table's stamps waited for the other's rewrite |
+/// | the fix, one flush at the end of each rewrite | 2 | 1 | 3 |
+#[test]
+fn each_altered_tables_rewrite_stamps_are_durable_before_the_next_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let prov = dir.path().join("d219-two-tables.provenance");
+    let mut db = Db::with_provenance(&prov);
+    let mut setup = db.session();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(120));", &mut setup);
+    db.ok("CREATE TABLE u (id INTEGER NOT NULL, v VARCHAR(120));", &mut setup);
+    let stamp_records =
+        || DurableProvenanceStore::open(&prov).expect("reopen the provenance file").recovery().stamps;
+
+    let mut frames = 0usize;
+    let pad = "y".repeat(60);
+    let packed: Vec<i64> = (1..=41).collect();
+    let mut writes: Vec<String> = Vec::new();
+    for table in ["t", "u"] {
+        writes.extend(packed.iter().map(|id| format!("INSERT INTO {table} VALUES ({id}, '{pad}');")));
+    }
+    // The author check reads table `t`; both tables' rows count toward the op total.
+    merge_arm(&mut db, &prov, "packed t + u d=82", "packed-82", &writes, &packed, 82, &mut frames);
+
+    let updated: Vec<i64> = vec![1, 2];
+    let mut writes: Vec<String> = Vec::new();
+    for table in ["t", "u"] {
+        writes.extend(updated.iter().map(|id| format!("UPDATE {table} SET v = 'q' WHERE id = {id};")));
+    }
+    writes.push("ALTER TABLE t ADD COLUMN w VARCHAR(10);".to_string());
+    writes.push("ALTER TABLE u ADD COLUMN w VARCHAR(10);".to_string());
+    let before = stamp_records();
+    let m = merge_arm(&mut db, &prov, "alter t + u, update 2+2", "alter-2", &writes, &updated, 4, &mut frames);
+    let written = stamp_records() - before;
+    assert!(
+        written >= 4 + 2 * 2,
+        "the fixture wrote {written} Stamp records for 4 published versions, so its two rewrites \
+         did not each move at least two attributed rows and cannot show one flush per table"
+    );
+    assert_eq!(
+        (m.during.stamps, m.during.row_authors, m.during.total()),
+        (2, 1, 3),
+        "a MERGE that alters two tables must make each table's rewrite stamps durable at the end of \
+         that table's rewrite (two syncs) and the publish once after the commit. Measured \
+         stamps={} row_authors={} total={} ({written} Stamp records written)",
+        m.during.stamps,
+        m.during.row_authors,
+        m.during.total()
+    );
+}
