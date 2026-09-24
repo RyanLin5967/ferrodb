@@ -2070,4 +2070,129 @@ mod tests {
             }
         }
     }
+
+    // ---- D233 review 4 A4: every latched descent refuses a cycle ---------------------------------
+
+    /// Point internal page `page`'s child for `key` at `target`, under `page`'s write latch: how these
+    /// tests plant a cycle. Returns the image it replaced.
+    fn redirect_child(tree: &BPlusTreeManager<Value, Value>, page: u32, key: &Value, target: u32) -> [u8; PAGE_SIZE] {
+        let _latch = tree.latches().write(page);
+        let before = page_bytes(tree, page);
+        let BPlusTreePage::Internal(mut n) = tree.read_node_raw(page).unwrap() else {
+            panic!("premise: page {page} is an internal page")
+        };
+        let slot = n.child_ptrs.iter().position(|&c| c == n.find_child(key)).unwrap();
+        n.child_ptrs[slot] = target;
+        tree.write_page(page, n.serialize().unwrap()).unwrap();
+        before
+    }
+
+    /// Run `op` on its own thread and wait up to 10 s for its answer. On a timeout `page` gets its
+    /// `before` image back through `write_page`, WITHOUT a page latch (the stuck thread may hold that
+    /// page's read latch, and a latched write would queue behind it for ever), so a thread looping on
+    /// the planted cycle reads the repaired page and leaves, instead of spinning until the binary ends.
+    /// A thread blocked on its own write latch stays blocked, using no CPU, as in the L2 test.
+    fn within_10s<T: Send + 'static>(
+        tree: &Arc<BPlusTreeManager<Value, Value>>,
+        page: u32,
+        before: [u8; PAGE_SIZE],
+        what: &str,
+        op: impl FnOnce(&BPlusTreeManager<Value, Value>) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(op(&worker));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tree.write_page(page, before).unwrap();
+                panic!("{what} has not returned after 10 s: it is following the planted cycle, or waiting on a latch it holds")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what} panicked before returning"),
+        }
+    }
+
+    /// A height-2 tree whose root routes `wide(15)` back to the root: a cycle through a page that
+    /// every latched descent still holds when it reads the pointer.
+    fn a_root_that_names_itself() -> (Arc<BPlusTreeManager<Value, Value>>, tempfile::TempDir, u32, [u8; PAGE_SIZE]) {
+        let (tree, dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert_eq!(height(&tree), 2, "premise: the root is the one internal page on every path");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let before = redirect_child(&tree, root, &wide(15), root);
+        (Arc::new(tree), dir, root, before)
+    }
+
+    fn refused_as_held(what: &str, got: Result<(), FerroError>) {
+        let err = got.expect_err(&format!("{what} through a child pointer to a page it holds was not refused"));
+        assert!(err.to_string().contains("already holds"), "{what} was refused, but not by the held-page check: {err}");
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** A latched read (`search` falls back to
+    /// `read_leaf_for_latched` after its optimistic restarts) read-crabs from the root with no bound, so
+    /// a child pointer naming the page it holds made it latch that page again and loop for ever.
+    #[test]
+    fn a_latched_read_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "search", |t| t.search(&wide(15)).map(|_| ()));
+        refused_as_held("search", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** Every `insert`, `upsert` and `delete` first runs
+    /// `latch_leaf_for_write`'s read-crabbing descent, along the same pointers the pessimistic descents
+    /// follow, so a check in the pessimistic ones alone is never reached: this one loops first.
+    #[test]
+    fn a_write_fast_path_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "delete", |t| t.delete(&wide(15)));
+        refused_as_held("delete", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** The unlink descent holds every page on its path in
+    /// WRITE, so a child pointer to one of them made it wait on its own latch while holding the root.
+    #[test]
+    fn an_unlink_descent_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "delete_unlinking", |t| t.delete_unlinking(&wide(15)));
+        refused_as_held("delete_unlinking", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** The split descent: the same hold, the same self-wait.
+    #[test]
+    fn a_split_descent_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "write_splitting", |t| {
+            t.write_splitting(wide(15), Value::Integer(99), LeafWrite::Insert)
+        });
+        refused_as_held("write_splitting", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** A read-crabbing descent lets go of each page as it
+    /// takes the next, so a cycle through a page it has let go of is not a self-wait: it is a loop. In
+    /// a height-3 tree a level-2 page routes the key back to the root, which the latched read no longer
+    /// holds there, so only the level bound can refuse it.
+    #[test]
+    fn a_latched_read_refuses_a_cycle_through_a_page_it_let_go_of() {
+        let (tree, _dir) = setup();
+        let mut n = 0;
+        while height(&tree) < 3 {
+            tree.insert(wide(n), Value::Integer(n)).unwrap();
+            n += 1;
+            assert!(n < 400, "premise: 400 keys did not build a height-3 tree");
+        }
+        let key = wide(n - 1);
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let BPlusTreePage::Internal(r) = tree.read_node(root).unwrap() else { panic!("premise: the root is internal") };
+        let mid = r.find_child(&key);
+        assert!(matches!(tree.read_node(mid).unwrap(), BPlusTreePage::Internal(_)), "premise: page {mid} is on level 2");
+        let before = redirect_child(&tree, mid, &key, root);
+        let tree = Arc::new(tree);
+        let got = within_10s(&tree, mid, before, "search", move |t| t.search(&key).map(|_| ()));
+        let err = got.expect_err("a search whose descent cycles through a page it let go of was not refused");
+        assert!(err.to_string().contains("levels"), "the search was refused, but not by the level bound: {err}");
+    }
 }
