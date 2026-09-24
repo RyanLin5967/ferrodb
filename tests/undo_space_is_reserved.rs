@@ -120,7 +120,8 @@ fn lowest_row_fixture(db: &mut Db, main: &mut Session) -> RecordId {
 }
 
 /// Row 1 (35 B) goes in first, so it is at the TOP of the page and row 2 (3934 B) is the lowest.
-/// 96 B stay free. This is the D210 fixture from `tests/abort_that_cannot_finish.rs`.
+/// 96 B stay free. This is the D210 fixture from `tests/abort_that_cannot_finish.rs` (since retired,
+/// lane §18).
 fn top_row_fixture(db: &mut Db, main: &mut Session) -> RecordId {
     db.ok(CREATE, main);
     db.ok("INSERT INTO notes VALUES (1, 'a');", main);
@@ -233,7 +234,8 @@ fn a_crash_with_the_relocating_txn_still_open_reopens_and_undoes_it() {
 /// ordinary free space, and that is allowed. The undo is what must not need it. FAILS at `00f4c39`
 /// at the ROLLBACK: `restore_at` wanted 35 B at the front of a page with 8 B free (D210 refused it
 /// rather than overwrite the slot array). This is the schedule of
-/// `abort_that_cannot_finish::rolling_back_a_relocation_onto_a_page_filled_since_refuses_and_leaves_the_page_intact`,
+/// `abort_that_cannot_finish::rolling_back_a_relocation_onto_a_page_filled_since_refuses_and_leaves_the_page_intact`
+/// (since retired, lane §18),
 /// with the outcome the design now requires.
 #[test]
 fn a_relocation_rolled_back_after_its_page_filled_is_restored_in_place() {

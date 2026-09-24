@@ -303,7 +303,8 @@ impl Page {
         // the slot array and the header, and `serialize` writes tuples LAST, so it silently
         // overwrote them: a corrupt page for every row on it, reported as success (the fresh-context
         // re-adversary, `frontier/d205_readversary.md`, `fffdc62`;
-        // `tests/abort_that_cannot_finish.rs`). The room is measured where the splice will land, from
+        // `tests/undo_refused_is_held.rs::rolling_back_onto_a_freed_slot_without_room_refuses_and_leaves_the_page_intact`).
+        // The room is measured where the splice will land, from
         // the start of the tuple region, not from a header field. The slot entry already exists, so
         // no slot space is needed.
         //

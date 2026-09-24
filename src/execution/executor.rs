@@ -508,7 +508,8 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
 ///   logged, so a resumed abort skipped it. It also said nothing stopped the user carrying on;
 ///   nothing did, because `Aborting` was never read. Since D211, a retry reaches the failed record
 ///   itself, and the transaction is refused every statement but ROLLBACK
-///   (`tests/abort_that_cannot_finish.rs`). An undo that never finds room still never finishes;
+///   (`tests/undo_refused_is_held.rs`). Since D213 an undo never needs room it could lose, so what can
+///   still refuse one is an I/O error, a failed log append, or a page that disagrees with the log;
 ///   see `TxnManager::abort`.
 fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
     match txn.abort(txn_id) {

@@ -786,7 +786,7 @@ impl TxnManager {
         // - `apply_then_log` logs a CLR only for an undo that is on the page, so a retry reaches the
         //   failed record itself;
         // - an `Aborting` transaction is refused everything but ROLLBACK (`snapshot_of`, `commit`);
-        // - the executor keeps the session's id when a rollback fails (`tests/abort_that_cannot_finish.rs`).
+        // - the executor keeps the session's id when a rollback fails (`tests/undo_refused_is_held.rs`).
         //
         // **What was still NOT recoverable at `00f4c39`, and is unrepresentable since D213:** an undo
         // that never finds room, for instance because other transactions committed rows into the
