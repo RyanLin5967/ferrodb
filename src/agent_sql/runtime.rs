@@ -219,6 +219,21 @@ pub fn revert_graph_captures() -> u64 {
     REVERT_GRAPH_CAPTURES.load(AtomicOrdering::Relaxed)
 }
 
+/// **Wall #18 instrument — how many retained reads a demand-driven `REVERT` planner examined as
+/// candidates**, one per (write, candidate read) pair it looked at. That is the walk's analogue of
+/// `GRAPH_BUILD_PAIRS`.
+///
+/// It exists so that a planner which walks out from the target cannot hide a linear scan: counting
+/// only the captures it visits would read 1 for a walk that then compares the target's writes
+/// against every read in the table. The full-graph planner examines no candidates (it compares
+/// pairs, counted by `GRAPH_BUILD_PAIRS`), so until a walk exists this reads 0.
+pub static REVERT_GRAPH_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+/// Candidates examined since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_candidates() -> u64 {
+    REVERT_GRAPH_CANDIDATES.load(AtomicOrdering::Relaxed)
+}
+
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///

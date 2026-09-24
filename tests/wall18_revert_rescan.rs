@@ -24,27 +24,36 @@
 //!
 //! Per `REVERT MERGE m_1` after N merges, one op each:
 //!
-//! | quantity                       | before the index | after the index | N = 8 → 64          |
-//! |--------------------------------|------------------|-----------------|---------------------|
-//! | applied entries examined       | N                | 1               | 8 → 64, then 1 → 1  |
-//! | applied entries matched        | 1                | 1               | control, never moves|
-//! | captures folded into the graph | N                | N               | 8 → 64 (unfixed)    |
-//! | graph pairs compared           | 3N²              | 3N²             | 192 → 12,288 (unfixed) |
+//! | quantity                          | full-graph planner | walk (`CaptureSet`) | N = 8 / 64      |
+//! |-----------------------------------|--------------------|---------------------|-----------------|
+//! | applied entries examined          | 1 (index, `5c15873`) | 1                 | 1 / 1           |
+//! | applied entries matched           | 1                  | 1                   | control         |
+//! | captures the planner consulted    | N (all, folded)    | 1 (the target)      | 8/64, then 1/1  |
+//! | graph pairs compared (`build`)    | 3N²                | 0                   | 192/12,288, then 0/0 |
+//! | index candidates examined (walk)  | 0                  | 1                   | 0/0, then 1/1   |
 //!
 //! `3N²` is N captures × 3 valued writes each (`record_applied` records the post image's two
 //! cells and the pre image's changed `qty`) against N predicate reads (one row-targeting read per
 //! `UPDATE ... WHERE id = i`), with no exact reads at all. The exponent, 64 = (64 / 8)², does not
 //! depend on the constant 3; the constant is a reading of `record_applied`, not a measurement.
+//! The walk's single candidate is the target's own `id = 1` targeting read, found in the point
+//! bucket for its col-0 write and rejected as itself.
 //!
-//! The first test is the failing-first one for this lane's index. The second is the failing-first
-//! one for the graph term, which this lane designed and did not build, so it is `#[ignore]`d with
-//! its reason; its assertion is the property the design must deliver.
+//! The first test is the failing-first one for the applied-log index. The second is the
+//! failing-first one for the graph term. It was `#[ignore]`d while the walk was only designed; it is
+//! now live, and it compares the candidate count as well, because captures alone cannot tell an
+//! indexed walk from one that scans every read in the table. The last three pin the ANSWER REVERT
+//! gives for the three kinds of read the walk indexes (an exact version, a point on the key, an
+//! unbounded scan), including a second hop. They pass on the full-graph planner first, which is
+//! what makes them a fair check of its replacement.
 
 use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
 
 use ferrodb::agent_sql::dispatch::AgentOutput;
-use ferrodb::agent_sql::runtime::{revert_applied_counters, revert_graph_captures, AgentRuntime};
+use ferrodb::agent_sql::runtime::{
+    revert_applied_counters, revert_graph_candidates, revert_graph_captures, AgentRuntime,
+};
 use ferrodb::agent_sql::MergeReport;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
@@ -54,8 +63,9 @@ use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
-use ferrodb::provenance::revert::graph_build_pairs;
+use ferrodb::provenance::revert::{graph_build_pairs, RevertPlan};
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::tel::ids::TxnId;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
@@ -140,6 +150,41 @@ fn report(out: Outcome) -> MergeReport {
     }
 }
 
+fn plan_of(out: Outcome) -> RevertPlan {
+    match out {
+        Outcome::Agent(AgentOutput::Revert(p)) => p,
+        Outcome::Agent(other) => panic!("expected a revert plan, got {}", other),
+        _ => panic!("expected an agent output"),
+    }
+}
+
+/// `inventory (id, qty)` holding rows `1..=rows`, every `qty` 100, written outside any agent
+/// session so nothing is retained.
+fn seeded(rows: usize) -> Db {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+    for i in 1..=rows {
+        db.ok(&format!("INSERT INTO inventory VALUES ({}, 100);", i), &mut s);
+    }
+    db
+}
+
+/// A new connection with an agent session open on it. Sessions are txn 1, 2, 3, ... in the order
+/// they begin — the numbering `provenance_scan_cascade.rs` asserts on.
+fn agent_session(db: &mut Db, name: &str) -> Session {
+    let mut a = db.session();
+    db.ok(&format!("BEGIN AGENT SESSION AS '{name}' RUN 'r_{name}';"), &mut a);
+    a
+}
+
+/// `MERGE` the session's task, insisting it landed, and return the merge id.
+fn merge(db: &mut Db, a: &mut Session) -> String {
+    let m = report(db.ok("MERGE;", a));
+    assert!(m.applied_to_target, "merge did not land: {}", m);
+    m.merge_id
+}
+
 /// What one `REVERT MERGE m_1` cost, after `n` merges, and whether it did its job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reading {
@@ -148,6 +193,7 @@ struct Reading {
     applied_matched: u64,
     graph_captures: u64,
     graph_pairs: u64,
+    graph_candidates: u64,
 }
 
 /// `n` tasks, each forking, decrementing ITS OWN row by primary key and merging; then one revert of
@@ -157,12 +203,7 @@ struct Reading {
 /// edge out of `m_1`: the revert is not blocked and cascades through nothing. That is what makes
 /// `matched` a constant and the undo a single transaction at every `n`.
 fn reading(n: usize) -> Reading {
-    let mut db = Db::new();
-    let mut s = db.session();
-    db.ok("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut s);
-    for i in 1..=n {
-        db.ok(&format!("INSERT INTO inventory VALUES ({}, 100);", i), &mut s);
-    }
+    let mut db = seeded(n);
     for i in 1..=n {
         let mut a = db.session();
         db.ok(&format!("BEGIN AGENT SESSION AS 'a{i}' RUN 'r{i}';"), &mut a);
@@ -174,14 +215,10 @@ fn reading(n: usize) -> Reading {
 
     let mut main = db.session();
     let (e0, m0) = revert_applied_counters();
-    let (c0, p0) = (revert_graph_captures(), graph_build_pairs());
-    let plan = match db.ok("REVERT MERGE m_1;", &mut main) {
-        Outcome::Agent(AgentOutput::Revert(p)) => p,
-        Outcome::Agent(other) => panic!("expected a revert plan, got {}", other),
-        _ => panic!("expected an agent output"),
-    };
+    let (c0, p0, k0) = (revert_graph_captures(), graph_build_pairs(), revert_graph_candidates());
+    let plan = plan_of(db.ok("REVERT MERGE m_1;", &mut main));
     let (e1, m1) = revert_applied_counters();
-    let (c1, p1) = (revert_graph_captures(), graph_build_pairs());
+    let (c1, p1, k1) = (revert_graph_captures(), graph_build_pairs(), revert_graph_candidates());
 
     // The revert must have DONE the thing whose cost is being counted. A blocked plan reverts
     // nothing, calls no `undo_txn`, and would read as a perfectly flat `examined` of 0.
@@ -197,14 +234,15 @@ fn reading(n: usize) -> Reading {
         applied_matched: m1 - m0,
         graph_captures: c1 - c0,
         graph_pairs: p1 - p0,
+        graph_candidates: k1 - k0,
     }
 }
 
 fn readings() -> (Reading, Reading) {
     let small = reading(SMALL);
     let large = reading(LARGE);
-    // Printed unconditionally: the graph arm is a pre-registered CONTROL for this lane's commit
-    // (the index cannot move it), and a control that is not recorded cannot be checked.
+    // Printed unconditionally: every field is pre-registered at each commit of this lane, including
+    // the ones a given commit cannot move, and a control that is not recorded cannot be checked.
     eprintln!("wall18 {:?}", small);
     eprintln!("wall18 {:?}", large);
     (small, large)
@@ -241,17 +279,18 @@ fn revert_finds_one_txns_ops_without_walking_the_whole_applied_log() {
     );
 }
 
-/// **The failing-first test for the graph term, which is DESIGNED, NOT BUILT.**
+/// **The failing-first test for the graph term.**
 ///
-/// Pre-registered red on this tree: captures 8 → 64 and pairs 192 → 12,288. The design in the lane
-/// report answers `REVERT` from indexes maintained as captures change, walking only the target and
-/// its dependents; for this fixture that is the target alone at every N, so both readings must be
-/// the same at N = 8 and N = 64. `captures >= 1` keeps a rewrite that stops counting from passing
-/// vacuously: any correct planner consults at least the target's own capture.
+/// Pre-registered (lane report Amendment 1): RED on the full-graph planner, (captures, pairs,
+/// candidates) = (8, 192, 0) at N = 8 against (64, 12288, 0) at N = 64; GREEN on the walk, (1, 0, 1)
+/// at both. For this fixture the revert's answer is the target alone at every N, so a planner whose
+/// work depends on history rather than on the answer fails here.
+///
+/// The candidate count is what makes this discriminate. Counting captures alone, a walk that visits
+/// only the target but then compares its writes against every read in the table reads 1 at both
+/// sizes and passes; its candidates read 8 and 64. `captures >= 1` keeps a planner that stops
+/// counting from passing vacuously: any correct planner consults at least the target's capture.
 #[test]
-#[ignore = "wall #18 graph term OPEN: designed in artie-research frontier/lane_wall18_revert.md, \
-            not built. Run with --ignored to see the pre-registered red (captures 8 -> 64, pairs \
-            192 -> 12288)"]
 fn revert_graph_work_does_not_grow_with_merge_history() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (small, large) = readings();
@@ -260,15 +299,102 @@ fn revert_graph_work_does_not_grow_with_merge_history() {
         "the planner consulted no capture at all, not even the target's: {small:?}"
     );
     assert_eq!(
-        (small.graph_captures, small.graph_pairs),
-        (large.graph_captures, large.graph_pairs),
-        "REVERT's dependency work grew with merge history: captures {} -> {}, pairs {} -> {} \
-         from N={} to N={}, for a revert whose answer is the same at both",
+        (small.graph_captures, small.graph_pairs, small.graph_candidates),
+        (large.graph_captures, large.graph_pairs, large.graph_candidates),
+        "REVERT's dependency work grew with merge history: captures {} -> {}, pairs {} -> {}, \
+         candidates {} -> {} from N={} to N={}, for a revert whose answer is the same at both",
         small.graph_captures,
         large.graph_captures,
         small.graph_pairs,
         large.graph_pairs,
+        small.graph_candidates,
+        large.graph_candidates,
         small.n,
         large.n,
     );
+}
+
+/// **The answer through an exact read, one hop and two.**
+///
+/// A (txn 1) writes row 1 and merges. B (txn 2) reads row 1 BY KEY — an exact read of A's version —
+/// then writes row 2 and merges. C (txn 3) reads row 2 by key, which is B's version, and stays open.
+/// C read nothing A wrote, so it depends on A only THROUGH B: reverting A must name both, and
+/// reverting B must name C alone. A planner that stops after the first hop names `[2]` for A.
+#[test]
+fn a_two_hop_chain_is_named_through_its_middle() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut db = seeded(3);
+
+    let mut a = agent_session(&mut db, "a");
+    db.ok("UPDATE inventory SET qty = qty - 1 WHERE id = 1;", &mut a);
+    let m_a = merge(&mut db, &mut a);
+
+    let mut b = agent_session(&mut db, "b");
+    db.ok("SELECT qty FROM inventory WHERE id = 1;", &mut b);
+    db.ok("UPDATE inventory SET qty = qty - 1 WHERE id = 2;", &mut b);
+    let m_b = merge(&mut db, &mut b);
+
+    let mut c = agent_session(&mut db, "c");
+    db.ok("SELECT qty FROM inventory WHERE id = 2;", &mut c);
+
+    let mut main = db.session();
+    let from_b = plan_of(db.ok(&format!("REVERT MERGE {m_b};"), &mut main));
+    assert_eq!(from_b.blocked_by, vec![TxnId(3)], "C read B's version of row 2: {from_b:?}");
+    let from_a = plan_of(db.ok(&format!("REVERT MERGE {m_a};"), &mut main));
+    assert_eq!(
+        from_a.blocked_by,
+        vec![TxnId(2), TxnId(3)],
+        "B read A's row 1 and C read B's row 2, so both are downstream of A: {from_a:?}"
+    );
+    assert_eq!(db.qty_of(1), Value::Integer(99), "a halted revert changes nothing");
+}
+
+/// **The answer through a point on the key.**
+///
+/// A (txn 1) writes row 1 and merges. D (txn 2) then runs `UPDATE ... WHERE id = 1`: it named the
+/// row A last wrote, and that row-targeting read is retained as a point on column 0. G (txn 3) does
+/// the same to row 2, which A never touched — the control. Both stay open.
+#[test]
+fn a_write_that_names_a_row_by_key_depends_on_the_merge_that_last_wrote_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut db = seeded(2);
+
+    let mut a = agent_session(&mut db, "a");
+    db.ok("UPDATE inventory SET qty = qty - 1 WHERE id = 1;", &mut a);
+    let m_a = merge(&mut db, &mut a);
+
+    let mut d = agent_session(&mut db, "d");
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 1;", &mut d);
+    let mut g = agent_session(&mut db, "g");
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut g);
+
+    let mut main = db.session();
+    let p = plan_of(db.ok(&format!("REVERT MERGE {m_a};"), &mut main));
+    assert_eq!(p.blocked_by, vec![TxnId(2)], "D named row 1 after A wrote it; G named row 2: {p:?}");
+}
+
+/// **The answer through an unbounded scan, on both sides of the write.**
+///
+/// F (txn 1) scans the whole table before anything is published, at `observed_at` 1. A (txn 2)
+/// writes row 1 and merges, stamping `begin_ts` 1. E (txn 3) scans the whole table afterwards, at
+/// `observed_at` 2. Both scans cover row 1; only E's snapshot admitted A's version
+/// (`begin_ts < observed_at`). Both stay open.
+#[test]
+fn a_full_scan_depends_on_every_merge_published_before_it_and_no_later_one() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut db = seeded(2);
+
+    let mut f = agent_session(&mut db, "f");
+    db.ok("SELECT id, qty FROM inventory;", &mut f);
+
+    let mut a = agent_session(&mut db, "a");
+    db.ok("UPDATE inventory SET qty = qty - 1 WHERE id = 1;", &mut a);
+    let m_a = merge(&mut db, &mut a);
+
+    let mut e = agent_session(&mut db, "e");
+    db.ok("SELECT id, qty FROM inventory;", &mut e);
+
+    let mut main = db.session();
+    let p = plan_of(db.ok(&format!("REVERT MERGE {m_a};"), &mut main));
+    assert_eq!(p.blocked_by, vec![TxnId(3)], "E scanned after A published, F before: {p:?}");
 }
