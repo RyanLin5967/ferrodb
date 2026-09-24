@@ -544,4 +544,56 @@ mod tests {
         assert_eq!(tuples.unwrap().len(), 5);
     }
 
+    /// The free space `hfm`'s page directory lists for `page_id`.
+    fn listed_free_space(hfm: &HeapFileManager, page_id: u32) -> u16 {
+        let mut dir_page = hfm.first_directory_page_id;
+        loop {
+            let frame_i = hfm.buffer_pool_manager.fetch_page(dir_page).unwrap();
+            let data = hfm.buffer_pool_manager.frames[frame_i].read().unwrap().data;
+            hfm.buffer_pool_manager.unpin_page(dir_page, false);
+            let dir = PageDirectory::deserialize(data);
+            if let Some(e) = dir.entries.iter().find(|e| e.page_id == page_id) {
+                return e.free_space;
+            }
+            assert_ne!(dir.next_page_directory, 0, "page {page_id} is not in the directory");
+            dir_page = dir.next_page_directory;
+        }
+    }
+
+    /// **D261 (lane `lane_d261_relocation_space.md` §2 T1): an unlogged relocation to a page the
+    /// directory overstates keeps its row.** The relocation deletes the row from its page BEFORE it
+    /// inserts it at the destination, and the destination came from the directory's figure. At
+    /// `867d3bc`, with an overstated entry, the insert refused after the delete, and on an unlogged
+    /// heap (ALTER's rewrite) nothing undoes a delete: the row was gone. The overstated entry is
+    /// planted directly; `d257-review1` R2 names two rollback routes to one at `9aa6968`, which D213
+    /// closes on this branch (lane §0.1).
+    #[test]
+    fn an_unlogged_relocation_to_a_page_the_directory_overstates_keeps_its_row() {
+        let (hfm, _dir) = setup();
+        // Page P, filled exactly: 2000 + 4 and 2065 + 4 bytes are the 4073 a fresh page has.
+        let p1 = hfm.insert(Tuple::new(vec![1; 2000])).unwrap();
+        let p2 = hfm.insert(Tuple::new(vec![2; 2065])).unwrap();
+        assert_eq!(p1.page_id, p2.page_id, "premise failed: the two tuples do not share page P");
+        // Page Q: row r, and a filler that leaves Q 40 bytes free.
+        let r = hfm.insert(Tuple::new(vec![3; 100])).unwrap();
+        assert_ne!(r.page_id, p1.page_id, "premise failed: P was not full");
+        let filler = hfm.insert(Tuple::new(vec![4; 3925])).unwrap();
+        assert_eq!(filler.page_id, r.page_id, "premise failed: the filler did not land on Q");
+        // The directory now claims P is empty, as an overstated entry would. P is listed before Q.
+        hfm.update_directory_entry(p1.page_id, (PAGE_SIZE - HEADER_SIZE) as u16).unwrap();
+
+        let moved = hfm.update(r, Tuple::new(vec![5; 150])).unwrap_or_else(|e| {
+            panic!(
+                "the relocation failed ({e}) after deleting the row it was moving; reading it now gives {:?}",
+                hfm.read(r).err()
+            )
+        });
+        assert_eq!(hfm.read(moved).unwrap().data, vec![5; 150], "the relocated row does not read back");
+        assert_eq!(
+            listed_free_space(&hfm, p1.page_id),
+            0,
+            "the overstated entry for P was not corrected to P's real free space"
+        );
+    }
+
 }

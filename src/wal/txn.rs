@@ -3656,6 +3656,60 @@ use super::*;
         );
         FAIL_RELEASES.with(|f| f.set(0));
     }
+
+    /// **D261 (lane `lane_d261_relocation_space.md` §2 T3): a rollback leaves every page directory entry
+    /// equal to the page's real free space.** The directory is what `find_page_with_space` trusts. At
+    /// `867d3bc` no undo told it anything: undoing an insert frees its slot, and when the tuple was
+    /// the page's lowest the page gains the bytes back while its entry still lists them as taken.
+    #[test]
+    fn a_rollback_leaves_every_page_directory_entry_equal_to_the_pages_real_free_space() {
+        use crate::storage::page_directory::PageDirectory;
+        let (bp, _wal, txn, _dir) = setup();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t1 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        // Page P, filled exactly (2000 + 4 and 2065 + 4 are a fresh page's 4073), and a row on Q.
+        let a = heap.insert(Tuple::new(vec![1; 2000])).unwrap();
+        let b = heap.insert(Tuple::new(vec![2; 2065])).unwrap();
+        let q = heap.insert(Tuple::new(vec![3; 100])).unwrap();
+        txn.commit(t1).unwrap();
+        assert_eq!(a.page_id, b.page_id, "premise failed: the two tuples do not share page P");
+        assert_ne!(q.page_id, a.page_id, "premise failed: P was not full");
+
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        let moved = heap.update(a, Tuple::new(vec![4; 2100])).unwrap();
+        assert_eq!(moved.page_id, q.page_id, "premise failed: the growing UPDATE did not relocate onto Q");
+        let extra = heap.insert(Tuple::new(vec![5; 50])).unwrap();
+        assert_eq!(extra.page_id, q.page_id, "premise failed: the INSERT did not land on Q");
+        txn.abort(t2).unwrap();
+
+        let mut dir_page = heap.first_directory_page_id;
+        let mut checked = 0;
+        loop {
+            let frame_i = bp.fetch_page(dir_page).unwrap();
+            let data = bp.frames[frame_i].read().unwrap().data;
+            bp.unpin_page(dir_page, false);
+            let dir = PageDirectory::deserialize(data);
+            for e in &dir.entries {
+                let frame_i = bp.fetch_page(e.page_id).unwrap();
+                let page = Page::deserialize(bp.frames[frame_i].read().unwrap().data).unwrap();
+                bp.unpin_page(e.page_id, false);
+                let real = page.get_free_space_end() - page.get_free_space_start();
+                assert_eq!(
+                    e.free_space, real,
+                    "after the rollback the directory lists page {} with {} bytes free, and the page has {real}",
+                    e.page_id, e.free_space
+                );
+                checked += 1;
+            }
+            if dir.next_page_directory == 0 {
+                break;
+            }
+            dir_page = dir.next_page_directory;
+        }
+        assert!(checked >= 2, "premise failed: the directory lists {checked} page(s), not P and Q");
+    }
 }
 
 // **The seam's test half, BELOW the tests module on purpose.** `tests/d53_private_root_allowlist.rs`
