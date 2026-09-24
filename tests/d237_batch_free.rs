@@ -46,6 +46,11 @@ fn allocated(bp: &BufferPoolManager, page: u32) -> bool {
 fn a_batch_free_with_an_unfreeable_page_frees_none_of_it() {
     let (bp, _dir) = pool();
     let ids: Vec<u32> = (0..3).map(|_| bp.new_page().unwrap()).collect();
+    for (n, &p) in ids.iter().enumerate() {
+        let i = bp.fetch_page(p).unwrap();
+        bp.frame_write(i).data[0] = 0x40 + n as u8;
+        bp.unpin_page(p, true);
+    }
     // Four bitmap pages' span in: a fresh file has only bitmap page 0, so nothing maps it. A
     // reserved region covering it would refuse it too; either refusal is deterministic.
     let unmapped = (PAGE_SIZE as u32 - 4) * 8 * 4;
@@ -62,6 +67,14 @@ fn a_batch_free_with_an_unfreeable_page_frees_none_of_it() {
         freed.is_empty(),
         "free_pages refused with `{err}` having already freed {freed:?}; a retry would free them again"
     );
+    // Review 2 N4: after the refusal every page is still pinnable and still holds its bytes, so the
+    // refusal took back whatever the call had done to their frames.
+    for (n, &p) in ids.iter().enumerate() {
+        let i = bp.fetch_page(p).unwrap_or_else(|e| panic!("page {p} cannot be pinned after the refusal: {e}"));
+        let byte = bp.frames[i].read().unwrap().data[0];
+        bp.unpin_page(p, false);
+        assert_eq!(byte, 0x40 + n as u8, "page {p} lost its bytes to a refused free");
+    }
 
     bp.free_pages(&ids).unwrap();
     assert!(ids.iter().all(|&p| !allocated(&bp, p)), "the batch without the bad page did not free every page");
@@ -116,4 +129,7 @@ fn a_concurrent_pinner_never_sees_a_half_freed_set() {
         }
     }
     eprintln!("{TRIALS} trials: {whole} freed whole, {refused} refused whole");
+    // Review 2 N4: a run in which no trial freed anything tested nothing. The pinner holds the page
+    // about half the time, so across 200 trials a zero here is not a schedule.
+    assert!(whole > 0, "no trial freed its set: {refused} of {TRIALS} refused, so the run tested nothing");
 }

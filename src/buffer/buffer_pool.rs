@@ -291,6 +291,13 @@ pub struct Frame {
     pub page_id: Option<u32>,
     pub pin_counter: AtomicU16,
     pub dirty_flag: AtomicBool,
+    /// **Being freed** by `BufferPoolManager::free_pages` (D237 review 2, N1): set in its pass 1,
+    /// with the label left as it is, and cleared either in the same frame-lock hold that resets the
+    /// frame to free (pass 3) or by a refusal. A freeing frame is not free (`claim_free_frame` takes
+    /// only an unlabelled frame) and not pinnable (`pin_if_labelled` refuses it), and an eviction
+    /// treats it as gone. Unlabelling it instead, as pass 1 first did, made it look free, and a
+    /// concurrent fault of another page claimed it.
+    pub freeing: bool,
 }
 
 /// What happened when the pool tried to take a replacement victim's frame.
@@ -644,8 +651,21 @@ impl Drop for FrameWriteGuard<'_> {
 /// # }
 /// ```
 ///
-/// (A `compile_fail` doctest passes on ANY compile error, so the snippet holds nothing but that one
-/// borrow; with `write` returning a guard tied to the pool instead, as it first did, it compiles.)
+/// The same holds for the read guard (review 2, N4):
+///
+/// ```compile_fail
+/// # fn f(pool: &ferrodb::buffer::buffer_pool::BufferPoolManager) -> Result<(), ferrodb::error::FerroError> {
+/// let pin = pool.pin(1)?;
+/// let frame = pin.read();
+/// pin.unpin(false); // E0505: `pin` is borrowed by `frame`
+/// drop(frame);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// (A `compile_fail` doctest passes on ANY compile error, so each snippet holds nothing but that one
+/// borrow. With guards tied to the POOL's lifetime instead, as `write` first was, both compile; that
+/// is the fire-check's mutant M8, their red arm.)
 ///
 /// # Dirtiness
 ///
@@ -963,7 +983,9 @@ impl BufferPoolManager {
         // src/storage/page_latch.rs.
         let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
-        if frame.page_id != Some(page_id) {
+        // A frame `free_pages` is part way through freeing keeps its label, so the label alone
+        // would let this pin it after the call's pin check (D237 review 2, N1).
+        if frame.page_id != Some(page_id) || frame.freeing {
             return None;
         }
         frame.pin_counter.fetch_add(1, Ordering::Relaxed);
@@ -1092,6 +1114,10 @@ impl BufferPoolManager {
     /// happen under one acquisition of that frame's lock, so two threads scanning at once cannot
     /// both take it — the original bug here probed under a read lock and re-acquired a write lock,
     /// and both threads wrote a different page into the same frame.
+    ///
+    /// **Only an unlabelled frame is free.** A frame `free_pages` is freeing keeps its label while
+    /// it is marked (`Frame::freeing`) and loses it only in the same lock hold that resets it, so a
+    /// claim can never take a frame part way through being freed (D237 review 2, N1).
     fn claim_free_frame(&self, incoming: u32) -> Option<usize> {
         // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
         // only from `fetch_page`, which already opens a section -- the marker is here anyway
@@ -1172,7 +1198,9 @@ impl BufferPoolManager {
         // else.
         {
             let frame = self.frames[frame_i].read().unwrap();
-            if frame.page_id != Some(victim) {
+            // A victim `free_pages` is freeing is gone: its bytes must not be written back over a
+            // slot pass 2 is about to give away, and its frame must not be relabelled (D237 N1).
+            if frame.page_id != Some(victim) || frame.freeing {
                 return Ok(Evicted::Gone);
             }
             if frame.pin_counter.load(Ordering::Relaxed) > 0 {
@@ -1190,7 +1218,7 @@ impl BufferPoolManager {
         // the pin because that whole cycle can complete and leave the count back at zero.
         let mut pt = self.page_table.write().unwrap();
         let mut frame = self.frame_write(frame_i);
-        if frame.page_id != Some(victim) {
+        if frame.page_id != Some(victim) || frame.freeing {
             return Ok(Evicted::Gone);
         }
         if frame.pin_counter.load(Ordering::Relaxed) > 0
@@ -1221,6 +1249,7 @@ impl BufferPoolManager {
     /// The structural argument is that it cannot get a stale candidate at all: **a pinned page
     /// cannot be evicted.** Every path that would unmap it refuses while `pin_counter > 0` —
     /// `evict_into` returns `Declined`, `delete_page` and `free_page` return `PagePinned`,
+    /// `free_pages` refuses the whole set (and refuses a pin on a frame it is freeing),
     /// `invalidate_all` refuses the whole sweep, and `branch::arena::evict` leaves it. So between
     /// the pin this call is undoing and this call, the mapping cannot have changed.
     ///
@@ -1461,18 +1490,31 @@ impl BufferPoolManager {
     ///   HELD from the first check to the last frame reset. Every miss, fault-in, eviction, flush and
     ///   table lookup waits.
     /// - Pass 1 write-locks each resident page's frame in turn. A pin refuses the whole call: the
-    ///   frames already taken get their labels back, and nothing has been freed. An unpinned frame
-    ///   is **unlabelled**. That closes the one pin path that takes none of the three locks: a hit
-    ///   pins under the frame's READ lock after checking the label (`pin_if_labelled`), and an
-    ///   unlabelled frame fails that check and falls to the miss path, which needs `in_transit`.
+    ///   frames already marked are unmarked, and nothing has been freed. An unpinned frame is
+    ///   **marked as being freed** (`Frame::freeing`), with its label left as it is. That closes
+    ///   the one pin path that takes none of the three locks: a hit pins under the frame's READ
+    ///   lock after checking the label (`pin_if_labelled`), and it refuses a freeing frame.
+    /// - **Marked, not unlabelled (review 2, N1).** A fault that got its replacement verdict before
+    ///   this call took the ARC lock claims a frame without any of the three locks
+    ///   (`claim_free_frame`, one frame lock at a time), and it takes any UNLABELLED frame. The
+    ///   first version unlabelled here, so such a fault claimed a frame of the set; pass 3 then
+    ///   zeroed its bytes and reset its pin, or a refusal wrote the old label over the new one. A
+    ///   freeing frame keeps its label, so no claim takes it, and an eviction treats it as gone.
     /// - Pass 2 is the disk: [`DiskManager::deallocate_many`] validates every page before it clears
-    ///   any bit (review F4). A refusal there gives the labels back too.
-    /// - Pass 3 forgets the frames: table entry, bytes, pin count, dirty flag, ARC entry.
+    ///   any bit (review F4). A refusal there unmarks too. Unmarking clears the mark and nothing
+    ///   else, so it cannot write over anything.
+    /// - Pass 3 forgets the frames, each in one frame-lock hold: label to `None`, bytes, pin count,
+    ///   dirty flag and mark, then the table entry and the ARC entry.
     ///
-    /// A pinner therefore either pinned before the check, and the call refuses whole, or waits until
-    /// the frees are done. Costs: the three locks are held across one bitmap read and one bitmap
-    /// write per touched bitmap page, so every miss in the process stalls for that long, once per
-    /// call. A page listed twice is freed once.
+    /// A pinner therefore either pinned before the check, and the call refuses whole, or waits
+    /// until the frees are done; a fault of another page finds its frame elsewhere. Costs (review 2
+    /// N6), all with the three locks held, so every miss, fault-in, eviction, flush and table
+    /// lookup in the process waits for them, once per call: one bitmap read and one bitmap write
+    /// per touched bitmap page; one frame write lock per resident page in each of pass 1 and pass 3
+    /// (and in the unmark, on a refusal); and one 4 KB shadow refresh per resident page for each of
+    /// those writes, since a frame write guard republishes the frame to optimistic readers on drop.
+    /// A mark or an unmark leaves the label alone, so a refused call leaves no shadow at `NO_PAGE`.
+    /// A page listed twice is freed once.
     ///
     /// **Not covered:** an I/O failure on the second of two touched bitmap pages (see
     /// `deallocate_many`); and anything after the frees in the caller, which is D229's durable
@@ -1489,27 +1531,32 @@ impl BufferPoolManager {
         let mut cache = self.arc_locked();
         let mut pt = self.page_table.write().unwrap();
 
-        // Gives pass 1's frames their labels back, when the call refuses after taking some.
-        let relabel = |taken: &[(u32, usize)]| {
+        // Takes pass 1's marks off again, when the call refuses after marking some. It clears the
+        // mark and touches nothing else: a label is never written back, so it cannot land on a
+        // frame anything else has claimed since (D237 review 2, N1).
+        let unmark = |taken: &[(u32, usize)]| {
             for &(page_id, frame_i) in taken {
-                self.frame_write(frame_i).page_id = Some(page_id);
+                let mut frame = self.frame_write(frame_i);
+                if frame.freeing && frame.page_id == Some(page_id) {
+                    frame.freeing = false;
+                }
             }
         };
 
-        // Pass 1: refuse on any pin; unlabel every other resident frame.
+        // Pass 1: refuse on any pin; mark every other resident frame as being freed.
         let mut taken: Vec<(u32, usize)> = Vec::new();
         for &page_id in page_ids {
             let Some(&frame_i) = pt.get(&page_id) else { continue };
             let mut frame = self.frame_write(frame_i);
-            if frame.page_id != Some(page_id) {
-                continue; // listed twice, and an earlier turn already took its frame
+            if frame.page_id != Some(page_id) || frame.freeing {
+                continue; // listed twice, and an earlier turn already marked its frame
             }
             if frame.pin_counter.load(Ordering::Relaxed) > 0 {
                 drop(frame);
-                relabel(&taken[..]);
+                unmark(&taken[..]);
                 return Err(FerroError::PagePinned);
             }
-            frame.page_id = None;
+            frame.freeing = true;
             drop(frame);
             taken.push((page_id, frame_i));
         }
@@ -1520,20 +1567,26 @@ impl BufferPoolManager {
 
         // Pass 2: the disk, validated whole before any bit is cleared.
         if let Err(e) = self.disk_manager.deallocate_many(page_ids) {
-            relabel(&taken[..]);
+            unmark(&taken[..]);
             return Err(e);
         }
 
-        // Pass 3: forget the frames.
+        // Pass 3: forget the frames. The label goes to `None` and the mark comes off in the SAME
+        // frame-lock hold as the reset, as `free_page` does, so no one ever sees a free-looking frame
+        // that still holds a freed page's state.
         for &(page_id, frame_i) in &taken {
             pt.remove(&page_id);
             let mut frame = self.frame_write(frame_i);
+            frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
+            frame.freeing = false;
         }
+        // Past the commit point: pass 2 has freed the pages on disk, so nothing here may fail the
+        // call. `ArcCache::remove` of an absent page is a no-op, as in `invalidate_all`.
         for &(page_id, _) in &taken {
-            cache.remove(page_id)?;
+            let _ = cache.remove(page_id);
         }
         Ok(())
     }
@@ -1642,7 +1695,7 @@ fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
 
 impl Frame {
     pub fn new() -> Self {
-        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false)}
+        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false), freeing: false}
     }
 }
 #[cfg(test)]
