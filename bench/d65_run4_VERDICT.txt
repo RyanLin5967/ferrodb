@@ -1,0 +1,34 @@
+# D65 run 4 VERDICT — produced by artie-research frontier/analysis/d65_reopen_verdict.py @ 4805d67, run 2026-09-24T04:37:17Z, rc=0
+# input: bench/d65_reopen_curve_1e6_run2.txt as committed at 09afd04; cross-check: bench/d65_reopen_curve_1e6_run3_CUT_RAW.txt
+D65 reopen curve — pre-registered verdicts. input /Users/idide/wt/ferrodb-d65-reopen-curve/bench/d65_reopen_curve_1e6_run2.txt sha256 799ee1fed98ded25
+pre-registration pin: ok (bench/d65_reopen_curve_1e6_run2.txt before [HERE], sha256 44bb91f4feec5bbe)
+[HERE] 2026-09-24T02:37:03Z  binary built from 4428fb9 (tree dirty=[])
+rows: 7 (N = [1000, 10000, 100000, 250000, 500000, 750000, 1000000])
+VERDICT RUN STOP | stopped on space at N=1000000 (STOPPING: 9.3 GiB free, floor is 20 GiB. Not this run's budget -- the DISK. Reported as a stop, not a result.); nothing is extrapolated past the last row (rule 6)
+  N=    1000 cat_live@re=1001 reload_ctl=ok arena_pg=1000 img=48.0 len=4100 cat=336 live=1000
+  N=   10000 cat_live@re=10001 reload_ctl=ok arena_pg=10000 img=48.0 len=4096 cat=333 live=10000
+  N=  100000 cat_live@re=100001 reload_ctl=ok arena_pg=100000 img=48.0 len=4096 cat=334 live=100000
+  N=  250000 cat_live@re=250001 reload_ctl=ok arena_pg=250000 img=48.0 len=4096 cat=334 live=250000
+  N=  500000 cat_live@re=500001 reload_ctl=ok arena_pg=500000 img=48.0 len=4096 cat=334 live=500000
+  N=  750000 cat_live@re=750001 reload_ctl=ok arena_pg=750000 img=48.0 len=4096 cat=334 live=750000
+  N= 1000000 cat_live@re=1000001 reload_ctl=ok arena_pg=1000000 img=48.0 len=4096 cat=334 live=1000000
+in-run negatives at N=1000: unloaded=Err("len") kept-current=Err("len") flipped-extent=Err("ext") -> all refused
+A2 header round-trip (arena re pg = N, not a load control): ok at every row
+load: 238 samples 02:36:39..04:35:14Z, 1-min median 18.98, max 69.63 (source: artifact)
+  L2 N=    1000 est 02:37:10Z: max 1-min load 28.27, no spike
+  L2 N=   10000 est 02:38:08Z: max 1-min load 28.27, no spike
+  L2 FLAG N=  100000 est 02:50:57Z: 1-min load 42.02 > 1.5 x median 18.98 — this checkpoint's timing coincides with a load spike (verdicts unchanged)
+  L2 N=  250000 est 03:07:56Z: max 1-min load 23.55, no spike
+  L2 N=  500000 est 03:35:24Z: max 1-min load 25.47, no spike
+  L2 N=  750000 est 04:06:06Z: max 1-min load 27.26, no spike
+  L2 N= 1000000 est 04:35:29Z: max 1-min load 7.13, no spike
+VERDICT CATALOG NO_GROWTH | to N=1000000 (7 points, WARM cache per A4): b=+0.0027 R=1.566 inc=4/6; ms [0.769, 1.056, 0.964, 0.671, 0.733, 0.768, 1.204]; steps 1000->10000 x1.373; 10000->100000 x0.913; 100000->250000 x0.696; 250000->500000 x1.092; 500000->750000 x1.048; 750000->1000000 x1.568
+VERDICT ARENA LINEAR | b_hi=+1.1026 over 5 points (WARM cache per A4); 100000:38.482ms/385ns/br, 250000:115.447ms/462ns/br, 500000:241.525ms/483ns/br, 750000:334.788ms/446ns/br, 1000000:521.161ms/521ns/br; secondary 1e5->1e6 x13.54
+VERDICT A3 NOT_A_WALL_BY_MAGNITUDE | arena reopen at 1e6 = 521.161 ms (wall iff > 10000 ms); inside A3's inferred 0.3-3 s
+VERDICT RULE2 REPRODUCED | N=100000: 0.964 ms vs run 1 1.144 = x0.843; N=250000: 0.671 ms vs run 1 1.184 = x0.567 (band x0.5-x1.5)
+VERDICT RULE4 RECONCILED | 5 rows at N>=1e5; want len 4096, cat 334, pages live = N
+cross-check vs /Users/idide/wt/ferrodb-d65-reopen-curve/bench/d65_reopen_curve_1e6_run3_CUT_RAW.txt (NOT pooled, decides nothing):
+  N=    1000 catalog 0.769 vs 0.806 (x0.95)  arena 0.379 vs 0.381 (x0.99)
+  N=   10000 catalog 1.056 vs 0.973 (x1.09)  arena 3.508 vs 3.724 (x0.94)
+  N=  100000 catalog 0.964 vs 0.924 (x1.04)  arena 38.482 vs 36.6 (x1.05)
+  N=  250000 catalog 0.671 vs 1.124 (x0.60)  arena 115.447 vs 105.954 (x1.09)
