@@ -34,15 +34,21 @@
 //!
 //! # Pre-registered (lane_d219_provenance_sync.md carries the same table and is the record)
 //!
-//! | quantity, per MERGE of δ one-column updates | before the fix | after |
-//! |---|---|---|
-//! | `row_authors` syncs | δ | 1 |
-//! | `stamps` syncs | δ | δ (untouched by D219) |
-//! | `runs`, `forgets` syncs | 0 | 0 |
-//! | control arm, every kind | 0 | 0 |
-//! | merge latency excess slope, fsyncs per op | ≈ 2 (band 1.4–2.6) | ≈ 1 (0.7–1.3) |
-//! | queued-reader stall excess slope | ≈ the merge's (ratio 0.7–1.3) | ≈ the merge's |
-//! | state-lock-reader stall excess slope | ≈ 1 (0.6–1.4) | ≈ 0 (−0.2–0.2) |
+//! Three trees can be measured, and each δ point is labelled with the one its counts match:
+//! BEFORE (`3b9a39e`, no fix), ROW-ONLY (`871846a`: row authorship batched, the publish loop's
+//! stamps not) and AFTER (the whole fix: one sync per MERGE). The FAN-QUEUE row measures BEFORE and
+//! AFTER.
+//!
+//! | quantity, per MERGE of δ one-column updates | BEFORE | ROW-ONLY | AFTER |
+//! |---|---|---|---|
+//! | `total()` syncs | 2δ | δ + 1 | 1 |
+//! | `stamps` syncs | δ | δ | 0 (they ride the row-authorship sync) |
+//! | `row_authors` syncs | δ | 1 | 1 |
+//! | `runs`, `forgets` syncs | 0 | 0 | 0 |
+//! | control arm, every kind | 0 | 0 | 0 |
+//! | merge latency excess slope, fsyncs per op | ≈ 2 (1.4–2.6) | ≈ 1 (0.7–1.3) | ≈ 0 (−0.3–0.3) |
+//! | queued-reader stall excess slope | the merge's (ratio 0.7–1.3) | the merge's | ≈ 0 (−0.3–0.3) |
+//! | state-lock-reader stall excess slope | ≈ 1 (0.6–1.4) | ≈ 0 (−0.2–0.2) | ≈ 0 (−0.2–0.2) |
 //!
 //! The run REFUSES (exits non-zero) on: a durable-arm δ point whose sync counts match neither
 //! column; counts that differ between repetitions of one point; any non-zero count on the control
@@ -430,27 +436,30 @@ fn arm(dir: &std::path::Path, durable: bool) -> Result<(Vec<Point>, usize), Stri
             }
         }
         let c = counts.expect("a δ point ran no merges");
+        let dd = d as u64;
         let model = if !durable {
             if c.total() != 0 {
                 return Err(format!("control d={d}: the in-memory store synced: {c:?}"));
             }
             "control (all zero)"
-        } else if c.runs != 0 || c.forgets != 0 || c.stamps != d as u64 {
-            return Err(format!("durable d={d}: counts match neither model: {c:?}"));
-        } else if c.row_authors == d as u64 && d > 1 {
-            "BEFORE model (row_authors = d)"
-        } else if c.row_authors == 1 && d > 1 {
-            "AFTER model (row_authors = 1)"
-        } else if c.row_authors == 1 {
-            "d=1: both models predict 1"
+        } else if c.runs != 0 || c.forgets != 0 {
+            return Err(format!("durable d={d}: a run or a forget synced inside a MERGE: {c:?}"));
+        } else if (c.stamps, c.row_authors) == (dd, dd) && d > 1 {
+            "BEFORE model (2d syncs)"
+        } else if (c.stamps, c.row_authors) == (dd, 1) && d > 1 {
+            "ROW-ONLY model (d+1 syncs)"
+        } else if (c.stamps, c.row_authors) == (1, 1) {
+            "d=1: BEFORE and ROW-ONLY both predict 2 syncs"
+        } else if (c.stamps, c.row_authors) == (0, 1) {
+            "AFTER model (1 sync)"
         } else {
-            return Err(format!("durable d={d}: row_authors={} matches neither d nor 1", c.row_authors));
+            return Err(format!("durable d={d}: counts match no model: {c:?}"));
         };
         println!(
             "  {label:<8} d={d:<4} merge {merge_ms:>9.3} ms | queued-reader stall {queued_ms:>9.3} ms | \
-             state-lock-reader stall {state_ms:>9.3} ms | syncs/merge runs={} stamps={} row_authors={} \
-             forgets={} | {model} | errored reads {point_errors}",
-            c.runs, c.stamps, c.row_authors, c.forgets
+             state-lock-reader stall {state_ms:>9.3} ms | syncs/merge total={} runs={} stamps={} \
+             row_authors={} forgets={} | {model} | errored reads {point_errors}",
+            c.total(), c.runs, c.stamps, c.row_authors, c.forgets
         );
         points.push(Point { merge_ms, queued_ms, state_ms });
         arm_errors += point_errors;
