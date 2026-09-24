@@ -3751,13 +3751,23 @@ impl AgentRuntime {
         // would both judge the pick against rows the branch cannot see and plant a non-fork-point
         // image in `base_rows`. Contrast `evaluate_merge`, which decides what to write to main and
         // reads main as it stands.
-        let at = {
+        //
+        // `staged_here` is every row the branch has staged at all, deleted ones included, so the
+        // second pass below reads ONLY rows the branch never touched. It used to ask whether an
+        // image had been found, and a row staged `Deleted` records none — so the second pass read
+        // the deleted row back from the shared tables and the pick staged it into existence again
+        // (`a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it`).
+        let (at, staged_here) = {
             let mut state = self.state.lock().unwrap();
             let (at, _) = state.pin(onto, &ctx.txn).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {onto}"))
             })?;
             let ws = &state.workspaces[&onto];
+            let mut staged_here: BTreeSet<(u32, u64)> = BTreeSet::new();
             for key in &rows_touched {
+                if ws.rows.get(key).is_some() {
+                    staged_here.insert(*key);
+                }
                 match ws.rows.get(key) {
                     Some(RowState::Present(v)) => {
                         images.insert(*key, v.clone());
@@ -3772,13 +3782,13 @@ impl AgentRuntime {
                     }
                 }
             }
-            at
+            (at, staged_here)
         };
         // Rows the branch has never touched are read from the shared tables, by point lookup
         // against the primary key carried in the op's own before-image. A scan here would make a
         // pick of three cells cost O(table), which is the defect D69 removed from `merge`.
         for key in &rows_touched {
-            if images.contains_key(key) {
+            if images.contains_key(key) || staged_here.contains(key) {
                 continue;
             }
             let Some(op) = log.ops.values().find(|o| (o.tbl.0, o.row.0) == *key) else { continue };
