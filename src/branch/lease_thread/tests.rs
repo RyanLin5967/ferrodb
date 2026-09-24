@@ -344,6 +344,62 @@ fn a_reaped_branchs_workspace_is_forgotten_without_the_client_saying_anything() 
     );
 }
 
+/// ⛔ **D199, WRITTEN TO FAIL FIRST: a lease-expiry reap is attested, exactly once.**
+///
+/// `seal` attests a reap (MERGE, ABANDON), but a branch the lease reaper takes never reaches
+/// `seal`: `scan_once` reaps it and then only tells the runtime to forget its workspace. So the
+/// attested log still read `[Fork]` for a branch the catalog had retired. The log called a dead
+/// branch live, and under wall #19 its head was never dropped (`lane_wall19_attested.md` F1).
+///
+/// Hand-worked: the log is the session's `Fork`, then a `Reap` whose `prev` is that fork's
+/// attestation, so the branch's walk is 2 steps (trunk has no entries here). The reap's content
+/// commits to that head and to `published = false`, the abandon encoding, because a branch the
+/// lease took published nothing. Exactly once: a second scan and the reconciliation sweep find
+/// nothing more, and the log refuses nothing. A second attempt would show as a refusal rather
+/// than as an entry, because the log itself refuses a reaped branch, so the refusal count is
+/// what separates "the runtime attested once" from "the log caught the second one".
+#[test]
+fn a_lease_expiry_reap_is_attested_exactly_once() {
+    use crate::branch::attest::{BranchOp, ContentId};
+
+    let f = fixture();
+    let session = f.runtime.begin_session("pricing-agent", Some("r_1"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    write_pages(&f, branch, 3);
+    f.h.catalog.renew_lease(branch, EXPIRED).unwrap();
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: the session's fork is attested");
+    let fork_head = f.runtime.attestation_of(branch).expect("a live session has a head");
+
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
+    assert_eq!(counters.snapshot().reaped, 1, "the scan reaped nothing, so this proves nothing");
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "the lease reap left no attestation: the log still calls a retired branch live"
+    );
+    let reap = *f.runtime.attested_entries(branch).last().unwrap();
+    assert_eq!(reap.prev, fork_head, "the reap does not follow the branch's own fork");
+    let mut closed = fork_head.0.to_vec();
+    closed.push(0);
+    assert_eq!(
+        reap.content_cid,
+        ContentId::of(&closed),
+        "the reap does not commit to the head it closes and to published = false"
+    );
+    assert_eq!(f.runtime.verify_attested_branch(branch).unwrap(), 2, "Reap, Fork, then genesis");
+    assert_eq!(f.runtime.attestation_of(branch), None, "a lease-reaped branch still holds a head");
+
+    // Exactly once.
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
+    assert_eq!(f.runtime.forget_reaped_branches(), 0, "a workspace outlived the scan's forget");
+    assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
+    assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
 // -------------------------------------------------------------------------------------------
 // Stoppable cleanly.
 // -------------------------------------------------------------------------------------------
