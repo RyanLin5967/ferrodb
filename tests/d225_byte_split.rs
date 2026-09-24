@@ -39,7 +39,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::storage::heap_file_manager::HeapFileManager;
+use ferrodb::storage::heap_file_manager::{HeapFileManager, RecordId};
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::index_page::{BPlusTreePage, BTreeSerialize};
 use ferrodb::storage::tuple::Tuple;
@@ -459,6 +459,25 @@ fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
     assert_eq!(d.ids(&format!("SELECT n FROM u WHERE id = '{long_key}';")), vec![2]);
 }
 
+/// **The NOT NULL refusal of a multi-row UPDATE also comes before its first write.** Not D225's
+/// defect, the same shape: the check sat in the write loop, so a later row's NULL was refused
+/// after an earlier row was written and moved, and the abort undoes only the heap. It now runs in
+/// the pre-pass with the entry bound. Row `'a'` grows by 2020 characters beside a filler, so it
+/// cannot stay in place (INFERRED, not measured); row `'k'` would set a NOT NULL column to NULL.
+#[test]
+fn a_multi_row_update_refused_for_not_null_writes_no_row_first() {
+    let mut d = db();
+    d.sql("CREATE TABLE u (id VARCHAR(100) NOT NULL, n INTEGER, a VARCHAR(3000) NOT NULL, b VARCHAR(3000));");
+    d.sql(&format!("INSERT INTO u VALUES ('a', 1, 'x', '{}');", "z".repeat(2020)));
+    d.sql("INSERT INTO u VALUES ('k', 2, 'x', NULL);");
+    d.sql(&format!("INSERT INTO u VALUES ('f1', 10, '{}', NULL);", "f".repeat(1300)));
+
+    let e = d.err("UPDATE u SET a = b WHERE n < 3;");
+    assert!(e.contains("is declared NOT NULL"), "not the NOT NULL refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids("SELECT n FROM u WHERE id = 'a';"), vec![1], "row 'a' is unreachable by its key");
+    assert_eq!(d.ids("SELECT n FROM u WHERE a = 'x';"), vec![1, 2], "the refused update changed a row");
+}
+
 /// **CREATE INDEX over a row too wide for an index entry is refused by name, registers nothing,
 /// and leaks nothing, however often it is retried.**
 ///
@@ -502,8 +521,11 @@ fn a_create_index_the_entry_bound_refuses_registers_nothing_and_leaks_nothing() 
 /// fit. This one cannot write such a row through SQL at all, so the row is put in the heap
 /// directly: `(v, id)` would be (3 + 2100) + 5 = 2108 bytes. The rebuild frees each old tree
 /// before refilling it and persists the catalog only at the end, so a refusal part-way would
-/// leave the catalog naming freed pages. It must refuse before the first free: the catalog still
-/// names the old trees, and they still answer.
+/// leave the catalog naming freed pages. It must refuse before the first free.
+///
+/// The roots alone cannot show that: pages are reallocated lowest-first, so a rebuild that frees
+/// a root gets the same page back. What shows it is the primary tree's CONTENT. Row 2 went into
+/// the heap directly, so the old primary tree never held key 2, and any rebuild of it adds it.
 #[test]
 fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_freed() {
     let mut d = db();
@@ -524,6 +546,13 @@ fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_f
         abbreviate(&msg)
     );
     assert_eq!(d.catalog.get_table("t").unwrap().primary_index_root, entry.primary_index_root, "the primary tree was rebuilt");
+    let primary = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, d.bp.clone());
+    assert!(primary.search(&Value::Integer(1)).unwrap().is_some(), "the old primary tree lost key 1");
+    assert_eq!(
+        primary.search(&Value::Integer(2)).unwrap(),
+        None,
+        "the primary tree holds key 2, which only a rebuild adds: it was freed and rebuilt before the refusal"
+    );
     assert_eq!(d.index_root("t", "v"), index_before, "the secondary tree was rebuilt");
     let old = Tree::open(index_before, d.bp.clone());
     assert_eq!(

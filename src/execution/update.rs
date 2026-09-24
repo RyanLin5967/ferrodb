@@ -79,12 +79,22 @@ impl Modify for Update {
         // per row inside the write loop is not enough either, because a later row's refusal lands
         // after the earlier rows are written. So all of them are asked first, here, for exactly
         // the entries the loop below will add: a changed secondary value, and the tokens of
-        // changed text. The assignments are evaluated here too, still once per row.
+        // changed text. The assignments are evaluated here too, still once per row, and the NOT
+        // NULL check moves with them: it reads only the new values, and inside the loop it had
+        // the same late-refusal shape.
         let mut planned = Vec::with_capacity(res.len());
         for (rid, old_values) in res {
             let mut new_values = old_values.clone();
             for (col_idx, expr) in &self.assignments {
                 new_values[*col_idx] = evaluate(expr, &old_values)?;
+            }
+            for (i, col) in self.schema.columns.iter().enumerate() {
+                if !col.nullable && matches!(new_values[i], Value::Null) {
+                    return Err(FerroError::Constraint(format!(
+                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
+                        col.name, self.table
+                    )))
+                }
             }
             let pk = &old_values[0];
             for handle in &self.secondary_indexes {
@@ -109,15 +119,6 @@ impl Modify for Update {
         for (rid, old_values, new_values) in planned {
             let head_h = self.heap.read(rid)?.version_header()?;
             check_write_conflict(&self.view, &head_h)?;
-
-            for (i, col) in self.schema.columns.iter().enumerate() {
-                if !col.nullable && matches!(new_values[i], Value::Null) {
-                    return Err(FerroError::Constraint(format!(
-                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
-                        col.name, self.table
-                    )))
-                }
-            }
             let pk = old_values[0].clone();
             let mut old_ver = self.heap.read(rid)?;
             old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
