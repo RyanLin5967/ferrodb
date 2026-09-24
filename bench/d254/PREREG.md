@@ -209,3 +209,19 @@ image, and the refused object can be recorded on the pages. D254's claim is scop
 ### Counts
 
 No test is added or removed. The target has 4 tests, and per-target stays 2592.
+
+---
+
+## Amendment 3 — amendment 2's changes recorded (nothing built)
+
+| commit | what |
+|---|---|
+| `d8956c1` | amendment 2 |
+| `8ef6572` | the size refusal's text: "refused before any catalog page was written" (one string) |
+| `e5e2332` | CI and CF assert the refused index is absent from the catalog's pages; `assert_catalog_intact`'s `absent` becomes `Option<&str>` |
+
+- **`catalog.rs` is unchanged since `64d6d90`,** so P1–P4 re-cut from `e5e2332` are byte-identical to the committed
+  patches. The re-cut left the tree clean (`git status --porcelain`: 0).
+- **D249's E1 and E4 still apply** (`git apply --check`, rc 0).
+- **The run's mutant base moves to `e5e2332`,** where `src/` and `tests/` equal the tip's.
+- **The counts are unchanged:** the target has 4 tests, and per-target is 2592.
