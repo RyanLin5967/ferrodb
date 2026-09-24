@@ -2256,6 +2256,27 @@ fn main() {
     }
 }
 
+/// G7's measure of the box (PREREG A15.1): arm 1's control ns, max over min across N, per thread
+/// count. It is the only drift instrument this harness has, so it is printed beside every time
+/// number the summary reports, and says so when arm 1 did not run.
+fn g7_drift(read_rows: &[ReadRow]) -> String {
+    let parts: Vec<String> = READ_THREADS
+        .iter()
+        .filter_map(|&t| {
+            let cs: Vec<f64> =
+                read_rows.iter().filter(|r| r.threads == t).map(|r| r.arms[1].ns_per_read()).collect();
+            let lo = cs.iter().cloned().reduce(f64::min)?;
+            let hi = cs.iter().cloned().reduce(f64::max)?;
+            Some(format!("T={t} {:.3}x", hi / lo))
+        })
+        .collect();
+    if parts.is_empty() {
+        "G7: not measured (arm 1 did not run), so no time here has a drift measure".into()
+    } else {
+        format!("G7, the box's drift (arm 1's control, max/min across N; band 1.5): {}", parts.join(", "))
+    }
+}
+
 /// The READ-VS-N summary: the per-N curves the pre-registration is judged against, the two guards
 /// that can only be judged across N (G5, G7), and the verdict lines. Evaluating the predictions
 /// themselves is the reader's job, against `bench/read_vs_n/PREREG.md` — the harness prints facts
@@ -2286,6 +2307,7 @@ fn read_vs_n_summary(
             // commit more than once. Not over the printed blocks' checkpoint share either: axis
             // (ii)'s blocks end at multiples of 256 on purpose, so they over-sample that merge.
             println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN (reported, A13.3):");
+            println!("  {}", g7_drift(read_rows));
             println!(
                 "         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  \
                  seq tup  c.fault  ret runs  ckpts    ckpt ns  period   amort ns   typ ns ± SE"
@@ -2416,6 +2438,7 @@ fn read_vs_n_summary(
     }
     if arms.restart {
         println!("arm 3 (fresh-process open; microsecond timers in the child, printed here in ms):");
+        println!("  {}", g7_drift(read_rows));
         // A7.1/A9.3/A11.1: `recovered` judges D216's before/after pair. `wal B` = 24 judges only the
         // merge-OFF control, since after D216 a merge-on log still holds re-appended declarations.
         // `recover`, `rebuild` and `m rows` size it. A9.1: warmth is `child net` (total less recover
