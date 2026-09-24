@@ -2,7 +2,8 @@
 # D233 fire-check, amendment 6 (review 3: H1 the judge reads only the target files it names; L4
 # --no-fail-fast and a result line per binary; L6 src/ restored on any exit; L9 the control first; H2's
 # TIMEOUT label; M1 Rc registered for U4/U5; --self-test on planted outputs). Pre-registration: artie-research
-# frontier/lane_d233_free_at_empty.md §12 (the arms and killers of §9-§11 otherwise unchanged).
+# frontier/lane_d233_free_at_empty.md §12, amended by §13 (subject 79eec23; V8 and W5; the L2 and N1 tests in
+# U1's killers and in the base arms). The arms and killers of §9-§11 are otherwise unchanged.
 # Mutants cover BPlusTreeManager's free-at-empty (index.rs) and fork's FREE_ID reuse (table_catalog.rs).
 # Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work: it runs only when the
 # lead releases the FAN-QUEUE row for D233.
@@ -16,9 +17,9 @@
 # - control: SUBJECT_SHA, all four targets: every file OK, nothing FAILED, and per target
 #            passed + ignored == the harness's own `-- --list` count, both > 0. Anything else VOIDS the run (exit 2).
 # - base-F3: 0eda6ca's src/ with this tip's index.rs test module spliced in; the index selection
-#            must FAIL exactly Ra, Rb, Rc and G6T (the F3 red run, split per case, review 2 G4).
+#            must FAIL exactly Ra, Rb, Rc, G6T and the L2 test (the F3 red run, split per case, review 2 G4).
 # - base-G:  f03e25d's src/ with this tip's index.rs and table_catalog.rs test modules spliced in;
-#            index + catalog must FAIL exactly G6T, G2T, G9a, G9b.
+#            index + catalog must FAIL exactly G6T, G2T, G9a, G9b, the L2 test and the N1 test.
 # - base-L:  2b9d2c0's src/, --test lock_order_allowlist: exactly
 #            every_pool_method_that_locks_opens_a_pool_section FAILS (amendment 5).
 # - mutants: KILLED-AS-REGISTERED when every file is OK, every required killer FAILED and nothing outside
@@ -32,7 +33,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=f6909db
+SUBJECT_SHA=79eec23
 OUT=bench/d233/firecheck
 
 I=src/storage/index.rs
@@ -61,11 +62,14 @@ MUTANTS=(
   "W2_fork_checks_reaped_only|$C|"'"            match self.reusable_slot(id) {\n"|"            match self.core(id).map(\u007cr\u007c r.filter(\u007cr\u007c r.state() == BranchState::Reaped)) {\n"'
   "W3_unreadable_fails_the_fork|$C|"'"                Ok(None) \u007c Err(_) => stale.push(k),\n"|"                Ok(None) => stale.push(k),\n                Err(e) => return Err(e),\n"'
   "W4_malformed_skipped_silently|$C|"'"                stale.push(k);\n                continue;\n"|"                continue;\n"'
+  "V8_no_path_check|$I|"'"        if let Some(on_path) = [leaf.prev, leaf.next].into_iter().flatten().find(\u007cp\u007c stack.contains(p)) {\n"|"        if let Some(on_path) = [leaf.prev, leaf.next].into_iter().flatten().find(\u007cp\u007c false && stack.contains(p)) {\n"'
+  "W5_removal_before_the_build|$C|"'"            let child = BranchRecord::fork_child_from_core(\n                &parent_core,\n                parent_envelope.as_ref(),\n                child_id,\n                fork_epoch,\n                lease,\n            )?;\n\n        for k in &stale {\n            self.stale_free_ids.fetch_add(1, Ordering::Relaxed);\n            self.remove_if_present(k)?;\n        }\n        if reused {\n            self.remove_if_present(&keys::free_id(child_num))?;\n        }\n"|"        for k in &stale {\n            self.stale_free_ids.fetch_add(1, Ordering::Relaxed);\n            self.remove_if_present(k)?;\n        }\n        if reused {\n            self.remove_if_present(&keys::free_id(child_num))?;\n        }\n\n            let child = BranchRecord::fork_child_from_core(\n                &parent_core,\n                parent_envelope.as_ref(),\n                child_id,\n                fork_epoch,\n                lease,\n            )?;\n\n"'
 )
 # name|kill or survivor|required killers|optional killers
 # U4 and U5 require Rc (review 3 M1): each breaks the unlink Rc's premise asserts (lane §12).
+# U1 requires the L2 test too; V8 and W5 are §13's (lane §13 addendum).
 KILLERS=(
-  "U1_never_unlink|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied|"
+  "U1_never_unlink|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on a_neighbour_on_the_descent_path_is_refused_not_waited_on unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied|"
   "U2_no_prev_splice|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied|"
   "U3_no_next_splice|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement|unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
   "U4_parent_keeps_pointer|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf unlinks_racing_refills_and_readers_lose_no_key a_refused_cascade_that_would_empty_the_root_writes_nothing|a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
@@ -86,6 +90,8 @@ KILLERS=(
   "W2_fork_checks_reaped_only|kill|fork_never_reuses_a_reaped_slot_that_still_has_a_live_child|"
   "W3_unreadable_fails_the_fork|kill|a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal|"
   "W4_malformed_skipped_silently|kill|a_malformed_free_id_key_is_counted_and_removed|"
+  "V8_no_path_check|kill|a_neighbour_on_the_descent_path_is_refused_not_waited_on|"
+  "W5_removal_before_the_build|kill|a_refused_fork_of_a_quarantined_parent_keeps_the_free_slot|"
 )
 TARGETS="index catalog collateral lockorder"
 
@@ -468,7 +474,7 @@ git checkout 0eda6ca -- src/
 splice_tests "$I" || { echo "ABORT: splice failed (base-F3)" >&2; restore base-F3; exit 3; }
 run_target base-F3 index
 restore base-F3
-v=$(verdict base-F3 kill "a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on" "" index)
+v=$(verdict base-F3 kill "a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on a_neighbour_on_the_descent_path_is_refused_not_waited_on" "" index)
 echo "base-F3: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
@@ -481,7 +487,7 @@ git checkout f03e25d -- src/
 run_target base-G index
 run_target base-G catalog
 restore base-G
-v=$(verdict base-G kill "a_chain_whose_prev_is_its_next_is_refused_not_waited_on fork_never_reuses_a_reaped_slot_that_still_has_a_live_child a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal a_malformed_free_id_key_is_counted_and_removed" "" index catalog)
+v=$(verdict base-G kill "a_chain_whose_prev_is_its_next_is_refused_not_waited_on fork_never_reuses_a_reaped_slot_that_still_has_a_live_child a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal a_malformed_free_id_key_is_counted_and_removed a_neighbour_on_the_descent_path_is_refused_not_waited_on a_refused_fork_of_a_quarantined_parent_keeps_the_free_slot" "" index catalog)
 echo "base-G: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
