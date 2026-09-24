@@ -1875,9 +1875,8 @@ impl ArenaPageStore {
         let held: Vec<(PageId, u32)> = g.quarantine.iter().map(|q| (q.start, q.pages)).collect();
         let bytes = self.state_bytes_with_free(&held);
         replace_atomically(&OsFileOps, path, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
-        for (start, pages) in held {
-            self.space.give_back(start, pages);
-        }
+        // MUTANT (fire-check only, never land): a successful fold clears the quarantine without giving its ranges back.
+        let _ = held;
         g.quarantine.clear();
         Ok(bytes.len())
     }
