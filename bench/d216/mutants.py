@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""D216 / D227 / D234 / D247 mutants, each applied ALONE to a throwaway checkout of the tip.
+"""D216 / D227 / D234 / D247 / D252 mutants, each applied ALONE to a throwaway checkout of the tip.
 
-Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR]
+Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,M27,...]
+
+`--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
+`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves`
+until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
+buffered `TxnEnd` two D216 gate negative controls use as their premise, so they fail there, a full
+CONTROL is not clean, and every verdict would be VOID.
 
 For each mutant: restore the tree, apply one exact replacement (refused unless the pattern matches
 exactly once), run the named cargo test targets, and record KILLED when every expected test is
@@ -33,6 +39,7 @@ LIB = ("--lib", "wal::")
 D227 = ("--test", "d227_restart_keeps_declarations")
 HISTORY = ("--test", "d234_decoder_history_still_collapses")
 ARENA = ("--test", "d247_arena_page_write_back_flushes_no_log")
+D252 = ("--test", "d252_caught_up_subscription_lets_the_log_truncate")
 # Not a cargo-test argument list: `cargo build --examples`, for targets that spawn example binaries
 # (the staleness guard refuses a binary older than src/).
 BUILD_EXAMPLES = ("BUILD_EXAMPLES",)
@@ -145,6 +152,21 @@ MUTANTS = [
      "    for run in crate::provenance::DurableProvenanceStore::open(format!(\"{}.provenance\", db_path.display()))?.runs()? {\n"
      "        txn.declare_run(run)?;\n    }\n    let rebuild = recovered || stale;\n",
      [D227], ["a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind"], "KILL"),
+    # D252: a caught-up subscription lets the log truncate. Each half, and the pin that carries it.
+    ("M26_cursor_stops_at_the_commit", "src/replication/stream.rs",
+     "            (None, None) => decoded.walked_to.max(emitted_max),\n",
+     "            (None, None) => emitted_max,\n",
+     [D252], ["a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate",
+              "a_subscription_passes_a_durable_rollback_after_the_last_commit"], "KILL"),
+    ("M27_txn_end_after_the_flush", "src/wal/txn.rs",
+     "        let end = self.append_chained(txn_id, &RecKind::TxnEnd);\n        self.wal.flush_up_to(commit_lsn)?;\n        let _ = end?;\n",
+     "        self.wal.flush_up_to(commit_lsn)?;\n        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;\n",
+     [D252], ["a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate"], "KILL"),
+    ("M28_pin_never_moves", "src/replication/stream.rs",
+     "            let next = self.wal.pin(pumped.cursor)?;\n            let old = std::mem::replace(&mut self.pin, next);\n            drop(old);\n",
+     "",
+     [D252], ["a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate",
+              "a_subscription_passes_a_durable_rollback_after_the_last_commit"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
@@ -207,6 +229,13 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     tip = sys.argv[1]
+    mutants = MUTANTS
+    if "--only" in sys.argv:
+        wanted = sys.argv[sys.argv.index("--only") + 1].split(",")
+        unknown = [w for w in wanted if w not in {m[0] for m in MUTANTS}]
+        if unknown or not wanted:
+            sys.exit(f"refusing: --only names no mutant or unknown ones: {unknown}")
+        mutants = [m for m in MUTANTS if m[0] in wanted]
     env = dict(os.environ)
     if "--target-dir" in sys.argv:
         env["CARGO_TARGET_DIR"] = sys.argv[sys.argv.index("--target-dir") + 1]
@@ -219,7 +248,7 @@ def main():
         # CONTROL: every target the mutants use, on the unmutated tip. A test that already fails here
         # cannot be credited to a mutant, and a target that cannot run makes every verdict on it void.
         all_targets = []
-        for m in MUTANTS:
+        for m in mutants:
             for t in m[4]:
                 if t not in all_targets:
                     all_targets.append(t)
@@ -229,7 +258,7 @@ def main():
         if control_problems or control_failed:
             summary.append("CONTROL is not clean: every verdict below is VOID until it is")
 
-        for name, path, old, new, targets, expected, expect in MUTANTS:
+        for name, path, old, new, targets, expected, expect in mutants:
             git("checkout", "--", ".", cwd=TREE)
             if git("status", "--porcelain", "--untracked-files=no", cwd=TREE).stdout.strip():
                 raise SystemExit(f"{name}: the throwaway tree is not clean before applying it")
