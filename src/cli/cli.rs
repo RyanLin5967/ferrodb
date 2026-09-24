@@ -226,9 +226,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 /// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs.
 ///
 /// 1. **D244 review F7.** The branch catalog publishes its root and syncs. A publish that failed on
-///    a mutation's exit is otherwise retried only by the next mutation, and an exit makes none. If
-///    split pages have already reached the disk through another writer's sync or an eviction,
-///    the header would still name the old root, and the next open would refuse.
+///    a mutation's exit is otherwise retried only by the next mutation or the next sync
+///    (`durable()` publishes an owed root first, D244 review 2), and a quiet exit may have neither.
+///    If split pages have already reached the disk through an eviction, the header would still name
+///    the old root, and the next open would refuse. That eviction case is what this call still
+///    buys over `durable()`'s own publish.
 /// 2. The database's checkpoint.
 /// 3. Persist where the arena starts and what it has allocated. Without this the next open finds no
 ///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable. It

@@ -389,9 +389,38 @@ impl TableBranchCatalog {
     /// merely described here.
     fn durable(&self, seq: u64) -> Result<(), FerroError> {
         self.commit_group.wait_durable(seq, || {
+            self.publish_if_owed()?;
             self.pool.flush_all()?;
             self.pool.disk_manager.sync()
         })
+    }
+
+    /// **D244 review 2, R2-2 (the lead's decision): a sync writes the header before the pages it
+    /// names.** A publish that failed on a mutation's exit leaves split pages dirty in this pool
+    /// under a header naming the old root. Before this, the next `durable()` from ANY writer flushed
+    /// them without page 1, and the file refused to open after any exit that came before the next
+    /// successful publish: a kill, a panic, an error return, or pgserver, whose `serve` never returns
+    /// `Ok`. So the leader publishes first, and a failed publish fails the sync before anything is
+    /// flushed.
+    ///
+    /// It runs inside `wait_durable`'s sync closure, which runs after the group-commit mutex is
+    /// dropped (`group_commit.rs`). No `durable()` caller holds `logical`, so taking it here is
+    /// `mutate`'s lock order. When nothing is owed it is two atomic loads: `mutate` publishes on
+    /// every exit, so this path runs only after a failed publish. A catalog with no header page
+    /// (`create`) never owes one.
+    ///
+    /// `mutate`'s own publish on a failed exit stays, and it is not redundant with this one. It puts
+    /// the current page 1 in the pool at the failure itself, so a write-back that does not go
+    /// through `durable()` carries it too. `tests/d244_publish_root.rs` pins each separately: A1 for
+    /// the exit publish, A3 for this one.
+    fn publish_if_owed(&self) -> Result<(), FerroError> {
+        let header_page = self.header_page.load(Ordering::SeqCst);
+        let root = self.tree.root_page_id.load(Ordering::SeqCst);
+        if header_page == 0 || self.published_root.load(Ordering::SeqCst) == root {
+            return Ok(());
+        }
+        let _g = self.logical.lock().unwrap();
+        self.publish_root()
     }
 
     /// **D244 review F7: the publish a clean exit owes.** Writes the tree's root into the header
@@ -1130,8 +1159,12 @@ impl BranchCatalog for TableBranchCatalog {
                 // that error, where before D244 it could not fail once past the checks above. Kept
                 // on purpose: the header write it reports is still owed, and swallowing it would
                 // hide a catalog the next open refuses. It is reached when a caller passes the state
-                // the branch already has: the reaper's resume path re-enters an interrupted reap with
-                // `set_state(branch, Reaping, Reaping)` (`reaper.rs`, `resume_interrupted_reaps`).
+                // the branch already has, and the one production caller that does is the reaper's
+                // resume path, re-entering an interrupted reap with `set_state(branch, Reaping,
+                // Reaping)` (`reaper.rs`, `resume_interrupted_reaps`). That runs inside
+                // `LeaseThread::start`, so a heal-publish that fails there fails the start.
+                // (`quarantine` returns early for a branch already `Quarantined`, so it never gets
+                // here.)
                 return Ok(false);
             }
             let old = core.clone();

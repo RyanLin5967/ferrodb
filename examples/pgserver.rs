@@ -155,16 +155,5 @@ fn main() {
     // written would leave a durable map that still charges pages nothing owns.
     let stats = lease.stop();
     let _ = writeln!(std::io::stderr(), "pgserver: lease scan stopped after {stats:?}");
-    // D244 review F7: the branch catalog's root, published and synced before the arena's map, for
-    // the reason `ferrodb::cli::cli::exit_sequence` gives. This binary takes no database checkpoint
-    // at exit, so it makes the one call rather than calling that function. Both run whatever the
-    // other returns, so a failed publish does not cost the arena its checkpoint (D244 review 3,
-    // R3-F2); the publish's error is reported first.
-    let published = branches.publish_root_durably();
-    let arena_checkpoint = store.checkpoint(Path::new(&arena_path));
-    if let (Err(_), Err(a)) = (&published, &arena_checkpoint) {
-        let _ = writeln!(std::io::stderr(), "pgserver: the arena checkpoint failed as well ({a})");
-    }
-    published.expect("publish the branch catalog's root");
-    arena_checkpoint.expect("checkpoint the arena");
+    store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
 }
