@@ -550,21 +550,25 @@ impl RecKind {
             TAG_ABORT => Ok(RecKind::Abort),
             TAG_TXN_END => Ok(RecKind::TxnEnd),
             TAG_CHECKPOINT => Ok(RecKind::Checkpoint),
+            // D277: every read below goes through `need`, which refuses a record too short for it as
+            // corruption naming its kind. These arms indexed their slices unchecked, so a short record
+            // PANICKED, and the replica applier decodes whatever a peer's frame carries once its CRC
+            // matches (`replication::ReplicaApplier::apply`).
             TAG_HEAP_INSERT => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let tuple = bytes[15..15+length].to_vec();
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_INSERT)?;
+                let tuple = need(bytes, 15, length, TAG_HEAP_INSERT)?.to_vec();
                 Ok(RecKind::HeapInsert { dir_root, page_id, slot, tuple })
             }
             TAG_HEAP_DELETE => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let old = bytes[15..15 + length].to_vec();
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_DELETE)?;
+                let old = need(bytes, 15, length, TAG_HEAP_DELETE)?.to_vec();
                 Ok(RecKind::HeapDelete { dir_root, page_id, slot, old })
             }
             TAG_HEAP_UPDATE => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let old = bytes[15..15 + length].to_vec();
-                let new_len = u32::from_be_bytes(bytes[15 + length..19 + length].try_into().unwrap()) as usize;
-                let new = bytes[19 + length.. 19 + length + new_len].to_vec();
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_UPDATE)?;
+                let old = need(bytes, 15, length, TAG_HEAP_UPDATE)?.to_vec();
+                let new_len = u32::from_be_bytes(need(bytes, 15 + length, 4, TAG_HEAP_UPDATE)?.try_into().unwrap()) as usize;
+                let new = need(bytes, 19 + length, new_len, TAG_HEAP_UPDATE)?.to_vec();
                 Ok(RecKind::HeapUpdate { dir_root, page_id, slot, old, new })
             }
             TAG_DDL => {
@@ -647,19 +651,15 @@ impl RecKind {
                 Ok(RecKind::HeapRelease { dir_root, page_id, slot })
             }
             TAG_HEAP_INIT_PAGE => {
-                if bytes.len() < 9 {
-                    return Err(FerroError::Corruption(format!(
-                        "log record of kind 13 is truncated: wanted 9 bytes but the record is {}",
-                        bytes.len()
-                    )));
-                }
-                let dir_root = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-                let page_id = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+                let dir_root = u32::from_be_bytes(need(bytes, 1, 4, TAG_HEAP_INIT_PAGE)?.try_into().unwrap());
+                let page_id = u32::from_be_bytes(need(bytes, 5, 4, TAG_HEAP_INIT_PAGE)?.try_into().unwrap());
                 Ok(RecKind::HeapInitPage { dir_root, page_id })
             }
             TAG_CLR => {
-                let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-                let undo_next = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
+                let undone_lsn = u64::from_be_bytes(need(bytes, 1, 8, TAG_CLR)?.try_into().unwrap());
+                let undo_next = u64::from_be_bytes(need(bytes, 9, 8, TAG_CLR)?.try_into().unwrap());
+                // A CLR carries a record; one with none is as truncated as one cut inside its fields.
+                need(bytes, 17, 1, TAG_CLR)?;
                 let redo = RecKind::deserialize(&bytes[17..])?;
                 Ok(RecKind::Clr { undone_lsn, undo_next, redo: Box::new(redo) })
             }
@@ -1128,12 +1128,27 @@ pub fn scan_valid_end(file: &dyn Storage, base_lsn: u64, file_len: u64) -> Resul
     Ok(base_lsn + (offset - HEADER_SIZE as u64))
 }
 
-fn read_heap(bytes: &[u8]) -> Result<(u32, u32, u16, usize), FerroError> {
-    let dir_root = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-    let page_id = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
-    let slot = u16::from_be_bytes(bytes[9..11].try_into().unwrap());
-    let length = u32::from_be_bytes(bytes[11..15].try_into().unwrap()) as usize;
+/// A heap record's `dir_root`, `page_id`, `slot` and first length, each read through [`need`] (D277).
+fn read_heap(bytes: &[u8], tag: u8) -> Result<(u32, u32, u16, usize), FerroError> {
+    let dir_root = u32::from_be_bytes(need(bytes, 1, 4, tag)?.try_into().unwrap());
+    let page_id = u32::from_be_bytes(need(bytes, 5, 4, tag)?.try_into().unwrap());
+    let slot = u16::from_be_bytes(need(bytes, 9, 2, tag)?.try_into().unwrap());
+    let length = u32::from_be_bytes(need(bytes, 11, 4, tag)?.try_into().unwrap()) as usize;
     Ok((dir_root, page_id, slot, length))
+}
+
+/// **D277: `bytes[at..at + len]` of a record of kind `tag`, or its refusal as corruption naming the
+/// kind.** A record too short for a field is damage, whether it came off a disk or a peer's frame,
+/// and a decoder that indexes past it panics the process instead of refusing. The arms that already
+/// read through `take_*` (tags 9, 10 and 11) keep their `FerroError::Wal` refusal; those helpers are
+/// shared, and changing a refusal's variant is not this row.
+fn need(bytes: &[u8], at: usize, len: usize, tag: u8) -> Result<&[u8], FerroError> {
+    at.checked_add(len).and_then(|end| bytes.get(at..end)).ok_or_else(|| {
+        FerroError::Corruption(format!(
+            "log record of kind {tag} is truncated: wanted {len} byte(s) at offset {at} but the record is {} bytes",
+            bytes.len()
+        ))
+    })
 }
 
 fn crc32_table() -> [u32; 256] {
