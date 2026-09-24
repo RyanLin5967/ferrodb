@@ -1916,6 +1916,112 @@ mod tests {
         (c, path, pool)
     }
 
+    // ---- D233: FIFO lease churn must not leave a walk of empty leaves ------------------------
+
+    /// Leaves in the catalog tree's whole leaf chain that hold no entry, walked from the leftmost
+    /// leaf through `next`: the chain every range scan follows.
+    fn empty_leaves_in_chain(c: &TableBranchCatalog) -> usize {
+        let mut leaf = c.tree.leftmost_leaf().unwrap();
+        let mut empty = 0;
+        loop {
+            if leaf.key_arr.is_empty() {
+                empty += 1;
+            }
+            match leaf.next {
+                Some(n) => leaf = c.tree.read_leaf(n).unwrap(),
+                None => return empty,
+            }
+        }
+    }
+
+    /// Pages this thread reads for one `expired_before(0)`: a lease pass that expires nothing, so
+    /// it reads only what it must to reach the first live deadline. Counted by the pool's
+    /// test-only instrument over both read paths, latched and latch-free.
+    fn pages_per_lease_pass(c: &TableBranchCatalog) -> u64 {
+        let before = crate::buffer::buffer_pool::page_reads_on_this_thread();
+        let expired = c.expired_before(0).unwrap();
+        let read = crate::buffer::buffer_pool::page_reads_on_this_thread() - before;
+        assert!(expired.is_empty(), "every fixture deadline is after 0, so nothing expires");
+        read
+    }
+
+    /// Fork `live` branches, then reap the OLDEST and fork a new one, `checkpoints.last()` times,
+    /// so `live` branches always coexist and deadlines only move forward: the lease traffic the
+    /// D233 adversary modelled (`frontier/deadline_leaf_adversary.md` §5). Reaping is
+    /// `set_state(Live → Reaped)`, which removes the branch's DEADLINE key (`write_record`).
+    /// Returns `(reaps so far, pages per lease pass, empty leaves in the chain)` per checkpoint.
+    fn fifo_lease_churn(
+        c: &TableBranchCatalog,
+        live: usize,
+        checkpoints: &[usize],
+    ) -> Vec<(usize, u64, usize)> {
+        let mut deadline = 1_000u64;
+        let mut queue = std::collections::VecDeque::new();
+        for _ in 0..live {
+            queue.push_back(c.fork(BranchId::TRUNK, LeaseDeadline(deadline)).unwrap().branch_id);
+            deadline += 1;
+        }
+        let mut out = Vec::new();
+        let mut done = 0usize;
+        for &cp in checkpoints {
+            while done < cp {
+                let oldest = queue.pop_front().expect("live branches remain");
+                c.set_state(oldest, BranchState::Live, BranchState::Reaped).unwrap();
+                queue.push_back(c.fork(BranchId::TRUNK, LeaseDeadline(deadline)).unwrap().branch_id);
+                deadline += 1;
+                done += 1;
+            }
+            out.push((done, pages_per_lease_pass(c), empty_leaves_in_chain(c)));
+        }
+        out
+    }
+
+    /// ⛔ **D233, WRITTEN TO FAIL FIRST: a lease pass must not walk the leaves FIFO reaps emptied.**
+    ///
+    /// `BPlusTreeManager::delete` never unlinked a leaf. Deadlines only move forward, so the head
+    /// of the DEADLINE group is where every reap removes a key, and every leaf there that emptied
+    /// stayed in the chain. `expired_before` descends to the RECORD tail's leaf (no DEADLINE
+    /// separator is below `[0x01]`) and walks right through every one of them, every lease pass.
+    /// D2's falsifier ("the scan's node-touch count stays flat as N grows") was applied per ENTRY
+    /// and never per LEAF.
+    ///
+    /// Pre-registered (`frontier/lane_d233_free_at_empty.md` §3; the adversary's model): with 170
+    /// live branches, which is at least the 163 a leaf of 25-byte DEADLINE entries needs, one head
+    /// leaf empties per ~81 reaps. Before the fix, pages per pass ≈ h + E + 1 with E ≈ reaps/81,
+    /// so roughly (h or h+1, h+6, h+11) at (0, 405, 810) reaps, and the chain holds 0, ≥5, ≥10
+    /// empty leaves. After it, the chain holds no empty leaf and the pages per pass stay within 1
+    /// of the first checkpoint (1, not 0, in case the tree gains a level).
+    #[test]
+    fn a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied() {
+        let (c, p, _pool) = cat("d233-fifo");
+        let arms = fifo_lease_churn(&c, 170, &[0, 405, 810]);
+        let _ = std::fs::remove_file(p);
+        let base = arms[0].1;
+        assert!(
+            arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
+            "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}: the lease pass \
+             reads more pages as reaps accumulate, or emptied leaves stay in the chain"
+        );
+    }
+
+    /// D233, the 64-hop cliff. Past 63 empty leaves the latch-free descent exceeds its right walk
+    /// on each of 16 attempts before the latched path answers, which is about 17h + E + 1025 page
+    /// reads per pass. Pre-registered: before the fix, ≥ 1,000 pages per pass at 5,500 reaps
+    /// (E ≈ 67); after it, within 1 of the first checkpoint. Ignored in the default run because it
+    /// performs about 11,000 durable catalog writes; FAN-QUEUE runs it by name.
+    #[test]
+    #[ignore]
+    fn a_lease_pass_stays_flat_past_the_64_hop_cliff() {
+        let (c, p, _pool) = cat("d233-cliff");
+        let arms = fifo_lease_churn(&c, 170, &[0, 5_500]);
+        let _ = std::fs::remove_file(p);
+        let base = arms[0].1;
+        assert!(
+            arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
+            "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}"
+        );
+    }
+
     #[test]
     fn a_fresh_catalog_holds_trunk_and_nothing_else() {
         let (c, p, _pool) = cat("fresh");
