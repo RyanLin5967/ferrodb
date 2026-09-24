@@ -891,9 +891,10 @@ impl ProvenanceStore for DurableProvenanceStore {
         self.syncs.snapshot()
     }
 
-    /// Refused exactly when every write would be: a store poisoned by a failed append, or a file
-    /// lock poisoned by a panicking writer. Read without taking the lock — the trait says why the
-    /// probe is advisory.
+    /// Refused when a write would not succeed: a store poisoned by a failed append, or a file lock
+    /// poisoned by a panicking writer (where every write path but `flush` would panic on
+    /// `lock().unwrap()` rather than refuse, so refusing here is the safer answer). Read without
+    /// taking the lock — the trait says why the probe is advisory.
     fn check_writable(&self) -> Result<(), FerroError> {
         if self.file.is_poisoned() {
             return Err(FerroError::Provenance(format!(
