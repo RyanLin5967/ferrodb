@@ -2478,6 +2478,20 @@ impl AgentRuntime {
         (pinned, distinct.len(), ids)
     }
 
+    /// **D194 cost review (Amendment 10): what `version_history` holds.** Returns
+    /// `(rows with a history, entries, capacity)`, summed over every row, so a harness can show the
+    /// history flat against merges and the capacity returned.
+    ///
+    /// This is an instrument. It costs O(rows ever published) under the state lock, so no
+    /// statement path calls it.
+    pub fn version_history_census(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let rows = state.version_history.len();
+        let entries = state.version_history.values().map(Vec::len).sum();
+        let capacity = state.version_history.values().map(Vec::capacity).sum();
+        (rows, entries, capacity)
+    }
+
     /// Exit criterion 9: which agent + run + model wrote a given row.
     ///
     /// Answers for a row in the shared tables — that is, one some merge published — and keeps

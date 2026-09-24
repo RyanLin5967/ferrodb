@@ -878,3 +878,10 @@ released tests unchanged).
 - Under `-b`: 2169 / 3.
 - The harness gains a history census (`version_history_census`: rows, entries, capacity). At every k,
   Part 1 must print `entries == 256` and `capacity ≤ 2·entries + 4·256`, and it refuses otherwise.
+
+**Amendment 10 correction, written before the census code was committed.**
+- **The harness census at k = 0.** Amendment 10 says part 1 must print `entries == 256` "at every k". At
+  k = 0 no merge has published anything, so the history is empty. The pre-registered values are 0 at
+  k = 0 and 256 at k ∈ {8, 32, 128}, with capacity ≤ 2·entries + 4·256 at every k.
+- **The "Prediction for the tests-only commit" line.** It names four filters in one command line. It
+  means: each of W1, W2, W3 and C2, run by its own name, FAILS at `24a3961`.

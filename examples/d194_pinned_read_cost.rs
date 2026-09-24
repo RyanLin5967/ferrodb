@@ -21,6 +21,10 @@
 //!   the planner scans; `SEQ_SCAN_TUPLES` says which. Any other value REFUSES the run.
 //! * the median latency of each read over REPS repetitions. It is reported, not certified. The
 //!   pre-registered shape is a positive slope in k for OLD and a flat line for FRESH.
+//! * `AgentRuntime::version_history_census` (Amendment 10). OLD reads no published version, and
+//!   each merge's own pin leaves when it seals, so the history must hold exactly one entry per
+//!   published row: 0 at k = 0 and ROWS after, with capacity ≤ 2·entries + 4·ROWS. Anything else
+//!   REFUSES. This is the cost review's W1, measured on the shipped wiring.
 //!
 //! # Part 2: snapshot census
 //!
@@ -212,7 +216,7 @@ fn part1(dir: &std::path::Path) -> Result<(), String> {
     let scan = "SELECT id, v FROM t;";
     let point = "SELECT id, v FROM t WHERE id = 1;";
     println!("# part 1: rows={ROWS} reps={REPS} (latency = median of reps, reported not certified)");
-    println!("k\told_scan_hops\told_scan_us\tfresh_scan_hops\tfresh_scan_us\told_point_hops\told_point_seq_tuples\told_point_path\told_point_us\tfresh_point_hops\tfresh_point_us");
+    println!("k\told_scan_hops\told_scan_us\tfresh_scan_hops\tfresh_scan_us\told_point_hops\told_point_seq_tuples\told_point_path\told_point_us\tfresh_point_hops\tfresh_point_us\thistory_entries\thistory_capacity");
     let mut merged = 0u64;
     for &k in &CHECKPOINTS {
         while merged < k {
@@ -244,7 +248,15 @@ fn part1(dir: &std::path::Path) -> Result<(), String> {
         if op_h != want_point {
             return Err(format!("k={k}: OLD point read made {op_h} hops on the {path} path, pre-registered {want_point}"));
         }
-        println!("{k}\t{os_h}\t{os_us:.1}\t{fs_h}\t{fs_us:.1}\t{op_h}\t{op_t}\t{path}\t{op_us:.1}\t{fp_h}\t{fp_us:.1}");
+        let (_, entries, capacity) = s.ctx.runtime.version_history_census();
+        let want_entries = if k == 0 { 0 } else { ROWS as usize };
+        if entries != want_entries || capacity > 2 * entries + 4 * ROWS as usize {
+            return Err(format!(
+                "k={k}: version_history holds {entries} entries in capacity {capacity}; \
+                 pre-registered {want_entries} entries and capacity <= 2·entries + 4·{ROWS}"
+            ));
+        }
+        println!("{k}\t{os_h}\t{os_us:.1}\t{fs_h}\t{fs_us:.1}\t{op_h}\t{op_t}\t{path}\t{op_us:.1}\t{fp_h}\t{fp_us:.1}\t{entries}\t{capacity}");
     }
     Ok(())
 }
