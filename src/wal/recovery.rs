@@ -1362,9 +1362,12 @@ use super::*;
     /// **D250 (lane `lane_d250_drop_logged.md` §2 test 1): after a DROP that a WAL pin kept in the log
     /// and a crash, the next open writes no page the DROP freed.** The pin cancels the DROP's
     /// truncation (`WalManager::truncate`), so the log still holds the table's records. Redo takes a
-    /// freed page as it finds it: one never flushed is a zero page, `Page::empty` with LSN 0, and
-    /// every record applies. The fix: the DROP's record is durable before its frees, and recovery
-    /// skips every record a later DROP names. Red at `2c10f17`, where the DROP is refused for the pin;
+    /// freed page as it finds it. On this branch a freed page is not flushed before the free, so one
+    /// never flushed is a zero page, `Page::empty` with LSN 0, and every record applies. On the D229
+    /// merge every page is flushed before any free, so redo's page-LSN skip makes the replay a no-op
+    /// there and this test does not discriminate; test 13 (reuse under the pin) does, on both trees
+    /// (lane §3.8, §3.12). The fix: the DROP's record is durable before its frees, and recovery skips
+    /// every record a later DROP names. Red at `2c10f17`, where the DROP is refused for the pin;
     /// the hazard half is red under the mutant that removes the skip.
     #[test]
     fn after_a_pinned_drop_and_a_crash_redo_writes_no_page_the_drop_freed() {
@@ -1440,12 +1443,13 @@ use super::*;
         }
     }
 
-    /// **D250 (lane §2 test 2): after a DROP whose checkpoint failed after its frees, and a crash, the
-    /// next open writes no page the DROP freed.** The same state as a pin, reached by an I/O error: the
-    /// pages are free on disk, the catalog change was written, and the log still holds the table's
-    /// records. Red at `2c10f17` at the page bytes: there the `DropTable` record was logged only after
-    /// a successful checkpoint, so the log held the inserts and no DROP, and redo replayed them onto
-    /// the table's zeroed data page.
+    /// **D250 (lane §2 test 2): after a DROP whose checkpoint failed, and a crash, the next open writes
+    /// no page the DROP freed.** The same state as a pin, reached by an I/O error: the catalog change
+    /// was written, and the log still holds the table's records. On this branch the frees came before
+    /// the failed sync, so the pages are free on disk; on the D229 merge the sync fails before any
+    /// free, and the frees happen at the reopen (lane §3.12). Red at `2c10f17` at the page bytes:
+    /// there the `DropTable` record was logged only after a successful checkpoint, so the log held the
+    /// inserts and no DROP, and redo replayed them onto the table's zeroed data page.
     #[test]
     fn after_a_drop_whose_checkpoint_failed_and_a_crash_redo_writes_no_page_the_drop_freed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1736,17 +1740,28 @@ use super::*;
         assert!(o.catalog.get_table("keep").is_some(), "the table whose index took the dropped root is gone");
     }
 
-    /// **D250, the F2 residual the lead accepted (lane §3.7 test 10): an EMPTY table re-created at the
-    /// dropped root by a CREATE whose sync failed is forgotten by the next open, and its pages leak.**
-    /// After the DROP's record the log holds no `CreateTable` (the CREATE failed before logging it) and
-    /// no heap record, so nothing tells the new table from the dropped one. The CREATE was reported
-    /// failed, and no committed row is lost (a committed row is test 7). What this pins is that the
-    /// forget frees nothing: a failed CREATE's catalog entry names pages that are not known to be its
-    /// own, because the catalog page and the bitmap page are separate writes, so a free could hit
-    /// another owner. A guard at `f3f75af`, killed by FREEm. Only the three roots are probed; another
-    /// page the CREATE allocated is not, which weakens the probe and cannot falsify it.
+    /// **D250, the F2 residual the lead accepted (lane §3.7 test 10, rescoped in §3.12): an EMPTY table
+    /// re-created at the dropped root by a CREATE whose sync failed is forgotten by the next open, and
+    /// no page of it is handed out while anything live names it.** After the DROP's record the log
+    /// holds no `CreateTable` (the CREATE failed before logging it) and no heap record, so nothing
+    /// tells the new table from the dropped one. The CREATE was reported failed, and no committed row
+    /// is lost (a committed row is test 7).
+    ///
+    /// **The safety property, on every tree:** every page `allocate` hands out after the open, the
+    /// forgotten table's roots included, is named by no live catalog entry or index: a free never
+    /// aliases a live page. A live table `keep` exists so that property has something to alias. The
+    /// first version asserted that none of the forgotten roots is ever handed out, which pinned the
+    /// LEAK: on the D229 merge the open-time index reset frees the empty primary-root leaf, correctly.
+    /// **The leak is a separate count, stated per tree** in `LEAKED_ROOTS`. Killed by FREEm (the
+    /// count) and ALIASm (the safety check). Only the three roots are counted; another page the
+    /// CREATE allocated is not.
     #[test]
     fn an_empty_table_recreated_at_the_dropped_root_by_a_failed_create_is_forgotten_and_its_pages_leak() {
+        /// The forgotten table's roots that stay allocated and unnamed after the open. 3 on this
+        /// branch, where the forget frees nothing. **2 on the D229 merge**, the heap and time-travel
+        /// directory roots, where the open-time index reset frees the primary-root leaf: the merge sets
+        /// it, as pre-registered by the lead's decision (lane §3.12).
+        const LEAKED_ROOTS: usize = 3;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("recreated_empty.db");
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1756,6 +1771,13 @@ use super::*;
             let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
             let (bp, _wal, txn, mut catalog) =
                 manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO keep VALUES (1, 10);",
+                "CREATE INDEX kv ON keep (v);",
+            ] {
+                run_sql(sql, &mut catalog, &bp, &txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
             run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
             run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
             let root = catalog.get_table("t").unwrap().first_directory_page_id;
@@ -1780,20 +1802,46 @@ use super::*;
             "premise failed: the empty re-created `t` survived the open, so the residual whose pages this probes is gone"
         );
         assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP");
+        // Every page a live catalog entry names, as the open left them (after the rebuild).
+        let live: HashSet<u32> = o
+            .catalog
+            .tables
+            .values()
+            .flat_map(|e| {
+                [e.first_directory_page_id, e.time_travel_root, e.primary_index_root]
+                    .into_iter()
+                    .chain(e.indexes.iter().map(|i| i.root_page_id))
+                    .chain(e.fulltext_indexes.iter().map(|i| i.root_page_id))
+            })
+            .collect();
+        assert!(o.catalog.get_table("keep").is_some() && !live.is_empty(), "premise failed: no live table, so nothing could be aliased");
         // `allocate` hands out the lowest clear bit, so every free page below the high-water mark comes
         // out before the first page at or above it.
         let high = o.bp.disk_manager.high_water().unwrap();
+        let mut handed_out: HashSet<u32> = HashSet::new();
+        let mut reached_the_top = false;
         for _ in 0..=high {
             let next = o.bp.disk_manager.allocate().unwrap();
             assert!(
-                !owned.contains(&next),
-                "page {next}, a root of the table the open forgot ({owned:?}), was handed out: the forget freed it"
+                !live.contains(&next),
+                "page {next} was handed out while a live catalog entry names it{}: a free aliased a live page",
+                if owned.contains(&next) { ", and it is a root of the table the open forgot" } else { "" }
             );
             if next >= high {
-                return;
+                reached_the_top = true;
+                break;
             }
+            handed_out.insert(next);
         }
-        panic!("`allocate` handed out more pages below the high-water mark {high} than there are");
+        assert!(reached_the_top, "`allocate` handed out more pages below the high-water mark {high} than there are");
+        let leaked = owned.iter().filter(|p| !handed_out.contains(*p) && !live.contains(*p)).count();
+        assert_eq!(
+            leaked, LEAKED_ROOTS,
+            "the forgotten table's roots {owned:?}: {leaked} stay allocated and unnamed, where this tree's stated leak is \
+             {LEAKED_ROOTS}; {} were handed out and {} are live",
+            owned.iter().filter(|p| handed_out.contains(*p)).count(),
+            owned.iter().filter(|p| live.contains(*p)).count()
+        );
     }
 
     /// **D250 review 1's F7, the lead's door (lane §3.7 test 11): a runtime attached to an open that
