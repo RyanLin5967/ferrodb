@@ -807,4 +807,414 @@ use super::*;
         assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
         assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // D216 — a clean restart must not rebuild every index.
+    //
+    // `checkpoint_locked` truncates the log and then re-appends this process's DDL (`replay_schema`)
+    // and run declarations (`replay_runs`) as transaction-0 records, so a CLEAN close leaves a log
+    // that is not empty. `recover` treated any non-empty log as work, so `open_recovered` rebuilt
+    // every tree from the heap, O(rows), on the first restart after any process that ran DDL or bound
+    // a run. The rule these tests pin: the trees are stale only when the log holds a DATA record
+    // (a heap insert, delete or update, or a CLR), whether or not redo had to apply it, and only if
+    // no index page can reach the disk ahead of the log records it depends on.
+    // ---------------------------------------------------------------------------------------------
+
+    /// One statement through the executor, in `session`, so a `BEGIN` stays open across calls.
+    fn d216_sql(o: &mut OpenedDatabase, session: &mut Session, sql: &str) -> Result<crate::execution::executor::Outcome, FerroError> {
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+        crate::execution::executor::run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), session)
+    }
+
+    /// The rows a statement returned, outside any transaction.
+    fn d216_rows(o: &mut OpenedDatabase, sql: &str) -> Vec<Vec<Value>> {
+        match d216_sql(o, &mut Session::new(), sql) {
+            Ok(crate::execution::executor::Outcome::Rows(rows)) => rows,
+            Ok(_) => panic!("`{sql}` did not return rows"),
+            Err(e) => panic!("`{sql}` failed: {e}"),
+        }
+    }
+
+    /// Every record in the retained log, buffered ones included, as (lsn, transaction, kind).
+    fn d216_log(wal: &WalManager) -> Vec<(u64, u64, RecKind)> {
+        let mut out = Vec::new();
+        let end = wal.next_lsn.load(Ordering::SeqCst);
+        let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).unwrap();
+            out.push((rec.lsn, rec.txn_id, rec.kind));
+            lsn = next;
+        }
+        out
+    }
+
+    /// Whether every record is a transaction-0 re-declaration, which is all a clean close leaves.
+    fn d216_only_declarations(log: &[(u64, u64, RecKind)]) -> bool {
+        log.iter().all(|(_, txn, kind)| *txn == 0 && matches!(kind, RecKind::Ddl { .. } | RecKind::RunIdentity { .. }))
+    }
+
+    /// The log's (base, end).
+    fn d216_bounds(wal: &WalManager) -> (u64, u64) {
+        (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst))
+    }
+
+    /// D216's fixture: table `t` with a secondary index on `v` and two committed rows, closed CLEANLY
+    /// the way `cli::run_cli` exits, with a checkpoint. Returns the log's bounds as the close left
+    /// them.
+    ///
+    /// Checks the premise every D216 test stands on: the log is NOT empty (an empty log never
+    /// rebuilt, so it could not show the defect), and it holds nothing but re-declarations.
+    fn d216_cleanly_closed(db: &Path) -> (u64, u64) {
+        let lock = DbLock::acquire(db).unwrap();
+        let mut o = open_recovered(db, &lock).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+            "CREATE INDEX iv ON t (v);",
+            "INSERT INTO t VALUES (1, 10);",
+            "INSERT INTO t VALUES (2, 20);",
+        ] {
+            d216_sql(&mut o, &mut Session::new(), sql).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+        o.txn.checkpoint().unwrap();
+        let log = d216_log(&o.wal);
+        assert!(!log.is_empty(), "premise failed: the clean close left an empty log, and an empty log never rebuilt");
+        assert!(d216_only_declarations(&log), "premise failed: the clean close left more than re-declarations: {log:?}");
+        d216_bounds(&o.wal)
+    }
+
+    /// Write `t`'s primary root to disk through `flush_page` (the same write-back, `wal_gate` then
+    /// `DiskManager::write`, that an eviction does) and check that the page on disk carries `key`.
+    /// `t` is small enough that its primary tree is one leaf, and the check says so.
+    fn d216_flush_primary_root_holding(o: &OpenedDatabase, key: i32) {
+        use crate::storage::index_page::{BPlusTreeLeafPage, BPLUS_LEAF_TYPE};
+        let root = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell").load(Ordering::SeqCst);
+        o.bp.flush_page(root).unwrap();
+        let on_disk = o.bp.disk_manager.read(root).unwrap();
+        assert_eq!(on_disk[0], BPLUS_LEAF_TYPE, "premise failed: t's primary root is not a leaf, so writing it did not write the entry");
+        let leaf = BPlusTreeLeafPage::<Value, RecordId>::deserialize(on_disk).unwrap();
+        assert!(leaf.key_arr.contains(&Value::Integer(key)), "premise failed: the index page on disk does not carry key {key}");
+    }
+
+    /// **D216 — a clean restart after DDL must not rebuild the indexes.**
+    ///
+    /// A `Ddl` record changes no page (recovery does not replay DDL; the catalog lives outside the
+    /// WAL), so there is nothing for a tree to be stale against. Observed through `recovered` and
+    /// through the log's bounds: the open must neither truncate the log (the rebuild's checkpoint)
+    /// nor append to it. It used to do both: recovery took transaction 0, which is not a
+    /// transaction, for a loser and "aborted" it, writing an `Abort` and a `TxnEnd` under id 0 that
+    /// the rebuild's checkpoint then discarded. Then the trees the open left alone must answer.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
+    #[test]
+    fn a_clean_restart_after_ddl_does_not_rebuild_the_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("clean.db");
+        let closed = d216_cleanly_closed(&db);
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(
+            !o.recovered,
+            "a clean restart whose log held only DDL re-declarations reported a recovery, so the open rebuilt every index (D216)"
+        );
+        assert_eq!(
+            d216_bounds(&o.wal),
+            closed,
+            "the open changed the log a clean close left: a rebuild's checkpoint truncates it, and undoing transaction 0 appends to it"
+        );
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
+        assert_eq!(d216_rows(&mut o, "SELECT id FROM t WHERE v = 10;"), vec![vec![Value::Integer(1)]], "a lookup by the indexed value");
+        match d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (2, 99);") {
+            Err(FerroError::Constraint(m)) if m.contains("duplicate primary key") => {}
+            Err(e) => panic!("a duplicate of a committed key was refused, but not as a duplicate: {e}"),
+            Ok(_) => panic!("a duplicate of a committed key was ADMITTED"),
+        }
+    }
+
+    /// **D216, the run half — a clean restart after a process that declared an agent run.**
+    ///
+    /// `replay_runs` re-declares every run at the head of the new log, as `replay_schema` does for
+    /// DDL, so a process that served one attributed MERGE also left a non-empty log at a clean
+    /// close. The middle process here runs no DDL, so the log it leaves holds run declarations only.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
+    #[test]
+    fn a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes() {
+        use crate::{branch::types::BranchId, provenance::{ProvId, RunEntity}};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("runs.db");
+        d216_cleanly_closed(&db);
+        let closed = {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let run = RunEntity::new(ProvId(1), "restock-agent", "run-1", "a-model", "v1", [0u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+            o.txn.declare_run(run).unwrap();
+            o.txn.checkpoint().unwrap();
+            let log = d216_log(&o.wal);
+            assert!(
+                log.iter().any(|(_, _, kind)| matches!(kind, RecKind::RunIdentity { .. })),
+                "premise failed: the clean close re-declared no run: {log:?}"
+            );
+            assert!(d216_only_declarations(&log), "premise failed: the clean close left more than re-declarations: {log:?}");
+            d216_bounds(&o.wal)
+        };
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(
+            !o.recovered,
+            "a clean restart whose log held only run declarations reported a recovery, so the open rebuilt every index (D216)"
+        );
+        assert_eq!(d216_bounds(&o.wal), closed, "the open changed the log a clean close left");
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 1;"), vec![vec![Value::Integer(10)]], "a lookup by key");
+    }
+
+    /// **D216 — a log with transactions but no data records rebuilds nothing, and recovery still
+    /// reads it.**
+    ///
+    /// A transaction that wrote nothing leaves `Begin` and `Commit`, which change no page, so no tree
+    /// can be stale against them. But `recover` must still scan them: the WAL header's transaction
+    /// id moves only at a checkpoint, so it is recovery's analysis that raises the watermark past
+    /// the ids a crashed process issued. A fix that returned early for a log with no data records
+    /// would hand the same id out twice. The second assertion pins that.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`; the watermark
+    /// assertion holds there.
+    #[test]
+    fn a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idle.db");
+        d216_cleanly_closed(&db);
+        let committed = {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let t = o.txn.begin().unwrap();
+            o.txn.commit(t).unwrap();
+            // The crash: no checkpoint, so the header still holds the id it held at open.
+            t
+        };
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(
+            !o.recovered,
+            "a log holding a transaction that wrote nothing reported a recovery, so the open rebuilt every index"
+        );
+        let next = o.txn.begin().unwrap();
+        assert!(
+            next > committed,
+            "recovery did not raise the id watermark past transaction {committed}, which the crashed process committed; \
+             the next transaction was given id {next}"
+        );
+    }
+
+    /// **D216 control — a crashed, uncommitted heap write still forces the rebuild.**
+    ///
+    /// The loser's records are made durable by hand and its primary-index page is written to disk,
+    /// so the tree on disk names a row that recovery then undoes. Only a rebuild removes that entry;
+    /// without one, key 3 fails every lookup and every INSERT (D202's crash half,
+    /// `tests/pgserver_crash_rebuilds_indexes.rs`).
+    ///
+    /// Passes at `00f4c39`, where any non-empty log rebuilt, and must keep passing: the loser's
+    /// `HeapInsert` and the CLR that undoes it are data records.
+    #[test]
+    fn a_crashed_uncommitted_heap_write_still_forces_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loser.db");
+        d216_cleanly_closed(&db);
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let mut s = Session::new();
+            for sql in ["BEGIN;", "INSERT INTO t VALUES (3, 30);"] {
+                d216_sql(&mut o, &mut s, sql).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            o.wal.flush().unwrap();
+            d216_flush_primary_root_holding(&o, 3);
+            // The crash: no COMMIT, no checkpoint.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "a crash left an uncommitted heap write in the log, and the open reported no recovery");
+        let (base, end) = d216_bounds(&o.wal);
+        assert_eq!(base, end, "the rebuild's checkpoint did not run");
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 3;"), Vec::<Vec<Value>>::new(), "the undone row is visible by key");
+        d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 31);")
+            .unwrap_or_else(|e| panic!("key 3 was never committed, and inserting it after the crash failed: {e}"));
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 3;"), vec![vec![Value::Integer(31)]], "the new row by key");
+    }
+
+    /// **D216 control — a data record counts even when redo SKIPS it.**
+    ///
+    /// "Recovery replayed a data record" has to mean the record is in the log, not that redo changed
+    /// a page. Here a committed row's heap page reaches the disk and its index page does not, which
+    /// is an order eviction can produce. Redo then skips the record, because the page's LSN is
+    /// already at it, and the tree on disk still lacks the key. A rule that counted only the records
+    /// redo applied would skip the rebuild and lose the row by key.
+    ///
+    /// Passes at `00f4c39` and must keep passing.
+    #[test]
+    fn a_committed_row_whose_heap_page_reached_disk_still_forces_the_rebuild() {
+        use crate::storage::index_page::BPlusTreeLeafPage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("skipped.db");
+        d216_cleanly_closed(&db);
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+            let cell = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+            let root = cell.load(Ordering::SeqCst);
+            let rid = BPlusTreeManager::<Value, RecordId>::open_shared(cell, o.bp.clone())
+                .search(&Value::Integer(3))
+                .unwrap()
+                .expect("row 3 is in the tree in memory");
+            o.bp.flush_page(rid.page_id).unwrap();
+
+            let insert_lsn = d216_log(&o.wal)
+                .iter()
+                .rev()
+                .find(|(_, _, kind)| matches!(kind, RecKind::HeapInsert { .. }))
+                .map(|(lsn, ..)| *lsn)
+                .expect("the INSERT logged a HeapInsert");
+            let heap_on_disk = Page::deserialize(o.bp.disk_manager.read(rid.page_id).unwrap()).unwrap();
+            assert!(heap_on_disk.read(rid.slot_num as usize).is_ok(), "premise failed: row 3 did not reach disk in its heap page");
+            assert!(
+                heap_on_disk.lsn >= insert_lsn,
+                "premise failed: the heap page on disk (lsn {}) is behind its record (lsn {insert_lsn}), so redo would apply it, not skip it",
+                heap_on_disk.lsn
+            );
+            let index_on_disk = BPlusTreeLeafPage::<Value, RecordId>::deserialize(o.bp.disk_manager.read(root).unwrap()).unwrap();
+            assert!(
+                !index_on_disk.key_arr.contains(&Value::Integer(3)),
+                "premise failed: the index page reached disk too, so the tree would find row 3 without a rebuild"
+            );
+            // The crash: the commit made the log durable; nothing else is written.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(
+            o.recovered,
+            "a committed heap write was in the log, and the open reported no recovery because redo found its page already current"
+        );
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 3;"), vec![vec![Value::Integer(30)]], "a committed row is missing by key");
+        match d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 99);") {
+            Err(FerroError::Constraint(m)) if m.contains("duplicate primary key") => {}
+            Err(e) => panic!("a second row 3 was refused, but not as a duplicate: {e}"),
+            Ok(_) => panic!("a second row 3 was ADMITTED"),
+        }
+    }
+
+    /// **D216 control — the stale-indexes marker still forces the rebuild when the log holds only
+    /// re-declarations.**
+    ///
+    /// This is the state D216 makes new: `recover` reports no work for this log (the first test here
+    /// pins that on this same fixture), so the marker is the only thing left that can ask for a
+    /// rebuild. `a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty` covers
+    /// the empty log; this covers the non-empty one. The marker is planted by hand, since only
+    /// where it lives matters to the open.
+    ///
+    /// Passes at `00f4c39`, where the log alone rebuilt, and must keep passing.
+    #[test]
+    fn the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marked.db");
+        d216_cleanly_closed(&db);
+        let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
+        std::fs::write(&marker, "planted by the test\n").unwrap();
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
+        let (base, end) = d216_bounds(&o.wal);
+        assert_eq!(base, end, "the rebuild's checkpoint did not run");
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
+    }
+
+    /// **D216's precondition — an index page reaches the disk only after the log records it depends
+    /// on.**
+    ///
+    /// Index pages carry no LSN (`index_page.rs` writes 0), so `wal_gate` used to skip them: an
+    /// eviction could write a leaf holding an uncommitted key while the `Begin` and `HeapInsert`
+    /// behind that key were still only in the log buffer. After a crash, no record of the
+    /// transaction survives, the log shows no work, and the key names a slot the heap never got.
+    /// This was already true at `00f4c39` whenever the surviving log was empty, which is how the
+    /// middle process here leaves it there (its open rebuilds and checkpoints, and it declared
+    /// nothing). D216's rule, "rebuild only for a data record", is sound only once this holds.
+    ///
+    /// The structural assertion is the rule itself; the reopen is its consequence.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `flushed_lsn` assertion.
+    #[test]
+    fn an_index_page_reaches_disk_only_after_the_log_records_it_depends_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("gate.db");
+        d216_cleanly_closed(&db);
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let mut s = Session::new();
+            for sql in ["BEGIN;", "INSERT INTO t VALUES (3, 30);"] {
+                d216_sql(&mut o, &mut s, sql).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            d216_flush_primary_root_holding(&o, 3);
+            assert_eq!(
+                o.wal.flushed_lsn.load(Ordering::SeqCst),
+                o.wal.next_lsn.load(Ordering::SeqCst),
+                "an index page reached the disk while log records appended before it were still only in memory; \
+                 a crash now leaves an index entry that no surviving record accounts for"
+            );
+            // The crash: no COMMIT, no checkpoint.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "the loser's records were durable, and the open reported no recovery");
+        d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 31);")
+            .unwrap_or_else(|e| panic!("key 3 was never committed, and inserting it after the crash failed: {e}"));
+        assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 3;"), vec![vec![Value::Integer(31)]], "the new row by key");
+    }
+
+    /// **The gate's negative control: a page that carries its own LSN keeps the precise gate.**
+    ///
+    /// A heap page is written only after the log is durable up to ITS LSN, and a record appended
+    /// after that is not forced out with it. Here the INSERT's commit made the log durable through
+    /// the `Commit`, the `TxnEnd` after it is still buffered, and writing the heap page must leave
+    /// it buffered. A gate that flushed the whole log for every page would fail this, and would pay
+    /// a log write on every heap eviction to do so.
+    ///
+    /// Passes at `00f4c39` and must keep passing.
+    #[test]
+    fn a_page_whose_own_record_is_durable_does_not_flush_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("precise.db");
+        d216_cleanly_closed(&db);
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+        let rid = BPlusTreeManager::<Value, RecordId>::open_shared(o.catalog.root_cell("t", None).expect("a cell for t"), o.bp.clone())
+            .search(&Value::Integer(3))
+            .unwrap()
+            .expect("row 3 is in the tree");
+        let flushed = o.wal.flushed_lsn.load(Ordering::SeqCst);
+        assert!(
+            flushed < o.wal.next_lsn.load(Ordering::SeqCst),
+            "premise failed: nothing is waiting in the log buffer, so a flush it did not need could not be seen"
+        );
+        o.bp.flush_page(rid.page_id).unwrap();
+        assert_eq!(
+            o.wal.flushed_lsn.load(Ordering::SeqCst),
+            flushed,
+            "writing a heap page whose own record was already durable flushed the log anyway"
+        );
+    }
 }
