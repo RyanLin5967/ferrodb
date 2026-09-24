@@ -234,15 +234,29 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 ///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable. It
 ///    runs after the branch catalog's sync, so the map it writes is taken after the catalog's last
 ///    durable write.
+///
+/// Every step runs whatever the ones before it returned, and the errors come back in step order,
+/// the first returned and any later one printed. A failed publish must not also cost the database
+/// and the arena their checkpoints (D244 review 3, R3-F2), which is the shape
+/// `rollback-index-orphan` already gives its two checkpoints (its review 2, C2).
 pub fn exit_sequence(
     branches: &TableBranchCatalog,
     txn: &TxnManager,
     store: &ArenaPageStore,
     arena_path: &Path,
 ) -> Result<(), FerroError> {
-    branches.publish_root_durably()?;
-    txn.checkpoint()?;
-    store.checkpoint(arena_path)
+    let published = branches.publish_root_durably();
+    let wal_checkpoint = txn.checkpoint();
+    let arena_checkpoint = store.checkpoint(arena_path);
+    let mut errors = [published, wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
+    let first = errors.next();
+    for later in errors {
+        eprintln!("ferrodb: a later exit step failed as well ({later})");
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {

@@ -1130,8 +1130,8 @@ impl BranchCatalog for TableBranchCatalog {
                 // that error, where before D244 it could not fail once past the checks above. Kept
                 // on purpose: the header write it reports is still owed, and swallowing it would
                 // hide a catalog the next open refuses. It is reached when a caller passes the state
-                // the branch already has, e.g. `seal`'s reaper-less fallback passing `record.state`
-                // with `to = Reaped` (`agent_sql/runtime.rs`).
+                // the branch already has: the reaper's resume path re-enters an interrupted reap with
+                // `set_state(branch, Reaping, Reaping)` (`reaper.rs`, `resume_interrupted_reaps`).
                 return Ok(false);
             }
             let old = core.clone();
