@@ -98,8 +98,28 @@ const MAGIC: u32 = 0xF3EE_DB03;
 const VERSION: u32 = 2;
 
 /// The format every build before D223 reads, and the one this build still writes while every frame
-/// fits [`LEGACY_READ_BOUND`]. A log that never held a large frame can still be opened by an older
-/// build, and so can still be downgraded.
+/// fits [`LEGACY_READ_BOUND`]. A log to which no large frame was ever submitted can still be opened by
+/// an older build.
+///
+/// **"Submitted", not "held"** (D207 review 4, C4). The raise comes before the write, so a log stays
+/// at version 2 after a large append that then fails, after a crash before that frame is durable,
+/// and after a truncation that removes it. That refuses a downgrade that would have been safe: it is
+/// conservative, never unsafe.
+///
+/// **Mixed versions, measured in disk-frame bytes for every command kind** (review 4, C2 and C3).
+/// Every older build refuses to WRITE a disk frame over 8,384,512 bytes (its `MAX_ENTRY_BYTES`), and
+/// trims one over 8,384,576 when it READS. So:
+/// - **Rolling upgrade:** until every node runs this build, no committed entry may exceed 8,384,512
+///   disk bytes. An older follower cannot store it, never acknowledges it, and stalls. For a
+///   `WalBatch` that is a payload over 8,384,475 (its disk frame is the payload plus 37).
+/// - **Downgrade:** a disk frame of 8,384,513–8,384,576 bytes stays at version 1, correctly, because
+///   an older build reads it. But an older follower that lacks such a round refuses to store it and
+///   stalls until a snapshot covers that round. Nothing is lost, and no version mark can help: the
+///   follower that stalls is the one without the frame. So a downgrade across D223 is safe only
+///   when no committed entry over 8,384,512 disk bytes is still needed by a follower.
+///
+/// Both are latent: nothing in `src/` proposes an entry that large, but `Node::propose` is public.
+/// A protocol version bump would turn either stall into a refusal at the handshake.
 const LEGACY_VERSION: u32 = 1;
 
 /// The read bound of every build before D223. Their `MAX_FRAME` was `MAX_ENTRY_BYTES + 64`, with
