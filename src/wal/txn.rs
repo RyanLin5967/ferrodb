@@ -1444,13 +1444,25 @@ impl TxnManager {
     /// write the replaced database's line into the new quarantine, which is what the move exists to
     /// prevent. Called by the consensus snapshot install when a `TxnManager` is wired to its log
     /// (`PageStoreSnapshots::with_txn`).
+    ///
+    /// **D229's state goes with it** (D229 review 2's F11, PREREG amendment 19): the drop intent file moves
+    /// aside with the quarantine ([`start_fresh_database`]), and the pending frees are forgotten with their
+    /// `DiskManager` quarantine. They name the REPLACED database's page ids: kept in the file, the next open
+    /// would free them under the new database; kept here, this manager's next checkpoint would.
     pub fn start_new_incarnation(&self) -> Result<(), FerroError> {
         let _retry = self.release_retry.lock().unwrap();
-        start_fresh_quarantine(&self.wal.path).map_err(|e| {
-            FerroError::Wal(format!("could not move the replaced database's release quarantine aside ({e})"))
+        start_fresh_database(&self.wal.path).map_err(|e| {
+            FerroError::Wal(format!(
+                "could not move the replaced database's release quarantine and drop intent aside ({e})"
+            ))
         })?;
         self.pending_releases.lock().unwrap().clear();
         self.unrecorded.lock().unwrap().clear();
+        // Lock order: `release_retry`, then `pending_frees`, then the pool's quarantine.
+        let replaced = std::mem::take(&mut *self.pending_frees.lock().unwrap());
+        for p in &replaced {
+            self.bp.disk_manager.release_quarantine(&p.intent.pages);
+        }
         Ok(())
     }
 
