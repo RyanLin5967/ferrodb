@@ -1234,6 +1234,19 @@ impl State {
         Some((at, seq))
     }
 
+    /// **D194, Amendment 11 — a read of main as it stands, paired like a pin.** Returns the snapshot
+    /// and the merge clock that snapshot pairs with (`pin_seq`), taken under one acquisition of the
+    /// lock, as `State::pin` takes a pin's. An unpinned read carries that seq as its
+    /// `seen_through`, so `record_read` names the versions its scan saw, and dates its
+    /// `observed_at`, as of the scan rather than as of the record. It pins nothing, so the history
+    /// keeps nothing for it: a row that moves before the record makes the read refuse.
+    fn read_now(&self, txn: &TxnManager) -> (Arc<Snapshot>, u64) {
+        let at = txn.read_snapshot_cached();
+        let recorded = self.applied.last().map(|a| a.seq);
+        let seq = pin_seq(&self.publishing, self.apply_seq, recorded, &at);
+        (at, seq)
+    }
+
     /// **D194 step 4 — the one door that MOVES a pin (`REBASE`).** Sets `fork_snapshot` and
     /// `fork_seq` to a later instant, together, and writes nothing else: no row, no base image, no
     /// schema edit, nothing the envelope governs. `false` when the branch has no live workspace.
@@ -1425,15 +1438,17 @@ impl State {
     ///
     /// `seen_through` is what [`AgentRuntime::visible_rows_where`] reports: `Some(fork_seq)` for a
     /// read through a branch's pinned snapshot, which saw exactly the versions published at or
-    /// below that seq — so the newest of those — and `None` for a read of main as it stood, which
-    /// saw the latest.
+    /// below that seq — so the newest of those. Since Amendment 11 an unpinned read carries the
+    /// `pin_seq` its snapshot was paired with (`State::read_now`), for the same reason. `None`
+    /// still means "the latest", and no read path passes it any more.
     ///
-    /// ⚠ The history answers exactly for two kinds of value only. One is a LIVE pin, a key of
-    /// `retention.pins`. The other is a value at or above every published `begin_ts`, which returns
-    /// `latest` before the history is consulted; `rebase_commit` passes `apply_seq`, which is one.
-    /// For any other value the version may have been dropped, and the answer would be wrong. That
-    /// is why [`AgentRuntime::record_read`] refuses a read whose pin was released while it ran,
-    /// before it calls this.
+    /// ⚠ For a row whose latest version is above `seen_through`, the history answers exactly only
+    /// when `seen_through` is a LIVE pin, a key of `retention.pins`. For any other value the version
+    /// may have been dropped, and the answer would be wrong. That is why
+    /// [`AgentRuntime::record_read`] refuses such a read before it calls this: a pin released while
+    /// the read ran, or a read that was never pinned, whose row moved in the meantime.
+    /// `rebase_commit` passes `apply_seq`, which is at or above every latest version, so it never
+    /// reaches the history.
     fn version_seen(&self, tbl: TableId, row: RowId, seen_through: Option<u64>) -> Option<VersionRef> {
         let latest = self.versions.get(&(tbl.0, row.0)).copied()?;
         let Some(through) = seen_through else { return Some(latest) };
@@ -2844,10 +2859,16 @@ impl AgentRuntime {
                         let ws = &state.workspaces[&b];
                         (at, Some(fork_seq), Some((ws.rows.clone(), ws.unprobeable_rows)))
                     }
-                    None => (ctx.txn.read_snapshot_cached(), None, None),
+                    None => {
+                        let (at, seq) = state.read_now(&ctx.txn);
+                        (at, Some(seq), None)
+                    }
                 }
             }
-            None => (ctx.txn.read_snapshot_cached(), None, None),
+            None => {
+                let (at, seq) = self.state.lock().unwrap().read_now(&ctx.txn);
+                (at, Some(seq), None)
+            }
         };
         let base = scan_table_where(table, alias, raw, ctx, at)?;
         let tbl = table_id(table);
@@ -3050,21 +3071,24 @@ impl AgentRuntime {
                 )))
             }
         };
-        // **A read whose pin was released while it ran REFUSES. It does not record a version it
-        // may not have seen.** (D194 new-wall audit.)
+        // **A read that the history can no longer answer REFUSES. It does not record a version it
+        // may not have seen.** (D194 new-wall audit; Amendment 11.)
         //
-        // `seen_through` was taken with the pin, under an earlier acquisition of this lock, and the
-        // scan ran between the two acquisitions with the lock released. Something that seals or
-        // re-pins the branch the read went through can land in that gap. Once that pin is gone,
-        // `version_history` may have dropped the version the read saw. `version_seen` would then
-        // answer "none", or name an older version, and that would be recorded for a row the read
-        // did see. The premise check would still catch the row, because it moved. `REVERT` would
-        // not: the edge to the merge that published what the read saw would be gone.
+        // `seen_through` was taken with the snapshot, under an earlier acquisition of this lock:
+        // a pin for a pinned read, and `pin_seq` for an unpinned one (`State::read_now`). The scan
+        // ran between the two acquisitions with the lock released, and a merge can record, or a
+        // pin can be sealed or re-pinned, in that gap. For each matched row:
+        // * If its latest version is at or below `seen_through`, the scan saw exactly that latest
+        //   version, and that is what gets named. No history is involved.
+        // * If a newer version landed, the version the scan saw is the newest at or below
+        //   `seen_through`. The history answers that exactly only for a LIVE pin value, a key of
+        //   `retention.pins`. Otherwise it may already be gone: the pin was released mid-read, or
+        //   the read was never pinned. Then `version_seen` would answer "none" or an older version,
+        //   the premise check would compare the wrong thing, and REVERT would draw its edge from
+        //   the wrong merge. So the read refuses.
         //
-        // The keys of `retention.pins` are exactly the values the history still answers for, so
-        // membership is the state that decides. A read whose own pin moved is still answered
-        // exactly if another live branch pins the same value, for example a child that inherited
-        // it.
+        // A read whose own pin moved is still answered exactly if another live branch pins the same
+        // value, for example a child that inherited it, or if none of its rows moved.
         //
         // Where the gap can be reached, stated rather than assumed:
         // * NOT over pgwire. A connection's shared-path `SELECT` holds its registered read pass
@@ -3082,14 +3106,21 @@ impl AgentRuntime {
         // although it records a predicate. That errs toward refusing, and a refusal is safe.
         let names_versions = purpose == ReadPurpose::Inspection
             && shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions;
-        let released = seen_through.filter(|f| names_versions && !state.retention.pins.contains_key(f));
+        let released = seen_through.filter(|f| {
+            names_versions
+                && !state.retention.pins.contains_key(f)
+                && matched.iter().any(|(rid, _)| {
+                    state.versions.get(&(tbl.0, rid.0)).is_some_and(|v| v.begin_ts > *f)
+                })
+        });
         if let Some(f) = released {
             return Err(FerroError::Branch(format!(
                 "the snapshot this read went through (main as of apply-seq {f}) was released while \
-                 this read ran: {reader}, or the branch it read AS OF, was re-pinned by REBASE or \
-                 sealed while the read was in flight. The versions it saw can no longer be named, \
-                 and a read that retained the wrong ones would be worse than none. Nothing was \
-                 retained. Retry."
+                 this read ran, or was never a pin, and main has published a newer version of a row \
+                 it read since: {reader}, or the branch it read AS OF, was re-pinned by REBASE or \
+                 sealed while the read was in flight, or the read was of a branch no workspace \
+                 pins. The versions it saw can no longer be named, and a read that retained the \
+                 wrong ones would be worse than none. Nothing was retained. Retry."
             )));
         }
         // **And one whose pin claims a merge that has not recorded yet** (D194, Amendment 7). A pin
