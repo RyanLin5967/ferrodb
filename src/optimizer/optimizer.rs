@@ -10,6 +10,12 @@ pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, Ferr
                     return Ok(physical)
                 }
             }
+            // D255 — over an INNER join a WHERE conjunct is a join predicate like any ON conjunct,
+            // so the reorderer takes the filter with the join; `flatten` collects its predicate.
+            // Planned apart, `a JOIN b ON TRUE WHERE a.id = b.id` was a cross product.
+            if matches!(*input, LogicalPlan::Join { join_type: JoinType::Inner, .. }) {
+                return reorder_inner_joins(LogicalPlan::Filter { input, predicate }, catalog)
+            }
             Ok(PhysicalPlan::Filter { input: Box::new(optimize(*input, catalog)?), predicate })
         }
         LogicalPlan::Join { left, right, join_type, on } => match join_type {

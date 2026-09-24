@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::evaluate, optimizer::{cost_model::cost, optimizer::{build_join, combine_and, optimize, push, split_and}}, parser::parser::JoinType, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}};
+use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::Value}, error::FerroError, optimizer::{cost_model::cost, optimizer::{build_join, combine_and, optimize, push, split_and}}, parser::parser::JoinType, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}};
 
 pub const MAX_DP_RELATIONS: usize = 12;
 
@@ -24,7 +24,8 @@ pub struct Sub {
     pub cost: f64,
 }
 
-/// Plan a tree of INNER joins: flatten it, place every ON conjunct, and search for a join order.
+/// Plan a tree of INNER joins, with the WHERE filters over it: flatten it, place every conjunct,
+/// and search for a join order.
 ///
 /// # D255 — every ON conjunct is placed by the relations it reads
 ///
@@ -37,9 +38,13 @@ pub struct Sub {
 /// * **one relation** — a filter on that relation's LOGICAL leaf, placed by the same
 ///   [`push`] WHERE uses and before `optimize` chooses an access path, so `ON b.id = 3` reaches the
 ///   index as `WHERE b.id = 3` does. See [`filter_leaf`].
-/// * **no relation** — a filter over the whole join, unless it is TRUE, when it is dropped: it
-///   keeps every row, and `ON TRUE` then plans exactly as it did past 12 relations before D255.
+/// * **no relation** — a filter over the whole join, unless it is the literal TRUE, when it is
+///   dropped: it keeps every row, and `ON TRUE` then plans exactly as it did past 12 relations
+///   before D255.
 /// * **two or more** — a bridge, unchanged.
+///
+/// A WHERE conjunct that reads two or more of these relations is placed the same way: over an
+/// INNER join it is the same predicate as an ON conjunct, and [`flatten`] collects it with them.
 ///
 /// The other half of D255 is that a join no predicate links now plans as a cross product at every
 /// size instead of being refused at 12 relations or fewer — see [`dynamic_program`].
@@ -74,11 +79,12 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
             let mut rel = 0u64;
             relations_of(&part, &orig_offset, &mut rel, &widths);
             match rel.count_ones() {
-                // A `BoundExpr` is literals and operators over columns, so one that reads no column
-                // has one value for every row. Only TRUE is folded; anything else — FALSE, NULL, a
-                // non-boolean, an evaluation error — stays a per-row filter, where WHERE keeps its
-                // own column-free conjuncts too, so it fails or empties the join the same way.
-                0 => if !matches!(evaluate(&part, &[]), Ok(Value::Boolean(true))) {
+                // A conjunct that reads no column has one value for every row. Only the literal
+                // TRUE is dropped, and it is recognised by its shape, never evaluated: planning must
+                // not run a user's expression (`i32::MIN / -1` panics in `evaluate`, and EXPLAIN
+                // would then panic too). Everything else stays a per-row filter over the join, as a
+                // column-free WHERE conjunct always has.
+                0 => if part != BoundExpr::Literal(Value::Boolean(true)) {
                     constant.push(part)
                 },
                 1 => {
@@ -141,32 +147,41 @@ fn filter_leaf(leaf: LogicalPlan, filters: Vec<BoundExpr>) -> LogicalPlan {
 /// `left_deep` planned the same queries as cross products. And the parser has no `CROSS JOIN` and
 /// no comma FROM list, so `ON TRUE` is the only way to write a cross product at all.
 ///
-/// A split with no bridge is now a cross-product candidate, joined `ON true`, under PostgreSQL's
-/// two rules (`join_search_one_level`):
+/// A split with no bridge is now a cross-product candidate, joined `ON true`, under two rules from
+/// PostgreSQL's `join_search_one_level`:
 ///
 /// * **R1, a closed side.** One side is CLOSED: no multi-relation conjunct reads both a relation in
 ///   it and one outside it. It has no predicate left to wait for, so crossing it now loses none.
 ///   PostgreSQL's `make_rels_by_clauseless_joins`, for a rel with no join clauses.
-/// * **R2, the last ditch.** If no subset of this size got a plan, the size is searched again with
-///   every split a candidate. PostgreSQL forces cartesian products when a level produced nothing.
+/// * **R3, a linked split.** Some conjunct reads both sides without yet lying inside them — it
+///   reads a third relation too — so joining them is progress towards applying it. PostgreSQL's
+///   `have_relevant_joinclause`. A conjunct over at most two relations that reads both sides is a
+///   bridge, so R3 is only ever about conjuncts over three or more.
 ///
 /// What those two rules guarantee:
 ///
-/// * **The full set always gets a plan.** Level 1 is the base relations; if bridges and R1 give a
-///   level nothing, R2 joins any planned subset one size down with any relation outside it. The
-///   `Internal` error below is that argument failing, not a refusal of a query.
+/// * **The full set always gets a plan.** Take any planned proper subset S: if it is closed, R1
+///   joins it with any relation outside it; if not, some conjunct reads S and a relation x outside
+///   it, and `(S, {x})` is a bridge or R3. So every size has a plan. The `Internal` error below is
+///   that argument failing, not a refusal of a query. PostgreSQL's third rule, the one-sided "last
+///   ditch", is for a sub-problem whose rels have clauses to rels OUTSIDE it, and none exists here:
+///   every conjunct reads only relations of its own flattened unit.
 /// * **Every multi-relation conjunct is applied exactly once, in any tree.** At the lowest node
 ///   whose subset contains it, it is inside neither child but inside their union, so it reads both
 ///   sides; above that node it is inside one child.
 /// * **Queries that planned before D255 see the same candidates**, when their conjuncts each read at
-///   most two relations. R1 cannot fire once every relation is bridge-reachable: take the lowest
-///   node with relations both inside and outside a closed set — its children split the set from
-///   the rest, and its bridge reads both. R2 cannot fire on a connected graph, which has a
-///   connected, bridge-plannable subset of every size.
+///   most two relations. R3 cannot fire for them (above). R1 cannot fire once every relation is
+///   bridge-reachable: take the lowest node with relations both inside and outside a closed set —
+///   its children split the set from the rest, and its bridge reads both.
 ///
-/// The cost: with no join predicate at all every subset is closed and every split is built —
-/// 523,250 at 12 relations, the same count a 12-relation clique already built before D255, which is
-/// the load `MAX_DP_RELATIONS` bounds.
+/// **Where this differs from PostgreSQL, on purpose:** its clauseless joins are one-sided — a rel
+/// against a single base relation — "to avoid unreasonable growth of planning time". R1 here also
+/// admits a split whose sides are both larger, which is how two linked components are each joined
+/// and then crossed ONCE: `(w⋈x)×(y⋈z)` instead of `((w⋈x)×y)⋈z`, whose intermediate is a full
+/// cross product. This search visits every split anyway, so an admitted one costs its `build_join`.
+/// With no join predicate at all every subset is closed and all 523,250 splits of 12 relations are
+/// built — the count a 12-relation clique already built before D255, the load `MAX_DP_RELATIONS`
+/// bounds.
 fn dynamic_program(base: Vec<PhysicalPlan>, conjuncts: &[(u64, BoundExpr)], orig_offset: &[usize], widths: &[usize], catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     let n = widths.len();
     let mut best = HashMap::new();
@@ -180,40 +195,36 @@ fn dynamic_program(base: Vec<PhysicalPlan>, conjuncts: &[(u64, BoundExpr)], orig
     // build up subsets by increasing size
     for size in 2..=n {
         let masks: Vec<u64> = (1u64..(1u64 << n)).filter(|m| m.count_ones() as usize == size).collect();
-        for forced in [false, true] {
-            // R2: only when this size has no plan at all.
-            if forced && masks.iter().any(|m| best.contains_key(m)) {
-                break;
-            }
-            for &mask in &masks {
-                let mut sub = (mask - 1) & mask;
-                while sub > 0 {
-                    let l_mask = sub;
-                    let r_mask = mask & !sub;
-                    sub = (sub.wrapping_sub(1)) & mask;
-                    let (Some(l), Some(r)) = (best.get(&l_mask), best.get(&r_mask)) else {continue;};
+        for mask in masks {
+            let mut sub = (mask - 1) & mask;
+            while sub > 0 {
+                let l_mask = sub;
+                let r_mask = mask & !sub;
+                sub = (sub.wrapping_sub(1)) & mask;
+                let (Some(l), Some(r)) = (best.get(&l_mask), best.get(&r_mask)) else {continue;};
 
-                    let bridge: Vec<&BoundExpr> = conjuncts.iter()
-                        .filter(|(rel, _)| rel & mask == *rel && rel & l_mask != 0 && rel & r_mask != 0).map(|(_, e)| e).collect();
-                    if bridge.is_empty() && !(forced || closed(l_mask) || closed(r_mask)) {
-                        continue;
-                    }
+                // A bridge, or R3: some conjunct reads both sides. Otherwise only R1.
+                let linked = conjuncts.iter().any(|(rel, _)| rel & l_mask != 0 && rel & r_mask != 0);
+                if !(linked || closed(l_mask) || closed(r_mask)) {
+                    continue;
+                }
+                let bridge: Vec<&BoundExpr> = conjuncts.iter()
+                    .filter(|(rel, _)| rel & mask == *rel && rel & l_mask != 0 && rel & r_mask != 0).map(|(_, e)| e).collect();
 
-                    let mut order = l.order.clone();
-                    order.extend(&r.order);
-                    let map = build_remap(&order, orig_offset, widths);
-                    let on = if bridge.is_empty() {
-                        BoundExpr::Literal(Value::Boolean(true))
-                    } else {
-                        combine_and(bridge.iter().map(|e| remap(e, &map)).collect())
-                    };
-                    let left_width: usize = l.order.iter().map(|&x| widths[x]).sum();
-                    let right_width: usize = r.order.iter().map(|&x| widths[x]).sum();
-                    let candidate = build_join(l.plan.clone(), r.plan.clone(), on, JoinType::Inner, left_width, right_width, catalog);
-                    let cost = cost(&candidate, catalog).cost;
-                    if best.get(&mask).map_or(true, |s| cost < s.cost) {
-                        best.insert(mask, Sub { plan: candidate, order, cost });
-                    }
+                let mut order = l.order.clone();
+                order.extend(&r.order);
+                let map = build_remap(&order, orig_offset, widths);
+                let on = if bridge.is_empty() {
+                    BoundExpr::Literal(Value::Boolean(true))
+                } else {
+                    combine_and(bridge.iter().map(|e| remap(e, &map)).collect())
+                };
+                let left_width: usize = l.order.iter().map(|&x| widths[x]).sum();
+                let right_width: usize = r.order.iter().map(|&x| widths[x]).sum();
+                let candidate = build_join(l.plan.clone(), r.plan.clone(), on, JoinType::Inner, left_width, right_width, catalog);
+                let cost = cost(&candidate, catalog).cost;
+                if best.get(&mask).map_or(true, |s| cost < s.cost) {
+                    best.insert(mask, Sub { plan: candidate, order, cost });
                 }
             }
         }
@@ -221,7 +232,7 @@ fn dynamic_program(base: Vec<PhysicalPlan>, conjuncts: &[(u64, BoundExpr)], orig
 
     let full = (1u64 << n) - 1;
     let best_full = best.remove(&full).ok_or_else(|| FerroError::Internal(format!(
-        "the join search planned no subset covering all {n} relations; R2 in `dynamic_program` is meant to make that impossible"
+        "the join search planned no subset covering all {n} relations; R1 and R3 in `dynamic_program` are meant to make that impossible"
     )))?;
 
     let idendity: Vec<usize> = (0..n).collect();
@@ -242,8 +253,19 @@ pub fn flatten(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>, preds: &mut Vec
             flatten(*right, leaves, preds);
             preds.push(on);
         }
+        // D255 — a WHERE conjunct `push` left over an INNER join (it reads both inputs) is the same
+        // predicate as an ON conjunct, so it joins the ONs. A filter over any other join stays a
+        // leaf: `push` kept it above a join that NULL-extends, and it must stay there.
+        LogicalPlan::Filter { input, predicate } if is_inner_join(&input) => {
+            flatten(*input, leaves, preds);
+            preds.push(predicate);
+        }
         other => leaves.push(other),
     }
+}
+
+fn is_inner_join(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Join { join_type: JoinType::Inner, .. })
 }
 
 pub fn relation_of(idx: usize, orig_offset: &[usize], widths: &[usize]) -> usize {
