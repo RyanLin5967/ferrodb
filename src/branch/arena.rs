@@ -1295,7 +1295,13 @@ impl ArenaPageStore {
         b.extend_from_slice(&(self.space.extent_starts.issued_through() as u32).to_be_bytes());
         b.extend_from_slice(&(self.space.arena_ids.issued_through() as u32).to_be_bytes());
         b.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-        b.extend_from_slice(&self.reserved_pages.load(Ordering::SeqCst).to_be_bytes());
+        // **D232 review 4 B2: `reserved` is counted from the extents this image lists, not read
+        // from `reserved_pages`.** The atomic changes on paths that do not all hold `state` while
+        // they change it (`load_state`, the tail replay), and a reader holding only `state`, such as
+        // the consensus snapshot capture, serialised whatever it held at that moment. Counted under
+        // the same hold as the extent walk below, the image cannot disagree with itself, wherever
+        // and in whatever order the atomic is updated. See [`pages_reserved_by`].
+        b.extend_from_slice(&pages_reserved_by(&st.extents).to_be_bytes());
 
         // Sorted, for the same reason the two maps below are: this function decides the bytes of
         // a durable file and the CRC32 over them, and a `HashMap` iterated in hash order gives two
@@ -1395,7 +1401,10 @@ impl ArenaPageStore {
         let next_start = c.u32()?;
         let next_arena = c.u32()?;
         let live = c.u32()?;
-        let reserved = c.u32()?;
+        // **D232 review 4 B2.** Read to advance the cursor, and not trusted: `reserved` is counted
+        // from the extents below. An image written before `state_bytes` counted it can carry a
+        // short one (review 2 F1), and this is where that count stuck for the life of the process.
+        let _reserved_as_written = c.u32()?;
 
         let n = c.u32()? as usize;
         let mut free_extents: HashMap<u32, Vec<PageId>> = HashMap::new();
@@ -1459,6 +1468,7 @@ impl ArenaPageStore {
             ))
             .into());
         }
+        let reserved = pages_reserved_by(&extents);
 
         // **Never resume filling a restored extent.** The image records `next_free` as of the last
         // checkpoint, but a session that died after it may have handed out pages beyond that mark,
@@ -1500,7 +1510,8 @@ impl ArenaPageStore {
         // outside: `image_bytes == 0` iff this process has not written the image, so the next
         // persist is a full rewrite and the file is ours again.
         self.persist.lock().unwrap().image_bytes = 0;
-        *self.state.lock().unwrap() =
+        let mut st = self.state.lock().unwrap();
+        *st =
             // **D85: every restored extent's fill is SUSPECT until probed.**
             //
             // `next_free` is not persisted per page allocation, so the image can understate it by
@@ -1520,6 +1531,12 @@ impl ArenaPageStore {
                 // makes the next shadow a chain root, which can only shorten chains.
                 shadow_base: HashMap::new(),
             };
+        // **D232 review 4 B2: the counters change in the same `state` hold as the map they count.**
+        // Stored after this guard dropped, as they were, a reader holding `state` in between saw the
+        // loaded extents charged at the previous map's counts.
+        self.live_pages.store(live, Ordering::SeqCst);
+        self.reserved_pages.store(reserved, Ordering::SeqCst);
+        drop(st);
         *self.space.free_extents.lock().unwrap() = free_extents;
         // Raised, never lowered, and every held range is trimmed to match: the image says this
         // much was already issued, and a grant replayed afterwards must only re-offer its unissued
@@ -1530,8 +1547,6 @@ impl ArenaPageStore {
         // never returned to the leader — but it is re-stamped with the authority in force now, so
         // a later `join` still invalidates it.
         self.space.recycle_epoch.store(crate::cluster::epoch(), Ordering::SeqCst);
-        self.live_pages.store(live, Ordering::SeqCst);
-        self.reserved_pages.store(reserved, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1644,11 +1659,13 @@ impl ArenaPageStore {
 
         let mut st = self.state.lock().unwrap();
         let ext = st.extents.remove(&arena);
-        // **Review 3 A4: the counts leave with the extent, in the same `state` hold.**
-        // `state_bytes` reads both counters while holding only `state`, and the consensus snapshot
-        // capture calls it without `persist` (review 2 F4). Subtracted after `drop(st)`, as they
-        // were, such a reader could serialise a map without this extent that still charged its
-        // pages. The claim's add sits inside its insert block for the same reason.
+        // **Review 3 A4: `reserved_pages` leaves with the extent, in the same `state` hold.** Since
+        // review 4 B2 an image no longer reads this counter (`state_bytes` counts the extents it
+        // lists), so this placement is not what keeps an image right; it keeps the atomic exact for
+        // a reader of both under `state`, as the claim's add does. `live_pages` is subtracted here
+        // too, but it is a snapshot statistic by design (the tail replay's note): `allocated` was
+        // measured in the hold above, and `alloc_in_arena` and `release_page` change it without
+        // holding `state`.
         if ext.is_some() {
             self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
             self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
@@ -1856,12 +1873,17 @@ impl ArenaPageStore {
             // Forgetting the image makes the next persist an atomic rewrite, which replaces the
             // torn tail along with everything else.
             //
-            // **The cost, stated (new-wall audit round 2).** From here EVERY persist is a
-            // full-image rewrite, O(extents + current + pending + free list) bytes plus an fsync,
-            // until one rewrite succeeds: a rewrite that fails leaves `image_bytes` at 0 (and puts
-            // the reuse flag back, D248), so the next persist tries again. The first rewrite that
-            // succeeds sets `image_bytes` and appends resume. A failure-mode retry, bounded by the
-            // storage fault that caused it, not a steady-state cost. Pinned end to end by
+            // **The cost, stated (new-wall audit round 2; corrected by D232 review 4 B4).** From
+            // here EVERY persist is a full-image rewrite until one rewrite succeeds. A rewrite is
+            // `replace_atomically`: write a temporary and fsync it, rename it over the file, fsync
+            // the directory. That is two fsyncs where an append pays one. Its bytes are
+            // O(extents + their recycled lists + current + pending + free list), and a recycled
+            // list holds up to `page_count` four-byte ids, so the extents term is up to
+            // `ARENA_EXTENT_PAGES` times a count of extents. A rewrite that fails leaves
+            // `image_bytes` at 0 (and puts the reuse flag back, D248), so the next persist tries
+            // again. The first rewrite that succeeds sets `image_bytes` and appends resume. A
+            // failure-mode retry, bounded by the storage fault that caused it, not a steady-state
+            // cost. Pinned end to end by
             // `d232_a_failed_append_rewrites_until_one_succeeds_then_appends_again`.
             g.image_bytes = 0;
             return Err(FerroError::Io(e.to_string()));
@@ -2247,6 +2269,18 @@ fn saturating_sub_atomic(cell: &AtomicU32, v: u32) {
     let _ = cell.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(v)));
 }
 
+/// **D232 review 4 B2.** The pages `extents` reserve: what an image's `reserved` field says.
+///
+/// Counted from the map, not read from `reserved_pages`, at both ends of an image: `state_bytes`
+/// writes it and `load_state` sets the counter from it. So an image cannot charge pages its own
+/// extents do not hold, whatever order a writer changed the map and the counter in. Wrapping, as
+/// the atomic's own `fetch_add` is, so the bytes are the ones the counter wrote whenever the
+/// counter was right, and `two_stores_in_the_same_state_checkpoint_byte_identical_images` and
+/// every `<db>.arena` on disk still hold.
+fn pages_reserved_by(extents: &HashMap<ArenaId, ArenaExtent>) -> u32 {
+    extents.values().fold(0u32, |sum, ext| sum.wrapping_add(ext.page_count))
+}
+
 impl<'a> StateCursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], FerroError> {
         // `checked_add`, not `self.at + n`: `image_len` walks the structure BEFORE the checksum
@@ -2591,13 +2625,13 @@ impl PageStore for ArenaPageStore {
             );
             st.live_order.insert(arena);
             st.recycled.insert(arena, Vec::new());
-            // Counted with the extent, inside the same `state` hold and BEFORE the persist. A
-            // persist that turns out to be a full rewrite serialises this counter from live memory,
-            // and a count added afterwards is missing from an image that holds the extent (review 2
-            // F1: the restore came back short by the claim's pages). Inside the hold because
-            // `state_bytes` reads the counter while holding only `state`, and one caller, the
-            // consensus snapshot capture, does not hold `persist` (review 3 A4, review 2 F4). An
-            // appended claim record carries no count; its replay adds `page_count`.
+            // Counted with the extent, inside the same `state` hold and BEFORE the persist (review
+            // 2 F1, review 3 A4). Since review 4 B2 an image no longer reads this counter:
+            // `state_bytes` counts the extents it lists, so neither this placement nor this order
+            // decides what an image says (F1's short restore cannot recur through it). They keep
+            // the atomic exact for a reader of both under `state`, and the H2b undo below takes
+            // the pages back out. An appended claim record carries no count; its replay adds
+            // `page_count`.
             self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
         }
 
