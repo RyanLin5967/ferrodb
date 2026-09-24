@@ -105,7 +105,22 @@ pub struct TxnManager {
     /// Held here rather than written when it is bound, and that is the whole correctness property.
     /// See [`TxnManager::bind_run`].
     run_bindings: Mutex<HashMap<u64, RunEntity>>,
+    /// **D253, test only: pause points inside a checkpoint.** An observing instrument with no
+    /// behaviour of its own. A test puts a closure in one, and the next checkpoint takes it and
+    /// runs it at that point, on the checkpointing thread. That aims a second thread at the window
+    /// between the attach-table check and the truncation deterministically rather than by timing.
+    /// Neither field nor either call exists outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) checkpoint_pause_at_entry: CheckpointPause,
+    /// See `checkpoint_pause_at_entry`. Runs after the pages are flushed and synced, immediately
+    /// before the truncation.
+    #[cfg(test)]
+    pub(crate) checkpoint_pause_before_truncate: CheckpointPause,
 }
+
+/// A closure a test hands to the next checkpoint. See `TxnManager::checkpoint_pause_at_entry`.
+#[cfg(test)]
+pub(crate) type CheckpointPause = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 
 /// A retained DDL record, replayed into the log after every checkpoint.
 #[derive(Debug, Clone)]
@@ -231,7 +246,12 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            checkpoint_pause_at_entry: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_pause_before_truncate: Mutex::new(None),
+        }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -849,9 +869,13 @@ impl TxnManager {
     ///
     /// Must not take `att` — the callers above hold it, and `Mutex` is not re-entrant.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
+        #[cfg(test)]
+        Self::pause(&self.checkpoint_pause_at_entry);
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
+        #[cfg(test)]
+        Self::pause(&self.checkpoint_pause_before_truncate);
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
         self.wal.truncate(self.txn_ids.issued_through())?;
@@ -863,6 +887,16 @@ impl TxnManager {
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
         Ok(())
+    }
+
+    /// Run the closure a test left at this pause point, if any. The slot's lock is released first,
+    /// so the closure may block, and a checkpoint it provokes finds the slot empty.
+    #[cfg(test)]
+    fn pause(at: &CheckpointPause) {
+        let hook = at.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn snapshot_of(&self, txn_id: u64) -> Result<Snapshot, FerroError> {
