@@ -202,3 +202,73 @@ A2's M7 held the file lock in `await_run` across `wait_durable`. Since A4, `sync
 - U2, U3, U4 and U6–U8 pass. U6 passes only after the gate's 30 s timeout, because its `flush` waits on the held lock. No step can hang past that timeout.
 
 The runner's zero-collected refusal was fire-checked with a stub `cargo` on PATH: "running 0 tests" gives rc=97 and "running 3 tests" gives rc=0.
+
+## A4c (2026-09-24T13:10Z): the second fresh review of `efd3541..c485fbe`, fixed before any run
+
+The review found no BLOCKER, five DEFECTs and eight NITs. Its predictions at `a7127cd` and `312301c` matched A4, apart from the three corrected below. Each finding was re-read against the source before this entry.
+
+**Timestamp correction (NIT).** The headings of A4, A4a and A4b carry times I wrote before looking at the clock, and each is later than its own commit. The commits are authoritative: A4 `2a43e9c` 11:02:41Z, A4a `1cfc446` 11:05:26Z, A4b `c485fbe` 11:08:58Z. Every one of them precedes any run of anything on this branch, which is the property a pre-registration needs.
+
+### R2-D1: the D-1 fix closed one direction only
+
+`sync_handle` was a `try_clone()` of the append descriptor: one open file description, one error cursor. The review's reverse schedule:
+1. The group leader's out-of-lock fsync takes an EIO that belongs to pages an in-lock writer wrote.
+2. That writer's own fsync then returns 0.
+3. The writer acknowledges its records and marks the group durable (`covered_all`).
+4. A waiting follower returns `Ok`.
+
+**Fix:** `sync_handle` is opened as its OWN description (`OpenOptions::open(&path)`, write access, which Windows needs to flush). On Linux ≥ 4.13 an error is then reported once to each description that was open when it happened, so neither side can consume the other's. The post-fsync check under the lock stays: it refuses a follower the group makes leader after a failed sync, and it is what U5 tests.
+
+**Pre-registered SURVIVOR: M31 `shared_description`** (back to `try_clone()`). Nothing here can make a real fsync fail.
+
+### R2-D2: A4b's M7 predictions were wrong
+
+Under M7 the gate times out after 30 s and drops its receiver, so the tests' `release.send(()).unwrap()` panicked with SendError:
+- U6 FAILED, where A4b said it passes;
+- U5 failed at that unwrap, not at its claim.
+
+**Fix:** the harness sends `let _ = release.send(())`, since the release is a signal and a dropped receiver means the sync has already gone ahead. **Predictions, corrected:** under M7, U1 FAILS and U5 FAILS at its `expect_err`, the lost-error schedule A4b described. U6 PASSES after the 30 s timeout. U2–U4, U7 and U8 pass.
+
+### R2-D3: M6's step filter also collects R3
+
+**Corrected prediction:** under M6, R1 FAILS and so does R3. With the await deleted, the ADD COLUMN is installed before the injected failure lands at the post-commit write, so R3 fails at its column count. R2 and R4 pass.
+
+### R2-D4: four more of D219's mutants match 0 sites on this tree
+
+D219's M19, M22, M23 and M24 are orphaned, because A4's N-5 fix rewrote the restamp loop they target. D219's runner pins its own FIX and is unaffected. On trees containing D246 they are re-cut here, against the same tests:
+
+| mutant | edit | must fail |
+|---|---|---|
+| M26 `d219m19_rewrite_does_not_stamp` | the restamp block deleted | `catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered`, and the D219 integration target |
+| M27 `d219m22_flush_error_swallowed` | the flush's error dropped | `a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered` |
+| M28 `d219m23_stamp_refusal_swallowed` | every `stamp_pending` refusal dropped | `a_store_poisoned_between_plan_and_apply_leaves_the_table_consistently_altered` (D219 A2's) and `a_rewrite_refused_mid_restamp_still_writes_the_stamps_before_it` |
+| M29 `d219m24_rewrite_stamps_eagerly` | `stamp` for `stamp_pending` | `a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync` |
+
+### R2-D5: A4's top-of-`await_run` poison check refused every MERGE on a poisoned store
+
+That included merges of already-durable runs that write no provenance at all. D219 F1 ruled that shape out for ALTER. And A4's N-9 rationale was void: a failed `intern` returns `Err`, so no caller ever holds that id.
+
+**Fix:** the check returns to where it stops a write, before a still-pending record is written. A durable run (absent from `run_seqs`, or already covered) is vouched for on a poisoned store. A record written but not yet synced is still refused, by the post-fsync check.
+
+**U8's second half changes**, with this reason, before any run. The old line was:
+> `s.await_run(synced).expect_err("a poisoned store vouched for a run it holds no number for")`
+
+It now asserts that `await_run(synced)` is `Ok`: a durable run is vouched for even though the store is poisoned.
+
+- The first half is unchanged: a pending run is refused and nothing is written.
+- A4's "U8 RED at `efd3541` on its N-9 half" is withdrawn. At `efd3541` the new second half holds, so **U8 now holds at `a7127cd`**, and is red only under its mutants.
+- **M22** moves with the check.
+- **New M30 `await_refuses_durable_runs`** re-adds a top-level check, and must fail U8.
+
+### NITs
+
+- `runtime.rs`'s "(D246 A3, above)" now reads "below".
+- `sync_runs` books its sync under `runs` only after the post-fsync check passes.
+- `run.sh`'s header says A1–A4, and its FIX comment is completed.
+- **Pre-registered SURVIVORS**, each with its reason:
+  - **M32 `post_check_without_the_lock`**: the poison check kept, the lock dropped. U5's poison is set while the leader is paused, so the lock is not needed to see it there. Only the writer-between-fsync-and-store race needs the lock, and nothing here can pause a writer there.
+  - **M33 `executor_site_uses_complete`**, **M34 `dispatch_site_uses_complete`** and **M35 `pgwire_site_uses_complete`**: R4 calls `complete_for` directly. A test through `executor::run` would route an agent statement through dispatch, where `designated::tests` can refuse it. And no integration test can make `complete()` fail without a `cfg(test)` lever.
+- **The runner's zero-collected refusal counts, it does not name.** Each pre-registered step now lists its tests in `REQUIRE`. A step whose output lacks any of them is refused (rc 98).
+- **Latency coupling, stated rather than measured.** `sync_runs`' post-fsync lock waits behind any in-lock fsync in flight, such as a MERGE's `record_applied` under the catalog guard. So a fork's `complete()`, which runs outside the guard, can wait one extra provenance fsync. No statement inside the guard waits on the group.
+
+**U-test outcomes at the new fix:** U1–U8 hold. U8 holds at `a7127cd` too (see R2-D5). U5 stays **RED at `a7127cd`**.
