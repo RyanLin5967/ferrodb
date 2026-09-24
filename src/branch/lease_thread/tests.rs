@@ -449,6 +449,47 @@ fn a_reap_is_attested_once_it_lands_even_if_its_workspace_was_forgotten_first() 
     assert_eq!(f.runtime.attestation_refusals(), 0, "an attestation was refused");
 }
 
+/// ⛔ **D199, the lead's review of `d95a1e7`, WRITTEN TO FAIL FIRST: an unreadable record is
+/// counted, not guessed.** Whether a reap has landed is read from the branch's catalog record
+/// (`get_raw`). When that read fails, the forget path must not guess in either direction. It
+/// writes no entry, because guessing "landed" could attest a reap still in flight. It counts a
+/// refusal, because treating it silently as "not landed" hides the gap, which is what
+/// `3ddb1a4` did. A later visit that can read the record attests the reap, once.
+///
+/// Hand-worked: with the read failing, `[Fork]` and 1 refusal, and the workspace forgotten
+/// (1). Once it succeeds, `[Fork, Reap]` and still 1 refusal, with nothing left to forget (0).
+#[test]
+fn an_unreadable_record_is_counted_not_guessed() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap();
+    let branch = rt.begin_session("unreadable", Some("r_4"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.reaper.reap(branch).unwrap();
+    refusing.arm_raw(branch.id);
+    assert_eq!(rt.forget_branches(&[branch]), 1, "the workspace was not forgotten");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested without reading its record");
+    assert_eq!(rt.attestation_refusals(), 1, "the unreadable record was not counted");
+
+    refusing.disarm_raw();
+    assert_eq!(rt.forget_branches(&[branch]), 0, "the workspace was forgotten twice");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a readable, landed reap was not attested"
+    );
+    assert_eq!(rt.attestation_refusals(), 1, "a successful attestation was counted as a refusal");
+}
+
 /// ⛔ **D199, the other door, WRITTEN TO FAIL FIRST.** A branch a reaper took with no forget call
 /// at all (`reap_expired` can reap several and then return `Err`, dropping the ids it had) is
 /// found by `forget_reaped_branches`, which drops its workspace. It must attest the reap exactly
@@ -905,18 +946,34 @@ const CORRUPT_MARKER: &str = "CHILD entry (parent 7, fork epoch 11) names branch
 /// than corrupting a catalog is the point: the arm under test catches an `Err` from that call, so
 /// what matters is the error, not how a catalog came to produce it. Reproducing the real
 /// corruption would test `TableBranchCatalog`'s key layout instead.
+///
+/// **Also armable, separately, to refuse `get_raw` for one id (D199):** the read the runtime's
+/// forget path uses to tell a landed reap from one in flight. The two arms are independent and
+/// both start disarmed, so a test arming one sees the other delegate.
 struct RefusesLiveChildren {
     inner: Arc<dyn BranchCatalog>,
     /// `u64::MAX` means nothing is armed; no real id reaches it, ids are minted from 0 up.
     armed: AtomicU64,
+    /// The same convention, for `get_raw`.
+    raw_armed: AtomicU64,
 }
 
 impl RefusesLiveChildren {
     fn new(inner: Arc<dyn BranchCatalog>) -> Arc<RefusesLiveChildren> {
-        Arc::new(RefusesLiveChildren { inner, armed: AtomicU64::new(u64::MAX) })
+        Arc::new(RefusesLiveChildren {
+            inner,
+            armed: AtomicU64::new(u64::MAX),
+            raw_armed: AtomicU64::new(u64::MAX),
+        })
     }
     fn arm(&self, parent_id: u64) {
         self.armed.store(parent_id, Ordering::SeqCst);
+    }
+    fn arm_raw(&self, id: u64) {
+        self.raw_armed.store(id, Ordering::SeqCst);
+    }
+    fn disarm_raw(&self) {
+        self.raw_armed.store(u64::MAX, Ordering::SeqCst);
     }
 }
 
@@ -944,6 +1001,12 @@ impl BranchCatalog for RefusesLiveChildren {
         self.inner.get(b)
     }
     fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        if id == self.raw_armed.load(Ordering::SeqCst) {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "record {id} could not be read (armed by the test)"
+            ))
+            .into());
+        }
         self.inner.get_raw(id)
     }
     fn reparent(
