@@ -800,8 +800,12 @@ fn an_install_under_a_wal_pin_is_refused_and_names_the_pin() {
         to_engine.wal.next_lsn.load(Ordering::SeqCst) > base,
         "premise failed: the receiver's WAL is empty, so a pin could keep nothing"
     );
-    // A base backup or a change stream holding the log from its start.
+    // A base backup or a change stream holding the log from its start, and a newer reader at its
+    // end, so the oldest and the newest pin differ and the refusal must name the right one (the
+    // lead's direction on review 4's third finding).
     let pin = to_engine.wal.pin(base).unwrap();
+    let newer = to_engine.wal.pin(to_engine.wal.next_lsn.load(Ordering::SeqCst)).unwrap();
+    assert!(newer.lsn() > pin.lsn(), "premise failed: the two pins sit at one LSN");
 
     let at = SnapshotPoint {
         last_round: 3,
@@ -826,8 +830,9 @@ fn an_install_under_a_wal_pin_is_refused_and_names_the_pin() {
         "the refused install cleared its marker, so the node would start on a half-installed database"
     );
     assert!(
-        err.to_string().contains(&format!("lsn {}", pin.lsn())),
-        "the refusal does not name the pin that kept the log: {err}"
+        err.to_string().contains(&format!("at lsn {}, below", pin.lsn())),
+        "the refusal does not name the OLDEST pin, the one below the records it would have to \
+         discard: {err}"
     );
 }
 
