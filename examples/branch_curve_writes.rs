@@ -2241,11 +2241,13 @@ fn main() {
             println!("NOT A RESULT: {f}");
         }
     }
-    let code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
+    let mut code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
     if let Some(open) = db.take() {
         let (_, closed) = open.close();
         if let Err(e) = closed {
             println!("NOT A RESULT: the production database did not close cleanly at the end: {e}");
+            // A17.4: a failed close is a failure. The code was fixed above, so this used to exit 0.
+            code = 2;
         }
     }
     drop(hd);
