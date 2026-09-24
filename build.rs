@@ -31,8 +31,9 @@
 //!   each only if it exists), `build.rs`, `Cargo.toml` and `Cargo.lock`. An edit to any of them is
 //!   an edit to what is being compiled, so it re-stamps. This is what makes an unstaged edit say
 //!   `+DIRTY`.
-//! * **The git state**: this worktree's `HEAD` and index, and the checked-out branch's ref file
-//!   (or, on a repository that keeps its refs in reftable, its `reftable/` directories). Each is
+//! * **The git state**: this worktree's `HEAD` and index, and the ref file of every link from
+//!   `HEAD` to the branch it resolves to, normally just the checked-out branch's (or, on a
+//!   repository that keeps its refs in reftable, its `reftable/` directories). Each is
 //!   resolved by `git rev-parse` (`--git-path`, and `--git-common-dir` for the shared reftable),
 //!   because in a linked worktree `HEAD` and the index live in the worktree's own git directory
 //!   and the refs in the shared one. A commit moves the branch's ref file and leaves `HEAD`
@@ -79,14 +80,16 @@
 //!   deliberately: a harness in `examples/` edited and not committed must still say `+DIRTY`.
 //! * A watched git path that does not exist makes cargo re-run this script, and therefore rebuild
 //!   the crate, on every build until it does exist. The stamp stays right and the rebuild is the
-//!   cost. A branch that lives only in `packed-refs` does this until its next commit creates its
-//!   ref file, and `git gc` (`pack-refs --all`) makes that true of every branch at once, checked
-//!   out or not (measured by D231's review): after a gc, every checkout rebuilds on every build
-//!   until its branch moves.
-//! * `HEAD` is followed to the branch it names and that branch's file is watched. A symbolic ref
-//!   chain (`HEAD` to `foo` to `main`) is followed to its end, so retargeting `foo` changes what
-//!   `HEAD` resolves to without touching a watched file (measured by D231's review). Nothing here
-//!   builds such a chain.
+//!   cost. A branch that lives only in `packed-refs` does this until the next write to its ref
+//!   recreates the file. **One `git gc` puts every worktree into that state at once**: its
+//!   `pack-refs --all` deletes the loose ref of every branch, the checked-out ones included
+//!   (measured by D231's review 2), so each worktree then rebuilds on every build until its own
+//!   branch's ref is next written. For a main checkout this is new relative to the old watch list,
+//!   whose two files gc does not remove; for a linked worktree it is what the old list did always.
+//! * `HEAD` is followed link by link (`git symbolic-ref --no-recurse`), and every link's file is
+//!   watched, so retargeting the middle of a chain (`HEAD` to `foo` to `main`) re-stamps. A git
+//!   without `--no-recurse` is asked for the chain's end only, and there retargeting a middle link
+//!   is invisible (measured by D231's review 2 for the one-question form).
 //! * In a reftable repository the shared table changes on every ref update in every worktree, so
 //!   any commit anywhere re-stamps, and rebuilds, every worktree. ferrodb's repository uses the
 //!   files store, so this is latent here.
@@ -219,18 +222,36 @@ fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBu
     // support and that question arrived together, in git 2.45 (from the release notes, not
     // re-checked here).
     let reftable = git(&["rev-parse", "--show-ref-format"]).as_deref() == Some("reftable");
-    // `refs/heads/<branch>`, or nothing when HEAD is detached. A detached HEAD holds the commit
-    // itself, so its file is then the whole of it.
-    let branch = if reftable { None } else { git(&["symbolic-ref", "-q", "HEAD"]) };
-    // The branch's ref file is asked for EVEN when it does not exist. Then the branch lives only
-    // in `packed-refs`, its next commit creates the file, and until then cargo's re-run on every
-    // build for a missing watched path is what keeps the stamp right. (`packed-refs` itself is
-    // not watched: the module doc says why.)
+    // Every link from `HEAD` to the ref that holds the commit, one `--no-recurse` question each:
+    // retargeting any link changes what `HEAD` resolves to. Nothing at all when HEAD is detached,
+    // because a detached HEAD holds the commit itself. Git refuses a chain deeper than five, and
+    // so does this.
+    let mut links: Vec<String> = Vec::new();
+    if !reftable {
+        let mut at = "HEAD".to_string();
+        while links.len() < 5 {
+            let Some(next) = git(&["symbolic-ref", "-q", "--no-recurse", at.as_str()]) else {
+                break;
+            };
+            at = next.clone();
+            links.push(next);
+        }
+        // A git without `--no-recurse` fails the first question; it can still name the end.
+        if links.is_empty() {
+            if let Some(end) = git(&["symbolic-ref", "-q", "HEAD"]) {
+                links.push(end);
+            }
+        }
+    }
+    // Each link's ref file is asked for EVEN when it does not exist. Then the branch lives only
+    // in `packed-refs`, the next write to it creates the file, and until then cargo's re-run on
+    // every build for a missing watched path is what keeps the stamp right. (`packed-refs` itself
+    // is not watched: the module doc says why.)
     let mut asked = vec!["HEAD", "index"];
     if reftable {
         asked.push("reftable");
-    } else if let Some(b) = branch.as_deref() {
-        asked.push(b);
+    } else {
+        asked.extend(links.iter().map(String::as_str));
     }
     let mut args = vec!["rev-parse", "--path-format=absolute", "--git-common-dir"];
     for name in &asked {
