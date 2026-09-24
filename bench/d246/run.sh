@@ -17,7 +17,7 @@ FIRE=/Users/idide/wt/ferrodb-d246-fire.noindex
 OUT=$WT/bench/d246
 BASE=fbfe038   # D219's tip: pgserver on the in-memory provenance store
 RED=b6960d5    # the red test, before the fix
-FIX=b2af37e    # the fix (7e39cb1) plus the test's path claim
+FIX=57c4dc2    # the fix (7e39cb1), the path claim (b2af37e) and the slot claim
 T=d246_pgserver_provenance_survives_restart
 export CARGO_TARGET_DIR=$WT/target
 
