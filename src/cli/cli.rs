@@ -220,7 +220,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // The catalog guard lives for the whole call, the arena checkpoint included. That is the
     // existing order (the catalog before the arena, as the lease thread takes them), and the lease
     // thread has stopped, so nothing waits on it.
-    exit_sequence(&catalog.lock(), &txn, &store, Path::new(&arena_path))?;
+    // D230 MUTANT M12: the exit inline, not through exit_sequence
+    crate::catalog::clean_exit::checkpoint_for_exit(&catalog.lock(), &txn)?;
+    store.checkpoint(Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
 }
