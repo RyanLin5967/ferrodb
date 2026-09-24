@@ -3,8 +3,8 @@
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,...] [--skip M26,...]
 
-At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows`:
-those two mutate code only `d252-caught-up-pin` has, under a test target (the lib) both tips have.
+At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor`:
+those five mutate code only `d252-caught-up-pin` has, under a test target (the lib) both tips have.
 
 A mutant whose `--test` target the tip does not have is reported NOT-AT-TIP and left out of
 everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else. A pattern
@@ -12,7 +12,7 @@ that matches anything but once, where the targets exist, is a PATTERN-MISMATCH, 
 Mutants left out by `--only` or `--skip` are listed in the summary as SKIPPED.
 
 `--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
-`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound,M30_refusal_passes_its_rows`
+`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor`
 until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
 buffered `TxnEnd` two D216 gate negative controls use as their premise, so they fail there, a full
 CONTROL is not clean, and every verdict would be VOID.
@@ -188,7 +188,22 @@ MUTANTS = [
     ("M30_refusal_passes_its_rows", "src/replication/stream.rs",
      "        let next = refused_from.map_or(next, |first| next.min(first));\n",
      "        let next = refused_from.map_or(next, |_first| next);\n",
-     [STREAM], [S + "a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it"], "KILL"),
+     [STREAM], [S + "a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it",
+                S + "every_commit_a_refusal_holds_back_keeps_its_rows"], "KILL"),
+    # D252 review 3: the clamp covers every held-back commit (not only the refused one), at its FIRST
+    # row; and review 2's finding 1, the gap fill's watermark on a boundary.
+    ("M31_only_the_refused_commit_is_held", "src/replication/stream.rs",
+     ".filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());\n",
+     ".filter(|e| e.commit_lsn == c).map(|e| e.lsn).min());\n",
+     [STREAM], [S + "every_commit_a_refusal_holds_back_keeps_its_rows"], "KILL"),
+    ("M32_refusal_clamps_to_the_last_row", "src/replication/stream.rs",
+     ".filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());\n",
+     ".filter(|e| e.commit_lsn >= c).map(|e| e.lsn).max());\n",
+     [STREAM], [S + "every_commit_a_refusal_holds_back_keeps_its_rows"], "KILL"),
+    ("M33_gap_fill_covers_to_the_cursor", "src/replication/logical.rs",
+     "                history.covered_through = scanned_to;\n",
+     "                history.covered_through = from_lsn;\n                let _ = scanned_to;\n",
+     [STREAM], [S + "a_resume_cursor_inside_a_record_does_not_break_later_pumps"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
