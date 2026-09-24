@@ -65,7 +65,6 @@ pub(crate) enum FencedTruncation {
     KeptByFence,
 }
 
-
 pub struct WalManager {
     /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
     /// this log — a torn frame, a lost frame, a flush that reports success it did not achieve. Those

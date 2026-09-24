@@ -154,22 +154,7 @@ pub struct TxnManager {
     /// 6's caveat 1): a retry that fails before it can look at the slot writes that line, and the
     /// entry leaves only once a line for it is written or the slot is released.
     unrecorded: Mutex<Vec<(u64, RetiredSlot, String)>>,
-    /// **D253, test only: pause points inside a checkpoint.** An observing instrument with no
-    /// behaviour of its own. A test puts a closure in one, and the next checkpoint takes it and
-    /// runs it at that point, on the checkpointing thread. That aims a second thread at the window
-    /// between the attach-table check and the truncation deterministically rather than by timing.
-    /// Neither field nor either call exists outside `cfg(test)`.
-    #[cfg(test)]
-    pub(crate) checkpoint_pause_at_entry: CheckpointPause,
-    /// See `checkpoint_pause_at_entry`. Runs after the pages are flushed and synced, immediately
-    /// before the truncation.
-    #[cfg(test)]
-    pub(crate) checkpoint_pause_before_truncate: CheckpointPause,
 }
-
-/// A closure a test hands to the next checkpoint. See `TxnManager::checkpoint_pause_at_entry`.
-#[cfg(test)]
-pub(crate) type CheckpointPause = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,8 +218,8 @@ pub fn release_mismatches() -> u64 {
 ///   Any caller counts: the automatic trigger, a DDL, an open, or an explicit `checkpoint`, which
 ///   also returns its refusal.
 /// - automatic checkpoints that FAILED.
-/// - checkpoints whose truncation a WAL pin cancelled: `WalManager::truncate` keeps the log, and
-///   answers `Ok`, while a pin is below its end (review 4's finding 5).
+/// - checkpoints whose truncation a WAL pin cancelled: `WalManager::truncate_fenced` keeps the
+///   log, and answers `KeptByPin`, while a pin is below its end (review 4's finding 5).
 /// - checkpoints whose truncation the D253 fence cancelled, because something was appended after the
 ///   fence. These are also counted on their own in [`FENCE_KEPT_CHECKPOINTS`].
 ///
@@ -259,8 +244,8 @@ pub enum CheckpointOutcome {
     Truncated,
     /// The log was KEPT for this many releases still owed (F2).
     KeptForOwed(usize),
-    /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
-    /// and answers `Ok`, while one is held).
+    /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate_fenced` keeps
+    /// the log while one is held, and says so).
     KeptByPin,
     /// **D253.** A record was appended after the checkpoint's fence: `next_lsn`, read in the same
     /// attach-table hold that found no transaction. Its page change may be in no page this
@@ -319,6 +304,26 @@ pub fn failure_counters_line() -> Option<String> {
 fn injected_release_failure() -> bool {
     false
 }
+
+/// Where a checkpoint can pause for a test (D253). A parked checkpoint still holds what the point
+/// names, so a closure must not wait on anything that needs it: every `commit` takes
+/// `release_retry` (`release_retired`), as do `retry_pending_releases` and every DDL, and `begin`
+/// takes `att`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointPausePoint {
+    /// In `checkpoint_or_keep_locked`, after the fence is read and `att` is let go, before the
+    /// flush. Holds `release_retry`. (Not the function's entry: the retry and the fence come first.)
+    AtEntry,
+    /// In `checkpoint_or_keep_held`, after the sync, immediately before the truncation. Holds
+    /// `release_retry`; on the DDL path also `att`, and for a DROP the pin fence's write guard.
+    BeforeTruncate,
+}
+
+/// D253's checkpoint pause seam, production half: a checkpoint never pauses. The test half, which
+/// runs a closure a test handed to one manager, is defined after the tests module at the end of this
+/// file, like the release seam above and for its reason (no `#[cfg(test)]` above the tests module).
+#[cfg(not(test))]
+fn checkpoint_pause(_txn: u64, _at: CheckpointPausePoint) {}
 
 /// How a release failed. A mismatch between the page and the log can never succeed; anything else
 /// (an I/O error, a poisoned log) may on a retry.
@@ -489,12 +494,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()),
-            #[cfg(test)]
-            checkpoint_pause_at_entry: Mutex::new(None),
-            #[cfg(test)]
-            checkpoint_pause_before_truncate: Mutex::new(None),
-        }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1713,10 +1713,11 @@ impl TxnManager {
         let outcome = self.checkpoint_or_keep_held(owed, fence)?;
         let kept = matches!(outcome, CheckpointOutcome::KeptByPin | CheckpointOutcome::KeptByFence);
         if !frees.is_empty() && kept {
-            // Review 5's F4. Unreachable on this branch (the pin refusal and its pin fence run first,
-            // and `att` is held, so no transaction appends), and counted and printed so that it is not
-            // silent if that ever changes. A fence keep is counted in FENCE_KEPT_CHECKPOINTS (in
-            // `checkpoint_or_keep_held`), never as a pin's.
+            // Review 5's F4. Believed unreachable on this branch (the pin refusal and its pin fence
+            // run first, and `att` is held, so no transaction appends), and counted and printed so
+            // that it is not silent if it happens. `frontier/d253on16_review.md` F5 questions a pin
+            // at exactly the end read before `f`; that is #16's to settle. A fence keep is counted in
+            // FENCE_KEPT_CHECKPOINTS (in `checkpoint_or_keep_held`), never as a pin's.
             use std::io::Write;
             let why = if outcome == CheckpointOutcome::KeptByPin {
                 KEPT_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -1786,7 +1787,8 @@ impl TxnManager {
 
     /// A checkpoint that answers what it did with the log instead of refusing (a [`CheckpointOutcome`]):
     /// `Truncated`, `KeptForOwed(n)` when every page was flushed and the log KEPT for `n` owed
-    /// releases (retried first), or `KeptByPin` when a WAL pin cancelled the truncation. The automatic
+    /// releases (retried first), `KeptByPin` when a WAL pin cancelled the truncation, or `KeptByFence`
+    /// when something appended after the D253 fence did. The automatic
     /// trigger uses it; `checkpoint` turns `KeptForOwed` into a refusal. Refuses while a transaction
     /// is open, as `checkpoint` does. (It answered `Ok(0)` for both "truncated" and "kept by a pin"
     /// until review 5's F4.)
@@ -1844,8 +1846,9 @@ impl TxnManager {
         let owed = self.owed_releases();
         let fence = self.wal.next_lsn.load(Ordering::SeqCst);
         drop(att);
-        #[cfg(test)]
-        Self::pause(&self.checkpoint_pause_at_entry);
+        // A test may park the checkpoint here, holding `release_retry` (C1 needs it from the owed
+        // count to the decision): see `CheckpointPausePoint::AtEntry`.
+        checkpoint_pause(self.id, CheckpointPausePoint::AtEntry);
         self.checkpoint_or_keep_held(owed, fence)
     }
 
@@ -1871,8 +1874,7 @@ impl TxnManager {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
-        #[cfg(test)]
-        Self::pause(&self.checkpoint_pause_before_truncate);
+        checkpoint_pause(self.id, CheckpointPausePoint::BeforeTruncate);
         if owed > 0 {
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             if !self.keeping_log.swap(true, Ordering::SeqCst) {
@@ -1921,16 +1923,6 @@ impl TxnManager {
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
         Ok(CheckpointOutcome::Truncated)
-    }
-
-    /// Run the closure a test left at this pause point, if any. The slot's lock is released first,
-    /// so the closure may block, and a checkpoint it provokes finds the slot empty.
-    #[cfg(test)]
-    fn pause(at: &CheckpointPause) {
-        let hook = at.lock().unwrap().take();
-        if let Some(hook) = hook {
-            hook();
-        }
     }
 
     /// The transaction's snapshot, which every read and write inside it goes through, so this is also
@@ -3760,4 +3752,36 @@ fn injected_release_failure() -> bool {
         f.set(left.saturating_sub(1));
         left > 0
     })
+}
+
+// **D253's pause seam, test half, BELOW the tests module for the release seam's reason above.**
+#[cfg(test)]
+type CheckpointPauseHook = (u64, CheckpointPausePoint, Box<dyn FnOnce() + Send>);
+
+/// Closures tests handed to one manager's next checkpoint, keyed by the manager's `id` and the point.
+/// Process-wide, because the checkpoint that runs one is on another thread than the test that set
+/// it; keyed by manager, so a test can only pause its own.
+#[cfg(test)]
+static CHECKPOINT_PAUSES: Mutex<Vec<CheckpointPauseHook>> = Mutex::new(Vec::new());
+
+/// The seam's test half: run the closure a test left for this manager at this point, if any. The
+/// registry's lock is released first, so the closure may block.
+#[cfg(test)]
+fn checkpoint_pause(txn: u64, at: CheckpointPausePoint) {
+    let hook = {
+        let mut hooks = CHECKPOINT_PAUSES.lock().unwrap_or_else(|e| e.into_inner());
+        hooks.iter().position(|(t, p, _)| *t == txn && *p == at).map(|i| hooks.remove(i).2)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+impl TxnManager {
+    /// Test only: hand this manager's next checkpoint a closure to run at `at`, on the checkpointing
+    /// thread. D253's tests use it to aim a second thread at the checkpoint's window exactly.
+    pub(crate) fn set_checkpoint_pause(&self, at: CheckpointPausePoint, hook: Box<dyn FnOnce() + Send>) {
+        CHECKPOINT_PAUSES.lock().unwrap_or_else(|e| e.into_inner()).push((self.id, at, hook));
+    }
 }

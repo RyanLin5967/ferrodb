@@ -1093,18 +1093,22 @@ use super::*;
         D253_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Hand the next checkpoint a pause at `slot` that reports it has arrived and then waits to be
+    /// Hand `txn`'s next checkpoint a pause at `at` that reports it has arrived and then waits to be
     /// released. Returns the arrival signal and the release.
     fn park_checkpoint_at(
-        slot: &crate::wal::txn::CheckpointPause,
+        txn: &TxnManager,
+        at: crate::wal::txn::CheckpointPausePoint,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (arrived_tx, arrived) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
-        *slot.lock().unwrap() = Some(Box::new(move || {
-            arrived_tx.send(()).unwrap();
-            // A dropped sender also releases, so a failing test thread cannot wedge this one.
-            let _ = released.recv();
-        }));
+        txn.set_checkpoint_pause(
+            at,
+            Box::new(move || {
+                arrived_tx.send(()).unwrap();
+                // A dropped sender also releases, so a failing test thread cannot wedge this one.
+                let _ = released.recv();
+            }),
+        );
         (arrived, release)
     }
 
@@ -1225,7 +1229,7 @@ use super::*;
             before = heap.insert(Tuple::new(vec![1])).unwrap();
             txn.commit(t).unwrap();
 
-            let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+            let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::BeforeTruncate);
             let a = {
                 let txn = txn.clone();
                 std::thread::spawn(move || entry(&txn))
@@ -1309,7 +1313,7 @@ use super::*;
             before = heap.insert(Tuple::new(vec![1])).unwrap();
             txn.commit(t).unwrap();
 
-            let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_at_entry);
+            let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::AtEntry);
             let a = {
                 let txn = txn.clone();
                 std::thread::spawn(move || entry(&txn))
@@ -1409,7 +1413,7 @@ use super::*;
         } else {
             Vec::new()
         };
-        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::BeforeTruncate);
         let x = {
             let txn = txn.clone();
             std::thread::spawn(move || {
@@ -1477,7 +1481,7 @@ use super::*;
         heap.insert(Tuple::new(vec![1])).unwrap();
         txn.commit(t).unwrap();
 
-        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::BeforeTruncate);
         let a = {
             let txn = txn.clone();
             std::thread::spawn(move || txn.checkpoint_keeping_owed())
@@ -1532,7 +1536,7 @@ use super::*;
         heap.insert(Tuple::new(vec![1])).unwrap();
         txn.commit(t).unwrap();
         let fenced = fence_kept_checkpoints();
-        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::BeforeTruncate);
         let a = {
             let txn = txn.clone();
             std::thread::spawn(move || txn.checkpoint_keeping_owed())
@@ -1565,7 +1569,7 @@ use super::*;
         let (bp, _wal, txn) = setup(dir.path());
         let frees = vec![HeapFileManager::new(bp.clone()).unwrap().first_directory_page_id];
         let (fenced, drops) = (fence_kept_checkpoints(), kept_log_drops());
-        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let (arrived, release) = park_checkpoint_at(&txn, crate::wal::txn::CheckpointPausePoint::BeforeTruncate);
         let x = {
             let txn = txn.clone();
             std::thread::spawn(move || txn.drop_checkpointed(&frees, || Ok(())))
