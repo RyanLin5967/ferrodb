@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use ferrodb::agent_sql::dispatch::AgentOutput;
 use ferrodb::agent_sql::runtime::{merge_log_counters, table_id, AgentRuntime, StateSizes};
 use ferrodb::branch::arena::ArenaPageStore;
-use ferrodb::branch::lease_thread::{scan_interval_from_env, CatalogLock};
+use ferrodb::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseStats};
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::types::{BranchId, BranchState, LeaseDeadline, PageId, ARENA_EXTENT_PAGES};
 use ferrodb::branch::BranchCatalog;
@@ -892,8 +892,14 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     // A9.3/A12.2: D216's judge. Did `open_recovered` find records to replay? It is also the gate:
     // the open rebuilds only when this is true or the marker was present (`stale`, H6).
     let recovered = db.recovered;
-    let (_, closed) = db.close();
-    closed.expect("close the database cleanly");
+    // A20.4: the close's lease stats and its result go on the line, and the parent judges them
+    // (`restart_guards`). A failed close no longer panics the child, which the parent would have
+    // read as H1.
+    let (lease_stats, closed) = db.close();
+    if let Err(e) = &closed {
+        eprintln!("the child's close failed: {e}");
+    }
+    let close_ok = closed.is_ok();
     let load_end = load_1min_centi();
     let us = |d: Duration| d.as_micros() as u64;
     println!(
@@ -902,7 +908,8 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
          provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
          descents_total={} live={} c_desc={} c_att={} c_opt={} c_omiss={} c_lat={} c_fetch={} \
-         c_fault={} c_hop={} load_start_centi={} load_end_centi={}",
+         c_fault={} c_hop={} load_start_centi={} load_end_centi={} lease_panicked={} lease_failed={} \
+         lease_refused_branches={} close_ok={}",
         recovered as u64,
         stale as u64,
         us(t.total),
@@ -935,6 +942,10 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
         c.scan_leaves,
         load_start,
         load_end,
+        lease_stats.panicked as u64,
+        lease_stats.failed,
+        lease_stats.refused_branches,
+        close_ok as u64,
     );
     std::process::exit(0);
 }
@@ -1054,6 +1065,17 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
     // H6 (A12.2): the one thing besides `recovered` that makes the child's open rebuild. Nothing in
     // this harness rolls back, so a marker means an index undo failed in the parent, and the row's
     // `rebuild` is D205's, not a clean restart's.
+    // A20.4: the child's own close, judged here. A missing field reads u64::MAX, so it fires.
+    let (lp, lf, lr) = (r.get("lease_panicked"), r.get("lease_failed"), r.get("lease_refused_branches"));
+    if lp != 0 || lf != 0 || lr != 0 {
+        failures.push(format!(
+            "LEASE {at} (the child's close): the lease thread ended with panicked={lp}, failed={lf}, \
+             refused_branches={lr}"
+        ));
+    }
+    if r.get("close_ok") != 1 {
+        failures.push(format!("CLOSE {at} (the child's close): the child's database did not close cleanly"));
+    }
     if r.get("stale") != 0 {
         failures.push(format!(
             "H6 {at}: the stale-index marker was present at the child's open, so its rebuild is not a \
@@ -1446,10 +1468,23 @@ fn print_merge_row(r: &MergeRow) {
     );
 }
 
+/// A20.4: every close's lease stats are read. A scan thread that died (D265), failed a reap, or
+/// declined to decide about a branch leaves a failure, whatever the close's own result, because a
+/// run whose lease thread stopped reaping or refused a branch did not run the workload it reports.
+fn lease_end(stats: &LeaseStats, at: &str, failures: &mut Vec<String>) {
+    if stats.panicked || stats.failed > 0 || stats.refused_branches > 0 {
+        failures.push(format!(
+            "LEASE {at}: the lease thread ended with panicked={}, failed={}, refused_branches={}",
+            stats.panicked, stats.failed, stats.refused_branches
+        ));
+    }
+}
+
 /// Close cleanly and reopen, so `State` — which lives in memory (`reopen_with_storage` builds
 /// `State::default()`) — starts empty: M = 0. Returns the new handles; the caller swaps them in.
 fn reopen_for_merges(db: OpenDatabase, db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
-    let (_, closed) = db.close();
+    let (lease_stats, closed) = db.close();
+    lease_end(&lease_stats, "(the close before a merge batch)", failures);
     closed.expect("close cleanly before a merge batch");
     parent_open(db_path, failures)
 }
@@ -1950,7 +1985,9 @@ fn main() {
                         "extra-extent fire: arena_for reused trunk's extent, so H2 has nothing to see"
                     );
                 }
-                let (_, closed) = db.take().expect("the production database is open").close();
+                // Not `lease`: that names the LeaseDeadline every fork in this loop uses.
+                let (lease_stats, closed) = db.take().expect("the production database is open").close();
+                lease_end(&lease_stats, &format!("N={done} (the parent's close before the restart)"), &mut failures);
                 closed.expect("close cleanly before the restart");
                 // Every handle into the files goes before the child opens them.
                 drop(hd);
@@ -2225,7 +2262,8 @@ fn main() {
     // A18.2: the final close runs BEFORE the summary, and a failure goes into `failures`, so it
     // suppresses "every guard held" and prints among the other NOT A RESULT lines.
     if let Some(open) = db.take() {
-        let (_, closed) = open.close();
+        let (lease_stats, closed) = open.close();
+        lease_end(&lease_stats, "(the final close)", &mut failures);
         if let Err(e) = closed {
             failures.push(format!("the production database did not close cleanly at the end: {e}"));
         }
