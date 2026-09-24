@@ -3022,11 +3022,12 @@ impl AgentRuntime {
         // * In-process, yes. `abandon` and `forget_reaped_branches` take no `ExecCtx`, so a library
         //   caller can seal the branch while another thread reads it through a catalog handle.
         //
-        // Only an INSPECTION records versions. A row-targeting read records a region and its
-        // `observed_at`, and neither needs the history.
-        let released = seen_through.filter(|f| {
-            purpose == ReadPurpose::Inspection && !state.retention.pins.contains_key(f)
-        });
+        // Only an INSPECTION with an exact-version shape records versions. A row-targeting read, and
+        // a range or full-scan inspection, record a region and its `observed_at`, which is exact
+        // at `seen_through + 1`. Neither needs the history, and neither is refused (Amendment 8).
+        let names_versions = purpose == ReadPurpose::Inspection
+            && shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions;
+        let released = seen_through.filter(|f| names_versions && !state.retention.pins.contains_key(f));
         if let Some(f) = released {
             return Err(FerroError::Branch(format!(
                 "the snapshot this read went through (main as of apply-seq {f}) was released while \
@@ -3044,8 +3045,7 @@ impl AgentRuntime {
         // before the reservation sits at or below the start, and one taken inside the window sits
         // at it. In-process only, like the case above.
         let unrecorded = seen_through.filter(|&f| {
-            purpose == ReadPurpose::Inspection
-                && state.publishing.keys().next().is_some_and(|&start| start < f)
+            names_versions && state.publishing.keys().next().is_some_and(|&start| start < f)
         });
         if let Some(f) = unrecorded {
             return Err(FerroError::Branch(format!(
@@ -6175,8 +6175,10 @@ impl AgentRuntime {
         // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
         // numbering is unchanged: the same ops, in the same order, get the same sequence values.
         //
-        // **And the reservation is checked for freshness against an INDEPENDENT record before the
-        // publish transaction opens.** The invariant that matters is the one the assertion in
+        // **And the reservation is checked for freshness against an INDEPENDENT record before
+        // anything is published** (before the publish transaction applies a row; since D194's
+        // Amendment 7 the transaction itself is begun first, and a refusal aborts it). The
+        // invariant that matters is the one the assertion in
         // `record_applied` describes and cannot test: no two versions ever share a `begin_ts`. That
         // assertion compares the reservation to a re-count of the same `rows` list the stamping loop
         // walks, so both sides are the same sum and no input can falsify it. `State::applied` can:
@@ -6218,8 +6220,10 @@ impl AgentRuntime {
                 return Err(FerroError::Merge(e));
             }
             state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
-            let entry = PublishingEntry::register(&self.state, &mut state, base, publish_txn);
-            (base..state.apply_seq, entry)
+            let reserved = base..state.apply_seq;
+            // `register` takes the lock guard and releases it before the entry exists, so the
+            // entry can never be dropped while this thread still holds the lock its `Drop` takes.
+            (reserved, PublishingEntry::register(state, &self.state, base, publish_txn))
         };
         // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
         //
@@ -7437,20 +7441,37 @@ fn pin_seq(
 /// `register` inserts the entry and returns the guard in one call, so there is no way to write one
 /// without the other. `record_applied` removes the entry when it records the versions. Without the
 /// guard, every other exit would leave the entry behind: a refused `bind_run`, a failed `apply_in`,
-/// a failed commit. A stranded entry names an aborted txn, which every later snapshot contains, so
-/// pins would not be harmed. But it would refuse every `REBASE`, and it would read as a merge
-/// forever unrecorded. Removing twice is a no-op.
+/// a failed commit. Removing twice is a no-op.
+///
+/// A stranded entry would not mis-pair a pin, because it names a txn that has finished and that
+/// every later snapshot contains. It would still break things for good:
+/// - it refuses every `REBASE`;
+/// - it refuses every exact-version read through a pin above its start, as a merge that never
+///   records.
+///
+/// The one way to strand an entry is the poisoned-lock skip in `Drop`, which runs only after a
+/// holder of the state lock has panicked.
 struct PublishingEntry<'a> {
     state: &'a Mutex<State>,
     start: u64,
 }
 
 impl<'a> PublishingEntry<'a> {
-    /// Register a merge's reservation, with the lock already held as `locked`, and arm its removal.
-    /// `state` is the same mutex `locked` came from. The guard keeps it for the drop, which runs
-    /// after the caller has released `locked`.
-    fn register(state: &'a Mutex<State>, locked: &mut State, start: u64, txn: u64) -> Self {
+    /// Register a merge's reservation under the lock the caller already holds, and arm the entry's
+    /// removal. `locked` must come from `state`.
+    ///
+    /// It takes `locked` by value and releases it BEFORE the entry exists. The `Drop` relocks
+    /// `state`, so an entry alive while this thread held the lock would deadlock on the first
+    /// panic or `?` that dropped it there. Taking the guard makes that unrepresentable, instead of
+    /// a rule the caller has to keep.
+    fn register(
+        mut locked: std::sync::MutexGuard<'a, State>,
+        state: &'a Mutex<State>,
+        start: u64,
+        txn: u64,
+    ) -> Self {
         locked.publishing.insert(start, txn);
+        drop(locked);
         PublishingEntry { state, start }
     }
 }
@@ -8956,14 +8977,16 @@ mod tests {
     /// **D194, Amendment 6: a pin taken while a merge publishes does not claim the merge's
     /// versions.**
     ///
-    /// The window is forced on one thread by doing what `merge` does between its reservation and
-    /// its record: reserve two sequence numbers, register them, and begin the publish transaction
-    /// without committing it. A fork, and a lazy pin, taken inside the window must pair a snapshot
-    /// that cannot see the publish with a seq below it. Once the publish commits, a fork must claim
-    /// it.
+    /// The window is forced on one thread by doing what `merge` does from its reservation until
+    /// its record. It begins the publish transaction, reserves two sequence numbers, and
+    /// registers them through `PublishingEntry::register`, the call `merge` makes. Nothing is
+    /// committed yet. A fork taken inside the window, and a lazy pin taken there, must each pair a
+    /// snapshot that cannot see the publish with a seq below it. Once the publish commits, a fork
+    /// must claim it. Dropping the guard must then take the entry out.
     ///
-    /// Mutant-only red, because it names `publishing`. M15 (`pin_seq` returns `apply_seq`) fails it
-    /// at the first `fork_seq` assertion.
+    /// Mutant-only red, because it names `PublishingEntry`. M15 (`pin_seq` returns `apply_seq`)
+    /// fails it at the first `fork_seq` assertion, and M16 (`register` inserts nothing) fails it
+    /// there too.
     #[test]
     fn a_pin_taken_while_a_merge_publishes_does_not_claim_its_versions() {
         let (_dir, _bp, _catalog, txn) = txn_fixture("publishing");
@@ -8985,8 +9008,7 @@ mod tests {
             let mut st = rt.state.lock().unwrap();
             let start = st.apply_seq;
             st.apply_seq += 2;
-            let entry = PublishingEntry::register(&rt.state, &mut st, start, t);
-            (start, entry)
+            (start, PublishingEntry::register(st, &rt.state, start, t))
         };
 
         let during = rt.begin_session_pinned(id("during"), BranchId::TRUNK, &txn).unwrap().branch;
@@ -9033,7 +9055,7 @@ mod tests {
             let mut st = rt.state.lock().unwrap();
             let start = st.apply_seq;
             st.apply_seq += 1;
-            PublishingEntry::register(&rt.state, &mut st, start, t)
+            PublishingEntry::register(st, &rt.state, start, t)
         };
         let err = rt.rebase_validate(&ctx, branch).err().map(|e| e.to_string());
         assert!(
@@ -9048,51 +9070,100 @@ mod tests {
     /// **D194, Amendment 7 item 4: a read through a pin that claims a merge the history has not
     /// recorded yet refuses.**
     ///
-    /// The fixture is the state between a merge's commit and its `record_applied`: an entry in
-    /// `publishing`, and a branch pinned above its start, as `pin_seq` pins a snapshot that
-    /// contains the merge. The history still ends at version 3, so a read through that pin could
-    /// only name 3 for a row whose image already carried the merge. The anti-vacuity half: once
-    /// the entry is gone, the same read is retained.
+    /// The fixture is the state between a merge's commit and its `record_applied`: an entry
+    /// registered through `PublishingEntry::register`, and a branch pinned above its start, which
+    /// is how `pin_seq` pins a snapshot that contains the merge. The history still ends at version
+    /// 3, so a read through that pin could only name 3 for a row whose image already carried the
+    /// merge.
     ///
-    /// Mutant-only red, because it names `publishing`. M19, with the refusal removed, fails the
-    /// first assertion.
+    /// Three reads must NOT be refused (Amendment 8):
+    /// - one through a pin AT the start, which is a pin taken inside the window;
+    /// - a row-targeting read through the pin above;
+    /// - a full-scan inspection through it.
+    ///
+    /// Neither of the last two names a version. The anti-vacuity half: once the entry is gone, the
+    /// refused read is retained.
+    ///
+    /// Mutant-only red, because it names `PublishingEntry`. M19 (the refusal removed) fails the
+    /// first assertion. M20 (`<=`) fails the pin-at-start read, M21 (no shape conjunct) the full
+    /// scan, and M22 (no purpose conjunct) the row-targeting read.
     #[test]
     fn version_history_is_not_asked_for_a_merge_it_has_not_recorded() {
         let rt = AgentRuntime::new();
-        let b = BranchId::new(7, 0);
-        let (pinned_at, entry) = {
+        let (above, at_start) = (BranchId::new(7, 0), BranchId::new(8, 0));
+        let (start, entry) = {
             let mut st = rt.state.lock().unwrap();
             for _ in 0..3 {
                 publish_next(&mut st, 1);
             }
             let start = st.apply_seq;
             st.apply_seq += 2;
-            let entry = PublishingEntry::register(&rt.state, &mut st, start, 99);
+            (start, PublishingEntry::register(st, &rt.state, start, 99))
+        };
+        let pinned_at = {
+            let mut st = rt.state.lock().unwrap();
             let at = st.apply_seq;
-            st.insert_workspace(b, pinned("b_7", 100, at));
-            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
-            (at, entry)
+            st.insert_workspace(above, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, above));
+            st.insert_workspace(at_start, pinned("b_8", 101, start));
+            st.captures.insert(101, TxnCapture::new(TxnId(101), ProvId::NONE, at_start));
+            at
         };
         let row = vec![Value::Integer(1), Value::Integer(10)];
-        let read = || {
+        let read = |b: BranchId, shape: AccessShape, purpose: ReadPurpose, through: u64| {
             rt.record_read(
                 b,
                 TableId(1),
-                AccessShape::IndexLookup,
+                shape,
                 &[(RowId(1), row.clone())],
                 None,
                 None,
-                ReadPurpose::Inspection,
-                Some(pinned_at),
+                purpose,
+                Some(through),
             )
         };
-        let err = read().err().map(|e| e.to_string());
+        let exact = || read(above, AccessShape::IndexLookup, ReadPurpose::Inspection, pinned_at);
+        let err = exact().err().map(|e| e.to_string());
         assert!(
             err.as_deref().is_some_and(|e| e.contains("has not recorded its versions yet")),
             "a read through a pin above an unrecorded merge must refuse, and say why: {err:?}"
         );
+        assert!(
+            read(at_start, AccessShape::IndexLookup, ReadPurpose::Inspection, start).is_ok(),
+            "a pin AT the entry's start excludes the merge, so the history names what it saw"
+        );
+        assert!(
+            read(above, AccessShape::IndexLookup, ReadPurpose::RowTargeting, pinned_at).is_ok(),
+            "a row-targeting read records no version, so there is nothing it could mis-name"
+        );
+        assert!(
+            read(above, AccessShape::FullScan, ReadPurpose::Inspection, pinned_at).is_ok(),
+            "a full-scan inspection records a predicate at `observed_at`, not a version"
+        );
         drop(entry);
-        assert!(read().is_ok(), "with no merge publishing, the same read is retained");
+        assert!(exact().is_ok(), "with no merge publishing, the same read is retained");
+    }
+
+    /// **`pin_seq`'s two-catalog assertions have to be able to FIRE** (Amendment 8). With one
+    /// catalog neither case can arise, which is why nothing else reaches them. Here, a snapshot
+    /// excludes the merge that reserved at 5 and contains the one that reserved at 7.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no single fork_seq")]
+    fn pin_seq_names_a_contained_merge_above_an_excluded_one() {
+        let snap = Snapshot { high_water: 100, active: std::collections::HashSet::from([50]) };
+        let publishing = BTreeMap::from([(5, 50), (7, 60)]);
+        pin_seq(&publishing, 9, None, &snap);
+    }
+
+    /// The other assertion: version 9 was recorded while nothing is publishing, but `apply_seq`
+    /// says 5. No pin at 5 could read version 9 as anything but never published.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is recorded above")]
+    fn pin_seq_names_a_recorded_version_above_its_seq() {
+        let snap = Snapshot { high_water: 100, active: std::collections::HashSet::new() };
+        pin_seq(&BTreeMap::new(), 5, Some(9), &snap);
     }
 
     /// **The pin audit has to be able to FAIL at a door**, in the way `txn_refs`' audit is shown to
