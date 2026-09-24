@@ -176,13 +176,22 @@ fn a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth() {
         );
     }
 
-    // CONTROL FIRST. The leaf's cascade visits one (empty) span per level plus one each for the
-    // reap's own two questions about the leaf: D+2 on both builds. Below D it did not run.
+    // CONTROL FIRST. The leaf's cascade asks one question about one (empty) span per level, and a
+    // constant number more per level on the same branch's later changes. Below D it did not run.
+    //
+    // ⚠ AMENDED (lane §8.6, append-only). This asserted `<= D+2`, the count at `3d4d4d2` and
+    // `2987369`. D200 (`206af08`) made `release_id` ask once per released ancestor, so the count
+    // became 2D+1 from that commit on, and the bound failed there. This lane's pre-registration
+    // missed that until the audit re-derivation. The §8.6 change adds one question per Reaped flip
+    // and one per detach under a Reaped parent: 3D+1 at the tip (49 at D=16, 193 at D=64). The
+    // bound is now the linear window [D, 4D]. A walk down the chain would be ~D²/2, 2048 at D=64,
+    // so the window still refuses the defect this control exists to catch.
     for a in [&small, &large] {
         assert!(
-            a.cascade >= a.depth && a.cascade <= a.depth + 2,
-            "CONTROL moved: cascade={} at D={} (expected D+2 on both builds) — the fixture or the \
-             pre-registered model is wrong; the class assertions below mean nothing until it holds",
+            a.cascade >= a.depth && a.cascade <= 4 * a.depth,
+            "CONTROL moved: cascade={} at D={} (expected 3D+1 at the branch tip, linear in D) — the \
+             fixture or the pre-registered model is wrong; the class assertions below mean nothing \
+             until it holds",
             a.cascade,
             a.depth
         );
