@@ -176,3 +176,30 @@ fn a_version_2_log_refuses_new_transactions_until_a_checkpoint_upgrades_it() {
     assert_eq!(wal_version(&wal_file), 3, "the checkpoint did not rewrite the header as version 3");
     txn.begin().expect("an upgraded log refused a transaction");
 }
+
+/// **Guard: an EMPTY version-2 log is upgraded at open too, so writes work after it.** `recover`
+/// replays nothing and returns `false` for an empty log, so the checkpoint that upgrades it runs
+/// only because the log is version 2. Without that, the first transaction would be refused. A guard
+/// for the fix, added with it: killed by the runner's F1c, which stops `open_recovered` checkpointing
+/// a legacy log. At `56f6752` every log was version 2, so only its final version check would fail.
+///
+/// The empty log is made the way a real one gets that way. The first open creates the table, and
+/// that DDL leaves its records in the log. The second open replays them and checkpoints, and a
+/// process that ran no DDL re-declares nothing, so the log it leaves is empty. Then it is labelled
+/// version 2.
+#[test]
+fn an_empty_version_2_log_is_upgraded_at_open_so_writes_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty_legacy.db");
+    Db::open(&path).unwrap().ok("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(40));");
+    drop(Db::open(&path).unwrap());
+    let len = std::fs::metadata(wal_path(&path)).unwrap().len();
+    assert_eq!(len, 24, "premise: the log is not empty (header only) after the second open");
+    label_as_version_2(&wal_path(&path));
+
+    let mut db = Db::open(&path).expect("an empty version-2 log did not open");
+    db.ok("INSERT INTO notes VALUES (1, 'a');");
+    assert_eq!(db.rows("SELECT id, note FROM notes;"), vec![note(1, "a")], "the insert after the upgrade is missing");
+    drop(db);
+    assert_eq!(wal_version(&wal_path(&path)), 3, "the open did not rewrite the empty log as version 3");
+}

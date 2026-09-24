@@ -44,7 +44,7 @@ use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::wal::log::{RecKind, WalManager};
 use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
-use ferrodb::wal::txn::release_failures;
+use ferrodb::wal::txn::{directory_update_failures, release_failures};
 
 /// Opened through the one open path, so a reopen is the real recovery. Field order is drop order:
 /// every handle goes before the lock.
@@ -385,8 +385,14 @@ fn a_crash_after_a_relocating_commit_still_frees_its_space() {
     // release used to be finished before recovery's directory repair, so the page directory did not
     // yet list the page, and a failed DIRECTORY update was counted and printed as a failed release.
     let failures = release_failures();
+    let directory_failures = directory_update_failures();
     let mut db = Db::open(&path).unwrap_or_else(|e| panic!("the database did not reopen: {e}"));
     assert_eq!(release_failures(), failures, "recovery counted a release failure for a release that succeeded");
+    assert_eq!(
+        directory_update_failures(),
+        directory_failures,
+        "recovery told the page directory before repairing it, so the page was not listed yet"
+    );
     let mut main = Session::new();
     db.ok(&format!("INSERT INTO notes VALUES (3, '{}');", "z".repeat(80)), &mut main);
     assert_eq!(
