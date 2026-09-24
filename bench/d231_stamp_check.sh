@@ -30,8 +30,9 @@
 # STEPS, per arm. Q0 is a second commit with S0's exact tree; foreign.git's HEAD is <commit>^.
 # Each step is one change, then a build, then the probe:
 #   1-fresh-build        nothing                                        at S0          rerun yes
-#   2-no-change-rebuild  nothing, again: the re-run on EVERY build that
-#                        a missing watched path causes shows up here    at S0          rerun no
+#   2-no-change-rebuild  nothing, again. A re-run here is a script that
+#                        re-runs on every build (a missing watched
+#                        path) or re-scheduled itself (below)           at S0          rerun no
 #   3-unstaged-edit      a comment appended to src/lib.rs               at S0 +DIRTY   rerun yes
 #   4-commit             `git add` + `git commit` of that edit          at S1          rerun yes
 #   5-reset-soft         `git reset --soft HEAD~1`: moves the branch's
@@ -50,15 +51,42 @@
 #                        script re-runs with stale stat information     at Q0 +DIRTY   rerun yes
 #   11-no-self-rerun     nothing: a script whose `git status` wrote the
 #                        index back in step 10 re-runs itself here      at Q0 +DIRTY   rerun no
+#   12-example-edit      a comment appended to a tracked examples/*.rs  at Q0 +DIRTY   rerun yes
+#   13-test-edit         a comment appended to a tracked tests/*.rs     at Q0 +DIRTY   rerun yes
+#   14-manifest-edit     a comment appended to Cargo.toml               at Q0 +DIRTY   rerun yes
+#   (Steps 12-14 start dirty, so it is `rerun` that tests their watches. Cargo.lock is watched and
+#   not exercised: cargo may rewrite a lock file it did not write.)
+# Two WITNESS lines per arm are verdicts too: after `reset --soft`, only the branch ref file
+# changed; after `symbolic-ref`, only HEAD did. They are what make steps 5 and 7 test one watch
+# each, so a witness that does not hold FAILS rather than decorating the log.
+#
+# PRE-REGISTERED, before any run (2 arms x 14 steps + 4 witnesses = 32 verdicts):
+#   at the D231 tip   32 PASS, exit 0.
+#   at 9aa6968        21 PASS, 11 FAIL, exit 1:
+#     clone   FAIL 2  base's plain `git status` rewrites the index in step 1 (a fresh checkout's
+#                     entries are racy: measured by D231's review), so step 2 re-runs. Timing:
+#                     passes only if the checkout straddled a second boundary.
+#             FAIL 3  no re-run, stamp clean for an edited tree       (the D231 headline)
+#             FAIL 5  no re-run, stamp still at S1                    (branch ref not watched)
+#             FAIL 6  re-runs, stamps foreign.git's HEAD               (GIT_DIR honoured)
+#             FAIL 11 re-runs: step 10's `git status` wrote the index back
+#             FAIL 12, 13, 14  no re-run (inputs not watched); 14 is INFERRED: a comment in
+#                     Cargo.toml changes no fingerprint cargo keeps
+#     linked  FAIL 2, 11  re-runs on every build (`.git/HEAD` and `.git/index` are missing
+#                     paths in a linked worktree; Cargo FAQ)
+#             FAIL 6  stamps foreign.git's HEAD
+#     all four witnesses PASS at both commits (they are facts about git, not about build.rs).
 #
 # EXIT: 0 every verdict PASS; 1 at least one FAIL (the expected result at the base); 2 the
-# harness could not measure (a build failed, the probe printed nothing, a sha did not resolve, an
-# mtime could not be read). A run that collected nothing has not passed, so 2 is never folded into
-# 0 or 1. On exit 2, $WORK is left in place for diagnosis.
+# harness could not measure (a build failed, the probe printed something that is not a stamp, a
+# sha did not resolve, an mtime or a witnessed file could not be read, or fewer than 32 verdicts
+# were reached). A run that collected nothing has not passed, so 2 is never folded into 0 or 1.
 #
-# CLEANUP: on exit 0 or 1, $WORK is removed unless D231_KEEP=1. The removal is guarded by a
-# sentinel this script writes into a directory it created itself (`mkdir` without `-p`, so two
-# runs cannot share one), and by the path's shape.
+# EVIDENCE: every D231 line is also written to $WORK/result.txt, beside cargo's per-build JSON and
+# stderr. On exit 0 or 1 only the heavy directories (the checkouts, foreign.git, the target dirs)
+# are removed, unless D231_KEEP=1; the evidence stays. On exit 2 everything stays. The removal is
+# guarded by a sentinel this script writes into a directory it created itself (`mkdir` without
+# `-p`, so two runs cannot share one), and by the path's shape.
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -81,14 +109,23 @@ mkdir "$WORK" 2>/dev/null || { echo "D231 HARNESS: could not create $WORK (it ex
 : > "$WORK/.d231-stamp-check-sentinel"
 
 SELF=$(git -C "$(dirname "$0")" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+if [ -n "$(git -C "$(dirname "$0")" --no-optional-locks status --porcelain -- "$(basename "$0")" 2>/dev/null)" ]; then
+  SELF="$SELF+DIRTY"
+fi
 echo "D231 RUN commit_under_test=$SHA12 script_from=$SELF repo=$REPO work=$WORK git=$(git --version | awk '{print $3}') cargo=$(cargo --version 2>/dev/null | awk '{print $2}')"
 
 CLONE=$WORK/clone.noindex
 LINKED=$WORK/linked.noindex
 FOREIGN=$WORK/foreign.git
 PARSE=$WORK/d231_parse.py
+RESULT=$WORK/result.txt
 PASS=0
 FAIL=0
+EXPECTED_VERDICTS=32
+# What build_provenance() prints: `at <sha12|unknown>`, then ` +DIRTY (...)` when dirty.
+STAMP_RE='^at ([0-9a-f]{12}|unknown)( \+DIRTY .*)?$'
+say() { echo "$*" | tee -a "$RESULT"; }
+say "D231 RUN commit_under_test=$SHA12 script_from=$SELF (header repeated into the result file)"
 
 cat > "$PARSE" <<'PY'
 # Reads `cargo build --message-format=json` on stdin. Prints: <out_dir or -> <lib fresh: true|false|?>
@@ -162,7 +199,11 @@ check() {
     echo "$of" > "$WORK/outfile.$arm"
   fi
   got=$("$tgt/debug/examples/d231_stamp_probe" 2>&1 | head -1)
-  if [ -z "$got" ]; then echo "D231 HARNESS: the probe printed nothing, arm=$arm step=$step"; exit 2; fi
+  # Only a stamp is a measurement. An exec error or a panic would otherwise score as a FAIL, and a
+  # FAIL is what the base run is expected to produce.
+  if ! [[ $got =~ $STAMP_RE ]]; then
+    echo "D231 HARNESS: the probe printed something that is not a stamp, arm=$arm step=$step: $got"; exit 2
+  fi
   if [ "$of" = "-" ]; then echo "D231 HARNESS: cargo never said where the build script's output is, arm=$arm step=$step"; exit 2; fi
   mt after "$of"
   if [ "$after" != "$before" ]; then rerun=yes; else rerun=no; fi
@@ -173,14 +214,21 @@ check() {
   esac
   if [ "$stamp_ok" = y ] && [ "$rerun" = "$expect_rerun" ]; then verdict=PASS; else verdict=FAIL; fi
   if [ "$verdict" = PASS ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
-  echo "D231 commit=$SHA12 arm=$arm step=$step expect=\"$expect\" got=\"$got\" stamp_ok=$stamp_ok expect_rerun=$expect_rerun rerun=$rerun lib_fresh=$fresh script_stamp=$(script_stamp "$of") verdict=$verdict"
+  say "D231 commit=$SHA12 arm=$arm step=$step expect=\"$expect\" got=\"$got\" stamp_ok=$stamp_ok expect_rerun=$expect_rerun rerun=$rerun lib_fresh=$fresh script_stamp=$(script_stamp "$of") verdict=$verdict"
 }
 
-# witness <arm> <what> <index-before> <head-before> <ref-before> <index-file> <head-file> <ref-file>
+# witness <arm> <what> <expected "index head ref" as yes/no> <index-before> <head-before>
+#         <ref-before> <index-file> <head-file> <ref-file>
+# A verdict: the step that follows tests one watch only if exactly the expected files moved.
 witness() {
-  local i h r
-  mt i "$6"; mt h "$7"; mt r "$8"
-  echo "D231 WITNESS arm=$1 $2 index_touched=$([ "$3" = "$i" ] && echo no || echo yes) head_touched=$([ "$4" = "$h" ] && echo no || echo yes) branch_ref_touched=$([ "$5" = "$r" ] && echo no || echo yes)"
+  local f i h r seen verdict
+  for f in "$7" "$8" "$9"; do
+    [ -f "$f" ] || { echo "D231 HARNESS: witnessed file $f does not exist, arm=$1 $2"; exit 2; }
+  done
+  mt i "$7"; mt h "$8"; mt r "$9"
+  seen="$([ "$4" = "$i" ] && echo no || echo yes) $([ "$5" = "$h" ] && echo no || echo yes) $([ "$6" = "$r" ] && echo no || echo yes)"
+  if [ "$seen" = "$3" ]; then verdict=PASS; PASS=$((PASS + 1)); else verdict=FAIL; FAIL=$((FAIL + 1)); fi
+  say "D231 WITNESS commit=$SHA12 arm=$1 $2 expect=\"$3\" index/head/branch_ref_touched=\"$seen\" verdict=$verdict"
 }
 
 probe_source() {
@@ -218,7 +266,7 @@ FOREIGN12=$(git --git-dir="$FOREIGN" rev-parse --short=12 HEAD)
 if [ "$S0" = "$Q0" ] || [ "$S0" = "$FOREIGN12" ]; then
   echo "D231 HARNESS: S0=$S0 Q0=$Q0 foreign=$FOREIGN12; steps 6 and 7 need three different commits"; exit 2
 fi
-echo "D231 SHAS S0=$S0 Q0=$Q0 foreign=$FOREIGN12"
+say "D231 SHAS S0=$S0 Q0=$Q0 foreign=$FOREIGN12"
 
 for arm in clone linked; do
   if [ "$arm" = clone ]; then ck=$CLONE; else ck=$LINKED; fi
@@ -241,7 +289,7 @@ for arm in clone linked; do
   idx=$(gpath "$ck" index); hf=$(gpath "$ck" HEAD); rf=$(gpath "$ck" "$(git -C "$ck" symbolic-ref -q HEAD)")
   mt i0 "$idx"; mt h0 "$hf"; mt r0 "$rf"
   g "$ck" reset -q --soft HEAD~1 || exit 2
-  witness "$arm" reset-soft "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
+  witness "$arm" reset-soft "no no yes" "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
   check "$arm" "$ck" "$tgt" 5-reset-soft "at $S0 +DIRTY" yes
 
   touch "$idx"
@@ -250,7 +298,7 @@ for arm in clone linked; do
   g "$ck" branch -q "d231-probe-$arm-q0" "$Q0FULL" || exit 2
   mt i0 "$idx"; mt h0 "$hf"; mt r0 "$rf"
   g "$ck" symbolic-ref HEAD "refs/heads/d231-probe-$arm-q0" || exit 2
-  witness "$arm" head-only "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
+  witness "$arm" head-only "no yes no" "$i0" "$h0" "$r0" "$idx" "$hf" "$rf"
   check "$arm" "$ck" "$tgt" 7-head-only "at $Q0 +DIRTY" yes
 
   g "$ck" reset -q --hard || exit 2
@@ -263,14 +311,31 @@ for arm in clone linked; do
   touch "$ck/README.md" "$ck/src/lib.rs" "$idx"
   check "$arm" "$ck" "$tgt" 10-stale-stat "at $Q0 +DIRTY" yes
   check "$arm" "$ck" "$tgt" 11-no-self-rerun "at $Q0 +DIRTY" no
+
+  ex=$(git -C "$ck" ls-files 'examples/*.rs' | head -1)
+  ts=$(git -C "$ck" ls-files 'tests/*.rs' | head -1)
+  if [ -z "$ex" ] || [ -z "$ts" ]; then echo "D231 HARNESS: no tracked example or test file to edit"; exit 2; fi
+  printf '\n// d231 probe edit\n' >> "$ck/$ex"
+  check "$arm" "$ck" "$tgt" 12-example-edit "at $Q0 +DIRTY" yes
+  printf '\n// d231 probe edit\n' >> "$ck/$ts"
+  check "$arm" "$ck" "$tgt" 13-test-edit "at $Q0 +DIRTY" yes
+  printf '\n# d231 probe edit\n' >> "$ck/Cargo.toml"
+  check "$arm" "$ck" "$tgt" 14-manifest-edit "at $Q0 +DIRTY" yes
 done
 
-echo "D231 SUMMARY commit=$SHA12 pass=$PASS fail=$FAIL"
+say "D231 SUMMARY commit=$SHA12 pass=$PASS fail=$FAIL verdicts=$((PASS + FAIL)) expected_verdicts=$EXPECTED_VERDICTS result=$RESULT"
+if [ $((PASS + FAIL)) -ne "$EXPECTED_VERDICTS" ]; then
+  echo "D231 HARNESS: $((PASS + FAIL)) verdicts reached, not $EXPECTED_VERDICTS"; exit 2
+fi
 
 if [ "${D231_KEEP:-0}" = 1 ]; then
   echo "D231 KEPT $WORK"
 elif [ -f "$WORK/.d231-stamp-check-sentinel" ]; then
-  case "$WORK" in */d231-check-*.noindex) rm -rf "$WORK" && echo "D231 REMOVED $WORK" ;; esac
+  case "$WORK" in
+    */d231-check-*.noindex)
+      rm -rf "$CLONE" "$LINKED" "$FOREIGN" "$WORK/target-clone" "$WORK/target-linked" \
+        && echo "D231 REMOVED the checkouts and target dirs; evidence kept in $WORK" ;;
+  esac
 fi
 
 [ "$FAIL" -eq 0 ]

@@ -42,12 +42,13 @@
 //!   packed value, so a change to `packed-refs` cannot change what `HEAD` resolves to; while the
 //!   file does not exist, watching it already re-runs this script on every build (below).
 //!   Watching `packed-refs` as well would add no information, and would rebuild every worktree
-//!   of the repository whenever any packed branch anywhere is deleted, which rewrites that one
-//!   shared file (measured by D231's review).
+//!   of the repository whenever that one shared file is rewritten: a packed branch deleted
+//!   anywhere (measured by D231's review), `git gc`, `git fetch --prune`.
 //!
 //! **D231.** The list used to be `.git/HEAD` and `.git/index`, relative to the package. In a main
-//! checkout that missed every unstaged edit, so a binary said clean for code it was not built
-//! from, and every branch move that did not also rewrite the index (`git reset --soft` does not).
+//! checkout that missed unstaged edits, so a binary said clean for code it was not built from,
+//! and branch moves that did not also rewrite the index (`git reset --soft` does not), except
+//! when some other change happened to re-run the script first.
 //! In a linked worktree `.git` is a file and both paths were missing, and the Cargo FAQ says a
 //! missing watched path re-runs the script, and rebuilds the crate, on every build: the stamp came
 //! out right there, at the price of a rebuild per cargo invocation. `bench/d231_stamp_check.sh`
@@ -79,7 +80,13 @@
 //! * A watched git path that does not exist makes cargo re-run this script, and therefore rebuild
 //!   the crate, on every build until it does exist. The stamp stays right and the rebuild is the
 //!   cost. A branch that lives only in `packed-refs` does this until its next commit creates its
-//!   ref file.
+//!   ref file, and `git gc` (`pack-refs --all`) makes that true of every branch at once, checked
+//!   out or not (measured by D231's review): after a gc, every checkout rebuilds on every build
+//!   until its branch moves.
+//! * `HEAD` is followed to the branch it names and that branch's file is watched. A symbolic ref
+//!   chain (`HEAD` to `foo` to `main`) is followed to its end, so retargeting `foo` changes what
+//!   `HEAD` resolves to without touching a watched file (measured by D231's review). Nothing here
+//!   builds such a chain.
 //! * In a reftable repository the shared table changes on every ref update in every worktree, so
 //!   any commit anywhere re-stamps, and rebuilds, every worktree. ferrodb's repository uses the
 //!   files store, so this is latent here.
@@ -126,7 +133,11 @@ fn main() {
         // (git-status(1), BACKGROUND REFRESH). That takes the index lock out from under whoever
         // is committing in this worktree, and it rewrites a file this script watches, so the
         // script would schedule its own re-run.
-        cmd.arg("--no-optional-locks").args(args).current_dir(&root);
+        //
+        // `--no-replace-objects`: the stamped sha names the real commit, so `dirty` must compare
+        // against the real commit's tree. With `git replace` honoured, a replacement object
+        // changes the comparison without changing any file this script watches (D231 review).
+        cmd.args(["--no-optional-locks", "--no-replace-objects"]).args(args).current_dir(&root);
         for var in &local_env {
             cmd.env_remove(var);
         }
