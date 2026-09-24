@@ -275,6 +275,9 @@ impl Catalog {
     ///    `INSERT INTO t VALUES (4, ...)` leaves **two** slots with pk 4 in the same heap. Building
     ///    an index over that emits every token they share twice, `insert_entry` appends rather than
     ///    overwrites, and the search then returns that row twice. `post_tokens` probes first.
+    ///    ⚠ Since the reused-key fix (`execution::insert`), SQL writes the new version into the
+    ///    dead one's slot, so a heap written after it holds one slot per key. A heap written
+    ///    before it still holds two, and the probe is what keeps this correct over one.
     /// 3. **It lands in `fulltext_indexes`**, not `indexes` — see `FullTextIndexInfo`.
     pub fn create_fulltext_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
         let (schema, first_dir_page_id, col_index) = {
@@ -372,6 +375,22 @@ impl Catalog {
         self.persist()?;
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
+        self.sync_root_cells();
+        self.epoch += 1;
+        Ok(())
+    }
+
+    /// **D250: finish a DROP that the log records but the catalog on disk does not**, without freeing
+    /// anything. Called only by `wal::recovery::open_recovered`, for a table whose `DropTable` record
+    /// is durable (it is written before the first free) while the catalog change never reached disk.
+    /// Recovery has skipped the table's records, so it must not stay in the catalog. Its pages are NOT
+    /// freed here: recovery may already have allocated one the interrupted DROP freed. The rest of
+    /// what [`Catalog::drop_table`] does after its frees is done the same way.
+    pub fn forget_dropped_table(&mut self, name: &str) -> Result<(), FerroError> {
+        self.require_table(name)?;
+        self.tables.remove(name);
+        self.stats.remove(name);
+        self.persist()?;
         self.sync_root_cells();
         self.epoch += 1;
         Ok(())

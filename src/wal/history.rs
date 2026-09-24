@@ -3,7 +3,7 @@
 //! SCALE-DESIGN "D212 (a') DECIDED" and "AMENDED". The history of a merge is written in three
 //! places, in this order, and each has one job:
 //!
-//! 1. **The WAL, inside the publish transaction** (`RecKind::RevertHistory`, tag 11). This is what
+//! 1. **The WAL, inside the publish transaction** (`RecKind::RevertHistory`, tag 12). This is what
 //!    makes the history atomic with the rows: the transaction's `Commit` record decides for both,
 //!    so no crash can leave rows without their history or history without its rows.
 //! 2. **This store's in-memory queue**, the moment `TxnManager::commit` has flushed the `Commit`
@@ -14,7 +14,7 @@
 //!    retained window plus the queue in ONE [`replace_atomically`]. A failure refuses the
 //!    truncation, so the WAL keeps every record the file does not.
 //!
-//! Open reverses it: the file is loaded, then `recover` queues every tag-11 record of a
+//! Open reverses it: the file is loaded, then `recover` queues every tag-12 record of a
 //! transaction that has a `Commit` and whose `hseq` the file does not hold — by membership, not by
 //! position (AMENDED 2, F9) — and the first checkpoint drains them. Idempotency is keyed on `hseq`,
 //! never on the publish ordinal, because a REVERT's marker has an `hseq` and no ordinal.
@@ -503,7 +503,7 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
     Ok(by_hseq)
 }
 
-/// **Reassemble tag-11 WAL parts into records**, for the open's catch-up.
+/// **Reassemble tag-12 WAL parts into records**, for the open's catch-up.
 ///
 /// A record larger than one WAL part is split across parts `0, 1, ..` of its transaction, the last
 /// marked. `parts` is every `(txn, hseq, ordinal, part, last, bytes)` of the transactions that

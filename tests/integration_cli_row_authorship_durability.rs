@@ -192,3 +192,90 @@ fn the_shipped_binary_still_names_the_agent_that_wrote_a_row_after_a_restart() {
     assert!(rows.contains("1 | 40"), "the agent's write did not survive the restart:\n{rows}");
     assert!(rows.contains("2 | 20"), "the control row is not in the table:\n{rows}");
 }
+
+/// D250 review 2's R2-4 (D250 lane §3.10 test 16): a DROP completed at an open that never attached a
+/// runtime still forgets the table's authors.
+///
+/// An open completes a DROP whose record is durable and whose mutation failed, and that completion
+/// is durable at the open's own checkpoint. The table's provenance is forgotten only when a runtime
+/// is attached (`OpenedDatabase::attach_runtime`). At `b57a5d0` a crash between the two lost the
+/// forget for good: the checkpoint had truncated the `DropTable` record away, the catalog no longer
+/// named the table, and so no later open knew to forget it. A table created under the name then
+/// inherited the dropped one's authors, which is what B9's forget exists to prevent.
+///
+/// The logged-but-incomplete DROP is planted by this process through `open_recovered` and
+/// `drop_checkpointed` with a failing mutation, test 5's lever in `wal::recovery::tests`. The shipped
+/// binary does everything else.
+#[test]
+fn a_drop_completed_at_an_open_that_never_attached_a_runtime_still_forgets_the_tables_authors() {
+    use ferrodb::error::FerroError;
+    use ferrodb::storage::db_lock::DbLock;
+    use ferrodb::wal::log::DdlOp;
+    use ferrodb::wal::recovery::open_recovered;
+    use ferrodb::wal::txn::DdlRecord;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dropped_authors.db");
+
+    let setup = ferrodb(
+        &db,
+        "CREATE TABLE t (id INTEGER NOT NULL, qty INTEGER);\n\
+         INSERT INTO t VALUES (1, 10);\n",
+    );
+    assert_no_errors(&setup, "the setup session");
+    let agent = ferrodb(
+        &db,
+        "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus-5/2026-05';\n\
+         UPDATE t SET qty = qty + 30 WHERE id = 1;\n\
+         MERGE;\n\
+         SELECT * FROM ferro_row_authors;\n",
+    );
+    assert_no_errors(&agent, "the agent session");
+    assert_eq!(
+        attributed_lines(&agent, "restock-agent").len(),
+        1,
+        "premise failed: the merged row was not attributed, so nothing below could show its authors \
+         surviving the DROP:\n{agent}"
+    );
+
+    // A DROP whose record is durable and whose mutation failed, then the crash.
+    {
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("this process's first open failed");
+        let record = {
+            let e = o.catalog.get_table("t").expect("premise failed: `t` is not in the catalog");
+            DdlRecord {
+                op: DdlOp::DropTable,
+                table: "t".into(),
+                dir_root: e.first_directory_page_id,
+                time_travel_root: e.time_travel_root,
+                columns: Vec::new(),
+            }
+        };
+        let failed = o.txn.drop_checkpointed(record, || {
+            Err::<(), _>(FerroError::Internal("injected: the drop failed before it freed anything".into()))
+        });
+        assert!(failed.is_err(), "premise failed: the DROP succeeded although its mutation failed");
+    }
+    // An open that completes the DROP and checkpoints, then dies before any runtime is attached:
+    // R2-4's window.
+    {
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open that completes the DROP failed");
+        assert!(o.catalog.get_table("t").is_none(), "premise failed: the open did not complete the logged DROP");
+    }
+
+    // The view lists the tables the catalog names, so `t` is created again for it to be asked about.
+    let after = ferrodb(
+        &db,
+        "CREATE TABLE t (id INTEGER NOT NULL, qty INTEGER);\n\
+         SELECT * FROM ferro_row_authors;\n",
+    );
+    assert_no_errors(&after, "the session after the DROP");
+    let lines = attributed_lines(&after, "restock-agent");
+    assert!(
+        lines.is_empty(),
+        "the dropped `t`'s authors survived its DROP, which an open completed without ever attaching a \
+         runtime, so the new `t` inherits them:\n{after}"
+    );
+}

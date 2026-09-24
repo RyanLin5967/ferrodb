@@ -95,6 +95,15 @@ impl DbLock {
     }
 }
 
+impl DbLock {
+    /// Whether this is the lock on `db_path`. D204: `wal::recovery::open_recovered` takes a
+    /// `&DbLock` and refuses one held for a different file, so the one open path cannot be reached
+    /// without the single-writer lock on the database it opens.
+    pub fn guards(&self, db_path: &Path) -> bool {
+        self.path == lock_path(db_path)
+    }
+}
+
 impl Drop for DbLock {
     fn drop(&mut self) {
         // A failure to remove leaves a stale lock, which refuses the next open. That is noisy and

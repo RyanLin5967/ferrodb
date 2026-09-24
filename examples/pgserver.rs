@@ -8,8 +8,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::TableBranchCatalog;
@@ -20,12 +18,7 @@ use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
-use ferrodb::wal::txn::TxnManager;
-
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -51,27 +44,17 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let existed = Path::new(&db).exists();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&db)
-        .expect("open db");
-    let dm = Arc::new(DiskManager::new(file).unwrap());
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
-    // D212 (a'): REVERT's history store, before recover, as `cli.rs` does.
-    txn.attach_history_store(ferrodb::wal::history::HistoryStore::open_for_database(&db, existed).unwrap())
-        .unwrap();
-    recover(&txn).unwrap();
-    let catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
-    } else {
-        Catalog::create(bp.clone()).unwrap()
-    };
+    // **D204: the one open path.** Recovery, then every index rebuilt from the recovered heap, then a
+    // checkpoint, through the same function the CLI calls. This file used to spell the sequence out
+    // itself, and from D9 until D202 its copy omitted the rebuild. Index pages are not logged, so a
+    // row committed after the last checkpoint came back in the heap but not in its primary index: a
+    // lookup by key missed it, and an INSERT of its key was admitted as a second live row
+    // (`tests/pgserver_crash_rebuilds_indexes.rs`). `tests/open_path_allowlist.rs` keeps it from
+    // drifting again. Before the arena below, for the reason given there: the rebuild allocates pages.
+    // A PANIC on failure, not `process::exit`, for the reason given at the lease scan below: this
+    // runs after the lock, and exiting would strand `<db>.lock`.
+    // Kept whole until the runtime exists: the runtime joins it through `attach_runtime` below.
+    let opened = open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| panic!("pgserver: {e}"));
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
     // Readiness, not a guess: the test reads this line rather than sleeping.
@@ -95,11 +78,11 @@ fn main() {
     );
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
+        ArenaPageStore::reopen_from_checkpoint(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
             .expect("reattach to the arena")
     } else {
-        let base = bp.disk_manager.high_water().expect("high water") + 32_736;
-        ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
+        let base = opened.bp.disk_manager.high_water().expect("high water") + 32_736;
+        ArenaPageStore::new(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
     });
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
@@ -110,7 +93,10 @@ fn main() {
         store.clone(),
     ));
 
-    let runtime = Arc::new(
+    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
+    // table whose DROP the open completed, as the executor's DROP does (B9). `tests/open_path_allowlist.rs`
+    // holds both entry points to it.
+    let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
@@ -131,6 +117,8 @@ fn main() {
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
+
+    let OpenedDatabase { bp, txn, catalog, .. } = opened;
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));

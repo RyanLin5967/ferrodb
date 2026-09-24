@@ -1520,6 +1520,13 @@ impl SnapshotStore for PageStoreSnapshots {
         // applied onto a page from a different database with nothing to notice it. `truncate`
         // throws the log away whole and restarts it at the current end, which is exactly what a
         // node whose pages are now a checkpoint needs.
+        // The replaced database's release quarantine goes aside with its log (review 6's F6): its
+        // dedupe key has no incarnation, so a line of the replaced database would make a colliding
+        // mismatch of the installed one look already recorded. Before the truncation, so a failure
+        // leaves the install unfinished (its marker stays) rather than the old file current.
+        crate::wal::txn::start_fresh_quarantine(&self.wal.path).map_err(|e| {
+            FerroError::Wal(format!("the install could not move the replaced database's release quarantine aside ({e})"))
+        })?;
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         self.wal.truncate(0)?;
         let after = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);

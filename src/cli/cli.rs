@@ -1,13 +1,12 @@
-use std::{fs::OpenOptions, io, path::Path, sync::Arc};
+use std::{io, path::Path, sync::Arc};
 use std::io::Write;
 use crate::execution::executor::run;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
-use crate::wal::log::WalManager;
-use crate::wal::recovery::{rebuild_indexes, recover};
+use crate::wal::recovery::{open_recovered, OpenedDatabase};
 use crate::wal::txn::TxnManager;
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::TableBranchCatalog;
@@ -17,7 +16,6 @@ use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
 use crate::storage::db_lock::DbLock;
 use crate::tel::DurableEffectLog;
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
 /// Placeholder root recorded for trunk before a real tree exists. `AgentRuntime::with_storage`
 /// replaces it with a page it allocates; `reopen_with_storage` refuses if the recorded root does
@@ -55,27 +53,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // is the only point at which the problem is detectable. Held for the whole session: `_lock`
     // lives to the end of this function and releases on the way out, including on `?`.
     let _lock = DbLock::acquire(Path::new(db_path))?;
-    let existed = Path::new(db_path).exists();
-    let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
-    let dm = Arc::new(DiskManager::new(file)?);
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal.clone());
-    // D212 (a'): REVERT's history store, attached BEFORE recover: the open's catch-up queues the
-    // committed history the store lacks, and the checkpoint below writes it there before it
-    // truncates the log that holds its only other copy.
-    txn.attach_history_store(crate::wal::history::HistoryStore::open_for_database(db_path, existed)?)?;
-    let recovered = recover(&txn)?;
-    let mut catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
-    } else {
-        Catalog::create(bp.clone())?
-    };
-    if recovered {
-        rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
-    }
+    // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
+    // function every binary opens through. This sequence used to be written out here, and
+    // `examples/pgserver.rs` had its own copy that omitted the rebuild.
+    // Kept whole until the runtime exists: the runtime joins it through `attach_runtime` below.
+    let opened = open_recovered(Path::new(db_path), &_lock)?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`
@@ -102,7 +84,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // `reopen_from_checkpoint` refuses rather than guessing a base.
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone(), Path::new(&arena_path))?
+        ArenaPageStore::reopen_from_checkpoint(opened.bp.clone(), branches.clone(), Path::new(&arena_path))?
     } else {
         // The arena owns `[base, inf)` and the ordinary allocator is confined to `[0, base)`, so
         // `base` is a hard ceiling on how far ordinary tables can grow. The first version of this
@@ -114,8 +96,8 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // a database created just now and one that already has pages: an existing database gets its
         // arena above what it has already allocated, still with room to grow. Costs nothing up
         // front - bitmap pages are chained on demand, so a distant floor is only a bound check.
-        let base = bp.disk_manager.high_water()?.saturating_add(arena_headroom());
-        ArenaPageStore::new(bp.clone(), branches.clone(), base)?
+        let base = opened.bp.disk_manager.high_water()?.saturating_add(arena_headroom());
+        ArenaPageStore::new(opened.bp.clone(), branches.clone(), base)?
     });
     // Persist the free-space map whenever the arena claims a new extent, not only at exit. The
     // exit checkpoint below is still worth taking - it captures the final partial extent - but it
@@ -144,7 +126,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // should make no decision. Built once and shared by both arms, which open the same file.
     let effects = DurableEffectLog::default_for_database(db_path)?;
 
-    let runtime = Arc::new(
+    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
+    // table whose DROP the open completed, as the executor's DROP does (B9), or a table re-created
+    // under the name would inherit its authorship. `tests/open_path_allowlist.rs` holds both entry
+    // points to it.
+    let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
@@ -164,6 +150,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
+    let OpenedDatabase { bp, txn, catalog, .. } = opened;
     let mut session = Session::with_runtime(runtime.clone());
 
     // The catalog moves behind a mutex, and is locked for exactly one statement.
@@ -221,10 +208,24 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    txn.checkpoint()?;
+    // Review 2's C2 (the lead's decision): the WAL checkpoint's result is HELD, not returned at once.
+    // It refuses while a release is owed (F2), and returning then skipped the arena checkpoint below,
+    // so the branch tree written this session became unreachable. The arena checkpoint runs whatever
+    // the WAL's returned, and the WAL's error is reported after it.
+    let wal_checkpoint = txn.checkpoint();
     // Persist where the arena starts and what it has allocated. Without this the next open finds
     // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    store.checkpoint(Path::new(&arena_path))?;
+    // HELD too (review 3's caveat 4): returned at once, a failure here skipped the counters below and
+    // dropped the WAL's error. Both errors are reported; the WAL's is returned first.
+    let arena_checkpoint = store.checkpoint(Path::new(&arena_path));
+    if let Some(line) = crate::wal::txn::failure_counters_line() {
+        eprintln!("{line}");
+    }
+    if let (Err(_), Err(a)) = (&wal_checkpoint, &arena_checkpoint) {
+        eprintln!("ferrodb: the arena checkpoint failed as well ({a})");
+    }
+    wal_checkpoint?;
+    arena_checkpoint?;
     println!("bye bye");
     Ok(())
 }
