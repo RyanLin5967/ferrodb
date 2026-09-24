@@ -4549,6 +4549,9 @@ mod f1_lease_grace {
         let _slept = wall_step::by(S as i64);
         // An hour left — less than S — when the file was last written, at wall time t + S.
         // A catalog no D198 build wrote (PREREG amendment 11): the file time is its only evidence.
+        // Review 4, C7(b): a pre-D198 writer's lease clock IS the wall clock, so this lagging
+        // writer is not a schedule it can reach; the test pins the arithmetic of the resume's wall
+        // half (M35's killer), and E1's test covers a D198 writer whose clock lagged.
         let b = {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             let b = c.fork(BranchId::TRUNK, LeaseDeadline(t + HOUR)).unwrap().branch_id;
@@ -4878,13 +4881,21 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **Review 3, C4: an unresumed writer's own run is not downtime; the outage before it is.** A
-    /// process that writes an unmarked catalog and never resumes it — an embedder with no lease
-    /// thread, or a first start that fails before its resume — replaces the file's mtime with its
-    /// own. The credit owed at the next resume is the outage BEFORE that process plus the time
-    /// SINCE its last write, and not its run in between. Here: four hours before it, a two-hour run
-    /// (placed on the wall clock by the mtime and a thread-local step), one hour since. Owed: five.
-    /// Red against `1ec2deb`, which credits only since the last write, on the lease clock.
+    /// **Review 3, C4: the outage before an unresumed writer is kept.** A process that writes an
+    /// unmarked catalog and never resumes it — an embedder with no lease thread, or a first start
+    /// that fails before its resume — replaces the file's mtime with its own. The credit owed at
+    /// the next resume is the outage BEFORE that process plus the time SINCE its last commit.
+    ///
+    /// **Re-staged after review 4 (C7(c); PREREG amendment 12) with consistent clocks.** Its first
+    /// staging put a two-hour writer run and a one-hour gap on the wall clock only, so its lower
+    /// bound required the resumer's 3 h wall-over-lease lag as credit — the over-credit the design
+    /// names, not a property. Here every interval is the same on both clocks: a pre-D198 authority
+    /// wrote four hours ago; the writer opens, commits and stops (its run is the milliseconds
+    /// between readings `t0` and `t1`); the next start resumes an hour after `t1`, with its wall
+    /// clock stepped the same hour. Owed: the time from the authority's write to the writer's open,
+    /// plus the hour. That the writer's run is never credited, however long, is
+    /// `the_soft_mark_is_the_last_commit_…`'s to pin. Red against `1ec2deb`, which credits only
+    /// since the last write.
     #[test]
     fn the_downtime_before_an_unresumed_writer_is_kept_and_its_own_run_is_not_credited() {
         use crate::cluster::wall_step;
@@ -4899,33 +4910,36 @@ mod f1_lease_grace {
             c.as_written_before_d198().unwrap();
             b
         };
-        age_file(&path, t - 4 * HOUR);
+        let m_prev = t - 4 * HOUR;
+        age_file(&path, m_prev);
+        let t0 = LeaseDeadline::now_millis();
         {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             assert_no_d198_keys(&c);
             c.set_root(BranchId::TRUNK, 1).unwrap();
         }
-        // The writer's last write, two hours into its run; then an hour with nothing running.
-        age_file(&path, t + 2 * HOUR);
-        let _later = wall_step::by(3 * HOUR as i64);
+        let t1 = LeaseDeadline::now_millis();
+        // The next start: an hour after the writer's last commit, on both clocks.
+        let now = t1 + HOUR;
+        let _later = wall_step::by(HOUR as i64);
 
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-        let now = LeaseDeadline::now_millis();
-        let w0 = wall_now_millis() + 3 * HOUR;
         c.resume_leases(now).unwrap();
-        let w1 = wall_now_millis() + 3 * HOUR;
+        let t_after = LeaseDeadline::now_millis();
         let lease = c.enforced_lease(b).unwrap().expect("a live lease").0;
+        // The writer's open and its soft mark both lie in [t0, t1] on its lease clock. 2000 ms
+        // covers wall/lease skew and mtime granularity in the file term.
         let (lo, hi) = (
-            lapsed + 4 * HOUR + (w0 - (t + 2 * HOUR)),
-            lapsed + 4 * HOUR + (w1 - (t + 2 * HOUR)) + 2_000,
+            lapsed + (t0 - m_prev) + HOUR,
+            lapsed + (t1 - m_prev) + HOUR + (t_after - t0) + 2_000,
         );
         assert!(
             (lo..=hi).contains(&lease),
-            "credited {} ms; owed four hours before the unresumed writer plus {}..{} ms since its \
-             last write, and nothing for its run",
+            "credited {} ms; owed between {} and {} ms: the time before the unresumed writer, and \
+             an hour since its last commit",
             lease.saturating_sub(lapsed),
-            w0 - (t + 2 * HOUR),
-            w1 - (t + 2 * HOUR)
+            lo - lapsed,
+            hi - lapsed
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -4983,8 +4997,10 @@ mod f1_lease_grace {
     /// is credited, so the lease keeps what it had.
     ///
     /// Emulated in one process: the embedder's lease clock is this process's; its wall clock is
-    /// expressed by the mtime `t + S`; the next start's `now` and wall clock are both `S + 10 s`
-    /// later. Red against `bf15efb`, which credits the file's 10 s.
+    /// stepped `S` ahead while it opens, forks and commits (review 4, C2: so a soft mark stamped
+    /// with the WALL clock reads `t + S` and credits only 10 s — the test tells the two apart), and
+    /// the mtime is set to match; the next start's `now` and wall clock are both `S + 10 s` later.
+    /// Red against `bf15efb`, which credits the file's 10 s.
     #[test]
     fn an_unmarked_writer_whose_lease_clock_lagged_keeps_its_leases_across_the_next_start() {
         use crate::cluster::wall_step;
@@ -4993,6 +5009,7 @@ mod f1_lease_grace {
         let path = sidecar("e1-slept-embedder");
         let t = LeaseDeadline::now_millis();
         let b = {
+            let _slept = wall_step::by(S as i64);
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             c.fork(BranchId::TRUNK, LeaseDeadline(t + LEFT)).unwrap().branch_id
         };
