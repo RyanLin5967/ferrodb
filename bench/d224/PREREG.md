@@ -545,3 +545,131 @@ K now asserts that `n.transport_counters()`'s `idle_probes` and `idle_redials` E
 | N7, N8 | node | K, at the equality |
 | **N9** | transport | **T** only |
 | **N10** | transport | **SURVIVES**, a known survivor (amendment 6, G4). A kill is an unregistered result, and it is reported as one |
+
+---
+
+## Amendment 8 — review 3's R1–R5, written BEFORE their code (nothing built)
+
+Source: `artie-research frontier/d224_review3.md` @ `68e5a9d`, a review of `49ba420..c797187`, verdict
+SOUND-WITH-CAVEATS. Its findings: the merge equals git's own; K cannot race; G2's retractions are complete; and no
+code line in `transport.rs` changed after `bf1fd63`. The rest corrects registrations and claims, adds one test,
+strengthens K, and registers three mutants. The only changes to `transport.rs` are to comments.
+
+### R1: T also kills N1–N4. Corrected kill sets (before any run)
+
+T joined the transport module at `bdf6b0e`, and N1–N6 run on that module. Traced by review 3 (INFERRED):
+
+- N1 and N3 lose the frame, so T fails at `got`.
+- N2 probes the carried frame again on the fresh link, so T fails at `idle_probes − probes == 1` (it is 2).
+- N4 drops the frame, so T fails at `got`.
+
+With test L (below) added, the full table reads:
+
+| mutant | fails (transport module unless noted) |
+|---|---|
+| N1 | I, P, H, **T**, **L** |
+| N2 | B, P, `a_broken_connection_is_reconnected_and_the_frame_lost_to_it_is_counted`, **T** |
+| N3 | I, P, H, **T**, **L** |
+| N4 | I, P, H, **T**, **L** |
+| N5 | B |
+| N6 | H |
+| N7, N8 | K (node module) |
+| N9 | T |
+| **N10** | **L** (no longer a survivor; see R2) |
+| **N11**, **N12** | K (node module; see R3) |
+
+- **L under N1–N4.** Under N1, N3 and N4, L's frame never arrives on a second connection. Under N1 and N3, the write
+  into the reset link fails, is counted, and drops the frame, and the redial then carries nothing. Under N4, the
+  frame is dropped at the probe.
+- **L under N2:** it passes. The second probe on the fresh link finds it alive, and L asserts only redials +1 and
+  `lost_in_flight` 0, as H does.
+- **Where this table supersedes older ones:** amendment 2's table, A7's "N1–N6 as amendment 2", lane §3 and §4, item
+  (d) of the FAN-QUEUE row, and the run script's comments.
+
+### R2: N10 is killable. Test L, and the "not portable" reason retracted
+
+- **Retracted** (append-only): amendment 6's G4 reason, "a reset at the probe is not portable to produce". The same
+  reason sits in `make_mutants.py`'s N10 comment and in lane §4. The repo already produces a reset on close with no
+  dependency: `a_peer_that_resets_before_accept_cannot_fill_the_connection_cap` sets `SO_LINGER {1, 0}` through an
+  `extern "C" setsockopt` (`tests_transport.rs:2054-2104`, READ).
+- **L** = `a_link_the_peer_reset_is_redialled_after_an_idle_gap`, additions only. It is H's shape, with a reset in
+  place of the refusal:
+  - the hand-rolled peer reads all six of A's bytes, writes its handshake, sets `SO_LINGER {1, 0}`, and drops the
+    socket, which sends a reset and no FIN;
+  - after 600 ms (gate 150 ms), ONE send must arrive on a second connection, with `idle_redials` +1 and
+    `lost_in_flight` 0.
+- **How `peek` sees it** (INFERRED from memory of both stacks, as review 3 says): `peek` returns an error on both
+  XNU and Linux. XNU returns the pending `so_error`; Linux returns `sk_err`, since no FIN set `SOCK_DONE`. The fix takes
+  the `Err` arm and redials. Under N10 the probe calls the link alive, and the write into the reset socket fails and
+  drops the frame.
+- **Platforms: `cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64",
+  target_arch = "aarch64"))))`**, with each platform's own constants:
+  - macOS: `SOL_SOCKET` `0xffff`, `SO_LINGER` `0x80`, as the existing test uses;
+  - Linux's asm-generic values: 1 and 13.
+
+  `struct linger` is two `int`s on both. Other targets, Windows among them, do not compile L, so N10 is scored on
+  macOS and Linux only.
+
+### R3: K ends with UNEQUAL meters
+
+K ended with `idle_probes == idle_redials == 1`, so a `counters()` that swapped the two, or filled one from the other,
+passed its equality. K's fixture now leaves **probes ≥ 2 and redials 1** (a registered test change, since K has never
+run):
+
+1. The node's link to 2 stays OPEN through a first poll past the gate. Its first frame is probed, found alive and
+   written. The test reads that frame from `c1` to prove it, and drains the rest.
+2. Then `c1` closes. After another gap past the gate, a second poll campaigns again. That frame is probed, finds the
+   close, and redials.
+
+- **Premise:** `n.net.idle_redials() ≥ 1`, and `n.net.idle_probes() > n.net.idle_redials()`, both read from the
+  transport. The meters must differ, or a swap would pass.
+- **Assertion:** unchanged. The snapshot equals the direct readings, bracketed.
+- **Mutants (the node module):**
+  - **N11 `counters_swap_probes_and_redials`**, the two fields swapped in `counters()`;
+  - **N12 `counters_redials_read_from_probes`**, `idle_redials: self.idle_probes()`.
+
+  K fails both at the equality. N7 and N8 still fail it too.
+
+### R4: the claim "never a false red on the fix" is corrected, and T's comment with it
+
+- **The gate measures from A's REFRESH, not A's write.** `last_used = Instant::now()` runs only after `write_all`
+  returns. B's 1 s clock starts when B finishes reading that frame, which on loopback is usually before A's refresh.
+- **So the fix can fail T in two narrow windows** (INFERRED):
+  - **Route 1:** A's refresh comes more than about 300 ms after B's read, from a stall or a SIGSTOP between the
+    write returning and the refresh. Nothing is probed, and T fails with `idle_probes +0`.
+  - **Route 2:** A's kernel has not processed B's FIN by the end of the 300 ms settle. T fails with
+    `idle_probes +1, idle_redials +0`.
+- Every other stall widens the gap, and can only make N9 survive falsely.
+- **Amendment 6's "load can only widen it" and "never a false red on the fix" are retracted.** A T failure is read
+  by its message, as above.
+- **T pins the gate below about 0.65 D, not at D/2** (1.3 s against D = 2 s). A gate of 0.6 D would pass T and still
+  break the stated tolerance.
+
+**Also corrected, comments only** (review 3's INFO):
+
+- **"Two frames" is a lower bound.** Every write made before the peer's reset reaches this socket is lost uncounted,
+  and only the first after it is counted. The module header and `idle_probe_gap` will say "at least two". The
+  retransmission bound still covers this.
+- **The re-campaign citation.** `voter_tick` is at `election.rs:53-61`, not `:52-60`. It campaigns only when
+  `may_campaign()`; otherwise no campaign was due, so no lost frame goes unresent. The doc gains the condition.
+
+### R5: 2579 WAS measured; 2614 is a macOS figure
+
+- **Retracted:** amendment 6's and amendment 7's "(the base is D207's, never measured)".
+- READ: `/Users/idide/wt/logs/lead-land-0924/verify-d187-9e76a4c/SUMMARY.txt` says
+  `mode=per-target rc=0 passed=2579 failed=0 build_errors=0 head=9e76a4c`.
+- `git diff --quiet 9e76a4c 9aa6968` exits 0, so that is main's tree, measured on this Mac.
+- **Per-target at the new tip (predicted), and how the delta is built:**
+  - 2579 + 35 + L = **2615 on macOS**.
+  - Linux x86_64 and aarch64: 2614. D207's macOS-only test drops out, and L stays in.
+  - Other targets: 2613.
+  - K's changes add no test.
+
+### Run G4 at the new tip (predicted)
+
+| module | macOS | notes |
+|---|---|---|
+| transport | 63 + L = **64** | 63 on Linux x86_64 and aarch64 |
+| node | 14 | K strengthened, no test added |
+| log | 58 | |
+| replicate | 60 | |
