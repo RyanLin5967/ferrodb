@@ -5769,4 +5769,82 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&staging);
     }
+
+    /// **D232 review 4 B2: the image charges exactly its own extents' pages, whatever the counter
+    /// says.** `state_bytes` wrote `reserved` from the `reserved_pages` atomic, so the image agreed
+    /// with the extents it lists only while every change to the atomic sat in the same `state`
+    /// hold as the extent it counts. `load_state` and the tail replay change it after their hold,
+    /// and a reader holding only `state` could serialise that gap. The field is now summed over
+    /// the extents the image lists. The counter is knocked out of step here, which is what such a
+    /// reader saw.
+    #[test]
+    fn d232_the_image_charges_exactly_its_extents_pages_whatever_the_counter_says() {
+        let h = Harness::new();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let b = h.store.alloc_arena(x).unwrap();
+        let extents_hold: u32 =
+            [a, b].iter().map(|arena| h.store.extent_range(*arena).unwrap().1).sum();
+        assert_eq!(
+            h.store.reserved_page_count(),
+            extents_hold,
+            "fixture: the store holds extents other than the two claimed here"
+        );
+
+        h.store.reserved_pages.fetch_add(7, Ordering::SeqCst);
+        let image = h.store.state_bytes();
+        // The header: version u8, base u32, extent watermark u32, arena watermark u32, live u32,
+        // then reserved u32 at bytes 17..21.
+        let charged = u32::from_be_bytes(image[17..21].try_into().unwrap());
+        assert_eq!(
+            charged, extents_hold,
+            "D232 review 4 B2: the image charged {charged} reserved pages, and the extents it \
+             lists hold {extents_hold}"
+        );
+    }
+
+    /// **D232 review 4 B2, the load half: a loaded image charges exactly its extents' pages.**
+    /// Review 2 F1 wrote images whose `reserved` was short by the claim's own extent, and
+    /// `load_state` stored the field as it found it, so the restored count was short for the life
+    /// of the process. It now counts the extents it loads. The field is patched short by one
+    /// extent here, the shape F1 left on disk, and re-checksummed so the image still opens.
+    #[test]
+    fn d232_a_loaded_image_charges_exactly_its_extents_pages() {
+        let h = Harness::new();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let b = h.store.alloc_arena(x).unwrap();
+        let a_pages = h.store.extent_range(a).unwrap().1;
+        let b_pages = h.store.extent_range(b).unwrap().1;
+        let good = h.store.state_bytes();
+        assert_eq!(
+            u32::from_be_bytes(good[17..21].try_into().unwrap()),
+            a_pages + b_pages,
+            "fixture: the unpatched image does not charge exactly the two extents"
+        );
+
+        let body = good.len() - 4;
+        let mut short = good[..body].to_vec();
+        short[17..21].copy_from_slice(&a_pages.to_be_bytes());
+        let crc = crc32(&short);
+        short.extend_from_slice(&crc.to_be_bytes());
+
+        let from_short = h.fresh_store();
+        from_short.load_state(&short).expect("fixture: the patched image must still open");
+        assert_eq!(
+            from_short.reserved_page_count(),
+            a_pages + b_pages,
+            "D232 review 4 B2: the loaded store charged {} reserved pages, and the extents it \
+             loaded hold {}",
+            from_short.reserved_page_count(),
+            a_pages + b_pages
+        );
+        let from_good = h.fresh_store();
+        from_good.load_state(&good).unwrap();
+        assert_eq!(
+            from_short.state_bytes(),
+            from_good.state_bytes(),
+            "D232 review 4 B2: a store loaded from the short image writes a different image"
+        );
+    }
 }
