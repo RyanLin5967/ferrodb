@@ -306,10 +306,12 @@ fn the_idle_probe_meters_are_readable_from_a_running_node() {
     // added two: `idle_probes` and `idle_redials`. They are the only count of the probe, so they must
     // reach a running node's snapshot.
     //
-    // Peer 2 is a hand-rolled listener. It completes the node's handshake and then closes, as an idle
-    // close does. The node sends nothing until it is polled, so its link to 2 sits idle past the
-    // probe gate. One poll then makes it campaign, and its first frame to 2 is probed, finds the
-    // close, and redials.
+    // Peer 2 is a hand-rolled listener, and the node sends nothing until it is polled, so its link to
+    // 2 sits idle past the probe gate whenever the test waits. Two probes, one redial: first the link
+    // is still OPEN, so a poll's first frame is probed and written; then it is closed, so the next
+    // poll's first frame is probed, finds the close, and redials. The two meters then differ, which
+    // is what lets the equality below catch a snapshot that swaps them or fills one from the other
+    // (D224 review 3).
     use std::io::{Read, Write};
     let dir = tempfile::tempdir().unwrap();
     let peer = listener();
@@ -332,24 +334,40 @@ fn the_idle_probe_meters_are_readable_from_a_running_node() {
     let mut ours = Vec::new();
     crate::replication::write_handshake(&mut ours).unwrap();
     c1.write_all(&ours).unwrap();
-    // Everything the node sent has been read, so this close is a FIN, not a reset.
+
+    // --- 1. past the gate, the link still OPEN: the probe finds it alive -----------------------
+    std::thread::sleep(Duration::from_millis(400));
+    n.next_tick = Instant::now() - Duration::from_millis(50);
+    n.poll(Duration::ZERO).unwrap();
+    // The campaign's first frame arrives here, so the probe in front of it found the link alive.
+    let mut head = [0u8; 5];
+    c1.read_exact(&mut head).expect("the campaign frame should arrive on the open link");
+    assert_eq!(head[0], crate::replication::CONSENSUS_TAG);
+    let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; len];
+    c1.read_exact(&mut body).unwrap();
+    // Drain whatever else that poll sent, so the close below is a FIN rather than a reset.
+    c1.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut rest = [0u8; 4096];
+    while matches!(c1.read(&mut rest), Ok(k) if k > 0) {}
+    assert_eq!(n.net.idle_redials(), 0, "the probe of an open link redialled");
     drop(c1);
 
-    // Past the gate, with room for the FIN to reach the node's kernel before the probe.
+    // --- 2. past the gate again, the link CLOSED: the probe finds the close and redials -------
     std::thread::sleep(Duration::from_millis(400));
     n.next_tick = Instant::now() - Duration::from_millis(50);
     n.poll(Duration::ZERO).unwrap();
 
     // The premise, read from the transport itself rather than through the snapshot under test.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && (n.net.idle_probes() == 0 || n.net.idle_redials() == 0) {
+    while Instant::now() < deadline && n.net.idle_redials() == 0 {
         std::thread::sleep(Duration::from_millis(10));
     }
+    let (probes, redials) = (n.net.idle_probes(), n.net.idle_redials());
     assert!(
-        n.net.idle_probes() >= 1 && n.net.idle_redials() >= 1,
-        "the probe never fired and redialled (probes {}, redials {}), so this tests nothing",
-        n.net.idle_probes(),
-        n.net.idle_redials()
+        redials >= 1 && probes > redials,
+        "the fixture did not leave two different non-zero meters (probes {probes}, redials \
+         {redials}), so a swapped snapshot would pass"
     );
 
     // EQUAL, not merely nonzero: the snapshot must be the transport's own meters. A snapshot taken
