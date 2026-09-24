@@ -991,3 +991,77 @@ moved `runs = M` and `a = 0` to READ. The lead's decisions on C1–C7, and what 
    targets stop below one interval), the run prints NOT A RESULT naming that. The judge was never moved, so a run
    that exits 0 cannot be read as the fire having happened. The (e) command's M targets (64, 128) would do exactly
    this, which is why `ckpt-ddl` runs as (f3).
+
+**A14, 2026-09-24, before any build or run. Review 6 of `94413b1..1a59386` (artie-research
+`frontier/read_vs_n_review6.md` @ `2c08024`) returned UNSOUND on one defect (U1), with everything else in A13 sound.
+The lead's decisions on U1, U2 and C2–C5, and what changes:**
+
+1. **U1: `ckpt-ddl`'s injection check asserted a false premise. It is replaced by the state that moves the judge.**
+   * **The defect.** The check required `base1 != base0`. Right after `reopen_for_merges` the log is EMPTY past its
+     base: the open's own checkpoint runs in a new `TxnManager` whose declaration lists are empty (D227), and nothing
+     appends before the fire. So the DDL's truncation stores the base it already had, and (f3) would have panicked
+     "did not inject" before any merge. A13.1's `base_moved=1` and "rc = 0" were unreachable. The printed
+     `base_moved=1` was a literal, so no run could have shown otherwise.
+   * **The injection itself was right.** The record is retained, and the intercept is exactly D = 59 (review 6 §1a,
+     §1b).
+   * **The new check** (`ckpt-ddl`, before any merge):
+     * look up `ckpt_ddl`'s `first_directory_page_id` under the catalog lock;
+     * require `txn.retained_shape(dir_root).is_some()`, i.e. the record sits in `schema_log`, which is what every
+       later checkpoint re-appends;
+     * require `bytes_past_base > 0`.
+     * Either failing panics "did not inject". `past > 0` alone would also pass for a bare, unretained append, and
+       retention is what moves the judge.
+   * **`base_moved` is now COMPUTED** (1 when the base moved across the DDL, else 0), and the line also prints
+     `retained=1`.
+   * **Pre-registered for (f3): `CKPT-DDL base_moved=0 retained=1 bytes_past_base=59`**, and rc = 0. Everything else
+     in A13.1 stands: the CKPT totals 35899 and 71739, the fit's intercept 59.0, and the verdict script's A12.1 rule
+     failing.
+   * **`base_moved=0` also witnesses D227** ("the reopen leaves nothing past the base"). D227's fix would flip it to 1,
+     and would change A12.1's `a = 0` and `runs = M` for every run. Such a change is a finding to amend, not a
+     failure of this fire.
+2. **U2: arm 3's time slopes and R5's magnitude are REPORTED, not judged.**
+   * **The defect in A13.3's premise.**
+     * R5-slope and R8-slope are OLS fits over one child open at each of N = 64,000, 256,000 and 10^6. The middle
+       point carries 0.6% of an endpoint's weight, so each is a two-point slope.
+     * "±70%" held only for a true slope of exactly 1.0. The band is also R5's model uncertainty: D65 run 4 measured
+       its analogue at 1.10.
+     * This box's 1-min load reached 3.67× its median in D65 run 4. So a spike at the 64,000 endpoint can make a
+       superlinear wall read as LINEAR.
+   * **Withdrawn from judgment:** R5-slope, R8-slope and R5-mag (`lease_start` at 10^6 in [10, 90] s). Each is
+     printed and reported.
+   * **Still judged:**
+     * the O(N) claim, exactly, by R1–R3 (`open_sweep_visits` = N + 1, `sweep_descents` = visits, first-pass visits =
+       N + 1);
+     * R6 and R8-share, which are ratios within one child open;
+     * A9.1's rebuild band;
+     * R7;
+     * G7, which fails conservatively.
+   * **The load flag, pre-registered BEFORE the run.** It is the same threshold as D65's L2.
+     * The child reads the 1-minute load average at its start (before the open) and at its end (after the close). It
+       uses `/proc/loadavg`, or `sysctl -n vm.loadavg` where that is absent, the same reader as
+       `examples/d97_attestation.rs`.
+     * It prints both, ×100 as integers, on its `RESTART_RESULT` line: `load_start_centi` and `load_end_centi`
+       (u64::MAX when unavailable).
+     * The arm-3 summary prints both per row, plus **`L2`**: 1 when the row's larger reading exceeds **1.5 × the median
+       of every reading in the run**, else 0.
+     * A reported slope whose endpoint row carries `L2 = 1` is read as load-contaminated. This is a flag, never a
+       guard.
+   * **Arm 1's CLASS is judged on `slope(ratio)`, not on raw branch ns** (the lead's option, taken). The ratio is
+     branch over control at the same moment, already printed. Under G7's admitted 1.5× drift, a raw slope over
+     16,000…10^6 can move by up to ln 1.5 / ln 62.5 ≈ 0.098, against a < 0.3 threshold whose predicted value is
+     ≤ ~0.2.
+     * The class band is unchanged: < 0.3 on the saturated segment.
+     * The raw `slope(branch)` is reported.
+     * The knee [4, 25] and the resident magnitude [5, 60] µs stay as registered, under G7.
+3. **C2: the header prints the interval the ENGINE uses.** `wal::txn::checkpoint_interval()` becomes `pub`, a
+   visibility change only, and the header prints its value beside the raw environment variable. Before, a `0`, which
+   the engine maps to 1, or an unparseable value, which falls back to 256, printed verbatim.
+4. **C3: `typ ns ± SE` is a WITHIN-BLOCK standard error.** It is sd/√n over consecutive merges of one block. It is not
+   a noise floor for comparing rows, since between-block drift is outside it. The legend says so. It is reported
+   only.
+5. **C4: `RUN DIR` is printed after `RemoveOnDrop` is armed.** A failed stderr write can then no longer leak the empty
+   directory. (f0)'s criterion is unchanged: the line is absent on a refusal.
+6. **C5: the stale "guard" wordings are fixed.**
+   * `Fire::needs`'s doc now reads "the arm this mode needs".
+   * The refusal now reads "it needs the <arm> arm, which CURVE_ARMS does not run". So (f0)'s expected texts are
+     `is refused: it needs the Merge arm` / `Read arm` / `Restart arm`.
