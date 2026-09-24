@@ -1445,7 +1445,10 @@ impl BufferPoolManager {
     ///
     /// **D216: a page with no LSN waits for the log up to [`Frame::wal_mark`].** Index pages are not
     /// logged, and their LSN field is always 0 (nothing in `storage::index` sets it); `page_lsn_of`
-    /// reads no LSN from any other page type either. This gate used to skip all of them. But an
+    /// reads none from a catalog or directory page either. (It does read one from an arena page
+    /// whose first byte, the high byte of its birth epoch, is 0: bytes 11..19 of a copy-on-write
+    /// header, which are not an LSN. That predates D216, and arena pages are not the trees
+    /// `rebuild_indexes` rebuilds.) This gate used to skip all of these. But an
     /// index leaf's contents still depend on logged changes: it holds the key of every row inserted
     /// under it, and each such row's `HeapInsert` is appended BEFORE the leaf changes (heap first, in
     /// `execution::insert` and `execution::update`). So an eviction could write a leaf holding an

@@ -21,19 +21,24 @@ use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, 
 /// the WAL header catches up only at a checkpoint.
 ///
 /// A loser whose records are all transaction control undoes nothing, so it does not count either.
-/// That is sound on three conditions:
-/// - no page the buffer pool writes back reaches the disk before the log records it depends on:
-///   `BufferPoolManager::wal_gate`, against `Frame::wal_mark` for a page with no LSN of its own;
+/// That is sound on four conditions:
+/// - no heap, index or catalog page of a table reaches the disk before the log records it depends
+///   on: `BufferPoolManager::wal_gate`, against `Frame::wal_mark` for a page with no LSN of its own;
 /// - a record `WalManager::flush_up_to` reports durable IS durable. Until the D216 adversary's F1
 ///   it skipped a record that started exactly at the flushed point;
 /// - every index write outside DDL follows the heap record it indexes. `execution::insert` and
 ///   `execution::update` write the heap first, and D202's rollback undo (`TxnManager::abort`)
-///   takes back entries whose heap records were appended before it.
+///   takes back entries whose heap records were appended before it;
+/// - no transaction writes between a checkpoint's check for active transactions and its
+///   truncation, which would discard that transaction's records. `TxnManager::checkpoint` holds
+///   the check only briefly, so this rests on statements being serialised per database (the
+///   PRECONDITION on `TxnManager::undo_primary_writes`).
 ///
 /// Together they mean that an index page on disk carrying a transaction's change implies the
-/// change's heap record is in the log. (`rebuild_indexes` writes trees with no record at all, but
-/// it runs only when this function or the marker has already asked for it, and until its
-/// checkpoint completes the same trigger is still there for the next open.)
+/// change's heap record is in the log. (`rebuild_indexes` writes trees with no record at all. It
+/// runs only when this function or the marker has already asked for it, and until its checkpoint
+/// completes, the same trigger is still there for the next open. That makes the next open rebuild
+/// again; it does not make a rebuild interrupted part-way safe to walk, which predates D216.)
 ///
 /// Not covered, and never covered by more than coincidence:
 /// - A crash inside a DDL statement. DDL is not logged, and no DDL here is crash-atomic (the ALTER
@@ -46,6 +51,9 @@ use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, 
 ///   (`replication::backup::restore`) or an installed snapshot (`consensus::snapshot`). Their index
 ///   pages are a copy taken while the source was running, and the redo window that makes their
 ///   heap consistent replays heap records only.
+/// - A streaming replica. `replication::ReplicaApplier` redoes the primary's heap records into this
+///   pool and writes no index page and no local log record, so nothing here says its trees are
+///   behind its heap.
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
     // read whole log
