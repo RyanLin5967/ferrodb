@@ -804,6 +804,57 @@ fn an_install_moves_the_replaced_databases_release_quarantine_aside() {
     assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), old, "the replaced database's evidence was not kept");
 }
 
+/// An install moves the replaced database's drop intent aside (D229 review 2's F11; PREREG amendment
+/// 16), with its release quarantine, as one fresh-database transition.
+///
+/// An intent pending at the install names page ids of the REPLACED database. Left at its path, the next
+/// open would adopt it, find its table absent from the installed catalog, and free those ids after its
+/// checkpoint: live pages of the installed database, the alias D229 exists to prevent. Moved aside, not
+/// deleted: it is evidence.
+#[test]
+fn an_install_moves_the_replaced_databases_drop_intent_aside() {
+    use ferrodb::consensus::snapshot::{SnapshotPoint, SnapshotStore};
+    use ferrodb::storage::atomic_file::OsFileOps;
+    use ferrodb::wal::free_intent::{intent_path, store, FreeIntent};
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    seed_pages(&from_engine, 3, 0x2A);
+
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 2, 0x5B);
+    let intent = intent_path(&to_engine.wal.path);
+    store(&OsFileOps, &to_engine.wal.path, &[FreeIntent { table: "replaced".into(), dir_root: 3, pages: vec![3, 4, 5] }])
+        .expect("an intent of the replaced database");
+    let old = std::fs::read(&intent).unwrap();
+
+    let at = SnapshotPoint {
+        last_round: 3,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    to.install(&snap.meta, &spool).expect("install failed");
+
+    assert!(
+        !intent.exists(),
+        "the install kept the replaced database's drop intent at its path, so the next open would free its \
+         pages under the installed database"
+    );
+    let prefix = format!("{}.before-", intent.file_name().unwrap().to_string_lossy());
+    let aside: Vec<PathBuf> = std::fs::read_dir(dst.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+        .collect();
+    assert_eq!(aside.len(), 1, "the replaced database's intent was not moved aside once: {aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), old, "the replaced database's evidence was not kept");
+}
+
 /// A node whose storage was left part-way through an install refuses to start.
 ///
 /// Three files are replaced and no rename sequence makes them land together, so the dangerous state

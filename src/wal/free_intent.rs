@@ -246,4 +246,31 @@ mod tests {
         assert!(!intent_path(&wal).exists(), "no intents left, and the file is still there");
         assert_eq!(load(&wal).unwrap(), Vec::new());
     }
+
+    /// **A fresh log moves an earlier database's drop intent aside** (D229 review 2's F11; PREREG
+    /// amendment 16). A log of length 0 is a new database at this path, and an intent left beside it
+    /// names the earlier database's page ids: the next open would adopt it, find its table absent from
+    /// the new catalog, and free those ids under the new database. Moved, not deleted: it is evidence.
+    #[test]
+    fn a_fresh_log_moves_an_earlier_databases_drop_intent_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("x.wal");
+        store(&OsFileOps, &wal, &[intent("t", 7, &[7, 8, 9])]).unwrap();
+        let old = std::fs::read(intent_path(&wal)).unwrap();
+        assert!(!wal.exists(), "premise: the log already exists, so the open below is not a new database");
+        let _log = crate::wal::log::WalManager::new(wal.clone()).expect("open a fresh log");
+        assert!(
+            !intent_path(&wal).exists(),
+            "a fresh log kept the earlier database's drop intent at its path, so the next open would free those \
+             pages under the new database"
+        );
+        let prefix = format!("{}.before-", intent_path(&wal).file_name().unwrap().to_string_lossy());
+        let aside: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(aside.len(), 1, "the earlier intent was not moved aside once: {aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), old, "the earlier intent's evidence was not kept");
+    }
 }

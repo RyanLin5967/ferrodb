@@ -2141,3 +2141,73 @@ fn a_page_its_heap_lists_before_its_own_image_reached_the_disk_opens_as_an_empty
         panic!("a heap page its directory lists on disk before the page's own image: {e}");
     }
 }
+
+/// **`table_pages` of a FILLED table is what the oracle walks, and a heap-side alias is refused** (D229
+/// review 2's R6; PREREG amendment 16). The catalog unit test uses an empty table, one page per
+/// structure, so its equality cannot see a walk that skips directory entries, chain links, child
+/// pointers or the leaf chain, and it plants only a tree-side alias. Here: the fixture's `t`, 400 rows,
+/// every tree with internal nodes, and a time-travel heap given pages by an UPDATE. Then two plants, each
+/// on a fresh boot of the same image:
+/// 1. `t`'s time-travel ROOT listed in `t`'s heap directory: the time-travel walk then reaches a
+///    directory page already named (`HeapFileManager::collect_pages`' first refusal; M25 disables it);
+/// 2. one of `t`'s heap data pages listed a second time (its second refusal; M26 disables it).
+///
+/// Blind spot, stated: an alias ACROSS tables is not refused. `table_pages` walks one table, and no page
+/// records its owner, so a check would need every other table walked.
+#[test]
+fn table_pages_of_a_filled_table_is_what_the_oracle_walks_and_refuses_a_heap_side_alias() {
+    let m = Machine::boot(fixture(), None);
+    {
+        let mut d = m.open().expect("open the fixture");
+        must(&mut d.o, &mut Session::new(), "UPDATE t SET w = 'changed' WHERE id < 40;");
+        d.o.txn.checkpoint().expect("the checkpoint after the UPDATE");
+        let r = walk(&d.o).expect("walk");
+        assert!(r.twice.is_empty(), "premise: the oracle's walk reaches a page twice: {:?}", &r.twice[..r.twice.len().min(4)]);
+        assert!(
+            r.owner.values().any(|by| by == "t's time-travel heap"),
+            "premise: t's time-travel heap lists no page after the UPDATE, so the equality below does not cover it"
+        );
+        let walked = pages_of(&d.o, "t").expect("walk t");
+        let named: BTreeSet<u32> = d.o.catalog.table_pages("t").expect("t's pages").into_iter().collect();
+        assert_eq!(
+            named,
+            walked,
+            "table_pages of a filled table is not what the oracle walks: only table_pages names {:?}, only the walk {:?}",
+            named.difference(&walked).take(5).collect::<Vec<_>>(),
+            walked.difference(&named).take(5).collect::<Vec<_>>()
+        );
+    }
+    let image = m.snapshot();
+
+    let m1 = Machine::boot(&image, None);
+    {
+        let d = m1.open().expect("open the image for plant 1");
+        let e = d.o.catalog.get_table("t").expect("t").clone();
+        HeapFileManager::open(e.first_directory_page_id, d.o.bp.clone())
+            .add_to_directory(e.time_travel_root, 0)
+            .expect("plant t's time-travel root in t's heap directory");
+        let refused = d.o.catalog.table_pages("t");
+        assert!(
+            refused.is_err(),
+            "table_pages collected t's time-travel root once, although t's heap directory lists it as a data page too"
+        );
+    }
+
+    let m2 = Machine::boot(&image, None);
+    {
+        let d = m2.open().expect("open the image for plant 2");
+        let e = d.o.catalog.get_table("t").expect("t").clone();
+        let data = walk(&d.o)
+            .expect("walk")
+            .owner
+            .into_iter()
+            .find(|(_, by)| by == "t's heap")
+            .map(|(p, _)| p)
+            .expect("premise: t's heap lists no data page");
+        HeapFileManager::open(e.first_directory_page_id, d.o.bp.clone())
+            .add_to_directory(data, 0)
+            .expect("list one of t's data pages a second time");
+        let refused = d.o.catalog.table_pages("t");
+        assert!(refused.is_err(), "table_pages collected page {data} once, although t's heap directory lists it twice");
+    }
+}
