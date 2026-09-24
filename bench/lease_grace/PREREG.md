@@ -188,3 +188,14 @@ record or a deadline out: `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `exp
 `enforced_lease`, `reparent`, and the child `fork_staged` returns. `a_resume_shifts…` asserts
 through `get`, `get_raw`, `scan`, `scan_ids`, `in_state`, `expired_before` and `enforced_lease`.
 A method added later is not covered by anything but review.
+
+## Amendment 3 — two test names differ from Amendment 2, and one test is stronger (before the fix commit)
+
+- `…survive_a_close_and_reopen…` is named
+  `the_mark_and_the_offset_survive_a_close_and_reopen_from_the_file_alone`.
+- `…wrong_width…` is named `a_record_of_the_wrong_width_is_refused_at_resume_and_at_open`. It now
+  also reopens the file and requires `open` itself to refuse. The reason: `open` loads `D`, and
+  reading a damaged record as `D = 0` would read every stored deadline early. New mutant **M14**:
+  `open` ignores an unreadable `[0x08]` record (loads `D = 0`) → that test fails.
+- Counts are unchanged: `f1_lease_grace` has 10 tests (MEASURED: `grep -c '#\[test\]'` over the
+  module in the working file → 10).
