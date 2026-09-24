@@ -1242,6 +1242,24 @@ impl Outbox {
         st.queue.push_back(frame);
         self.woken.notify_all();
     }
+
+    /// Wait up to `delay` before the sender redials, returning early if woken. `false` means the
+    /// transport is stopping, and the sender must leave its loop rather than dial again.
+    ///
+    /// **The stop flags are read under the lock BEFORE waiting.** `shutdown` notifies once, and a
+    /// notify that lands while the sender is still inside `dial` finds nobody waiting; a wait begun
+    /// after it used to sleep out the whole delay before anything looked at the flags again — the
+    /// lost wakeup (D207, from F3-transport's `207d362`). `stopped` is set under this same lock, so
+    /// it lands either before this check or while the wait below is parked, never between them.
+    /// Both redial waits in `sender_loop` go through here, so there is one copy to get right.
+    fn wait_before_redial(&self, stop: &AtomicBool, delay: Duration) -> bool {
+        let st = self.state.lock().unwrap();
+        if st.stopped || stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let _ = self.woken.wait_timeout(st, delay);
+        true
+    }
 }
 
 /// Thread-per-peer carriage for consensus messages, over `std::net`.
@@ -1407,6 +1425,25 @@ impl Transport {
                      `invalid input` rather than anything about the peer"
                 )));
             }
+        }
+        // Two more knobs whose zero is a partition that reads as health, not a smaller setting
+        // (D207, ported from F3-transport's `207d362`). Not folded into the loop above: its message
+        // blames std's socket calls, and neither of these ever reaches one.
+        if opts.idle_deadline.is_zero() {
+            return Err(FerroError::Internal(
+                "`idle_deadline` is zero. It does not mean \"never idle\": a connection is closed \
+                 once it has been silent longer than this, which a zero makes true on the first \
+                 poll after the handshake — a node that accepts every peer and at once hangs up on \
+                 each"
+                    .to_string(),
+            ));
+        }
+        if opts.max_inbound_conns == 0 {
+            return Err(FerroError::Internal(
+                "`max_inbound_conns` is zero, so every inbound connection would be refused at the \
+                 cap: a node deaf to the whole cluster while its outbound meters read healthy"
+                    .to_string(),
+            ));
         }
         if opts.queue_depth == 0 {
             return Err(FerroError::Internal(
@@ -1815,8 +1852,9 @@ fn sender_loop(
                             // immediately is a 100%-CPU loop and a connection storm against a peer
                             // that has done nothing wrong.
                             counters.connect_failures.fetch_add(1, Ordering::SeqCst);
-                            let st = ob.state.lock().unwrap();
-                            let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
+                            if !ob.wait_before_redial(&stop, opts.reconnect_delay) {
+                                break;
+                            }
                             continue;
                         }
                     }
@@ -1826,8 +1864,9 @@ fn sender_loop(
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
                     // Wait on the condvar rather than sleeping, so a shutdown does not have to
                     // wait out a reconnect delay it has already made pointless.
-                    let st = ob.state.lock().unwrap();
-                    let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
+                    if !ob.wait_before_redial(&stop, opts.reconnect_delay) {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -1970,6 +2009,11 @@ fn accept_loop(
                         counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                         drop(map);
                         let _ = stream.shutdown(Shutdown::Both);
+                        // **Paced.** Refused back to back, a peer looping `connect()` against a
+                        // full cap had this thread spin accept-refuse-accept, a core of this process
+                        // for free. One poll per refusal bounds that, and delays a stop by at most
+                        // the poll the stop flag is already allowed (D207, from `207d362`).
+                        std::thread::sleep(opts.poll_interval);
                         continue;
                     }
                     map.insert(id, mine);
