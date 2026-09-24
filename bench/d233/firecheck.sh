@@ -130,11 +130,14 @@ run_target() { # $1 = label, $2 = target
   echo "rc=$rc" >> "$OUT/$1.$2.txt"
 }
 
-listed_in() { # $1 = target: what the harness says it will run, at SUBJECT_SHA (the list is kept)
+# The listing runs in the main shell, through `waited`, never inside `$(...)`: a command substitution is a
+# subshell, so the trap below could not see its `child`, and a TERM was deferred until the listing ended or
+# left it running (D237 judge review J4). Only the count runs inside `$(...)`.
+list_target() { # $1 = target: what the harness says it will run, at SUBJECT_SHA, kept as control.<t>.list
   # shellcheck disable=SC2046
   waited timeout 1800 cargo test $(target_args "$1") -- --list > "$OUT/control.$1.list" 2>&1
-  grep -cE ': test$' "$OUT/control.$1.list"
 }
+listed_count() { grep -cE ': test$' "$OUT/control.$1.list"; }
 
 # ---- The judge. It reads ONLY "$OUT/<label>.<target>.txt" for the targets it is given. Any other file in
 # $OUT (a diffstat, a list, the self-test log, a stale output) cannot change a verdict (review 3 H1). ----
@@ -148,6 +151,11 @@ tstate() { # $1 label, $2 target
   last=$(tail -n 1 "$f")
   case "$last" in rc=[0-9]*) rc=${last#rc=} ;; *) echo "INCOMPLETE ($2: no rc line)"; return ;; esac
   if [ "$rc" = 124 ]; then echo "TIMEOUT ($2)"; return; fi
+  # Before the result-line count (D237 judge review J1): an outside SIGKILL is RC-137, not COMPILE-FAIL.
+  case "$rc" in 0|101) ;; *) echo "RC-$rc ($2)"; return ;; esac
+  # A test binary killed by a signal (an abort, a stack overflow, a segfault): cargo exits 101 and names
+  # the signal. Checked before the result-line count, which a crash also shortens (J1).
+  if grep -qE "process didn't exit successfully: .*\(signal: [0-9]+" "$f"; then echo "CRASHED ($2)"; return; fi
   n=$(grep -cE '^test result:' "$f")
   if [ "$n" -eq 0 ]; then echo "COMPILE-FAIL ($2)"; return; fi
   if [ "$n" -ne "$(binaries "$2")" ]; then echo "INCOMPLETE ($2: $n result lines)"; return; fi
@@ -156,8 +164,7 @@ tstate() { # $1 label, $2 target
     0/0) ;;
     101/0) echo "RC-MISMATCH ($2: rc=101 and nothing FAILED)"; return ;;
     101/*) ;;
-    0/*) echo "RC-MISMATCH ($2: rc=0 with FAILED lines)"; return ;;
-    *) echo "RC-$rc ($2)"; return ;;
+    *) echo "RC-MISMATCH ($2: rc=0 with FAILED lines)"; return ;;
   esac
   echo OK
 }
@@ -365,6 +372,67 @@ self_test() {
   # shellcheck disable=SC2086
   expect "registered survivor, an unregistered test FAILED" "MISMATCH" "$(verdict u8x "$kind" "$req" "$opt" $TARGETS)"
 
+  # ---- D237 judge review J3: a case for every clause and file state the judge distinguishes. ----
+  # A partial kill: every required killer but one FAILED. Not a kill as registered.
+  killers_of U4_parent_keeps_pointer
+  # shellcheck disable=SC2046
+  fail_file part index 1 $(printf 'storage::index::tests::%s ' ${req% *})
+  all_ok part catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "a partial kill (one required killer passed)" "MISMATCH (missing: ${req##* }" "$(verdict part "$kind" "$req" "$opt" $TARGETS)"
+
+  # Only an optional killer FAILED.
+  killers_of U3_no_next_splice
+  fail_file optonly index 3 "storage::index::tests::${opt%% *}"
+  all_ok optonly catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "only an optional killer FAILED" "MISMATCH (missing: $req" "$(verdict optonly "$kind" "$req" "$opt" $TARGETS)"
+
+  # The control's count gate, clause by clause, and arm_state apart from it.
+  all_ok short index catalog collateral lockorder
+  expect "control listed 5, passed 4" "VOID (index: listed 5, passed 4, ignored 0)" "$(control_verdict short "index=5 catalog=4 collateral=12 lockorder=4")"
+  all_ok allign index collateral lockorder
+  plant allign catalog 0 "running 4 tests" "$(result_ok 0 4)"
+  expect "control whose target passed nothing and ignored all" "VOID (catalog: listed 4, passed 0, ignored 4)" "$(control_verdict allign "$lists")"
+  all_ok nolist index catalog collateral lockorder
+  expect "control with no list count" "VOID (lockorder: no list count)" "$(control_verdict nolist "index=4 catalog=4 collateral=12")"
+  all_ok tocount catalog collateral lockorder
+  plant tocount index 124 "running 4 tests" "$(result_ok 4 0)"
+  # The counts add up, so only arm_state can void this one.
+  expect "control with a TIMEOUT whose counts add up" "VOID (TIMEOUT (index))" "$(control_verdict tocount "$lists")"
+
+  # The file states.
+  killers_of U4_parent_keeps_pointer
+  all_ok late catalog collateral lockorder
+  printf '%s\n' "test storage::index::tests::${req%% *} ... FAILED" \
+    "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" "rc=101" \
+    "a line written after the rc line" > "$(tfile late index)"
+  # shellcheck disable=SC2086
+  expect "a line after the rc line" "INCOMPLETE (index: no rc line)" "$(verdict late "$kind" "$req" "$opt" $TARGETS)"
+  all_ok two catalog collateral lockorder
+  plant two index 0 "$(result_ok 2 0)" "$(result_ok 2 0)"
+  # shellcheck disable=SC2086
+  expect "two result lines in a one-binary target" "INCOMPLETE (index: 2 result lines)" "$(verdict two "$kind" "$req" "$opt" $TARGETS)"
+  all_ok k9r catalog collateral lockorder
+  plant k9r index 137 "running 4 tests" "$(result_ok 4 0)"
+  # shellcheck disable=SC2086
+  expect "rc=137 with a result line" "RC-137 (index)" "$(verdict k9r "$kind" "$req" "$opt" $TARGETS)"
+  all_ok k9 catalog collateral lockorder
+  plant k9 index 137 "   Compiling ferrodb v0.1.0"
+  # shellcheck disable=SC2086
+  expect "rc=137 with no result line (an outside SIGKILL)" "RC-137 (index)" "$(verdict k9 "$kind" "$req" "$opt" $TARGETS)"
+  all_ok nofail catalog collateral lockorder
+  plant nofail index 101 "running 4 tests" "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  # shellcheck disable=SC2086
+  expect "rc=101 with nothing FAILED" "RC-MISMATCH (index: rc=101 and nothing FAILED)" "$(verdict nofail "$kind" "$req" "$opt" $TARGETS)"
+  all_ok crash catalog collateral lockorder
+  plant crash index 101 "running 40 tests" "test storage::index::tests::${req%% *} ... FAILED" \
+    "thread 'storage::index::tests::x' panicked while processing panic. aborting." \
+    "error: test failed, to rerun pass \`--lib\`" "" "Caused by:" \
+    "  process didn't exit successfully: \`/t/target/debug/deps/ferrodb-0123\` (signal: 6, SIGABRT: process abort signal)"
+  # shellcheck disable=SC2086
+  expect "a test binary killed by a signal" "CRASHED (index)" "$(verdict crash "$kind" "$req" "$opt" $TARGETS)"
+
   base_req="every_pool_method_that_locks_opens_a_pool_section"
   fail_file base-L lockorder 3 "$base_req"
   expect "base arm" "KILLED-AS-REGISTERED" "$(verdict base-L kill "$base_req" "" lockorder)"
@@ -439,10 +507,12 @@ if ! self_test > "$OUT/selftest.log" 2>&1; then
   exit 2
 fi
 
+# Every checkout of src/ is --no-overlay, so a file absent at the target commit is removed and "src/ at <sha>"
+# is exact (D237 judge review J6); an overlay checkout only adds and overwrites.
 on_exit() {
-  git checkout "$SUBJECT_SHA" -- src/ 2>/dev/null
+  git checkout --no-overlay "$SUBJECT_SHA" -- src/ 2>/dev/null
   git diff --quiet "$SUBJECT_SHA" -- src/ tests/ ||
-    echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout $SUBJECT_SHA -- src/" >&2
+    echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout --no-overlay $SUBJECT_SHA -- src/" >&2
 }
 on_signal() { # $1 = the exit status
   if [ -n "$child" ]; then
@@ -452,25 +522,28 @@ on_signal() { # $1 = the exit status
   exit "$1"
 }
 trap on_exit EXIT
+trap 'on_signal 129' HUP
 trap 'on_signal 130' INT
+trap 'on_signal 131' QUIT
 trap 'on_signal 143' TERM
 
 bad=0
 restore() {
-  git checkout "$SUBJECT_SHA" -- src/
+  git checkout --no-overlay "$SUBJECT_SHA" -- src/
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: src/ not restored after $1" >&2; exit 3; }
 }
 
 echo "== control: $SUBJECT_SHA"
 for t in $TARGETS; do run_target control "$t"; done
+for t in $TARGETS; do list_target "$t"; done
 lists=""
-for t in $TARGETS; do lists="$lists $t=$(listed_in "$t")"; done
+for t in $TARGETS; do lists="$lists $t=$(listed_count "$t")"; done
 v=$(control_verdict control "$lists")
 echo "control: $v (lists:$lists)" | tee "$OUT/summary.txt"
 [ "$v" = clean ] || exit 2
 
 echo "== base-F3: 0eda6ca src/ + this tip's index.rs tests"
-git checkout 0eda6ca -- src/
+git checkout --no-overlay 0eda6ca -- src/
 splice_tests "$I" || { echo "ABORT: splice failed (base-F3)" >&2; restore base-F3; exit 3; }
 run_target base-F3 index
 restore base-F3
@@ -479,7 +552,7 @@ echo "base-F3: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
 echo "== base-G: f03e25d src/ + this tip's index.rs and table_catalog.rs tests"
-git checkout f03e25d -- src/
+git checkout --no-overlay f03e25d -- src/
 # This tip's table_catalog tests read the page-read counter as `buffer::page_reads::on_this_thread()`
 # (amendment 5); f03e25d has the same counter as `buffer::buffer_pool::page_reads_on_this_thread()`.
 # The splice renames the call so the spliced tests read the counter f03e25d actually increments.
@@ -492,7 +565,7 @@ echo "base-G: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
 echo "== base-L: src/ at 2b9d2c0 (amendment 5: the page-read counter broke the lock-order scanner)"
-git checkout 2b9d2c0 -- src/
+git checkout --no-overlay 2b9d2c0 -- src/
 run_target base-L lockorder
 restore base-L
 v=$(verdict base-L kill "every_pool_method_that_locks_opens_a_pool_section" "" lockorder)
@@ -519,7 +592,7 @@ EOF
   fi
   git diff --stat -- "$FILE" > "$OUT/$name.diffstat"
   for t in $TARGETS; do run_target "$name" "$t"; done
-  git checkout "$SUBJECT_SHA" -- "$FILE"
+  git checkout --no-overlay "$SUBJECT_SHA" -- "$FILE"
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: restore of $FILE after $name left a difference" >&2; exit 3; }
   # shellcheck disable=SC2086
   v=$(verdict "$name" "$kind" "$req" "$opt" $TARGETS)
