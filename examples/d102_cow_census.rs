@@ -65,7 +65,6 @@ use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::wal::txn::TxnManager;
 
 struct Server {
     ctx: Arc<ServerContext>,

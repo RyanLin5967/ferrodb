@@ -57,6 +57,11 @@ impl Db {
     /// `cli.rs`'s sequence, with the history store attached before `recover` when `window` is
     /// `Some(W)`, and not at all when it is `None`.
     fn open(dir: &Path, window: Option<u64>) -> Db {
+        Db::try_open(dir, window).unwrap_or_else(|e| panic!("the open failed: {e}"))
+    }
+
+    /// [`Db::open`], with `recover`'s refusal returned instead of unwrapped.
+    fn try_open(dir: &Path, window: Option<u64>) -> Result<Db, FerroError> {
         let path = dir.join("d212w.db");
         let existed = path.exists();
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
@@ -68,7 +73,7 @@ impl Db {
         if let Some(s) = &store {
             txn.attach_history_store(Arc::clone(s)).unwrap();
         }
-        let recovered = recover(&txn).unwrap();
+        let recovered = recover(&txn)?;
         let mut catalog = if existed {
             Catalog::open(bp.clone(), 1).unwrap()
         } else {
@@ -81,7 +86,7 @@ impl Db {
         let branches = LogBranchCatalog::open(&dir.join("d212w.branches"), 1).unwrap();
         let runtime =
             Arc::new(AgentRuntime::with_catalog(Arc::new(branches) as Arc<dyn BranchCatalog>));
-        Db { catalog, bp, txn, runtime, store, dir: dir.to_path_buf(), window }
+        Ok(Db { catalog, bp, txn, runtime, store, dir: dir.to_path_buf(), window })
     }
 
     /// A clean restart: checkpoint, drop everything, reopen from the files.
@@ -93,11 +98,11 @@ impl Db {
     }
 
     /// A crash: drop everything with no checkpoint, so the history queued in memory is lost and
-    /// the log is its only copy. Reopened with `window`.
-    fn crash_and_reopen(self, window: Option<u64>) -> Db {
+    /// the log is its only copy. Returns the directory to reopen.
+    fn crash(self) -> PathBuf {
         let dir = self.dir.clone();
         drop(self);
-        Db::open(&dir, window)
+        dir
     }
 
     fn exec(&mut self, sql: &str, s: &mut Session) -> Result<Outcome, FerroError> {
@@ -269,19 +274,25 @@ fn falsifier_3_after_a_checkpoint_the_history_is_in_the_store_and_not_the_log() 
     assert_eq!(publishes, 5, "a committed publish record is not in the store's file");
 }
 
-/// **AMENDED 2, F5.** A process that opens the database without the store must not truncate away
-/// history the store never received: the log is kept until an open WITH the store takes it.
+/// **AMENDED 3, item 4 (supersedes AMENDED 2's F5; the lead's decision (d), lane PREREG R3-1).** An
+/// open without the store is REFUSED while the log holds history, before recovery writes anything;
+/// an open WITH the store takes it. AMENDED 2's version asserted that such an open succeeded and
+/// kept the log, the mechanism item 4 removed by decision.
 #[test]
-fn f5_an_open_without_the_store_keeps_the_history_the_store_lacks() {
+fn f5_an_open_without_the_store_is_refused_while_the_log_holds_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Db::open(dir.path(), Some(1024));
     db.seed(2);
     let id = db.merge_one("a", "UPDATE inventory SET qty = 11 WHERE id = 1;");
     // The history is in the log only: the queue died with the process.
-    let db = db.crash_and_reopen(None);
-    assert!(db.history_parts_in_log() > 0, "an open without the store truncated the only copy");
+    let path = db.crash();
+    let refused = Db::try_open(&path, None).err().map(|e| e.to_string());
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains("no history store is attached")),
+        "an open without the store recovered a log that holds history: {refused:?}"
+    );
     // Anti-vacuity: an open WITH the store takes it, and the merge reverts.
-    let mut db = db.crash_and_reopen(Some(1024));
+    let mut db = Db::open(&path, Some(1024));
     db.revert_ok(&id);
     assert_eq!(db.qty_of(1), 10);
 }

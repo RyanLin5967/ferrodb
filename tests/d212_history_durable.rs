@@ -379,9 +379,12 @@ fn a_runtime_whose_clock_another_runtime_overtook_cannot_publish() {
     drop(b);
     assert_eq!(db.qty_of(2), 20, "the refused merge published its row");
 
-    // Anti-vacuity: a runtime that attaches AFTER that publish reads the clock, and merges.
+    // Anti-vacuity: a runtime that attaches AFTER that publish reads the clock, and merges. It runs
+    // as the SAME actor as task "a" (lane PREREG R3-2): a fresh runtime numbers provenance slots from
+    // prov1 again, and `TxnManager::declare_run` refuses prov1 for any other actor, which is the
+    // base's rule and not what this arm is about.
     let mut c = Session::with_runtime(Arc::new(AgentRuntime::new()));
-    db.ok("BEGIN AGENT SESSION AS 'c' RUN 'r_c';", &mut c);
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut c);
     db.ok("UPDATE inventory SET qty = 31 WHERE id = 3;", &mut c);
     db.merge(&mut c);
     drop(c);
