@@ -5208,8 +5208,13 @@ mod tests {
         {
             let at_crash = Arc::clone(&at_crash);
             let path = path.clone();
+            // The FIRST time the catalog takes the claim is the crash point; an implementation
+            // that asked it twice must not have a later call move the snapshot.
             faulty.after_add_arena(move |_, _| {
-                *at_crash.lock().unwrap() = Some(std::fs::read(&path).unwrap());
+                let mut slot = at_crash.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(std::fs::read(&path).unwrap());
+                }
             });
         }
         let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
