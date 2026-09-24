@@ -415,6 +415,7 @@ fn an_automatic_checkpoint_after_a_failed_persist_keeps_the_log_so_the_next_open
 
     let (mut c, recovered, lock) = open_as_production(dir.path());
     assert!(!recovered, "premise failed: C's open found a log to replay, so it rebuilt and nothing is stale");
+    let root_before = c.primary_root();
     let (page_one, root_now) = split_the_root_with_persist_failing(&mut c);
     c.catalog.first_catalog_page_id = page_one; // the fault clears; nothing below moves a root
     assert!(
@@ -427,6 +428,22 @@ fn an_automatic_checkpoint_after_a_failed_persist_keeps_the_log_so_the_next_open
         assert!(commits <= 10_000, "premise failed: {commits} commits and no automatic checkpoint flushed the split");
         c.sql("UPDATE u SET v = 1 WHERE k = 1;");
     }
+    // The central premise (review 7, F-C): the flush wrote a STALE catalog page, and it was the
+    // automatic checkpoint's. Both hold at the red tree and at the fix: every checkpoint flushes, and
+    // the automatic trigger resets its counter whether it truncated or kept the log.
+    let on_disk = Catalog::read_entries(page_one, |p| c.bp.disk_manager.read(p))
+        .expect("premise failed: the catalog chain on disk could not be read");
+    assert_eq!(
+        on_disk.iter().find(|e| e.name == "t").map(|e| e.primary_index_root),
+        Some(root_before),
+        "premise failed: a persist succeeded after the failed one, so the checkpoint flushed a current \
+         catalog page and nothing is stale"
+    );
+    assert_eq!(
+        c.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "premise failed: the flush was not the automatic checkpoint's"
+    );
     drop(c);
     drop(lock); // no exit at all
 
