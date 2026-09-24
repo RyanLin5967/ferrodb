@@ -414,6 +414,80 @@ pub struct OpenedDatabase {
     pub catalog: Catalog,
     /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
     pub recovered: bool,
+    /// The tables whose DROP the log records and this open completed (D250). A caller that keeps
+    /// per-table state outside the catalog forgets it for each, as the executor does after a DROP:
+    /// the CLI and pgserver call `AgentRuntime::forget_table` (B9, D250 review 1's F7).
+    pub completed_drops: Vec<String>,
+}
+
+/// The heap a record writes, as its directory root: a `Heap*` record's own, or the one a CLR redoes.
+fn heap_root(kind: &RecKind) -> Option<u32> {
+    match kind {
+        RecKind::HeapInsert { dir_root, .. }
+        | RecKind::HeapDelete { dir_root, .. }
+        | RecKind::HeapUpdate { dir_root, .. }
+        | RecKind::HeapRelease { dir_root, .. } => Some(*dir_root),
+        RecKind::Clr { redo, .. } => heap_root(redo),
+        _ => None,
+    }
+}
+
+/// D250: every heap root a `DropTable` record names (the table's heap and its time-travel heap),
+/// mapped to the LSN of the LAST such record. A record of that root below that LSN belongs to a
+/// dropped table.
+fn dropped_roots(records: &[crate::wal::log::LogRecord]) -> HashMap<u32, u64> {
+    let mut dropped = HashMap::new();
+    for rec in records {
+        if let RecKind::Ddl { op: DdlOp::DropTable, dir_root, time_travel_root, .. } = &rec.kind {
+            dropped.insert(*dir_root, rec.lsn);
+            dropped.insert(*time_travel_root, rec.lsn);
+        }
+    }
+    dropped
+}
+
+/// D250 (b): the tables the retained log DROPPED that the catalog on disk still names, so their
+/// DROP never finished: its record is durable before its first free, but the catalog change reaches
+/// disk only with the checkpoint after. Left alone, as a NEW table re-created at the same root:
+/// - one whose `CreateTable` names the root after the DROP;
+/// - one with any heap record (or CLR) on its heap or time-travel root after the DROP (D250 review
+///   1's F2). A CREATE whose checkpoint wrote the catalog and then failed to sync logs no
+///   `CreateTable`, but every row committed into it leaves such a record. An EMPTY table re-created
+///   that way is still forgotten; its CREATE was reported failed.
+fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Result<Vec<String>, FerroError> {
+    let mut drops: Vec<(String, u32, u32, u64)> = Vec::new();
+    let mut created: HashMap<u32, u64> = HashMap::new();
+    let mut written: HashMap<u32, u64> = HashMap::new();
+    let end = wal.next_lsn.load(Ordering::SeqCst);
+    let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+    while lsn < end {
+        let (rec, next) = wal.read_record(lsn)?;
+        match &rec.kind {
+            RecKind::Ddl { op: DdlOp::DropTable, table, dir_root, time_travel_root, .. } => {
+                drops.push((table.clone(), *dir_root, *time_travel_root, rec.lsn))
+            }
+            RecKind::Ddl { op: DdlOp::CreateTable, dir_root, .. } => {
+                created.insert(*dir_root, rec.lsn);
+            }
+            other => {
+                if let Some(root) = heap_root(other) {
+                    written.insert(root, rec.lsn);
+                }
+            }
+        }
+        lsn = next;
+    }
+    let later = |map: &HashMap<u32, u64>, root: &u32, at: &u64| map.get(root).is_some_and(|&l| l > *at);
+    Ok(drops
+        .into_iter()
+        .filter(|(table, dir_root, tt_root, at)| {
+            !later(&created, dir_root, at)
+                && !later(&written, dir_root, at)
+                && !later(&written, tt_root, at)
+                && catalog.get_table(table).is_some_and(|e| e.first_directory_page_id == *dir_root)
+        })
+        .map(|(table, _, _, _)| table)
+        .collect())
 }
 
 /// **D204 — THE way to open a database file.** Every binary calls this; none spells the sequence
@@ -447,62 +521,6 @@ pub struct OpenedDatabase {
 /// Anything built on top, such as the agent runtime and its arena, comes AFTER this returns. The
 /// rebuild allocates pages, and the arena floor must sit above everything this has allocated
 /// (`cli::run_cli` explains the arena ordering).
-/// The heap a record writes, as its directory root: a `Heap*` record's own, or the one a CLR redoes.
-fn heap_root(kind: &RecKind) -> Option<u32> {
-    match kind {
-        RecKind::HeapInsert { dir_root, .. }
-        | RecKind::HeapDelete { dir_root, .. }
-        | RecKind::HeapUpdate { dir_root, .. }
-        | RecKind::HeapRelease { dir_root, .. } => Some(*dir_root),
-        RecKind::Clr { redo, .. } => heap_root(redo),
-        _ => None,
-    }
-}
-
-/// D250: every heap root a `DropTable` record names (the table's heap and its time-travel heap),
-/// mapped to the LSN of the LAST such record. A record of that root below that LSN belongs to a
-/// dropped table.
-fn dropped_roots(records: &[crate::wal::log::LogRecord]) -> HashMap<u32, u64> {
-    let mut dropped = HashMap::new();
-    for rec in records {
-        if let RecKind::Ddl { op: DdlOp::DropTable, dir_root, time_travel_root, .. } = &rec.kind {
-            dropped.insert(*dir_root, rec.lsn);
-            dropped.insert(*time_travel_root, rec.lsn);
-        }
-    }
-    dropped
-}
-
-/// D250 (b): the tables the retained log DROPPED that the catalog on disk still names, so their
-/// DROP never finished: its record is durable before its first free, but the catalog change reaches
-/// disk only with the checkpoint after. A table re-created at the same directory root after its
-/// DROP (a later `CreateTable` naming it) is a new table, and is left alone.
-fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Result<Vec<String>, FerroError> {
-    let mut drops: Vec<(String, u32, u64)> = Vec::new();
-    let mut created: HashMap<u32, u64> = HashMap::new();
-    let end = wal.next_lsn.load(Ordering::SeqCst);
-    let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
-    while lsn < end {
-        let (rec, next) = wal.read_record(lsn)?;
-        match &rec.kind {
-            RecKind::Ddl { op: DdlOp::DropTable, table, dir_root, .. } => drops.push((table.clone(), *dir_root, rec.lsn)),
-            RecKind::Ddl { op: DdlOp::CreateTable, dir_root, .. } => {
-                created.insert(*dir_root, rec.lsn);
-            }
-            _ => {}
-        }
-        lsn = next;
-    }
-    Ok(drops
-        .into_iter()
-        .filter(|(table, dir_root, at)| {
-            created.get(dir_root).is_none_or(|&c| c < *at)
-                && catalog.get_table(table).is_some_and(|e| e.first_directory_page_id == *dir_root)
-        })
-        .map(|(table, _, _)| table)
-        .collect())
-}
-
 pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, FerroError> {
     if !lock.guards(db_path) {
         return Err(FerroError::Io(format!(
@@ -537,9 +555,10 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // and a second free would hit its new owner. Stated cost: pages the DROP had not freed yet leak,
     // one table's worth per incomplete DROP. No other mechanism reclaims them: D229 does not defer
     // DROP's frees (the lead, 2026-09-24), so this cost is D250's, stated.
-    for table in logged_drops_the_catalog_missed(&wal, &catalog)? {
+    let completed_drops = logged_drops_the_catalog_missed(&wal, &catalog)?;
+    for table in &completed_drops {
         use std::io::Write;
-        catalog.forget_dropped_table(&table)?;
+        catalog.forget_dropped_table(table)?;
         let _ = writeln!(
             std::io::stderr(),
             "ferrodb: finished the DROP of `{table}`, which the log records but the catalog on disk did not; \
@@ -580,7 +599,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             }
         }
     }
-    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
+    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered, completed_drops })
 }
 
 #[cfg(test)]
@@ -1415,6 +1434,9 @@ use super::*;
             o.catalog.get_table("t").is_none(),
             "the next open did not complete the logged DROP: recovery skipped the table's records and left it in the catalog"
         );
+        // Lane §3.5 (review 1's F7): the open names the DROP it completed, so the entry points forget
+        // the table's provenance as the executor's DROP does.
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "the open did not report the DROP it completed");
     }
 
     /// A database built by hand on the given page and log storage, at `db` (its log at `<db>.wal`), so

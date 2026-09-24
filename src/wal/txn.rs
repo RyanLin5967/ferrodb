@@ -1607,7 +1607,19 @@ impl TxnManager {
         // D250: durable before the first free. `log_ddl` appends and flushes, and takes the table out
         // of the retained schema.
         let logged_at = self.wal.next_lsn.load(Ordering::SeqCst);
-        self.log_ddl(record.clone())?;
+        if let Err(e) = self.log_ddl(record.clone()) {
+            // **D250 review 1's F1: fail-stop, as for a Commit whose flush failed.** A failed flush
+            // keeps the record in the log buffer, so the next commit's flush would make the DROP
+            // durable after the client was told it failed, and the next open would complete it over
+            // every row committed since. Poisoned, this process writes nothing more; the next open
+            // decides from what reached disk whether the table was dropped.
+            self.wal.poison(&format!(
+                "the DROP of `{}` could not make its record durable ({e}); the next open decides from what \
+                 reached disk whether the table was dropped",
+                record.table
+            ));
+            return Err(e);
+        }
         let out = match f() {
             Ok(out) => out,
             Err(e) => {
