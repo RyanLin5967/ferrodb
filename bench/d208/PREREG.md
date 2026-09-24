@@ -82,3 +82,28 @@ Any mutant surviving all eight tests is a surviving mutant. It is reported as on
 ## Owed decisions (⚖)
 
 None. No D53 pinned assertion changed, and neither D53 test file is touched.
+
+---
+
+## Amendment 1 (appended before any run; nothing above is edited)
+
+**A semantic merge conflict with lane #16's current head, and a resolution branch.** The finding's
+lane moved on from `d7891d5` to `00f4c39` (D210/D211, UNBUILT). There, D205's
+`wal::recovery::tests::a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree` walks every
+tree through `root_cell(name, column.as_deref())`, with `column: Option<String>` naming full-text
+indexes by column alone. `git merge-tree --write-tree 344d309 00f4c39` is clean (rc=0), and the
+merged tree does NOT compile against D208's `Option<IndexTree<&str>>`. That line is the only one:
+checked by grepping the merged tree for every `root_cell(` call.
+
+`d208-root-cell-per-index-on-00f4c39` = `88f09ee` is that merge with the call adapted (kind per
+index, `column.as_ref().map(|i| i.borrowed())`). The assertion is unchanged. It is a D205 test, not
+one of D53's. Built with plumbing, so this worktree did not move.
+
+Expected at `88f09ee` (INFERRED):
+- `--test root_cell_is_per_index` 8 passed.
+- `--lib -- wal::recovery::` all pass, including the adapted test.
+- Everything lane #16 pre-registered for `00f4c39` still holds. This branch touches none of its
+  paths except that one test line and the files listed at the top.
+
+If #16 lands at a head other than `00f4c39`, this branch is stale. The resolution is those two
+edits in that test, re-applied.
