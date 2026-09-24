@@ -1,0 +1,3 @@
+# 2026-09-24T02:52:26Z python3 time.sleep(0.005) x200; load: 24.88 20.34 17.75
+taskpolicy -b : n=200 sleep(5ms) actual ms: p50=79.9 p90=106.8 max=153.6 over60ms=126
+default QoS   : n=200 sleep(5ms) actual ms: p50=6.3 p90=6.3 max=8.1 over60ms=0
