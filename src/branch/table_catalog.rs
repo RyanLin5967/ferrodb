@@ -64,6 +64,9 @@ pub struct TableBranchCatalog {
     /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
     /// (measured x0.92, `bench/fork_concurrency_before.txt`).
     commit_group: CommitGroup,
+    /// Keys REWRITTEN or REMOVED: every call to [`Self::upsert`] and [`Self::remove_if_present`].
+    /// See [`TableBranchCatalog::key_rewrites`].
+    key_rewrites: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -341,6 +344,20 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
+    /// Keys this catalog has rewritten or removed since it was opened — an **observing instrument**,
+    /// counting every call to `upsert` and `remove_if_present`.
+    ///
+    /// Added for D198 so that "what does a restart write?" is a number rather than a reading of the
+    /// code: a restart grace that rewrote one record per live branch is a write wall at 10⁶ that
+    /// no test of correctness sees.
+    ///
+    /// Blind spot, stated: the fork path's inserts of provably-new keys (`write_record_new`, the
+    /// CHILD key in `fork_staged`) and `create`'s trunk go through `tree.insert` and are NOT
+    /// counted. Nothing at open forks, so the open-time count is complete; a fork-cost count is not.
+    pub fn key_rewrites(&self) -> u64 {
+        self.key_rewrites.load(Ordering::Relaxed)
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
@@ -428,6 +445,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            key_rewrites: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -451,6 +469,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            key_rewrites: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -503,10 +522,12 @@ impl TableBranchCatalog {
     /// [`BPlusTreeManager::upsert`] closes the window at the layer that owns the latch.
     /// SCALE-DESIGN D126; probe in `tests/d126_atomic_upsert.rs` and `mod d126_record_key_probe`.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
+        self.key_rewrites.fetch_add(1, Ordering::Relaxed);
         self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
+        self.key_rewrites.fetch_add(1, Ordering::Relaxed);
         match self.tree.delete(key) {
             Ok(()) => Ok(true),
             Err(FerroError::KeyNotFound) => Ok(false),
@@ -3026,6 +3047,47 @@ mod f1_lease_grace {
         let err = c.resume_leases(4_000).unwrap_err().to_string();
         assert!(err.contains("last-alive mark must be 8 bytes"), "{err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The branch-count wall, as a count.** A restart grace that rewrites one record per live
+    /// branch costs a million writes per restart at 10⁶ branches — added by a correctness fix and
+    /// invisible to every correctness test. Chubby's stopped timer needs no per-lease write at all,
+    /// so the number of keys a resume writes must not depend on how many leases it credits.
+    ///
+    /// Two sizes, and every branch's lease is running at the mark in both, so each one IS owed the
+    /// downtime. The count must also be non-zero: the new mark is a write, and an instrument that
+    /// saw nothing would make the equality vacuous.
+    #[test]
+    fn a_resume_writes_the_same_number_of_keys_whatever_the_number_of_live_branches() {
+        let mut writes = Vec::new();
+        for n in [10usize, 100] {
+            let path = sidecar(&format!("o1-{n}"));
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let ids: Vec<BranchId> = (0..n)
+                .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id)
+                .collect();
+            c.record_lease_alive(1_000).unwrap();
+            let before = c.key_rewrites();
+            let resumed = c.resume_leases(4_000).unwrap();
+            writes.push((n, c.key_rewrites() - before));
+            // Premise, checked so a cheap resume cannot pass by crediting nobody: every lease
+            // reads the downtime later.
+            assert!(
+                matches!(resumed, LeaseResume::Resumed { downtime_millis: 3_000, .. }),
+                "{resumed:?}"
+            );
+            for b in &ids {
+                assert_eq!(lease(&c, *b), 4_500, "a lease was not credited the downtime");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(writes[0].1 > 0, "the counter saw no write at all, not even the mark: {writes:?}");
+        assert_eq!(
+            writes[0].1, writes[1].1,
+            "a resume wrote a number of keys that grows with the number of live branches \
+             ((branches, keys written) = {writes:?}): at 10^6 branches that is a per-restart write \
+             wall, which is the thing a stopped timer exists not to need"
+        );
     }
 
     #[test]
