@@ -70,9 +70,10 @@ pub struct WalManager {
 ///
 /// A checkpoint re-appends the retained DDL and run declarations after a truncation, because the
 /// truncation discarded them. When a pin kept the log, nothing was discarded, and re-appending them
-/// only grew the log by every declaration at every checkpoint. So the answer has to reach the
-/// caller, and it cannot be dropped without a warning.
-#[must_use = "a checkpoint re-declares only after a real truncation (D234), so it has to know whether there was one"]
+/// grew the log by every declaration at every checkpoint. A kept checkpoint therefore re-declares
+/// no run, and the schema only once a pin has passed its last declaration, which needs the pins
+/// below. So the answer has to reach the caller, and it cannot be dropped without a warning.
+#[must_use = "a checkpoint re-declares in full only after a real truncation (D234), so it has to know whether there was one"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Truncation {
     /// The log was discarded and restarted at its end.

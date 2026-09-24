@@ -489,8 +489,10 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     //   actor is a log `LogicalDecoder` refuses whole. At 00f4c39 this checkpoint ran on every
     //   non-empty log, so that could not happen;
     // - (D234) whenever there is a table to declare, so the declarations are in the log before
-    //   anything can pin it. A checkpoint that a pin keeps from truncating re-declares nothing,
-    //   and at an open nothing holds a pin yet. A log can be empty while the catalog has tables:
+    //   anything can pin it. A checkpoint that a pin keeps from truncating re-declares no run, and
+    //   the schema only once a pin has passed its last declaration, so a reader that started
+    //   before then would meet changes to tables nothing had declared; at an open nothing holds a
+    //   pin yet. A log can be empty while the catalog has tables:
     //   one written before D227, one cut by a crash between a truncation and its replay, or one a
     //   snapshot install truncated (the D234 adversary's F4).
     let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
@@ -1706,9 +1708,10 @@ use super::*;
     /// A log written before D227 can be empty while the database has tables: a clean close by a
     /// process that ran no DDL re-declared nothing. `open_recovered` retains the tables (D227) but
     /// took no checkpoint over an empty log. Since D234, a checkpoint that a pin keeps from
-    /// truncating re-declares nothing, so tables retained and never written could stay out of the
-    /// log for as long as a change stream lags. The open therefore checkpoints whenever it has a
-    /// declaration to make, and at an open nothing holds a pin yet.
+    /// truncating re-declares the schema only once a pin has passed its last declaration, so a
+    /// change stream that pinned the log first would meet changes to tables nothing had declared,
+    /// until some later checkpoint re-declared them. The open therefore checkpoints whenever it has
+    /// a declaration to make, and at an open nothing holds a pin yet.
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39`, and at `e2611bf`, at the
     /// declaration assertion (the open takes no checkpoint, and the log stays empty).

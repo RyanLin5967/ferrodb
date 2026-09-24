@@ -1067,10 +1067,13 @@ impl TxnManager {
     /// Called immediately after a truncation. Without it the log is self-describing only until the
     /// first checkpoint, which is to say almost never.
     fn replay_schema(&self) -> Result<(), FerroError> {
-        let records = self.schema_log.lock().unwrap().clone();
         // Where this declaration begins, recorded even when there is nothing to declare: a reader at
-        // or below it has seen the whole schema, which is then empty (D234).
+        // or below it has seen the whole schema, which is then empty (D234). Recorded BEFORE the
+        // copy: `log_ddl` retains before it appends, so a statement racing this either made the
+        // copy or appended its own record at or above this position, and no reader starting here
+        // can miss it.
         self.schema_declared_at.store(self.wal.next_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
+        let records = self.schema_log.lock().unwrap().clone();
         if records.is_empty() {
             return Ok(());
         }
