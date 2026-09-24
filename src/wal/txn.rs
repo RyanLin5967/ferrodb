@@ -3359,6 +3359,34 @@ use super::*;
         (bp, wal, txn, catalog, owned, dir)
     }
 
+    /// **D250 review 3's Q4 (lane §3.15 test 19): a DROP whose mutation PANICS after its record is
+    /// durable poisons the log, wherever `att` is released.** The next open completes the logged DROP,
+    /// so nothing may write the table after the record. At `cd0914b` a panic in `f` stopped later
+    /// writes only because `f` ran inside `att`'s critical section, whose `Mutex` the unwind poisoned:
+    /// a property of lock placement that nothing pinned. A guard now poisons the log itself.
+    #[test]
+    fn a_drop_whose_mutation_panics_after_its_record_is_durable_poisons_the_log() {
+        let (_bp, wal, txn, _catalog, owned, _dir) = table_to_drop();
+        let record = DdlRecord {
+            op: DdlOp::DropTable,
+            table: "t".into(),
+            dir_root: owned[0],
+            time_travel_root: owned[1],
+            columns: Vec::new(),
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            txn.drop_checkpointed(record, || -> Result<(), FerroError> {
+                panic!("injected: the DROP's mutation panicked before it freed anything")
+            })
+        }));
+        assert!(caught.is_err(), "premise failed: the mutation did not panic");
+        assert!(
+            wal.poisoned().is_some(),
+            "a DROP whose mutation panicked after its record was durable left the log writable: only a poisoned \
+             `att` lock stood between it and a write the next open's completion would skip"
+        );
+    }
+
     /// **D250 (lane §2 test 4; replaces the parent's
     /// `a_drop_is_refused_before_its_mutation_while_a_pin_would_keep_the_log`): a DROP under a WAL pin
     /// succeeds, and the pin keeps the log.** What makes the kept log harmless after a crash is

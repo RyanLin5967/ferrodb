@@ -1803,19 +1803,64 @@ use super::*;
             "premise failed: the empty re-created `t` survived the open, so the residual whose pages this probes is gone"
         );
         assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP");
-        // Every page a live catalog entry names, as the open left them (after the rebuild).
-        let live: HashSet<u32> = o
-            .catalog
-            .tables
-            .values()
-            .flat_map(|e| {
-                [e.first_directory_page_id, e.time_travel_root, e.primary_index_root]
-                    .into_iter()
-                    .chain(e.indexes.iter().map(|i| i.root_page_id))
-                    .chain(e.fulltext_indexes.iter().map(|i| i.root_page_id))
-            })
-            .collect();
-        assert!(o.catalog.get_table("keep").is_some() && !live.is_empty(), "premise failed: no live table, so nothing could be aliased");
+        // Every page a live table OWNS, as the open left them (after the rebuild): each heap's and
+        // time-travel heap's directory chain and the pages it lists, and every node of every tree.
+        // Lane §3.15 (D250 review 3's D): roots alone let a data-page alias through.
+        let heap_pages = |dir_root: u32| -> Vec<u32> {
+            let mut out = Vec::new();
+            let mut dir_page = dir_root;
+            while dir_page != 0 {
+                let frame_i = o.bp.fetch_page(dir_page).unwrap();
+                let data = o.bp.frames[frame_i].read().unwrap().data;
+                o.bp.unpin_page(dir_page, false);
+                let dir = crate::storage::page_directory::PageDirectory::deserialize(data);
+                out.push(dir_page);
+                out.extend(dir.entries.iter().map(|e| e.page_id));
+                dir_page = dir.next_page_directory;
+            }
+            out
+        };
+        let primary_pages = |root: u32| -> Vec<u32> {
+            let tree = BPlusTreeManager::<Value, RecordId>::open(root, o.bp.clone());
+            let mut out = Vec::new();
+            let mut stack = vec![root];
+            while let Some(page) = stack.pop() {
+                out.push(page);
+                if let crate::storage::index_page::BPlusTreePage::Internal(node) = tree.read_node(page).unwrap() {
+                    stack.extend(node.child_ptrs.iter().copied());
+                }
+            }
+            out
+        };
+        let secondary_pages = |root: u32| -> Vec<u32> {
+            let tree = BPlusTreeManager::<(Value, Value), ()>::open(root, o.bp.clone());
+            let mut out = Vec::new();
+            let mut stack = vec![root];
+            while let Some(page) = stack.pop() {
+                out.push(page);
+                if let crate::storage::index_page::BPlusTreePage::Internal(node) = tree.read_node(page).unwrap() {
+                    stack.extend(node.child_ptrs.iter().copied());
+                }
+            }
+            out
+        };
+        let mut live: HashSet<u32> = HashSet::new();
+        for e in o.catalog.tables.values() {
+            live.extend(heap_pages(e.first_directory_page_id));
+            live.extend(heap_pages(e.time_travel_root));
+            live.extend(primary_pages(e.primary_index_root));
+            for i in &e.indexes {
+                live.extend(secondary_pages(i.root_page_id));
+            }
+            for i in &e.fulltext_indexes {
+                live.extend(secondary_pages(i.root_page_id));
+            }
+        }
+        let keep_dir = o.catalog.get_table("keep").expect("premise failed: `keep` did not survive the open").first_directory_page_id;
+        assert!(
+            heap_pages(keep_dir).len() >= 2,
+            "premise failed: `keep`'s heap lists no data page, so a data-page alias could not be seen"
+        );
         // `allocate` hands out the lowest clear bit, so every free page below the high-water mark comes
         // out before the first page at or above it.
         let high = o.bp.disk_manager.high_water().unwrap();
@@ -1913,6 +1958,97 @@ use super::*;
         );
     }
 
+    /// **D250 review 3's A (lane §3.15 test 18): a DROP in the log does not make every later open
+    /// rebuild.** At `cd0914b` the open re-declared every dropped table's `DropTable` after its
+    /// truncation, and `recover` counts any non-empty log as recovered, so every open of a process
+    /// that never truncated after its open (pgserver always, a killed CLI) rebuilt every index. The
+    /// forget now runs inside the open, before its checkpoint, and nothing is re-declared.
+    #[test]
+    fn a_drop_in_the_log_does_not_make_every_later_open_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("three_opens.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);", "DROP TABLE t;"] {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            // The crash: every handle goes, and no checkpoint runs after the DROP's.
+        }
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("open 1 failed");
+            assert!(o.recovered, "premise failed: the log after the DROP held nothing, so nothing here could recur");
+        }
+        for open in [2, 3] {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap_or_else(|e| panic!("open {open} failed: {e}"));
+            assert!(
+                !o.recovered,
+                "open {open} found a non-empty log and rebuilt every index: a DROP long since completed keeps \
+                 every open of a process that never truncates rebuilding"
+            );
+        }
+    }
+
+    /// **D250 review 3's A (lane §3.15 test 17): a DROP whose own forget never ran is forgotten by the
+    /// next open.** The executor's DROP forgets the table's authors after its barrier (B9); a crash in
+    /// between left them in the database's provenance file. The next open finds the DROP in the log and
+    /// the table gone from the catalog, and forgets them itself, before its checkpoint truncates the
+    /// record away, with no runtime attached.
+    #[test]
+    fn a_drop_whose_own_forget_never_ran_is_forgotten_by_the_next_open() {
+        use crate::{
+            agent_sql::runtime::table_id,
+            branch::types::BranchId,
+            provenance::{DurableProvenanceStore, ProvId, ProvenanceStore, RunEntity},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("forget_at_open.db");
+        let provenance = PathBuf::from(format!("{}.provenance", db.display()));
+        {
+            // Authors of `t` and `keep` in the database's provenance file, as a CLI session leaves them.
+            let store = DurableProvenanceStore::open(&provenance).unwrap();
+            let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+            let author = store.intern(&run).unwrap();
+            store.stamp_row(table_id("t").0, 1, author).unwrap();
+            store.stamp_row(table_id("keep").0, 1, author).unwrap();
+        }
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            // `run_sql`'s session has an IN-MEMORY runtime, so the executor's forget never reaches the
+            // file: the state a crash between the DROP and its forget leaves.
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (1, 10);",
+                "DROP TABLE t;",
+            ] {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            // The crash.
+        }
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("the open after the DROP failed");
+            assert!(o.catalog.get_table("t").is_none(), "premise failed: `t` came back");
+            // No runtime is attached: the forget must not depend on one.
+        }
+        let store = DurableProvenanceStore::open(&provenance).unwrap();
+        assert_eq!(
+            store.row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "the dropped `t`'s authors survived an open that found its DROP in the log: a table created under the \
+             name inherits them"
+        );
+        assert_ne!(
+            store.row_author(table_id("keep").0, 1).unwrap(),
+            ProvId::NONE,
+            "the open forgot the authors of `keep`, which was never dropped"
+        );
+    }
+
     /// **D250, the D229 merge review's finding 3 (lane §3.8 test 13): after a pinned DROP whose freed
     /// pages a new table took, and a crash, the new table holds only its own row.** Test 1's hazard is
     /// a freed page that was never flushed. On the D229 tree every page is flushed before the free, so
@@ -1960,6 +2096,13 @@ use super::*;
                 let e = o.catalog.get_table("u").unwrap();
                 (e.first_directory_page_id, e.time_travel_root)
             };
+            // Lane §3.15 (D250 review 3's Q3-1): LSNm's kill rests on `u`'s roots BEING `t`'s, which
+            // the allocation's symmetry gives today; asserted, so a change to it cannot pass silently.
+            assert_eq!(
+                (u_heap, u_tt),
+                (t_heap, t_tt),
+                "premise failed: `u`'s heap and time-travel roots are not the dropped `t`'s, so LSNm could survive"
+            );
             let writes = heap_writes_at(&o.wal);
             // The pages `u` writes that `t`'s records also write, and that are older on disk than the
             // first of those records: redo without the skip would apply `t`'s records to each.
