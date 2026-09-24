@@ -10,15 +10,21 @@
 //! `ProvenanceStore::sync_counts().row_authors`, read immediately before and after the `MERGE`
 //! statement. It counts the fsyncs that made logical row authorship durable, which are exactly the
 //! syncs `record_applied` issues. The executor's physical `(page, slot)` stamps are counted apart,
-//! in `stamps`, and are deliberately NOT asserted by the first test: they are one sync per
-//! published version on the publish loop, outside the `state` lock. They appear in its failure
-//! message so a reader sees the whole bill.
+//! in `stamps`, and are deliberately NOT asserted by the first test. When it was written they were
+//! one sync per published version on the publish loop, outside the `state` lock; since `86e1762`
+//! they ride the row-authorship sync, so the column its failure message labels "physical stamp
+//! syncs" reads 0 there.
 //!
 //! **The second test asserts them.** D219's exit is ONE provenance sync per MERGE whatever δ is,
 //! physical and logical together, so
 //! `every_provenance_sync_a_merge_issues_is_one_whatever_delta_is` reads `total()` — every sync the
 //! store issued inside the MERGE, whatever it carried — and adds the one physical-stamp path the
 //! publish loop does not own: an ALTER's rewrite re-stamping the rows it moves.
+//!
+//! **The third test is the one exception, and why.** A merge that alters a table AND publishes
+//! rows has two durability points — the schema phase makes its heap rewrite durable before the
+//! publish begins — so it syncs twice, whatever δ is:
+//! `a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrite`.
 //!
 //! # Pre-registered, from reading the source at `9aa6968`, before this file was ever run
 //!
