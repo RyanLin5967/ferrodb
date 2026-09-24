@@ -3811,9 +3811,11 @@ impl AgentRuntime {
     /// missed a branch whose workspace an earlier sweep had dropped while its reap was still in
     /// flight.
     ///
-    /// **The epoch is the catalog's current one**, the epoch at which the reap is recorded, which
-    /// is what `HistoryEntry::epoch` documents. It is not the record's `fork_epoch`, which `seal`
-    /// stamps: by the time a sweep visits, the reaper may have released the slot
+    /// **The epoch is the branch's fork epoch, the same value `seal` stamps** (the lead's review,
+    /// `ad60009`). The epoch is hashed into the entry, so one op carrying two meanings would be two
+    /// formats. It comes from the log's own index ([`AttestedHistory::opened_at`]: the epoch of
+    /// the branch's `Fork` entry, which `attest_fork` took from the catalog record), not from
+    /// `get_raw(id).fork_epoch`. By the time a sweep visits, the reaper may have released the slot
     /// (`TwoTierReaper::reap` calls `release_id`) and a fork may have recycled it, so the record
     /// `get_raw` returns can be another branch's. `published` is false: a branch the lease took
     /// published nothing.
@@ -3829,15 +3831,16 @@ impl AgentRuntime {
         if landed.is_empty() {
             return;
         }
-        let epoch = self.branches.current_epoch();
         let mut h = self.attested.lock().unwrap();
         for branch in landed {
-            if h.head_of(branch).is_none() {
+            // `None` exactly when there is no live head: already sealed, or never forked here.
+            // Skipped, not refused. This is the exactly-once key.
+            let Some(fork_epoch) = h.opened_at(branch) else {
                 continue;
-            }
+            };
             // Cannot be refused: the branch has a live head and is not trunk (trunk is never
             // reaped). Counted rather than unwrapped if it ever is, as in `seal`.
-            let _ = Self::append_reap(&mut h, branch, epoch, false);
+            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);
         }
     }
 

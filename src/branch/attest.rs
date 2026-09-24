@@ -802,7 +802,7 @@ pub struct AttestedHistory {
     /// `verify_against`, and the runtime's `attested_entries`. The only reader of `by_branch` was
     /// `verify_branch`, which used one element per key and now finds it with a reverse scan
     /// inside a walk that is already O(n). Size: O(live branches), including trunk.
-    heads: HashMap<BranchId, Attestation>,
+    heads: HashMap<BranchId, Tip>,
     /// Merkle levels; `levels[0]` is the leaf hashes. Maintained incrementally so that `append` is
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
     /// quadratic, which is the difference between a benchmark that runs and one that does not.
@@ -811,6 +811,19 @@ pub struct AttestedHistory {
     /// counter: nothing reads it to decide anything. It exists because a refusal the runtime does
     /// not propagate (a merge or reap that already committed) must still leave a trace.
     refused: u64,
+}
+
+/// A live branch's entry in [`AttestedHistory`]'s per-branch index. Derived from `entries` by
+/// `push`, like the rest of the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tip {
+    /// The attestation of the branch's latest entry.
+    head: Attestation,
+    /// The epoch of the branch's FIRST entry in this log: its `Fork`'s epoch for every branch but
+    /// trunk, since the writer refuses anything else first. Kept so that a reap recorded after the
+    /// catalog has let go of the branch's record still carries its fork epoch, as `seal`'s Reap
+    /// entries do (D199). 8 bytes per live branch.
+    opened: Epoch,
 }
 
 impl Default for AttestedHistory {
@@ -855,7 +868,17 @@ impl AttestedHistory {
     /// Takes a whole [`BranchId`]: a reaped slot and its recycled successor are different
     /// branches and must not share a head. See the note on the `heads` field.
     pub fn head_of(&self, branch: BranchId) -> Option<Attestation> {
-        self.heads.get(&branch).copied()
+        self.heads.get(&branch).map(|t| t.head)
+    }
+
+    /// The epoch a **live** branch's history opened at in this log: its `Fork`'s epoch, which
+    /// `AgentRuntime::attest_fork` takes from the branch's catalog record. `None` exactly when
+    /// [`Self::head_of`] is `None`.
+    ///
+    /// D199 reads it to stamp a lease-expiry `Reap` with the same epoch `seal` stamps, at a point
+    /// where the catalog record may already belong to a branch that recycled the slot.
+    pub fn opened_at(&self, branch: BranchId) -> Option<Epoch> {
+        self.heads.get(&branch).map(|t| t.opened)
     }
 
     /// The Merkle tree head over all `len()` entries. `MTH({})` for an empty log.
@@ -899,7 +922,7 @@ impl AttestedHistory {
         epoch: Epoch,
         content_cid: ContentId,
     ) -> Result<Attestation, AppendRefused> {
-        let prev = match self.heads.get(&parent).copied() {
+        let prev = match self.heads.get(&parent).map(|t| t.head) {
             Some(head) => head,
             None if parent.is_trunk() => Attestation::genesis(),
             None => return self.refuse(AppendRefused::NoLiveParent { parent }),
@@ -926,7 +949,7 @@ impl AttestedHistory {
         if op == BranchOp::Reap && branch.is_trunk() {
             return self.refuse(AppendRefused::TrunkReap);
         }
-        let prev = match self.heads.get(&branch).copied() {
+        let prev = match self.heads.get(&branch).map(|t| t.head) {
             Some(head) => head,
             None if branch.is_trunk() => Attestation::genesis(),
             None => return self.refuse(AppendRefused::NoLiveHead { branch }),
@@ -956,7 +979,8 @@ impl AttestedHistory {
         if e.op == BranchOp::Reap {
             self.heads.remove(&e.branch);
         } else {
-            self.heads.insert(e.branch, att);
+            let opened = self.heads.get(&e.branch).map_or(e.epoch, |t| t.opened);
+            self.heads.insert(e.branch, Tip { head: att, opened });
         }
         self.extend_tree(e.leaf_hash());
         self.entries.push(e);
