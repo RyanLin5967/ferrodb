@@ -2117,9 +2117,9 @@ fn main() {
         // record is logged after it, so the log past its base is that record alone.
         //
         // A14.1: the injection is the record's RETENTION in `schema_log`, which is what every later
-        // checkpoint re-appends; that is asserted. Whether the base moved is printed, not asserted:
-        // after `reopen_for_merges` the log is empty past its base (D227), so the DDL's truncation
-        // stores the base it already had.
+        // checkpoint re-appends; that is asserted. The base is expected NOT to move: after
+        // `reopen_for_merges` the log is empty past its base (D227), so the DDL's truncation stores
+        // the base it already had. A moved base is refused below (A15.4), not asserted.
         if fire == Fire::CkptDdl {
             let mut plain = Session::with_runtime(Arc::clone(&open.runtime));
             let base0 = open.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
@@ -2142,14 +2142,15 @@ fn main() {
                 (base1 != base0) as u8,
                 retained as u8
             );
-            // A15.4: refused here, not only by the verdict script. A moved base means the reopen
-            // left records past it, so D227's premise is gone, and with it A12.1's `a = 0` and
-            // `runs = M` for every CKPT line this run prints.
+            // A15.4: refused here, not only by the verdict script. A moved base means records sat
+            // past it at the DDL's checkpoint, which A14.1 expects never to happen (D227); A12.1's
+            // `a = 0` and `runs = M` for every CKPT line this run prints rest on the same premise.
+            // The check sees only that the base moved, and the message names only that (A16.2).
             if base1 != base0 {
                 failures.push(
-                    "A14.1: ckpt-ddl's base MOVED across the DDL, so the reopen left records past the base: \
-                     D227's premise, and with it A12.1's a = 0 and runs = M, no longer holds; amend the \
-                     pre-registration before reading (f3)"
+                    "A14.1: ckpt-ddl's base MOVED across the DDL: records sat past the base at the DDL's \
+                     checkpoint, and A14.1 expects none (D227). A12.1's a = 0 and runs = M rest on the same \
+                     premise; amend the pre-registration before reading (f3)"
                         .into(),
                 );
             }
@@ -2565,8 +2566,9 @@ fn read_vs_n_summary(
     println!();
     if fire == Fire::CkptDdl {
         println!(
-            "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads it, so none may appear below; \
-             the replay-bytes line above must carry the pre-registered intercept."
+            "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads the replay-bytes integer; the \
+             only NOT A RESULT that may appear below is A14.1's refusal of a moved base (A15.4). The replay-bytes \
+             line above must carry the pre-registered intercept (A16.2)."
         );
     } else if fire != Fire::None {
         println!("FIRECHECK {fire:?}: exactly the guard this mode breaks must appear below, and no other.");
