@@ -2693,6 +2693,10 @@ fn read_vs_n_summary(
              seven only by joining the rows on N (A18.6). recover_us is reported too; `recovered` judges its fact \
              (A16.5)."
         );
+        println!(
+            "  arm 3: warmth, `child net ms` (child total less recover and rebuild) against `parent total ms`, is \
+             REPORTED, not judged: no band was registered for it before data (A21.2)."
+        );
         // A18.1: an H6 row is no point of the curve (A17.2), so it is not counted here either.
         if counted < 2 {
             failures.push(format!(
