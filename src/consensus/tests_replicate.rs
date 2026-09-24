@@ -1808,3 +1808,28 @@ fn a_wal_batch_one_byte_over_a_frame_is_refused_at_proposal_and_one_at_the_limit
         }
     }
 }
+
+#[test]
+fn an_entry_that_fits_no_frame_is_still_offered_alone() {
+    // The at-least-one rule in `slice_from`, pinned: it is what mutant M27 removes, and before this
+    // test nothing killed that mutant. Since D223 no proposal can put an entry like this in a log.
+    // One placed around admission — a driver bug, or a log written before D223 — is still a state
+    // this code must handle. The rule stops such an entry hiding as an empty batch, which a follower
+    // would read as a heartbeat.
+    let cfg = Config::new([N1, N2, N3], 2, 1).with_learners((4..=1028).map(NodeId));
+    let mut c = Consensus::new(N1, cfg3(), 73);
+    // Around admission, on purpose: `seed` appends through `append_own_entry` directly.
+    seed(&mut c, &[(1, Command::Membership { config: cfg })]);
+    let offered = c.entries_from(1);
+    assert_eq!(
+        offered.len(),
+        1,
+        "an entry no frame can carry was hidden: the batch is empty, which a follower reads as a \
+         heartbeat, so the leader would never learn that this round cannot be sent"
+    );
+    assert_eq!(
+        crate::consensus::transport::entry_wire_len(&offered[0]),
+        usize::MAX,
+        "the fixture is an entry the wire can express, so this test exercises nothing"
+    );
+}

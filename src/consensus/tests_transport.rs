@@ -2628,3 +2628,44 @@ fn removing_voters_from_a_learner_list_is_a_binary_search_per_learner() {
          binary search per learner can use: this is a scan per learner again"
     );
 }
+
+#[test]
+fn every_send_the_transport_refuses_is_counted() {
+    // **D223.** `node.rs` discards every `Err` from `send` by design, and its comment says such a
+    // send is "counted by the transport". An encode refusal and the two addressing refusals were
+    // not, so a message could vanish with no number attached. Needs the new accessors, so its red
+    // evidence is mutants M32 and M33 (PREREG amendment 8), not a run on an older tree.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let t =
+        Transport::from_listener(NodeId(1), l, BTreeMap::from([(NodeId(2), dead)]), fast()).unwrap();
+
+    // Unencodable: a configuration one member over the wire's cap.
+    let too_big = Config::new((1..=MAX_CONFIG_NODES as u32 + 1).map(NodeId), 1, 1);
+    let m = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry { term: 1, round: 1, command: Command::Membership { config: too_big } }],
+            commit: 0,
+        },
+    };
+    assert!(t.send(&m).is_err(), "an Append the encoder cannot frame was accepted");
+    assert_eq!(t.unencodable(), 1, "an encode refusal was not counted");
+
+    // Unaddressable: to this node itself, and to a node this transport holds no address for.
+    let beat =
+        |to: u32| Message { from: NodeId(1), to: NodeId(to), term: 1, body: Body::PreVoteResp { granted: true } };
+    assert!(t.send(&beat(1)).is_err(), "a send to self was accepted");
+    assert!(t.send(&beat(3)).is_err(), "a send to an unconfigured node was accepted");
+    assert_eq!(t.unaddressable(), 2, "an addressing refusal was not counted");
+    assert_eq!(t.unencodable(), 1, "an addressing refusal was counted as an encoding one");
+    assert_eq!(t.sent(), 0, "a refused send was counted as sent");
+
+    // Anti-vacuity: an accepted send moves neither refusal counter.
+    t.send(&beat(2)).unwrap();
+    assert_eq!((t.unencodable(), t.unaddressable(), t.sent()), (1, 2, 1));
+}
