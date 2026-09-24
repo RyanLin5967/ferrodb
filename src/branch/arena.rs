@@ -1103,7 +1103,8 @@ impl ArenaPageStore {
             let stamped =
                 self.read_page(page).ok().and_then(|h| h.header().ok()).map(|h| h.arena_id);
             match stamped {
-                Some(id) if id == arena => {
+                // MUTANT (fire-check only, never land): any readable page counts as this extent's.
+                Some(_id) => {
                     if ended {
                         // One of ours past the end: a hole in the prefix, not its end.
                         proven = false;
