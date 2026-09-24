@@ -12,10 +12,9 @@ that matches anything but once, where the targets exist, is a PATTERN-MISMATCH, 
 Mutants left out by `--only` or `--skip` are listed in the summary as SKIPPED.
 
 `--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
-`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor`
-until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
-buffered `TxnEnd` two D216 gate negative controls use as their premise, so they fail there, a full
-CONTROL is not clean, and every verdict would be VOID.
+`d252-caught-up-pin` the full set runs with no flag since the lead's ruling on the lane's §12.4 ⚖
+(the two D216 gate negative controls plant their own buffered record), whose commit made a full
+CONTROL clean there.
 
 For each mutant: restore the tree, apply one exact replacement (refused unless the pattern matches
 exactly once), run the named cargo test targets, and record KILLED when every expected test is
