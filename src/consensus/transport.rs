@@ -137,6 +137,29 @@ const B_REAP: u8 = 3;
 /// 1024 the quadratic term is about a million comparisons, which is microseconds.
 pub const MAX_CONFIG_NODES: usize = 1024;
 
+/// Most node ids **one frame** may spend, summed over every configuration it carries.
+///
+/// [`MAX_CONFIG_NODES`] bounds one configuration, and that alone is not a bound on the frame.
+/// `Config::with_learners` retains learners with `Vec::contains` (`config.rs`), so a configuration of
+/// n members and n learners costs n x n comparisons however this file validates it, and an `Append`
+/// may carry many: an 8 MiB frame holds about 1018 configurations of 1024 + 1024 ids, which is 1.07e9
+/// comparisons for one frame. The per-configuration cap cut the original 10^12 to that and stopped
+/// there (D207, ported from F3-transport's `1b3a6a6`, which never merged).
+///
+/// Charged per frame, the worst case is two maximal configurations, about 2.1e6 comparisons. Real
+/// traffic is nowhere near it: membership changes are single-node by construction, so a frame carries
+/// one configuration of a handful of nodes. Both halves of the codec charge it, for the reason
+/// [`MAX_CONFIG_NODES`] is enforced on both: a limit only the receiver knows is a frame the sender
+/// emits and every peer refuses.
+pub const MAX_FRAME_CONFIG_NODES: usize = 4096;
+
+// One maximal configuration — a full member list and a full learner list — must fit a frame's
+// budget, or a configuration the encoder accepts could never be sent at all.
+const _: () = assert!(
+    MAX_FRAME_CONFIG_NODES >= 2 * MAX_CONFIG_NODES,
+    "a single maximal configuration no longer fits the per-frame node budget"
+);
+
 /// `RecKind::Ddl`'s tag in `wal::log`. Named here because [`Command::Catalog`] is carried *as* one
 /// of those records, and because the tag has to be checked before the record is handed to
 /// `RecKind::deserialize` — see [`decode_catalog`].
@@ -174,7 +197,10 @@ pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroErr
     put_u32(&mut body, m.from.0);
     put_u32(&mut body, m.to.0);
     put_u64(&mut body, m.term);
-    encode_body(&mut body, &m.body)?;
+    // Spent by every configuration in the message, as `decode` spends it. See
+    // [`MAX_FRAME_CONFIG_NODES`].
+    let mut budget = MAX_FRAME_CONFIG_NODES;
+    encode_body(&mut body, &m.body, &mut budget)?;
 
     // Belt as well as braces: every variable-length step above already refused to grow past the
     // limit, and this is the single statement a reader can check the claim against.
@@ -232,7 +258,7 @@ fn put_bytes(b: &mut Vec<u8>, v: &[u8]) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn encode_body(b: &mut Vec<u8>, body: &Body) -> Result<(), FerroError> {
+fn encode_body(b: &mut Vec<u8>, body: &Body, budget: &mut usize) -> Result<(), FerroError> {
     match body {
         Body::PreVote { last_term, last_round } => {
             b.push(K_PRE_VOTE);
@@ -262,7 +288,7 @@ fn encode_body(b: &mut Vec<u8>, body: &Body) -> Result<(), FerroError> {
             room(b, 4)?;
             put_u32(b, u32::try_from(entries.len()).map_err(|_| too_big(entries.len()))?);
             for e in entries {
-                encode_entry(b, e)?;
+                encode_entry(b, e, budget)?;
             }
         }
         Body::AppendResp { success, matched, hint, digest } => {
@@ -274,7 +300,7 @@ fn encode_body(b: &mut Vec<u8>, body: &Body) -> Result<(), FerroError> {
         }
         Body::InstallSnapshot { meta, offset, data, done } => {
             b.push(K_INSTALL_SNAPSHOT);
-            encode_snapshot_meta(b, meta)?;
+            encode_snapshot_meta(b, meta, budget)?;
             put_u64(b, *offset);
             put_bool(b, *done);
             put_bytes(b, data)?;
@@ -287,16 +313,16 @@ fn encode_body(b: &mut Vec<u8>, body: &Body) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn encode_entry(b: &mut Vec<u8>, e: &Entry) -> Result<(), FerroError> {
+fn encode_entry(b: &mut Vec<u8>, e: &Entry, budget: &mut usize) -> Result<(), FerroError> {
     // Checked per entry rather than only at the end, so a list of a hundred million `NoOp`s is
     // refused after the first few bytes instead of after 1.7 GB of them.
     room(b, 17)?;
     put_u64(b, e.term);
     put_u64(b, e.round);
-    encode_command(b, &e.command)
+    encode_command(b, &e.command, budget)
 }
 
-fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
+fn encode_command(b: &mut Vec<u8>, c: &Command, budget: &mut usize) -> Result<(), FerroError> {
     match c {
         Command::WalBatch { start_lsn, bytes } => {
             b.push(C_WAL_BATCH);
@@ -374,7 +400,7 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
         Command::Checkpoint => b.push(C_CHECKPOINT),
         Command::Membership { config } => {
             b.push(C_MEMBERSHIP);
-            encode_config(b, config)?;
+            encode_config(b, config, budget)?;
         }
         Command::NoOp => b.push(C_NO_OP),
     }
@@ -407,7 +433,7 @@ fn encode_branch_op(b: &mut Vec<u8>, op: &BranchOp) {
     }
 }
 
-fn encode_config(b: &mut Vec<u8>, cfg: &Config) -> Result<(), FerroError> {
+fn encode_config(b: &mut Vec<u8>, cfg: &Config, budget: &mut usize) -> Result<(), FerroError> {
     put_u64(b, cfg.version);
     put_u64(b, cfg.term);
     for list in [cfg.members(), cfg.learners()] {
@@ -422,6 +448,19 @@ fn encode_config(b: &mut Vec<u8>, cfg: &Config) -> Result<(), FerroError> {
                 list.len()
             )));
         }
+        // The frame's budget, for the same reason and in the same order as `decode_node_list`
+        // charges it: after the per-configuration cap, so each refusal names its own limit.
+        if list.len() > *budget {
+            return Err(FerroError::Wal(format!(
+                "a configuration holds {} nodes, but only {} of this frame's \
+                 {MAX_FRAME_CONFIG_NODES}-node budget is left; a peer would refuse this frame, so it \
+                 is refused here where the cause is visible. Send fewer Membership entries per \
+                 Append",
+                list.len(),
+                *budget
+            )));
+        }
+        *budget -= list.len();
         room(b, 4 + list.len() * 4)?;
         put_u32(b, u32::try_from(list.len()).map_err(|_| too_big(list.len()))?);
         for n in list {
@@ -431,14 +470,18 @@ fn encode_config(b: &mut Vec<u8>, cfg: &Config) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn encode_snapshot_meta(b: &mut Vec<u8>, meta: &SnapshotMeta) -> Result<(), FerroError> {
+fn encode_snapshot_meta(
+    b: &mut Vec<u8>,
+    meta: &SnapshotMeta,
+    budget: &mut usize,
+) -> Result<(), FerroError> {
     put_u64(b, meta.last_round);
     put_u64(b, meta.last_term);
     put_u64(b, meta.total_bytes);
     // The configuration travels with the snapshot because a receiver that installs one without it
     // cannot count a majority — F6's rule, enforced here by there being no way to encode a
     // `SnapshotMeta` that omits it.
-    encode_config(b, &meta.config)
+    encode_config(b, &meta.config, budget)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -461,7 +504,10 @@ pub fn decode(body: &[u8]) -> Result<Message, FerroError> {
     let from = NodeId(take_u32(body, &mut at)?);
     let to = NodeId(take_u32(body, &mut at)?);
     let term: Term = take_u64(body, &mut at)?;
-    let b = decode_body(body, &mut at)?;
+    // Spent by every configuration in this frame, so the work a frame can buy is bounded and not
+    // only the work each configuration can. See [`MAX_FRAME_CONFIG_NODES`].
+    let mut budget = MAX_FRAME_CONFIG_NODES;
+    let b = decode_body(body, &mut at, &mut budget)?;
     if at != body.len() {
         return Err(FerroError::Wal(format!(
             "a consensus frame has {} byte(s) left over after its last field; the sender and this \
@@ -512,7 +558,7 @@ fn take_bytes(bytes: &[u8], at: &mut usize) -> Result<Vec<u8>, FerroError> {
     Ok(slice.to_vec())
 }
 
-fn decode_body(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
+fn decode_body(bytes: &[u8], at: &mut usize, budget: &mut usize) -> Result<Body, FerroError> {
     Ok(match take_u8(bytes, at)? {
         K_PRE_VOTE => {
             Body::PreVote { last_term: take_u64(bytes, at)?, last_round: take_u64(bytes, at)? }
@@ -522,7 +568,7 @@ fn decode_body(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
             Body::RequestVote { last_term: take_u64(bytes, at)?, last_round: take_u64(bytes, at)? }
         }
         K_REQUEST_VOTE_RESP => Body::RequestVoteResp { granted: take_bool(bytes, at)? },
-        K_APPEND => decode_append(bytes, at)?,
+        K_APPEND => decode_append(bytes, at, budget)?,
         K_APPEND_RESP => Body::AppendResp {
             success: take_bool(bytes, at)?,
             matched: take_u64(bytes, at)?,
@@ -530,7 +576,7 @@ fn decode_body(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
             digest: take_u64(bytes, at)?,
         },
         K_INSTALL_SNAPSHOT => {
-            let meta = decode_snapshot_meta(bytes, at)?;
+            let meta = decode_snapshot_meta(bytes, at, budget)?;
             let offset = take_u64(bytes, at)?;
             let done = take_bool(bytes, at)?;
             let data = take_bytes(bytes, at)?;
@@ -550,7 +596,7 @@ fn decode_body(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
     })
 }
 
-fn decode_append(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
+fn decode_append(bytes: &[u8], at: &mut usize, budget: &mut usize) -> Result<Body, FerroError> {
     let prev_round: Round = take_u64(bytes, at)?;
     let prev_term: Term = take_u64(bytes, at)?;
     let commit: Round = take_u64(bytes, at)?;
@@ -562,20 +608,24 @@ fn decode_append(bytes: &[u8], at: &mut usize) -> Result<Body, FerroError> {
     // decode, and the first entry that runs off the end of the body ends it.
     let mut entries = Vec::new();
     for i in 0..count {
-        entries.push(decode_entry(bytes, at).map_err(|e| {
+        entries.push(decode_entry(bytes, at, budget).map_err(|e| {
             FerroError::Wal(format!("entry {i} of {count} in an Append frame: {e}"))
         })?);
     }
     Ok(Body::Append { prev_round, prev_term, entries, commit })
 }
 
-fn decode_entry(bytes: &[u8], at: &mut usize) -> Result<Entry, FerroError> {
+fn decode_entry(bytes: &[u8], at: &mut usize, budget: &mut usize) -> Result<Entry, FerroError> {
     let term: Term = take_u64(bytes, at)?;
     let round: Round = take_u64(bytes, at)?;
-    Ok(Entry { term, round, command: decode_command(bytes, at)? })
+    Ok(Entry { term, round, command: decode_command(bytes, at, budget)? })
 }
 
-fn decode_command(bytes: &[u8], at: &mut usize) -> Result<Command, FerroError> {
+fn decode_command(
+    bytes: &[u8],
+    at: &mut usize,
+    budget: &mut usize,
+) -> Result<Command, FerroError> {
     Ok(match take_u8(bytes, at)? {
         C_WAL_BATCH => {
             Command::WalBatch { start_lsn: take_u64(bytes, at)?, bytes: take_bytes(bytes, at)? }
@@ -594,7 +644,7 @@ fn decode_command(bytes: &[u8], at: &mut usize) -> Result<Command, FerroError> {
         },
         C_LEASE_TICK => Command::LeaseTick { unix_millis: take_u64(bytes, at)? },
         C_CHECKPOINT => Command::Checkpoint,
-        C_MEMBERSHIP => Command::Membership { config: decode_config(bytes, at)? },
+        C_MEMBERSHIP => Command::Membership { config: decode_config(bytes, at, budget)? },
         C_NO_OP => Command::NoOp,
         other => {
             return Err(FerroError::Wal(format!(
@@ -719,7 +769,12 @@ fn decode_branch_op(bytes: &[u8], at: &mut usize) -> Result<BranchOp, FerroError
 ///
 /// Refused rather than quietly canonicalised, because canonicalising means the bytes that arrived
 /// are not the bytes this node would re-emit, and F7's MAC is taken over bytes.
-fn decode_node_list(bytes: &[u8], at: &mut usize, what: &str) -> Result<Vec<NodeId>, FerroError> {
+fn decode_node_list(
+    bytes: &[u8],
+    at: &mut usize,
+    what: &str,
+    budget: &mut usize,
+) -> Result<Vec<NodeId>, FerroError> {
     let count = take_u32(bytes, at)? as usize;
     // Refused before a single id is read. See [`MAX_CONFIG_NODES`]: the frame limit bounds the
     // bytes a peer can make this process hold, not the work it can make this process do.
@@ -730,6 +785,20 @@ fn decode_node_list(bytes: &[u8], at: &mut usize, what: &str) -> Result<Vec<Node
              list lengths, so a large one is a request for this node's CPU rather than a cluster"
         )));
     }
+    // ...and charged against the FRAME's budget, also before a single id is read. The cap above
+    // bounds each configuration and nothing else bounds how many a frame carries. Checked second,
+    // so a count over the cap is always refused by the cap: in the other order the budget would
+    // answer for every count above it, and the cap's own refusal would be unreachable there.
+    if count > *budget {
+        return Err(FerroError::Wal(format!(
+            "a configuration claims {count} {what}s, but only {} of this frame's \
+             {MAX_FRAME_CONFIG_NODES}-node budget is left. A configuration costs work quadratic in \
+             its own size, so bounding one configuration bounds nothing about a frame that carries \
+             a thousand of them",
+            *budget
+        )));
+    }
+    *budget -= count;
     // Not pre-allocated from `count`, for the reason given in `decode_append`.
     let mut out: Vec<NodeId> = Vec::new();
     for _ in 0..count {
@@ -766,11 +835,11 @@ fn first_common(a: &[NodeId], b: &[NodeId]) -> Option<NodeId> {
     None
 }
 
-fn decode_config(bytes: &[u8], at: &mut usize) -> Result<Config, FerroError> {
+fn decode_config(bytes: &[u8], at: &mut usize, budget: &mut usize) -> Result<Config, FerroError> {
     let version = take_u64(bytes, at)?;
     let term = take_u64(bytes, at)?;
-    let members = decode_node_list(bytes, at, "member")?;
-    let learners = decode_node_list(bytes, at, "learner")?;
+    let members = decode_node_list(bytes, at, "member", budget)?;
+    let learners = decode_node_list(bytes, at, "learner", budget)?;
 
     // A node cannot be both. `with_learners` drops such a learner silently, which is the right
     // thing for a *builder* — the voter entry is the stronger statement — and the wrong thing for a
@@ -810,11 +879,20 @@ fn decode_config(bytes: &[u8], at: &mut usize) -> Result<Config, FerroError> {
     Ok(cfg)
 }
 
-fn decode_snapshot_meta(bytes: &[u8], at: &mut usize) -> Result<SnapshotMeta, FerroError> {
+fn decode_snapshot_meta(
+    bytes: &[u8],
+    at: &mut usize,
+    budget: &mut usize,
+) -> Result<SnapshotMeta, FerroError> {
     let last_round = take_u64(bytes, at)?;
     let last_term = take_u64(bytes, at)?;
     let total_bytes = take_u64(bytes, at)?;
-    Ok(SnapshotMeta { last_round, last_term, total_bytes, config: decode_config(bytes, at)? })
+    Ok(SnapshotMeta {
+        last_round,
+        last_term,
+        total_bytes,
+        config: decode_config(bytes, at, budget)?,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1008,14 +1086,25 @@ fn send_handshake(stream: &mut TcpStream) -> Result<(), FerroError> {
 
 /// Knobs, all of them with a defensible default.
 ///
-/// Every one is a real parameter rather than a tuning guess: `queue_depth` is how much a peer may
-/// fall behind before this node starts dropping to it, `poll_interval` is how long a thread may
-/// stay blocked in `read` after a shutdown has been asked for, and `reconnect_delay` is how hard
-/// this node retries a peer that is down.
+/// Every one is a real parameter rather than a tuning guess: `queue_depth` and `queue_bytes` are how
+/// far a peer may fall behind, in messages and in bytes, before this node starts dropping to it,
+/// `poll_interval` is how long a thread may stay blocked in `read` after a shutdown has been asked
+/// for, and `reconnect_delay` is how hard this node retries a peer that is down.
 #[derive(Debug, Clone)]
 pub struct TransportOptions {
     /// Messages held for one peer before the **oldest** is dropped. See [`Transport::send`].
     pub queue_depth: usize,
+    /// Bytes of queued frames held for one peer before the **oldest** is dropped.
+    ///
+    /// A depth in messages is not a bound on memory: a message is anything from 18 bytes to 8 MiB, so
+    /// `queue_depth` alone let one peer's queue hold 1024 x 8 MiB = 8.6 GB (D207, ported from
+    /// F3-transport's `207d362`, which never merged). Both bounds apply and whichever binds first
+    /// wins: the depth stops a flood of tiny heartbeats, and this stops a run of maximal `Append`s.
+    ///
+    /// A frame larger than the whole bound is still queued, alone — the oldest are dropped until
+    /// the queue is empty and then it goes in — so no message is ever unsendable because of this
+    /// knob, however small it is set.
+    pub queue_bytes: usize,
     /// Socket read timeout, and the listener's accept poll. Bounds shutdown latency.
     pub poll_interval: Duration,
     /// How long a sender thread waits after a failed dial before trying that peer again.
@@ -1054,6 +1143,7 @@ impl Default for TransportOptions {
     fn default() -> Self {
         TransportOptions {
             queue_depth: 1024,
+            queue_bytes: 64 * 1024 * 1024,
             poll_interval: Duration::from_millis(50),
             reconnect_delay: Duration::from_millis(100),
             handshake_deadline: Duration::from_secs(5),
@@ -1082,7 +1172,8 @@ struct Counters {
     lost_in_flight: AtomicU64,
     /// Bytes of decoded messages sitting in the inbox, undelivered.
     inbox_bytes: AtomicUsize,
-    /// Connections closed immediately because `max_inbound_conns` were already established.
+    /// Connections closed without being served: because `max_inbound_conns` were already
+    /// established, or because the accepted socket could not be configured (D207).
     refused_conns: AtomicU64,
     /// Connections closed for going silent longer than `idle_deadline`.
     idle_closed: AtomicU64,
@@ -1104,11 +1195,16 @@ struct Outbox {
     state: Mutex<OutboxState>,
     woken: Condvar,
     depth: usize,
+    /// `TransportOptions::queue_bytes`.
+    max_bytes: usize,
     dropped: AtomicU64,
 }
 
 struct OutboxState {
     queue: VecDeque<Vec<u8>>,
+    /// The sum of `queue`'s frame lengths, kept beside it so the byte bound costs no walk. Every
+    /// push, drop and pop of a frame moves it by that frame's length, under the same lock.
+    bytes: usize,
     /// A clone of the live socket, held **only** so that [`Transport::shutdown`] can call
     /// `shutdown(Both)` on it. A sender thread parked in `write_all` against a peer whose receive
     /// window is full is otherwise unreachable, and joining it would hang for ever.
@@ -1117,7 +1213,8 @@ struct OutboxState {
 }
 
 impl Outbox {
-    /// Enqueue, dropping the **oldest** if this peer is already `depth` behind.
+    /// Enqueue, dropping the **oldest** while this peer is already `depth` frames behind, or while
+    /// this frame would take it past `max_bytes`.
     ///
     /// Oldest and not newest, deliberately. Consensus messages are cumulative: a later `Append`
     /// carries a higher `commit` and later entries, and a later heartbeat supersedes an earlier
@@ -1128,10 +1225,19 @@ impl Outbox {
         if st.stopped {
             return;
         }
-        while st.queue.len() >= self.depth {
-            st.queue.pop_front();
-            self.dropped.fetch_add(1, Ordering::SeqCst);
+        // Both bounds, whichever binds first. The loop stops at an empty queue whatever the bytes
+        // say, so a frame larger than the whole byte bound is still admitted, alone: no message is
+        // made permanently unsendable by the bound that exists to keep sending possible.
+        while !st.queue.is_empty()
+            && (st.queue.len() >= self.depth
+                || st.bytes.saturating_add(frame.len()) > self.max_bytes)
+        {
+            if let Some(old) = st.queue.pop_front() {
+                st.bytes -= old.len();
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
+        st.bytes += frame.len();
         st.queue.push_back(frame);
         self.woken.notify_all();
     }
@@ -1180,11 +1286,19 @@ pub struct Transport {
     key: Option<Arc<Key>>,
 }
 
-/// Removes a connection from the live registry however its thread leaves — including the early
-/// return on a refused handshake.
+/// Removes a connection from the live registry however it leaves — including the early return on a
+/// refused handshake, and a connection that never got a thread at all.
 ///
 /// A `Drop` guard rather than a call at the end of `conn_loop`, because "every exit path also
 /// deregisters" is exactly the invariant a later edit breaks by adding one more `return`.
+///
+/// **Made in the same critical section that reserves the slot**, and moved into the connection
+/// thread from there. It used to be made at the top of `conn_loop`, which left the two exits in
+/// `accept_loop` between the reservation and the spawn outside it: the spawn failure released the
+/// slot by hand, and the failed socket setup did not — so each failed setup leaked a slot and a
+/// descriptor, and `max_inbound_conns` of them made the node refuse every real peer (D207, ported
+/// from F3-transport's `207d362`, which never merged). With the guard owning the slot from the
+/// moment it exists, no exit can be added that forgets it.
 struct ConnRegistration {
     id: u64,
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
@@ -1328,11 +1442,13 @@ impl Transport {
                 addr,
                 state: Mutex::new(OutboxState {
                     queue: VecDeque::new(),
+                    bytes: 0,
                     live: None,
                     stopped: false,
                 }),
                 woken: Condvar::new(),
                 depth: opts.queue_depth,
+                max_bytes: opts.queue_bytes,
                 dropped: AtomicU64::new(0),
             });
             outboxes.insert(peer, Arc::clone(&ob));
@@ -1483,7 +1599,8 @@ impl Transport {
     pub fn sent(&self) -> u64 {
         self.counters.sent.load(Ordering::SeqCst)
     }
-    /// Messages dropped because a peer was `queue_depth` behind. See [`Transport::send`].
+    /// Messages dropped because a peer was `queue_depth` messages or `queue_bytes` bytes behind.
+    /// See [`Transport::send`].
     pub fn dropped(&self) -> u64 {
         self.outboxes.values().map(|o| o.dropped.load(Ordering::SeqCst)).sum()
     }
@@ -1552,7 +1669,10 @@ impl Transport {
     pub fn signs_its_traffic(&self) -> bool {
         self.key.is_some()
     }
-    /// Connections closed immediately because `max_inbound_conns` were already established.
+    /// Inbound connections closed without being served: the cap was full, or the accepted socket
+    /// could not be configured. F3-transport's `207d362` recorded the second as what a peer that
+    /// connects and resets before `accept` leaves behind on macOS (D207), so on that platform this
+    /// meter climbing while `live_inbound_conns` stays low reads as resets, not as a busy node.
     pub fn refused_conns(&self) -> u64 {
         self.counters.refused_conns.load(Ordering::SeqCst)
     }
@@ -1594,6 +1714,7 @@ impl Transport {
             let mut st = ob.state.lock().unwrap();
             st.stopped = true;
             st.queue.clear();
+            st.bytes = 0;
             if let Some(s) = st.live.take() {
                 let _ = s.shutdown(Shutdown::Both);
             }
@@ -1620,6 +1741,7 @@ fn stop_started(stop: &Arc<AtomicBool>, outboxes: &[Arc<Outbox>], threads: Vec<J
         let mut st = ob.state.lock().unwrap();
         st.stopped = true;
         st.queue.clear();
+        st.bytes = 0;
         if let Some(s) = st.live.take() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -1723,7 +1845,11 @@ fn sender_loop(
             if st.stopped {
                 break;
             }
-            st.queue.pop_front()
+            let taken = st.queue.pop_front();
+            if let Some(f) = taken.as_ref() {
+                st.bytes -= f.len();
+            }
+            taken
         };
         let Some(frame) = frame else { continue };
 
@@ -1833,7 +1959,11 @@ fn accept_loop(
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 };
-                {
+                // The reservation and the guard that releases it are made together, so from here on
+                // EVERY way out — the two `continue`s below, a panic, and every return from
+                // `conn_loop` — gives the slot back. See [`ConnRegistration`] for the exit that did
+                // not (D207).
+                let registration = {
                     let mut map = conns.lock().unwrap();
                     if map.len() >= opts.max_inbound_conns {
                         counters.refused_conns.fetch_add(1, Ordering::SeqCst);
@@ -1842,35 +1972,48 @@ fn accept_loop(
                         continue;
                     }
                     map.insert(id, mine);
-                }
+                    ConnRegistration { id, conns: Arc::clone(&conns) }
+                };
                 // An accepted socket's blocking mode is not portably inherited from its listener,
                 // so it is set explicitly rather than assumed. The read timeout is what lets the
                 // connection thread notice a shutdown.
                 if stream.set_nonblocking(false).is_err()
                     || stream.set_read_timeout(Some(opts.poll_interval)).is_err()
                 {
+                    // Not hypothetical: F3-transport's `207d362` recorded that on macOS a peer which
+                    // connects and resets before `accept` leaves a socket on which `SO_RCVTIMEO`
+                    // fails with EINVAL. `registration` is dropped by this `continue`, which
+                    // releases the slot; the refusal is counted, because an unserved connection
+                    // with no number attached is the silent loss this module does not allow.
+                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
                 let tx_c = tx.clone();
                 let stop_c = Arc::clone(&stop);
                 let counters_c = Arc::clone(&counters);
-                let conns_c = Arc::clone(&conns);
                 let opts_c = opts.clone();
                 let key_c = key.clone();
                 match std::thread::Builder::new()
                     .name(format!("consensus-in-{self_id}"))
                     .spawn(move || {
                         conn_loop(
-                            stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c, key_c,
+                            stream,
+                            registration,
+                            self_id,
+                            tx_c,
+                            stop_c,
+                            counters_c,
+                            opts_c,
+                            key_c,
                         )
                     }) {
                     Ok(h) => conn_threads.push(h),
                     Err(_) => {
-                        // The slot was reserved above and no thread will release it, so it is
-                        // released here. Without this a run of spawn failures would fill the cap
-                        // with connections that do not exist and refuse every real peer after.
-                        conns.lock().unwrap().remove(&id);
+                        // A failed spawn drops the closure it was given, and `registration` with
+                        // it, so the slot is already released: no thread will ever run for it, and
+                        // no second release is needed here.
                         continue;
                     }
                 }
@@ -1894,20 +2037,19 @@ fn accept_loop(
 #[allow(clippy::too_many_arguments)]
 fn conn_loop(
     mut stream: TcpStream,
-    id: u64,
+    // Held, never read: dropping it at any return below is what releases the slot.
+    _registration: ConnRegistration,
     self_id: NodeId,
     tx: mpsc::Sender<(Message, usize)>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     opts: TransportOptions,
     key: Option<Arc<Key>>,
 ) {
     // The accept thread already reserved this connection's slot and registered its socket, so
-    // `shutdown` can reach a peer that connects and then goes silent. All this thread owns is the
-    // guard that releases the slot again, on every exit path including the refused-handshake
-    // return below.
-    let _registration = ConnRegistration { id, conns: Arc::clone(&conns) };
+    // `shutdown` can reach a peer that connects and then goes silent, and it handed over the guard
+    // that releases the slot. Owning it here is what makes every exit path below release it,
+    // including the refused-handshake return.
 
     let verdict = recv_handshake(&mut stream, &stop, opts.handshake_deadline);
 

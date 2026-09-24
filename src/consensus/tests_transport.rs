@@ -860,6 +860,7 @@ fn fast() -> TransportOptions {
         inbox_bytes: 32 * 1024 * 1024,
         max_inbound_conns: 256,
         idle_deadline: Duration::from_secs(60),
+        queue_bytes: 64 * 1024 * 1024,
     }
 }
 
@@ -1488,9 +1489,15 @@ fn the_oldest_queued_frame_is_the_one_dropped_and_the_newest_always_survives() {
     // up, so the peer would be told something that is permanently out of date.
     let ob = Outbox {
         addr: "127.0.0.1:1".parse().unwrap(),
-        state: Mutex::new(OutboxState { queue: VecDeque::new(), live: None, stopped: false }),
+        state: Mutex::new(OutboxState {
+            queue: VecDeque::new(),
+            bytes: 0,
+            live: None,
+            stopped: false,
+        }),
         woken: Condvar::new(),
         depth: 4,
+        max_bytes: 64 * 1024 * 1024,
         dropped: std::sync::atomic::AtomicU64::new(0),
     };
 
@@ -1924,9 +1931,15 @@ fn the_spawn_failure_teardown_actually_stops_the_threads_it_is_given() {
     let opts = fast();
     let ob = Arc::new(Outbox {
         addr: "127.0.0.1:1".parse().unwrap(), // refuses instantly, so the loop is in its retry path
-        state: Mutex::new(OutboxState { queue: VecDeque::new(), live: None, stopped: false }),
+        state: Mutex::new(OutboxState {
+            queue: VecDeque::new(),
+            bytes: 0,
+            live: None,
+            stopped: false,
+        }),
         woken: Condvar::new(),
         depth: 4,
+        max_bytes: 64 * 1024 * 1024,
         dropped: std::sync::atomic::AtomicU64::new(0),
     });
     let ob_c = Arc::clone(&ob);
