@@ -1,0 +1,36 @@
+# 2026-09-24T22:00:33Z HEAD=56ba536 dirty=1
+# cmd: timeout 1800 cargo test --no-fail-fast --test d270_catalog_persist_allocate_first
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d270.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.46s
+     Running tests/d270_catalog_persist_allocate_first.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d270_catalog_persist_allocate_first-6a040453678cad1b)
+
+running 2 tests
+test a_refused_allocation_for_the_catalog_leaves_its_pages_as_they_were ... FAILED
+test a_catalog_page_that_does_not_read_back_is_found_before_any_page_is_written ... FAILED
+
+failures:
+
+---- a_refused_allocation_for_the_catalog_leaves_its_pages_as_they_were stdout ----
+
+thread 'a_refused_allocation_for_the_catalog_leaves_its_pages_as_they_were' (356840731) panicked at tests/d270_catalog_persist_allocate_first.rs:193:5:
+assertion `left == right` failed: the refused statement changed the catalog's pages: a restart would read this image
+  left: {"aaa", "b1", "b2", "b3"}
+ right: {"b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_catalog_page_that_does_not_read_back_is_found_before_any_page_is_written stdout ----
+
+thread 'a_catalog_page_that_does_not_read_back_is_found_before_any_page_is_written' (356840729) panicked at tests/d270_catalog_persist_allocate_first.rs:221:10:
+a catalog whose second page does not read back cannot be rewritten
+
+
+failures:
+    a_catalog_page_that_does_not_read_back_is_found_before_any_page_is_written
+    a_refused_allocation_for_the_catalog_leaves_its_pages_as_they_were
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+error: test failed, to rerun pass `--test d270_catalog_persist_allocate_first`
+error: 1 target failed:
+    `--test d270_catalog_persist_allocate_first`
+# rc=101 end=2026-09-24T22:00:38Z

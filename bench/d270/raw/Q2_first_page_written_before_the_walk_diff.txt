@@ -1,0 +1,16 @@
+diff --git a/src/catalog/catalog.rs b/src/catalog/catalog.rs
+index 2c9c0cf..1fa2261 100644
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -539,6 +539,11 @@ impl Catalog {
+         // 3. Walk the chain the catalog already owns: reads only. A page that does not read back as a
+         //    catalog page is found here, not after its predecessors were rewritten. A chain that loops
+         //    back on itself is corruption; the old loop would have followed it for ever.
++        {
++            let mut early = images[0];
++            CatalogPage::stamp_links(&mut early, self.first_catalog_page_id, 0);
++            self.write_catalog_page(self.first_catalog_page_id, &early)?;
++        }
+         let mut chain: Vec<u32> = Vec::new();
+         let mut id = self.first_catalog_page_id;
+         while id != 0 {

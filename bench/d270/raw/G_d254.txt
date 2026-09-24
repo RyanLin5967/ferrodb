@@ -1,0 +1,15 @@
+# 2026-09-24T21:58:17Z HEAD=56ba536 dirty=0
+# cmd: timeout 1800 cargo test --no-fail-fast --test d254_catalog_persist_bound
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d270.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.84s
+     Running tests/d254_catalog_persist_bound.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d254_catalog_persist_bound-e16469b54ac53f5f)
+
+running 4 tests
+test persist_refuses_an_entry_no_page_can_hold_before_writing_any_page ... ok
+test a_create_table_whose_entry_exceeds_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+test a_create_fulltext_index_that_grows_an_entry_past_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+test a_create_index_that_grows_an_entry_past_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+# rc=0 end=2026-09-24T21:58:19Z

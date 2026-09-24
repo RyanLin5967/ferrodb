@@ -1,0 +1,30 @@
+# 2026-09-24T22:00:39Z HEAD=56ba536 dirty=1
+# cmd: timeout 1800 cargo test --no-fail-fast --test d254_catalog_persist_bound
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d270.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.07s
+     Running tests/d254_catalog_persist_bound.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d254_catalog_persist_bound-e16469b54ac53f5f)
+
+running 4 tests
+test persist_refuses_an_entry_no_page_can_hold_before_writing_any_page ... FAILED
+test a_create_table_whose_entry_exceeds_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+test a_create_fulltext_index_that_grows_an_entry_past_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+test a_create_index_that_grows_an_entry_past_a_page_is_refused_and_leaves_the_catalog_and_the_pages_alone ... ok
+
+failures:
+
+---- persist_refuses_an_entry_no_page_can_hold_before_writing_any_page stdout ----
+
+thread 'persist_refuses_an_entry_no_page_can_hold_before_writing_any_page' (356849021) panicked at tests/d254_catalog_persist_bound.rs:131:5:
+persist: expected the size refusal naming table m, got: NotEnoughSpace
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    persist_refuses_an_entry_no_page_can_hold_before_writing_any_page
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+error: test failed, to rerun pass `--test d254_catalog_persist_bound`
+error: 1 target failed:
+    `--test d254_catalog_persist_bound`
+# rc=101 end=2026-09-24T22:00:43Z
