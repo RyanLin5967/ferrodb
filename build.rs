@@ -224,8 +224,9 @@ fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBu
     let reftable = git(&["rev-parse", "--show-ref-format"]).as_deref() == Some("reftable");
     // Every link from `HEAD` to the ref that holds the commit, one `--no-recurse` question each:
     // retargeting any link changes what `HEAD` resolves to. Nothing at all when HEAD is detached,
-    // because a detached HEAD holds the commit itself. Git refuses a chain deeper than five, and
-    // so does this.
+    // because a detached HEAD holds the commit itself. The walk stops collecting after five links.
+    // It refuses nothing: git itself resolves a chain of four links and refuses five (measured by
+    // D231 review 3, git 2.50.1), so past that `rev-parse HEAD` fails and the stamp is `unknown`.
     let mut links: Vec<String> = Vec::new();
     if !reftable {
         let mut at = "HEAD".to_string();
