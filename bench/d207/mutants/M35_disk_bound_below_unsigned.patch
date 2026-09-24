@@ -1,6 +1,6 @@
 --- a/src/consensus/log.rs
 +++ b/src/consensus/log.rs
-@@ -134,7 +134,7 @@
+@@ -154,7 +154,7 @@
  /// A frame this log writes must be one its own scan reads back (`MAX_FRAME`). It is a different
  /// condition from admission, strictly looser than anything a frame carries, so neither masks the
  /// other's failures; each is tested at its own layer.

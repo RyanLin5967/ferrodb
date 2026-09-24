@@ -1,6 +1,6 @@
 --- a/src/consensus/log.rs
 +++ b/src/consensus/log.rs
-@@ -713,7 +713,7 @@
+@@ -733,7 +733,7 @@
          // the version-2 header durable first, so no crash can leave a large frame under a header
          // an older build accepts. It runs before the offsets below are taken, because the switch
          // moves the live file.
@@ -9,7 +9,7 @@
              self.raise_version()?;
          }
  
-@@ -729,6 +729,9 @@
+@@ -749,6 +749,9 @@
  
          self.index.extend(placed);
          self.end_offset = at;

@@ -182,6 +182,40 @@ LOG_MUTANTS = [
         "                    version: LEGACY_VERSION,\n                    generation: 1,\n",
         "                    version: VERSION,\n                    generation: 1,\n",
     )]),
+    # --- amendment 13: review 4's C1 -------------------------------------------------------------
+    ("M41_raise_only_when_all_large", [(
+        RAISE_BEFORE,
+        "        if self.version == LEGACY_VERSION && frames.iter().all(|f| f.len() > LEGACY_READ_BOUND) {\n",
+    )]),
+    ("M42_raise_on_first_only", [(
+        RAISE_BEFORE,
+        "        if self.version == LEGACY_VERSION && frames.first().is_some_and(|f| f.len() > LEGACY_READ_BOUND) {\n",
+    )]),
+    ("M43_raise_on_last_only", [(
+        RAISE_BEFORE,
+        "        if self.version == LEGACY_VERSION && frames.last().is_some_and(|f| f.len() > LEGACY_READ_BOUND) {\n",
+    )]),
+    ("M44_legacy_bound_raised", [(
+        "const LEGACY_READ_BOUND: usize = 8_384_576;\n",
+        "const LEGACY_READ_BOUND: usize = 8_388_538;\n",
+    )]),
+    ("M45_raise_floor_term_is_last_term", [(
+        '        self.switch(all, self.snapshot_round, self.snapshot_term, VERSION, "format upgrade")\n',
+        '        self.switch(all, self.snapshot_round, self.last_term(), VERSION, "format upgrade")\n',
+    )]),
+    ("M46_raise_rewrites_the_header_in_place", [(
+        "        let all = self.index.clone();\n"
+        '        self.switch(all, self.snapshot_round, self.snapshot_term, VERSION, "format upgrade")\n',
+        "        let h = Header {\n"
+        "            version: VERSION,\n"
+        "            generation: self.generation,\n"
+        "            snapshot_round: self.snapshot_round,\n"
+        "            snapshot_term: self.snapshot_term,\n"
+        "        };\n"
+        "        write_at(&*self.files[self.live], &h.encode(), 0)?;\n"
+        "        self.version = VERSION;\n"
+        "        Ok(())\n",
+    )]),
 ]
 
 # Mutants of node.rs (D223 review F3), same shape.

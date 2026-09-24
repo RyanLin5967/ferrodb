@@ -1,6 +1,6 @@
 --- a/src/consensus/log.rs
 +++ b/src/consensus/log.rs
-@@ -844,7 +844,7 @@
+@@ -864,7 +864,7 @@
              Vec::new()
          };
  
