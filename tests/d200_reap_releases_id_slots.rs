@@ -34,6 +34,8 @@ use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::cow::page_header::PageType;
+use ferrodb::cow::{stamp_checksum, PageStore, PAGE_HEADER_SIZE};
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::DiskManager;
 
@@ -306,6 +308,9 @@ struct Faulty {
     /// `detach_child` under these parents. Nothing is written when one fires.
     io_flip_of: Vec<u64>,
     io_detach_under: Vec<u64>,
+    /// PERSISTENT `Io` on `live_child_in_epoch_range` for these parents (audit 6 E1): the slow
+    /// path's per-page window read.
+    io_window_of: Vec<u64>,
 }
 
 fn injected_io(what: &str, id: u64) -> FerroError {
@@ -407,6 +412,9 @@ impl BranchCatalog for Faulty {
         lo: Epoch,
         hi: Epoch,
     ) -> Result<bool, FerroError> {
+        if self.io_window_of.contains(&parent_id) {
+            return Err(injected_io("live_child_in_epoch_range", parent_id));
+        }
         self.inner.live_child_in_epoch_range(parent_id, lo, hi)
     }
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
@@ -459,6 +467,7 @@ fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
         io_liveness: Vec::new(),
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
+        io_window_of: Vec::new(),
     })
 }
 
@@ -475,6 +484,7 @@ fn faulty_with_io(f: &Fixture, io_get_raw: Vec<u64>, io_liveness: Vec<u64>) -> A
         io_liveness,
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
+        io_window_of: Vec::new(),
     })
 }
 
@@ -492,6 +502,25 @@ fn faulty_with_io_writes(f: &Fixture, flip_of: Vec<u64>, detach_under: Vec<u64>)
         io_liveness: Vec::new(),
         io_flip_of: flip_of,
         io_detach_under: detach_under,
+        io_window_of: Vec::new(),
+    })
+}
+
+/// A `Faulty` whose only fault is a persistent `Io` on the slow path's window read for these
+/// parents (audit 6 E1).
+fn faulty_with_io_window(f: &Fixture, window_of: Vec<u64>) -> Arc<Faulty> {
+    Arc::new(Faulty {
+        inner: Arc::clone(&f.catalog),
+        fail_detach_at: 0,
+        detaches: AtomicU64::new(0),
+        fail_get_raw_of: AtomicU64::new(u64::MAX),
+        panic_release_at: 0,
+        releases: AtomicU64::new(0),
+        io_get_raw: Vec::new(),
+        io_liveness: Vec::new(),
+        io_flip_of: Vec::new(),
+        io_detach_under: Vec::new(),
+        io_window_of: window_of,
     })
 }
 
@@ -625,6 +654,7 @@ fn a_crash_between_two_releases_strands_no_ancestor() {
         io_liveness: Vec::new(),
         io_flip_of: Vec::new(),
         io_detach_under: Vec::new(),
+        io_window_of: Vec::new(),
     });
     let through = reaper_through(&f, &faulty);
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| through.reap(l)));
@@ -864,4 +894,66 @@ fn a_non_branch_read_inside_a_cascade_is_the_slots_refusal() {
         keyed.contains(&s4.id) && keyed.contains(&s5.id),
         "a refused slot lost its key, so no later open would ask again: {keyed:?}"
     );
+}
+
+/// **Audit 6 E1: a failed READ on the slow path of a resumed reap is that reap's refusal.** Audit
+/// 5 mapped four read sites, not the slow path's two (`retire_arenas_by_rule`'s `page_birth` and
+/// its per-page `live_child_in_epoch_range`). There one bad leaf failed EVERY open: the reap stops
+/// before its flip, so the record stays `Reaping` and the next open asks again. Each branch here
+/// has a written page and a live child, so its reap takes the slow path. R6's page has a byte
+/// flipped without re-stamping its checksum (one bad page: `read_page` fails `Cow`), and R7's
+/// window read fails `Io` through `Faulty`. PRE-REGISTERED (lane §8.20): fails at the open's
+/// `expect` at `04aab74`; kills M64 (R6) and M65 (R7).
+#[test]
+fn a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal() {
+    let f = fixture();
+    let c = &*f.catalog;
+    let mut slow = Vec::new();
+    for _ in 0..2 {
+        let r = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let page = f.store.alloc_for(r, PageType::BTreeLeaf, c.next_epoch()).unwrap();
+        {
+            let h = f.store.read_page(page).unwrap();
+            let mut fr = h.write();
+            fr.data[PAGE_HEADER_SIZE] = 0xAB;
+            stamp_checksum(&mut fr.data);
+        }
+        c.fork(r, LeaseDeadline(u64::MAX)).unwrap();
+        assert!(c.has_live_children(r.id).unwrap(), "fixture: R needs a live child for the slow path");
+        c.set_state(r, BranchState::Live, BranchState::Reaping).unwrap();
+        slow.push((r, page));
+    }
+    let ((r6, bad_page), (r7, _)) = (slow[0], slow[1]);
+    {
+        let h = f.store.read_page(bad_page).unwrap();
+        let mut fr = h.write();
+        fr.data[PAGE_HEADER_SIZE] ^= 0xFF;
+    }
+    assert!(f.store.read_page(bad_page).is_err(), "fixture: R6's page must fail its checksum");
+
+    let faulty = faulty_with_io_window(&f, vec![r7.id]);
+    let opener = reaper_through(&f, &faulty);
+    let resumed = opener.resume_interrupted_reaps().expect(
+        "E1: a failed read on a resumed reap's slow path failed the whole open; it must be that reap's refusal",
+    );
+    assert!(resumed.is_empty(), "a refused reap was reported as resumed: {resumed:?}");
+    assert_eq!(opener.refused_reaps(), 2, "R6's and R7's declined reaps were not both counted");
+    let why = opener.open_slot_refusals();
+    assert!(
+        why.iter().any(|w| w.starts_with(&format!("resumed reap of b{}@", r6.id))
+            && w.contains("failed its checksum")),
+        "R6's refusal is missing or lost its cause: {why:?}"
+    );
+    assert!(
+        why.iter().any(|w| w.starts_with(&format!("resumed reap of b{}@", r7.id))
+            && w.ends_with(&format!("live_child_in_epoch_range of slot {}", r7.id))),
+        "R7's refusal is missing or lost its cause: {why:?}"
+    );
+    for r in [r6, r7] {
+        assert_eq!(
+            c.get_raw(r.id).unwrap().state,
+            BranchState::Reaping,
+            "a refused reap must stop before its flip, so the next open asks again"
+        );
+    }
 }

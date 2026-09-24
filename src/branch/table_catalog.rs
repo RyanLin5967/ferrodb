@@ -180,6 +180,12 @@ pub struct TableBranchCatalog {
     /// finishing, which is where a torn flip leaves its state.
     #[cfg(test)]
     fail_next_record_upsert: std::sync::atomic::AtomicBool,
+    /// **E3/E4 (wall21 review audit 6), test-only failpoints.** Fail the next upsert, or the next
+    /// removal, of a DEADLINE key once, with `Io`: the two tear points of a deadline move.
+    #[cfg(test)]
+    fail_next_deadline_upsert: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_deadline_remove: std::sync::atomic::AtomicBool,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -583,6 +589,10 @@ impl TableBranchCatalog {
             liveness_walk_budget: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_remove: std::sync::atomic::AtomicBool::new(false),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -619,6 +629,10 @@ impl TableBranchCatalog {
             liveness_walk_budget: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_remove: std::sync::atomic::AtomicBool::new(false),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -677,10 +691,22 @@ impl TableBranchCatalog {
         {
             return Err(FerroError::Io("injected: the RECORD upsert failed".into()));
         }
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::DEADLINE)
+            && self.fail_next_deadline_upsert.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the DEADLINE upsert failed".into()));
+        }
         self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::DEADLINE)
+            && self.fail_next_deadline_remove.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the DEADLINE removal failed".into()));
+        }
         match self.tree.delete(key) {
             Ok(()) => Ok(true),
             Err(FerroError::KeyNotFound) => Ok(false),
@@ -4021,6 +4047,95 @@ mod tests {
         let got = c.has_live_children(p.branch_id.id);
         assert!(matches!(got, Ok(false)), "B3: a question from above the cycle did not end: {got:?}");
         c.liveness_walk_budget.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E3 (wall21 review audit 6): a `Live` record re-deadlined twice appears ONCE in
+    /// `expired_before`.** A torn renew (the new DEADLINE key written, the old one's removal failed)
+    /// leaves a stale key that no later rewrite names, because the removal is keyed on the previous
+    /// record's deadline. `expired_before` pushed the record once per key it scanned, so while the
+    /// record was `Live` and expired the reaper saw it twice, and the second row became a spurious
+    /// refusal. Uses the `fail_next_deadline_remove` failpoint, which the red commit adds.
+    /// PRE-REGISTERED (lane §8.20): fails at the first count at the red commit; kills M66.
+    #[test]
+    fn a_live_record_re_deadlined_twice_appears_once() {
+        let path = sidecar("e3-dedup");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let lid = l.branch_id.id;
+        let rows = |c: &TableBranchCatalog| {
+            c.expired_before(1_000).unwrap().iter().filter(|r| r.branch_id().id == lid).count()
+        };
+        c.fail_next_deadline_remove.store(true, Ordering::SeqCst);
+        assert!(
+            c.renew_lease(l.branch_id, LeaseDeadline(200)).is_err(),
+            "fixture: the injected removal must fail the renew"
+        );
+        assert!(
+            !c.fail_next_deadline_remove.load(Ordering::SeqCst),
+            "fixture: the injected DEADLINE removal never fired"
+        );
+        assert_eq!(rows(&c), 1, "E3: a torn renew left two DEADLINE keys, and L was named once per key");
+        c.renew_lease(l.branch_id, LeaseDeadline(300)).unwrap();
+        assert_eq!(rows(&c), 1, "E3: after a second renew the stale key still duplicated L");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E4 (wall21 review audit 6): a failed move INTO `Live` never leaves a `Live` record without
+    /// its DEADLINE key.** `write_record` upserted DEADLINE(new) after the RECORD, so a move from an
+    /// unindexed state (`release_from_quarantine`, a fork's recycle) that failed there left a `Live`
+    /// record that never expires and is never reaped. Uses the `fail_next_deadline_upsert`
+    /// failpoint, which the red commit adds. PRE-REGISTERED (lane §8.20): fails at the first
+    /// assertion at the red commit; kills M67.
+    #[test]
+    fn a_move_into_live_that_fails_never_leaves_a_live_record_unindexed() {
+        let path = sidecar("e4-deadline");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let lid = l.branch_id.id;
+        let indexed =
+            |c: &TableBranchCatalog| c.expired_before(1_000).unwrap().iter().any(|r| r.branch_id().id == lid);
+        c.set_state(l.branch_id, BranchState::Live, BranchState::Quarantined).unwrap();
+        assert!(!indexed(&c), "fixture: a Quarantined branch is not in the deadline index");
+        c.fail_next_deadline_upsert.store(true, Ordering::SeqCst);
+        assert!(
+            c.set_state(l.branch_id, BranchState::Quarantined, BranchState::Live).is_err(),
+            "fixture: the injected DEADLINE failure must fail the move"
+        );
+        assert!(
+            !c.fail_next_deadline_upsert.load(Ordering::SeqCst),
+            "fixture: the injected DEADLINE upsert failure never fired"
+        );
+        let state = c.get_raw(lid).unwrap().state;
+        assert!(
+            state != BranchState::Live || indexed(&c),
+            "E4: the failed move left a Live record with no DEADLINE key: it never expires"
+        );
+        assert_eq!(state, BranchState::Quarantined, "the failed move must leave the record in its old state");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E6 (wall21 review audit 6): a stale STATE key must not list a record that is in another
+    /// state.** Since D264 a torn move can leave a stale STATE key, and `in_state` did not re-check
+    /// the record, so `in_state(Quarantined)` (the `ferro_quarantine` view) could list a `Live` or
+    /// even a reaped branch as held. PRE-REGISTERED (lane §8.20): fails at `04aab74`; kills M68.
+    #[test]
+    fn a_stale_quarantined_key_does_not_list_a_live_branch() {
+        let path = sidecar("e6-stale");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        let lid = l.branch_id.id;
+        c.upsert(keys::state(BranchState::Quarantined.as_u8(), lid), Vec::new()).unwrap();
+        assert!(
+            c.ids_in_state(BranchState::Quarantined).unwrap().contains(&lid),
+            "fixture: the stale Quarantined key must be in the index"
+        );
+        let ids = |s: BranchState| -> Vec<u64> {
+            c.in_state(s).unwrap().iter().map(|r| r.branch_id.id).collect()
+        };
+        let held = ids(BranchState::Quarantined);
+        assert!(!held.contains(&lid), "E6: a stale Quarantined key listed a Live branch as held: {held:?}");
+        assert!(ids(BranchState::Live).contains(&lid), "control: in_state(Live) must still list L");
         let _ = std::fs::remove_file(&path);
     }
 
