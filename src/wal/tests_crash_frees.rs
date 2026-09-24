@@ -54,6 +54,7 @@ use crate::storage::page_directory::{PageDirectory, MAX_ENTRIES};
 use crate::storage::tuple::Tuple;
 use crate::storage::sim::{Durability, FaultPlan, OpKind, SimFabric, WriteShape};
 use crate::storage::storage::Storage;
+use crate::wal::free_intent::{self, FreeIntent};
 use crate::wal::log::DdlOp;
 use crate::wal::txn::DdlRecord;
 
@@ -1353,4 +1354,66 @@ fn a_drop_whose_mutation_fails_frees_nothing_until_the_next_open_completes_it() 
         oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open that completed the DROP: {e}"));
     }
     assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "the open left the completed DROP's intent in place");
+}
+
+/// **An intent left for a table that was re-created at its root frees none of the new table's
+/// pages** (the lead, after D250 review 1's F2; PREREG amendment 5).
+///
+/// `r` is dropped under a WAL pin, so its `DropTable` record stays in the log, and re-created,
+/// taking the dropped heap's root, with heap records above the DROP's LSN: D250 F2 keeps it out of
+/// the open's completion. The old table's intent is then PLANTED, as a lost removal would leave it:
+/// D229's own order removes an intent durably (A4) before its pages leave the quarantine, so no table
+/// can take the root while the intent is pending, and this state is unreachable through it. The open
+/// must decide the intent by identity (a table is at its root, so it is dropped, not carried out)
+/// and free nothing of the new `r`.
+///
+/// Mutant-only red: M13 decides every intent as carried out.
+#[test]
+fn a_stale_intent_for_a_dropped_root_frees_nothing_of_the_table_re_created_there() {
+    let m = Machine::boot(&Snapshot::default(), None);
+    {
+        let mut d = m.open().expect("open a new database");
+        let s = &mut Session::new();
+        must(&mut d.o, s, "CREATE TABLE r (id INTEGER NOT NULL, v INTEGER);");
+        for id in 0..5 {
+            must(&mut d.o, s, &format!("INSERT INTO r VALUES ({id}, {id});"));
+        }
+        let root = d.o.catalog.get_table("r").expect("r").first_directory_page_id;
+        let old_pages = d.o.catalog.table_pages("r").expect("r's pages");
+        let base = d.o.wal.base_lsn.load(Ordering::SeqCst);
+        let pin = d.o.wal.pin(base).expect("pin the log at its base");
+        must(&mut d.o, s, "DROP TABLE r;");
+        assert_eq!(d.o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the DROP's record in the log");
+        must(&mut d.o, s, "CREATE TABLE r (id INTEGER NOT NULL, v INTEGER);");
+        assert_eq!(
+            d.o.catalog.get_table("r").expect("r again").first_directory_page_id,
+            root,
+            "premise: the re-created r is not at the dropped root, so D250 F2 has nothing to skip"
+        );
+        for id in 100..105 {
+            must(&mut d.o, s, &format!("INSERT INTO r VALUES ({id}, {id});"));
+        }
+        let now = pages_of(&d.o, "r").expect("walk the new r");
+        assert!(
+            old_pages.iter().any(|p| now.contains(p)),
+            "premise: the new r holds none of the old r's pages, so a wrong free could hit nothing of it"
+        );
+        free_intent::store(&d.o.wal.path, &[FreeIntent { table: "r".into(), dir_root: root, pages: old_pages }])
+            .expect("plant the old r's intent");
+        drop(pin);
+        // The crash.
+    }
+    let m2 = Machine::boot(&m.snapshot(), None);
+    {
+        let mut d = m2.open().expect("the open with a stale intent");
+        assert!(
+            d.o.completed_drops.is_empty(),
+            "the open completed the DROP of a table re-created at its root: {:?}",
+            d.o.completed_drops
+        );
+        let mut want = Want::default();
+        want.present.insert("r".to_string(), (100..105).collect());
+        oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open with a stale intent for r's root: {e}"));
+    }
+    assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "the open left the stale intent in place");
 }
