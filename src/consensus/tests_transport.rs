@@ -2545,3 +2545,141 @@ fn an_open_connection_holds_its_slot_until_it_closes() {
     }
     assert_eq!(t.live_inbound_conns(), 0, "the slots were not given back when the connections closed");
 }
+
+// ---------------------------------------------------------------------------------------------
+// D207 amendment 2 — the rest of 207d362 the lead scoped in: two knobs refused at zero, the cap-full
+// backoff, and the lost wakeup. Written red against 196f9aa, before their fix; every test here
+// compiles against that tree.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_zero_idle_deadline_is_refused_at_bind() {
+    // Zero does not mean "never idle". `conn_loop` closes a connection once
+    // `last_heard.elapsed() > idle_deadline`, which a zero deadline makes true on the first poll
+    // after the handshake: a node that accepts every peer and hangs up on each at once, while its
+    // outbound meters read healthy. Refused where it is set, like the three timings before it.
+    let mut opts = fast();
+    opts.idle_deadline = Duration::ZERO;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    match Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts) {
+        Ok(_) => panic!("a zero idle_deadline was accepted at bind"),
+        Err(e) => assert!(
+            format!("{e}").contains("`idle_deadline` is zero"),
+            "refused, but not by name: {e}"
+        ),
+    }
+}
+
+#[test]
+fn a_connection_cap_of_zero_is_refused_at_bind() {
+    // `map.len() >= 0` holds for every accept, so a cap of zero refuses every inbound connection: a
+    // node deaf to the whole cluster, counting refusals, with nothing named as the cause.
+    let mut opts = fast();
+    opts.max_inbound_conns = 0;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    match Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts) {
+        Ok(_) => panic!("a max_inbound_conns of zero was accepted at bind"),
+        Err(e) => assert!(
+            format!("{e}").contains("`max_inbound_conns` is zero"),
+            "refused, but not by name: {e}"
+        ),
+    }
+}
+
+#[test]
+fn refusals_at_a_full_cap_are_paced_by_the_poll_interval() {
+    // A peer that loops `connect()` against a full cap was refused back to back — accept, refuse,
+    // accept — with nothing to slow the accept thread, so it bought a core of this process for free.
+    // Each cap-full refusal now waits one `poll_interval` before the next accept (207d362).
+    //
+    // Asserted as a LOWER bound on elapsed time, which load can only lengthen: n paced refusals are
+    // separated by at least n - 1 sleeps, so a paced loop can never finish them sooner. An unpaced
+    // one finishes them within an accept poll or two of the last connect.
+    let poll = Duration::from_millis(100);
+    let mut opts = fast();
+    opts.max_inbound_conns = 1;
+    opts.poll_interval = poll;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    // Fill the cap with one real connection, left idle.
+    let mut first = TcpStream::connect(addr).unwrap();
+    first.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = Vec::new();
+    crate::replication::write_handshake(&mut hs).unwrap();
+    first.write_all(&hs).unwrap();
+    first.flush().unwrap();
+    let mut theirs = [0u8; 6];
+    first.read_exact(&mut theirs).unwrap();
+    // The slot is reserved before the connection thread writes its handshake, so it is held by now.
+    assert_eq!(t.live_inbound_conns(), 1, "the admitted connection does not hold the cap's one slot");
+
+    const EXTRA: u64 = 8;
+    // Taken before the first extra connects, so it precedes every refusal counted below.
+    let t0 = Instant::now();
+    let c0 = t.refused_conns();
+    let mut held = Vec::new();
+    for _ in 0..EXTRA {
+        held.push(TcpStream::connect(addr).unwrap());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && t.refused_conns() < c0 + EXTRA {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let c1 = t.refused_conns();
+    let took = t0.elapsed();
+    assert_eq!(c1 - c0, EXTRA, "{EXTRA} connections against a full cap, {} refused", c1 - c0);
+    let floor = poll * (EXTRA as u32 - 1);
+    assert!(
+        took >= floor,
+        "{EXTRA} refusals at a full cap took {took:?}. Paced by a {poll:?} poll they cannot take less \
+         than {floor:?}, so the accept thread is refusing back to back"
+    );
+    drop(held);
+    drop(first);
+}
+
+#[test]
+fn a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay() {
+    // **The lost wakeup.** After a failed dial the sender waits on the outbox condvar for
+    // `reconnect_delay`, so that `shutdown`'s notify can cut the wait short. A notify that lands while
+    // the sender is still INSIDE the dial finds nobody waiting, and the sender then waited the whole
+    // delay before it looked at the stop flag again: a shutdown that should take a poll took a
+    // `reconnect_delay`.
+    //
+    // Deterministic rather than raced. The peer is a listener that accepts at the kernel and never
+    // answers the handshake, so the sender sits in `dial`'s handshake read — polling the stop flag,
+    // never the condvar — until `shutdown` is called. The dial then fails BECAUSE of the shutdown,
+    // after its notify has come and gone.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = silent.local_addr().unwrap();
+    silent.set_nonblocking(true).unwrap();
+    let mut opts = fast();
+    opts.reconnect_delay = Duration::from_secs(30);
+    opts.handshake_deadline = Duration::from_secs(60);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::from([(NodeId(2), peer)]), opts)
+        .unwrap();
+
+    // The sender has connected, and is waiting for a handshake that will never come.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut held = None;
+    while Instant::now() < deadline && held.is_none() {
+        match silent.accept() {
+            Ok((s, _)) => held = Some(s),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(held.is_some(), "the sender never dialled the silent peer, so nothing here is tested");
+
+    let started = Instant::now();
+    t.shutdown();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "shutdown took {took:?}: the sender's dial failed because of the shutdown, missed the \
+         notify that had already been sent, and waited out its 30 s reconnect_delay"
+    );
+    drop(held);
+}
