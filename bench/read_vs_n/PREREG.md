@@ -1420,3 +1420,69 @@ FAN-QUEUE #18 note, `8049b26`).**
      data.
    * The arm-3 summary prints a line saying so.
 3. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 44. Both unchanged.
+
+**A22, 2026-09-24, before any build or run. Review 12 of `edbe154..03a7ea0` (artie-research
+`frontier/read_vs_n_review12.md` @ `4c12762`, read at `6d1c587`) returned SOUND-WITH-CAVEATS. D265 holds. The lead's
+decisions on A1–A4, A7–A9, B3 and B4 follow.**
+
+1. **A1: D265's exit extends to pgserver, the other registered entry point.**
+   * **One check serves both entry points: `LeaseStats::ended_alive()`**, which returns `Err` when the scan thread
+     panicked.
+     * `OpenDatabase::close` returns its result after the checkpoints, as `run_cli` needs.
+     * `examples/pgserver.rs` calls it after its final arena checkpoint and PANICS on `Err`. That follows the file's
+       own rule: a panic rather than `process::exit`, so `<db>.lock` is released. The server therefore exits
+       non-zero.
+   * **Red first.** `tests/d265_entry_points_check_the_lease.rs`, (d): every registered entry point's production text
+     (`src/cli/cli.rs`, `examples/pgserver.rs`, cut at the first bare `#[cfg(test)]` line as in
+     `open_path_allowlist`) calls `.ended_alive()`.
+     * It reads files only, so it compiles at the red commit, where it FAILS.
+     * The fix commit adds (e): `ended_alive()` returns `Err` for `panicked = true` and `Ok` for a default
+       `LeaseStats`.
+   * **Mutant:** delete pgserver's `.ended_alive()` call. (d) must FAIL.
+   * **Stated limit, unchanged.** No production reader polls `stats()` during a session. A server that is killed,
+     rather than shut down, never surfaces the death.
+2. **A2: no attribute line in `lease_thread.rs`'s production region.**
+   * **The defect.** The red commit's `#[cfg(test)] scan_seam::fire(reaper);` hid 248 lines from the d53 tripwire:
+     `tests/d53_private_root_allowlist.rs` cuts at the first SUBSTRING `#[cfg(test)]`. The view shrank from 866 lines
+     to 618, as review 12 measured.
+   * **Now:**
+     * `scan_once` calls `scan_seam::fire(reaper)` unconditionally;
+     * at the END of the file, a `#[cfg(not(test))]` module defines `fire` as an empty `#[inline(always)]` fn;
+     * then the `#[cfg(test)]` module holds the real seam;
+     * then `mod tests`.
+   * `#[cfg(not(test))]` does not contain the substring `#[cfg(test)]`, so both tripwires again read every line of
+     production code.
+   * The d53 test is not touched.
+3. **A3: (a4)'s expectation is corrected.**
+   * At the tip, tests (a)–(c) pass, and libtest prints a passing test's captured output nowhere. The lease thread
+     inherits that capture, so the seam's panic text ("D265 test seam: …") is NOT in (a4)'s file.
+   * `lease: the scan thread panicked …` IS in it: `report()` writes with `writeln!(std::io::stderr(), …)`, which the
+     capture does not intercept.
+   * The seam's text appears in (a5), where (a) and (b) fail and their capture is printed.
+4. **A4: the FIRECHECK line prints each id WITH where the verdict script grades it.**
+   * `Fire::expects()` now returns `(id, At)` pairs. `At` is `Any`, `First`, `Last`, `Every`, `AfterFirst` or
+     `AxisTwo`. They print as `N=<n>` or `axis ii M=<m>`, taken from the run's registered checkpoints and M targets.
+   * At the registered commands:
+     * control-cold: G5 at N=2048 (`Last`);
+     * merge-quarantined: M1; allowed M5, and G1 at N=2048 (`AfterFirst`);
+     * extra-branch: G1 at every checkpoint;
+     * extra-extent: H2 at every checkpoint;
+     * orphan-extent: H4 at every checkpoint;
+     * no-cluster-time: H5 at N=2048 (`Last`);
+     * pinned-checkpoint: M6 at every axis-(ii) target;
+     * stale-marker: H6 at N=256 (`First`); allowed ARM3.
+   * The line also says that the script grades further shape rules it does not print: A17.2's shape, H2's +1, H4's
+     `freed = 1`, and (f2)'s CKPT lines.
+5. **B3: the parent's two mid-run CLOSE lines are mirrored on stderr**, as `the parent's close failed (<where>): <error>`,
+   like the child's. A reopen that panics after a failed close can no longer lose the cause. The verdict script needs
+   the pattern.
+6. **A7: a dead lease thread is not waited out as a slow one.**
+   * `wait_first_pass` now returns Done, TimedOut or Died, reading `stats().panicked` (D265).
+   * The parent's open pushes `LEASE (the parent's open): the lease thread died on its first pass …` instead of
+     PARENT_PASS, whose "a sweep may overlap a timed window" is false for a dead thread.
+   * The child's H5 is not pushed when `lease_panicked ≠ 0`. Its LEASE line names the cause.
+7. **A8, A9 and B4 (nits).**
+   * A20.4's block moves after H6's check, so H6's comment heads H6's `if` again.
+   * Arm 3's counted ROWS are bound once (`counted_rows`), and read for L2, ARM3, the load median and the span legend.
+   * The restart's byte-size comment no longer says "clean close" (A21.1).
+8. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: **46**, the previous 44 plus (d) and (e).
