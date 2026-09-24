@@ -43,6 +43,19 @@ MUTANTS = [
         "            idle_redials: self.idle_redials(),\n",
         "            idle_redials: 0,\n",
     )]),
+    # PREREG amendment 6 (D224 review 2). N9: the gate is the whole deadline, not half; killed by T.
+    # N10: a reset read as alive; registered as a KNOWN SURVIVOR (no portable test reaches it).
+    ("N9_gate_is_the_whole_deadline", [(
+        "    opts.idle_deadline / 2\n",
+        "    opts.idle_deadline\n",
+    )]),
+    ("N10_reset_read_as_alive", [(
+        "        Err(e) => !matches!(\n"
+        "            e.kind(),\n"
+        "            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted\n"
+        "        ),\n",
+        "        Err(_) => false,\n",
+    )]),
 ]
 
 

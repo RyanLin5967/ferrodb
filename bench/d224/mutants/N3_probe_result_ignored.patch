@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2045,7 +2045,7 @@
+@@ -2049,7 +2049,7 @@
          // reads per frame: this one and the refresh after the write.
          if last_used.elapsed() >= probe_gap {
              counters.idle_probes.fetch_add(1, Ordering::SeqCst);
