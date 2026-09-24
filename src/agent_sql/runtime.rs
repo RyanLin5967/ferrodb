@@ -477,7 +477,7 @@ impl Workspace {
     /// **D194.** The snapshot this branch reads the shared tables through, pinning it now if the
     /// branch was forked without one. Idempotent: once pinned, `apply_seq` and `txn` are ignored.
     ///
-    /// Called only under the `State` lock, with `apply_seq` read under that same lock, so the
+    /// Reached only through [`State::pin`], which reads `apply_seq` under the same lock, so the
     /// seq and the snapshot a lazy pin records describe one instant — the same pairing the fork
     /// itself makes. See `fork_seq` for why they must never be taken apart.
     fn pin(&mut self, apply_seq: u64, txn: &TxnManager) -> Arc<Snapshot> {
@@ -984,6 +984,21 @@ impl State {
             .get(&(tbl.0, row.0, col.0))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// **D194 — the one door that pins a branch's view of the shared tables.** Returns the snapshot
+    /// the branch reads through and the `fork_seq` it pairs with, pinning both now if the branch
+    /// was forked with no transaction manager; `None` when `branch` has no live workspace.
+    ///
+    /// It mutates a workspace, so it counts as one of the ways into branch state that
+    /// `integration_capability_envelope` pins the number of. What it writes is the two fork
+    /// fields and nothing else — no row, no schema edit, nothing the envelope governs — and every
+    /// reader of a branch's view comes through here rather than each taking its own `get_mut`.
+    fn pin(&mut self, branch: BranchId, txn: &TxnManager) -> Option<(Arc<Snapshot>, u64)> {
+        let apply_seq = self.apply_seq;
+        let ws = self.workspaces.get_mut(&branch)?;
+        let at = ws.pin(apply_seq, txn);
+        Some((at, ws.fork_seq))
     }
 
     /// Record a published row version: in `versions`, which the premise check reads as "now", and
@@ -1863,15 +1878,12 @@ impl AgentRuntime {
         // an inherited snapshot would hide from the merge every op published in between. If that
         // parent was itself forked with no manager and has not been read, forking a child is the
         // moment it is pinned — otherwise the two would pin separately, at different instants.
-        let apply_seq = state.apply_seq;
-        let (fork_seq, fork_snapshot) = match state.workspaces.get_mut(&parent) {
-            Some(p) => {
-                if let Some(txn) = base {
-                    p.pin(apply_seq, txn);
-                }
-                (p.fork_seq, p.fork_snapshot.clone())
-            }
-            None => (apply_seq, base.map(|txn| txn.read_snapshot_cached())),
+        if let Some(txn) = base {
+            state.pin(parent, txn);
+        }
+        let (fork_seq, fork_snapshot) = match state.workspaces.get(&parent) {
+            Some(p) => (p.fork_seq, p.fork_snapshot.clone()),
+            None => (state.apply_seq, base.map(|txn| txn.read_snapshot_cached())),
         };
         // Forking from a branch that is itself an open agent task: the child's visible state *is*
         // the parent's state at fork time, uncommitted rows included, exactly as the child's root
@@ -2345,12 +2357,11 @@ impl AgentRuntime {
         let (at, seen_through, staged) = match branch {
             Some(b) => {
                 let mut state = self.state.lock().unwrap();
-                let apply_seq = state.apply_seq;
-                match state.workspaces.get_mut(&b) {
+                match state.pin(b, &ctx.txn) {
                     // D57 item 1 below: the clone is taken under the lock.
-                    Some(ws) => {
-                        let at = ws.pin(apply_seq, &ctx.txn);
-                        (at, Some(ws.fork_seq), Some((ws.rows.clone(), ws.unprobeable_rows)))
+                    Some((at, fork_seq)) => {
+                        let ws = &state.workspaces[&b];
+                        (at, Some(fork_seq), Some((ws.rows.clone(), ws.unprobeable_rows)))
                     }
                     None => (ctx.txn.read_snapshot_cached(), None, None),
                 }
@@ -3742,12 +3753,10 @@ impl AgentRuntime {
         // reads main as it stands.
         let at = {
             let mut state = self.state.lock().unwrap();
-            let apply_seq = state.apply_seq;
-            let ws = state.workspaces.get_mut(&onto).ok_or_else(|| {
+            let (at, _) = state.pin(onto, &ctx.txn).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {onto}"))
             })?;
-            let at = ws.pin(apply_seq, &ctx.txn);
-            let ws = &*ws;
+            let ws = &state.workspaces[&onto];
             for key in &rows_touched {
                 match ws.rows.get(key) {
                     Some(RowState::Present(v)) => {
@@ -4130,12 +4139,9 @@ impl AgentRuntime {
             if !state.workspaces.contains_key(&source) {
                 return Err(FerroError::Branch(format!("no agent session on branch {source}")));
             }
-            let apply_seq = state.apply_seq;
-            let tgt_at = state
-                .workspaces
-                .get_mut(&target)
-                .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {target}")))?
-                .pin(apply_seq, &ctx.txn);
+            let (tgt_at, _) = state
+                .pin(target, &ctx.txn)
+                .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {target}")))?;
             let src = &state.workspaces[&source];
             let tgt = &state.workspaces[&target];
             let same_view = src
