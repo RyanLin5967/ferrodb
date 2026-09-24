@@ -70,8 +70,13 @@ fn roots_of<'a>(entries: impl IntoIterator<Item = &'a TableEntry>) -> BTreeMap<S
 /// since none of them can be confirmed.
 fn unpersisted_roots(catalog: &Catalog) -> String {
     let in_memory = roots_of(catalog.tables.values());
-    let disk = &catalog.buffer_pool.disk_manager;
-    match Catalog::read_entries(catalog.first_catalog_page_id, |page_id| disk.read(page_id)) {
+    let pool = &catalog.buffer_pool; // D230 MUTANT M11: reads the pool's copy, as bd25853 did
+    match Catalog::read_entries(catalog.first_catalog_page_id, |page_id| {
+        let frame_i = pool.fetch_page(page_id)?;
+        let data = pool.frames[frame_i].read().unwrap().data;
+        pool.unpin_page(page_id, false);
+        Ok(data)
+    }) {
         Ok(on_disk) => {
             let recorded = roots_of(&on_disk);
             let stale: Vec<String> = in_memory
