@@ -539,3 +539,89 @@ Both name `publishing`, so they cannot compile at `0570fe8`. They are MUTANT-ONL
   The failure is the envelope tripwire at `get_mut(` **5**. Its State allowlist now also needs
   `publishing`, next to `version_history` and `retention`.
 - Under `-b`: 2160 / 2.
+
+## Amendment 7 (append-only, before any run; written BEFORE the code it describes): second fresh-context review, of `7c92d8d..3c52476`
+
+The review found no wrong answer, no deadlock and no compile error. It did find the following, and each
+is corrected here.
+
+1. **Registration came in two halves, and either could be deleted unseen (Medium).**
+   - **The defect.** `merge` inserted `(start, None)` at the reservation and then `(start, Some(t))`
+     after `begin`. M16 deleted both at once, so neither half alone was caught. The test also wrote the
+     protocol out by hand instead of calling the code `merge` calls.
+   - **Fix, part 1: one registration.** The publish transaction now begins BEFORE the reservation. The
+     reservation registers `(start, t)` in one call, `PublishingEntry::register`, which also arms the
+     cleanup, so registration and guard are one statement.
+   - **Fix, part 2: the map loses its `None`.** It becomes `BTreeMap<start, txn>`, so there is no `None`
+     case left to test.
+   - **Order and visibility.** Beginning earlier changes nothing a snapshot can see, because visibility
+     comes at commit. A fork between `begin` and the reservation sees neither the reservation nor the
+     transaction, and pairs its snapshot with the old `apply_seq`: consistent.
+   - **The refused reservation** (`fresh_reservation`) now aborts the transaction it began.
+   - **The tests** register through `PublishingEntry::register` and release by dropping the guard, so
+     a mutant in either is theirs. Their assertions are unchanged.
+   - **Still unkilled, stated:** deleting the `_publishing` binding in `merge` (keeping the insert)
+     would strand an entry only on a failed publish. No test fails a publish after its reservation
+     in-process. With `Some(t)` always present, a stranded entry is harmless to pins, since an aborted
+     txn is contained. It would, however, refuse every later `REBASE`. Recorded as a known unkilled
+     mutant: M18.
+
+2. **`pin_seq`'s `debug_assert` could fire on a legitimate path (Low).** A merge with zero ops reserves
+   `base..base`. A pin between its commit and its record saw `start == seq` for a contained entry. The
+   assertion now checks only what it names: when some entry is EXCLUDED, every contained entry lies
+   below the lowest excluded start.
+
+3. **The two-catalog detector covered less than claimed (Low).** A second check sits beside it: the
+   last recorded version (`applied.last()`, O(1)) must be at or below the pin's seq. With one catalog
+   this always holds. When B records while A is still in flight, it fires. Both callers pass it.
+
+4. **A pin taken between a merge's commit and its record claims versions the history cannot name yet
+   (Low, in-process only; already present at `0570fe8`).**
+   - The snapshot contains the merge and `pin_seq` gives `E`, which is correct. But `versions` and
+     `version_history` do not have the merge until `record_applied`.
+   - A read recorded in that gap would name the superseded version.
+   - **Fix:** `record_read` also refuses an Inspection read whose `seen_through` is ABOVE some
+     `publishing` start. Its message says the merge "has not recorded its versions yet". That is
+     exactly the gap:
+     - A pin taken before the reservation is at or below `start`.
+     - A pin taken inside the window is `start`.
+     - Only a pin taken after the commit and before the record is above it.
+   - A new test covers it.
+
+5. **The Amendment 6 text overclaimed (Low).** It said REBASE "checks at validation and again at
+   commit". The code checks only at validation. At commit, `apply_seq != new_seq` covers any merge that
+   reserved after validation. A merge with zero ops moves nothing and claims nothing. The text is
+   corrected here, and the code stays as it is: a second check would be a guard no mutant can tell
+   apart from the first.
+
+6. **Out of scope, stated.** An UNPINNED read (`seen_through = None`, a read of main as it stands)
+   pairs a current snapshot with `versions`' latest, and it can name a version recorded after its scan
+   ran. That is in-process only, and `observed_at`'s over-report direction is documented at the
+   reservation.
+
+### Tests, replacing Amendment 6's
+
+- `a_pin_taken_while_a_merge_publishes_does_not_claim_its_versions`: same assertions. It registers
+  through `PublishingEntry::register`. At the end it drops the guard and asserts
+  `publishing.is_empty()`.
+- `rebase_is_refused_while_a_merge_publishes`: same assertions, and registers the same way.
+- NEW `version_history_is_not_asked_for_a_merge_it_has_not_recorded`, mutant-only red.
+  - A pinned branch at `F`. A registered entry with `start < F` stands in for a merge that committed
+    after the pin's snapshot and has not recorded yet.
+  - `record_read(.., Some(F))` returns `Err` containing "has not recorded its versions yet".
+  - After the guard drops, the same call returns `Ok`.
+
+### Mutants, added to Amendment 6's
+
+| id | edit | expected |
+|---|---|---|
+| M16 | `PublishingEntry::register`'s insert removed | debug: `record_applied`'s "never registered" fires in every merge test. `a_pin_taken_while_...` FAILS at its first `fork_seq` assertion |
+| M18 | `merge`'s `_publishing` binding replaced by `let _ =` (the guard drops at once) | UNKILLED by any test here. With `Some(t)`, `record_applied`'s assert fires in every merge test, because the entry is gone before the record. So it is in fact killed in debug, by M16's instrument |
+| M19 | `record_read`'s unrecorded-merge refusal removed | `version_history_is_not_asked_...` FAILS: `Ok` where `Err` was expected |
+
+### Counts, replacing Amendment 6's
+
+- `cargo test --lib version_history`: **8**.
+- `cargo test --lib rebase`: 5.
+- Run of record at default QoS: **58 result lines, 2162 passed (2152 + 10), 1 failed, 2 ignored**.
+- Under `-b`: 2161 / 2.
