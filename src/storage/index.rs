@@ -1356,4 +1356,112 @@ mod tests {
             );
         }
     }
+
+    // ---- D233: free-at-empty ----------------------------------------------------------------
+
+    /// A 1,000-byte key: a leaf holds four entries and an internal page four children, so a few
+    /// dozen keys build a tree deep enough for an unlink to cascade.
+    fn wide(i: i32) -> Value {
+        Value::Varchar(format!("{i:06}{}", "x".repeat(994)))
+    }
+
+    /// Every leaf reachable by descending from the root, left to right.
+    fn leaves_by_descent(tree: &BPlusTreeManager<Value, Value>) -> Vec<u32> {
+        fn walk(tree: &BPlusTreeManager<Value, Value>, page: u32, out: &mut Vec<u32>) {
+            match tree.read_node(page).unwrap() {
+                BPlusTreePage::Leaf(_) => out.push(page),
+                BPlusTreePage::Internal(n) => {
+                    for c in &n.child_ptrs {
+                        walk(tree, *c, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, tree.root_page_id.load(Ordering::Acquire), &mut out);
+        out
+    }
+
+    /// The leaf chain from the leftmost leaf through `next`.
+    fn leaves_by_chain(tree: &BPlusTreeManager<Value, Value>) -> Vec<BPlusTreeLeafPage<Value, Value>> {
+        let mut out = vec![tree.leftmost_leaf().unwrap()];
+        while let Some(n) = out.last().unwrap().next {
+            out.push(tree.read_leaf(n).unwrap());
+        }
+        out
+    }
+
+    fn height(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        let mut h = 1;
+        let mut page = tree.root_page_id.load(Ordering::Acquire);
+        while let BPlusTreePage::Internal(n) = tree.read_node(page).unwrap() {
+            h += 1;
+            page = n.child_ptrs[0];
+        }
+        h
+    }
+
+    /// D233: after `delete` empties leaves, the parents and the leaf chain must agree on which
+    /// leaves are in the tree, no emptied leaf may stay in the chain, `prev` must mirror `next`,
+    /// every surviving key must be found, and a key put back into an emptied range must be found
+    /// by `search` AND by a full scan.
+    ///
+    /// Two removals are forced on a tree of height at least 3: keys 0..20, which empty a whole
+    /// left subtree (the cascade, and the leftmost-child rule at every level it climbs), and keys
+    /// 35..42, which empty at least one leaf in the middle (a slotted child). This is the test
+    /// that sees an unlink that splices the chain but leaves the parent pointing at the leaf. The
+    /// catalog's lease-pass test cannot see that, because its descent never lands there. Here a
+    /// re-inserted key would land in a leaf no scan reaches.
+    #[test]
+    fn free_at_empty_keeps_the_chain_and_the_parents_in_agreement() {
+        let (tree, _dir) = setup();
+        const N: i32 = 60;
+        for i in 0..N {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert!(height(&tree) >= 3, "premise: height {} is too shallow to cascade", height(&tree));
+        let before = leaves_by_descent(&tree);
+
+        let gone: Vec<i32> = (0..20).chain(35..42).collect();
+        for &i in &gone {
+            tree.delete(&wide(i)).unwrap();
+        }
+
+        let descent = leaves_by_descent(&tree);
+        let chain = leaves_by_chain(&tree);
+        let chain_ids: Vec<u32> = chain.iter().map(|l| l.page_id).collect();
+        assert!(descent.len() < before.len(), "premise: no leaf was taken out of the tree");
+        assert_eq!(descent, chain_ids, "the parents and the leaf chain disagree about the leaves");
+        assert!(chain.iter().all(|l| !l.key_arr.is_empty()), "an emptied leaf is still in the chain");
+        assert_eq!(chain[0].prev, None, "the first leaf still has a left neighbour");
+        for w in chain.windows(2) {
+            assert_eq!(w[1].prev, Some(w[0].page_id), "prev does not mirror next");
+        }
+
+        for i in 0..N {
+            let found = tree.search(&wide(i)).unwrap().is_some();
+            assert_eq!(found, !gone.contains(&i), "key {i}: found = {found}");
+        }
+
+        for i in [3, 38] {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let scanned: Vec<Value> = tree
+            .range_scan(Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        let mut sorted = scanned.clone();
+        sorted.sort();
+        assert_eq!(scanned, sorted, "the chain is out of order");
+        assert_eq!(scanned.len(), (N as usize) - gone.len() + 2, "a full scan lost or duplicated a key");
+        for i in [3, 38] {
+            assert!(tree.search(&wide(i)).unwrap().is_some(), "re-inserted key {i} not found by search");
+            assert_eq!(
+                scanned.iter().filter(|k| **k == wide(i)).count(),
+                1,
+                "re-inserted key {i} not seen exactly once by a full scan"
+            );
+        }
+    }
 }
