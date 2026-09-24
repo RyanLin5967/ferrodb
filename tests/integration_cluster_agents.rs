@@ -43,7 +43,7 @@ use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
 use ferrodb::consensus::config::Config;
 use ferrodb::consensus::node::{Applier, Node, NodeOptions};
-use ferrodb::consensus::{BranchOp, Command, Entry, NodeId, Round};
+use ferrodb::consensus::{BranchOp, Command, Entry, NodeId, Role, Round};
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -1841,4 +1841,120 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
     }
     fleet.settle_to(*merged.iter().max().unwrap());
     fleet.shutdown();
+}
+
+// =================================================================================================
+// D73 — an election must be a function of the turns, not of the machine between them
+// =================================================================================================
+
+/// **D73's red test, and it is red on the wall-clock `Fleet` by construction, not by luck.**
+///
+/// The flake the D73 ledger row names — `node 1 never regained the leadership; leaders =
+/// [Some(NodeId(3)) x3]`, 1 in 5 under load — is a leader deposed while the harness was doing
+/// something other than turning the cluster. A pause between two turns is that "something", made
+/// on purpose: one second is 50 ticks of the 20 ms tick `Fleet::start` configured at `9aa6968`, six
+/// times the 8-tick lease and past every election timeout a node can draw (10–19 ticks). On that
+/// clock the leader's next `poll` catches up the whole second, finds its majority silent for longer
+/// than the lease, and steps down — every time the sleep returns, because a sleep is a floor on
+/// elapsed time.
+///
+/// The claim is the harness's, stated as the test: the SAME turns, with pauses between them, leave
+/// the same leader in the same term. A pause is not a turn, so it must not be time.
+#[test]
+fn a_pause_between_turns_is_not_time_to_the_cluster() {
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let want = NodeId(leader as u32 + 1);
+    let term = fleet.reps[leader].with_node(|n| n.term());
+
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(1));
+        fleet.pump_all();
+    }
+
+    let seen: Vec<(Option<NodeId>, u64)> =
+        fleet.reps.iter().map(|r| (r.leader(), r.with_node(|n| n.term()))).collect();
+    assert!(
+        seen.iter().all(|s| *s == (Some(want), term)),
+        "three pauses between turns changed the cluster: {want} led term {term} before them, and \
+         after them every node reports (leader, term) = {seen:?}. A pause the state machine can \
+         see is a clock the harness does not own"
+    );
+    fleet.shutdown();
+}
+
+/// Drive a fresh three-node fleet for `turns` turns, pausing for `pause(t)` before turn `t`, and
+/// record what every node believed after each one: `(role, term, leader, commit round)`, in node
+/// order.
+fn election_trace(
+    turns: usize,
+    pause: impl Fn(usize) -> Duration,
+) -> Vec<Vec<(Role, u64, Option<NodeId>, Round)>> {
+    let fleet = Fleet::start(3);
+    let mut trace = Vec::with_capacity(turns);
+    for t in 0..turns {
+        let p = pause(t);
+        if !p.is_zero() {
+            std::thread::sleep(p);
+        }
+        fleet.pump_all();
+        trace.push(
+            fleet
+                .reps
+                .iter()
+                .map(|r| r.with_node(|n| (n.role(), n.term(), n.leader(), n.commit_round())))
+                .collect(),
+        );
+    }
+    fleet.shutdown();
+    trace
+}
+
+/// **The exit, as an equality: an election is a function of the turns alone.**
+///
+/// Two fleets from the same seeds, driven through the same number of turns, one of them paused
+/// between some of them. If ticks come from the turns and every message takes a fixed number of
+/// turns to arrive, the two replay one election turn for turn — same roles, same terms, same leader,
+/// same commit round, at every turn. If anything the machine did between turns can reach a
+/// timeout, they part company.
+///
+/// Red on the wall-clock `Fleet`: the paused fleet sees 25 ms as more than a tick, the other does
+/// not, so they campaign at different turns. **That is also this equality's negative control** —
+/// an equality nobody has seen fail can hold because both sides broke the same way — and the
+/// anti-vacuity checks below refuse the other way it could hold for nothing: two fleets that never
+/// elected anyone are identical too.
+#[test]
+fn the_same_turns_elect_the_same_leader_at_the_same_turn_whatever_the_machine_does_between_them() {
+    const TURNS: usize = 600;
+    let steady = election_trace(TURNS, |_| Duration::ZERO);
+    let paused = election_trace(TURNS, |t| {
+        if t % 13 == 5 { Duration::from_millis(25) } else { Duration::ZERO }
+    });
+
+    let first_diff = (0..TURNS).find(|&t| steady[t] != paused[t]);
+    assert_eq!(
+        first_diff,
+        None,
+        "the paused fleet diverged from the steady one at turn {first_diff:?}: steady {:?}, paused \
+         {:?}. Pausing between turns changed what the cluster did, so its timeouts are reading \
+         something other than the turns",
+        first_diff.map(|t| &steady[t]),
+        first_diff.map(|t| &paused[t])
+    );
+
+    // Anti-vacuity. The trace must move — nobody leads after the first turn, because no timeout
+    // can expire in one tick — and it must end with one leader every node agrees on, holding a
+    // committed round. Two fleets that stalled would satisfy the equality above and prove nothing.
+    assert!(
+        steady[0].iter().all(|s| s.2.is_none()),
+        "a leader existed after one turn, before any election timeout could expire: {:?}",
+        steady[0]
+    );
+    let last = &steady[TURNS - 1];
+    let l = last[0].2;
+    assert!(
+        l.is_some() && last.iter().all(|s| s.2 == l && s.3 >= 1),
+        "after {TURNS} turns the fleet had not settled on one leader with a committed round: \
+         {last:?}"
+    );
 }
