@@ -498,7 +498,9 @@ impl Catalog {
     pub fn persist(&self) -> Result<(), FerroError> {
         let written = self.write_pages();
         if let Some(debt) = &self.persist_debt {
-            debt.store(written.is_err(), Ordering::SeqCst);
+            if written.is_err() {
+                debt.store(true, Ordering::SeqCst); // D230 MUTANT M15: a successful persist never clears the debt
+            }
         }
         written
     }
