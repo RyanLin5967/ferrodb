@@ -1275,8 +1275,9 @@ pub struct AgentRuntime {
     /// **Scope (wall #19): the branches this log saw forked, plus trunk.** The log refuses to write
     /// an entry for any other branch rather than root it at genesis: a fork from such a parent
     /// fails its `BEGIN AGENT SESSION`, and a merge into, or reap of, such a branch commits with
-    /// no entry and is counted by [`AgentRuntime::attestation_refusals`]. A lease-expiry reap does
-    /// not reach this log at all (`lane_wall19_attested.md` F1).
+    /// no entry and is counted by [`AgentRuntime::attestation_refusals`]. A lease-expiry reap is
+    /// attested from the forget path that drops its workspace (D199,
+    /// [`AgentRuntime::attest_forgotten_reaps`]).
     attested: Mutex<AttestedHistory>,
 }
 
@@ -3777,6 +3778,34 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// **D199: attest the reaps of branches a reaper took without the client**, i.e. every branch
+    /// whose workspace a forget path ([`Self::forget_branches`], [`Self::forget_reaped_branches`])
+    /// has just removed. Without this, a branch the lease reaper retired kept `[Fork]` as its
+    /// whole history: the log called it live, and its head was never dropped (wall #19).
+    ///
+    /// **Exactly once, by construction.** Attesting follows removing the workspace, and only one
+    /// path can remove a given workspace. `seal` removes it before its own [`Self::attest_reap`],
+    /// so a sealed branch never arrives here. A branch forgotten here is already reaped in the
+    /// catalog, so a later `seal` stops at the catalog. The log refuses a second `Reap` in any
+    /// case, and a refusal would show in [`Self::attestation_refusals`], not as a second entry.
+    ///
+    /// **The epoch is the catalog's current one**, the epoch at which the reap is recorded.
+    /// `seal` stamps the branch's fork epoch, but that is unreadable here, because `get` on a
+    /// reaped id is a hard error. `published` is false: a branch the lease took published nothing.
+    ///
+    /// Called with neither `state` nor the catalog held, the leaf-lock rule on
+    /// [`AgentRuntime::attested`]. `current_epoch` is read and released before the log is locked.
+    fn attest_forgotten_reaps(&self, reaped: &[BranchId]) {
+        if reaped.is_empty() {
+            return;
+        }
+        let epoch = self.branches.current_epoch();
+        for &branch in reaped {
+            // Counted, not returned, for the reason `seal`'s arms give: the reap has happened.
+            let _ = self.attest_reap(branch, epoch, false);
+        }
+    }
+
     // ---- D103: ancestry, and the merge it makes possible ------------------------------------
 
     /// Put `branch` and every ancestor it needs into the ancestry index, deriving the chain from
@@ -5614,12 +5643,18 @@ impl AgentRuntime {
 
             // ---- phase 3: forget them, under the lock ---------------------------------------
             if !gone.is_empty() {
-                let mut state = self.state.lock().unwrap();
-                for bid in &gone {
-                    if forget_one_branch(&mut state, *bid) {
-                        forgotten += 1;
+                let mut sealed: Vec<BranchId> = Vec::with_capacity(gone.len());
+                {
+                    let mut state = self.state.lock().unwrap();
+                    for bid in &gone {
+                        if forget_one_branch(&mut state, *bid) {
+                            forgotten += 1;
+                            sealed.push(*bid);
+                        }
                     }
                 }
+                // D199: attested once the state lock is released. See `attest_forgotten_reaps`.
+                self.attest_forgotten_reaps(&sealed);
             }
 
             // A short chunk means the range ran out, which is the only end condition: `examined`
@@ -5677,12 +5712,18 @@ impl AgentRuntime {
             if gone.is_empty() {
                 continue;
             }
-            let mut state = self.state.lock().unwrap();
-            for bid in gone {
-                if forget_one_branch(&mut state, bid) {
-                    forgotten += 1;
+            let mut sealed: Vec<BranchId> = Vec::with_capacity(gone.len());
+            {
+                let mut state = self.state.lock().unwrap();
+                for bid in gone {
+                    if forget_one_branch(&mut state, bid) {
+                        forgotten += 1;
+                        sealed.push(bid);
+                    }
                 }
             }
+            // D199: attested once the state lock is released. See `attest_forgotten_reaps`.
+            self.attest_forgotten_reaps(&sealed);
         }
         forgotten
     }
