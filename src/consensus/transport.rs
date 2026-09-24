@@ -40,8 +40,8 @@
 //! partitioned follower would stop heartbeating the healthy majority, turning one node's failure
 //! into the cluster's.
 //!
-//! **Every way a message can be lost here has its own counter**, because an invisible drop is
-//! indistinguishable from a protocol bug, and because the three causes call for different actions:
+//! **Every loss this transport decides on has its own counter**, because an invisible drop is
+//! indistinguishable from a protocol bug, and because the causes call for different actions:
 //! [`Transport::dropped`] means a peer is too slow to keep up,
 //! [`Transport::lost_in_flight`] means a connection broke mid-frame, and
 //! [`Transport::inbound_dropped`] means *this* node is not draining its own inbox. A send after
@@ -50,6 +50,19 @@
 //! (D223): after shutdown, misaddressed, or unencodable, in [`Transport::refused_after_stop`],
 //! [`Transport::unaddressable`] and [`Transport::unencodable`]. The caller in `node.rs` discards the
 //! error, so the count is the only trace a refusal leaves.
+//!
+//! **What is not counted, because it cannot be.** This used to say *every* way a message could be
+//! lost had a counter, and that was never true. A frame handed to the kernel is not tracked any
+//! further: TCP gives no delivery receipt. When a connection dies, whatever sat in its buffers is
+//! lost with no number attached, and only the frame whose own write failed reaches `lost_in_flight`.
+//! That includes the first frame written after the peer closed its end, which is exactly what the
+//! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
+//! the next write that fails. So a live connection closed for silence costs its sender two frames,
+//! not nothing. The same is true of the receiving side. A connection closed on a frame with an
+//! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
+//! whatever the peer sends after it; of those closes, only the idle one is counted
+//! ([`Transport::idle_closed`]). Consensus re-sends, so none of these is a correctness loss; they
+//! are why `sent()` minus a peer's `received()` is not fully accounted for by the counters here.
 //!
 //! # The wire format
 //!
@@ -1129,8 +1142,16 @@ pub struct TransportOptions {
     ///
     /// A peer whose host vanishes without sending a FIN leaves a connection that is never readable
     /// and never errors, so its thread and descriptors are pinned for the life of the process.
-    /// Consensus heartbeats every few ticks, so a genuinely live peer is never silent for long, and
-    /// closing costs only a reconnect.
+    ///
+    /// **What closing a live peer costs**, stated because it used to say "only a reconnect". The
+    /// leader heartbeats its followers, and they answer it, so those connections are never silent
+    /// for long. **Followers send each other nothing** while a leader holds, so each follower's
+    /// connection *to* another is closed by the receiver after this long. The sender does not read
+    /// its socket and does not see the close. When the leader then dies, a surviving follower's
+    /// first campaign frame to the other survivor is written into the closed connection and lost
+    /// uncounted. Its second fails the write and is counted in `lost_in_flight`. Only then does it
+    /// redial. So a failover after a long stable term can take an election round or two longer than
+    /// one after a short term. See the module header for why neither loss is a correctness failure.
     pub idle_deadline: Duration,
     /// Most bytes of undelivered inbound messages held before further ones are refused.
     ///
@@ -1157,9 +1178,10 @@ impl Default for TransportOptions {
     }
 }
 
-/// Everything this transport has counted. **Drops and refusals are counted, never silent** — a
-/// message that vanished without a number attached is indistinguishable from a protocol bug, and
-/// this transport is allowed to drop.
+/// Everything this transport has counted. **Every drop and refusal it decides on is counted, never
+/// silent** — a message that vanished without a number attached is indistinguishable from a protocol
+/// bug, and this transport is allowed to drop. What TCP loses after a frame left this process is
+/// not, and cannot be; the module header lists those cases.
 #[derive(Debug, Default)]
 struct Counters {
     sent: AtomicU64,
