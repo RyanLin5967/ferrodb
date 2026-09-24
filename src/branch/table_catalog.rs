@@ -23,12 +23,13 @@
 //!
 //! See `SCALE-DESIGN.md` D2b.
 
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::branch::group_commit::CommitGroup;
-use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+use crate::branch::record::{parent_entry_holders, BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
@@ -271,11 +272,19 @@ impl TableBranchCatalog {
     /// source through the **trait**, so it is not specific to `LogBranchCatalog` and the
     /// equivalence test can drive it with either.
     ///
-    /// Child entries are rebuilt from the children themselves — every non-`Reaped` record that
-    /// names a parent contributes one — which is exactly how `LogBranchCatalog::index` derives the
-    /// live set at replay. Rebuilding from the PARENT's `live_children` array instead would copy a
-    /// representation rather than re-derive the truth, and would carry across any staleness the
-    /// source happened to hold.
+    /// Child entries are rebuilt from the children themselves, by the rule `LogBranchCatalog::index`
+    /// uses at replay (one function, `record::parent_entry_holders`). Rebuilding from the PARENT's
+    /// `live_children` array instead would copy a representation rather than re-derive the truth,
+    /// and would carry across any staleness the source happened to hold.
+    ///
+    /// ⛔ **D235: the rule here used to be "every non-`Reaped` record that names a parent
+    /// contributes one", copied from `index` on purpose, so it inherited `index`'s omission.** A
+    /// `Reaped` interior branch with a live descendant is a D16 PIN: its entry under its own parent
+    /// is what keeps the grandparent's pages parked. The old rule dropped it, so a migrated
+    /// catalog, whose CHILD span is then durable and never rebuilt, answered "childless" for the
+    /// grandparent from the first open, and `release_id` below freed the slot of every reaped node
+    /// between two others. `a_migrated_catalog_answers_every_query_the_way_its_source_does` had no
+    /// such node until D235 added one.
     pub fn migrate_from(
         pool: Arc<BufferPoolManager>,
         source: &dyn BranchCatalog,
@@ -287,7 +296,11 @@ impl TableBranchCatalog {
         // cannot run before the records exist.
         let mut max_id = 0u64;
         let mut reaped: Vec<u64> = Vec::new();
-        let mut children: Vec<(u64, Epoch, u64)> = Vec::new();
+        // Every (parent, fork epoch, child) edge, and every record's parent and state. Which edges
+        // become CHILD entries is decided only after the scan (D235): whether a `Reaped` record is
+        // a pin depends on records below it, which the scan may not have reached yet.
+        let mut edges: Vec<(u64, Epoch, u64)> = Vec::new();
+        let mut nodes: HashMap<u64, (Option<u64>, BranchState)> = HashMap::new();
         for rec in source.scan()? {
             let rec = rec?;
             // `scan` yields core records; the unbounded fields come from the source's own `get`,
@@ -297,16 +310,20 @@ impl TableBranchCatalog {
             if full.state == BranchState::Reaped {
                 reaped.push(full.branch_id.id);
             }
-            if full.state != BranchState::Reaped {
-                if let Some(p) = full.parent_id {
-                    children.push((p.id, full.fork_epoch, full.branch_id.id));
-                }
+            nodes.insert(full.branch_id.id, (full.parent_id.map(|p| p.id), full.state));
+            if let Some(p) = full.parent_id {
+                edges.push((p.id, full.fork_epoch, full.branch_id.id));
             }
             let old = cat.core(full.branch_id.id)?;
             cat.write_record(&full, old.as_ref())?;
         }
-        for (parent, epoch, child) in children {
-            cat.attach_child(parent, epoch, child)?;
+        // Every non-`Reaped` record, and every `Reaped` one with a live descendant: the same
+        // function `LogBranchCatalog::index` derives its live sets with.
+        let holders = parent_entry_holders(&nodes);
+        for (parent, epoch, child) in edges {
+            if holders.contains(&child) {
+                cat.attach_child(parent, epoch, child)?;
+            }
         }
 
         // Counters, matching what `LogBranchCatalog::open` derives: the next id is one past the

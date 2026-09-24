@@ -6,6 +6,8 @@
 //! Fork = one durable `BranchRecord` + append `fork_epoch` to the parent's sorted
 //! `live_children` array. No page is read, written, or refcounted, which is exit criterion 1.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
@@ -1274,6 +1276,57 @@ pub fn reclaimable(live_children: &[Epoch], birth: Epoch, freed: Epoch) -> bool 
     lo == hi
 }
 
+/// **D235: which records hold an entry in their parent's live set. This is D16's pin rule,
+/// applied when that set is REBUILT rather than maintained.**
+///
+/// A record's fork epoch belongs under its parent if the record is not `Reaped`, OR if it is
+/// `Reaped` and anything below it is not. That is exactly the state the running reaper leaves:
+/// `TwoTierReaper::detach_from_parent` never detaches a branch that still has live children, and
+/// its cascade detaches a reaped node only once the last live node below it has gone. The entry
+/// that stays is the only thing saying the grandparent's pages are still visible.
+///
+/// Both rebuilders used to count only non-`Reaped` records: `LogBranchCatalog::index` (so every
+/// `open` and every snapshot `reload_from`) and `TableBranchCatalog::migrate_from`. So the first
+/// rebuild after an interior prune dropped every pin. The grandparent then read as childless while a
+/// live grandchild still reached its pages through the root it inherited:
+/// - its pages became reclaimable;
+/// - its in-place barrier fell back to its own fork epoch;
+/// - the reaped interior's id slot went back on the free list.
+/// Adversary: artie-research `frontier/d16_restart_pin_adversary.md` @ `911aef8`.
+///
+/// `nodes` maps every record's id to its parent's id and its state. Returns the ids whose entry
+/// belongs under their parent. It is O(records): each walk up a parent chain stops at the first
+/// ancestor that is not `Reaped` (that one holds an entry on its own account) or that is already
+/// marked (the walk that marked it marked everything above it too). The already-marked stop also
+/// ends a walk around a cycle. No catalog produces one, but a corrupt log could, and a rebuild must
+/// terminate on whatever it is given.
+pub(crate) fn parent_entry_holders(
+    nodes: &HashMap<u64, (Option<u64>, BranchState)>,
+) -> HashSet<u64> {
+    let mut holders = HashSet::with_capacity(nodes.len());
+    for (&id, &(parent, state)) in nodes {
+        if state == BranchState::Reaped {
+            continue;
+        }
+        holders.insert(id);
+        // Every `Reaped` ancestor between this live node and the next non-`Reaped` one is a pin
+        // held open by it.
+        let mut up = parent;
+        while let Some(p) = up {
+            match nodes.get(&p) {
+                Some(&(grand, BranchState::Reaped)) => {
+                    if !holders.insert(p) {
+                        break;
+                    }
+                    up = grand;
+                }
+                _ => break,
+            }
+        }
+    }
+    holders
+}
+
 /// A page that has been logically freed but must wait for the reclamation rule to clear it.
 /// Slow-path reaping (branch had live children) parks entries here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,5 +2119,79 @@ mod core_record_tests {
         let mut bad = bytes.clone();
         bad[49] = 200;
         assert!(BranchRecord::deserialize_core(&bad).is_err(), "unknown state tag accepted");
+    }
+}
+
+#[cfg(test)]
+mod d235_parent_entry_holders {
+    //! The pin rule on its own, over hand-shaped id graphs. The catalogs' rebuilds are tested end
+    //! to end in `tests/d235_rebuild_keeps_d16_pins.rs` and in the migration-equivalence test;
+    //! these pin the rule's edges, which those fixtures do not all reach.
+    use super::*;
+
+    const LIVE: BranchState = BranchState::Live;
+    const REAPED: BranchState = BranchState::Reaped;
+
+    fn graph(edges: &[(u64, Option<u64>, BranchState)]) -> HashMap<u64, (Option<u64>, BranchState)> {
+        edges.iter().map(|&(id, parent, st)| (id, (parent, st))).collect()
+    }
+
+    #[test]
+    fn a_reaped_interior_with_a_live_child_holds_its_entry_and_a_reaped_leaf_does_not() {
+        // trunk 0 -> 1 (live) -> 2 (reaped) -> 3 (live);  0 -> 4 (reaped leaf)
+        let g = graph(&[(0, None, LIVE), (1, Some(0), LIVE), (2, Some(1), REAPED),
+                        (3, Some(2), LIVE), (4, Some(0), REAPED)]);
+        let h = parent_entry_holders(&g);
+        assert!(h.contains(&2), "the reaped interior is a D16 pin and must keep its entry");
+        assert!(h.contains(&3) && h.contains(&1), "live records always hold their entry");
+        assert!(!h.contains(&4), "a reaped leaf with nothing live below it holds nothing");
+    }
+
+    #[test]
+    fn the_rule_is_transitive_through_a_run_of_reaped_nodes() {
+        // 0 -> 1 (live) -> 2 (reaped) -> 3 (reaped) -> 4 (reaped) -> 5 (live)
+        let g = graph(&[(0, None, LIVE), (1, Some(0), LIVE), (2, Some(1), REAPED),
+                        (3, Some(2), REAPED), (4, Some(3), REAPED), (5, Some(4), LIVE)]);
+        let h = parent_entry_holders(&g);
+        for id in [2, 3, 4] {
+            assert!(h.contains(&id), "reaped node {id} sits above live node 5 and must hold");
+        }
+    }
+
+    #[test]
+    fn a_fully_reaped_subtree_holds_nothing_even_under_a_live_parent() {
+        // 0 -> 1 (live) -> 2 (reaped) -> {3, 4} (reaped)
+        let g = graph(&[(0, None, LIVE), (1, Some(0), LIVE), (2, Some(1), REAPED),
+                        (3, Some(2), REAPED), (4, Some(2), REAPED)]);
+        let h = parent_entry_holders(&g);
+        for id in [2, 3, 4] {
+            assert!(!h.contains(&id), "{id} has nothing live below it, so it pins nothing");
+        }
+    }
+
+    #[test]
+    fn a_walk_stops_at_a_live_ancestor_and_at_a_missing_one() {
+        // 0 -> 1 (reaped) -> 2 (live) -> 3 (reaped) -> 4 (live); and 9 (reaped) under missing 8
+        // with 10 (live) below it.
+        let g = graph(&[(0, None, LIVE), (1, Some(0), REAPED), (2, Some(1), LIVE),
+                        (3, Some(2), REAPED), (4, Some(3), LIVE),
+                        (9, Some(8), REAPED), (10, Some(9), LIVE)]);
+        let h = parent_entry_holders(&g);
+        assert!(h.contains(&3), "3 is pinned by 4");
+        assert!(h.contains(&1), "1 is pinned by 2, on 2's own walk");
+        assert!(h.contains(&9), "9 is pinned by 10 even though 9's own parent record is missing");
+        assert!(!h.contains(&8), "a missing record is not invented");
+    }
+
+    #[test]
+    fn a_cycle_of_reaped_records_terminates() {
+        // No catalog can produce this; a corrupt log could. A live node hangs below a reaped cycle
+        // 1 -> 2 -> 3 -> 1, and the rebuild must still return.
+        let g = graph(&[(1, Some(3), REAPED), (2, Some(1), REAPED), (3, Some(2), REAPED),
+                        (4, Some(3), LIVE)]);
+        let h = parent_entry_holders(&g);
+        for id in [1, 2, 3, 4] {
+            assert!(h.contains(&id), "{id}: every node of a cycle above a live node is pinned");
+        }
     }
 }

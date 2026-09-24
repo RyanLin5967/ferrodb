@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
+use crate::branch::record::{parent_entry_holders, CoreRecord, BranchRecord, CapabilityEnvelope};
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
@@ -202,14 +202,36 @@ impl LogBranchCatalog {
         // entry would be a page nobody knows to park. Derived, the child record *is* the parent's
         // entry — the two cannot disagree because there is only one of them.
         //
-        // A reaped child is not live, and `detach_from_parent` runs BEFORE `mark_reaped`, so a
-        // crash between the two leaves a parent whose stored array had already lost the epoch while
-        // the child still reads Live. Derivation re-adds it, which PARKS the pages until the
-        // resumed reap finishes — the safe direction. The unsafe direction, dropping a child that
-        // is still live, cannot happen: a live child's own record says so.
+        // ⛔ **D235: THIS PARAGRAPH SAID "the unsafe direction, dropping a child that is still
+        // live, cannot happen: a live child's own record says so". That held for a LIVE child and
+        // was FALSE for a D16 PIN.** A `Reaped` interior branch with a live descendant keeps its
+        // entry under its own parent (`reaper.rs::detach_from_parent`), and that entry is the only
+        // thing protecting the grandparent's pages. This derivation skipped every `Reaped` record,
+        // so the first reopen after an interior prune lost the pin. From then on the grandparent's
+        // pages were reclaimable while a live grandchild still read them through its inherited
+        // root. Adversary: artie-research `frontier/d16_restart_pin_adversary.md` @ `911aef8`.
+        // Reproduced by `tests/d235_rebuild_keeps_d16_pins.rs`.
+        //
+        // The rule is now D16's own, applied transitively: `record::parent_entry_holders`, which
+        // `TableBranchCatalog::migrate_from` shares so the two rebuilders cannot drift apart.
+        //
+        // **Crash windows, restated for the reaper as it is now.** The paragraph also said
+        // `detach_from_parent` runs BEFORE `mark_reaped`. That is stale: `reap` marks `Reaped`
+        // first and detaches second ("MARK REAPED FIRST, THEN DETACH" in `reaper.rs`).
+        // - A crash between the two leaves an entry for a reaped child. This derivation drops it
+        //   unless something below that child still lives, which is exactly what the reaper would
+        //   have decided.
+        // - A crash earlier in the reap leaves the child `Reaping`, which is not `Reaped`, so its
+        //   entry is kept and the pages stay PARKED until the resumed reap finishes. That is the
+        //   safe direction.
+        let nodes: HashMap<u64, (Option<u64>, BranchState)> = records
+            .iter()
+            .map(|(id, r)| (*id, (r.parent_id.map(|p| p.id), r.state)))
+            .collect();
+        let holders = parent_entry_holders(&nodes);
         let mut derived: HashMap<u64, Vec<Epoch>> = HashMap::new();
-        for r in records.values() {
-            if r.state == BranchState::Reaped {
+        for (id, r) in records.iter() {
+            if !holders.contains(id) {
                 continue;
             }
             if let Some(p) = r.parent_id {
@@ -227,11 +249,13 @@ impl LogBranchCatalog {
         }
         // A parent that now has no live children must end up with an EMPTY array, not the stale one
         // its last serialised copy held — `release_id` refuses to recycle a slot while the array is
-        // non-empty, so a leftover entry would strand the id for ever.
+        // non-empty, so a leftover entry would strand the id for ever. "Live children" here means
+        // the same entry holders as above (D235). Otherwise a pinned interior's array is emptied
+        // and its slot goes on the free list below while pages are still parked under its id.
         let has_kids: std::collections::HashSet<u64> = records
-            .values()
-            .filter(|r| r.state != BranchState::Reaped)
-            .filter_map(|r| r.parent_id.map(|p| p.id))
+            .iter()
+            .filter(|(id, _)| holders.contains(*id))
+            .filter_map(|(_, r)| r.parent_id.map(|p| p.id))
             .collect();
         for (id, rec) in records.iter_mut() {
             if !has_kids.contains(id) {
@@ -951,6 +975,10 @@ mod tests {
     /// is invisible until something reopens. Reaped children must be excluded, and a parent that
     /// loses its last live child must end up with an EMPTY array — `release_id` refuses to recycle
     /// a slot while the array is non-empty, so a stale entry strands the id for ever.
+    ///
+    /// ⚠ **D235 narrows "reaped children must be excluded" to reaped children with nothing live
+    /// below them**, which is the only kind this test builds. A reaped INTERIOR child with a live
+    /// descendant is a D16 pin and must be KEPT. That case is `tests/d235_rebuild_keeps_d16_pins.rs`.
     #[test]
     fn live_children_is_derived_at_replay_and_excludes_reaped_children() {
         let dir = std::env::temp_dir().join(format!("ferrodb-derive-{}", std::process::id()));
