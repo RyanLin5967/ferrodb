@@ -1052,3 +1052,144 @@ error. Its findings:
 | M36 | `add_pending` inserts without merging | the interval test FAILS |
 | M37 | `read_now` returns `apply_seq` | `an_unpinned_scan_inside_a_publish_window_pairs_with_its_start` FAILS |
 | M38 | the `None` refusal is removed | `a_read_without_a_paired_seq_is_refused` FAILS |
+
+## Amendment 13 (append-only; written BEFORE the tests and code it describes): review 6's CONDITIONAL PASS, and the lead's decisions A–F
+
+Review 6 is `frontier/d194_review6.md` @ `8a87787`, taken at `0fdcd81`. `0fdcd81` is not moved; the
+commits below follow it.
+
+### A (before landing): the SQL session unbinds by STATE after a MERGE or ABANDON
+
+`dispatch.rs`'s MERGE arm cleared `session.agent` only on `Ok`. After Amendment 12's "published and
+sealed" error, that left the connection bound to a reaped branch:
+- BEGIN AGENT SESSION was refused as "already open";
+- every read was refused as "no agent session";
+- ABANDON failed, because the branch was already reaped.
+
+**Fix.** Both the MERGE arm and the ABANDON arm keep the runtime's result. They clear the binding
+whenever the runtime holds no live workspace for that branch
+(`AgentRuntime::has_live_workspace`, new and O(log n)), and only then apply `?`.
+- The decision is read from state, never from error text.
+- The MERGE arm's old condition, `applied_to_target`, is equivalent on every `Ok`:
+  - a published merge seals, so no workspace remains;
+  - a conflict or a quarantine keeps the workspace.
+
+**Red tests.** Both are in `runtime.rs` `mod tests`, go through `executor::run`, and compile at
+`0fdcd81`.
+
+| test | at `0fdcd81` | at the fix |
+|---|---|---|
+| `a_session_whose_merge_published_but_failed_is_unbound`: the MERGE's 2nd author stamp fails, then the same session begins a new agent session | **FAILS**: "an agent session is already open" | passes |
+| `a_session_whose_branch_was_abandoned_elsewhere_is_unbound_by_its_own_abandon`: connection 2 runs `ABANDON BRANCH` on connection 1's branch, connection 1's own `ABANDON;` fails, then connection 1 begins a new session | **FAILS** (the same refusal) | passes |
+
+### F (before landing): the attested half of Amendment 12's F1 gets a test
+
+**Test:** `a_merge_whose_author_stamp_fails_is_attested_once`. After the failed-stamp merge:
+- TRUNK's attested chain holds exactly one `Merge` entry;
+- the branch's chain ends in `Reap`, and holds exactly one `Reap`.
+
+It passes at `0fdcd81` (mutant-only). **M39** skips `attest_merge` on the authorship-error path and
+FAILS it.
+
+### B: a seal failure no longer hides the stamp failure
+
+When both fail, the error names both: "… recording who wrote its rows failed (…), and sealing its
+branch then failed too (…)".
+
+**Untested, stated.** No injection point can make `seal` fail after a publish. Its fallible steps are
+the reaper and branch-catalog calls, which in-memory tests cannot break. The change is error
+reporting, and it has no branch that could admit or refuse anything.
+
+### C: the cluster wrapper tells, from state, whether the rows landed
+
+`cluster.rs`'s publish-failure wrapper now asks the runtime `published_merge_of(from)`: is there a
+merge record for this branch?
+- `record_applied` inserts that record after the publish commits and before any author stamp.
+- **Record present:** the error says the rows LANDED here as merge `m_N`, and that finishing it failed.
+- **Record absent:** it keeps the old meaning.
+
+The lookup scans `merges` (O(merges ever), not pruned before this change) on the error path only.
+The old text's runs of spaces, left by line continuations that an earlier edit lost, are removed at
+the same time.
+
+**Untested, stated.** No cluster test drives a publish whose stamp fails.
+
+### D: a row the failed stamp missed never answers with its PREVIOUS author
+
+**Confirmed from source at `0fdcd81`, so it had to change:**
+- `DurableProvenanceStore::stamp_row` updates memory before its append, and poisons the store if the
+  append fails.
+- `row_author` reads memory WITHOUT checking the poison.
+- `record_applied` stops at the first failed stamp.
+
+So every row after the failed one answers the previous merge's author.
+
+**Two changes:**
+1. **`record_applied` stamps best-effort.**
+   - A failed `stamp_row(row, run)` is followed by `stamp_row(row, NONE)`, which clears the row so it
+     reads as "nobody on record" (unknown).
+   - The loop then continues with the remaining rows.
+   - The error it returns names the first failure, and lists the rows it could not stamp and could not
+     clear.
+2. **`DurableProvenanceStore::row_author` and `attributed_rows` REFUSE when the store is poisoned.**
+   - A store whose log has stopped accepting writes cannot say who last wrote a row: the write it
+     refused may have been exactly that.
+   - `who_wrote_row` then answers `None` and `authors_of` answers empty. Neither names a stale author.
+   - The physical `attribute` / `who_wrote(rid)` reads are unchanged. Their test asserts that they
+     still answer after poisoning.
+
+**Stated blind spot:** after a RESTART the reopened store is healthy and replays only what reached its
+file, so a row whose new stamp never landed answers its previous author again. Closing that needs
+authorship written atomically with the publish, which is D212 option (a) or D219's grouped stamp.
+
+**Tests (both compile at `0fdcd81`).**
+
+| test | at `0fdcd81` | at the fix |
+|---|---|---|
+| `a_row_the_failed_stamp_missed_never_names_its_previous_author` (runtime; `FailingStamps` fails the 5th call: run A's merge stamps rows 1–3, run B's merge fails its 2nd stamp) | **FAILS**: rows after B's failure name run A | passes: every row names B, or no one |
+| `a_poisoned_store_refuses_to_say_who_wrote_a_row` (`durable.rs`: stamp a row, inject an append failure, then `row_author`) | **FAILS**: `Ok`, naming the old author | passes: `Err` |
+
+### E: waiting on the lead's decision about retiring two tests
+
+The design is already registered here, so the direction is fixed before any code.
+- **Buckets.** A kept entry sits in the bucket of its HIGHEST live reader, the max pin in `[h, s)`.
+- **Departure.** When pin `p` departs, every entry in its bucket either:
+  - moves down to `a`, the next lower live pin, if `a ≥ h`; or
+  - is freed.
+
+  That frees exactly the rectangle `(a, p] × (p, b]`, and never re-tests an entry a higher pin reads.
+- **The queue.** Departed pins whose buckets are not yet empty, swept at the Amendment 10 budgets. It
+  never restarts.
+- **New pins** never enter a kept entry's interval, because a new pin is at or above every recorded
+  `s`, so arrivals touch no bucket.
+- **Red test:** review 6's fixture (cold = B + 1000, hot = 100). After P0 and P1 depart, no hot entry
+  is held. At `0fdcd81` all 100 are held.
+- **Counter test:** after the two departures, sweeps have touched exactly 100 entries, and the queue is
+  empty.
+
+This retires the interval queue (`add_pending` / `sweep_pending` over `(lo, hi]`), so two mutant-only
+tests from Amendment 12 no longer compile. Deleting them is a test deletion, and that is the lead's
+decision. Until it is made, the `HistoryRetention` doc and lane §10.1 stop claiming the queue drains.
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M39 | `attest_merge` skipped when authorship failed | `..._is_attested_once` FAILS |
+| M40 | MERGE unbinds only on `Ok` again | `a_session_whose_merge_published_but_failed_is_unbound` FAILS |
+| M41 | ABANDON unbinds only on `Ok` again | `a_session_whose_branch_was_abandoned_elsewhere...` FAILS |
+| M42 | no clear after a failed stamp | `a_row_the_failed_stamp_missed...` FAILS (the failed row names A) |
+| M43 | the stamp loop stops at the first failure again | the same test FAILS (the later rows name A) |
+| M44 | durable `row_author` stops checking the poison | `a_poisoned_store_refuses_...` FAILS |
+
+### Counts, replacing Amendment 12's (before E)
+
+Six new tests:
+- lib: the two unbinding tests, attested-once, the previous-author test, and the poisoned-store test;
+- and `version_history` is still 15.
+
+Run of record at default QoS: **59 result lines, 2183 passed (2178 + 5 lib + 0), 2 failed, 2
+ignored**.
+
+Correction to the line above: six tests means 2178 + 6 = **2184 passed**. The durable-store test is
+also a lib test.
