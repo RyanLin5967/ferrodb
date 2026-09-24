@@ -1495,8 +1495,8 @@ impl SnapshotStore for PageStoreSnapshots {
         // together, and the marker covers all three at once.
         let ops = crate::storage::atomic_file::OsFileOps;
         crate::replication::backup::restore(&dir, &self.paths.page_file)?;
-        std::fs::write(&self.paths.arena_image, &arena)
-            .map_err(|e| FerroError::Io(format!("write the arena image: {e}")))?;
+        // The arena image is NOT written here: it is written below, together with the load, in one
+        // `persist` hold (D232 review 5 F1).
         std::fs::write(&self.paths.branch_catalog, &branches)
             .map_err(|e| FerroError::Io(format!("write the branch catalog: {e}")))?;
 
@@ -1538,7 +1538,14 @@ impl SnapshotStore for PageStoreSnapshots {
         // The live objects, not only the files. A node that replaced its durable state and went on
         // serving the old in-memory index would answer for a database it no longer has, and the
         // only sign of it would be a restart much later that "changed" the answers.
-        self.arenas.load_state(&arena)?;
+        //
+        // **The arena map: its file and its load in ONE `persist` hold (D232 review 5 F1).**
+        // Written above, with the other two files, a claim or free landing before the load could
+        // persist the pre-install map over the installed file, and the fsync and marker removal
+        // below would then make that mixture look whole. Latent while nothing in production
+        // constructs a `PageStoreSnapshots`: the one caller is
+        // `tests/integration_cluster_snapshot.rs`.
+        self.arenas.install_image(&self.paths.arena_image, &arena)?;
         self.branches.reload_from(&self.paths.branch_catalog, header.root_page_id)?;
 
         // Durable before returning, and through `OsFileOps::sync_file` rather than

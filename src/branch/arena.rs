@@ -1368,7 +1368,55 @@ impl ArenaPageStore {
 
     /// Replace the free-space map from a checkpoint. Refuses a truncated or corrupt image rather
     /// than loading a partial map — a free-space map that is half right hands out live pages.
+    ///
+    /// **D232 review 5 F4:** [`Self::parse_state`], then `persist`, then [`Self::install_locked`],
+    /// which takes the guard by `&mut`: the install cannot run without it, so it cannot release it
+    /// early either (review 4 B3.1's hold, made a type rather than a reading).
     pub fn load_state(&self, bytes: &[u8]) -> Result<(), FerroError> {
+        let parsed = self.parse_state(bytes)?;
+        let mut persist = self.persist.lock().unwrap();
+        self.install_locked(&mut persist, parsed);
+        Ok(())
+    }
+
+    /// **D232 review 5 F1.** Install `bytes`, a whole arena image from elsewhere (a snapshot), as
+    /// this store's map AND as the file at `path`, both inside one `persist` hold.
+    ///
+    /// Written and loaded as two steps, the write outside the hold, a claim or free landing between
+    /// them persisted the PRE-install map over the installed file (a rewrite renames it over; an
+    /// append puts a pre-install record behind the installed image), and the install then fsynced
+    /// that file and removed its marker: the mixture the marker exists to refuse, unmarked. Under
+    /// one hold nothing can persist between the file and the map. The write goes through the live
+    /// path, as `std::fs::write` did in `PageStoreSnapshots::install`; its caller makes it durable.
+    pub fn install_image(&self, path: &std::path::Path, bytes: &[u8]) -> Result<(), FerroError> {
+        self.install_image_with(&OsFileOps, path, bytes)
+    }
+
+    /// [`Self::install_image`] against an injected [`FileOps`], so a test can see what is held at
+    /// the moment the file is written.
+    pub(crate) fn install_image_with(
+        &self,
+        ops: &dyn FileOps,
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> Result<(), FerroError> {
+        let parsed = self.parse_state(bytes)?;
+        let mut persist = self.persist.lock().unwrap();
+        if let Err(e) = ops.write(path, bytes) {
+            // The file may now be partly written, so no persist may append behind it: the next one
+            // rewrites. The map in memory is untouched.
+            persist.image_bytes = 0;
+            return Err(FerroError::Io(format!("write the arena image {}: {e}", path.display())));
+        }
+        self.install_locked(&mut persist, parsed);
+        Ok(())
+    }
+
+    /// Everything [`Self::load_state`] does before its first effect (D232 review 5 F4): the
+    /// checksum, the version, the base, the cursor, the derived `reserved`, `current` cleared, and
+    /// the claim epochs. It takes no lock and changes nothing, so a refusal leaves the store as it
+    /// was, and the O(image) work stays outside `persist`.
+    fn parse_state(&self, bytes: &[u8]) -> Result<ParsedState, FerroError> {
         let body = bytes
             .len()
             .checked_sub(4)
@@ -1496,6 +1544,37 @@ impl ArenaPageStore {
         // remember its range after it is consumed so a restored page can be checked against it.
         // Named in this row's summary rather than left to be discovered.
         let claim_epoch = extents.keys().map(|a| (*a, crate::cluster::epoch())).collect();
+        Ok(ParsedState {
+            next_start,
+            next_arena,
+            live,
+            reserved,
+            free_extents,
+            extents,
+            recycled,
+            current,
+            pending,
+            claim_epoch,
+            in_image_order,
+        })
+    }
+
+    /// Everything [`Self::load_state`] does from its first effect to its last, under the `persist`
+    /// its caller holds (D232 review 5 F4). It cannot fail, so nothing leaves a map half installed.
+    fn install_locked(&self, persist: &mut PersistState, parsed: ParsedState) {
+        let ParsedState {
+            next_start,
+            next_arena,
+            live,
+            reserved,
+            free_extents,
+            extents,
+            recycled,
+            current,
+            pending,
+            claim_epoch,
+            in_image_order,
+        } = parsed;
         // **D81 — a map that came from somewhere else is a file this process did not write.**
         //
         // Taken before the `state` lock, per the outermost-persist rule in [`PersistState`].
@@ -1510,16 +1589,16 @@ impl ArenaPageStore {
         // outside: `image_bytes == 0` iff this process has not written the image, so the next
         // persist is a full rewrite and the file is ours again.
         //
-        // **D232 review 4 B3.1 (D263 review 1 F1): and HELD until this function returns.** It was
-        // a temporary, released at once, and everything below ran without it. A claim that took
-        // `persist` in between could reserve from the free list or watermark this call replaces
-        // and insert into whichever map was live, so two extents covered one range, and its own
-        // rewrite made that durable. A free could remove an extent from the replaced map and give
-        // its range to the installed free list. Held from here to the end, the whole install sits
-        // between two claims or frees. Everything above this line only parses `bytes`, so the
-        // O(image) checksum stays outside the hold. The order is a claim's: `persist`, then
-        // `state`, then `free_extents` and the grant counters.
-        let mut persist = self.persist.lock().unwrap();
+        // **D232 review 4 B3.1 (D263 review 1 F1): and HELD for the whole install**, which this
+        // function's `&mut PersistState` now guarantees (review 5 F4). It used to be a temporary,
+        // released at once, and everything below ran without it. A claim that took `persist` in
+        // between could reserve from the free list or watermark this call replaces and insert into
+        // whichever map was live, so two extents covered one range, and its own rewrite made that
+        // durable. A free could remove an extent from the replaced map and give its range to the
+        // installed free list. Held for the whole install, it sits between two claims or frees.
+        // The durable half, the file an install writes, is inside the same hold only through
+        // [`Self::install_image`] (review 5 F1). The order is a claim's: `persist`, then `state`,
+        // then `free_extents` and the grant counters.
         persist.image_bytes = 0;
         let mut st = self.state.lock().unwrap();
         *st =
@@ -1558,9 +1637,6 @@ impl ArenaPageStore {
         // never returned to the leader — but it is re-stamped with the authority in force now, so
         // a later `join` still invalidates it.
         self.space.recycle_epoch.store(crate::cluster::epoch(), Ordering::SeqCst);
-        // Released only here: see B3.1 above.
-        drop(persist);
-        Ok(())
     }
 
     // ---- D81: the append-only tail ---------------------------------------------------------
@@ -2265,6 +2341,22 @@ impl ArenaPageStore {
         store.checkpoint_to(path.to_path_buf());
         Ok(store)
     }
+}
+
+/// **D232 review 5 F4.** An arena image parsed and checked but not yet installed: what
+/// [`ArenaPageStore::parse_state`] hands [`ArenaPageStore::install_locked`].
+struct ParsedState {
+    next_start: u32,
+    next_arena: u32,
+    live: u32,
+    reserved: u32,
+    free_extents: HashMap<u32, Vec<PageId>>,
+    extents: HashMap<ArenaId, ArenaExtent>,
+    recycled: HashMap<ArenaId, Vec<PageId>>,
+    current: HashMap<BranchId, ArenaId>,
+    pending: Vec<PendingFree>,
+    claim_epoch: HashMap<ArenaId, u64>,
+    in_image_order: Vec<ArenaId>,
 }
 
 struct StateCursor<'a> {
@@ -5893,5 +5985,72 @@ mod tests {
             from_good.state_bytes(),
             "D232 review 4 B2: a store loaded from the short image writes a different image"
         );
+    }
+
+    /// **D232 review 5 F1/F4: an install writes the arena file only while it holds `persist`.**
+    /// Written outside the hold, a claim or free landing between the write and the load persisted
+    /// the pre-install map over the installed file. The `FileOps` here records, at the moment of
+    /// the write, whether `persist` is held: this test runs on one thread, so `try_lock` answering
+    /// `WouldBlock` means the install itself holds it.
+    #[test]
+    fn d232_an_install_writes_the_arena_file_only_under_persist() {
+        use crate::storage::atomic_file::{FileOps, OsFileOps};
+        use std::cell::Cell;
+        use std::path::Path;
+        struct HeldAtWrite<'a> {
+            store: &'a ArenaPageStore,
+            held: Cell<Option<bool>>,
+        }
+        impl FileOps for HeldAtWrite<'_> {
+            fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+                let held = matches!(
+                    self.store.persist.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                self.held.set(Some(held));
+                OsFileOps.write(path, bytes)
+            }
+            fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+                OsFileOps.append(path, bytes)
+            }
+            fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+                OsFileOps.sync_file(path)
+            }
+            fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                OsFileOps.rename(from, to)
+            }
+            fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+                OsFileOps.sync_dir(dir)
+            }
+        }
+
+        let h = Harness::new();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let image = h.store.state_bytes();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-install-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let target = h.fresh_store();
+        let ops = HeldAtWrite { store: &target, held: Cell::new(None) };
+        target.install_image_with(&ops, &path, &image).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            image,
+            "fixture: the install did not write the image"
+        );
+        assert_eq!(
+            target.extent_range(a),
+            h.store.extent_range(a),
+            "fixture: the install did not load the image"
+        );
+        assert_eq!(
+            ops.held.get(),
+            Some(true),
+            "D232 review 5 F1: the install wrote the arena file while persist was free, so a claim \
+             or free could persist the pre-install map over it"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
