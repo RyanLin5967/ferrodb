@@ -6,6 +6,9 @@ Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR]
 For each mutant: restore the tree, apply one exact replacement (refused unless the pattern matches
 exactly once), run the named cargo test targets, and record KILLED when every expected test is
 reported FAILED, SURVIVED otherwise. A mutant marked expect=SURVIVE is a stated blind spot.
+A CONTROL run of every target on the unmutated tip comes first: a test failing there is never
+credited to a mutant, and a verdict is VOID when its target failed to compile, timed out, ran no
+test, or exited nonzero with no FAILED test.
 
 Raw cargo output goes to bench/d216/raw/<mutant>.txt beside this script, and one summary line per
 mutant to bench/d216/raw/summary.txt. Commit them by explicit path BEFORE reading them.
@@ -16,6 +19,7 @@ path already exists, rather than reusing somebody else's tree.
 """
 import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -28,6 +32,11 @@ TIMEOUT = 3600  # seconds per cargo invocation
 LIB = ("--lib", "wal::")
 D227 = ("--test", "d227_restart_keeps_declarations")
 D234 = ("--test", "d234_declared_runs_reach_the_log")
+HISTORY = ("--test", "d234_decoder_history_still_collapses")
+PGSERVER = ("--test", "pgserver_crash_rebuilds_indexes")
+# Not a cargo-test argument list: `cargo build --examples`, for targets that spawn example binaries
+# (the staleness guard refuses a binary older than src/).
+BUILD_EXAMPLES = ("BUILD_EXAMPLES",)
 
 R = "wal::recovery::tests::"
 T = "wal::txn::tests::"
@@ -95,7 +104,7 @@ MUTANTS = [
      [LIB], [], "SURVIVE"),
     ("M13_pgserver_declares_no_runs", "examples/pgserver.rs",
      "    txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!(\"pgserver: {e}\"));\n", "",
-     [LIB], [], "SURVIVE"),
+     [BUILD_EXAMPLES, PGSERVER], [], "SURVIVE"),
     ("M14_unconditional_replay", "src/wal/txn.rs",
      "        if truncation == Truncation::Truncated {\n", "        if true {\n",
      [LIB, D234], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing",
@@ -107,13 +116,77 @@ MUTANTS = [
     ("M16_open_ignores_declarations", "src/wal/recovery.rs",
      "    if rebuild || holds_records || declares {\n", "    if rebuild || holds_records {\n",
      [LIB], [R + "an_open_over_an_empty_log_still_declares_every_table"], "KILL"),
+    # The D234 adversary's F1: each half of the replay held to the rule on its own.
+    ("M17_unconditional_schema_replay", "src/wal/txn.rs",
+     "        if truncation == Truncation::Truncated {\n",
+     "        self.replay_schema()?;\n        if truncation == Truncation::Truncated {\n",
+     [LIB], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing"], "KILL"),
+    ("M18_unconditional_run_replay", "src/wal/txn.rs",
+     "        if truncation == Truncation::Truncated {\n",
+     "        self.replay_runs()?;\n        if truncation == Truncation::Truncated {\n",
+     [LIB, D234], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing",
+                   "a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
+    # The D234 adversary's F7: the decoder's history collapse, whose natural trigger D234 removed.
+    ("M19_history_never_collapses", "src/replication/logical.rs",
+     "        if drop.is_empty() {\n            return;\n        }\n",
+     "        if true {\n            return;\n        }\n",
+     [HISTORY], ["identical_declarations_under_a_held_pin_do_not_grow_the_decoders_history"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
+RESULT_LINE = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
 
 
 def git(*args, cwd=None, check=True):
     return subprocess.run(["git", *args], cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def run(cmd, env):
+    """Run `cmd` in the throwaway tree in its own process group; on timeout kill the whole group, so
+    no test binary or spawned ferrodb outlives it. Returns (rc, output)."""
+    p = subprocess.Popen(cmd, cwd=TREE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=TIMEOUT)
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        out, _ = p.communicate()
+        return 124, (out or "") + "\n<TIMEOUT: process group killed>"
+
+
+def run_targets(targets, env):
+    """Run each target. Returns (log, failed test names, problems): a problem is a nonzero exit with
+    no FAILED test to account for it, a compile error, a timeout, or a target that ran no test."""
+    log, failed, problems = [], set(), []
+    for target in targets:
+        if target == BUILD_EXAMPLES:
+            cmd = ["cargo", "build", "--examples"]
+        else:
+            cmd = ["cargo", "test", *target]
+        rc, out = run(cmd, env)
+        log.append(f"$ {' '.join(cmd)}\nrc={rc}\n{out}")
+        mine = set()
+        ran = 0
+        for line in out.splitlines():
+            line = line.strip()
+            m = FAILED_LINE.match(line)
+            if m:
+                mine.add(m.group(1))
+            r = RESULT_LINE.match(line)
+            if r:
+                ran += int(r.group(1)) + int(r.group(2))
+        failed |= mine
+        label = " ".join(target)
+        if "error[E" in out or "could not compile" in out:
+            problems.append(f"{label}: COMPILE-ERROR")
+        elif rc == 124:
+            problems.append(f"{label}: TIMEOUT")
+        elif target != BUILD_EXAMPLES and ran == 0:
+            problems.append(f"{label}: RAN-NOTHING")
+        elif rc != 0 and not mine:
+            problems.append(f"{label}: rc={rc} with no FAILED test")
+    return log, failed, problems
 
 
 def main():
@@ -129,9 +202,22 @@ def main():
     git("worktree", "add", "--detach", TREE, tip, cwd=REPO)
     summary = []
     try:
+        # CONTROL: every target the mutants use, on the unmutated tip. A test that already fails here
+        # cannot be credited to a mutant, and a target that cannot run makes every verdict on it void.
+        all_targets = []
+        for m in MUTANTS:
+            for t in m[4]:
+                if t not in all_targets:
+                    all_targets.append(t)
+        log, control_failed, control_problems = run_targets(all_targets, env)
+        open(os.path.join(OUT, "CONTROL.txt"), "w").write("\n".join(log))
+        summary.append(f"CONTROL failed={sorted(control_failed)} problems={control_problems}")
+        if control_problems or control_failed:
+            summary.append("CONTROL is not clean: every verdict below is VOID until it is")
+
         for name, path, old, new, targets, expected, expect in MUTANTS:
             git("checkout", "--", ".", cwd=TREE)
-            if git("status", "--porcelain", cwd=TREE).stdout.strip():
+            if git("status", "--porcelain", "--untracked-files=no", cwd=TREE).stdout.strip():
                 raise SystemExit(f"{name}: the throwaway tree is not clean before applying it")
             full = os.path.join(TREE, path)
             text = open(full).read()
@@ -140,33 +226,22 @@ def main():
                 summary.append(f"{name} PATTERN-MISMATCH ({count} matches) expect={expect}")
                 continue
             open(full, "w").write(text.replace(old, new))
-            failed, log = set(), []
-            for target in targets:
-                cmd = ["cargo", "test", *target]
-                try:
-                    r = subprocess.run(cmd, cwd=TREE, env=env, capture_output=True, text=True, timeout=TIMEOUT)
-                    out, rc = r.stdout + r.stderr, r.returncode
-                except subprocess.TimeoutExpired as e:
-                    def text_of(x):
-                        return x.decode(errors="replace") if isinstance(x, bytes) else (x or "")
-                    out, rc = text_of(e.stdout) + text_of(e.stderr), 124
-                log.append(f"$ {' '.join(cmd)}\nrc={rc}\n{out}")
-                for line in out.splitlines():
-                    m = FAILED_LINE.match(line.strip())
-                    if m:
-                        failed.add(m.group(1))
-                if "error[E" in out or "could not compile" in out:
-                    failed.add("<COMPILE-ERROR>")
+            log, failed, problems = run_targets(targets, env)
             open(os.path.join(OUT, f"{name}.txt"), "w").write("\n".join(log))
-            if "<COMPILE-ERROR>" in failed:
-                verdict = "COMPILE-ERROR"
+            credited = failed - control_failed
+            extra = sorted(credited - set(expected))
+            if problems:
+                verdict = f"VOID ({problems})"
             elif expected:
-                missing = [t for t in expected if t not in failed]
+                missing = [t for t in expected if t not in credited]
                 verdict = "KILLED" if not missing else f"SURVIVED (not failed: {missing})"
             else:
-                verdict = "SURVIVED" if not failed else f"KILLED-UNEXPECTEDLY ({sorted(failed)})"
+                verdict = "SURVIVED" if not credited else "KILLED-UNEXPECTEDLY"
+            if extra:
+                verdict += f" (also failed: {extra})"
             summary.append(f"{name} {verdict} expect={expect}")
     finally:
+        git("checkout", "--", ".", cwd=TREE, check=False)
         git("worktree", "remove", "--force", TREE, cwd=REPO, check=False)
         open(os.path.join(OUT, "summary.txt"), "w").write("\n".join(summary) + "\n")
     print("\n".join(summary))
