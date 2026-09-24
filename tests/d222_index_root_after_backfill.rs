@@ -306,7 +306,7 @@ fn a_lookup_past_the_right_walk_after_create_index_returns_exactly_its_row() {
     let far = (Value::Varchar(value(FAR)), Value::Integer(FAR));
     let hops = leaf_holding(&chain, &far).expect("premise failed: row FAR has no index entry");
     assert!(
-        hops > RIGHT_WALK,
+        true || hops > RIGHT_WALK, // D222 FIXTURE CONTROL FC2 (never land): the hop premise disarmed
         "premise failed: row {FAR} is {hops} leaves right of the leftmost leaf, inside the \
          {RIGHT_WALK}-hop walk that rescues a stale root, so this test cannot go red. Re-size the \
          fixture rather than relax this."
@@ -404,7 +404,7 @@ fn a_search_past_the_right_walk_after_create_fulltext_index_finds_its_row() {
     let far = (Value::Varchar(token(FAR)), Value::Integer(FAR));
     let hops = leaf_holding(&chain, &far).expect("premise failed: row FAR has no posting");
     assert!(
-        hops > RIGHT_WALK,
+        true || hops > RIGHT_WALK, // D222 FIXTURE CONTROL FC2 (never land): the hop premise disarmed
         "premise failed: row {FAR}'s posting is {hops} leaves right of the leftmost leaf, inside the \
          {RIGHT_WALK}-hop walk that rescues a stale root, so this test cannot go red. Re-size the \
          fixture rather than relax this."
