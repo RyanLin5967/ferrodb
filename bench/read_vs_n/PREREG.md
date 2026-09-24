@@ -1296,3 +1296,42 @@ loose `H6` cell pattern, Y3's grading names) belongs to its maintainer.**
    * With `counted < 2` the summary prints "L2: not judged (fewer than two counted rows)."
    * `counted == 0` keeps A16.8's "no row was counted."
 9. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
+
+**A19, 2026-09-24, before any build or run. D239's floor read gets its own timer (relayed by lane `d209-open-sweep` at
+the lead's request; its report is artie-research `frontier/lane_d239_floor_before_recovery.md`, §2 and §9).**
+
+1. **The change coming in.** D239 lands as `d239-on-16` @ `c4efffb`, on #16 @ `ed6e901`, after #16. It adds one call,
+   `ArenaPageStore::reserve_persisted_floor`, inside `wal::recovery::open_recovered`, between `DiskManager::new` and
+   `BufferPoolManager::new`, before `recover`.
+   * The call reads the whole `{db}.arena` image and checks its CRC32. That is O(arena extents), about 48 B each.
+   * The arena store's reopen repeats the same read after the open returns.
+   * On this lane it would fall inside `boot.files`, which R7 lists as a flat step. So `files` would silently carry
+     an O(N) read.
+2. **At this tree the call does not exist.** The lane now adds:
+   * `BootTimings::floor`, a `Duration`, zero at this tree;
+   * the child prints `floor_us=` after `files_us=` on its `RESTART_RESULT` line;
+   * the RESTART row prints `floor ms` next to `files ms`.
+3. **The merge resolution, pre-registered for whoever merges D239 into this lane.** Time the call exactly as variant P
+   does (`7be2904`, which is D239 built on this lane's `38d97a2`):
+   * `let floor = Instant::now();` before the `.arena` path is built;
+   * `timings.floor = floor.elapsed();` right after `reserve_persisted_floor(..)?`;
+   * `timings.files = t.elapsed().saturating_sub(timings.floor);`.
+4. **Pre-registered values.**
+   * At this tree: `floor_us = 0` in every RESTART row.
+   * At a tree containing the D239 call: `floor_us > 0` in every RESTART row. Every child opens a database whose
+     `.arena` image the parent's close wrote, and a whole-file read plus a CRC does not finish in under 1 µs
+     (INFERRED). A row with `floor_us = 0` there means the timer was not wired at the merge. That is a finding, and it
+     means arm 3's `files` cannot be read as flat.
+   * `floor` is REPORTED, like every arm-3 time since A16.4. It is expected to be linear in the arena image's bytes,
+     which the RESTART row does not print.
+5. **#16 @ `ed6e901`, which D239 sits on, keeps this lane's merge-arm premises (READ, `git show ed6e901:src/wal/txn.rs`,
+   `checkpoint_or_keep_held`).**
+   * A checkpoint that TRUNCATES still resets the commit counter and then replays schema and runs. So A12.1's
+     `replay_bytes` and M6 hold.
+   * A checkpoint KEPT FOR OWED releases returns before truncating and before resetting the counter. So the
+     `checkpointed` flag is false and the base does not move: M6 agrees.
+   * A checkpoint kept by a PIN resets the counter and leaves the base where it was, which is still A10.2's
+     disagreement. So `pinned-checkpoint` still fires M6. It now replays nothing, which is D234's fix, and the CKPT
+     lines still print `replay_bytes=-`.
+   * Owed releases do not arise in this workload (INFERRED: nothing here fails a release).
+6. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
