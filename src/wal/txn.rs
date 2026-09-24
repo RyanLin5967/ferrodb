@@ -229,6 +229,15 @@ pub fn txn_end_failures() -> u64 {
     TXN_END_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Rollbacks whose `TxnEnd` record could not be written after their undo walk had finished, since
+/// process start (review 8's F3, lane §21.20). The transaction ended anyway: see `TxnManager::abort`.
+pub static ABORT_TXN_END_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`ABORT_TXN_END_FAILURES`].
+pub fn abort_txn_end_failures() -> u64 {
+    ABORT_TXN_END_FAILURES.load(Ordering::Relaxed)
+}
+
 /// Mismatch lines written from a STORED observation, since process start (review 7's F4): a
 /// mismatch whose first quarantine write failed, recorded later by a retry that could not read the
 /// page. Its release stays owed, so it is not in [`RELEASE_MISMATCHES`], which counts a mismatch when
@@ -298,6 +307,7 @@ pub fn failure_counters_line() -> Option<String> {
         ("release mismatches", release_mismatches()),
         ("mismatches recorded from a stored observation", stored_mismatch_lines()),
         ("commits whose TxnEnd could not be written", txn_end_failures()),
+        ("rollbacks whose TxnEnd could not be written", abort_txn_end_failures()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
         ("drops that kept the log", kept_log_drops()),
@@ -918,7 +928,11 @@ impl TxnManager {
         // life of the process, MERGE's publish and autocommit read "not committed", and a ROLLBACK
         // appended an `Abort` after the durable `Commit` and undid a committed transaction. The
         // append runs FIRST because `append_chained` looks the transaction up in `att`. Latent
-        // today: `append` does no I/O, and the poison's one caller is a `Commit` flush that failed.
+        // today, on three premises (review 7 §8; review 8's F4): `append` does no I/O; the poison's
+        // one caller is a `Commit` flush that failed, and this transaction's flush succeeded; and
+        // commits are serialised (the PRECONDITION on `undo_primary_writes`), so no other commit's
+        // failed flush can poison the log between this flush and this append. This path is what
+        // keeps the answer right the day any of the three stops holding.
         let ended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
@@ -1096,7 +1110,17 @@ impl TxnManager {
             }
             lsn = rec.prev_lsn;
         }
-        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        // **Review 8's F3 (lane §21.20, the lead's decision): once the undo walk has finished, the
+        // transaction ends whether or not its `TxnEnd` can be written**, the shape of `commit` and
+        // `end_read_only`. Every undo is on its page and logged as a CLR, so the rollback HAS
+        // happened: recovery's undo of a loser whose undos are all CLRs follows their `undo_next` to
+        // the `Begin` and changes nothing, and the `Abort` above already told every log reader. With
+        // `?` here, a failed append answered `Err` for a finished rollback and left the id `Aborting`
+        // in `att`. The executor's ROLLBACK could retry, but autocommit's
+        // `roll_back_failed_statement`, MERGE's publish and `apply_dml` never do, so every checkpoint
+        // and DDL was refused until a reopen, silently. The append runs FIRST because
+        // `append_chained` looks the transaction up in `att`. Latent for `commit`'s reasons.
+        let ended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att_write().remove(&txn_id);
         // D213: every slot this transaction retired has been restored by the undo above, so there
         // is nothing left to release.
@@ -1105,6 +1129,15 @@ impl TxnManager {
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
         self.run_bindings.lock().unwrap().remove(&txn_id);
+        if let Err(e) = ended {
+            use std::io::Write;
+            ABORT_TXN_END_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: transaction {txn_id} rolled back, but its TxnEnd record could not be written ({e}); it has \
+                 ended anyway, and every undo it made is already logged"
+            );
+        }
         Ok(())
     }
 
@@ -3627,6 +3660,7 @@ use super::*;
         // The abort appends `Abort`, a CLR for the delete, a CLR for the insert, then `TxnEnd`: the
         // fourth fails.
         wal.fail_next_append.store(4, Ordering::SeqCst);
+        let failures = abort_txn_end_failures();
         txn.abort(t2).unwrap_or_else(|e| panic!("a rollback whose undo walk finished was reported as failed: {e}"));
         assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the countdown was not consumed");
         let mine: Vec<RecKind> = walk_log(&wal).into_iter().filter(|r| r.txn_id == t2).map(|r| r.kind).collect();
@@ -3638,6 +3672,9 @@ use super::*;
             0,
             "premise: a TxnEnd was written, so the injected failure hit another append"
         );
+        // Added with the fix (lane §21.20): the counter does not exist at the red commit's base. Only
+        // this test moves it.
+        assert_eq!(abort_txn_end_failures(), failures + 1, "the failed TxnEnd was not counted exactly once");
         assert_eq!(heap.read(a).unwrap().data, vec![7; 40], "premise: the rolled-back delete was not undone");
         assert!(heap.read(b).is_err(), "premise: the rolled-back insert was not undone");
         assert!(

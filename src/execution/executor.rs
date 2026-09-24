@@ -202,9 +202,12 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
         // room, then left the transaction open in the ATT and forgotten by the only session that could
         // finish it: its rows held, every checkpoint refused, and no ROLLBACK able to reach it.
         //
-        // Once `commit` has written `TxnEnd` it answers `Ok`, whatever the automatic checkpoint after
-        // it does (review 2's C4, fixed in `TxnManager::commit` rather than here), so an `Err` from
-        // either call means the transaction is still open.
+        // `commit` answers `Ok` once its `Commit` is durable, whether or not its `TxnEnd` could be
+        // written (lane §21.18) and whatever the automatic checkpoint after it does (review 2's C4).
+        // `abort` answers `Ok` once its undo walk has finished, whether or not its `TxnEnd` could be
+        // written (review 8's F3). Both are fixed in `TxnManager`, not here. So an `Err` from either
+        // call means the transaction is still open: for a `Commit` whose flush failed, undecided on a
+        // poisoned log that refuses everything until a reopen (review 8's F4).
         Stmt::Commit => match session.current {
             Some(id) => {
                 txn.commit(id)?;
