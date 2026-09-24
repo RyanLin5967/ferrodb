@@ -11,6 +11,7 @@
 //! | `a_runtime_attached_to_one_database_refuses_another_databases_history` | 4: the door hands the runtime its database's store | `attach_history` skips the same-store check |
 //! | `a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids` | 1: the runtime reads history only through store ∪ queue | `HistoryStore::records` returns the durable window only |
 //! | `a_fresh_log_moves_the_old_history_aside` | 10: a fresh log is a new database, and the history goes aside | `WalManager::with_storage` skips the history move |
+//! | `another_databases_history_is_refused_at_open` | 10a: the store's incarnation, checked at open against the one the log declares | `recover` skips the incarnation check |
 //!
 //! A "crash" here drops every handle with no checkpoint, so the history queued in memory is lost
 //! and the log is its only copy.
@@ -263,4 +264,38 @@ fn a_fresh_log_moves_the_old_history_aside() {
         .map(|p| std::fs::read(p).unwrap())
         .collect();
     assert_eq!(aside, vec![old], "the earlier history was not moved aside whole");
+}
+
+/// **Item 10a.** A store carries its database's incarnation, and the log declares it after every
+/// truncation; an open whose store names another incarnation is REFUSED, so a REVERT history copied
+/// in from another database is never read as this one's. The log is not fresh here, so item 10b's
+/// move does not apply: this is the case only the check catches.
+///
+/// RED before item 10a's code: nothing ties a store to its log, and the open succeeds.
+#[test]
+fn another_databases_history_is_refused_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let history_of = |db: &Path| {
+        let mut p = db.as_os_str().to_os_string();
+        p.push(".history");
+        PathBuf::from(p)
+    };
+    let mut written = Vec::new();
+    for name in ["reach10a_a.db", "reach10a_b.db"] {
+        let path = dir.path().join(name);
+        let mut db = Db::open(&path);
+        db.seed(&[(1, 10)]);
+        let _ = db.task("a", "UPDATE inventory SET qty = 11 WHERE id = 1;");
+        db.o.txn.checkpoint().unwrap();
+        drop(db);
+        written.push(std::fs::read(history_of(&path)).expect("premise: the checkpoint wrote the store"));
+    }
+    assert_ne!(written[0], written[1], "premise: the two databases' histories differ");
+
+    let a = dir.path().join("reach10a_a.db");
+    std::fs::write(history_of(&a), &written[1]).unwrap();
+    match Db::try_open(&a) {
+        Ok(_) => panic!("an open read another database's REVERT history as its own"),
+        Err(e) => assert!(e.to_string().contains("incarnation"), "refused, but not for the incarnation: {e}"),
+    }
 }
