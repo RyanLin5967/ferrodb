@@ -780,3 +780,116 @@ Residuals, stated:
 - The lib filter, extended by one name:
   `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now the_first_start_key_is_its_own_group`
   → **44** (33 + 5 + 3 + 1 + 1 + 1).
+
+## Amendment 11 — the soft mark (lead's decision after review 3: "the soft mark is yours to take"). Written before its fix.
+
+The lead ruled that `b5bf3a3` is this lane's own unlanded test, not a test on `main`, so the ⚖7 of
+amendment 10 is the lead's decision, not Ryan's. The decision: write the soft mark, then rebuild the
+fixtures honestly. Nothing here has been run (quiet mode).
+
+### Committed so far, with predictions
+
+| commit | test | at that commit (`bf15efb` source) | after the fix | kills |
+|---|---|---|---|---|
+| `960cc02` | `f1_lease_grace::an_unmarked_writer_whose_lease_clock_lagged_keeps_its_leases_across_the_next_start` (review 3's E1) | **FAIL**: a fresh catalog records no `[0x09]`, so the credit is the file's 10 s and a lease with 840 s left is expired ("…blind to the 7200000 ms that clock lagged…") | PASS: credit `now − s ≈ S + 10 s`, the lease keeps `840 s − (s − t)` | M51, M52 |
+| `960cc02` | `f1_lease_grace::the_soft_mark_is_the_last_commit_of_an_unresumed_writer_not_its_first` | **FAIL**: credit 0 (the file's time is in the future), below `now − after_last >= 50` | PASS: credit `now − s_last`, within the bounds by program order | M50, M52 |
+
+### The fix that follows
+
+**The soft mark.** `[0x09]` becomes 16 bytes, `(mark, accrued)`, both BE `u64`:
+- `mark` is the writer's LEASE-clock reading at its commit.
+- `accrued` is the downtime owed before that writer opened the catalog.
+
+**Who writes it.** Every commit of an unmarked catalog writes it, riding `stage` with no extra fsync.
+It is not written:
+- once the catalog is marked;
+- once this process's resume or heartbeat has superseded it;
+- on a cluster member;
+- when the lease clock cannot be read.
+
+The migration writes `(L(now), age(source))` into the tmp catalog before the rename, as before. The
+first-commit-only rider of `bf15efb` is gone.
+
+**The credit.** For an unmarked catalog, from the evidence taken at open:
+
+    credit(now) = accrued + max( now − mark , file_age(file time, now) )
+
+- `now − mark` is 0 without a soft mark. It is the mark's own semantics: cross-process lease-clock
+  subtraction, which is exactly what a lease on the writer's clock is owed.
+- `file_age` is amendment 10's `max(W − m, L − m)`.
+- The file time is:
+  - own mtime (`Own`);
+  - with a soft mark present, own mtime; without one, `min(own, legacy)` (`OwnOrLegacy`);
+  - the source mtime (`Source`).
+- The migrating process ignores its own soft mark. It uses `(no soft, source)`, as `bf15efb` did.
+- **Why the file term stays in the `max`.** Every soft-mark write is a file write, so the file's age is
+  at most the wall time since the last soft mark. It can exceed the soft credit only by
+  `lag_new − lag_old`: an over-credit, in the accepted direction. And it keeps a pre-D198 catalog,
+  which has no soft mark, on amendment 10's rule.
+- **What this process's soft marks carry.** Their `accrued` is the credit evaluated at open, if the
+  catalog held a live lease then, and 0 otherwise. So the writer's own run is never credited.
+
+**E1 is closed** for every D198 writer that commits. The residual is the over-credit between its last
+commit and its death, the accepted direction, the same as a mark's.
+
+**`LeaseResume::FirstStartFromFileTime`** gains `writer_mark: Option<u64>`, and the report names it.
+
+**Cost (UNMEASURED).** Every commit of an unmarked catalog pays one extra upsert and one lease-clock
+read. A marked catalog pays nothing, and the binaries mark at their first start. `[0x09]` sorts after
+`[0x07]` (`HEADER`), which every fork rewrites, so it usually shares that leaf.
+
+### The fixtures rebuilt (a test change; why it is not a weakened assertion)
+
+With the soft mark, every catalog a D198 build creates carries `[0x09]`. Six of this lane's own
+unlanded tests use a D198-written catalog to stand for one that no D198 build wrote:
+- `b5bf3a3` `a_pre_d198_catalog_credits_the_downtime_since_its_file_was_last_written` and
+  `a_pre_d198_catalog_with_no_live_branch_does_not_move_the_offset`;
+- `f8d8225` `a_first_start_credits_the_files_wall_clock_age_even_when_the_lease_clock_lags_it` and
+  `the_first_start_evidence_survives_a_start_that_wrote_and_failed_before_resuming` (review 3's C4
+  scenario is a pre-D198 catalog followed by a failed D198 start);
+- `ba77cbd` `a_switchover_with_no_recorded_evidence_credits_from_the_earlier_file` and
+  `the_downtime_before_an_unresumed_writer_is_kept_and_its_own_run_is_not_credited` (its "last
+  authority before the writer" is placed on the wall clock, which a D198 writer's soft mark would
+  contradict).
+
+**The change.** Each fixture's writer ends with a new `#[cfg(test)]` helper,
+`TableBranchCatalog::as_written_before_d198`. It removes `[0x08]` and `[0x09]` and makes that durable
+WITHOUT `stage`, so no soft mark is rewritten. After the reopen, each test ASSERTS the absence of
+both keys as a premise, before anything else (new premise assertions; additions).
+
+**Why it is not weakened.**
+- Every existing assertion, and every expected value, is byte-identical.
+- The rebuild REMOVES state that made the fixture not what it names. It narrows what can pass: the
+  premise assertion fails on any fixture that still carries a D198 key.
+- Predicted: five of the six would PASS without the rebuild, through the `max` (the file term
+  dominates the soft mark's milliseconds). So the rebuild is not what turns them green.
+- The sixth, the C6 no-key test, would pass VACUOUSLY: with the fixture's soft mark present, the
+  legacy log is ignored, and M48 would survive it.
+- The soft-mark path is covered by the two new tests above, not by these.
+
+Unchanged, because their fixtures are honestly D198-written:
+- the backward-step pin;
+- the C4 migrated test and the C6 with-key test, which are D198 migrations. C6 with a key passes
+  through the own-mtime term of the `max`, since its mtime is aged 2 h;
+- the `D = 0` magic control and the crash-after-switch test.
+
+### New mutants
+
+| mutant | must fail |
+|---|---|
+| M50 the soft mark written only on a process's FIRST commit (`bf15efb`'s rider) | last-commit test (credit ≥ `now − before_last + 200`) |
+| M51 the soft mark ignored at open (file time only) | E1 test |
+| M52 no soft mark written by `stage` | E1 test, last-commit test |
+| M53 the soft mark's `accrued` written as 0 | C4 failed-start test (rebuilt), accrual test |
+| M54 the soft mark written on a MARKED catalog | `a_marked_catalog_writes_no_soft_mark` (added with the fix, green-only: it reads the new `soft_mark()`) |
+| M55 the heartbeat does not supersede the soft mark | the same test (the first `record_lease_alive` would write one) |
+| M56 `as_written_before_d198` commits through `stage` (the strip would rewrite a soft mark) | the premise assertions of the six rebuilt tests |
+| M57 `OwnOrLegacy` with a soft mark also takes the legacy's age (double counting) | **SURVIVES** (an over-credit; C6 with a key asserts survival only). Registered, replacing M49. |
+
+Amendment 10's M43/M44 are superseded by M50–M53: the rider they mutate no longer exists in that form.
+
+### Counts, per-target
+
+- `f1_lease_grace` → **36** (+2 at `960cc02`, +1 `a_marked_catalog_writes_no_soft_mark` with the fix).
+- **base + 53**.
+- The lib filter of amendment 10 → **47** (36 + 5 + 3 + 1 + 1 + 1).
