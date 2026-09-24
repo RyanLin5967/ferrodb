@@ -397,6 +397,38 @@ impl Fire {
         })
     }
 
+    /// What this mode must fire, and what the pre-registration allows beside it, by guard id
+    /// (A20.1). Exhaustive, with no `_` arm, so a new mode must declare both. The FIRECHECK line
+    /// prints them, and the verdict script cross-checks them against its own table.
+    fn expects(self) -> (&'static [&'static str], &'static [&'static str]) {
+        match self {
+            Fire::None => (&[], &[]),
+            Fire::WrongPage => (&["G2"], &[]),
+            Fire::CensusOff => (&["G3"], &[]),
+            Fire::ControlCatalog => (&["G4"], &[]),
+            Fire::ControlCold => (&["G5"], &["G7"]),
+            Fire::WrongHeight => (&["G6"], &[]),
+            Fire::ControlDrift => (&["G7"], &[]),
+            Fire::WrongArenas => (&["H2"], &[]),
+            Fire::WrongLive => (&["H3"], &[]),
+            Fire::MergeQuarantined => (&["M1"], &["M5", "G1"]),
+            Fire::WrongStart => (&["M2"], &[]),
+            Fire::WrongVisits => (&["M3"], &[]),
+            Fire::WrongDelta => (&["M4"], &[]),
+            Fire::WrongLiveMerge => (&["M5"], &[]),
+            Fire::WrongCkptFlag => (&["M6"], &[]),
+            Fire::ExtraBranch => (&["G1"], &[]),
+            Fire::ChildLocked => (&["H1"], &["ARM3"]),
+            Fire::ExtraExtent => (&["H2"], &[]),
+            Fire::OrphanExtent => (&["H4"], &[]),
+            Fire::NoClusterTime => (&["H5"], &[]),
+            Fire::PinnedCheckpoint => (&["M6"], &[]),
+            Fire::StaleMarker => (&["H6"], &["ARM3"]),
+            // A JUDGE fire: no guard; its own FIRECHECK line names what may print (A20.3).
+            Fire::CkptDdl => (&[], &[]),
+        }
+    }
+
     /// Why this mode cannot run with these arms, if it cannot. A refusal, not a warning: each case
     /// would otherwise end in "every guard held" having tested nothing (A9.2, A11.4, A12.3).
     fn refusal(self, arms: Option<Arms>) -> Option<String> {
@@ -2669,7 +2701,14 @@ fn read_vs_n_summary(
              truncated to re-append it); PARENT_PASS and a failed close = findings; any other = a finding."
         );
     } else if fire != Fire::None {
-        println!("FIRECHECK {fire:?}: exactly the guard this mode breaks must appear below, and no other.");
+        // A20.1: what must fire and what is allowed beside it, by id, from `Fire::expects`.
+        let (must, may) = fire.expects();
+        println!(
+            "FIRECHECK {fire:?}: must appear below: {}; allowed extras (PREREG): {}; any other is a finding \
+             (A20.1).",
+            must.join(", "),
+            if may.is_empty() { "none".to_string() } else { may.join(", ") }
+        );
     }
     if failures.is_empty() && ns_void.is_empty() {
         println!("GUARDS: every guard held. The counters and the ns columns stand as printed.");
