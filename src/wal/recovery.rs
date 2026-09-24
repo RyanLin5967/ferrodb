@@ -1,5 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
+use crate::branch::arena::ArenaPageStore;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
@@ -400,7 +401,8 @@ pub struct OpenedDatabase {
 /// out for itself (`tests/open_path_allowlist.rs` enforces that).
 ///
 /// The order is the whole content:
-/// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL;
+/// 1. open the file, register the arena region a previous session persisted (D239), and open the
+///    buffer pool, the WAL and the transaction manager, and attach the WAL;
 /// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
 /// 3. open the catalog, or create it for a new file;
 /// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
@@ -442,7 +444,16 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         .create(true)
         .open(db_path)
         .map_err(|e| FerroError::Io(format!("open {}: {e}", db_path.display())))?;
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file)?)));
+    let dm = Arc::new(DiskManager::new(file)?);
+    // **D239: the arena region is reserved BEFORE recovery.** The arena store attaches only after
+    // this returns, and until a region is registered every arena page reads as free to the page
+    // allocator, because arena pages never set bitmap bits. Recovery's directory repair and the
+    // rebuild below both allocate, and a rebuild that outgrew a full table region was handed arena
+    // pages and wrote over live branch data. See `ArenaPageStore::reserve_persisted_floor`.
+    let mut arena_path = db_path.as_os_str().to_os_string();
+    arena_path.push(".arena");
+    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
+    let bp = Arc::new(BufferPoolManager::new(dm));
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push(".wal");
     let wal = Arc::new(WalManager::new(PathBuf::from(wal_path))?);
