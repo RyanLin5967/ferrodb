@@ -584,3 +584,77 @@ fn a_reap_through_an_attached_reaper_is_attested_too() {
     );
     runtime.verify_attested_branch(branch).expect("the chain must verify");
 }
+
+/// ⛔ **WALL #19 (D192), WRITTEN TO FAIL FIRST: a reaped branch keeps its proofs and loses its
+/// head.**
+///
+/// `AttestedHistory` kept a head, and an index of every entry position, for every branch it had
+/// ever seen, so its per-branch part grew with branches ever forked rather than with branches
+/// alive. The fix drops a branch's head when its reap entry is appended. This drives that through
+/// the production lifecycle, and checks first the half that must NOT change: every entry still
+/// proves, every walk still completes, and a head published early still proves the log only grew.
+///
+/// Hand-worked expectations. The log in append order (a merge attests before its seal reaps):
+/// `Fork a, Merge 1, Reap a, Fork b, Merge 2, Reap b, Fork c, Reap c, Fork d`, which is 9 entries.
+/// Walks: a = Reap, Fork (forked before trunk had a head) = 2; b = Reap, Fork, Merge 1 = 3;
+/// c = Reap, Fork, Merge 2, Merge 1 = 4; d = Fork, Merge 2, Merge 1 = 3; trunk = 2.
+///
+/// The head check is LAST, so the unfixed code fails there and its panic line proves that every
+/// assertion above it passed on the same log.
+#[test]
+fn a_reaped_branch_keeps_its_proofs_and_loses_its_head() {
+    let mut db = Db::new();
+    db.seed();
+
+    let a = db.agent_writes_and_merges("agent-a", 1, 111);
+    let early = db.runtime.attestation_head();
+    let b = db.agent_writes_and_merges("agent-b", 2, 222);
+
+    let mut sc = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-c' RUN 'r_c';", &mut sc);
+    let c = sc.agent.as_ref().unwrap().branch;
+    db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut sc);
+    db.runtime.abandon(c).unwrap();
+
+    let mut sd = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-d' RUN 'r_d';", &mut sd);
+    let d = sd.agent.as_ref().unwrap().branch;
+
+    assert_eq!(early.size, 3, "one merged lifecycle is three entries");
+    assert_eq!(db.runtime.attested_len(), 9, "the log must keep every event");
+    for x in [a, b, c] {
+        assert_eq!(ops_of(&db.runtime, x), vec![BranchOp::Fork, BranchOp::Reap], "reaped {x}");
+    }
+    assert_eq!(ops_of(&db.runtime, d), vec![BranchOp::Fork], "live d");
+
+    let head = db.runtime.attestation_head();
+    let log = db.runtime.attested_log();
+    for (index, entry) in log.iter().enumerate() {
+        let proof = db.runtime.attested_inclusion_proof(index).expect("a proof for every entry");
+        assert!(verify_inclusion(entry, &proof, &head), "entry {index} lost its inclusion proof");
+    }
+    let cp = db.runtime.attested_consistency_proof(early.size).expect("early size is in the log");
+    assert!(
+        verify_consistency(&early, &head, &cp),
+        "a head published after the first lifecycle lost its consistency proof"
+    );
+
+    let walks: Vec<usize> = [a, b, c, d, BranchId::TRUNK]
+        .iter()
+        .map(|&x| db.runtime.verify_attested_branch(x).expect("an honest log's walk"))
+        .collect();
+    assert_eq!(walks, vec![2, 3, 4, 3, 2], "ancestry walks of a, b, c, d and trunk");
+
+    let trunk_last = *db.runtime.attested_entries(BranchId::TRUNK).last().unwrap();
+    assert_eq!(
+        db.runtime.attestation_of(BranchId::TRUNK),
+        Some(trunk_last.attestation()),
+        "trunk's head is not its last merge"
+    );
+    let d_fork = db.runtime.attested_entries(d)[0];
+    assert_eq!(db.runtime.attestation_of(d), Some(d_fork.attestation()), "live d lost its head");
+
+    // THE BOUND, last.
+    let reaped_heads: Vec<_> = [a, b, c].iter().map(|&x| db.runtime.attestation_of(x)).collect();
+    assert_eq!(reaped_heads, vec![None, None, None], "a reaped branch still holds a head");
+}

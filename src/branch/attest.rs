@@ -1153,6 +1153,18 @@ impl AttestedHistory {
         let k = largest_power_of_two_below(n);
         node_hash(&self.mth_range(lo, lo + k), &self.mth_range(lo + k, hi))
     }
+
+    /// Wall #19's instrument: every element held in a collection keyed by branch — the map
+    /// entries, plus anything nested under them. An element count, never bytes.
+    ///
+    /// The destructuring is exhaustive on purpose: a field added to [`AttestedHistory`] is a
+    /// compile error here until someone decides whether it is keyed by branch, so the pin that
+    /// reads this cannot silently stop seeing a new per-branch collection.
+    #[cfg(test)]
+    fn per_branch_elements(&self) -> usize {
+        let AttestedHistory { entries: _, by_branch, heads, levels: _ } = self;
+        by_branch.len() + by_branch.values().map(Vec::len).sum::<usize>() + heads.len()
+    }
 }
 
 /// The largest power of two **strictly** less than `n`, for `n >= 2`. RFC 6962's `k`.
@@ -1883,6 +1895,103 @@ mod tests {
                 assert_eq!(prev, Attestation([0x33; 32]));
             }
             other => panic!("expected a DanglingLink naming the real value, got {other:?}"),
+        }
+    }
+
+    /// ⛔ **WALL #19 (D192), WRITTEN TO FAIL FIRST.** After N reaped branches the per-branch index
+    /// must hold only the branches that can still be written to, while the log keeps every entry
+    /// and every proof.
+    ///
+    /// The shape is the production lifecycle `integration_branch_attestation` pins: a fork from
+    /// trunk, a merge entry on trunk, a reap entry on the worker. `L` branches are forked first and
+    /// never reaped, so the bound is `1 + L` (trunk plus the live ones), not zero.
+    ///
+    /// Every expected value is worked by hand from the structure, never read back from it:
+    /// * log entries: `L + 3N`, one per fork, merge and reap. The log is the contract, and nothing
+    ///   here asks it to shrink.
+    /// * `verify_branch` steps for worker `i` (1-based): its Reap, its Fork, trunk's merges
+    ///   `i-1 .. 1`, then genesis, so `i + 1`. Trunk: `N`. A live branch forked before trunk had a
+    ///   head: `1`.
+    /// * per-branch index elements while every branch stays indexed: `L + N + 1` `by_branch` keys,
+    ///   `L + 3N` positions under them and `L + N + 1` `heads` keys, so `3L + 5N + 2`, which is
+    ///   177 at N=32 and 337 at N=64 with L=5. Once a reap drops its branch: `1 + L` = 6 at both.
+    ///
+    /// The index count is asserted LAST, so a failing run's panic line also proves that every
+    /// proof and walk above it passed on the same log.
+    #[test]
+    fn reaped_branches_leave_the_per_branch_index_and_every_proof_survives() {
+        const L: u64 = 5;
+        const N: u64 = 64;
+        const MID: u64 = 32;
+        let worker = |i: u64| bid(1000 + i, 0);
+
+        let mut h = AttestedHistory::new();
+        let mut epoch = 1u64;
+        let mut live_heads: Vec<(BranchId, Attestation)> = Vec::new();
+        for j in 1..=L {
+            let att = h.append_fork(bid(j, 0), BranchId::TRUNK, Epoch(epoch), cid(epoch));
+            live_heads.push((bid(j, 0), att));
+            epoch += 1;
+        }
+        let mut mid_head: Option<TreeHead> = None;
+        let mut mid_elements = 0usize;
+        let mut last_merge: Option<Attestation> = None;
+        for i in 1..=N {
+            h.append_fork(worker(i), BranchId::TRUNK, Epoch(epoch), cid(epoch));
+            last_merge =
+                Some(h.append(BranchId::TRUNK, Epoch(epoch + 1), BranchOp::Merge, cid(epoch + 1)));
+            h.append(worker(i), Epoch(epoch + 2), BranchOp::Reap, cid(epoch + 2));
+            epoch += 3;
+            if i == MID {
+                mid_head = Some(h.head());
+                mid_elements = h.per_branch_elements();
+            }
+        }
+        let mid_head = mid_head.expect("the loop passes MID");
+        let head = h.head();
+
+        // The log keeps every event. That is the contract, and the fix must not touch it.
+        assert_eq!(h.len(), (L + 3 * N) as usize, "log length");
+        assert_eq!(mid_head.size, (L + 3 * MID) as usize, "log length at the mid checkpoint");
+
+        // Every entry, the reaped branches' included, still proves its inclusion...
+        for i in 0..h.len() {
+            let p = h.inclusion_proof(i).expect("a proof for every logged index");
+            assert!(
+                verify_inclusion(&h.entries()[i], &p, &head),
+                "entry {i} lost its inclusion proof"
+            );
+        }
+        // ...a head published halfway through still proves the log only grew...
+        let cp = h.consistency_proof(mid_head.size).expect("the mid size is within the log");
+        assert!(
+            verify_consistency(&mid_head, &head, &cp),
+            "the head published at N={MID} lost its consistency proof"
+        );
+        // ...and every chain still walks, the reaped ones included.
+        h.verify_chain().expect("the honest log must verify");
+        for i in 1..=N {
+            assert_eq!(
+                h.verify_branch(worker(i)),
+                Ok((i + 1) as usize),
+                "reaped worker {i}'s walk"
+            );
+        }
+        assert_eq!(h.verify_branch(BranchId::TRUNK), Ok(N as usize), "trunk's walk");
+        for (b, att) in &live_heads {
+            assert_eq!(h.verify_branch(*b), Ok(1), "live branch {b}'s walk");
+            assert_eq!(h.head_of(*b), Some(*att), "live branch {b} lost its head");
+        }
+        assert_eq!(h.head_of(BranchId::TRUNK), last_merge, "trunk's head is not its last merge");
+
+        // THE BOUND. The same count at N=32 and at N=64: it follows the live branches, not N.
+        assert_eq!(
+            (mid_elements, h.per_branch_elements()),
+            ((1 + L) as usize, (1 + L) as usize),
+            "per-branch index elements at N={MID} and N={N}: reaped branches are still indexed"
+        );
+        for i in 1..=N {
+            assert_eq!(h.head_of(worker(i)), None, "reaped worker {i} still has a head");
         }
     }
 
