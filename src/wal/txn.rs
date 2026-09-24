@@ -154,7 +154,22 @@ pub struct TxnManager {
     /// 6's caveat 1): a retry that fails before it can look at the slot writes that line, and the
     /// entry leaves only once a line for it is written or the slot is released.
     unrecorded: Mutex<Vec<(u64, RetiredSlot, String)>>,
+    /// **D253, test only: pause points inside a checkpoint.** An observing instrument with no
+    /// behaviour of its own. A test puts a closure in one, and the next checkpoint takes it and
+    /// runs it at that point, on the checkpointing thread. That aims a second thread at the window
+    /// between the attach-table check and the truncation deterministically rather than by timing.
+    /// Neither field nor either call exists outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) checkpoint_pause_at_entry: CheckpointPause,
+    /// See `checkpoint_pause_at_entry`. Runs after the pages are flushed and synced, immediately
+    /// before the truncation.
+    #[cfg(test)]
+    pub(crate) checkpoint_pause_before_truncate: CheckpointPause,
 }
+
+/// A closure a test hands to the next checkpoint. See `TxnManager::checkpoint_pause_at_entry`.
+#[cfg(test)]
+pub(crate) type CheckpointPause = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,7 +468,12 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            checkpoint_pause_at_entry: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_pause_before_truncate: Mutex::new(None),
+        }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1760,6 +1780,8 @@ impl TxnManager {
 
     /// [`TxnManager::checkpoint_or_keep_held`], taking `release_retry` for it.
     fn checkpoint_or_keep_locked(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
+        #[cfg(test)]
+        Self::pause(&self.checkpoint_pause_at_entry);
         let _retry = self.release_retry.lock().unwrap();
         self.checkpoint_or_keep_held(retry)
     }
@@ -1784,6 +1806,8 @@ impl TxnManager {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
+        #[cfg(test)]
+        Self::pause(&self.checkpoint_pause_before_truncate);
         if owed > 0 {
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             if !self.keeping_log.swap(true, Ordering::SeqCst) {
@@ -1828,6 +1852,16 @@ impl TxnManager {
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
         Ok(CheckpointOutcome::Truncated)
+    }
+
+    /// Run the closure a test left at this pause point, if any. The slot's lock is released first,
+    /// so the closure may block, and a checkpoint it provokes finds the slot empty.
+    #[cfg(test)]
+    fn pause(at: &CheckpointPause) {
+        let hook = at.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// The transaction's snapshot, which every read and write inside it goes through, so this is also
