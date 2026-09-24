@@ -2563,8 +2563,12 @@ fn read_vs_n_summary(
              (A14.2); O(N) is judged on R1-R3's integers.",
             load_median.map(|m| format!("{:.2}", m as f64 / 100.0)).unwrap_or_else(|| "-".into())
         );
-        // A15.3: a clean-load statement only when every counted row has both readings.
-        if !unavailable.is_empty() || !partly.is_empty() {
+        // A15.3: a clean-load statement only when every counted row has both readings. A16.8: and
+        // only when a row was counted at all, since "every counted row" is vacuous over none.
+        let counted = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
+        if counted == 0 {
+            println!("  L2: no row was counted.");
+        } else if !unavailable.is_empty() || !partly.is_empty() {
             println!(
                 "  L2 is incomplete: UNAVAILABLE (unguarded) at N={unavailable:?}; one reading only at \
                  N={partly:?}; L2 = 1 at N={flagged:?}. No clean-load statement is made for this run."
