@@ -70,14 +70,7 @@ pub const REPL_MAGIC: u32 = 0xFEDB_0001;
 /// incompatibility at the point it could have been refused. Both peers of a pair are built from
 /// this same constant, so they always move together; a mixed-version pair is an operator running
 /// two builds, and that is exactly the case this refuses.
-///
-/// **3 since D268.** The stream, and consensus `WalBatch` commands, carry raw log frames, which the
-/// replica decodes with `RecKind::deserialize`. D268 added tag 12 (an init-flagged `HeapInsert`),
-/// and D213 had added tag 11 (`HeapRelease`) without a bump. A version-2 peer decodes neither, so it
-/// failed several frames in, on the first new page the primary filled. It is refused here now. The
-/// consensus MAC domain carries this byte (`consensus::signing`), so a version-2 node's tags no
-/// longer verify either.
-pub const REPL_VERSION: u16 = 3;
+pub const REPL_VERSION: u16 = 2;
 
 /// The one tag carrying a `consensus::Message` — see [`crate::consensus::transport`].
 ///
@@ -97,7 +90,7 @@ pub const REPL_VERSION: u16 = 3;
 /// the same style as `H`/`R`/`U`/`E`.
 ///
 /// **It must stay disjoint from every replication tag.** A consensus client that dials a
-/// replication listener now passes the handshake — both speak the same version — and is caught one frame
+/// replication listener now passes the handshake — both speak version 2 — and is caught one frame
 /// later by that tag mismatch instead. `consensus::transport` pins the disjointness with a test
 /// that reads the tag byte off each encoded `Message` rather than off a constant, so the check is
 /// against the real wire bytes.
@@ -443,20 +436,6 @@ mod tests {
         wrong_version.extend_from_slice(&99u16.to_be_bytes());
         let e = read_handshake(&mut std::io::Cursor::new(wrong_version)).unwrap_err();
         assert!(format!("{e}").contains("version 99"), "got {e}");
-    }
-
-    /// **D268: a version-2 peer is refused at the handshake.** This build's log carries tag 12, an
-    /// init-flagged `HeapInsert`, and a peer speaking version 2 cannot decode it. Without the refusal
-    /// here it would complete the handshake and fail several frames in, on the first new page the
-    /// primary fills. Lane report: artie-research `frontier/lane_d268_power_loss_redo.md` §2, test 5.
-    #[test]
-    fn a_v2_peer_is_refused_at_the_handshake() {
-        let mut v2 = Vec::new();
-        v2.extend_from_slice(&REPL_MAGIC.to_be_bytes());
-        v2.extend_from_slice(&2u16.to_be_bytes());
-        let e = read_handshake(&mut std::io::Cursor::new(v2))
-            .expect_err("a peer speaking replication version 2 was accepted, and it cannot decode tag 12");
-        assert!(format!("{e}").contains("version 2"), "refused, but not for its version: {e}");
     }
 }
 
