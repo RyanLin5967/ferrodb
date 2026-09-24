@@ -3558,6 +3558,41 @@ mod tests {
         let _ = std::fs::remove_file(&main);
     }
 
+    /// **W3 (wall21 review audit 3), the one-time build: one undecodable `Reaped` record must not
+    /// stop the build, and with it the open.** `open_from_header` runs the build and propagates its
+    /// error, and the build re-read each `Reaped`-indexed slot with `core(id)?`. So a catalog from
+    /// before the UNRELEASED span with one corrupt `Reaped` record could not be opened at all.
+    /// PRE-REGISTERED (lane §8.14 amendment 1): fails at the reopen at `9d5934f`; M43's killer.
+    #[test]
+    fn an_unreadable_reaped_record_does_not_stop_the_one_time_build() {
+        let path = sidecar("w3-build");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+            assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+            // A pre-D200 file holding one corrupt `Reaped` record, durably.
+            let _g = c.logical.lock().unwrap();
+            assert!(
+                c.remove_if_present(&keys::unreleased(s.branch_id.id)).unwrap(),
+                "fixture: a releasable flip keys S"
+            );
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            c.upsert(keys::record(s.branch_id.id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1)
+            .expect("W3: one undecodable Reaped record failed the one-time build, and so the open");
+        assert!(c.core(sid).is_err(), "fixture: S's record must still not decode");
+        assert!(keyed(&c, sid), "W3: the build left an unreadable Reaped slot off the span");
+        assert!(c.tree.search(&keys::unreleased_index_built()).unwrap().is_some(), "no marker");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked
     /// `has_live_children` for every unreleased `Reaped` slot. Over a DEAD chain that is still
     /// attached, each question walks everything below the slot, and a NO files no witness, so the
