@@ -1965,7 +1965,7 @@ use super::*;
 
         // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
         // resume point must fail.
-        wal.truncate(txn.txn_ids.issued_through()).unwrap();
+        let _ = wal.truncate(txn.txn_ids.issued_through()).unwrap();
         assert!(
             wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
             "the log was not truncated past the open transaction, so this test proves nothing"
@@ -2177,6 +2177,71 @@ use super::*;
         assert!(
             index_undo_failures() >= before + 1,
             "an index undo failed and nothing counted it: the failure is silent"
+        );
+    }
+    /// **D234 — a checkpoint that a pin kept from truncating re-appends no declaration.**
+    ///
+    /// `WalManager::truncate` keeps the whole log while any pin sits below its end (a backup, a
+    /// snapshot handoff, a change stream's cursor), and `checkpoint_locked` re-appended every DDL and
+    /// run declaration regardless. The kept log already holds them, so each such checkpoint only grew
+    /// the log, by every declaration: O(M) per checkpoint, O(M²) over a pinned period, and all of it
+    /// replayed by recovery. One committed transaction per round stands in for real work, and the
+    /// range the pinned checkpoints wrote must hold no declaration at all. Then the pin is released,
+    /// and the next checkpoint must truncate and re-declare every run; otherwise "re-declares
+    /// nothing" would pass against a checkpoint that simply lost the runs.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the pinned-range assertion (every
+    /// round re-appends all 40 declarations).
+    #[test]
+    fn a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing() {
+        const RUNS: u32 = 40;
+        const ROUNDS: usize = 5;
+        let (_bp, wal, txn, _dir) = setup();
+        let declarations = |recs: &[LogRecord]| {
+            recs.iter()
+                .filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::RunIdentity { .. } | RecKind::Ddl { .. }))
+                .count()
+        };
+        for prov in 1..=RUNS {
+            txn.declare_run(a_run(prov, &format!("agent-{prov}"))).unwrap();
+        }
+        txn.checkpoint().unwrap();
+        assert_eq!(
+            declarations(walk_log(&wal).as_slice()),
+            RUNS as usize,
+            "premise failed: the unpinned checkpoint did not declare every run"
+        );
+
+        let pin = wal.pin_durable();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let before = wal.next_lsn.load(Ordering::SeqCst);
+        for _ in 0..ROUNDS {
+            let t = txn.begin().unwrap();
+            txn.commit(t).unwrap();
+            txn.checkpoint().unwrap();
+        }
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise failed: a checkpoint truncated past a held pin");
+        let written: Vec<LogRecord> = walk_log(&wal).into_iter().filter(|r| r.lsn >= before).collect();
+        assert!(!written.is_empty(), "premise failed: the rounds wrote nothing, so there is no range to inspect");
+        assert_eq!(
+            declarations(written.as_slice()),
+            0,
+            "{ROUNDS} checkpoints under a held pin re-appended {} declarations ({} bytes of log in all), \
+             and the kept log already held every one",
+            declarations(written.as_slice()),
+            wal.next_lsn.load(Ordering::SeqCst) - before
+        );
+
+        drop(pin);
+        txn.checkpoint().unwrap();
+        assert!(
+            wal.base_lsn.load(Ordering::SeqCst) > base,
+            "premise failed: with the pin released the checkpoint still did not truncate"
+        );
+        assert_eq!(
+            declarations(walk_log(&wal).as_slice()),
+            RUNS as usize,
+            "the first checkpoint after the pin was released did not re-declare every run"
         );
     }
 }
