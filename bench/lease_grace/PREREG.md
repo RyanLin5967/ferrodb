@@ -1294,3 +1294,102 @@ test code added since `012f65c`.
   `wall_now_millis`, `credited`.
 
 **Found:** no second error. The first `cargo check --lib --tests --examples` settles it; a read cannot.
+
+## Amendment 14 — review 6 (`frontier/lease_review6.md` @ `ffc6437`): the tip fails CI's `-D dead_code`. Written before the fix.
+
+Nothing here has been run (quiet mode).
+
+### B2, and the dead-code pass over the whole branch
+
+`StoredCore::serialize_core` has had no non-test caller since `fb04e4c`. All three production
+`.serialize_core()` calls have a `StoredRecord` receiver: `create`'s `trunk`, and `rec` in
+`write_record_new`/`write_record`. CI builds with `RUSTFLAGS: "-D duplicate_macro_attributes -D dead_code"`
+(`.github/workflows/tests.yml:67`), so the non-test lib fails there. `tools/land-gate.sh` refuses it too,
+through `prepush.sh`, after the suite.
+
+**The fix:** `#[cfg(test)]` on `StoredCore::serialize_core`, as `LeaseOffset::millis` already has.
+
+**The pass, over EVERY item the branch added or stopped calling (`9aa6968..84480c4`), not just this
+one.** Instruments, in this lane's scratchpad:
+- `deadcode.py`: every identifier the branch defines, with its reference count outside `cfg(test)`
+  regions and outside `tests.rs`/`tests_*.rs`, comments stripped;
+- `fnsites.py`: every production fn the branch added, with each call site's line, so the receiver can
+  be read by hand;
+- a list of the calls the branch REMOVED, checked the same way.
+
+Its blind spot is a method name shared by two types, which is how `serialize_core` hid. So every
+shared name was read against its receiver.
+
+**Found:** `StoredCore::serialize_core` is the only dead item.
+- **Every other method of `mod stored`'s types has a production caller with a receiver of that
+  type:**
+  - `StoredCore`:
+    - `branch_id`: `write_record`'s `prev`, `expired_before`, `enforced_lease`;
+    - `generation`, `state`, `depth`, `check_readable`;
+    - `deadline`: its own `outward`, `write_record`'s `prev`, `expired_before`, `enforced_lease`;
+    - `outward` (`outward_core`), `into_hydrated` (`hydrate`), `fork_child` (`fork_staged`), `decode`.
+  - `StoredRecord`: `serialize_core`, `branch_id`, `state`, `deadline`, `arenas`, `envelope`,
+    `set_*`, `mark_reaped`, `reposition`, `outward`, `inward_at_zero`.
+  - `AliveState`: `decode`, `encode`, `mark`, `offset`, `resume`, `heartbeat`.
+  - `LeaseOffset::credit` and `is_zero`.
+  - `OffsetCell::new`, `load` and `publish`.
+  - `StoredDeadline::outward`, `inward` and `index_key`.
+  - `expired_span`.
+- **The remaining new items have production callers or are `pub` on exported types:**
+  - `FileWallStamp`'s four methods and `standalone_lease_millis`;
+  - `SoftMark`, `FirstStartEvidence`, `FileTimes`' three variants;
+  - `stage_mark`, `record_soft_mark`, `soft_mark`, `take_first_start_evidence`, `sync_dir_of`,
+    `header_admits_offset`, `switch_header_magic`, `write_header_page`;
+  - `CoreRecord::with_lease_deadline`, `LeaseDeadline::saturating_deadline`;
+  - `lease_resume_report`, `refuse_if_lease_expired`, `resume_lease_clock`, `anchored_millis`,
+    `local_lease_millis`;
+  - the pub ones: `key_rewrites`, `expiry_rows_examined`, `last_alive_mark` and
+    `LeaseThread::lease_resume`, all on types re-exported from the `pub mod`s `branch::table_catalog` and
+    `branch::lease_thread`.
+- **`CoreRecord::serialize_core` loses its one production caller** when `StoredCore`'s becomes
+  test-only. It stays live for the lint: it is `pub fn` on `CoreRecord`, which is re-exported by
+  `pub use record::{CoreRecord, …}` from `pub mod branch`, and `dead_code` does not report exported
+  items.
+- **Every crate-private fn whose callers the branch rewrote still has a production caller:**
+  `hydrate`, `ids_in_span`, `in_deadline_index`, `remove_if_present`, `renew_lease`, `stage`, `upsert`,
+  `write_record`.
+- **Test helpers:**
+  - every `#[cfg(test)]` helper in `src/` has a test use;
+  - every non-test helper the branch added in `tests/*.rs` has a use (`EXPIRED`, `Db`, `seed`,
+    `session`, `expire`, `names_the_expired_lease`, `ids_seen`, `wall_millis`, `set_lease`,
+    `printed_downtime`, the `LEASE_*`/`CLOCK_SLACK_MILLIS`/`DOWN_PAST_DEADLINE_MILLIS` constants);
+  - the example's enum variants and fields are all used.
+
+### S1: step 0 carries CI's flags
+
+Every GREEN step now starts with:
+
+    RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo check --lib --tests --examples
+
+It builds the non-test lib as well, which is where B2 fails. If it fails, every later step is void.
+`tools/prepush.sh` is the equivalent the gate runs, and either one is enough. Amendment 13's step 0,
+which had no RUSTFLAGS, is superseded.
+
+### Records
+
+- **C1: R2's exception list gains a cluster-member writer.** A file or log last written by a process
+  that was a cluster member holds leases on the replicated-tick scale, not on a lag-0 wall clock.
+  That includes `main`'s members, whose lease reading was `cluster_millis` at `9aa6968`. It is
+  unreachable today, because nothing proposes a `LeaseTick` (lane §6). It goes into
+  `FirstStartEvidence`'s R2 doc with the code fix.
+- **C2, added to the clock list.** `started_at` (`agent_sql/runtime.rs:1698`) is a LEASE reading
+  (`LeaseDeadline::now_millis()`). It is exported as a wall timestamp in replication JSONL
+  (`replication/jsonl.rs:262–282`) and in the system view (`catalog/system_views.rs:734`). Under F2 it
+  lags the wall clock by host sleep. This is stated at `cluster/mod.rs` beside `local_lease_millis`,
+  and was missing here. It is a label, not a lease decision.
+- **C6n.** Amendment 13's "the harness takes the true median" is true of the median OVER ROUNDS.
+  Within a round, `quantile(.., 0.5)` takes the element at `round((n − 1)/2)`, the upper middle for
+  even `n`, and the defaults 2000 and 200 are both even. The numeric effect is one sample of a sorted
+  run. The statistic is otherwise as amendment 13 states it.
+- **P1.** M64's row: under the mutant the credit is `now − m`, which is exactly `hi + (b0 − a1)`, and
+  `b0 − a1 ≥ 1000` ms because of the 1 s sleep. So the margin is `b0 − a1 ≥ 1000` ms. Amendment 13's
+  "≥ `hi + 1000 − commit time`" had the right direction but was looser than the test.
+
+### Counts
+
+Unchanged: `f1_lease_grace` **41**, the lib filter **52**, **base + 58**. Review 6 confirmed them.
