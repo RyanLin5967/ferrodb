@@ -435,3 +435,16 @@ New tests, in `root_cell_is_per_index`:
 ### 3. Docs (READ at `5528b6e`)
 - **C3:** PrimaryWrite's doc (`src/wal/txn.rs`) now names D208's two extra map writers, and says why neither can reach the `(t, None)` cell a PrimaryWrite holds. `rename_root_cells` moves index keys only. `install_fresh_cell` replaces `(t, None)` only in CREATE TABLE, for a name absent from the catalog, under `ddl_checkpointed`.
 - **Q3:** `AlterPlan.primary_cell`'s doc records that `apply_plan` does not check the table's identity (the same `Arc`, the same `dir_root`), and that this is unreachable today because both callers plan and apply with only reads between.
+
+---
+
+## Amendment 8 (appended before any run): D222's final tip
+
+D222 is final at `8387264`, which is append-only from `05cbaae`. The three test-only commits since are `2ffdb68`, `07e6db0` and `8387264`; `git diff 05cbaae 8387264 -- src/` is empty (RUN).
+
+It is merged at `e389b1b`:
+- `merge-tree` was clean (RUN).
+- The only delta is `tests/d222_index_root_after_backfill.rs`, +93/−37. Its DROP TABLE test gains full-text arms inside the same test.
+- `catalog.rs` still holds exactly two `let new_root_id` reads, one per creator (RUN).
+
+**The D222 expectation, as a test count:** `#[test]` in `tests/d222_index_root_after_backfill.rs` = **5**, unchanged (RUN), so GREEN stays **5/5**. The per-target prediction is unchanged: **2634 run, passed=2633, failed=1**. Nothing else in the pre-registration changes.
