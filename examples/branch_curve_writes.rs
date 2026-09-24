@@ -2447,9 +2447,14 @@ fn read_vs_n_summary(
         // (the upper one for an even count, as every median here); a row is flagged when its larger
         // reading exceeds 1.5 × that median. A flag, never a guard: the slopes it qualifies are
         // reported, not judged.
+        //
+        // A15.6: ONE rule with the verdict script, whose `rrows` leaves out H6 rows. An H6 open
+        // rebuilt for the stale-index marker and is NOT A RESULT for every arm-3 value, so it sets
+        // no baseline and carries no flag. (`stale` absent reads as u64::MAX, which H6 also takes.)
+        let is_h6 = |r: &RestartRow| r.get("stale") != 0;
         let mut loads: Vec<u64> = restart_rows
             .iter()
-            .filter(|r| !r.child.is_empty())
+            .filter(|r| !r.child.is_empty() && !is_h6(r))
             .flat_map(|r| [r.get("load_start_centi"), r.get("load_end_centi")])
             .filter(|&l| l != u64::MAX)
             .collect();
@@ -2471,6 +2476,7 @@ fn read_vs_n_summary(
             let (l0, l1) = (r.get("load_start_centi"), r.get("load_end_centi"));
             let hi = [l0, l1].into_iter().filter(|&l| l != u64::MAX).max();
             let l2 = match (hi, load_median) {
+                _ if is_h6(r) => "H6",
                 (Some(h), Some(m)) => if (h as f64) > 1.5 * (m as f64) { "1" } else { "0" },
                 _ => "-",
             };
@@ -2496,7 +2502,8 @@ fn read_vs_n_summary(
         }
         println!(
             "  arm 3: load0/load1 = the child's 1-min load at its start and end; L2 = 1 when the row's larger \
-             reading exceeds 1.5 x the run's median reading ({}). The time slopes and R5's magnitude are REPORTED \
+             reading exceeds 1.5 x the run's median reading ({}), H6 rows left out of the median and printed `H6` \
+             (A15.6, the verdict script's rule). The time slopes and R5's magnitude are REPORTED \
              (A14.2); O(N) is judged on R1-R3's integers.",
             load_median.map(|m| format!("{:.2}", m as f64 / 100.0)).unwrap_or_else(|| "-".into())
         );
