@@ -1251,3 +1251,48 @@ script's maintainer. Item 4 is the lane's own.**
    unclean close printed NOT A RESULT under rc 0. Review 9 §3 noted this as pre-existing, outside its delta. A close
    failure is now a failure like any other.
 5. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
+
+**A18, 2026-09-24, before any build or run. Review 10 of `38d97a2..4513060` (artie-research
+`frontier/read_vs_n_review10.md` @ `3fdebb7`) returned SOUND-WITH-CAVEATS. No false verdict can print: the verdict
+script refuses the un-repinned output. The lead's decisions on Y1–Y8 follow. The script's side (the Y2 fixture, its
+loose `H6` cell pattern, Y3's grading names) belongs to its maintainer.**
+
+1. **Y1: arm 3's point count counts only non-H6 rows.**
+   * `measured`, the count behind "arm 3: N restart(s) measured; one point is not a curve", now leaves H6 rows out.
+     Before, it counted them, so A17.2's own (f) `stale-marker` shape (one H6 row and one counted row) printed no
+     refusal while its curve had one point. An all-H6 run had zero points and no refusal.
+   * **(f) is amended.** The `stale-marker` fire is allowed ONE extra, the ARM3 refusal "arm 3: 1 restart(s)
+     measured; one point is not a curve", in the same pattern as `control-cold`'s allowed G7.
+     * Its expectation becomes: rc 2, H6 at 256, and that ARM3 line; any other guard is a finding.
+     * A17.2's "H6 as the only guard" is withdrawn.
+   * An all-H6 run prints "arm 3: 0 restart(s) measured; one point is not a curve".
+2. **Y2: the final close runs BEFORE the summary, and its error goes into `failures`.**
+   * Before, the close ran after the summary had printed "GUARDS: every guard held", so a failed close printed its
+     NOT A RESULT under that line (rc 2 since A17.4).
+   * Now a failed close suppresses the GUARDS line and prints among the other NOT A RESULT lines. The rc follows from
+     `failures` like every other failure. A17.4's "a failure like any other" is now true, and A17.4's separate rc
+     patch is folded into that.
+3. **Y3: A13.9's refusal is described correctly.** A17.1 and the `FIRECHECK CkptDdl` line said it meant "the fire did
+   not inject". That is false: A14.1 asserts the record's retention before any merge, and failing it panics "did not
+   inject". A13.9's refusal can only follow a successful injection. It means the record was retained but no axis-(ii)
+   checkpoint truncated to re-append it: **DID_NOT_FIRE**, the judge never moved.
+4. **Y4: the line says what each NOT A RESULT GRADES as**, rather than which ones "may appear":
+   * A14.1's refusal of a moved base: a FINDING. The premise changed; amend before reading.
+   * A13.9's refusal: DID_NOT_FIRE.
+   * PARENT_PASS and a failed close: FINDINGS (FIRED_WITH_EXTRA). See item 5.
+   * Any other: a finding.
+5. **Y5: PARENT_PASS is named on the line.** On a loaded box, `parent_open`'s "the parent's first lease pass did not
+   finish within {bound}" can print under (f3)'s own command: the first open, every checkpoint's reopen, and axis
+   (ii)'s reopen.
+6. **Y6: the R7 line names which steps the summary table carries.** `recover` IS in the table (`recover ms`). The
+   other seven (`files`, `lock`, `sql_catalog`, `branch_catalog`, `effect_log`, `runtime`, `provenance`) are only in
+   the RESTART rows, so L2 and G7 sit beside those seven only by joining on N.
+7. **Y7: A15.6's "An H6 row prints L2 as `H6`" is SUPERSEDED by A17.2.** An H6 row prints only its N and its
+   `H6: NOT A RESULT …` line, so no L2 cell reads `H6`. The FAN-QUEUE row's (h) expectation is corrected. The script's
+   loose pattern that still accepts an `H6` cell is its maintainer's to drop.
+8. **Y8: L2 is not judged on fewer than two counted rows.** With one counted row, the median is that row's own upper
+   reading, so `max > 1.5 × median` is false by construction, and the clean-load statement came from an instrument
+   that could not fire.
+   * With `counted < 2` the summary prints "L2: not judged (fewer than two counted rows)."
+   * `counted == 0` keeps A16.8's "no row was counted."
+9. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 41. Both unchanged.
