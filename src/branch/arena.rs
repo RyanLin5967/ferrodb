@@ -2577,12 +2577,7 @@ impl PageStore for ArenaPageStore {
             st.live_order.insert(arena);
             st.recycled.insert(arena, Vec::new());
         }
-        // Counted with the extent and BEFORE the persist, for the reason the extent is in the map
-        // by then: a persist that turns out to be a full rewrite serialises this counter from live
-        // memory, and a count added afterwards is missing from an image that holds the extent
-        // (review 2 F1: the restore came back short by the claim's pages). An appended claim
-        // record carries no count; its replay adds `page_count`.
-        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
+        // MUTANT (fire-check only, never land): the pages are counted only after the persist, as at d95132e.
 
         // Persist the map now that the region has grown. This is the write that makes
         // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
@@ -2642,9 +2637,9 @@ impl PageStore for ArenaPageStore {
             st.extents.remove(&arena);
             st.live_order.remove(&arena);
             st.recycled.remove(&arena);
-            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
             return Err(e);
         }
+        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
 
         // Keep the durable record truthful: the reaper frees exactly `record.arenas`.
         //
