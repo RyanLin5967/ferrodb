@@ -387,3 +387,33 @@ fn a_standalone_node_at_the_end_of_the_value_space_refuses_distinguishably() {
         GrantError::SpaceExhausted { counter: "txn-id", issued_through: u64::MAX }
     );
 }
+
+// ---- F2: the standalone lease clock is monotonic within a process ------------------------------
+
+#[test]
+fn f2_the_standalone_lease_clock_is_its_anchor_plus_monotonic_elapsed_time() {
+    use std::time::Duration;
+    // The whole reading is anchor + elapsed. The wall clock is not an argument, which is the F2
+    // property by construction: nothing read from it after the anchor can move a lease.
+    assert_eq!(anchored_millis(1_700_000_000_000, Duration::ZERO), 1_700_000_000_000);
+    assert_eq!(anchored_millis(1_700_000_000_000, Duration::from_millis(1_500)), 1_700_000_001_500);
+    // Sub-millisecond elapsed time does not round up: a lease is not expired a millisecond early.
+    assert_eq!(anchored_millis(10, Duration::from_micros(999)), 10);
+    // Saturates. A wrapped reading would be a time near 1970 and would reap every lease there is.
+    assert_eq!(anchored_millis(u64::MAX - 1, Duration::from_millis(5)), u64::MAX);
+    assert_eq!(anchored_millis(5, Duration::MAX), u64::MAX);
+}
+
+#[test]
+fn f2_the_process_lease_clock_never_reads_backwards() {
+    // A weak witness, stated as one: the wall clock can go backwards and this cannot, but no test
+    // in-process can step the wall clock to show the difference — `anchored_millis`'s signature,
+    // pinned above, is what carries that half. This pins the other half: successive readings of
+    // the real clock, through the path every lease decision takes, are non-decreasing.
+    let mut last = local_lease_millis();
+    for _ in 0..10_000 {
+        let now = local_lease_millis();
+        assert!(now >= last, "the lease clock went backwards: {last} -> {now}");
+        last = now;
+    }
+}

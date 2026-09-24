@@ -279,7 +279,11 @@ pub fn apply_lease_tick(unix_millis: u64) -> Result<u64, GrantError> {
 /// Where a lease decision is entitled to read time from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseSource {
-    /// This node is its own leader, so its wall clock *is* the cluster's time.
+    /// This node is its own leader, so its own clock *is* the cluster's time.
+    ///
+    /// Named for the wall clock it read until F2, and kept under that name because
+    /// `cluster::tests` pins the rule by it. What it reads now is [`local_lease_millis`]: the
+    /// wall clock ONCE per process, then a monotonic clock.
     LocalWall,
     /// The cluster's time as of the last applied tick.
     Cluster(u64),
@@ -322,16 +326,63 @@ pub fn lease_now_millis() -> Result<u64, GrantError> {
         (p.authority, p.cluster_millis)
     };
     match lease_source(auth, ms)? {
-        LeaseSource::LocalWall => Ok(local_wall_millis()),
+        LeaseSource::LocalWall => Ok(local_lease_millis()),
         LeaseSource::Cluster(ms) => Ok(ms),
     }
+}
+
+/// A standalone node's lease clock, in milliseconds on the unix-epoch scale.
+///
+/// # F2 — monotonic within a process, anchored to the wall clock once
+///
+/// This returned `SystemTime::now()` on every call, so a forward step of the wall clock — an NTP
+/// step, a VM resuming, an operator setting the date — expired every lease whose deadline it
+/// crossed, in one scan, with no client having been idle at all. Reaping is destructive and a
+/// `BranchId` generation makes it unrecoverable, so a clock that can jump is the wrong input.
+///
+/// So the wall clock is read **once per process**, at the first lease reading, and every reading
+/// after that is that anchor plus [`std::time::Instant`]'s elapsed time. `Instant` is monotonic:
+/// within one process the lease clock never moves backwards and no step of the wall clock moves it
+/// at all. Deadlines stay on the unix-epoch millisecond scale they have always had, so every
+/// durable deadline already written keeps its meaning.
+///
+/// **Across processes the anchor is taken again**, and whatever the wall clock did between the two
+/// — a step, a slew, the machine being off — lands in the gap between one process's last reading
+/// and the next one's first. That gap is exactly what F1's restart grace measures as downtime and
+/// adds to every live lease (`BranchCatalog::resume_leases`), so a step between processes is
+/// credited rather than charged. Together the two rules are Chubby's (§2.8–2.9): the lease timer
+/// runs only while the authority does, and deadlines only ever move forward.
+///
+/// ⚠ **A suspended machine stops this clock.** `Instant` does not advance while the host sleeps
+/// (`CLOCK_UPTIME_RAW` on macOS; `CLOCK_MONOTONIC` on Linux does not count suspend either), so a
+/// lease does not run down while the process is frozen. That is the stopped timer again — a
+/// suspended process is an authority that is down — and it is the direction that keeps a lease
+/// rather than reaps one. Anything else that reads the lease clock as a wall-clock timestamp
+/// inherits the same lag after a sleep; `AgentRuntime::begin_session_as_staged` stamps a run's
+/// `started_at` from it.
+///
+/// Private on purpose, for the reason [`local_wall_millis`] gives.
+fn local_lease_millis() -> u64 {
+    static ANCHOR: OnceLock<(u64, std::time::Instant)> = OnceLock::new();
+    let (wall, at) = *ANCHOR.get_or_init(|| (local_wall_millis(), std::time::Instant::now()));
+    anchored_millis(wall, at.elapsed())
+}
+
+/// The lease reading `since_anchor` after a wall-clock anchor of `anchor_wall_millis`.
+///
+/// Pure, and its signature is the F2 property: the wall clock is not an argument, so no reading of
+/// it after the anchor can reach a lease decision. Saturates rather than wrapping — a wrapped
+/// reading is a time in 1970, which reaps everything.
+fn anchored_millis(anchor_wall_millis: u64, since_anchor: std::time::Duration) -> u64 {
+    anchor_wall_millis.saturating_add(u64::try_from(since_anchor.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The local wall clock in unix milliseconds.
 ///
 /// **The only `SystemTime::now()` a lease decision may reach**, and only via
-/// [`lease_now_millis`] on a standalone node. Private on purpose: a caller that can name this
-/// function can reintroduce the divergence the module exists to remove.
+/// [`local_lease_millis`]'s anchor on a standalone node — once per process since F2. Private on
+/// purpose: a caller that can name this function can reintroduce the divergence the module exists
+/// to remove.
 fn local_wall_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
