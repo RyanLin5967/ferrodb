@@ -2730,7 +2730,8 @@ fn a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt
     assert_eq!(a.lost_in_flight(), 0, "the frame arrived, but a loss was counted on the way");
 }
 
-// D224, after the fix: the counters that make "busy links pay nothing" a count rather than a claim.
+// D224, after the fix: the counters that make "a busy link is never probed" a count rather than a
+// claim. All a busy link pays is two clock reads per frame.
 // They need the new accessors, so their red evidence is the mutants in bench/d224/PREREG.md.
 
 #[test]
@@ -2764,8 +2765,10 @@ fn a_busy_link_is_never_probed() {
         t_recv.push(Instant::now());
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Anti-vacuity: the link lived past the gate by a second, so skipping the refresh would have
-    // shown here. A lower bound on elapsed time, which load can only lengthen.
+    // A guard on the fixture, not a check on the transport. As written it cannot fail: the 60 sleeps
+    // of 100 ms alone take 6 s (D224 review 2). It is kept so that cutting `FRAMES` or the sleep until
+    // the link no longer outlives the gate by a second fails loudly, instead of leaving this test
+    // quietly vacuous. The sleeps are the real anti-vacuity.
     assert!(t0.elapsed() >= gate + Duration::from_secs(1), "the link did not outlive the probe gate");
 
     // Write k happened within [t_send[k], t_recv[k]], so this bounds every gap between A's writes
@@ -2845,7 +2848,9 @@ fn a_link_left_holding_a_refusal_is_redialled_after_an_idle_gap() {
     let mut ours = Vec::new();
     crate::replication::write_handshake(&mut ours).unwrap();
 
-    // --- the refused connection, left as `conn_loop` leaves it ---------------------------------
+    // --- the refused connection, as `conn_loop` leaves it after reading all six bytes ----------
+    // (Its `stop` and deadline refusals return before reading them, so on Linux their close is a
+    // reset behind the `Error` frame. The probe reads that as closed too.)
     let (mut c1, _) = listener.accept().expect("the transport should dial on its own");
     c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut hs = [0u8; 6];
@@ -2909,5 +2914,64 @@ fn a_link_left_holding_a_refusal_is_redialled_after_an_idle_gap() {
     c2.read_exact(&mut body).unwrap();
     assert_eq!(decode(&body).unwrap().term, 7, "the redialled link carried some other frame first");
     assert_eq!(a.idle_redials() - redials, 1, "the frame arrived, but not through the probe's redial");
+    assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
+}
+
+#[test]
+fn a_link_closed_by_a_peer_with_half_the_idle_deadline_is_still_probed() {
+    // **D224 review 2, G3.** The premise is `D_r >= D_s / 2`: a receiver may run half the sender's
+    // idle deadline, and a gate at half is what tolerates it. Every other test gives both ends the
+    // same options (`pair`), where a gate of the whole deadline would pass as well. Here the premise
+    // sits at its boundary: sender A runs 2 s, so its gate is 1 s, and receiver B runs 1 s.
+    let mut a_opts = fast();
+    a_opts.idle_deadline = Duration::from_secs(2);
+    let mut b_opts = fast();
+    b_opts.idle_deadline = Duration::from_secs(1);
+    let la = TcpListener::bind("127.0.0.1:0").unwrap();
+    let lb = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (aa, ab) = (la.local_addr().unwrap(), lb.local_addr().unwrap());
+    let a = Transport::from_listener(NodeId(1), la, BTreeMap::from([(NodeId(2), ab)]), a_opts).unwrap();
+    let b = Transport::from_listener(NodeId(2), lb, BTreeMap::from([(NodeId(1), aa)]), b_opts).unwrap();
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    };
+
+    a.send(&msg(1)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 1, "the link never carried its first frame");
+
+    // B closes A's link after 1 s of silence: half of A's deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && (b.idle_closed() == 0 || b.live_inbound_conns() > 0) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        b.idle_closed() >= 1 && b.live_inbound_conns() == 0,
+        "B never closed A's idle link, so this test exercises nothing"
+    );
+    // Let B's FIN reach A's kernel, as in I and P. The gap since A's last write is now at least
+    // 1.3 s: past A's 1 s gate, and short of the 2 s a gate of the whole deadline would wait for.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (probes, redials) = (a.idle_probes(), a.idle_redials());
+    a.send(&msg(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = None;
+    while Instant::now() < deadline && got.is_none() {
+        got = b.recv_timeout(Duration::from_millis(20)).map(|m| m.term);
+    }
+    assert_eq!(
+        got,
+        Some(2),
+        "a frame sent once, after a peer with half the idle deadline closed the link, never arrived \
+         (idle_probes +{}, idle_redials +{}, lost_in_flight {})",
+        a.idle_probes() - probes,
+        a.idle_redials() - redials,
+        a.lost_in_flight()
+    );
+    assert_eq!(a.idle_probes() - probes, 1, "the link was not probed exactly once before the write");
+    assert_eq!(a.idle_redials() - redials, 1, "the probe did not find the close and redial");
     assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
 }
