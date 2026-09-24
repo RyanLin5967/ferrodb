@@ -6,9 +6,31 @@
 //! and show the tree; cascade only on explicit request. Silently cascading a revert through an
 //! agent's downstream work is not recoverable by the agent.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 use crate::catalog::column::Value;
 use crate::provenance::readset::{PredicateSummary, ReadSet, VersionRef};
 use crate::tel::ids::{ColId, TxnId};
+
+/// **Wall #18 instrument — how many (write, read) pairs [`DependencyGraphBuilder::build`]
+/// compared.**
+///
+/// `build` joins every retained write against every retained read with two nested loops: exact
+/// writes × exact reads, and valued writes × predicate reads. `AgentRuntime::revert_merge` calls it
+/// once per `REVERT` over every capture the runtime has retained, so a history of N merged tasks of
+/// one fixed shape costs Θ(N²) comparisons per revert, however few of them become edges. This
+/// counts the comparisons, not the edges: a flat edge count beside a growing pair count is the
+/// join, not the answer, getting bigger.
+///
+/// ⚠ One relaxed add of a local count per `build` call, so the instrument cannot create the slope
+/// it measures. `ProvenanceLog`'s own callers reach `build` too; scope a reading by subtracting
+/// around the one call being measured.
+pub static GRAPH_BUILD_PAIRS: AtomicU64 = AtomicU64::new(0);
+
+/// Pairs compared since process start. Read twice and subtract to scope it to a phase.
+pub fn graph_build_pairs() -> u64 {
+    GRAPH_BUILD_PAIRS.load(AtomicOrdering::Relaxed)
+}
 
 /// What to do when the target of a revert has dependents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -232,8 +254,10 @@ impl DependencyGraphBuilder {
 
     pub fn build(&self) -> DependencyGraph {
         let mut g = DependencyGraph::new();
+        let mut pairs = 0u64;
         for (writer, wv) in &self.writes {
             for (reader, rv) in &self.reads {
+                pairs += 1;
                 if reader != writer && rv == wv {
                     g.add_edge(DependencyEdge { from: *writer, to: *reader, via: *wv });
                 }
@@ -241,6 +265,7 @@ impl DependencyGraphBuilder {
         }
         for w in &self.valued_writes {
             for r in &self.predicate_reads {
+                pairs += 1;
                 if r.txn == w.txn {
                     continue;
                 }
@@ -260,6 +285,7 @@ impl DependencyGraphBuilder {
                 }
             }
         }
+        GRAPH_BUILD_PAIRS.fetch_add(pairs, AtomicOrdering::Relaxed);
         g
     }
 }

@@ -181,6 +181,43 @@ pub fn scan_table_seq_tuples() -> u64 {
     SCAN_TABLE_SEQ_TUPLES.load(AtomicOrdering::Relaxed)
 }
 
+/// **Wall #18 instrument — how many `applied` entries `REVERT` TOUCHED to find one transaction's
+/// ops, and how many it KEPT.** The `OURS_SCAN_*` pair's shape, aimed at `undo_txn`.
+///
+/// `undo_txn` asks a KEYED question — `a.txn == txn` — of `State::applied`, a Vec that is never
+/// pruned and gains one entry per cell that any `MERGE` ever published. `EXAMINED` counts what the
+/// lookup walked; `MATCHED` counts what it returned, which the undo loop must then apply and which
+/// no index can remove. `EXAMINED` growing with merge history while `MATCHED` stays put is the
+/// rescan; both growing together would be a bigger revert, not a defect.
+///
+/// ⚠ Counted per reverted TRANSACTION, not per op: one relaxed add of a local count per call, so
+/// the instrument cannot create the slope it measures.
+pub static REVERT_APPLIED_EXAMINED: AtomicU64 = AtomicU64::new(0);
+pub static REVERT_APPLIED_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `(examined, matched)` since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_applied_counters() -> (u64, u64) {
+    (
+        REVERT_APPLIED_EXAMINED.load(AtomicOrdering::Relaxed),
+        REVERT_APPLIED_MATCHED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// **Wall #18 instrument — how many retained captures one `REVERT` folded into its dependency
+/// graph.**
+///
+/// `revert_merge` rebuilds the whole graph from `State::captures` on every call, and `captures`
+/// keeps every PUBLISHED transaction for the life of the process (`forget_captures_unless_published`
+/// is the only remover, and it drops only the unpublished). So this counts merged-branch history,
+/// not the size of the revert being planned. What the build then does with those captures is
+/// pairwise, and is counted separately by `provenance::revert::GRAPH_BUILD_PAIRS`.
+pub static REVERT_GRAPH_CAPTURES: AtomicU64 = AtomicU64::new(0);
+
+/// Captures folded since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_captures() -> u64 {
+    REVERT_GRAPH_CAPTURES.load(AtomicOrdering::Relaxed)
+}
+
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///
@@ -5842,8 +5879,18 @@ impl AgentRuntime {
     fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
         let ops: Vec<AppliedOp> = {
             let state = self.state.lock().unwrap();
-            let mut v: Vec<AppliedOp> =
-                state.applied.iter().filter(|a| a.txn == txn).cloned().collect();
+            let mut examined = 0u64;
+            let mut v: Vec<AppliedOp> = state
+                .applied
+                .iter()
+                .filter(|a| {
+                    examined += 1;
+                    a.txn == txn
+                })
+                .cloned()
+                .collect();
+            REVERT_APPLIED_EXAMINED.fetch_add(examined, AtomicOrdering::Relaxed);
+            REVERT_APPLIED_MATCHED.fetch_add(v.len() as u64, AtomicOrdering::Relaxed);
             v.sort_by(|a, b| b.seq.cmp(&a.seq));
             v
         };
@@ -6467,9 +6514,12 @@ fn capture_is_protected(state: &State, txn: TxnId) -> bool {
 
 fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
     let mut log = ProvenanceLog::new();
+    let mut folded = 0u64;
     for c in captures.values() {
+        folded += 1;
         log.record(c.clone().finish());
     }
+    REVERT_GRAPH_CAPTURES.fetch_add(folded, AtomicOrdering::Relaxed);
     log.dependency_graph()
 }
 
