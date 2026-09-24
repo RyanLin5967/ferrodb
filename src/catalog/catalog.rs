@@ -131,6 +131,39 @@ impl Catalog {
         self.roots.retain(|(t, _), _| live.contains(t));
     }
 
+    /// Discard every shared cell and re-seed it from the durable records. D205, ported from
+    /// `b9a0a75` (W4(c), 2026-09-22, which was never merged).
+    ///
+    /// # Why [`Catalog::sync_root_cells`] cannot be used for this
+    ///
+    /// `sync_root_cells` **creates missing cells and never overwrites an existing one**, and that
+    /// asymmetry is deliberate: a live handle may have split past the value on the catalog page, so
+    /// clobbering the cell would hand the next reader a root that has already moved. It is therefore
+    /// powerless in the one situation where the record is RIGHT and the cell is WRONG.
+    ///
+    /// `wal::recovery::rebuild_indexes` is exactly that situation. It frees every index tree, builds
+    /// a fresh one, and writes the new root into the `TableEntry`. The cells were seeded by
+    /// `Catalog::open` from the pre-crash roots, and `sync_root_cells` leaves them there. Every cell
+    /// then points into a tree that was just freed, and `plan::open_table` and the optimizer take the
+    /// cell in preference to the record. So the rebuild is correct on disk and invisible to every
+    /// statement that follows it. Measured by the fresh-context adversary's schedule: a DROP, then a
+    /// crash, and afterwards a committed row is missing by key and its key is admitted twice
+    /// (`frontier/d202_adversary.md` §2; `recovery.rs`'s
+    /// `a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree`).
+    ///
+    /// # ⛔ Precondition: no handle may exist
+    ///
+    /// Dropping a cell while another handle holds a clone of the `Arc` is precisely the D53 defect:
+    /// the next `open_table` mints a fresh cell, two handles hold independent root pointers, and the
+    /// root-split retry in `read_leaf_for` compares a private value against itself. This is safe only
+    /// where nothing has opened a table yet or still holds one. Its one caller is
+    /// `rebuild_indexes`, which runs inside `wal::recovery::open_recovered` before anything is built
+    /// on the catalog, and in tests between statements, when no statement is alive to hold a tree.
+    pub fn reseed_root_cells(&mut self) {
+        self.roots.clear();
+        self.sync_root_cells();
+    }
+
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
         // E67: this was `FerroError::KeyNotFound`, so creating a table that already exists answered
         // `error: key wasn't found` - a storage-layer message, for a name collision, telling the

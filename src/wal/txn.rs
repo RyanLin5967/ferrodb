@@ -119,6 +119,20 @@ pub struct TxnManager {
     index_undo: Mutex<HashMap<u64, Vec<PrimaryWrite>>>,
 }
 
+/// Index undos at abort that failed, since process start. D205 (the adversary's C1).
+///
+/// A failure here is not returned by [`TxnManager::abort`], because the transaction has ended and
+/// every caller reads `Err` as "the abort did not happen". It is counted instead, so it is never
+/// silent. What it leaves behind is fail-stop: the entry it could not repair names a freed slot,
+/// so a reader of that key gets `SlotDeleted`, and the next open rebuilds every tree
+/// (`wal::recovery::open_recovered`). Read twice and subtract to scope it to a phase.
+pub static INDEX_UNDO_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`INDEX_UNDO_FAILURES`].
+pub fn index_undo_failures() -> u64 {
+    INDEX_UNDO_FAILURES.load(Ordering::Relaxed)
+}
+
 /// One primary-index write, as a transaction's abort must undo it. D202.
 ///
 /// `prev` is what the entry held before the write: `None` for a key that was absent, `Some(rid)`
@@ -695,10 +709,35 @@ impl TxnManager {
         // key, this removes the key while its slot still holds the (uncommitted, invisible) row,
         // so a lock-free reader sees "no such key" rather than a key pointing at a freed slot.
         // A relocated write has a window either way round: the entry and the slot it names are
-        // two page writes. Its error is kept until the heap undo below has run, because a
-        // transaction whose heap undo was skipped is worse than one whose index undo failed.
+        // two page writes.
+        //
+        // **D205 C1 — an index-undo failure is COUNTED, never returned.** Every caller reads this
+        // function's `Err` as "the abort did not happen": `executor.rs` skips
+        // `session.current = None`, and the caller's own error is replaced by this one. Returned
+        // after `TxnEnd`, as it was at `c21eaff`, it left a session holding a dead id and hid the
+        // statement's error. The transaction does end, so `Ok` is the true answer. The failure is
+        // not silent: [`INDEX_UNDO_FAILURES`] counts it. The entry it failed to repair names a
+        // freed slot, so readers of that key fail with `SlotDeleted` rather than guessing, and the
+        // next open rebuilds every tree from the heap (`open_recovered`).
+        //
+        // **D205 C2 — a heap undo that fails AFTER this has succeeded is recoverable**, and the
+        // `Err` below says so to the caller truthfully, because the transaction has NOT ended:
+        // - it stays in the ATT as `Aborting`, and the CLRs already written make the heap undo
+        //   resumable. A second `abort`, which is `ROLLBACK` in an explicit transaction whose session
+        //   kept it (`executor.rs`), finds this list gone (already applied, and re-applying is not
+        //   needed) and resumes the heap undo at `undo_next`;
+        // - a crash instead makes it a loser: recovery finishes the heap undo, and
+        //   `open_recovered` rebuilds every tree from that heap;
+        // - until one of those happens, a key this undo restored names the before-image's slot,
+        //   which the unfinished heap undo has not refilled yet. That reads as `SlotDeleted`, which
+        //   fails stop, and a row whose INSERT was not yet undone is uncommitted and invisible to
+        //   every snapshot. Nothing answers wrongly.
+        // A heap undo that fails permanently (e.g. `restore_at` into a page with no room) was
+        // unrecoverable in-process before D202 too. Only a restart repairs it.
         let writes = self.index_undo.lock().unwrap().remove(&txn_id).unwrap_or_default();
-        let index_undone = self.undo_primary_writes(writes);
+        if self.undo_primary_writes(writes).is_err() {
+            INDEX_UNDO_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
         let mut lsn = {
             self.att_read().get(&txn_id).unwrap().last_lsn.load(Ordering::Acquire)
         };
@@ -747,7 +786,7 @@ impl TxnManager {
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
         self.run_bindings.lock().unwrap().remove(&txn_id);
-        index_undone
+        Ok(())
     }
 
     /// Record that `txn_id` is about to move the primary-index entry for `key` away from `prev`.
@@ -772,6 +811,16 @@ impl TxnManager {
     /// refused (the head is not deleted-for-them), and another UPDATE or DELETE of it is refused
     /// by `check_write_conflict` (the head's `begin_ts` is not committed for them). A check here
     /// could not be made to fire, and an unfireable guard is one no test can hold to account.
+    /// Measured by `tests/rollback_index_undo.rs::nobody_else_can_move_a_key_between_its_uncommitted_write_and_its_rollback`.
+    ///
+    /// **⛔ PRECONDITION: statements on one database are serialised.** Every refusal above is a
+    /// check one statement makes against state another statement left, so they hold only if no two
+    /// statements interleave INSIDE each other. Today one mutex per database guarantees that:
+    /// pgwire's `ServerContext::catalog: Mutex<Catalog>` (`src/pgwire/mod.rs`), which every
+    /// connection's statement and the lease scan take, and the CLI's `CatalogLock` (`cli::run_cli`).
+    /// `execution::executor::run` takes `&mut Catalog`, so no statement runs without one. A change
+    /// that lets two statements on one database run concurrently (an `RwLock`, or a per-table lock)
+    /// must re-establish this, or turn this undo into a compare-and-restore.
     ///
     /// Every write is attempted even if one fails, and the first error is returned.
     fn undo_primary_writes(&self, writes: Vec<PrimaryWrite>) -> Result<(), FerroError> {
@@ -1983,5 +2032,23 @@ use super::*;
         txn.record_primary_write(t, Arc::new(AtomicU32::new(1_000_000)), Value::Integer(5), None);
         txn.abort(t).expect("the transaction ended, so its abort must report success");
         assert!(txn.snapshot_of(t).is_err(), "premise failed: the transaction is still active after its abort");
+    }
+
+    /// **D205 C1, the other half: the failure `abort` no longer returns is counted, not dropped.**
+    /// `>= before + 1` rather than `==`, because the counter is process-wide and the test above
+    /// forces the same failure concurrently.
+    #[test]
+    fn an_index_undo_failure_is_counted() {
+        use crate::catalog::column::Value;
+
+        let (_bp, _wal, txn, _dir) = setup();
+        let before = index_undo_failures();
+        let t = txn.begin().unwrap();
+        txn.record_primary_write(t, Arc::new(AtomicU32::new(1_000_000)), Value::Integer(5), None);
+        txn.abort(t).unwrap();
+        assert!(
+            index_undo_failures() >= before + 1,
+            "an index undo failed and nothing counted it: the failure is silent"
+        );
     }
 }

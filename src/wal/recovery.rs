@@ -277,6 +277,20 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
         }
     }
+    // **D205: the records above are the only copy that moved.** Every loop in this function
+    // writes the fresh root into the `TableEntry`, and the SHARED cells (`Catalog::roots`, D53)
+    // still hold the roots `Catalog::open` seeded before any of this ran: the trees `free_tree` has
+    // just released. `plan::open_table` and the optimizer prefer the cell to the record, so without
+    // this the rebuild is correct on disk and invisible. Every statement after recovery descended a
+    // freed tree, and the fresh-context adversary's schedule (a DROP below the table, then a crash)
+    // turned that into a committed row missing by key and a duplicate admitted.
+    //
+    // Here, and not only in `open_recovered`, because this is the function that makes the cells
+    // wrong. A caller that rebuilds and then queries, as the full-text and recovery tests do, gets
+    // cells that match what it built. `reseed_root_cells` and not `sync_root_cells`, and that
+    // difference is the whole bug: `sync_root_cells` never overwrites an existing cell. Ported from
+    // `b9a0a75` (W4(c), never merged); see the precondition on `Catalog::reseed_root_cells`.
+    catalog.reseed_root_cells();
     catalog.persist()
 }
 
@@ -302,6 +316,8 @@ pub struct OpenedDatabase {
 /// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
 /// 3. open the catalog, or create it for a new file;
 /// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
+///    The rebuild ends by reseeding the shared root cells (D205). Without that, every statement
+///    after recovery descends the trees the rebuild freed.
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
