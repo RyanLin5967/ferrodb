@@ -75,7 +75,8 @@ pub mod tag {
     /// - put here by `set_state` on the way into `Reaping`;
     /// - kept by the `Reaped` flip only if nothing is alive below it, and taken off by the flip
     ///   if something is (a PINNED interior is not releasable);
-    /// - put back by `detach_child` when it removes a reaped parent's last pin;
+    /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
+    ///   frees it runs for an originator whose own key covers it until that originator's release);
     /// - taken off by `release_id`.
     ///
     /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —

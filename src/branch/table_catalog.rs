@@ -404,8 +404,8 @@ impl TableBranchCatalog {
         cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
 
         // D200: nothing goes on the UNRELEASED span here. `release_id` below frees every reaped
-        // slot with nothing alive below it; the rest are pinned, which the span does not hold, and
-        // `detach_child` puts each one back when its last pin goes.
+        // slot with nothing alive below it; the rest are pinned, which the span does not hold. A
+        // later cascade that frees one runs for an originator whose own key covers it.
         // Free ids last: `release_id` refuses while a slot still has live children, so it has to
         // see the child entries that were just attached.
         for id in reaped {
@@ -1374,8 +1374,8 @@ impl BranchCatalog for TableBranchCatalog {
         // - Into `Reaped` with nothing alive below it: on it, until `release_id` takes it off.
         // - Into `Reaped` while PINNED: OFF it. It cannot be released while anything below it
         //   lives, and a span holding every pinned interior made every open pay for all of them,
-        //   under the statement lock (lead audit of `17cbd4c`). `detach_child` puts it back the
-        //   moment its last pin goes.
+        //   under the statement lock (lead audit of `17cbd4c`). It needs no key when its last pin
+        //   goes: the cascade that frees it runs for an originator whose own key covers it.
         match (to, releasable) {
             (BranchState::Reaping, _) | (BranchState::Reaped, Some(true)) => {
                 self.upsert(keys::unreleased(branch.id), Vec::new())?;
@@ -1720,20 +1720,14 @@ impl BranchCatalog for TableBranchCatalog {
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
-        // **D200.** A REAPED parent whose last pin this detach removed is releasable from now on:
-        // back on the UNRELEASED span, in the same sync as the detach, so a crash before the
-        // cascade releases it leaves it where the open sweep looks. Any liveness answer short of a
-        // clear YES marks it too: the sweep asks again, and a stray candidate costs one visit,
-        // never a release.
-        if removed {
-            if let Ok(Some(p)) = self.core(parent_id) {
-                if p.state() == BranchState::Reaped
-                    && !matches!(BranchCatalog::has_live_children(self, parent_id), Ok(true))
-                {
-                    self.upsert(keys::unreleased(parent_id), Vec::new())?;
-                }
-            }
-        }
+        // D200: this does NOT put a reaped parent whose last pin it removed back on the
+        // UNRELEASED span (`b7e8d4e` did; removed in the next commit). Every cascade that
+        // detaches here runs on behalf of an ORIGINATOR whose own key covers it: set at
+        // `Reaping`, kept by the flip because the originator is releasable, and removed only by
+        // its `release_id`, which runs after the cascade. A crash anywhere in the cascade
+        // therefore leaves the originator on the span, and the open sweep re-runs the cascade
+        // from it. The parent mark was a second guard that nothing could fire, costing one
+        // liveness question per detach.
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;

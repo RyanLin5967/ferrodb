@@ -39,9 +39,10 @@
 //!
 //! ⚠ **The "after the fix" column is the count at `2987369`, not at the branch tip.** Later commits
 //! on this branch add liveness questions of their own. From `206af08`, `release_id` asks once per
-//! released ancestor. From `b7e8d4e`, the `Reaped` flip asks once, and `detach_child` asks once
-//! under a Reaped parent. At the tip, REAP is 4·(D−1) = 60 / 252 (still flat, 4 per reap), DRAIN
-//! and WRITE PATH are unchanged, and the CONTROL is 3D+1 = 49 / 193 (lane report §8.6).
+//! released ancestor. From `b7e8d4e`, the `Reaped` flip asks once. (`b7e8d4e` also had
+//! `detach_child` ask under a Reaped parent; the next commit removed that.) At the tip, REAP is
+//! 4·(D−1) = 60 / 252 (still flat, 4 per reap), DRAIN and WRITE PATH are unchanged, and the
+//! CONTROL is 2D+2 = 34 / 130 (lane report §8.6).
 //!
 //! The assertions are on the SLOPE (per-unit cost at D=64 against D=16), not on the exact cells,
 //! so a constant this model missed cannot fail them; the exact cells are printed for the record.
@@ -188,14 +189,14 @@ fn a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth() {
     // ⚠ AMENDED (lane §8.6, append-only). This asserted `<= D+2`, the count at `3d4d4d2` and
     // `2987369`. D200 (`206af08`) made `release_id` ask once per released ancestor, so the count
     // became 2D+1 from that commit on, and the bound failed there. This lane's pre-registration
-    // missed that until the audit re-derivation. The §8.6 change adds one question per Reaped flip
-    // and one per detach under a Reaped parent: 3D+1 at the tip (49 at D=16, 193 at D=64). The
-    // bound is now the linear window [D, 4D]. A walk down the chain would be ~D²/2, 2048 at D=64,
-    // so the window still refuses the defect this control exists to catch.
+    // missed that until the audit re-derivation. The §8.6 change adds one question per Reaped
+    // flip: 2D+2 at the tip (34 at D=16, 130 at D=64). The bound is now the linear window [D, 4D].
+    // A walk down the chain would be ~D²/2, 2048 at D=64, so the window still refuses the defect
+    // this control exists to catch.
     for a in [&small, &large] {
         assert!(
             a.cascade >= a.depth && a.cascade <= 4 * a.depth,
-            "CONTROL moved: cascade={} at D={} (expected 3D+1 at the branch tip, linear in D) — the \
+            "CONTROL moved: cascade={} at D={} (expected 2D+2 at the branch tip, linear in D) — the \
              fixture or the pre-registered model is wrong; the class assertions below mean nothing \
              until it holds",
             a.cascade,
