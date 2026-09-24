@@ -868,14 +868,23 @@ impl TxnManager {
     /// corrections).
     ///
     /// Durable: a marker beside the log, which the next `wal::recovery::open_recovered` honours by
-    /// rebuilding every tree, even when the log it opens is empty. `recover` returns `false` for an
-    /// empty log, and a clean restart can leave one, so without this "the next open rebuilds" was
-    /// false. Visible: one line on stderr, written with `writeln!` and not `eprintln!` (which panics
-    /// on a closed stderr; `branch::lease_thread` records why), plus [`INDEX_UNDO_FAILURES`].
+    /// rebuilding every tree, even when the log it opens holds no data record. `recover` returns
+    /// `false` for such a log, and a clean restart can leave one (an empty log, or since D216 one of
+    /// re-declarations), so without this "the next open rebuilds" was false. Visible: one line on
+    /// stderr, written with `writeln!` and not `eprintln!` (which panics on a closed stderr;
+    /// `branch::lease_thread` records why), plus [`INDEX_UNDO_FAILURES`].
     fn mark_indexes_stale(&self, txn_id: u64, e: &FerroError) {
         use std::io::Write;
         let marker = stale_indexes_marker(&self.wal.path);
-        let written = std::fs::write(&marker, format!("txn {txn_id}: {e}\n"));
+        // **Through `replace_atomically`, not `std::fs::write`** (the D216 re-adversary's M3). The
+        // marker has to survive a power cut, not only a process exit: the entries it describes can
+        // reach the disk before the next checkpoint. D216 also made it the ONLY trigger for a log of
+        // re-declarations, which before then asked for the rebuild by itself.
+        let written = crate::storage::atomic_file::replace_atomically(
+            &crate::storage::atomic_file::OsFileOps,
+            &marker,
+            format!("txn {txn_id}: {e}\n").as_bytes(),
+        );
         let _ = writeln!(
             std::io::stderr(),
             "ferrodb: the rollback of transaction {txn_id} could not undo its primary-index writes ({e}); \
