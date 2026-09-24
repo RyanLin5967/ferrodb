@@ -393,9 +393,45 @@ fn a_lease_expiry_reap_is_attested_exactly_once() {
     assert_eq!(f.runtime.verify_attested_branch(branch).unwrap(), 2, "Reap, Fork, then genesis");
     assert_eq!(f.runtime.attestation_of(branch), None, "a lease-reaped branch still holds a head");
 
-    // Exactly once.
+    // Exactly once: another scan, the reconciliation sweep, and the same id reported to the
+    // forget path a second time (a reaper may name a branch twice) all find nothing to attest.
     scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
     assert_eq!(f.runtime.forget_reaped_branches(), 0, "a workspace outlived the scan's forget");
+    assert_eq!(f.runtime.forget_branches(&[branch]), 0, "a forgotten branch was forgotten again");
+    assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
+    assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// ⛔ **D199, the other door, WRITTEN TO FAIL FIRST.** A branch a reaper took with no forget call
+/// at all (`reap_expired` can reap several and then return `Err`, dropping the ids it had) is
+/// found by `forget_reaped_branches`, which drops its workspace. It must attest the reap exactly
+/// as the scan's forget does. `scan_once` never reaches this path on success, so the test above
+/// cannot see a mutant that removes the attestation only here.
+///
+/// Hand-worked: `[Fork]` before the sweep, `[Fork, Reap]` after, one workspace forgotten, and
+/// nothing more on a second sweep.
+#[test]
+fn a_reap_the_reconciliation_finds_is_attested_exactly_once() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let session = f.runtime.begin_session("sweep-agent", Some("r_2"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    write_pages(&f, branch, 2);
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.reaper.reap(branch).unwrap();
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: nothing has told the runtime yet");
+
+    assert_eq!(f.runtime.forget_reaped_branches(), 1, "the sweep did not find the workspace");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "the reconciliation forgot a reaped branch and left no attestation"
+    );
+    assert_eq!(f.runtime.forget_reaped_branches(), 0, "the sweep found the workspace twice");
     assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
     assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
 }
