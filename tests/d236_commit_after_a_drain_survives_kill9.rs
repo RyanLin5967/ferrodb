@@ -17,8 +17,9 @@
 //!    `HeapInsert`, so it is written under `>=` as well. After the reopen it must be there at every
 //!    commit, which separates "the drained COMMIT was lost" from "the reopen lost committed data".
 //! 1. `BEGIN`, then insert 1.5x the buffer pool into one table: 1536 rows, one per heap page.
-//!    The pool is `MAX_BUFFER_POOL_PAGES` = 1024 frames at `9aa6968`. The first eviction of the
-//!    load drains the log, and every page loaded after it stays dirty and unflushed.
+//!    The pool is `MAX_BUFFER_POOL_PAGES` = 1024 frames at `9aa6968`. The load's first DIRTY
+//!    eviction (the first heap page, at about insert 1016) drains the log, and every page loaded
+//!    after it stays dirty and unflushed.
 //! 2. A `SELECT` that scans every page and matches nothing. It appends no record, and its faults
 //!    must evict at least one of those dirty pages, which drains the buffer. The pool is ARC, not
 //!    LRU, so "must" is a premise, and the test checks it (below).
@@ -32,17 +33,21 @@
 //! ARC is scan-resistant, and the size is what lets this scan get past that (INFERRED from
 //! `src/buffer/arc.rs` at `9aa6968`; `frontier/d236_review.md` W1 and `lane_d236.md` AMENDMENT 1
 //! in artie-research). With c frames and N heap pages:
-//! * The load promotes every page to T2, and its evictions move T2's oldest pages into the ghost
+//! * The load promotes every heap page to T2, and its evictions move T2's oldest pages into the ghost
 //!   list b2. b2 loses entries only once all four lists together hold 2c, so for N < 2c every
 //!   evicted page is still a ghost when the scan starts.
 //! * The scan's first page is a b2 ghost. A ghost hit evicts T2's oldest page, which becomes a
 //!   ghost in turn, so every page the scan reaches is a ghost hit, and each one evicts the next
-//!   oldest load page. At step 2c + 1 - N (about 513 here) it evicts the first dirty page, and the gate
-//!   drains.
+//!   oldest load page. After about 2c - N steps it evicts the first dirty page, and the gate drains
+//!   (step 496 in a model of `arc.rs` driven by this test's access trace, which counts the setup and
+//!   index pages that shift it: `frontier/d236_arc_band_check.md` in artie-research).
 //! * For N ≥ 2c the early pages have left b2 before the scan starts. The scan is then a run of
 //!   complete misses that recycle ONE T1 frame, the dirty tail in T2 is never touched, and nothing
 //!   drains. At 2600 rows this test is predicted to refuse at every commit, and more rows make that
 //!   worse, not better.
+//! * The setup and index pages also sit in the lists, so the band's real upper edge is a few dozen
+//!   pages below 2c (the model drains at N = 2030 and not at 2040). The fixture check below is
+//!   therefore necessary, not sufficient: the premise assertion is what decides a run.
 //!
 //! # The premises, each checked and each refusing rather than passing
 //!
