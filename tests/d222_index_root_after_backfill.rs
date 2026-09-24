@@ -49,6 +49,14 @@
 //! Every expected id comes from the fixture's construction — id `i` holds [`value`]`(i)` or
 //! [`token`]`(i)`, a bijection — and never from the engine. The two INSERT tests pick their probe
 //! off the chain (the first key of the second leaf) and check it against that bijection first.
+//!
+//! # A third symptom: `DROP TABLE` leaked the tree
+//!
+//! `drop_table` frees each index from its RECORDED root, and `free_subtree` on a leaf frees that
+//! one page. So at `9aa6968` dropping a table whose index was built by a splitting backfill
+//! returned the leftmost leaf and leaked every other page of the tree. `wal::recovery::
+//! rebuild_indexes` frees the old tree from the same record and leaked the same way; that path is
+//! not tested here.
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -79,6 +87,9 @@ const FAR: i32 = 950;
 const NEAR: i32 = 5;
 /// Padding after the 6-character prefix, so every key's text is 200 bytes.
 const PAD: usize = 194;
+/// Rows in the `DROP TABLE` test: about 30 leaves, enough to split the root, and no hop count to
+/// meet because nothing there is looked up.
+const LEAK_ROWS: i32 = 300;
 
 type Tree = BPlusTreeManager<(Value, Value), ()>;
 type Leaf = BPlusTreeLeafPage<(Value, Value), ()>;
@@ -174,8 +185,10 @@ impl Db {
 }
 
 /// `t` holding rows `1..=ROWS`, THEN `CREATE INDEX`, so every entry is written by the backfill.
-/// `ANALYZE` last: without statistics `v` gets `DEFAULT_DISTINCT`, and the cost model prefers the
-/// sequential scan for `v = ..`, which premise 3 would refuse.
+/// `ANALYZE` last, for margin rather than necessity: with statistics `v` is unique and the index
+/// costs 17 against the filtered sequential scan's 92 (`cost_model.rs`, `row_width` 24+4+255 = 283,
+/// so 72 heap pages); without them the estimate is 10 rows and the index still wins, but only 89 to
+/// 92, one constant away from the plan premise 3 refuses.
 fn secondary_fixture() -> Db {
     let mut d = Db::new();
     d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(255));");
@@ -472,5 +485,69 @@ fn an_insert_after_create_fulltext_index_posts_into_the_leaf_that_covers_its_tok
         "the new token sorts after every other token, so its posting belongs in the LAST leaf; it \
          is in leaf {at} of {}",
         chain.len()
+    );
+}
+
+/// Build `t` with `LEAK_ROWS` rows and an index on `v` — created BEFORE the rows when
+/// `index_first`, so the INSERT path builds it and `sync_roots` records every root move, and AFTER
+/// them otherwise, so the backfill builds it — then drop and rebuild it twice.
+///
+/// Returns the highest allocated page with the second copy built, and again with the third built.
+/// The first build-and-drop absorbs one-off growth, as in `catalog.rs`'s
+/// `dropping_a_table_returns_its_pages_including_the_time_travel_heap`. The allocator hands out the
+/// lowest free page, and identical statements need identical pages, so if the drop returned every
+/// page the third copy lands exactly on the pages the second one freed and the two numbers match.
+fn highest_page_across_a_drop(index_first: bool) -> (u32, u32) {
+    let mut d = Db::new();
+    let build = |d: &mut Db| {
+        d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(255));");
+        if index_first {
+            d.sql("CREATE INDEX iv ON t (v);");
+        }
+        for i in 1..=LEAK_ROWS {
+            d.sql(&format!("INSERT INTO t VALUES ({i}, '{}');", value(i)));
+        }
+        if !index_first {
+            d.sql("CREATE INDEX iv ON t (v);");
+        }
+    };
+    build(&mut d);
+    d.sql("DROP TABLE t;");
+    build(&mut d);
+    let chain = leaf_chain(&d.bp, d.secondary_root());
+    assert!(
+        chain.len() > 1,
+        "premise failed: {LEAK_ROWS} rows left t.v's tree one leaf, so there is no split tree to \
+         leak and this measures nothing"
+    );
+    let peak = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
+    d.sql("DROP TABLE t;");
+    build(&mut d);
+    let after = d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap");
+    (peak, after)
+}
+
+/// `DROP TABLE` returns every page of an index that `CREATE INDEX` built by backfill.
+///
+/// The control is the same table and the same rows with the index created FIRST, so no backfill
+/// happens and the recorded root is kept current by `sync_roots`. It must not move at the base or
+/// with the fix; if it does, something other than D222 is leaking and the second arm says nothing.
+#[test]
+fn drop_table_returns_every_page_of_an_index_built_by_backfill() {
+    let (control_peak, control_after) = highest_page_across_a_drop(true);
+    assert_eq!(
+        control_after, control_peak,
+        "control: with the index created BEFORE the rows, rebuilding an identical table after a \
+         DROP moved the highest allocated page from {control_peak} to {control_after}. Something \
+         other than the backfill's root read is leaking, so the arm below cannot be read."
+    );
+
+    let (peak, after) = highest_page_across_a_drop(false);
+    assert_eq!(
+        after, peak,
+        "with the index built by CREATE INDEX's backfill, rebuilding an identical table after a \
+         DROP moved the highest allocated page from {peak} to {after}: the drop did not return the \
+         index's pages. `drop_table` frees from the recorded root, and a root read before the \
+         backfill is the leftmost leaf, which frees one page."
     );
 }
