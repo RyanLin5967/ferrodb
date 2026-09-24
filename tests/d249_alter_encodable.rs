@@ -23,13 +23,16 @@ use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
+use ferrodb::catalog::catalog_page::CatalogPage;
+use ferrodb::catalog::column::{Column, DataType, Value};
+use ferrodb::catalog::schema::Schema;
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
-use ferrodb::parser::parser::Parser;
+use ferrodb::parser::parser::{AlterAction, Parser};
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
@@ -50,7 +53,12 @@ impl Db {
             .truncate(true)
             .open(dir.path().join("d249.db"))
             .unwrap();
-        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        // A floor for the page allocator, so that a mutant reaching `persist`'s loop over an entry no
+        // page can hold (D254) refuses at page 256 instead of writing zero pages until the disk is
+        // full. No test here needs more than a few dozen pages.
+        dm.reserve_region("test floor", 256, u32::MAX).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(dm));
         let catalog = Catalog::create(bp.clone()).unwrap();
         let wal = Arc::new(WalManager::new(dir.path().join("d249.wal")).unwrap());
         let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
@@ -174,14 +182,15 @@ fn an_added_column_whose_name_the_catalog_cannot_hold_is_refused_and_wedges_noth
     assert_not_wedged(&mut db, "ADD COLUMN", "after_add");
 }
 
-/// The ADD case again, on a table whose row layout an added column WOULD change.
+/// The ADD case again, on an eight-column table: it pins the wedge, and NOT where the refusal
+/// happens.
 ///
-/// A trailing NULL column occupies its type's width after the existing ones and, below nine
-/// columns, leaves the null bitmap at one byte. So a two-column row rewritten to three still reads
-/// back as its first two values, and the test above cannot tell "refused before the rewrite" from
-/// "refused after it". At the ninth column the bitmap grows to two bytes, and every value after it
-/// moves. A row rewritten under nine columns then does NOT read back under the old eight. This is
-/// the test that pins where the refusal happens, and not only that it happens (I19).
+/// It was written to pin the placement too, on the premise that the ninth column's wider null
+/// bitmap moves every value. That premise is false (D249 review, F1): every INTEGER is padded to a
+/// 4-byte boundary after the 24-byte version header, so eight columns (24 + 1 bytes) and nine
+/// (24 + 2) both put the first value at 28, and a row rewritten under nine reads back unchanged
+/// under eight. `deserialize` checks no length either. The test that pins the placement is the
+/// 33-column one below.
 #[test]
 fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten() {
     let mut db = Db::new();
@@ -219,4 +228,136 @@ fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_re
         ),
     }
     assert_not_wedged(&mut db, "ADD COLUMN (ninth)", "after_add_ninth");
+}
+
+/// Where the refusal happens: before any row is rewritten (I19), on a table where a rewrite would
+/// show.
+///
+/// With 32 INTEGER columns the null bitmap is 4 bytes, so the first value sits at 24 + 4 = 28 with no
+/// padding. With 33 it is 5 bytes, padded to 32, so every value moves. A row rewritten under 33
+/// columns does not read back under the old 32. The premise is asserted through the tuple layer
+/// itself, and is not used as the expected value.
+#[test]
+fn a_thirty_third_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten() {
+    let names: Vec<String> = (0..32).map(|i| if i == 0 { "id".to_string() } else { format!("c{i}") }).collect();
+    let want: Vec<Value> = (1..=32).map(Value::Integer).collect();
+
+    // Premise: a 33-column row does NOT read back as its first 32 values under the 32-column schema.
+    let cols32: Vec<Column> =
+        names.iter().enumerate().map(|(i, n)| Column::new(n.clone(), DataType::Integer, i != 0)).collect();
+    let mut cols33 = cols32.clone();
+    cols33.push(Column::new("added".to_string(), DataType::Integer, true));
+    let mut values33 = want.clone();
+    values33.push(Value::Null);
+    let rewritten = Tuple::serialize(&values33, &Schema::new(cols33), 1).unwrap();
+    assert!(
+        !matches!(rewritten.deserialize(&Schema::new(cols32)), Ok(ref v) if *v == want),
+        "a 33-column row reads back unchanged under 32 columns, so this fixture cannot tell a refusal \
+         before the rewrite from one after it"
+    );
+
+    let mut db = Db::new();
+    let decl: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| if i == 0 { format!("{n} INTEGER NOT NULL") } else { format!("{n} INTEGER") })
+        .collect();
+    db.exec(&format!("CREATE TABLE t ({});", decl.join(", "))).unwrap();
+    let row: Vec<String> = (1..=32).map(|i| i.to_string()).collect();
+    db.exec(&format!("INSERT INTO t VALUES ({});", row.join(", "))).unwrap();
+    let long = over_long();
+
+    let err = db
+        .exec(&format!("ALTER TABLE t ADD COLUMN {long} INTEGER;"))
+        .err()
+        .expect("a 33rd column with a 300-byte name must be refused, not written truncated");
+    assert_refused_by_name(&err, "ADD COLUMN (33rd)");
+
+    let columns = db.catalog.get_table("t").expect("the table is still there").schema.columns.len();
+    assert_eq!(columns, 32, "ADD COLUMN (33rd) was refused, but the catalog in memory holds {columns} columns");
+    match db.exec("SELECT * FROM t;") {
+        Ok(Outcome::Rows(rows)) => assert_eq!(
+            rows,
+            vec![want],
+            "ADD COLUMN (33rd) was refused, but the row no longer reads back under the old 32 columns: it \
+             was rewritten under 33 before the refusal (I19)"
+        ),
+        Ok(_) => panic!("SELECT after the refusal returned something other than rows"),
+        Err(e) => panic!("SELECT after the refused ADD COLUMN (33rd) failed: {e}"),
+    }
+    assert_not_wedged(&mut db, "ADD COLUMN (33rd)", "after_add_33rd");
+}
+
+/// The size arm, reached through an INDEX rename.
+///
+/// A rename grows the entry twice when the renamed column is indexed: once in the schema, once in the
+/// index record, which also names the column. Here the schema-only growth still fits a page and the
+/// full growth does not, so a pre-check that forgot the index renames would pass it. Both halves are
+/// premises, asserted through the page's own placement question.
+#[test]
+fn a_rename_that_grows_an_indexed_column_past_a_page_is_refused_by_size() {
+    let mut db = Db::new();
+    let fillers: Vec<String> = (1..=14).map(|i| format!("f{i:02}{}", "x".repeat(252))).collect();
+    assert!(fillers.iter().all(|f| f.len() == 255), "each filler name must be exactly 255 bytes");
+    let decl: Vec<String> = fillers.iter().map(|f| format!("{f} INTEGER")).collect();
+    db.exec(&format!("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER, {});", decl.join(", "))).unwrap();
+    db.exec("CREATE INDEX ix ON t (v);").unwrap();
+    let to = "w".repeat(255);
+
+    // Premises: renaming the schema alone would fit an empty catalog page; renaming the index too does
+    // not.
+    let before = db.catalog.get_table("t").expect("the table is there").clone();
+    let mut schema_only = before.clone();
+    for c in schema_only.schema.columns.iter_mut() {
+        if c.name == "v" {
+            c.name = to.clone();
+        }
+    }
+    let mut full = schema_only.clone();
+    for ix in full.indexes.iter_mut() {
+        if ix.column_name == "v" {
+            ix.column_name = to.clone();
+        }
+    }
+    assert!(
+        CatalogPage::new(0).has_space(&schema_only),
+        "the schema-only rename already overflows a page, so this cannot see the index half"
+    );
+    assert!(!CatalogPage::new(0).has_space(&full), "the full rename fits a page, so this tests nothing");
+
+    let err = db
+        .exec(&format!("ALTER TABLE t RENAME COLUMN v TO {to};"))
+        .err()
+        .expect("a rename that grows the entry past a catalog page must be refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, FerroError::Constraint(_)) && msg.contains("\"t\"") && msg.contains("catalog page"),
+        "expected the size refusal naming the table, got: {err:?}"
+    );
+    let after = db.catalog.get_table("t").expect("the table is still there");
+    assert!(
+        after.schema.columns.iter().any(|c| c.name == "v") && after.indexes.iter().any(|ix| ix.column_name == "v"),
+        "the rename was refused, but the catalog in memory holds the renamed column or index"
+    );
+    assert_not_wedged(&mut db, "RENAME COLUMN (indexed, past a page)", "after_index_rename");
+}
+
+/// A plan decides against the entry it read. Held across a change to the same table, it must be
+/// refused, not installed over an entry nobody checked.
+#[test]
+fn a_plan_held_across_a_change_to_its_own_table_is_refused() {
+    let mut db = Db::with_one_row();
+    let rename = AlterAction::RenameColumn { from: "v".to_string(), to: "w".to_string() };
+    let plan = db.catalog.plan_alters("t", std::slice::from_ref(&rename), &db.txn, None).unwrap();
+
+    // The table changes while the plan is held: an index on the column the plan renames.
+    db.catalog.create_index("t", "v").unwrap();
+
+    let applied = db.catalog.apply_plan(plan, &db.txn);
+    assert!(applied.is_err(), "a plan made before the table changed was applied anyway");
+    let entry = db.catalog.get_table("t").expect("the table is still there");
+    assert!(
+        entry.schema.columns.iter().any(|c| c.name == "v") && entry.indexes.iter().any(|ix| ix.column_name == "v"),
+        "the stale plan was refused, but the table no longer has its column v with its index"
+    );
 }
