@@ -1339,6 +1339,48 @@ impl BufferPoolManager {
         Ok(())
     }
 
+    /// Free `pages` on disk and drop their frames, **refusing whole** if any of them is pinned
+    /// (D229; `invalidate_all`'s rule). Every page is checked before any bit is written, so a
+    /// refusal leaves the pool and the bitmap exactly as they were.
+    ///
+    /// The bits go through [`DiskManager::deallocate_many`], one write per bitmap page, and only
+    /// then are the frames dropped, as in `free_page`. An I/O error on a later bitmap page leaves
+    /// earlier bits clear with every frame still resident; the caller's quarantine and durable
+    /// intent are what make that safe. A dirty frame is discarded: its page is being freed.
+    ///
+    /// Still holding the page-table write lock across the bitmap writes, so no thread can fault a
+    /// page in between the check and the free. page_table -> bitmap_lock is the only order.
+    pub fn free_pages(&self, pages: &[u32]) -> Result<(), FerroError> {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
+        let mut pt = self.page_table.write().unwrap();
+        let mut resident = Vec::new();
+        for &page_id in pages {
+            if let Some(&frame_i) = pt.get(&page_id) {
+                if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                    return Err(FerroError::PagePinned);
+                }
+                resident.push((page_id, frame_i));
+            }
+        }
+        self.disk_manager.deallocate_many(pages)?;
+        for (page_id, _) in &resident {
+            pt.remove(page_id);
+        }
+        drop(pt);
+        for (page_id, frame_i) in resident {
+            let mut frame = self.frame_write(frame_i);
+            frame.page_id = None;
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+            drop(frame);
+            self.arc_locked().remove(page_id)?;
+        }
+        Ok(())
+    }
+
     /// Drop every cached page **without writing any of them back**.
     ///
     /// For F6: a snapshot install replaces the page file underneath this pool, so every frame it

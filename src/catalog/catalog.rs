@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog_page::{CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry};
@@ -108,6 +108,14 @@ pub struct Catalog {
     /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
     /// write statement no longer invalidates every reader's cache.
     epoch: u64,
+    /// **How many catalog pages, from the first, held an entry at the last persist or load**
+    /// (D229 (c)). The chain never shrinks: `persist` keeps every page linked, writes an empty image
+    /// to a page that has just stopped holding entries, and stops there, so it rewrites the used
+    /// pages and not the chain's peak length (the review's repair of R0).
+    ///
+    /// Shared by clones, as the chain it counts is: a clone that persisted would write the same
+    /// pages. Deliberately not serialized; `load` recounts it from the chain.
+    catalog_pages_used: Arc<AtomicU32>,
 }
 
 impl Catalog {
@@ -119,11 +127,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, catalog_pages_used: Arc::new(AtomicU32::new(1))})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, catalog_pages_used: Arc::new(AtomicU32::new(1))};
         catalog.load()?;
         Ok(catalog)
     }
@@ -479,48 +487,53 @@ impl Catalog {
         Ok(())
     }
 
-    /// Remove a table and give back every page it allocated.
+    /// Every page a table holds, ascending: both heaps (directory pages and the pages they list)
+    /// and every node of its primary, B-tree and full-text trees. Reads only.
     ///
-    /// **E69 found three gaps in this, all of them because nothing had ever called it.** It has existed
-    /// since the catalog did, and until `DROP TABLE` reached the SQL surface there was no caller at
-    /// all - so a page leak and a stale-stats bug sat here unexercised:
+    /// This is what a DROP names in its durable intent BEFORE it unlinks the table (D229), because
+    /// the entry is the only record of where those pages are, and the process that trusts the
+    /// trees is this one.
     ///
-    /// - the **time-travel heap was never freed**. Every table has one (`time_travel_root`), `UPDATE`
-    ///   and `DELETE` push old versions into it, and dropping the table left all of it allocated. On a
-    ///   table with any update history that is the larger leak of the two heaps.
-    /// - `self.stats` kept the dropped table's row counts, so a table recreated under the same name
-    ///   inherited the old table's statistics and the optimizer planned against a stranger's data.
-    /// - the missing-table error was a bare `KeyNotFound`, rendering as "key wasn't found" - the exact
-    ///   contentless message E67 removed everywhere else.
+    /// **E69's gaps stay closed here:** the time-travel heap is a table's larger heap once it has
+    /// update history (E69), and the full-text trees are listed beside the B-tree ones (B8). Every
+    /// tree is read from its LIVE root, its shared cell, and not from the record (D208 review 2,
+    /// C4). A record that lags its cell names the pre-split page, which is now the new root's left
+    /// child (a leaf if the tree was one level deep, an internal node otherwise; D208 review 3,
+    /// C3), and reading from it misses the rest of the tree (`tests/root_cell_is_per_index.rs`, T12).
     ///
-    /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
-    /// where those pages are.
-    pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
-        // Every tree is freed from its LIVE root, its shared cell, and not from the record (D208
-        // review 2, C4). A record that lags its cell names the pre-split page, which is now the new
-        // root's left child (a leaf if the tree was one level deep, an internal node otherwise; D208
-        // review 3, C3). Freeing from it frees that left part and leaks the rest of the tree
-        // (`tests/root_cell_is_per_index.rs`, T12).
-        let (heap_dir, tt_root, primary_root, sec_roots) = {
-            let entry = self.require_table(name)?;
-            (
-                entry.first_directory_page_id,
-                entry.time_travel_root,
-                self.live_root(name, None, entry.primary_index_root),
-                // B8: the full-text roots go in the SAME list because the trees are the same type,
-                // and leaving them out would leak one tree per full-text index on every DROP TABLE
-                // — the E69 gap, re-opened by a second index list.
-                entry.indexes.iter().map(|i| self.live_root(name, Some(IndexTree::Secondary(&i.column_name)), i.root_page_id))
-                    .chain(entry.fulltext_indexes.iter().map(|i| self.live_root(name, Some(IndexTree::FullText(&i.column_name)), i.root_page_id)))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        HeapFileManager::open(heap_dir, self.buffer_pool.clone()).free_all()?;
-        HeapFileManager::open(tt_root, self.buffer_pool.clone()).free_all()?;
-        BPlusTreeManager::<Value, RecordId>::open(primary_root, self.buffer_pool.clone()).free_all()?;
-        for root in sec_roots {
-            BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).free_all()?;
+    /// Refuses a page two of the table's structures name: freeing it for this table would free it
+    /// under its other owner too.
+    pub fn table_pages(&self, name: &str) -> Result<Vec<u32>, FerroError> {
+        let entry = self.require_table(name)?;
+        let mut pages = BTreeSet::new();
+        HeapFileManager::open(entry.first_directory_page_id, self.buffer_pool.clone()).collect_pages(&mut pages)?;
+        HeapFileManager::open(entry.time_travel_root, self.buffer_pool.clone()).collect_pages(&mut pages)?;
+        let primary = self.live_root(name, None, entry.primary_index_root);
+        BPlusTreeManager::<Value, RecordId>::open(primary, self.buffer_pool.clone()).collect_pages(&mut pages)?;
+        let index_roots = entry
+            .indexes
+            .iter()
+            .map(|i| self.live_root(name, Some(IndexTree::Secondary(&i.column_name)), i.root_page_id))
+            .chain(entry.fulltext_indexes.iter().map(|i| self.live_root(name, Some(IndexTree::FullText(&i.column_name)), i.root_page_id)));
+        for root in index_roots {
+            BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).collect_pages(&mut pages)?;
         }
+        Ok(pages.into_iter().collect())
+    }
+
+    /// Remove a table from the catalog. **Frees nothing** (D229).
+    ///
+    /// Its pages are freed by the DROP that calls this, and only after the DDL's checkpoint has made
+    /// the removal durable and truncated the log: `TxnManager::drop_checkpointed`, with the pages
+    /// from [`Catalog::table_pages`] named in a durable intent BEFORE this runs. Freeing here, before
+    /// the removal was durable, was what let a crash leave a table named over free pages, and a
+    /// free that failed part-way leave one in the same process (`frontier/d229_design.md` §2 (b), (f)).
+    ///
+    /// E69, which found the time-travel heap never freed, also found two gaps that stay closed here:
+    /// `self.stats` kept the dropped table's row counts, so a table recreated under the same name
+    /// was planned against a stranger's data; and the missing-table error was a bare `KeyNotFound`.
+    pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
+        self.require_table(name)?;
         self.tables.remove(name);
         self.stats.remove(name);
         self.persist()?;
@@ -629,6 +642,25 @@ impl Catalog {
         }
     }
 
+    /// Write every entry into the catalog chain, in the pool.
+    ///
+    /// **The chain never shrinks (D229 (c), closes D238).** Entries are packed from the first page
+    /// on, in name order. A page that stops holding entries is written as an empty catalog page and
+    /// KEPT in the chain, linked; nothing here frees a page. The chain used to be cut after the
+    /// last page with entries and the rest freed at once, before the shortened chain was durable,
+    /// so a crash could leave page 1 on disk still linking a page `allocate` then handed to someone
+    /// else and zero-wrote, and the next `load` refused it: the database stopped opening
+    /// (`frontier/d229_candidates_adversary.md` (e)).
+    ///
+    /// **It walks only as far as it must:** past every page that holds an entry now, and past every
+    /// page that held one at the last persist or load (`catalog_pages_used`), so a page that has just
+    /// become empty is written empty. Pages beyond both are empty already and are not rewritten, so
+    /// a persist after a mass DROP costs the pages in use, not the chain's peak length (the review's
+    /// repair of R0).
+    ///
+    /// ⚠ **Not crash-atomic across pages**, and not made so here: a persist that moves entries
+    /// between pages, cut off part-way, can leave an entry on two pages or on none. `load` resolves
+    /// the first (the earlier page's copy wins); the second is D240, a separate row.
     pub fn persist(&self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
@@ -640,6 +672,9 @@ impl Catalog {
         let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
         sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let mut iter = sorted.into_iter().peekable();
+        let was_used = self.catalog_pages_used.load(Ordering::Acquire).max(1);
+        let mut written = 0u32;
+        let mut used = 1u32;
 
         loop {
             let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
@@ -661,61 +696,64 @@ impl Catalog {
             }
 
             let has_more = iter.peek().is_some();
-            let mut orphan_head = 0;
-            if has_more {
-                if page.next_catalog_page == 0 {
-                    let new_id = self.buffer_pool.new_page()?;
-                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
-                    // zero-filled page, and the next turn of this loop deserializes whatever is at
-                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
-                    // with format byte 0. That used to parse as an accidentally-empty page because
-                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
-                    // is between initialising the page here and teaching the format allowlist to
-                    // accept all-zeroes, which would let a genuinely corrupt page through.
-                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
-                    {
-                        let mut frame = self.buffer_pool.frame_write(frame_i);
-                        frame.data = CatalogPage::new(new_id).serialize()?;
-                    }
-                    self.buffer_pool.unpin_page(new_id, true);
-                    page.next_catalog_page = new_id;
+            if has_more && page.next_catalog_page == 0 {
+                let new_id = self.buffer_pool.new_page()?;
+                // Stamp it as an empty catalog page before linking it. `new_page` hands back a
+                // zero-filled page, and the next turn of this loop deserializes whatever is at
+                // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
+                // with format byte 0. That used to parse as an accidentally-empty page because
+                // byte 0 was never read; now that the byte is the format stamp (B8), the choice
+                // is between initialising the page here and teaching the format allowlist to
+                // accept all-zeroes, which would let a genuinely corrupt page through.
+                let frame_i = self.buffer_pool.fetch_page(new_id)?;
+                {
+                    let mut frame = self.buffer_pool.frame_write(frame_i);
+                    frame.data = CatalogPage::new(new_id).serialize()?;
                 }
-            } else {
-                orphan_head = page.next_catalog_page;
-                page.next_catalog_page = 0;
+                self.buffer_pool.unpin_page(new_id, true);
+                page.next_catalog_page = new_id;
             }
 
             let next = page.next_catalog_page;
+            written += 1;
+            if !page.entries.is_empty() {
+                used = written;
+            }
 
             {
                 let mut frame = self.buffer_pool.frame_write(frame_i);
                 frame.data = page.serialize()?;
             }
             self.buffer_pool.unpin_page(curr_page_id, true);
+            // Raised as each page is written, so a persist that fails part-way still leaves the
+            // count covering every page it put entries on, and the next one rewrites them.
+            self.catalog_pages_used.fetch_max(used, Ordering::AcqRel);
 
-            if !has_more {
-                let mut free_id = orphan_head;
-                while free_id != 0 {
-                    let frame_i = self.buffer_pool.fetch_page(free_id)?;
-                    let next_orphan = {
-                        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                        CatalogPage::deserialize(frame.data)?.next_catalog_page
-                    };
-
-                    self.buffer_pool.unpin_page(free_id, false);
-                    self.buffer_pool.delete_page(free_id)?;
-                    free_id = next_orphan;
-                }
+            if next == 0 || (!has_more && written >= was_used) {
                 break;
             }
             curr_page_id = next;
         }
+        self.catalog_pages_used.store(used, Ordering::Release);
         Ok(())
     }
 
-    // traverses catalog pages and loads into hashmap
+    /// Read the catalog chain into `tables`.
+    ///
+    /// **A table named on two pages is loaded from the EARLIER page** (D229 (c); the candidates
+    /// adversary's caveat on R0). Now that the chain never shrinks, a persist that moves an entry
+    /// to an earlier page leaves its old copy on a later page until that page is rewritten.
+    /// `flush_all` writes in ascending page id and page 1 is the lowest, so a crash in between
+    /// leaves page 1 new and the tail old, and the earlier copy is the newer one. The later copy
+    /// used to win (`HashMap::insert` in chain order), root and all.
+    ///
+    /// It also recounts `catalog_pages_used`: up to the last page with an entry, which is where
+    /// the next persist must write to.
     pub fn load(&mut self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
+        let mut loaded: HashMap<String, TableEntry> = HashMap::new();
+        let mut position = 0u32;
+        let mut used = 1u32;
         loop{
             let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
             let cat_page = {
@@ -723,14 +761,20 @@ impl Catalog {
                 CatalogPage::deserialize(frame.data)?
             };
             self.buffer_pool.unpin_page(curr_page_id, false);
+            position += 1;
+            if !cat_page.entries.is_empty() {
+                used = position;
+            }
             for entry in cat_page.entries {
-                self.tables.insert(entry.name.clone(), entry);
+                loaded.entry(entry.name.clone()).or_insert(entry);
             }
             if cat_page.next_catalog_page == 0 {
                 break;
             }
             curr_page_id = cat_page.next_catalog_page;
         }
+        self.tables.extend(loaded);
+        self.catalog_pages_used.store(used, Ordering::Release);
         // Seed the shared root cells from the records just loaded.
         self.sync_root_cells();
         // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.

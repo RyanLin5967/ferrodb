@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}, wal::txn::TxnManager};
@@ -400,9 +401,22 @@ impl HeapFileManager {
         }
     }
 
-    pub fn free_all(&self) -> Result<(), FerroError> {
+    /// Every page of this heap, its directory pages and the pages they list, added to `into`.
+    /// Reads only (D229): a DROP names its pages in a durable intent first and frees them only
+    /// after its checkpoint, so this replaced `free_all`, which freed each page as it went and left
+    /// a table named over free pages whenever one free failed part-way.
+    ///
+    /// Refuses a page `into` already holds: a page named twice is an alias, and freeing it on this
+    /// table's behalf would free it under its other owner as well.
+    pub fn collect_pages(&self, into: &mut BTreeSet<u32>) -> Result<(), FerroError> {
         let mut dir_page_id = self.first_directory_page_id;
         while dir_page_id != 0 {
+            if !into.insert(dir_page_id) {
+                return Err(FerroError::Io(format!(
+                    "the heap from directory page {} reaches page {dir_page_id} a second time",
+                    self.first_directory_page_id
+                )));
+            }
             let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
             let dir = {
                 let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
@@ -410,11 +424,14 @@ impl HeapFileManager {
             };
             self.buffer_pool_manager.unpin_page(dir_page_id, false);
             for entry in &dir.entries {
-                self.buffer_pool_manager.free_page(entry.page_id)?;
+                if !into.insert(entry.page_id) {
+                    return Err(FerroError::Io(format!(
+                        "the heap from directory page {} lists page {} that is already named",
+                        self.first_directory_page_id, entry.page_id
+                    )));
+                }
             }
-            let next = dir.next_page_directory;
-            self.buffer_pool_manager.free_page(dir_page_id)?;
-            dir_page_id = next;
+            dir_page_id = dir.next_page_directory;
         }
         Ok(())
     }

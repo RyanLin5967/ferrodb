@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,16 @@ pub struct DiskManager {
     /// the branch catalog needs a page source of its own that does not depend on the branch
     /// catalog, and there was nowhere to put it. So the floor became a table.
     regions: Mutex<Vec<Region>>,
+    /// **Pages a DROP has given up and whose durable intent is not yet cleared (D229).** `allocate`
+    /// skips them, as it skips a region, whether their bits are set or already clear.
+    ///
+    /// A DROP frees its pages only after its checkpoint has made the unlink durable, and removes
+    /// its intent only after the frees are synced. In between, and across a crash (the next open
+    /// re-quarantines every pending intent's pages BEFORE recovery can allocate, the review's A1),
+    /// a page here may be clear on disk while the intent still says it will be freed. Handing one
+    /// out then would let the intent free it a second time under its new owner. In memory only, and
+    /// deliberately: the intent file is the durable half. Lock order: `bitmap_lock` first.
+    quarantine: Mutex<BTreeSet<u32>>,
 }
 
 /// A half-open page range `[lo, hi)` owned by some allocator other than this one.
@@ -136,6 +147,7 @@ impl DiskManager{
             storage,
             bitmap_lock: Mutex::new(()),
             regions: Mutex::new(Vec::new()),
+            quarantine: Mutex::new(BTreeSet::new()),
         })
     }
     
@@ -212,6 +224,128 @@ impl DiskManager{
             Err(e) => return Err(e)
         };
         Ok(())
+    }
+
+    /// Clear the bits of `pages`: **one write per bitmap page, and every page checked before any is
+    /// written** (D229). A page inside a reserved region, or past the end of the bitmap chain,
+    /// refuses the whole call with nothing written.
+    ///
+    /// Against `deallocate` in a loop, this reads the chain once rather than once per page, and a
+    /// refusal no longer arrives after half the pages are free. An I/O error on a LATER bitmap page
+    /// still leaves the earlier ones written: the bits are spread over several pages and no single
+    /// write covers them. The caller's quarantine and durable intent are what make that safe.
+    pub fn deallocate_many(&self, pages: &[u32]) -> Result<(), FerroError> {
+        self.write_bits(pages, false)
+    }
+
+    /// Set the bits of `pages`, with `deallocate_many`'s checks and write order (D229, the review's
+    /// caveat 2). The recovery reset uses it for pages a durable structure names whose bit is clear:
+    /// a crash model that loses unsynced writes can revert a bit that the heap's own log redoes.
+    pub fn set_allocated(&self, pages: &[u32]) -> Result<(), FerroError> {
+        self.write_bits(pages, true)
+    }
+
+    fn write_bits(&self, pages: &[u32], set: bool) -> Result<(), FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        for &page_id in pages {
+            // An arena page has no bit here, as in `deallocate`.
+            if let Some(r) = self.region_containing(page_id) {
+                return Err(FerroError::Io(format!(
+                    "page {} is inside the reserved '{}' region [{}, {}) and is not this allocator's \
+                     to free",
+                    page_id, r.name, r.lo, r.hi
+                )));
+            }
+        }
+        let chain = self.chain_locked()?;
+        let mut by_bitmap: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for &page_id in pages {
+            let k = (page_id / BITS_PER_BITMAP) as usize;
+            if k >= chain.len() {
+                return Err(FerroError::Io(format!(
+                    "page {page_id} is past the end of the allocation bitmap chain ({} page(s)), so it has no bit to change",
+                    chain.len()
+                )));
+            }
+            by_bitmap.entry(k).or_default().push(page_id);
+        }
+        for (k, ids) in by_bitmap {
+            let mut bitmap = self.read(chain[k])?;
+            for page_id in ids {
+                let local = page_id % BITS_PER_BITMAP;
+                let byte_index = (local / 8) as usize + 4;
+                if set {
+                    bitmap[byte_index] |= 1 << (local % 8);
+                } else {
+                    bitmap[byte_index] &= !(1 << (local % 8));
+                }
+            }
+            self.write(chain[k], &bitmap)?;
+        }
+        Ok(())
+    }
+
+    /// The bitmap chain's page ids, from page 0. Caller holds `bitmap_lock`.
+    fn chain_locked(&self) -> Result<Vec<u32>, FerroError> {
+        let mut chain = vec![0u32];
+        loop {
+            let page = self.read(*chain.last().expect("the chain starts at page 0"))?;
+            let next = u32::from_le_bytes(page[0..4].try_into().unwrap());
+            if next == 0 {
+                return Ok(chain);
+            }
+            if chain.contains(&next) {
+                return Err(FerroError::Io(format!("the allocation bitmap chain cycles at page {next}")));
+            }
+            chain.push(next);
+        }
+    }
+
+    /// The pages that hold the allocation bitmap itself, from page 0 (D229: the recovery reset
+    /// keeps them, and they hold no page type byte of their own).
+    pub fn bitmap_chain(&self) -> Result<Vec<u32>, FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        self.chain_locked()
+    }
+
+    /// Every page whose bit is set, ascending: the recovery reset's candidates (D229).
+    pub fn allocated_pages(&self) -> Result<Vec<u32>, FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        let mut out = Vec::new();
+        for (k, id) in self.chain_locked()?.into_iter().enumerate() {
+            let bitmap = self.read(id)?;
+            let base = k as u32 * BITS_PER_BITMAP;
+            for local in 0..BITS_PER_BITMAP {
+                if bitmap[(local / 8) as usize + 4] & (1 << (local % 8)) != 0 {
+                    out.push(base + local);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keep `pages` out of [`DiskManager::allocate`] until they are released (D229, see the field).
+    pub fn quarantine(&self, pages: &[u32]) {
+        self.quarantine.lock().unwrap().extend(pages.iter().copied());
+    }
+
+    /// Let `allocate` hand `pages` out again. Only after their intent is durably gone (A4).
+    pub fn release_quarantine(&self, pages: &[u32]) {
+        let mut quarantine = self.quarantine.lock().unwrap();
+        for page in pages {
+            quarantine.remove(page);
+        }
+    }
+
+    /// The pages [`DiskManager::allocate`] is skipping, ascending. Diagnostics and tests.
+    pub fn quarantined(&self) -> Vec<u32> {
+        self.quarantine.lock().unwrap().iter().copied().collect()
+    }
+
+    /// The page file's length in bytes. The recovery reset frees a set bit whose page lies wholly
+    /// past it: that page's zero-write never landed, so nothing was ever written there (D229).
+    pub fn file_len(&self) -> Result<u64, FerroError> {
+        self.storage.len().map_err(|e| FerroError::Io(e.to_string()))
     }
 
     /// Highest page the **bitmap allocator** has handed out, plus one.
@@ -401,6 +535,9 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
         // Snapshot once. There are a handful of regions at most, and re-locking inside the bit
         // loop would take the regions lock millions of times per scan.
         let regions: Vec<Region> = self.regions.lock().unwrap().clone();
+        // Held, not snapshotted: it is empty unless a DROP's frees are pending (D229), and a copy
+        // per call would cost a big DROP's page count on every allocation.
+        let quarantine = self.quarantine.lock().unwrap();
         let mut current_bitmap_id = 0;
         let mut global_offset = 0;
         loop {
@@ -430,6 +567,11 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
                                 }
                                 continue;
                             }
+                            // A page a pending DROP intent will free (D229). Skipped like a bounded
+                            // region's page, for the same reason.
+                            if quarantine.contains(&candidate) {
+                                continue;
+                            }
                             page_bitmap[byte_index] |= 1 << bit_index;
                             self.write(current_bitmap_id, &page_bitmap)?;
                             return Ok(candidate);
@@ -452,9 +594,12 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
             // Two pages are about to be taken: the new bitmap page and the page it serves. BOTH
             // must fall outside every reserved region. `advance_past_regions` is a free function
             // precisely so this can be tested without first handing out 32736 pages.
+            // Past every quarantined page as well (D229): once a DROP's pages are freed their bits
+            // are clear, so the bitmap's high-water mark no longer covers them.
             let raw_base = self
                 .scan_bitmap_high_water()?
-                .max(self.next_page_id.load(Ordering::SeqCst));
+                .max(self.next_page_id.load(Ordering::SeqCst))
+                .max(quarantine.last().map_or(0, |q| q.saturating_add(1)));
             let grow_base = match advance_past_regions(&regions, raw_base) {
                 Ok(b) => b,
                 Err(r) => {

@@ -69,7 +69,7 @@
 //! tree overlap. Page latches live on the shared `BufferPoolManager` so they would still exclude
 //! correctly, but the stale `root_page_id` is a separate defect and this change does not fix it.
 
-use std::{marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
+use std::{collections::BTreeSet, marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}, range_scan::RangeScanner}};
 use crate::storage::index_page::BPlusTreePage;
@@ -294,8 +294,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// hint, the latched path answers. It is always correct, only slow.
     ///
     /// What makes a snapshot safe to descend: leaves never go underfull (nothing frees a tree
-    /// page except `free_all`, under the exclusive catalog lock with readers drained), so a page
-    /// this reader copied cannot have been reused as something else mid-descent.
+    /// page except a DROP, after its checkpoint and under the exclusive catalog lock with readers
+    /// drained, and the recovery reset, before any statement runs; D229), so a page this reader
+    /// copied cannot have been reused as something else mid-descent.
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         const RESTARTS: usize = 16;
         const RIGHT_WALK: usize = 64;
@@ -741,17 +742,32 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(())
     }
 
-    pub fn free_subtree(&self, page_id: u32) -> Result<(), FerroError> {
-        if let BPlusTreePage::Internal(internal) = self.read_node(page_id)? {
-            for child in &internal.child_ptrs {
-                self.free_subtree(*child)?;
+    /// Every node of this tree, from its root through the child pointers and along the leaf chain,
+    /// added to `into`. Reads only (D229): a DROP names its pages in a durable intent first and
+    /// frees them only after its checkpoint, so this replaced `free_all`, which freed as it walked.
+    /// The leaf chain is followed too, so a right half whose parent was never told of it (a split
+    /// that failed before `insert_into_parent`) is not leaked.
+    ///
+    /// Refuses a node `into` already holds from another structure: a page named twice is an alias.
+    pub fn collect_pages(&self, into: &mut BTreeSet<u32>) -> Result<(), FerroError> {
+        let mut mine = BTreeSet::new();
+        let mut stack = vec![self.root_page_id.load(Ordering::Acquire)];
+        while let Some(page_id) = stack.pop() {
+            if !mine.insert(page_id) {
+                continue;
+            }
+            if into.contains(&page_id) {
+                return Err(FerroError::Io(format!(
+                    "tree node {page_id} is already named by another structure"
+                )));
+            }
+            match self.read_node(page_id)? {
+                BPlusTreePage::Internal(node) => stack.extend(node.child_ptrs.iter().copied()),
+                BPlusTreePage::Leaf(leaf) => stack.extend(leaf.next),
             }
         }
-        self.buffer_pool.free_page(page_id)
-    }
-
-    pub fn free_all(&self) -> Result<(), FerroError> {
-        self.free_subtree(self.root_page_id.load(Ordering::Acquire))
+        into.extend(mine);
+        Ok(())
     }
 
     pub fn read_leaf(&self, page_id: u32) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
@@ -784,19 +800,6 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                 }
             }
         }
-    }
-
-    pub fn free_tree(&self) -> Result<(), FerroError> {
-        self.free_from(self.root_page_id.load(Ordering::SeqCst))
-    }
-
-    fn free_from(&self, page_id: u32) -> Result<(), FerroError> {
-        if let BPlusTreePage::Internal(node) = self.read_node(page_id)? {
-            for child in &node.child_ptrs {
-                self.free_from(*child)?;
-            }
-        }
-        self.buffer_pool.free_page(page_id)
     }
 
     /// Rebalance an underfull node — **unimplemented, and E70 measured why that is currently safe.**

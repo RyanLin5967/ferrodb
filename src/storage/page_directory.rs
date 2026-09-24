@@ -15,6 +15,8 @@ pub struct PageDirectoryEntry {
 const HEADER_SIZE: usize = 11;
 const ENTRY_SIZE: usize = 6;
 const PAGE_TYPE_DIRECTORY: u8 = 1;
+/// The most entries one directory page holds: `add_entry` refuses the next.
+pub const MAX_ENTRIES: usize = (PAGE_SIZE - HEADER_SIZE) / ENTRY_SIZE;
 // HEADER FORMAT: |page_type (u8, 1)|page_id (u32, 4)|next_page_directory (u32, 4)|num_entries (u16, 2)|
 impl PageDirectory {
 
@@ -103,6 +105,32 @@ impl PageDirectory {
             num_entries: num_entries as u16,
             entries,
         }
+    }
+
+    /// [`PageDirectory::deserialize`] for bytes read after a crash, which must not be trusted to
+    /// be a directory page (D229's recovery reset; the design's E6). `deserialize` checks neither
+    /// the type byte nor the entry count, and a count past the page panics on a slice bound.
+    ///
+    /// `Ok(None)` for an all-zero page: the image a crash leaves of a directory page that was
+    /// allocated (`new_page` zero-writes at once) and never written. It names nothing.
+    pub fn parse_checked(bytes: [u8; PAGE_SIZE]) -> Result<Option<Self>, FerroError> {
+        if bytes.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        let stored_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        if bytes[0] != PAGE_TYPE_DIRECTORY {
+            return Err(FerroError::Io(format!(
+                "page {stored_id} was reached as a heap directory page but its type byte is {}",
+                bytes[0]
+            )));
+        }
+        let num_entries = u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize;
+        if num_entries > MAX_ENTRIES {
+            return Err(FerroError::Io(format!(
+                "directory page {stored_id} claims {num_entries} entries; a page holds at most {MAX_ENTRIES}"
+            )));
+        }
+        Ok(Some(Self::deserialize(bytes)))
     }
 
 }

@@ -340,7 +340,15 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             // Lane §21: a DROP must TRUNCATE, not only flush, because it frees the pages the log's
             // records name. So it names the heaps it frees, and is refused before the drop while
             // another table owes a release. See `TxnManager::drop_checkpointed`.
-            txn.drop_checkpointed(&[dir_root, tt_root], || catalog.drop_table(&table))?;
+            //
+            // D229: the table's pages are named in a durable intent BEFORE it is unlinked, while this
+            // process still trusts its trees, and freed only after the checkpoint has made the unlink
+            // durable and truncated the log. `drop_table` frees nothing.
+            txn.drop_checkpointed(&[dir_root, tt_root], |intent| {
+                let pages = catalog.table_pages(&table)?;
+                intent.record(&table, dir_root, pages)?;
+                catalog.drop_table(&table)
+            })?;
             // B9: the agent layer keys row authorship and version stamps by a hash of the table
             // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
             // would attribute the new table's rows to an agent that never touched it. See
