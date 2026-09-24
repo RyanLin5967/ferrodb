@@ -2907,6 +2907,63 @@ mod tests {
         assert_eq!(ids, sorted, "scan came back out of branch-id order");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **Wall #21 — the witness, made to fire against each check it may not skip.**
+    ///
+    /// The integration test (`tests/wall21_reaped_chain_liveness.rs`) proves the cost. This
+    /// proves the guards, one at a time, because in production they mask each other:
+    /// `detach_from_parent` and `release_id` both ask `has_live_children` before they act, and a
+    /// NO drops the root's witness — so a mutant of `valid_witness`'s identity check can never
+    /// be reached through the reaper. Each step below drives one check directly, and re-files the
+    /// witnesses first so an earlier drop cannot pass a later step for it.
+    #[test]
+    fn a_witness_answers_only_for_the_incarnations_it_names_and_is_dropped_when_they_die() {
+        let (c, p, _pool) = cat("w21witness");
+        let t = BranchId::TRUNK.id;
+        // trunk → a → b → leaf, with a and b reaped by the catalog's own transition.
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        let leaf = c.fork(b.branch_id, LeaseDeadline(100)).unwrap();
+        for r in [&b, &a] {
+            c.set_state(r.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(r.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        let at = |r: &BranchRecord| BranchAt { id: r.branch_id.id, fork_epoch: r.fork_epoch };
+        let held = || c.witnesses.lock().unwrap().len();
+        assert_eq!(held(), 0, "fixture: nothing has been asked yet");
+
+        // 1. FILED. A walk that reaches the leaf files it on every node it came down.
+        assert!(c.has_live_children(t).unwrap(), "fixture: trunk must see the leaf (D16)");
+        for r in [&a, &b] {
+            assert_eq!(c.valid_witness(at(r)), Some(at(&leaf)), "{:?} has no witness", r.branch_id);
+        }
+
+        // 2. THE WITNESSED NODE'S INCARNATION. A witness filed under another fork epoch of the
+        //    same slot — a recycled id — must not answer, and must be dropped.
+        let other = BranchAt { id: a.branch_id.id, fork_epoch: Epoch(a.fork_epoch.0 + 1_000) };
+        assert_eq!(c.valid_witness(other), None, "a witness answered for another incarnation");
+        assert!(!c.witnesses.lock().unwrap().contains_key(&a.branch_id.id), "stale witness kept");
+
+        // 3. THE LIVE BRANCH'S INCARNATION. `reparent` rewrites the leaf's fork epoch, so a
+        //    witness naming the old one names a branch that no longer exists as filed.
+        assert!(c.has_live_children(t).unwrap());
+        c.reparent(leaf.branch_id, BranchId::TRUNK, c.next_epoch(), 321).unwrap();
+        assert_eq!(c.valid_witness(at(&b)), None, "a witness answered for a reparented branch");
+
+        // 4. THE LIVE BRANCH'S STATE. Re-filed against the leaf as it is now, then the leaf dies:
+        //    the witness must stop answering, and the walk must decide NO.
+        assert!(c.has_live_children(t).unwrap(), "the leaf's CHILD entry under b still pins");
+        assert!(c.valid_witness(at(&b)).is_some(), "fixture: the walk did not re-file b");
+        c.set_state(leaf.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(leaf.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert_eq!(c.valid_witness(at(&b)), None, "a witness outlived the branch it names");
+        assert!(!c.has_live_children(t).unwrap(), "a dead chain still pins trunk");
+
+        // 5. NOTHING LEFT. Trunk's witness is the one only a NO can drop: no walk ever validates
+        //    the root it starts from.
+        assert_eq!(held(), 0, "witnesses outlived their subtree");
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
