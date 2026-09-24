@@ -1744,4 +1744,112 @@ mod tests {
             p1.cursor
         );
     }
+
+    /// **Every commit a refusal holds back keeps its rows, not only the refused one (the third D252
+    /// review's BLOCKER).**
+    ///
+    /// A refusal holds back its own commit and every commit after it in the batch, and
+    /// `Pumped::refused` says all of them are replayed. Clamping the cursor to the refused
+    /// transaction's first row alone still stepped over a LATER-committing transaction whose rows
+    /// began earlier: B writes, R writes, A writes and commits, R writes again and commits
+    /// (refused), B commits. The cursor went to R's first row, above B's, and B's published row was
+    /// lost under a clean report. R writes on both sides of A's commit, so a clamp to R's LAST row
+    /// loses R's first. The replay is checked by content as well as by count.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the count assertion (1 against 3:
+    /// only R's second row), and at `809fbcb` (2 against 3: B's row is lost).
+    #[test]
+    fn every_commit_a_refusal_holds_back_keeps_its_rows() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+
+        let (_d, w) = wal("held_back");
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        let start = w.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let secret = |txn: u64, id: i32, qty: i32| {
+            w.append(txn, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(id, qty) })
+                .unwrap();
+        };
+
+        // B opens on the published table and commits LAST.
+        w.append(3, 0, &RecKind::Begin).unwrap();
+        insert(&w, 3, 2, 20);
+        // R writes the undecided table on both sides of A's commit.
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        secret(1, 5, 50);
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 1, 10);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        secret(1, 6, 60);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(3, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]);
+        let p1 = narrow.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: A was not delivered ahead of the refusal: {p1:?}");
+        assert_eq!(p1.refused, 3, "premise failed: R's two rows and B's were not all held back: {p1:?}");
+
+        let amended = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics")
+                .publishing("inventory", ["id", "qty"])
+                .publishing("secret", ["id", "qty"]),
+        );
+        let mut buf = Vec::new();
+        let p2 = amended.pump(&w, p1.cursor, p1.emitted_through, &mut buf).unwrap();
+        let feed = String::from_utf8(buf).unwrap();
+        assert!(p2.is_clean(), "{p2:?}");
+        assert_eq!(p2.emitted, 3, "the held-back commits did not all arrive from cursor {}: {feed}", p1.cursor);
+        for (qty, what) in [("50", "R's first row"), ("60", "R's second row"), ("20", "B's row")] {
+            assert!(feed.contains(&format!("\"qty\":{qty}")), "{what} was lost: {feed}");
+        }
+        assert!(!feed.contains("\"qty\":10"), "A was delivered twice: {feed}");
+    }
+
+    /// **A resume cursor inside a record must not break the decoder for the cursors after it (the
+    /// second D252 review's finding 1).**
+    ///
+    /// A cursor handed in from outside (a client's resume position, `Subscription::new`) can lie
+    /// inside a record. The pump on it fails, as it should. But the gap fill before it recorded that
+    /// cursor itself as covered, so every later pump of the same decoder from a sound cursor above it
+    /// gap-filled from the middle of a record and failed too.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the second pump's `expect`.
+    #[test]
+    fn a_resume_cursor_inside_a_record_does_not_break_later_pumps() {
+        let (_d, w) = wal("bad_cursor");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let row = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 10) })
+            .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        let second = w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // One streamer, so one decoder and one history, as a server shares across its clients.
+        let s = streamer();
+        assert!(
+            s.pump(&w, row + 1, 0, &mut Vec::new()).is_err(),
+            "premise failed: a cursor inside a record was accepted, so nothing here is at stake"
+        );
+        let p = s
+            .pump(&w, second, 0, &mut Vec::new())
+            .expect("a sound cursor failed after an unsound one had been tried on the same decoder");
+        assert_eq!(p.emitted, 1, "{p:?}");
+    }
 }
