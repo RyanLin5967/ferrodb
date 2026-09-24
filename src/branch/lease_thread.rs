@@ -426,7 +426,8 @@ impl LeaseThread {
         // An interval has to start at a reading of the clock it is measured in, and the only cost
         // is the repeat this row removes everywhere else.
         if let Ok(now) = LeaseDeadline::try_now_millis() {
-            reaper.orphan_sweep_finished_at(now);
+            // MUTANT (fire-check only, never land): a stamp an hour ahead of the lease clock.
+            reaper.orphan_sweep_finished_at(now + 3_600_000);
         }
         if !resumed.is_empty() {
             // The reaper reclaimed pages without any client asking, so the runtime still holds
