@@ -250,3 +250,73 @@ The lead numbered this "amendment 7"; 7 and 8 were already taken, so it is 9.
   - a test-side raw walk into a `Vec`, which must hold no page twice and must equal `table_pages` as a set;
   - a planted alias (the primary root listed in the heap's directory) that `table_pages` must refuse. That second check
     is the one that can fail: a `collect_pages` that stopped refusing would pass the first.
+
+**Amendment 10 (the D229 merge review, `frontier/d229_merge_review.md` @ `8e208f7`, items 4-6 as the lead routed them;
+registered BEFORE the code).** The lead asked for these in the review-1 amendment. That is amendment 9, already committed
+(`73638a4`), so they are appended here. The review read `25c5492`. Its stale-base finding is closed by the re-merge
+`9cc779f` (D250 @ `f3f75af`), and it found no double free and no alias.
+
+- **(4.1) The intent is written before the `DropTable` record.** New test
+  `a_drop_whose_record_flush_failed_left_its_intent_for_the_open_that_completes_it`, on a new database:
+  - `t` (rows 1-3) and `u` (row 0) are created, and the log's next `sync_data` is set to fail once;
+  - `DROP TABLE t` then fails at its record's flush, which poisons the log (D250 F1);
+  - in the same process, the intent file must exist;
+  - after the crash, the open must complete the DROP (`completed_drops == ["t"]`: the record's bytes reached the log
+    file) and leave `t` absent with none of its pages allocated and unnamed, `u` whole, and the intent file gone.
+  - Mutant **M20**: `record_free_intent` moved after `log_ddl`. Predicted RED: the in-process assertion (no intent
+    was written), and at the open, `t`'s heap pages leak. The F2 sweeps' point at that sync is a second predicted
+    killer.
+- **(4.2) The frees run whatever the truncation does.** New test
+  `a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation`, on a new database:
+  - `t` (rows 1-3) is created, and the log is pinned at its base;
+  - `DROP TABLE t` runs; premise: the pin kept the log, so the base did not move;
+  - in the same process, every page of the old `t` must have its bit clear, the intent file must be gone and nothing
+    must stay quarantined;
+  - `u` is then created and filled; premise: it takes at least one old `t` page;
+  - no page may be reached twice or while free, and `u`'s rows must be found by scan and by key;
+  - after a crash with the pin still held, the open must pass the oracle (`u` whole, `t` absent, no old `t` page
+    allocated and unnamed).
+  - Mutant **M21** (the review's FREEPOSm): `free_pending_frees()` moved from after the checkpoint's sync onto the
+    truncated path only. Predicted RED at the in-process bit assertion.
+  - The reopen half is also the reuse-under-a-pin schedule that the review's §3 names as the combined tree's hazard
+    for D250's skip. It is registered here as a GREEN expectation only; D250's owner registers D250's mutants against
+    it.
+- **(4.3) The supersede branch becomes a refusal.** `record_free_intent` refuses a DROP whose pages share any page
+  with an intent already pending, decided or not, before anything is written. The log is not poisoned, nothing is
+  quarantined, and the intent file is not rewritten. D229's own order cannot produce the state (a failed record or
+  mutation poisons the log, and a poisoned log refuses the next DROP first), so a shared page means a damaged or stale
+  intent, and carrying out both would free a live page. The branch it replaces was dead code. New test
+  `a_drop_of_a_table_a_pending_intent_already_names_is_refused_before_anything_happens`: an intent naming `t`'s
+  pages is planted and adopted (`adopt_free_intents`); `DROP TABLE t` must be refused with:
+  - `t` still present with its rows;
+  - the log not poisoned;
+  - the intent file byte-identical;
+  - no page of `t` freed.
+  - Mutant **M22**: the refusal never fires. Predicted RED (the DROP succeeds).
+- **(5) M3 and M12 go back into the runner as predicted SURVIVORS** (the review's §5: they were retired by argument
+  where a measurement is cheap), re-expressed at one site each at the new base, and run against `wal::` (this file,
+  D250's and #16's `wal` tests). A kill falsifies amendment 3's equivalence claim, and the amendment after the run says
+  which test killed it and why.
+- **(6) Stale claims corrected, docs only:**
+  - `Catalog::drop_table`: it said the frees follow the checkpoint that "truncated the log".
+  - `free_intent`'s module doc: the same claim, and "written durably BEFORE the unlink" (it is before the `DropTable`
+    record).
+  - `forget_dropped_table`: "narrowed" becomes closes.
+  - `free_pending_frees`: "at the end of every checkpoint" becomes "right after every checkpoint's sync".
+  - `record_free_intent`: the doc, replaced with the refusal's.
+  - pgwire `ServerContext::writer_active`: "frees ... immediately (`Catalog::drop_table`)".
+  - The unlogged F2 sweep (with R5): renamed
+    `a_crash_at_every_operation_of_drop_table_with_no_row_of_it_in_the_log_leaves_it_whole_or_gone`, and its doc no
+    longer states the retired A3 premise. Its assertions are unchanged.
+  - The review's §6.1: `table_pages` now runs before the barrier, a new dependency on the one-`Mutex<Catalog>`
+    precondition. It is written where that precondition is stated (`undo_primary_writes`) and at the executor's DROP.
+  - D250's own stale docs (its test 2's "failed after its frees", test 1's "one never flushed is a zero page", and the
+    executor's "logged AFTER the checkpoint") are sent to `delete-insert-gap`, not edited here, so the next re-merge
+    takes D250's wording.
+  - The lane's §1 (a) (#16's refusals are gone) and §3 ("needs no fail-stop") are corrected in `frontier/lane_d229.md`.
+- **R6's mutant, M23:** `BPlusTreeManager::collect_pages` stops refusing a node another structure already named.
+  Predicted RED on the planted-alias half of `table_pages_names_both_heaps_and_every_tree`. It runs the catalog tests,
+  as M9 and M10 do.
+- **Counts predicted at the code's tip:** `wal::recovery::tests_crash_frees::` has 22 tests (15 + amendment 9's four
+  + three here), all GREEN. Mutants: M1, M2, M4-M6, M9-M11, M13-M23 killed; M3, M7 and M12 survive. The base and the
+  one-site check follow in the amendment after the code.
