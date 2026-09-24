@@ -19,7 +19,8 @@ OUT=$WT/bench/d246
 BASE=fbfe038   # D219 tip when D246 was cut: pgserver on the in-memory provenance store (pgserver.rs identical through 1c226d8)
 RED=b6960d5    # the red test, before the fix
 RED2=8764a2d   # A2/A3's red tests (the fork's run synced under the guard) on eca45fb's code
-FIX=89b6624    # D246 on D219 tip 1c226d8 (f5154d1), plus A1 (69f8e85) and the A2/A3 fix
+RED4=a7127cd   # A4's red tests (the fresh review's defects) on the A2/A3 fix's code
+FIX=312301c    # D246 on D219 tip 1c226d8 (f5154d1), plus A1 (69f8e85), the A2/A3 fix and A4's
 T=d246_pgserver_provenance_survives_restart
 TF=d246_fork_run_is_durable_after_the_guard
 export CARGO_TARGET_DIR=$WT/target
@@ -44,6 +45,12 @@ step() {
   } > "$OUT/$name.txt"
   (cd "$FIRE" && "$@") >> "$OUT/$name.txt" 2>&1
   rc=$?
+  # A test step that collected nothing has not passed (PREREG A4, N-8): a filter that matches no
+  # test prints "running 0 tests" and exits 0.
+  if [ "$3" = cargo ] && [ "$4" = test ] && grep -q '^running 0 tests' "$OUT/$name.txt"; then
+    echo "# REFUSED: this step collected zero tests" >> "$OUT/$name.txt"
+    rc=97
+  fi
   echo "rc=$rc" >> "$OUT/$name.txt"
 }
 
@@ -60,6 +67,11 @@ build_and_test a_red_$RED
 git -C "$FIRE" checkout --detach -f -q "$RED2" || exit 3
 step a2_red_fork_$RED2 timeout 3600 cargo test --test "$TF"
 step a2_red_publish_$RED2 timeout 3600 cargo test --lib agent_sql::runtime::tests::a_publish
+# A4 (PREREG): U5 and U8 FAIL, U6 and U7 pass; R3 FAILS, R1 and R2 pass; the N-5 test FAILS.
+git -C "$FIRE" checkout --detach -f -q "$RED4" || exit 3
+step a4_red_durable_$RED4 timeout 3600 cargo test --lib provenance::durable::tests::
+step a4_red_publish_$RED4 timeout 3600 cargo test --lib agent_sql::runtime::tests::a_publish
+step a4_red_alter_$RED4 timeout 3600 cargo test --lib catalog::alter::tests
 
 # ---- (b) GREEN: the fix -------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -f -q "$FIX" || exit 3
@@ -70,7 +82,10 @@ step b_green_d219_$FIX timeout 3600 cargo test --test d219_one_provenance_sync_p
 step b_green_lib_provenance_$FIX timeout 3600 cargo test --lib provenance::
 step b_green_lib_group_commit_$FIX timeout 3600 cargo test --lib branch::group_commit
 step b_green_lib_alter_$FIX timeout 3600 cargo test --lib catalog::alter::tests
-step b_green_lib_publish_$FIX timeout 3600 cargo test --lib agent_sql::runtime::tests::a_publish
+step b_green_lib_runtime_$FIX timeout 3600 cargo test --lib agent_sql::runtime::tests::
+for t in d154_length_prefix_refusal agent_sql_surface integration_prompt_clause integration_run_identity_feed; do
+  step b_green_${t}_$FIX timeout 3600 cargo test --test "$t"
+done
 
 # ---- (c) fire-checks on the fix -----------------------------------------------------------------
 # M1: the fix removed (pgserver.rs as it was at BASE). C1, C2 (decode refused at this base), C3, C4.
@@ -90,7 +105,7 @@ open(p, "w").write(s.replace(old, '.with_durable_provenance(format!("{db}.proven
 PYEOF
 build_and_test c_M2_another_file
 
-# ---- (d) A2/A3 mutants, each on a fresh checkout of the fix (PREREG A2's table) ------------------
+# ---- (d) A2–A4 mutants, each on a fresh checkout of the fix (PREREG A2's and A4's tables) --------
 # mutant <name> <filter>...: FORK = the fork integration target, else a `cargo test --lib` filter.
 mutant() {
   local m=$1 i=0 filter
@@ -111,10 +126,23 @@ mutant M3_intern_under_the_guard FORK                       # T1, T3 fail
 mutant M4_complete_skips_the_run FORK                       # T1, T2, T3 fail
 mutant M5_drop_skips_the_run FORK                           # T4 fails
 mutant M6_publish_before_the_run_is_durable agent_sql::runtime::tests::a_publish FORK   # R1 fails; FORK all pass
-mutant M7_run_sync_under_the_lock provenance::durable::tests::   # U1 fails
+mutant M7_run_sync_under_the_lock provenance::durable::tests::   # U1 and U5 fail (A4b)
 mutant M8_written_run_is_not_awaited provenance::durable::tests::   # U2 fails
 mutant M9_synchronous_sync_covers_nothing provenance::durable::tests::   # U3 fails
 mutant M10_intern_repeat_does_not_await provenance::durable::tests::   # U4 fails
+# PREREG A4
+mutant M11_repeat_run_syncs FORK                            # T2 fails, only T2
+mutant M15_pending_written_last provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
+mutant M16_sync_before_write provenance::                   # SURVIVOR: all pass
+mutant M17_ticket_before_write provenance:: FORK agent_sql::runtime::tests::a_   # SURVIVOR: all pass
+mutant M18_covered_before_sync provenance::                 # SURVIVOR: all pass
+mutant M19_no_poison_check_after_the_run_sync provenance::durable::tests::   # U5 fails
+mutant M20_await_writes_every_pending_record provenance::durable::tests::   # U6 fails
+mutant M21_intern_pending_ignores_the_poison provenance::durable::tests::   # U7 fails
+mutant M22_await_run_ignores_the_poison provenance::durable::tests::   # U8 fails
+mutant M23_await_after_the_schema_apply agent_sql::runtime::tests::a_   # R3 fails
+mutant M24_failed_complete_keeps_the_session agent_sql::runtime::tests::a_failed_completion   # R4 fails
+mutant M25_refused_restamp_leaves_stamps_pending catalog::alter::tests   # the N-5 test fails
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"

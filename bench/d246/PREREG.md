@@ -189,3 +189,16 @@ A fresh-context review of A1–A3 found no BLOCKER and five DEFECTs. It also fou
 ### A4a (2026-09-24T11:20Z): the N-5 test's refusal point, corrected before the test was written
 
 A4 says the N-5 test's store "refuses the 6th `stamp_pending`". The packed fixture guarantees only that SOME row moves, not how many, so a fixed 6th could miss the loop entirely. **Replaced by:** a twin ALTER counts the restamps `m`, with the premise `m >= 2`. The test's store then allows `m / 2` and refuses the next. The expectations are unchanged: refused by the test's store; the later `flush` issues 0 syncs; **RED at `efd3541`** (1 sync).
+
+### A4b (2026-09-24T11:40Z): M7's edit moves with the D-1 fix; its predictions, stated before any run
+
+A2's M7 held the file lock in `await_run` across `wait_durable`. Since A4, `sync_runs` takes that lock itself for its post-fsync poison check, so the old edit would self-deadlock and hang every test that awaits a run, instead of failing one.
+
+**New edit, same property ("the group sync holds the file lock across its fsync"):** `sync_runs` takes the lock at its top and holds it through the gate and the fsync, and the later acquisition is removed. Checked by `--check` at `312301c`.
+
+**Predicted:**
+- **U1 FAILS**, as A2 said: the stager blocks behind the held sync.
+- **U5 now FAILS too.** The failing `stamp_row` blocks on the lock the leader holds, so the store is poisoned only after the leader's check has passed. That is the lost-error schedule D-1 closes, reached by holding the lock.
+- U2, U3, U4 and U6–U8 pass. U6 passes only after the gate's 30 s timeout, because its `flush` waits on the held lock. No step can hang past that timeout.
+
+The runner's zero-collected refusal was fire-checked with a stub `cargo` on PATH: "running 0 tests" gives rc=97 and "running 3 tests" gives rc=0.
