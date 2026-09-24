@@ -285,30 +285,6 @@ use crate::buffer::touch_queue::TouchQueue;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64};
 
-/// **Test instrument (D233), observing only:** the pages THIS THREAD asked the pool for, through
-/// either read path: [`BufferPoolManager::fetch_page`] (latched) or
-/// [`BufferPoolManager::read_page_optimistic`] (latch-free). A caller reads it before and after an
-/// operation, and the difference is the pages that operation read.
-///
-/// Thread-local and `#[cfg(test)]` on purpose. A counter shared across threads on the read path is
-/// the one word per read that D51 measured as a contention wall and D58 removed, so the instrument
-/// costs nothing outside tests and adds no shared write inside them.
-#[cfg(test)]
-thread_local! {
-    static PAGE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Pages this thread has read through any pool. See `PAGE_READS`.
-#[cfg(test)]
-pub(crate) fn page_reads_on_this_thread() -> u64 {
-    PAGE_READS.with(|c| c.get())
-}
-
-#[cfg(test)]
-fn count_page_read() {
-    PAGE_READS.with(|c| c.set(c.get() + 1));
-}
-
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
     pub page_id: Option<u32>,
@@ -724,8 +700,8 @@ impl BufferPoolManager {
     /// back to [`BufferPoolManager::fetch_page`], which is always correct. The returned stamp lets
     /// the caller ask later whether the page it read is still the page in that frame.
     pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
-        #[cfg(test)]
-        count_page_read();
+        // D233's test instrument; empty outside tests. See `buffer::page_reads`.
+        crate::buffer::page_reads::count();
         let frame_i = self.page_table.lookup(page_id)?;
         self.read_frame_optimistic(frame_i, page_id)
     }
@@ -775,8 +751,8 @@ impl BufferPoolManager {
         // here down. The thread-local depth counter is re-entrant, so the nested `enter_pool` in
         // `new_page -> fetch_page` is fine. See src/storage/page_latch.rs.
         let _pool = enter_pool();
-        #[cfg(test)]
-        count_page_read();
+        // D233's test instrument; empty outside tests. See `buffer::page_reads`.
+        crate::buffer::page_reads::count();
         for _attempt in 0..FETCH_ATTEMPTS {
             // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
             if let Some(frame_i) = self.try_pin_resident(page_id) {

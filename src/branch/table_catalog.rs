@@ -2007,9 +2007,9 @@ mod tests {
     /// it reads only what it must to reach the first live deadline. Counted by the pool's
     /// test-only instrument over both read paths, latched and latch-free.
     fn pages_per_lease_pass(c: &TableBranchCatalog) -> u64 {
-        let before = crate::buffer::buffer_pool::page_reads_on_this_thread();
+        let before = crate::buffer::page_reads::on_this_thread();
         let expired = c.expired_before(0).unwrap();
-        let read = crate::buffer::buffer_pool::page_reads_on_this_thread() - before;
+        let read = crate::buffer::page_reads::on_this_thread() - before;
         assert!(expired.is_empty(), "every fixture deadline is after 0, so nothing expires");
         read
     }
