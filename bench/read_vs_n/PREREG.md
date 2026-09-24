@@ -264,4 +264,20 @@ threads; an 8 GB budget. The exact commands are in `artie-research frontier/lane
 
 ## Amendments (append-only)
 
-(none)
+**A1, 2026-09-24. Written after the code (`5bd7dfb`) and before any build or run. It changes no prediction; it records
+where the implementation's protocol differs from the text above.**
+
+1. The child takes one argument, `--open-only <db>`. The parent keeps its independent counts (live arenas, live
+   branches) and makes the H2/H3 comparisons itself. The `wrong-arenas` and `wrong-live` fire modes offset the
+   parent's expected value.
+2. **R2 as checked.** `sweep_descents` is shared with the lease thread's first pass, so the open's share cannot be
+   read off it. The child reports `descents_total` and `visits_total` after the first pass, and R2 becomes
+   `descents_total = visits_total` (one `get_raw` per visit, over both sweeps). The census is per thread, so its
+   `c.desc` over the open covers the opening thread only, which is the synchronous sweep: R2's "3·visits + ≤ 12"
+   applies to it unchanged.
+3. The D65 reload control (merged from `d65-reopen-curve`) compares the image's `current` count with
+   `store.current_arena_count()` in the production layout, not with N. Trunk writes here, and every restart
+   clears `current` (`load_state`: "Never resume filling a restored extent"), so N would make the control fail
+   for a reason unrelated to the load. The historical path still passes N.
+4. Before timing, arm 1 flushes with `TxnManager::checkpoint`: WAL, then the whole pool, then fsync. Reads never
+   dirty a page, so no timed window pays a write-back.
