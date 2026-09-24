@@ -7356,4 +7356,177 @@ mod tests {
              over-reports rather than corrupts, so it must not be refused"
         );
     }
+
+    // ---- D246 A3: a publish never declares to the log a run its provenance file lacks ----------
+    //
+    // Pre-registered in `bench/d246/PREREG.md` A3. Unit tests rather than integration tests for one
+    // reason: `DurableProvenanceStore::fail_next_append` exists only under `cfg(test)`, and it is
+    // the only way to stop a provenance write at a chosen point without killing the process.
+
+    /// A database whose provenance is a durable store this test also holds, with one session that
+    /// has STAGED `BEGIN AGENT SESSION` and inserted a row, and whose `ForkDurability` is held
+    /// uncompleted. That is pgwire's window between releasing the catalog guard and `complete()`,
+    /// in which another connection can already name the branch.
+    struct UncompletedFork {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<crate::wal::txn::TxnManager>,
+        wal: Arc<crate::wal::log::WalManager>,
+        durable: Arc<crate::provenance::DurableProvenanceStore>,
+        prov_path: std::path::PathBuf,
+        session: crate::execution::session::Session,
+        fork: Option<ForkDurability>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn d246_parse(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    fn uncompleted_fork() -> UncompletedFork {
+        use crate::execution::executor::{run, run_staged};
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("a3.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let wal = Arc::new(crate::wal::log::WalManager::new(dir.path().join("a3.wal")).unwrap());
+        let txn = Arc::new(crate::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let prov_path = dir.path().join("a3.provenance");
+        let durable =
+            Arc::new(crate::provenance::DurableProvenanceStore::open(&prov_path).unwrap());
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = durable.clone() as Arc<dyn crate::provenance::ProvenanceStore>;
+        let mut session = crate::execution::session::Session::with_runtime(Arc::new(rt));
+        run(
+            d246_parse("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut session,
+        )
+        .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}"));
+        let mut fork = None;
+        run_staged(
+            d246_parse("BEGIN AGENT SESSION AS 'a' RUN 'r1' MODEL 'claude-opus-5/2026-05';"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut session,
+            &mut fork,
+        )
+        .unwrap_or_else(|e| panic!("BEGIN AGENT SESSION failed: {e}"));
+        assert!(fork.is_some(), "premise: BEGIN AGENT SESSION staged no fork");
+        run(
+            d246_parse("INSERT INTO t VALUES (1, 10);"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut session,
+        )
+        .unwrap_or_else(|e| panic!("INSERT in the session failed: {e}"));
+        UncompletedFork { catalog, bp, txn, wal, durable, prov_path, session, fork, _dir: dir }
+    }
+
+    impl UncompletedFork {
+        fn merge(&mut self) -> Result<crate::execution::executor::Outcome, FerroError> {
+            crate::execution::executor::run(
+                d246_parse("MERGE;"),
+                &mut self.catalog,
+                self.bp.clone(),
+                self.txn.clone(),
+                &mut self.session,
+            )
+        }
+
+        /// Every slot the log declares, from a cold decode of everything it holds.
+        fn declared_in_the_log(&self) -> BTreeMap<u32, RunEntity> {
+            use std::sync::atomic::Ordering;
+            let (base, next) =
+                (self.wal.base_lsn.load(Ordering::SeqCst), self.wal.next_lsn.load(Ordering::SeqCst));
+            crate::replication::logical::LogicalDecoder::blank()
+                .decode(&self.wal, base, next)
+                .unwrap_or_else(|e| panic!("a cold decode of [{base}, {next}) was refused: {e}"))
+                .runs
+        }
+
+        /// The runs a second store opened on the same file recovers: what a crash now keeps.
+        fn runs_in_the_file(&self) -> Vec<RunEntity> {
+            crate::provenance::DurableProvenanceStore::open(&self.prov_path)
+                .expect("reopen the provenance file")
+                .runs()
+                .expect("read the reopened runs")
+        }
+    }
+
+    /// **R1.** A `MERGE` of a branch whose `BEGIN` has not completed, with the provenance store's
+    /// next append failing, must not leave the log declaring a slot the provenance file lacks.
+    ///
+    /// Before A2 this could not happen: `intern` synced the run at staging. After A2 the run's
+    /// record is pending until `complete()`, so the publish must make it durable BEFORE `bind_run`
+    /// declares its slot to the log. The failure injected here stands in for a crash between the
+    /// publish's WAL commit and the provenance sync that follows it: without that ordering, the log
+    /// commits slot 1 and the file never receives it. A reopened store then issues slot 1 to the
+    /// next new run, and the log declares it twice with different actors: D246's defect, reached
+    /// by another door.
+    #[test]
+    fn a_publish_never_declares_to_the_log_a_run_its_provenance_file_lacks() {
+        let mut f = uncompleted_fork();
+        f.durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(f.merge().is_err(), "the injected provenance failure was swallowed");
+
+        let in_file = f.runs_in_the_file();
+        for (slot, run) in &f.declared_in_the_log() {
+            let held = in_file.iter().find(|r| r.prov_id.0 == *slot);
+            assert!(
+                held.is_some_and(|r| r.same_actor(run)),
+                "the log declares slot {slot} as {}, and the provenance file holds {:?} there. A \
+                 crash now reopens a store that issues slot {slot} again. File: {in_file:?}",
+                run.describe(),
+                held.map(RunEntity::describe),
+            );
+        }
+        drop(f.fork.take());
+    }
+
+    /// **R2, R1's control.** Without the injection the same `MERGE` succeeds. The log declares
+    /// slot 1 for `('a', 'r1')`, which is R1's premise: its decode sees this path's declaration, so
+    /// R1 passing with nothing declared means the publish was refused first, not that the
+    /// instrument is blind. The file holds the run.
+    #[test]
+    fn a_publish_of_an_uncompleted_fork_declares_its_run_and_the_file_holds_it() {
+        let mut f = uncompleted_fork();
+        let merged = f.merge();
+        assert!(merged.is_ok(), "the control MERGE failed: {:?}", merged.err());
+
+        let declared = f.declared_in_the_log();
+        let r1 = declared.get(&1).unwrap_or_else(|| {
+            panic!("premise: the log declares no slot 1 after the MERGE: {declared:?}")
+        });
+        assert_eq!(
+            (r1.agent_id.as_str(), r1.run_id.as_str()),
+            ("a", "r1"),
+            "premise: slot 1 is not the run that merged"
+        );
+        let in_file = f.runs_in_the_file();
+        assert!(
+            in_file.iter().any(|r| r.prov_id.0 == 1 && r.same_actor(r1)),
+            "the log declares slot 1 and the provenance file does not hold it: {in_file:?}"
+        );
+        f.fork.take().expect("the staged fork").complete().unwrap();
+    }
 }
