@@ -3,9 +3,9 @@
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,...] [--skip M26,...]
 
-At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor,M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal`:
-those eight mutate code only the child branches have, under a test target (the lib) every tip has.
-At `d252-caught-up-pin`, run with `--skip M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal`
+At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor,M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal,M39_growth_ignores_deliverable_commits`:
+those nine mutate code only the child branches have, under a test target (the lib) every tip has.
+At `d252-caught-up-pin`, run with `--skip M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal,M39_growth_ignores_deliverable_commits`
 (D276 code, only on `d276-oversized-transaction`). At `d276-oversized-transaction`, run the full set.
 
 A mutant whose `--test` target the tip does not have is reported NOT-AT-TIP and left out of
@@ -215,18 +215,24 @@ MUTANTS = [
     # D276: a transaction larger than max_bytes. No growth; no cap (grows to the frontier); growth
     # over a refusal.
     ("M35_window_never_grows", "src/replication/stream.rs",
-     "        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
-     "        if false && next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
+     "        if next == cursor\n            && candidates.is_empty()\n",
+     "        if false\n            && next == cursor\n            && candidates.is_empty()\n",
      [STREAM], [S + "a_transaction_larger_than_max_bytes_is_delivered_whole",
-                S + "a_transaction_beyond_the_window_cap_is_refused_by_name"], "KILL"),
+                S + "a_transaction_beyond_the_window_cap_is_refused_by_name",
+                S + "a_pump_delivers_what_its_window_holds_before_growing"], "KILL"),
     ("M36_window_has_no_cap", "src/replication/stream.rs",
      "            let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);\n",
      "            let cap = u64::MAX;\n",
      [STREAM], [S + "a_transaction_beyond_the_window_cap_is_refused_by_name"], "KILL"),
     ("M37_window_grows_over_a_refusal", "src/replication/stream.rs",
-     "        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
-     "        if next == cursor && decoded.open_from.is_some() && to < frontier {\n",
+     "            && refused_commit.is_none()\n            && to < frontier\n",
+     "            && to < frontier\n",
      [STREAM], [S + "a_refusal_inside_an_oversized_transaction_is_reported_not_grown_past"], "KILL"),
+    # Review 5: grow only when nothing is deliverable.
+    ("M39_growth_ignores_deliverable_commits", "src/replication/stream.rs",
+     "        if next == cursor\n            && candidates.is_empty()\n",
+     "        if next == cursor\n",
+     [STREAM], [S + "a_pump_delivers_what_its_window_holds_before_growing"], "KILL"),
     ("M33_gap_fill_covers_to_the_cursor", "src/replication/logical.rs",
      "                history.covered_through = scanned_to;\n",
      "                history.covered_through = from_lsn;\n                let _ = scanned_to;\n",
