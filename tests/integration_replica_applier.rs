@@ -569,3 +569,30 @@ fn an_alter_wrapped_in_a_clr_still_halts_the_replica() {
     assert!(format!("{err}").contains("DIVERGED"), "{err}");
     assert!(applier.diverged().is_some(), "the divergence was not latched");
 }
+
+/// **D267, the replica's way in: a replica marks every page it applies as allocated.**
+///
+/// The applier writes an empty page for each page a record names that its file does not hold yet,
+/// then applies the record, and until D267 it never set that page's bitmap bit. A promoted replica's
+/// allocator then hands out the lowest clear bit, a page holding a row the primary committed. Page 1
+/// is the first page a fresh file's allocator hands out, so it is where the collision shows.
+/// Lane report: artie-research `frontier/lane_d268_power_loss_redo.md` §2, test 4.
+#[test]
+fn a_replica_does_not_hand_out_a_page_it_applied() {
+    let p = pair("claim");
+    let src = ReplicationSource::new(&p.primary_wal);
+    let applier = ReplicaApplier::new(Arc::clone(&p.replica_bp), src.start_lsn());
+
+    primary_insert(&p.primary_wal, 1, 1, 0, 0x33);
+    ship_all(&p, &applier);
+    let held = {
+        let idx = p.replica_bp.fetch_page(1).expect("fetch");
+        let page = Page::deserialize(p.replica_bp.frames[idx].read().unwrap().data).expect("page");
+        p.replica_bp.unpin_page(1, false);
+        page.read(0).map(|t| t.data)
+    };
+    assert_eq!(held.ok(), Some(tuple(0x33)), "premise: the replica does not hold the shipped row on page 1");
+
+    let next = p.replica_bp.disk_manager.allocate().expect("allocate");
+    assert_ne!(next, 1, "the replica's allocator handed out page 1, which holds a row it applied");
+}

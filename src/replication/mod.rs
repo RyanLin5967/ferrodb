@@ -437,6 +437,20 @@ mod tests {
         let e = read_handshake(&mut std::io::Cursor::new(wrong_version)).unwrap_err();
         assert!(format!("{e}").contains("version 99"), "got {e}");
     }
+
+    /// **D268: a version-2 peer is refused at the handshake.** This build's log carries tag 12, an
+    /// init-flagged `HeapInsert`, and a peer speaking version 2 cannot decode it. Without the refusal
+    /// here it would complete the handshake and fail several frames in, on the first new page the
+    /// primary fills. Lane report: artie-research `frontier/lane_d268_power_loss_redo.md` §2, test 5.
+    #[test]
+    fn a_v2_peer_is_refused_at_the_handshake() {
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&REPL_MAGIC.to_be_bytes());
+        v2.extend_from_slice(&2u16.to_be_bytes());
+        let e = read_handshake(&mut std::io::Cursor::new(v2))
+            .expect_err("a peer speaking replication version 2 was accepted, and it cannot decode tag 12");
+        assert!(format!("{e}").contains("version 2"), "refused, but not for its version: {e}");
+    }
 }
 
 /// Where a replica is, and whether it may go on — persisted next to the replica's database.
