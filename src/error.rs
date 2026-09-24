@@ -96,6 +96,14 @@ pub enum FerroError {
     /// an egress refusal from a bad insert.
     Publication(String),
 
+    /// **D280.** The database's pages carry an LSN its write-ahead log never issued, so the database
+    /// was refused at open. See `WalManager::open_for_database`.
+    ///
+    /// Structured rather than a `Wal(String)` because the cause decides what the operator does
+    /// next, and a test that has to match rendered text pins wording, not the fact. `page_id` and
+    /// `page_lsn` name the page with the highest such LSN.
+    LogBehindPages { db: String, cause: LogBehindPagesCause, page_id: u32, page_lsn: u64 },
+
     /// This node is not the leader, so it refused rather than serving a write or a stale read.
     ///
     /// `leader` is an **address** and not a `NodeId`, because the only useful thing a refused
@@ -119,6 +127,38 @@ impl Display for FerroError {
                  {limit}); refused rather than written truncated"
             ),
             FerroError::Publication(e) => write!(f, "publication refused: {}", e),
+            // Every arm says what the file is, why opening it would lose data, and what to do. The
+            // shared tail is the mechanism, because an operator told only "refused" will look for a
+            // flag to override it, and there is none.
+            FerroError::LogBehindPages { db, cause, page_id, page_lsn } => {
+                let why = format!(
+                    "page {page_id} carries LSN {page_lsn}, which this database's own write-ahead \
+                     log never issued. Opened as a primary, the log would start at LSN 1, below \
+                     the pages' LSNs, and after a crash recovery would silently skip committed \
+                     writes to those pages"
+                );
+                match cause {
+                    LogBehindPagesCause::ReplicaFile => write!(
+                        f,
+                        "refusing to open {db}: it is a replica's file ({db}.replstate is \
+                         present), and promoting a replica is not supported. {why}. Keep serving \
+                         it with repl_replica."
+                    ),
+                    LogBehindPagesCause::MissingLog => write!(
+                        f,
+                        "refusing to open {db}: its write-ahead log {db}.wal is missing. {why}. \
+                         This is a restored base backup or a database whose log was lost: put \
+                         back the .wal that belongs to this file. A base-backup image can only \
+                         be served as a replica."
+                    ),
+                    LogBehindPagesCause::EmptyLog => write!(
+                        f,
+                        "refusing to open {db}: its write-ahead log {db}.wal has never issued an \
+                         LSN. {why}. The log does not belong to these pages: put back the one \
+                         that does."
+                    ),
+                }
+            }
             FerroError::Io(e) => write!(f, "io error: {}", e),
             FerroError::NotEnoughSpace => write!(f, "not enough space in page"),
             FerroError::SlotDeleted => write!(f, "the slot is delted"),
@@ -157,3 +197,15 @@ impl Display for FerroError {
 }
 
 impl error::Error for FerroError {}
+
+/// What [`FerroError::LogBehindPages`] found beside the data file, which is what the refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogBehindPagesCause {
+    /// `<db>.replstate` is present: a replica's file. It takes precedence over the other two, since
+    /// a replica never has a log of its own.
+    ReplicaFile,
+    /// `<db>.wal` does not exist: a `backup::restore` output, or a database whose log was lost.
+    MissingLog,
+    /// `<db>.wal` exists but has never issued an LSN (its base and its end are both the first LSN).
+    EmptyLog,
+}

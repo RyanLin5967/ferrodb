@@ -1520,6 +1520,14 @@ impl SnapshotStore for PageStoreSnapshots {
         // applied onto a page from a different database with nothing to notice it. `truncate`
         // throws the log away whole and restarts it at the current end, which is exactly what a
         // node whose pages are now a checkpoint needs.
+        //
+        // ⚠ D280's twin, latent while snapshots are unwired in production (`agent_sql/cluster.rs`
+        // installs none). "The current end" is THIS node's end, and nothing places it above the
+        // installed pages' LSNs, which are the SENDER's. If it is below them, the next local write
+        // to an installed page is skipped by redo after a crash, which is the loss
+        // `WalManager::open_for_database` refuses on open. Before this path is wired, it needs the
+        // same predicate: no installed page may carry an LSN at or above the re-based log's end.
+        // It must either re-base above the highest one or refuse.
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         self.wal.truncate(0)?;
         let after = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);

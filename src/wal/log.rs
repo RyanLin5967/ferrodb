@@ -1,11 +1,13 @@
-use std::{fs::OpenOptions, mem::take, path::PathBuf, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::OpenOptions, mem::take, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
 use crate::{
     branch::types::BranchId,
+    buffer::buffer_pool::page_lsn_of,
     catalog::column::DataType,
-    error::FerroError,
+    error::{FerroError, LogBehindPagesCause},
     provenance::{ProvId, RunEntity},
-    storage::storage::Storage,
+    replication::ReplicaState,
+    storage::{disk_manager::{DiskManager, PAGE_SIZE}, storage::Storage},
 };
 
 const HEADER_SIZE: usize = 24;
@@ -588,6 +590,69 @@ impl WalManager {
             fail_next_append: std::sync::atomic::AtomicBool::new(false)})
     }
 
+    /// Open `<db>.wal` for the database at `db_path`. **It refuses when the data file's pages carry an
+    /// LSN this log never issued** (D280). `cli.rs` and `examples/pgserver.rs` both open through
+    /// here, so they cannot disagree about it.
+    ///
+    /// `WalManager::new` on a missing file starts the log at `INITIAL_LSN`, and it looks at no page.
+    /// Three files arrive in exactly that state with pages stamped by some other log:
+    /// - a `backup::restore` output (a file copy);
+    /// - a replica's file (`repl_replica` builds no `WalManager`, and every record it applies stamps
+    ///   the primary's LSN);
+    /// - any database whose `.wal` was lost.
+    ///
+    /// Opened as a primary, the first write to such a page takes an LSN tens of bytes into the new
+    /// log, far below the page's. Commit forces only the log. After a crash, redo reads the page
+    /// back with its old, higher LSN and skips the record (`page.lsn >= lsn`, `recovery.rs`). The
+    /// transaction has its Commit, so nothing undoes it or reports it: the write is gone. So this
+    /// refuses, and it never re-bases. Re-basing (starting the log above the highest page LSN)
+    /// would be an explicit operator decision, and no such option exists yet.
+    ///
+    /// **A normal open reads no page.** The pages are scanned only when the log cannot have issued
+    /// anything:
+    /// - `<db>.wal` does not exist. Checked BEFORE it is created, so a refused open leaves the
+    ///   directory as it found it.
+    /// - `<db>.wal` has never issued an LSN: base and end are both `INITIAL_LSN`. `truncate` sets the
+    ///   base to the end and never lowers it, so a log that has issued anything has a base above 1.
+    ///
+    /// **What it reads.** Every page the file physically holds, not `0..high_water`. A replica
+    /// applies records to pages the primary allocated after the backup, and its copy of the bitmap
+    /// never learns of them. A page only counts if it names itself in bytes 1..5, which is the rule
+    /// redo uses. Its LSN is then read by `buffer_pool::page_lsn_of`, the WAL gate's classifier.
+    /// The self-naming rule is what stops that classifier reading the bitmap page and COW arena
+    /// pages as heap pages with large LSNs.
+    ///
+    /// **Blind spots, stated so nobody takes this for more than it is:**
+    /// - A log that has issued anything is trusted without reading a page. A restored file opened
+    ///   by a binary from before this guard, which logged a write and checkpointed, now has a log
+    ///   whose base is above 1. It is not rescanned, and its untouched pages stay exposed.
+    /// - The existence check and the creation are two steps, so the caller must hold the
+    ///   database's `DbLock`, as both entry points do.
+    /// - A database that has never logged anything (no DDL, no DML) is rescanned on every open. In
+    ///   the CLI that includes the sparse gap below the arena floor. The first `CREATE TABLE` logs a
+    ///   `Ddl` record and ends that for good.
+    pub fn open_for_database(db_path: &Path, dm: &DiskManager) -> Result<Self, FerroError> {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(".wal");
+        let path = PathBuf::from(name);
+        // `try_exists`, not `exists`: an error here must refuse, not read as "missing" and create a
+        // second log beside one this process cannot see.
+        let exists = path
+            .try_exists()
+            .map_err(|e| FerroError::Wal(format!("cannot tell whether {} exists: {e}", path.display())))?;
+        if !exists {
+            refuse_pages_the_log_never_issued(db_path, dm, LogBehindPagesCause::MissingLog)?;
+            return Self::new(path);
+        }
+        let wal = Self::new(path)?;
+        if wal.base_lsn.load(Ordering::SeqCst) == INITIAL_LSN
+            && wal.next_lsn.load(Ordering::SeqCst) == INITIAL_LSN
+        {
+            refuse_pages_the_log_never_issued(db_path, dm, LogBehindPagesCause::EmptyLog)?;
+        }
+        Ok(wal)
+    }
+
     /// Pin the log at its current durable frontier, and return where that turned out to be.
     ///
     /// **Reading the LSN and registering the claim happen under one lock, and that is the whole
@@ -855,6 +920,57 @@ impl WalManager {
         }
         self.flush()
     }
+}
+
+/// The refusal half of [`WalManager::open_for_database`]. It is called only when the log has
+/// issued nothing, so any page LSN at or above `INITIAL_LSN` came from some other log.
+///
+/// It scans every page and reports the one with the HIGHEST such LSN, rather than stopping at the
+/// first: that number is how far the log would have to start to be above every page, and it is the
+/// figure an operator needs. `.replstate` is looked for only once the scan has found something.
+fn refuse_pages_the_log_never_issued(
+    db_path: &Path,
+    dm: &DiskManager,
+    cause_unless_replica: LogBehindPagesCause,
+) -> Result<(), FerroError> {
+    let len = dm.storage.len().map_err(|e| FerroError::Io(e.to_string()))?;
+    // Whole pages only. A torn last page cannot be read back, and recovery replaces such a page
+    // with `Page::empty` (lsn 0) before redo, so its bytes are not an LSN redo will compare with.
+    let pages = u32::try_from(len / PAGE_SIZE as u64)
+        .map_err(|_| FerroError::Io(format!("{} is too long to hold u32 page ids", db_path.display())))?;
+    let mut highest: Option<(u32, u64)> = None;
+    for page_id in 0..pages {
+        let lsn = self_named_page_lsn(page_id, &dm.read(page_id)?);
+        if lsn >= INITIAL_LSN && highest.is_none_or(|(_, h)| lsn > h) {
+            highest = Some((page_id, lsn));
+        }
+    }
+    let Some((page_id, page_lsn)) = highest else {
+        return Ok(());
+    };
+    let replica = ReplicaState::at(db_path);
+    let is_replica = replica.path().try_exists().map_err(|e| {
+        FerroError::Wal(format!("cannot tell whether {} exists: {e}", replica.path().display()))
+    })?;
+    Err(FerroError::LogBehindPages {
+        db: db_path.display().to_string(),
+        cause: if is_replica { LogBehindPagesCause::ReplicaFile } else { cause_unless_replica },
+        page_id,
+        page_lsn,
+    })
+}
+
+/// The page's LSN, or 0 unless the page names itself in bytes 1..5.
+///
+/// The identity rule is redo's (`recovery.rs`, `redo_one`): a page that does not name itself is
+/// treated there as `Page::empty`, with LSN 0. Every page type this engine stamps puts its id at
+/// bytes 1..5, and `Page::serialize` always writes it. The bitmap page and COW arena pages do not,
+/// and `page_lsn_of` alone would read both as heap pages (see its doc).
+fn self_named_page_lsn(page_id: u32, data: &[u8; PAGE_SIZE]) -> u64 {
+    if data[1..5] != page_id.to_be_bytes() {
+        return 0;
+    }
+    page_lsn_of(data)
 }
 
 pub fn scan_valid_end(file: &dyn Storage, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{

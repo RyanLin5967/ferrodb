@@ -1433,7 +1433,14 @@ impl BufferPoolManager {
     }
 }
 
-fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
+/// The LSN field of a page, found by its type byte; 0 for a type that carries none.
+///
+/// Classifies by `data[0]` alone, and that byte is not a type on every page: on the bitmap page it
+/// is the low byte of the next-bitmap pointer, and on a COW arena page it is the top byte of
+/// `birth_epoch`. Both read as a heap page here. The WAL gate can live with that, since it only
+/// flushes the log further than it needed to. `WalManager::open_for_database` cannot, so it also
+/// requires the page to name itself in bytes 1..5, as redo does.
+pub(crate) fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
     match data[0] {
         0 => u64::from_be_bytes(data[11..19].try_into().unwrap()),
         2 | 3 => u64::from_be_bytes(data[5..13].try_into().unwrap()),
