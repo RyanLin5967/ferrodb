@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2171,10 +2171,7 @@
+@@ -2176,10 +2176,7 @@
          // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
          // link. Either way the frame is carried to a redial rather than written into a closed link.
          Ok(_) => true,

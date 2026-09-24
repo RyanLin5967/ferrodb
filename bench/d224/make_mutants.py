@@ -44,7 +44,8 @@ MUTANTS = [
         "            idle_redials: 0,\n",
     )]),
     # PREREG amendment 6 (D224 review 2). N9: the gate is the whole deadline, not half; killed by T.
-    # N10: a reset read as alive; registered as a KNOWN SURVIVOR (no portable test reaches it).
+    # N10: a reset read as alive. Amendment 6 registered it as a survivor with no portable test;
+    # amendment 8 retracts that reason, and test L kills it on macOS and Linux (SO_LINGER 0).
     ("N9_gate_is_the_whole_deadline", [(
         "    opts.idle_deadline / 2\n",
         "    opts.idle_deadline\n",
@@ -55,6 +56,16 @@ MUTANTS = [
         "            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted\n"
         "        ),\n",
         "        Err(_) => false,\n",
+    )]),
+    # PREREG amendment 8 (D224 review 3, R3): the node's snapshot cross-wired; K's unequal meters
+    # kill both. Scored on the node module.
+    ("N11_counters_swap_probes_and_redials", [(
+        "            idle_probes: self.idle_probes(),\n            idle_redials: self.idle_redials(),\n",
+        "            idle_probes: self.idle_redials(),\n            idle_redials: self.idle_probes(),\n",
+    )]),
+    ("N12_counters_redials_read_from_probes", [(
+        "            idle_redials: self.idle_redials(),\n",
+        "            idle_redials: self.idle_probes(),\n",
     )]),
 ]
 
