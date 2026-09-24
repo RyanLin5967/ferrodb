@@ -280,7 +280,8 @@ impl Arms {
 ///   sees real work move. The measured branch path is untouched.
 /// * IN PATH (A7.5, A8, A11.6): a real state change that the measured code then sees.
 ///
-/// Every mode breaks a READ-VS-N guard, so a mode without `CURVE_ARMS` is refused (A11.4).
+/// Every mode breaks one arm's guard, so a mode whose arm is not in `CURVE_ARMS` is refused at
+/// startup (A11.4, A12.3): it could only print "every guard held" having injected nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fire {
     None,
@@ -336,6 +337,19 @@ enum Fire {
     /// resets the commit counter while `truncate` keeps the log: A10.2's one legitimate
     /// disagreement, produced for real. Needs an M target of at least one checkpoint interval.
     PinnedCheckpoint,
+    /// H6 (A12.2): before the FIRST restart the parent leaves the stale-index marker beside the log,
+    /// the file a failed index undo leaves (`TxnManager::mark_indexes_stale`), so the child's open
+    /// finds it and rebuilds for it.
+    StaleMarker,
+}
+
+/// The arm whose guard a fire mode breaks (A12.3). `Any` is G1, which every arm set checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NeedsArm {
+    Any,
+    Read,
+    Merge,
+    Restart,
 }
 
 impl Fire {
@@ -344,6 +358,72 @@ impl Fire {
             Err(_) => Fire::None,
             Ok(mode) => Fire::parse(&mode),
         }
+    }
+
+    /// The arm whose guard this mode breaks; `None` for no fire. Exhaustive, with no `_` arm, so a
+    /// new mode does not compile until it names its arm (A12.3).
+    fn needs(self) -> Option<NeedsArm> {
+        Some(match self {
+            Fire::None => return None,
+            Fire::WrongPage
+            | Fire::CensusOff
+            | Fire::ControlCatalog
+            | Fire::ControlCold
+            | Fire::WrongHeight
+            | Fire::ControlDrift => NeedsArm::Read,
+            Fire::MergeQuarantined
+            | Fire::WrongStart
+            | Fire::WrongVisits
+            | Fire::WrongDelta
+            | Fire::WrongLiveMerge
+            | Fire::WrongCkptFlag
+            | Fire::PinnedCheckpoint => NeedsArm::Merge,
+            Fire::WrongArenas
+            | Fire::WrongLive
+            | Fire::ChildLocked
+            | Fire::ExtraExtent
+            | Fire::OrphanExtent
+            | Fire::NoClusterTime
+            | Fire::StaleMarker => NeedsArm::Restart,
+            Fire::ExtraBranch => NeedsArm::Any,
+        })
+    }
+
+    /// Why this mode cannot run with these arms, if it cannot. A refusal, not a warning: each case
+    /// would otherwise end in "every guard held" having tested nothing (A9.2, A11.4, A12.3).
+    fn refusal(self, arms: Option<Arms>) -> Option<String> {
+        let need = self.needs()?;
+        let Some(a) = arms else {
+            return Some(format!(
+                "CURVE_FIRECHECK={:?} is refused without CURVE_ARMS: every mode breaks a READ-VS-N guard",
+                self
+            ));
+        };
+        let on = match need {
+            NeedsArm::Any => true,
+            NeedsArm::Read => a.read,
+            NeedsArm::Merge => a.merge,
+            NeedsArm::Restart => a.restart,
+        };
+        if !on {
+            return Some(format!(
+                "CURVE_FIRECHECK={:?} is refused: its guard is in the {need:?} arm, which \
+                 CURVE_ARMS does not run, so it could only pass unseen (PREREG A12.3)",
+                self
+            ));
+        }
+        // Merges free extents, and a recycled extent can hold a stale checksummed page that the
+        // open sweep's fill probe counts, so it would rightly not free the orphan and H4 would stay
+        // silent.
+        if self == Fire::OrphanExtent && a.merge {
+            return Some(
+                "CURVE_FIRECHECK=orphan-extent is refused with the merge arm on: its orphan could land \
+                 in a recycled extent that still holds a readable page (PREREG A9.2). Run it with \
+                 CURVE_ARMS=restart."
+                    .into(),
+            );
+        }
+        None
     }
 
     /// One mode by name. Refuses a name it does not know rather than running unguarded.
@@ -370,12 +450,13 @@ impl Fire {
             "orphan-extent" => Fire::OrphanExtent,
             "no-cluster-time" => Fire::NoClusterTime,
             "pinned-checkpoint" => Fire::PinnedCheckpoint,
+            "stale-marker" => Fire::StaleMarker,
             other => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
                  wrong-live-merge, wrong-ckpt-flag, extra-branch, child-locked, extra-extent, \
-                 orphan-extent, no-cluster-time, pinned-checkpoint"
+                 orphan-extent, no-cluster-time, pinned-checkpoint, stale-marker"
             ),
         }
     }
@@ -755,10 +836,17 @@ impl RestartRow {
 /// A fresh process because a real restart is one (D65 adversary, finding e): the parent has a
 /// large live heap and warm allocator. The OS page cache is warm either way — purging it needs
 /// root — so this is a WARM-CACHE restart, and PREREG says so.
+/// The stale-index marker `open_recovered` honours, beside `{db}.wal`: the engine's own path helper.
+fn stale_marker(db_path: &str) -> std::path::PathBuf {
+    ferrodb::wal::txn::stale_indexes_marker(Path::new(&format!("{db_path}.wal")))
+}
+
 fn open_only_child(db_path: &str, fire: Fire) -> ! {
     // H5's in-path fire (PREREG A7.5): a cluster member with no applied `LeaseTick`, held from
     // before the open to after the close. Its lease passes refuse before the orphan sweep.
     let _cluster = (fire == Fire::NoClusterTime).then(|| ClusterScope::joined(NodeId(1)));
+    // H6 (A12.2): read BEFORE the open, which removes the marker once it has rebuilt for it.
+    let stale = stale_marker(db_path).exists();
     let interval = scan_interval_from_env().expect("lease scan interval");
     let c0 = this_thread();
     let db = open_database(db_path, interval).expect("open the database");
@@ -772,20 +860,21 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
     let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
-    // A9.3/A11.1: D216's judge. Did `open_recovered` find records to replay? Not "did it rebuild":
-    // the stale-index marker also forces a rebuild, and `rebuild_us` is the independent cross-check.
+    // A9.3/A12.2: D216's judge. Did `open_recovered` find records to replay? It is also the gate:
+    // the open rebuilds only when this is true or the marker was present (`stale`, H6).
     let recovered = db.recovered;
     let (_, closed) = db.close();
     closed.expect("close the database cleanly");
     let us = |d: Duration| d.as_micros() as u64;
     println!(
-        "RESTART_RESULT recovered={} total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
+        "RESTART_RESULT recovered={} stale={} total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
          rebuild_us={} branch_catalog_us={} arena_us={} effect_log_us={} runtime_us={} \
          provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
          descents_total={} live={} c_desc={} c_att={} c_opt={} c_omiss={} c_lat={} c_fetch={} \
          c_fault={} c_hop={}",
         recovered as u64,
+        stale as u64,
         us(t.total),
         us(t.lock),
         us(t.boot.files),
@@ -853,7 +942,7 @@ fn print_restart_header() {
         "  RESTART       N   arenas   total ms  lease_st ms   arena ms  br_cat ms  recover ms  \
          tel ms  prov ms  open visits  1st-pass visits  1st-pass ms  c.desc/v  c.att/v  c.fault/v  \
          freed  live  parent ms  lock ms  files ms  sqlcat ms  rebuild ms  runtime ms  descents  \
-         wal B  tel B  prov B  m rows  recovered"
+         wal B  tel B  prov B  m rows  recovered  stale"
     );
     println!("  RESTART-RAW N=<n> <the child's RESTART_RESULT line, verbatim: every field it measured>");
 }
@@ -866,7 +955,7 @@ fn print_restart_row(r: &RestartRow) {
     println!(
         "  RESTART {:>8} {:>8} {:>10.3} {:>12.3} {:>10.3} {:>10.3} {:>11.3} {:>7.3} {:>8.3} {:>12} \
          {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3} {:>8.3} {:>9.3} {:>9.3} \
-         {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7} {:>10}",
+         {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7} {:>10} {:>6}",
         r.n,
         r.expect_arenas,
         ms("total_us"),
@@ -896,6 +985,7 @@ fn print_restart_row(r: &RestartRow) {
         r.prov_bytes,
         r.m_rows,
         r.get("recovered"),
+        r.get("stale"),
     );
     // A7.2: every field the child measured, verbatim, whether or not a column above shows it.
     println!("  RESTART-RAW N={} {}", r.n, r.raw);
@@ -926,6 +1016,15 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
     }
     if r.get("first_pass_done") != 1 {
         failures.push(format!("H5 {at}: the lease thread's first pass did not finish in its bound"));
+    }
+    // H6 (A12.2): the one thing besides `recovered` that makes the child's open rebuild. Nothing in
+    // this harness rolls back, so a marker means an index undo failed in the parent, and the row's
+    // `rebuild` is D205's, not a clean restart's.
+    if r.get("stale") != 0 {
+        failures.push(format!(
+            "H6 {at}: the stale-index marker was present at the child's open, so its rebuild is not a \
+             clean restart's"
+        ));
     }
 }
 
@@ -980,6 +1079,9 @@ struct MergeOne {
     /// The state cross-check for `checkpointed` (A9.4, guard M6): the log's `base_lsn` moved, which
     /// only a checkpoint's truncation does.
     base_lsn_moved: bool,
+    /// When the log's base moved (a real truncation): the WAL bytes appended after it, i.e. the
+    /// checkpoint's re-appended declarations (A12.1). `None` otherwise.
+    replay_bytes: Option<u64>,
     /// On an applied merge that checkpointed: the merge cycles since the previous checkpoint (or
     /// the open), this one included. The period the checkpoint amortizes over, counted in the unit
     /// being amortized, so a deferred trigger or a cycle that commits twice shows here (A10.1).
@@ -988,9 +1090,12 @@ struct MergeOne {
 
 /// One agent task: `BEGIN AGENT SESSION`, one INSERT of a row nobody has written, `MERGE;`.
 /// `since_ckpt` counts cycles since the last checkpoint; the caller zeroes it at every open.
+///
+/// The agent id is fixed-width (`mc` + 10 digits) so every run declaration encodes to the same
+/// size, which is what makes A12.1's replay bytes an exact line in the retained runs.
 fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire, since_ckpt: &mut u64) -> MergeOne {
     let mut sess = Session::with_runtime(Arc::clone(&db.runtime));
-    exec_sql(db, &mut sess, &format!("BEGIN AGENT SESSION AS 'mc{id}';")).expect("begin");
+    exec_sql(db, &mut sess, &format!("BEGIN AGENT SESSION AS 'mc{id:010}';")).expect("begin");
     exec_sql(db, &mut sess, &format!("INSERT INTO {MERGE_TABLE} VALUES ({id}, {id});"))
         .expect("insert");
     if fire == Fire::MergeQuarantined {
@@ -1016,6 +1121,7 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire, since_ckpt: &mut u64) -> 
     let (v1, c1) = merge_log_counters();
     let commits1 = db.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst);
     let base1 = db.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    let next1 = db.txn.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
     let runs_after = db.txn.retained_runs() as u64;
     let after = db.runtime.state_sizes();
     let applied_to_target =
@@ -1039,6 +1145,7 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire, since_ckpt: &mut u64) -> 
         runs_after,
         checkpointed,
         base_lsn_moved: base1 != base0,
+        replay_bytes: (base1 != base0).then(|| next1 - base1),
         period,
     }
 }
@@ -1074,13 +1181,20 @@ fn merge_guards(at: &str, one: &MergeOne, fire: Fire, delta: &mut Option<u64>, f
     }
 }
 
-/// One axis-(ii) auto-checkpoint (A11.3): the merge that paid it, against the median of the merges
-/// in its own period. EVERY checkpoint is kept, not only those in a printed block, so the linearity
-/// fit has one point per checkpoint interval instead of one per M target.
+/// One axis-(ii) auto-checkpoint (A11.3, A12.1): the merge that paid it. EVERY checkpoint is kept,
+/// not only those in a printed block.
 #[derive(Clone, Copy, Debug)]
 struct CkptPoint {
-    /// Merges since the open when it ran: the run declarations it re-appended (A7.4).
+    /// Merges since the open when it ran.
     m: usize,
+    /// `retained_runs` after it: the run declarations its checkpoint re-appended, which is the
+    /// replay's input and so both fits' x (A12.4). It equals `m` only while nothing refills
+    /// `run_log` at open (ledger D227).
+    runs: u64,
+    /// A12.1's JUDGED instrument, an integer: the WAL bytes appended after the truncation
+    /// (`next_lsn - base_lsn` once the merge returns), which is everything the checkpoint
+    /// re-appended and nothing else. `None` when the log was not truncated (a WAL pin, M6's case).
+    replay_bytes: Option<u64>,
     ns: u128,
     /// The median ns of the applied merges since the previous checkpoint that did not checkpoint.
     median: f64,
@@ -1093,53 +1207,103 @@ impl CkptPoint {
     }
 }
 
-/// A11.3: is the checkpoint's excess over the typical merge linear in M? A least-squares line WITH an
-/// intercept over every axis-(ii) checkpoint. The intercept takes the M-independent flushes and
-/// fsyncs, which bend a log-log slope below 1 (A9.1's band) however linear the replay is. Linearity
-/// is judged by the two halves' slopes agreeing. The raw points print first, so any other fit can be
-/// redone from the output.
+/// A least-squares line `y = c + a·x`, with what a reader needs to judge it.
+#[derive(Clone, Copy, Debug)]
+struct Line {
+    a: f64,
+    c: f64,
+    /// Standard error of `a`; `None` below three points (n − 2 degrees of freedom).
+    se_a: Option<f64>,
+    resid_sd: Option<f64>,
+    max_abs_resid: f64,
+}
+
+/// `None` below two points, or when every x is the same.
+fn fit_line(pts: &[(f64, f64)]) -> Option<Line> {
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+    if sxx == 0.0 {
+        return None;
+    }
+    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let a = sxy / sxx;
+    let c = my - a * mx;
+    let resid: Vec<f64> = pts.iter().map(|p| p.1 - (c + a * p.0)).collect();
+    let max_abs_resid = resid.iter().fold(0.0f64, |m, r| m.max(r.abs()));
+    let (se_a, resid_sd) = if pts.len() > 2 {
+        let s2 = resid.iter().map(|r| r * r).sum::<f64>() / (n - 2.0);
+        (Some((s2 / sxx).sqrt()), Some(s2.sqrt()))
+    } else {
+        (None, None)
+    };
+    Some(Line { a, c, se_a, resid_sd, max_abs_resid })
+}
+
+/// Every axis-(ii) checkpoint, raw, then two fits over them.
+///
+/// * **Judged (A12.1): the replay's BYTES against `runs`.** `replay_runs` appends one fixed-size
+///   record per retained run, so control flow fixes the count and no load can move it. The line is
+///   printed as fitted, not graded: PREREG A12.1 pre-registers its slope, intercept and residual.
+/// * **Reported, never judged: the replay's TIME.** A11.3's verdict on it had no noise floor
+///   (review 4 R1), so it prints each slope with its standard error and nothing more.
 fn print_ckpt_fit(points: &[CkptPoint]) {
-    println!("arm 2, axis (ii): every auto-checkpoint (A11.3); excess = ns - the median of its own period");
+    println!("arm 2, axis (ii): every auto-checkpoint (A11.3, A12.1); excess = ns - the median of its own period");
     for p in points {
         println!(
-            "  CKPT M={} ns={} period_median_ns={:.0} excess_ns={:.0} period={}",
+            "  CKPT M={} runs={} replay_bytes={} ns={} period_median_ns={:.0} excess_ns={:.0} period={}",
             p.m,
+            p.runs,
+            p.replay_bytes.map(|b| b.to_string()).unwrap_or_else(|| "-".into()),
             p.ns,
             p.median,
             p.excess(),
             p.period
         );
     }
-    // (slope a in ns per merge of M, intercept c in ns)
-    let fit = |pts: &[CkptPoint]| -> Option<(f64, f64)> {
-        let n = pts.len() as f64;
-        if pts.len() < 2 {
-            return None;
-        }
-        let mx = pts.iter().map(|p| p.m as f64).sum::<f64>() / n;
-        let my = pts.iter().map(CkptPoint::excess).sum::<f64>() / n;
-        let sxx: f64 = pts.iter().map(|p| (p.m as f64 - mx).powi(2)).sum();
-        if sxx == 0.0 {
-            return None;
-        }
-        let sxy: f64 = pts.iter().map(|p| (p.m as f64 - mx) * (p.excess() - my)).sum();
-        let a = sxy / sxx;
-        Some((a, my - a * mx))
-    };
-    let show = |f: Option<(f64, f64)>| {
-        f.map(|(a, c)| format!("a = {a:.3} ns per merge of M, c = {c:.0} ns")).unwrap_or_else(|| "-".into())
-    };
-    let (lo, hi) = points.split_at(points.len() / 2);
-    let (f_lo, f_hi) = (fit(lo), fit(hi));
-    println!("  fit, all {} points: {}", points.len(), show(fit(points)));
-    println!("  fit, lower half (M <= {}): {}", lo.last().map(|p| p.m).unwrap_or(0), show(f_lo));
-    println!("  fit, upper half: {}", show(f_hi));
-    match (f_lo, f_hi) {
-        (Some((a_lo, _)), Some((a_hi, _))) if a_lo != 0.0 => {
-            println!("  halves: a_hi / a_lo = {:.3} (A11.3 judges a > 0 and this in [0.5, 2.0])", a_hi / a_lo)
-        }
-        _ => println!("  halves: not computable (fewer than 4 checkpoints, or a flat lower half)"),
+    let bytes: Vec<(f64, f64)> =
+        points.iter().filter_map(|p| p.replay_bytes.map(|b| (p.runs as f64, b as f64))).collect();
+    match fit_line(&bytes) {
+        Some(l) => println!(
+            "  replay bytes vs runs (JUDGED, A12.1), {} truncating checkpoints: slope = {:.3} bytes per run, \
+             intercept = {:.1} bytes, max |residual| = {:.1} bytes",
+            bytes.len(),
+            l.a,
+            l.c,
+            l.max_abs_resid
+        ),
+        None => println!(
+            "  replay bytes vs runs (JUDGED, A12.1): not computable ({} truncating checkpoints)",
+            bytes.len()
+        ),
     }
+    let or_dash = |v: Option<f64>, prec: usize| v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "-".into());
+    let show = |l: Option<Line>| {
+        l.map(|l| {
+            format!(
+                "a = {:.3} ± {} ns per retained run, c = {:.0} ns, residual sd = {} ns",
+                l.a,
+                or_dash(l.se_a, 3),
+                l.c,
+                or_dash(l.resid_sd, 0)
+            )
+        })
+        .unwrap_or_else(|| "not computable".into())
+    };
+    let excess = |pts: &[CkptPoint]| -> Vec<(f64, f64)> { pts.iter().map(|p| (p.runs as f64, p.excess())).collect() };
+    let range = |pts: &[CkptPoint]| match (pts.first(), pts.last()) {
+        (Some(f), Some(l)) => format!("runs {}..={}, {} points", f.runs, l.runs, pts.len()),
+        _ => "no points".into(),
+    };
+    // The lower half takes floor(n/2) points; for an odd n the middle point is the upper half's.
+    let (lo, hi) = points.split_at(points.len() / 2);
+    println!("  excess vs runs (REPORTED, never judged), all ({}): {}", range(points), show(fit_line(&excess(points))));
+    println!("  excess vs runs, lower half ({}): {}", range(lo), show(fit_line(&excess(lo))));
+    println!("  excess vs runs, upper half ({}): {}", range(hi), show(fit_line(&excess(hi))));
 }
 
 /// One printed MERGE row: the per-merge MEANS of a batch (axis i) or of a block (axis ii).
@@ -1245,20 +1409,9 @@ fn main() {
     }
     let arms = Arms::from_env();
     let fire = Fire::from_env();
-    // A11.4: every mode breaks a READ-VS-N guard, and without `CURVE_ARMS` none of them runs, so
-    // the fire could only ever pass unseen.
-    if fire != Fire::None && arms.is_none() {
-        panic!("CURVE_FIRECHECK={fire:?} is refused without CURVE_ARMS: every mode breaks a READ-VS-N guard");
-    }
-    // A9.2: a combination the fire's premise forbids is refused, not documented. Merges free
-    // extents, and a recycled extent can hold a stale checksummed page that the open sweep's fill
-    // probe counts, so it would rightly not free the orphan and H4 would stay silent.
-    if fire == Fire::OrphanExtent && arms.is_some_and(|a| a.merge) {
-        panic!(
-            "CURVE_FIRECHECK=orphan-extent is refused with the merge arm on: its orphan could land \
-             in a recycled extent that still holds a readable page (PREREG A9.2). Run it with \
-             CURVE_ARMS=restart."
-        );
+    // Before anything is created: a mode that cannot inject with these arms is refused.
+    if let Some(why) = fire.refusal(arms) {
+        panic!("{why}");
     }
     let read_k: usize = std::env::var("CURVE_READ_K").ok().and_then(|v| v.parse().ok()).unwrap_or(16_384);
     // Arm 2 (PREREG A3): K merges per checkpoint on axis (i), and the M targets of axis (ii).
@@ -1743,6 +1896,12 @@ fn main() {
                     m_rows,
                     ..Default::default()
                 };
+                // H6's in-path fire (A12.2): the marker a failed index undo leaves, at the first restart.
+                if fire == Fire::StaleMarker && checkpoint_index == 0 {
+                    let marker = stale_marker(&db_path_str);
+                    std::fs::write(&marker, "READ-VS-N stale-marker fire\n").expect("stale-marker fire: write");
+                    assert!(marker.exists(), "stale-marker fire did not inject: {} is absent", marker.display());
+                }
                 // H1's in-path fire: the parent holds the lock file, so the child's open refuses.
                 let held = (fire == Fire::ChildLocked).then(|| {
                     DbLock::acquire(Path::new(&db_path_str)).expect("child-locked fire: hold the lock")
@@ -1905,6 +2064,8 @@ fn main() {
                     if let Some(&median) = period_ns.get(period_ns.len() / 2) {
                         ckpt_points.push(CkptPoint {
                             m: m_done,
+                            runs: one.runs_after,
+                            replay_bytes: one.replay_bytes,
                             ns: one.nanos,
                             median: median as f64,
                             period: one.period.unwrap_or(0),

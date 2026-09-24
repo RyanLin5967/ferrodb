@@ -98,9 +98,9 @@ pub struct OpenDatabase {
     pub timings: OpenTimings,
     /// Whether `open_recovered` found log records to replay. NOT whether it rebuilt the indexes: it
     /// also rebuilds when the stale-index marker is present, with this false. **Observing only —
-    /// READ-VS-N arm 3** judges D216 on this rather than on a timer (a clean shutdown should leave
-    /// nothing to replay, and before D216 it does), and cross-checks it with the rebuild's own time,
-    /// because after D216 this is the fixed `recover`'s own verdict.
+    /// READ-VS-N arm 3** judges D216 on this rather than on a timer: a clean shutdown should leave
+    /// nothing to replay, and before D216 it does. This flag is also the rebuild's GATE (with the
+    /// marker), so the rebuild's time is a consequence of it, not a check on it.
     pub recovered: bool,
     /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
     /// the lock file goes and another process may open the database. That covers THIS struct's
