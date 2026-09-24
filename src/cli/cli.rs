@@ -202,32 +202,53 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    // Review 2's C2 (the lead's decision): the WAL checkpoint's result is HELD, not returned at once.
-    // It refuses while a release is owed (F2), and returning then skipped the arena checkpoint below,
-    // so the branch tree written this session became unreachable. The arena checkpoint runs whatever
-    // the WAL's returned, and the WAL's error is reported after it.
-    //
-    // D230: that step persists the catalog from its in-memory records first. A `sync_roots` whose
-    // persist failed this session left the catalog page behind the trees, and a checkpoint alone
-    // would flush that page and truncate the log, so the next open would not rebuild and would read
-    // it. On failure the log is kept for the next open to rebuild from, and the error names the
-    // roots. See `catalog::clean_exit`.
-    let wal_checkpoint = crate::catalog::clean_exit::checkpoint_for_exit(&catalog.lock(), &txn);
-    // Persist where the arena starts and what it has allocated. Without this the next open finds
-    // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    // HELD too (review 3's caveat 4): returned at once, a failure here skipped the counters below and
-    // dropped the WAL's error. Both errors are reported; the WAL's is returned first.
-    let arena_checkpoint = store.checkpoint(Path::new(&arena_path));
+    // The catalog guard lives for the whole call, the arena checkpoint included. That is the
+    // existing order (the catalog before the arena, as the lease thread takes them), and the lease
+    // thread has stopped, so nothing waits on it.
+    exit_sequence(&catalog.lock(), &txn, &store, Path::new(&arena_path))?;
+    println!("bye bye");
+    Ok(())
+}
+
+/// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
+/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs
+/// (D230 review 3, F3(b)).
+///
+/// 1. **D230:** persist the catalog from its in-memory records, then checkpoint the log
+///    (`catalog::clean_exit::checkpoint_for_exit`). A `sync_roots` whose persist failed this session
+///    left the catalog page behind the trees, and a checkpoint alone would flush that page and
+///    truncate the log, so the next open would not rebuild and would read it. On failure the log is
+///    kept for the next open to rebuild from, and the error names the roots.
+/// 2. Persist where the arena starts and what it has allocated. Without this the next open finds no
+///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
+///
+/// The arena step runs whatever the first returned, and the first error is returned and any later
+/// one printed. A refused catalog persist must not also cost the arena its checkpoint (review 3,
+/// F4). This is the shape `rollback-index-orphan` gives its two checkpoints: its review 2's C2 (the
+/// lead's decision) holds the WAL checkpoint's result because it refuses while a release is owed,
+/// and returning then skipped the arena checkpoint, leaving the session's branch tree unreachable.
+pub fn exit_sequence(
+    catalog: &Catalog,
+    txn: &TxnManager,
+    store: &ArenaPageStore,
+    arena_path: &Path,
+) -> Result<(), FerroError> {
+    let wal_checkpoint = crate::catalog::clean_exit::checkpoint_for_exit(catalog, txn);
+    let arena_checkpoint = store.checkpoint(arena_path);
+    // #16 (rollback-index-orphan): the failure counters are printed after both checkpoints, whatever
+    // they returned (its review 3's caveat 4: a failure must not skip them).
     if let Some(line) = crate::wal::txn::failure_counters_line() {
         eprintln!("{line}");
     }
-    if let (Err(_), Err(a)) = (&wal_checkpoint, &arena_checkpoint) {
-        eprintln!("ferrodb: the arena checkpoint failed as well ({a})");
+    let mut errors = [wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
+    let first = errors.next();
+    for later in errors {
+        eprintln!("ferrodb: a later exit step failed as well ({later})");
     }
-    wal_checkpoint?;
-    arena_checkpoint?;
-    println!("bye bye");
-    Ok(())
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {

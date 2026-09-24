@@ -560,27 +560,43 @@ impl Catalog {
 
     // traverses catalog pages and loads into hashmap
     pub fn load(&mut self) -> Result<(), FerroError> {
-        let mut curr_page_id = self.first_catalog_page_id;
-        loop{
-            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
-            let cat_page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                CatalogPage::deserialize(frame.data)?
-            };
-            self.buffer_pool.unpin_page(curr_page_id, false);
-            for entry in cat_page.entries {
-                self.tables.insert(entry.name.clone(), entry);
-            }
-            if cat_page.next_catalog_page == 0 {
-                break;
-            }
-            curr_page_id = cat_page.next_catalog_page;
+        let pool = self.buffer_pool.clone();
+        let entries = Self::read_entries(self.first_catalog_page_id, |page_id| {
+            let frame_i = pool.fetch_page(page_id)?;
+            let data = pool.frames[frame_i].read().unwrap().data;
+            pool.unpin_page(page_id, false);
+            Ok(data)
+        })?;
+        for entry in entries {
+            self.tables.insert(entry.name.clone(), entry);
         }
         // Seed the shared root cells from the records just loaded.
         self.sync_root_cells();
         // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.
         self.epoch += 1;
         Ok(())
+    }
+
+    /// The table entries of the catalog page chain that starts at `first`, each page read with
+    /// `read_page`. **It constructs no `Catalog`, seeds no root cell, and opens nothing**: it only
+    /// decodes. `load` reads the chain through the buffer pool. The clean exit's error message reads
+    /// it from the `DiskManager` (`clean_exit::unpersisted_roots`), which is what the next open will
+    /// see (D230 review 3, F1 and F5). A read-back that went through `Catalog::open` instead would
+    /// be a second way to open a database, which `open_path_allowlist` refuses.
+    pub fn read_entries(
+        first: u32,
+        mut read_page: impl FnMut(u32) -> Result<[u8; crate::storage::disk_manager::PAGE_SIZE], FerroError>,
+    ) -> Result<Vec<TableEntry>, FerroError> {
+        let mut entries = Vec::new();
+        let mut curr_page_id = first;
+        loop {
+            let cat_page = CatalogPage::deserialize(read_page(curr_page_id)?)?;
+            entries.extend(cat_page.entries);
+            if cat_page.next_catalog_page == 0 {
+                return Ok(entries);
+            }
+            curr_page_id = cat_page.next_catalog_page;
+        }
     }
 
     pub fn analyze(&mut self, table: &str) -> Result<(), FerroError> {
