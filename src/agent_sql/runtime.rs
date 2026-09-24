@@ -5752,8 +5752,9 @@ impl AgentRuntime {
     /// - one [`revert_store::VERSIONS_TABLE`] upsert per row it published, with its new version;
     /// - the counters: the version clock, the highest txn named, the log's high key, retention.
     ///
-    /// The `versions` upsert is an `UPDATE ... WHERE k = <key>`, planned through the primary index
-    /// like every DML statement since D178 (`planner::plan::build_scan` optimizes its predicate).
+    /// The `versions` upsert is an `UPDATE ... WHERE k = <key>`, optimized like every DML statement
+    /// since D178 (`planner::plan::build_scan` runs `optimize`), so it can take the primary index on
+    /// `k`; whether it does is the cost model's choice, which prefers a scan on a very small table.
     #[allow(clippy::too_many_arguments)]
     fn plan_history(
         &self,
