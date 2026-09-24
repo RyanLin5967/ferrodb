@@ -443,3 +443,17 @@ primary heap, so the open panics, and every later one does too.
   built.
 - The runner gains M24 (the new `flush_page` removed, killed by the red test) and D250's SKIPm, TTm, CLRm and LSNm
   (amendment 12). Base and counts follow in the next amendment.
+
+**Amendment 14 (after the fix `650bf70`).** `650bf70` is the fix as amendment 12 registered it: `add_empty_page` calls
+`flush_page` on the initialised page before `add_to_directory`. It also carries amendment 13's restated fixture.
+
+**The GREEN phase and mutant base is `650bf70`:**
+- `wal::recovery::tests_crash_frees::`: **23 run, 23 passed**, predicted.
+- `wal::recovery::tests::`: all pass EXCEPT D250 test 10, predicted RED for the reason amendment 12 gives. That is a
+  ⚖, and no assertion is changed here.
+- The RED checkpoint for the new test is `18c647e`: **1 FAILED** there (the open panics in `Page::deserialize`),
+  predicted.
+- `lane_d229_run.sh` carries **27 mutants**: amendment 11's 22, M24, and D250's SKIPm, LSNm, TTm and CLRm.
+  PATTERNS_ONLY at `650bf70` finds one site per expression (rc 0, 28 expressions). The fire check at `18c647e` refuses
+  M24 (0 sites, rc 1), as it must.
+- **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M24, SKIPm, LSNm, TTm and CLRm. M3, M7 and M12 survive.
