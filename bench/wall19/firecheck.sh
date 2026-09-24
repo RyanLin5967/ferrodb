@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
 # lease-reap attestation, and must turn its NAMED killers red. Pre-registration: artie-research
-# frontier/lane_wall19_attested.md §12 (it supersedes the counts of 10.6, 10.7 and 11). Run from the
+# frontier/lane_wall19_attested.md §12, amended by §13 (the D199 seal review's fallback, M21-M23, the judge
+# review's J1/J3/J5/J6). Run from the
 # worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work: it runs only when FAN-QUEUE row #14
 # is released.
 #
@@ -23,9 +24,9 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=2673674           # the tree these mutants were written against
+SUBJECT_SHA=b4ba33b           # the tree these mutants were written against (lane §13)
 OUT=bench/wall19/firecheck
-CONTROL_COUNTS="lib=34 lease=25 integ=10" # pre-registered, lane §11 and §12
+CONTROL_COUNTS="lib=34 lease=29 integ=10" # pre-registered, lane §11-§13
 
 # name|file|old text (python literal)|new text (python literal)
 # '|' is the field separator, so a literal pipe inside mutant text is written \u007c.
@@ -38,12 +39,12 @@ MUTANTS=(
   "M4_refusal_not_counted|$A|"'"        self.refused += 1;\n"|""'
   "M5_trunk_exemption_removed|$A|"'"            None if branch.is_trunk() => Attestation::genesis(),\n"|""'
   "M6_reap_keeps_head|$A|"'"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n"|"        if false {\n            self.heads.remove(&e.branch);\n"'
-  "M7_scan_forget_does_not_attest|$R|"'"\n            self.attest_landed_reaps(&gone);\n"|"\n"'
-  "M8_sweep_forget_does_not_attest|$R|"'"\n                self.attest_landed_reaps(&gone);\n"|"\n"'
+  "M7_scan_forget_does_not_attest|$R|"'"\n            self.attest_landed_reaps(&gone, false);\n"|"\n"'
+  "M8_sweep_forget_does_not_attest|$R|"'"\n                self.attest_landed_reaps(&gone, false);\n"|"\n"'
   "M9_no_head_check|$R|"'"            let Some(fork_epoch) = h.opened_at(branch) else {\n                continue;\n            };\n"|"            let fork_epoch = h.opened_at(branch).unwrap_or_default();\n"'
-  "M10_lease_reap_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, fork_epoch, true);\n"'
+  "M10_lease_reap_published|$R|"'"\n            self.attest_landed_reaps(&gone, false);\n"|"\n            self.attest_landed_reaps(&gone, true);\n"'
   "M11_attest_before_landed|$R|"'"                Ok(r) if r.generation > b.generation => landed.push(b),\n"|"                Ok(_) => landed.push(b),\n"'
-  "M12_lease_reap_current_epoch|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, self.branches.current_epoch(), false);\n"'
+  "M12_lease_reap_current_epoch|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, published);\n"|"            let _ = Self::append_reap(&mut h, branch, self.branches.current_epoch(), published);\n"'
   "M13_opened_follows_latest|$A|"'"            let opened = self.heads.get(&e.branch).map_or(e.epoch, \u007ct\u007c t.opened);\n"|"            let opened = e.epoch;\n"'
   "M14_unreadable_not_counted|$R|"'"        for branch in unreadable {\n            if h.head_of(branch).is_some() {\n                h.count_refusal();\n            }\n"|"        for branch in unreadable {\n            if h.head_of(branch).is_some() {\n            }\n"'
   "M15_unreadable_as_landed|$R|"'"                Err(_) => unreadable.push(b),\n"|"                Err(_) => landed.push(b),\n"'
@@ -52,6 +53,9 @@ MUTANTS=(
   "M18_seal_attests_a_flip_it_did_not_make|$R|"'"            .filter(\u007cr\u007c r.generation == branch.generation && r.state != BranchState::Reaped);\n"|"            ;\n"'
   "M19_seal_unreadable_not_counted|$R|"'"            Err(_) => {\n                let mut h = self.attested.lock().unwrap();\n                if h.head_of(branch).is_some() {\n                    h.count_refusal();\n                }\n            }\n"|"            Err(_) => {}\n"'
   "M20_seal_unreadable_guessed_landed|$R|"'"            Err(_) => {\n                let mut h = self.attested.lock().unwrap();\n                if h.head_of(branch).is_some() {\n                    h.count_refusal();\n                }\n            }\n"|"            Err(_) => {\n                let _ = self.attest_reap(branch, fork_epoch, published);\n            }\n"'
+  "M21_seal_has_no_landed_fallback|$R|"'"            None => self.attest_landed_reaps(&[branch], published),\n"|"            None => {}\n"'
+  "M22_seal_fallback_drops_published|$R|"'"            None => self.attest_landed_reaps(&[branch], published),\n"|"            None => self.attest_landed_reaps(&[branch], false),\n"'
+  "M23_landed_rule_ignores_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, published);\n"|"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"'
 )
 # name|required killers (all must FAIL)|optional killers (lane §12)
 A_REG=a_branch_with_no_live_head_is_refused_and_a_reaped_walk_keeps_its_reap
@@ -67,6 +71,10 @@ L_RECON=a_reap_the_reconciliation_finds_is_attested_exactly_once
 L_SEALFAIL=a_seal_whose_reap_fails_after_the_flip_is_still_attested
 L_SEALUNREAD=a_seal_that_cannot_read_its_record_after_the_flip_counts_it_not_guesses
 I_OUT=a_branch_outside_the_log_cannot_parent_a_session_and_its_reap_writes_nothing
+L_F1=a_seal_whose_read_before_the_reap_fails_still_attests_the_reap_it_made
+L_F1B=an_unreadable_seal_counts_the_reap_and_a_retried_abandon_attests_it
+L_F2=a_lease_reap_refused_after_its_flip_is_attested_when_the_client_seals
+L_PUB=a_merged_seal_that_takes_the_landed_path_records_published
 I_REAPED=a_reaped_branch_keeps_its_proofs_and_loses_its_head
 I_ALTER=altering_one_entry_breaks_the_chain
 I_8="a_fork_a_merge_and_a_reap_each_leave_an_attested_entry a_childs_chain_walks_into_the_parent_it_forked_from the_merge_entry_commits_to_the_rows_it_published $I_ALTER a_published_head_catches_a_rewrite_that_the_chain_walk_accepts an_auditor_can_check_every_entry_against_a_published_head a_reap_through_an_attached_reaper_is_attested_too $I_REAPED"
@@ -74,23 +82,26 @@ KILLERS=(
   "M1_append_genesis_fallback|$A_REG $A_RECYCLED $I_OUT|"
   "M2_fork_genesis_fallback|$A_REG $I_OUT|"
   "M3_trunk_reap_allowed|$A_REG|"
-  "M4_refusal_not_counted|$A_REG $L_UNREAD $L_SEALUNREAD $I_OUT|"
+  "M4_refusal_not_counted|$A_REG $L_UNREAD $L_SEALUNREAD $L_F1B $I_OUT|"
   "M5_trunk_exemption_removed|$A_M5 $A_RECYCLED $A_REAPED $A_REG $I_8|"
-  "M6_reap_keeps_head|$A_REAPED $A_REG $A_OPENED $L_LEASE $L_SEALFAIL $I_REAPED|"
+  "M6_reap_keeps_head|$A_REAPED $A_REG $A_OPENED $L_LEASE $L_SEALFAIL $L_F2 $I_REAPED|"
   "M7_scan_forget_does_not_attest|$L_LEASE $L_LANDS $L_UNREAD|"
   "M8_sweep_forget_does_not_attest|$L_RECON|"
-  "M9_no_head_check|$L_LEASE $L_SEALFAIL|"
+  "M9_no_head_check|$L_LEASE $L_SEALFAIL $L_F2|"
   "M10_lease_reap_published|$L_LEASE|"
   "M11_attest_before_landed|$L_LANDS|"
-  "M12_lease_reap_current_epoch|$L_LEASE|"
+  "M12_lease_reap_current_epoch|$L_LEASE $L_PUB|"
   "M13_opened_follows_latest|$A_OPENED|"
-  "M14_unreadable_not_counted|$L_UNREAD|"
-  "M15_unreadable_as_landed|$L_UNREAD|"
+  "M14_unreadable_not_counted|$L_UNREAD $L_F1B|"
+  "M15_unreadable_as_landed|$L_UNREAD $L_F1B|"
   "M16_first_entry_not_last|$A_REAPED $A_REG $A_VBF $L_LEASE $I_REAPED $I_ALTER|"
-  "M17_seal_attests_behind_the_fallible_step|$L_SEALFAIL|$L_SEALUNREAD"
-  "M18_seal_attests_a_flip_it_did_not_make|$L_LEASE $L_SEALFAIL|"
+  "M17_seal_attests_behind_the_fallible_step|$L_SEALFAIL $L_F1B $L_F2|$L_SEALUNREAD"
+  "M18_seal_attests_a_flip_it_did_not_make|$L_LEASE $L_SEALFAIL $L_F2|"
   "M19_seal_unreadable_not_counted|$L_SEALUNREAD|"
   "M20_seal_unreadable_guessed_landed|$L_SEALUNREAD|"
+  "M21_seal_has_no_landed_fallback|$L_F1 $L_F1B $L_F2 $L_PUB|"
+  "M22_seal_fallback_drops_published|$L_PUB|"
+  "M23_landed_rule_ignores_published|$L_PUB|"
 )
 TARGETS="lib lease integ"
 
@@ -138,6 +149,11 @@ tstate() { # $1 label, $2 target
   last=$(tail -n 1 "$f")
   case "$last" in rc=[0-9]*) rc=${last#rc=} ;; *) echo "INCOMPLETE ($2: no rc line)"; return ;; esac
   if [ "$rc" = 124 ]; then echo "TIMEOUT ($2)"; return; fi
+  # Before the result-line count (D237 judge review J1): an outside SIGKILL is RC-137, not COMPILE-FAIL.
+  case "$rc" in 0|101) ;; *) echo "RC-$rc ($2)"; return ;; esac
+  # A test binary killed by a signal (an abort, a stack overflow, a segfault): cargo exits 101 and names
+  # the signal. Checked before the result-line count, which a crash also removes (J1).
+  if grep -qE "process didn't exit successfully: .*\(signal: [0-9]+" "$f"; then echo "CRASHED ($2)"; return; fi
   n=$(grep -cE '^test result:' "$f")
   if [ "$n" -eq 0 ]; then echo "COMPILE-FAIL ($2)"; return; fi
   if [ "$n" -ne "$(binaries "$2")" ]; then echo "INCOMPLETE ($2: $n result lines)"; return; fi
@@ -146,8 +162,7 @@ tstate() { # $1 label, $2 target
     0/0) ;;
     101/0) echo "RC-MISMATCH ($2: rc=101 and nothing FAILED)"; return ;;
     101/*) ;;
-    0/*) echo "RC-MISMATCH ($2: rc=0 with FAILED lines)"; return ;;
-    *) echo "RC-$rc ($2)"; return ;;
+    *) echo "RC-MISMATCH ($2: rc=0 with FAILED lines)"; return ;;
   esac
   echo OK
 }
@@ -245,7 +260,23 @@ expect() { # $1 case, $2 expected verdict prefix, $3 actual verdict
     *) echo "self-test FAIL  $1: expected '$2', got '$3'"; st_bad=$((st_bad + 1)) ;;
   esac
 }
-clean_set() { ok_file "$1" lib 34; ok_file "$1" lease 25; ok_file "$1" integ 10; }
+reg() { printf '%s\n' $CONTROL_COUNTS | sed -n "s/^$1=//p"; } # a target's registered passed count
+target_of() { # $1 killer name: the target its test lives in, from the name table above
+  case " $A_REG $A_RECYCLED $A_REAPED $A_OPENED $A_VBF $A_M5 " in *" $1 "*) echo lib; return ;; esac
+  case " $I_OUT $I_REAPED $I_ALTER $I_8 " in *" $1 "*) echo integ; return ;; esac
+  echo lease
+}
+plant_kill() { # $1 label, $2 names that FAIL (each in its own target), $3 more lease tests that FAIL
+  local label=$1 t n names
+  for t in $TARGETS; do
+    names=""
+    for n in $2; do [ "$(target_of "$n")" = "$t" ] && names="$names x::$n"; done
+    if [ "$t" = lease ]; then for n in $3; do names="$names x::$n"; done; fi
+    # shellcheck disable=SC2086
+    if [ -n "$names" ]; then fail_file "$label" "$t" 1 $names; else ok_file "$label" "$t" "$(reg "$t")"; fi
+  done
+}
+clean_set() { ok_file "$1" lib "$(reg lib)"; ok_file "$1" lease "$(reg lease)"; ok_file "$1" integ "$(reg integ)"; }
 
 self_test() {
   local keep=$OUT st_bad=0 tmp m name rest t
@@ -255,24 +286,22 @@ self_test() {
   clean_set control
   expect "clean control" "clean" "$(control_verdict control "$CONTROL_COUNTS")"
 
-  ok_file short lib 33; ok_file short lease 25; ok_file short integ 10
-  expect "control short of its registered count" "VOID (lib: passed 33" "$(control_verdict short "$CONTROL_COUNTS")"
+  ok_file short lib $(($(reg lib) - 1)); ok_file short lease "$(reg lease)"; ok_file short integ "$(reg integ)"
+  expect "control short of its registered count" "VOID (lib: passed $(($(reg lib) - 1))" "$(control_verdict short "$CONTROL_COUNTS")"
 
-  ok_file ign lib 34; ok_file ign integ 10
-  plant ign lease 0 "running 26 tests" "test result: ok. 25 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s"
-  expect "control with an ignored test" "VOID (lease: passed 25, ignored 1" "$(control_verdict ign "$CONTROL_COUNTS")"
+  ok_file ign lib "$(reg lib)"; ok_file ign integ "$(reg integ)"
+  plant ign lease 0 "running tests" "test result: ok. $(reg lease) passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  expect "control with an ignored test" "VOID (lease: passed $(reg lease), ignored 1" "$(control_verdict ign "$CONTROL_COUNTS")"
 
-  ok_file dirty lib 34; ok_file dirty integ 10
-  fail_file dirty lease 25 "branch::lease_thread::tests::$L_LEASE"
-  # 25 passed plus a FAILED one: the count gate alone would pass this control, so the case proves the
+  ok_file dirty lib "$(reg lib)"; ok_file dirty integ "$(reg integ)"
+  fail_file dirty lease "$(reg lease)" "branch::lease_thread::tests::$L_LEASE"
+  # The registered count passed plus a FAILED one: the count gate alone would pass this control, so the case proves the
   # FAILED check fires on its own.
   expect "dirty control" "VOID (a test FAILED)" "$(control_verdict dirty "$CONTROL_COUNTS")"
 
   # M4 with its registered sets (three targets), read from the table the run uses.
   killers_of M4_refusal_not_counted || { echo "self-test FAIL  M4 has no KILLERS row"; st_bad=$((st_bad + 1)); }
-  fail_file M4 lib 33 "branch::attest::tests::$A_REG"
-  fail_file M4 lease 23 "branch::lease_thread::tests::$L_UNREAD" "branch::lease_thread::tests::$L_SEALUNREAD"
-  fail_file M4 integ 9 "$I_OUT"
+  plant_kill M4 "$req" ""
   # shellcheck disable=SC2086
   expect "killed mutant" "KILLED-AS-REGISTERED" "$(verdict M4 "$req" "$opt" $TARGETS)"
 
@@ -285,10 +314,7 @@ self_test() {
   expect "killed mutant, stray files in \$OUT" "KILLED-AS-REGISTERED" "$(verdict M4 "$req" "$opt" $TARGETS)"
 
   # Every named killer, plus one test that is not named: not a kill as registered.
-  fail_file plus lib 33 "branch::attest::tests::$A_REG"
-  fail_file plus lease 22 "branch::lease_thread::tests::$L_UNREAD" "branch::lease_thread::tests::$L_SEALUNREAD" \
-    "branch::lease_thread::tests::stop_does_not_wait_out_the_scan_interval"
-  fail_file plus integ 9 "$I_OUT"
+  plant_kill plus "$req" "stop_does_not_wait_out_the_scan_interval"
   # shellcheck disable=SC2086
   expect "named killers plus an unregistered failure" "MISMATCH (missing: ; unexpected: stop_does_not_wait_out_the_scan_interval)" "$(verdict plus "$req" "$opt" $TARGETS)"
 
@@ -300,19 +326,58 @@ self_test() {
   expect "two result lines in a one-binary target" "INCOMPLETE (lease: 2 result lines)" "$(verdict two "$req" "$opt" $TARGETS)"
 
   # A kill on a test that is not the mutant's named killer is not a kill (F5).
-  fail_file other lib 33 "branch::attest::tests::genesis_is_not_zero"; ok_file other lease 25; ok_file other integ 10
+  fail_file other lib 33 "branch::attest::tests::genesis_is_not_zero"; ok_file other lease "$(reg lease)"; ok_file other integ "$(reg integ)"
   # shellcheck disable=SC2086
   expect "a failure that is not the named killer" "MISMATCH" "$(verdict other "$req" "$opt" $TARGETS)"
 
-  fail_file part lib 33 "branch::attest::tests::$A_REG"; ok_file part lease 25; fail_file part integ 9 "$I_OUT"
+  # Every required killer but the last FAILED.
+  plant_kill part "${req% *}" ""
   # shellcheck disable=SC2086
   expect "a required killer missing" "MISMATCH (missing: " "$(verdict part "$req" "$opt" $TARGETS)"
 
   killers_of M17_seal_attests_behind_the_fallible_step || { echo "self-test FAIL  M17 has no KILLERS row"; st_bad=$((st_bad + 1)); }
-  ok_file m17 lib 34; ok_file m17 integ 10
-  fail_file m17 lease 23 "branch::lease_thread::tests::$L_SEALFAIL" "branch::lease_thread::tests::$L_SEALUNREAD"
+  plant_kill m17 "$req $opt" ""
   # shellcheck disable=SC2086
   expect "required plus optional killer" "KILLED-AS-REGISTERED" "$(verdict m17 "$req" "$opt" $TARGETS)"
+
+  # ---- D237 judge review J3: the clauses and file states the cases above leave uncovered. ----
+  # Only an optional killer FAILED (M17's), none of its required ones.
+  ok_file optonly lib "$(reg lib)"; ok_file optonly integ "$(reg integ)"
+  fail_file optonly lease 28 "branch::lease_thread::tests::$L_SEALUNREAD"
+  # shellcheck disable=SC2086
+  expect "only an optional killer FAILED" "MISMATCH (missing: " "$(verdict optonly "$req" "$opt" $TARGETS)"
+
+  # A control whose target timed out although its counts add up: only arm_state can void it.
+  ok_file tocount lib "$(reg lib)"; ok_file tocount integ "$(reg integ)"
+  plant tocount lease 124 "running tests" "test result: ok. $(reg lease) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  expect "control with a TIMEOUT whose counts add up" "VOID (TIMEOUT (lease))" "$(control_verdict tocount "$CONTROL_COUNTS")"
+
+  # The file states.
+  ok_file late lib 34; ok_file late integ 10
+  printf '%s\n' "test branch::lease_thread::tests::$L_SEALFAIL ... FAILED" \
+    "test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" "rc=101" \
+    "a line written after the rc line" > "$(tfile late lease)"
+  # shellcheck disable=SC2086
+  expect "a line after the rc line" "INCOMPLETE (lease: no rc line)" "$(verdict late "$req" "$opt" $TARGETS)"
+  ok_file k9r lib 34; ok_file k9r integ 10
+  plant k9r lease 137 "running tests" "test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  # shellcheck disable=SC2086
+  expect "rc=137 with a result line" "RC-137 (lease)" "$(verdict k9r "$req" "$opt" $TARGETS)"
+  ok_file k9 lib 34; ok_file k9 integ 10
+  plant k9 lease 137 "   Compiling ferrodb v0.1.0"
+  # shellcheck disable=SC2086
+  expect "rc=137 with no result line (an outside SIGKILL)" "RC-137 (lease)" "$(verdict k9 "$req" "$opt" $TARGETS)"
+  ok_file nofail lib 34; ok_file nofail integ 10
+  plant nofail lease 101 "running tests" "test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  # shellcheck disable=SC2086
+  expect "rc=101 with nothing FAILED" "RC-MISMATCH (lease: rc=101 and nothing FAILED)" "$(verdict nofail "$req" "$opt" $TARGETS)"
+  ok_file crash lib 34; ok_file crash integ 10
+  plant crash lease 101 "running tests" "test branch::lease_thread::tests::$L_SEALFAIL ... FAILED" \
+    "thread 'branch::lease_thread::tests::x' panicked while processing panic. aborting." \
+    "error: test failed, to rerun pass \`--lib\`" "" "Caused by:" \
+    "  process didn't exit successfully: \`/t/target/debug/deps/ferrodb-0123\` (signal: 6, SIGABRT: process abort signal)"
+  # shellcheck disable=SC2086
+  expect "a test binary killed by a signal" "CRASHED (lease)" "$(verdict crash "$req" "$opt" $TARGETS)"
 
   for t in $TARGETS; do plant cf "$t" 101 "error[E0308]: mismatched types" "error: could not compile \`ferrodb\` (lib test) due to 1 previous error"; done
   # shellcheck disable=SC2086
@@ -370,10 +435,12 @@ if ! self_test > "$OUT/selftest.log" 2>&1; then
   exit 2
 fi
 
+# Every checkout of src/ is --no-overlay, so a file absent at the target commit is removed and "src/ at <sha>"
+# is exact (D237 judge review J6); an overlay checkout only adds and overwrites.
 on_exit() {
-  git checkout "$SUBJECT_SHA" -- src/ 2>/dev/null
+  git checkout --no-overlay "$SUBJECT_SHA" -- src/ 2>/dev/null
   git diff --quiet "$SUBJECT_SHA" -- src/ tests/ examples/ ||
-    echo "ON EXIT: src/, tests/ or examples/ still differ from $SUBJECT_SHA; restore with: git checkout $SUBJECT_SHA -- src/" >&2
+    echo "ON EXIT: src/, tests/ or examples/ still differ from $SUBJECT_SHA; restore with: git checkout --no-overlay $SUBJECT_SHA -- src/" >&2
 }
 on_signal() { # $1 = the exit status
   if [ -n "$child" ]; then
@@ -383,7 +450,9 @@ on_signal() { # $1 = the exit status
   exit "$1"
 }
 trap on_exit EXIT
+trap 'on_signal 129' HUP
 trap 'on_signal 130' INT
+trap 'on_signal 131' QUIT
 trap 'on_signal 143' TERM
 
 echo "== control (unmutated $SUBJECT_SHA)"
@@ -413,7 +482,7 @@ EOF
   fi
   git diff --stat -- "$FILE" > "$OUT/$name.diffstat"
   for t in $TARGETS; do run_target "$name" "$t"; done
-  git checkout "$SUBJECT_SHA" -- "$FILE"
+  git checkout --no-overlay "$SUBJECT_SHA" -- "$FILE"
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: restore of $FILE after $name left a difference" >&2; exit 3; }
   # shellcheck disable=SC2086
   v=$(verdict "$name" "$req" "$opt" $TARGETS)
