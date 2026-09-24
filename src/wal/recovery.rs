@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -26,6 +26,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // to start from to see everything this transaction did.
     let mut first_lsn: HashMap<u64, u64> = HashMap::new();
     let mut ended: HashSet<u64> = HashSet::new();
+    let mut committed: HashSet<u64> = HashSet::new();
+    // D213: per transaction, the slots its forward deletes retired and no `HeapRelease` has freed.
+    let mut owed: HashMap<u64, Vec<RetiredSlot>> = HashMap::new();
     let mut touched = HashSet::new();
     // analysis
     for rec in &records {
@@ -33,10 +36,25 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         last_lsn.insert(rec.txn_id, rec.lsn);
         first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
         match &rec.kind {
+            RecKind::HeapDelete { dir_root, page_id, slot, .. } => {
+                owed.entry(rec.txn_id).or_default().push(RetiredSlot { dir_root: *dir_root, page_id: *page_id, slot: *slot });
+            }
+            RecKind::HeapRelease { page_id, slot, .. } => {
+                if let Some(slots) = owed.get_mut(&rec.txn_id) {
+                    slots.retain(|r| (r.page_id, r.slot) != (*page_id, *slot));
+                }
+            }
+            _ => {}
+        }
+        match &rec.kind {
             RecKind::Commit | RecKind::TxnEnd => {
                 ended.insert(rec.txn_id);
+                if matches!(rec.kind, RecKind::Commit) {
+                    committed.insert(rec.txn_id);
+                }
             }
-            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. } => {
+            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. }
+            | RecKind::HeapRelease { dir_root, page_id, .. } => {
                 touched.insert((*dir_root, *page_id));
             }
             RecKind::Clr { redo, .. } => {
@@ -74,13 +92,14 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         }
     }
 
-    // redo
+    // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
+    // came from a CLR (D213).
     for rec in &records {
         match &rec.kind {
-            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. } => {
+            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
+            | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
                 redo_one(bp, rec.lsn, &rec.kind)?;
             }
-            RecKind::Clr { redo, .. } => redo_one(bp, rec.lsn, redo)?,
             _ => {}
         }
     }
@@ -107,6 +126,20 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         txn.abort(id)?;
     }
 
+    // D213: finish the releases a crash cut off. A committed transaction's retired slots are freed
+    // by `HeapRelease` records written after its `Commit`, and those wait in the log buffer for the
+    // next flush. A crash in between leaves the slots retired, and nothing else would ever free
+    // them. Before the directory repair below, so the directory counts the freed bytes. Ascending
+    // id, for the reason the losers are sorted.
+    let mut owed: Vec<(u64, Vec<RetiredSlot>)> = owed
+        .into_iter()
+        .filter(|(id, slots)| committed.contains(id) && !slots.is_empty())
+        .collect();
+    owed.sort_unstable_by_key(|(id, _)| *id);
+    for (id, slots) in owed {
+        txn.finish_releases(id, last_lsn[&id], first_lsn[&id], &slots);
+    }
+
     // repair directory
     for (dir_root, page_id) in &touched {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
@@ -131,13 +164,25 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
 ///
 /// Idempotent by page LSN: a record whose LSN is at or below the page's is skipped, which is what
 /// makes a re-sent overlap after a reconnect harmless.
+///
+/// `kind` is the record as logged. A `Clr` is passed WHOLE, not unwrapped: a `HeapDelete` inside a
+/// CLR frees its slot, while the same record outside one retires it (D213).
 pub fn apply_redo(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
     redo_one(bp, lsn, kind)
 }
 
 fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
-    let page_id = match kind {
-        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..} => *page_id,
+    // A CLR is redone as the record it carries, with one difference that is the CLR's own. Its
+    // `HeapDelete` undoes an insert, so it FREES the slot. A forward `HeapDelete` RETIRES it, as the
+    // delete did when it ran: its transaction may still roll back, and if it committed, a
+    // `HeapRelease` later in the log frees it (D213).
+    let (op, compensation) = match kind {
+        RecKind::Clr { redo, .. } => (redo.as_ref(), true),
+        other => (other, false),
+    };
+    let page_id = match op {
+        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..}
+        | RecKind::HeapRelease { page_id, .. } => *page_id,
         _ => return Ok(())
     };
     let frame_i = bp.fetch_page(page_id)?;
@@ -154,8 +199,10 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
         bp.unpin_page(page_id, false);
         return Ok(());
     }
-    match kind {
-        RecKind::HeapDelete { slot, ..} => page.delete(*slot as usize)?,
+    match op {
+        RecKind::HeapDelete { slot, ..} if compensation => page.delete(*slot as usize)?,
+        RecKind::HeapDelete { slot, ..} => page.retire(*slot as usize)?,
+        RecKind::HeapRelease { slot, .. } => page.release(*slot as usize)?,
         RecKind::HeapInsert { slot, tuple, ..} => {
             if (*slot as usize) == page.slot_arr.len() {
                 let s = page.insert(Tuple::new(tuple.clone()))?;

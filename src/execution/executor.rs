@@ -504,7 +504,7 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
 ///   alone would let the user carry on inside a transaction they believe was rolled back.
 ///
 ///   ⛔ **Corrected (D211, re-adversary `fffdc62`).** This said `ROLLBACK` "can resume the undo from
-///   its CLRs", which was false until `TxnManager::undo_then_log`: the failed undo's CLR was already
+///   its CLRs", which was false until `TxnManager::apply_then_log`: the failed undo's CLR was already
 ///   logged, so a resumed abort skipped it. It also said nothing stopped the user carrying on;
 ///   nothing did, because `Aborting` was never read. Since D211, a retry reaches the failed record
 ///   itself, and the transaction is refused every statement but ROLLBACK
