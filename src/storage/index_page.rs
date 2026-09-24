@@ -642,4 +642,103 @@ mod tests {
         assert_eq!(leaf.key_arr[1], (Value::Varchar("toronto".into()), Value::Integer(1)));
         assert_eq!(leaf.key_arr[2], (Value::Varchar("toronto".into()), Value::Integer(2)));
     }
+
+    /// Bytes one key occupies on a page, measured with the page encoding itself.
+    fn d225_bytes(k: &(Value, Value)) -> usize {
+        let mut buf = Vec::new();
+        k.serialize(&mut buf);
+        buf.len()
+    }
+
+    /// **D225 — a leaf splits by BYTES, so both halves of a mixed-width leaf fit.**
+    ///
+    /// The leaf is `d208_review2` A1's, built in memory: 16 `('a', pk)` entries of 9 bytes, then 16
+    /// `('b' x 247, pk)` of 255 (`Varchar` is 1 tag + 2 length + the bytes, `Integer` 1 + 4, `()`
+    /// nothing). 4224 bytes against a 4069-byte body, so it is full and must split. The count split
+    /// cut at `mid = 16` and put all sixteen wide entries, 4080 bytes, in the right half: over the
+    /// body, so `serialize` panicked slicing past the page. Red at `9aa6968` on the right half's
+    /// `is_full` assertion, before any serialize runs.
+    ///
+    /// The balanced cut is 24, by arithmetic rather than by asking the subject: 16·9 + 8·255 = 2184
+    /// left and 8·255 = 2040 right, 144 apart; 23 gives 1929 / 2295 (366 apart) and 25 gives
+    /// 2439 / 1785. Pinning it separates a byte split from "count, unless that overflows", which
+    /// would cut at 17.
+    #[test]
+    fn a_mixed_width_leaf_splits_into_two_halves_that_fit() {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+        for pk in 1..=16 {
+            leaf.insert_entry((Value::Varchar("a".into()), Value::Integer(pk)), ());
+        }
+        for pk in 17..=32 {
+            leaf.insert_entry((Value::Varchar("b".repeat(247)), Value::Integer(pk)), ());
+        }
+        // Premise: the leaf holds the mixed widths the reproducer's arithmetic assumes, narrow first.
+        assert_eq!(leaf.key_arr.len(), 32);
+        assert!(leaf.key_arr[..16].iter().all(|k| d225_bytes(k) == 9), "premise: 16 narrow 9-byte entries first");
+        assert!(leaf.key_arr[16..].iter().all(|k| d225_bytes(k) == 255), "premise: 16 wide 255-byte entries after");
+        assert!(leaf.is_full(), "premise: 4224 bytes is over the 4069-byte body, so this leaf must split");
+
+        let (separator, right) = leaf.split(2);
+        assert!(!leaf.is_full(), "the left half is at or over the page: {} entries", leaf.key_arr.len());
+        assert!(!right.is_full(), "the right half is at or over the page: {} entries", right.key_arr.len());
+        assert_eq!(leaf.key_arr.len(), 24, "not the byte-balanced cut (16·9 + 8·255 | 8·255)");
+        assert_eq!(right.key_arr.len(), 8);
+        assert_eq!((leaf.num_keys, right.num_keys), (24, 8));
+        assert_eq!((leaf.vals.len(), right.vals.len()), (24, 8));
+        assert_eq!(right.key_arr[0], separator, "the separator is the right half's first key");
+        assert!(leaf.key_arr.last() < right.key_arr.first(), "the halves are out of key order");
+        assert_eq!(leaf.next, Some(2), "the left half must publish the new page as its next");
+        leaf.serialize().expect("the left half serializes");
+        right.serialize().expect("the right half serializes");
+    }
+
+    /// **D225 — the same defect one level up, in an INTERNAL split.**
+    ///
+    /// 32 separators: 17 narrow `('a', pk)` of 9 bytes, then 15 wide `('b' x 260, pk)` of 268. Keys
+    /// 17·9 + 15·268 = 4173 plus 33 child pointers (132) = 4305 bytes against a 4077-byte body, so
+    /// it is full. The count split pushes key 16 (the last narrow one) up and keeps 15 wide keys
+    /// and 16 pointers on the right: 4020 + 64 = 4084 bytes, over the body, so `serialize` would
+    /// slice past the page. A tree reaches this state: before the 32nd separator arrived the node
+    /// held 4305 - 268 - 4 = 4033 bytes, under the threshold. Red at `9aa6968` on the right half's
+    /// `is_full`.
+    ///
+    /// The balanced cut pushes key 24 up: left 17·9 + 7·268 + 25·4 = 2129, right 7·268 + 8·4 =
+    /// 1908, 221 apart; pushing 23 gives 1857 / 2180 (323 apart) and 25 gives 2401 / 1636.
+    #[test]
+    fn a_mixed_width_internal_node_splits_into_two_halves_that_fit() {
+        let mut node = BPlusTreeInternalPage::<(Value, Value)>::new(1);
+        for pk in 1..=17 {
+            node.key_arr.push((Value::Varchar("a".into()), Value::Integer(pk)));
+        }
+        for pk in 18..=32 {
+            node.key_arr.push((Value::Varchar("b".repeat(260)), Value::Integer(pk)));
+        }
+        node.child_ptrs = (100..133).collect();
+        node.num_keys = 32;
+        assert!(node.key_arr[..17].iter().all(|k| d225_bytes(k) == 9), "premise: 17 narrow 9-byte keys first");
+        assert!(node.key_arr[17..].iter().all(|k| d225_bytes(k) == 268), "premise: 15 wide 268-byte keys after");
+        assert_eq!(node.child_ptrs.len(), 33, "premise: one more child than keys");
+        assert!(node.is_full(), "premise: 4305 bytes is over the 4077-byte body, so this node must split");
+
+        let all_keys = node.key_arr.clone();
+        let (up, right) = node.split(2);
+        assert!(!node.is_full(), "the left half is at or over the page: {} keys", node.key_arr.len());
+        assert!(!right.is_full(), "the right half is at or over the page: {} keys", right.key_arr.len());
+        assert_eq!(up, all_keys[24], "not the byte-balanced cut (push key 24)");
+        assert_eq!((node.key_arr.len(), right.key_arr.len()), (24, 7));
+        assert_eq!((node.num_keys, right.num_keys), (24, 7));
+        assert_eq!(node.child_ptrs.len(), node.key_arr.len() + 1);
+        assert_eq!(right.child_ptrs.len(), right.key_arr.len() + 1);
+        // Every key exactly once, in order, with the pushed one between the halves; every pointer
+        // exactly once, in order.
+        let mut keys = node.key_arr.clone();
+        keys.push(up.clone());
+        keys.extend(right.key_arr.iter().cloned());
+        assert_eq!(keys, all_keys);
+        let mut ptrs = node.child_ptrs.clone();
+        ptrs.extend(&right.child_ptrs);
+        assert_eq!(ptrs, (100..133).collect::<Vec<u32>>());
+        node.serialize().expect("the left half serializes");
+        right.serialize().expect("the right half serializes");
+    }
 }
