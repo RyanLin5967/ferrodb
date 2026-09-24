@@ -22,7 +22,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=ca374ec
+SUBJECT_SHA=f6aa116
 OUT=bench/d233/firecheck
 mkdir -p "$OUT"
 
@@ -57,8 +57,8 @@ MUTANTS=(
   "V5_next_guard_dropped|$I|"'"        let _right_latch = leaf.next.map(\u007cid\u007c self.latches().write(id));\n"|"        let _ = leaf.next.map(\u007cid\u007c self.latches().write(id));\n"'
   "V6_parent_planned_after_writes|$I|"'"        let (parent_id, parent) = self.unlink_from_parent(stack, leaf_id)?;\n        let parent = parent.serialize()?;\n        let leaf = leaf.serialize()?;\n\n        // The writes, in the order a latch-free reader may see them (above).\n        self.write_page(leaf_id, leaf)?;\n        if let Some((prev_id, image)) = left {\n            self.write_page(prev_id, image)?;\n        }\n        if let Some((next_id, image)) = right {\n            self.write_page(next_id, image)?;\n        }\n        self.write_page(parent_id, parent)\n"|"        let leaf = leaf.serialize()?;\n\n        // The writes, in the order a latch-free reader may see them (above).\n        self.write_page(leaf_id, leaf)?;\n        if let Some((prev_id, image)) = left {\n            self.write_page(prev_id, image)?;\n        }\n        if let Some((next_id, image)) = right {\n            self.write_page(next_id, image)?;\n        }\n        let (parent_id, parent) = self.unlink_from_parent(stack, leaf_id)?;\n        let parent = parent.serialize()?;\n        self.write_page(parent_id, parent)\n"'
   "V7_no_self_naming_check|$I|"'"        if (leaf.prev.is_some() && leaf.prev == leaf.next) \u007c\u007c leaf.prev == Some(leaf_id) \u007c\u007c leaf.next == Some(leaf_id) {\n"|"        if false && ((leaf.prev.is_some() && leaf.prev == leaf.next) \u007c\u007c leaf.prev == Some(leaf_id) \u007c\u007c leaf.next == Some(leaf_id)) {\n"'
-  "W1_reuse_the_head_whatever|$C|"'"            match self.reusable_slot(id) {\n"|"            match Ok::<Option<u32>, FerroError>(Some(self.core(id)?.map(\u007cr\u007c r.generation()).unwrap_or(0))) {\n"'
-  "W2_fork_checks_reaped_only|$C|"'"            match self.reusable_slot(id) {\n"|"            match self.core(id).map(\u007cr\u007c r.filter(\u007cr\u007c r.state() == BranchState::Reaped).map(\u007cr\u007c r.generation())) {\n"'
+  "W1_reuse_the_head_whatever|$C|"'"            match self.reusable_slot(id) {\n"|"            match self.core(id) {\n"'
+  "W2_fork_checks_reaped_only|$C|"'"            match self.reusable_slot(id) {\n"|"            match self.core(id).map(\u007cr\u007c r.filter(\u007cr\u007c r.state() == BranchState::Reaped)) {\n"'
   "W3_unreadable_fails_the_fork|$C|"'"                Ok(None) \u007c Err(_) => stale.push(k),\n"|"                Ok(None) => stale.push(k),\n                Err(e) => return Err(e),\n"'
   "W4_malformed_skipped_silently|$C|"'"                stale.push(k);\n                continue;\n"|"                continue;\n"'
 )
@@ -81,7 +81,7 @@ KILLERS=(
   "V5_next_guard_dropped|survivor||unlinks_racing_refills_and_readers_lose_no_key"
   "V6_parent_planned_after_writes|kill|a_refused_cascade_that_would_empty_the_root_writes_nothing|"
   "V7_no_self_naming_check|kill|a_chain_whose_prev_is_its_next_is_refused_not_waited_on|"
-  "W1_reuse_the_head_whatever|kill|fork_never_reuses_a_free_id_whose_record_is_live a_stale_free_id_is_skipped_counted_and_removed_and_the_next_is_reused fork_never_reuses_a_reaped_slot_that_still_has_a_live_child a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal|"
+  "W1_reuse_the_head_whatever|kill|fork_never_reuses_a_free_id_whose_record_is_live a_stale_free_id_is_skipped_counted_and_removed_and_the_next_is_reused fork_never_reuses_a_reaped_slot_that_still_has_a_live_child|"
   "W2_fork_checks_reaped_only|kill|fork_never_reuses_a_reaped_slot_that_still_has_a_live_child|"
   "W3_unreadable_fails_the_fork|kill|a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal|"
   "W4_malformed_skipped_silently|kill|a_malformed_free_id_key_is_counted_and_removed|"
