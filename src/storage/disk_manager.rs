@@ -293,8 +293,14 @@ impl DiskManager{
         self.reserve_region("branch arena", base, u32::MAX)
     }
 
-    /// Reserve `[lo, hi)` for another allocator. Refuses any overlap with an existing region or
-    /// with a page this allocator has already handed out.
+    /// Reserve `[lo, hi)` for another allocator. Refuses any overlap with an existing region.
+    ///
+    /// It does NOT refuse a region over pages this allocator has already handed out; the comment
+    /// in the body says why that check is deliberately absent here. That case is refused where it
+    /// can be: `ArenaPageStore::new` refuses a base below `high_water()`,
+    /// `ArenaPageStore::reopen_from_checkpoint` refuses a region the bitmap already owns pages in
+    /// ("overlaps pages the bitmap allocator owns"), and `deallocate` refuses a page inside a
+    /// region. (D239 review 1 §5: this sentence used to claim the refusal for this function.)
     ///
     /// Re-registering a region **identical** to an existing one is accepted: that is a restart, and
     /// the branch module's harness does it deliberately (`fresh_store()` passes
