@@ -287,6 +287,11 @@ struct Faulty {
     detaches: AtomicU64,
     /// Fail the next `get_raw` of this id, once; `u64::MAX` = never.
     fail_get_raw_of: AtomicU64,
+    /// PANIC on the Nth `release_id` (1-based); 0 = never. A panic, not an error: `release_id`
+    /// returns `()`, and a panic caught by the test is the closest thing to a crash between two
+    /// releases, because nothing after it in the reap runs.
+    panic_release_at: u64,
+    releases: AtomicU64,
 }
 
 fn injected(what: &str) -> FerroError {
@@ -379,6 +384,10 @@ impl BranchCatalog for Faulty {
         self.inner.live_count()
     }
     fn release_id(&self, id: u64) {
+        let n = self.releases.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.panic_release_at {
+            panic!("injected crash between two releases (release_id call {n}, slot {id})");
+        }
         self.inner.release_id(id)
     }
     fn attach_child(
@@ -406,6 +415,8 @@ fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
         fail_detach_at,
         detaches: AtomicU64::new(0),
         fail_get_raw_of: AtomicU64::new(u64::MAX),
+        panic_release_at: 0,
+        releases: AtomicU64::new(0),
     })
 }
 
@@ -496,5 +507,77 @@ fn a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator
         want,
         "F1: a parent read that failed mid-cascade let the reap release the originator and remove \
          the only key, stranding every reaped ancestor above it"
+    );
+}
+
+/// **M28 killed: the release ORDER is the crash-safety argument, so it is tested.** A crash between
+/// two of the cascade's releases must strand nothing.
+///
+/// Top-down (§8.8), the released slots are the TOP ones, so the originator's re-walk climbs
+/// through the unreleased lower ones and releases them. Bottom-up (M28), or inside the loop (M26),
+/// the LOWER ones are released and recycled, the re-walk stops at the first recycled record, and
+/// the upper ones are stranded: `Reaped`, unreleased, with no key.
+///
+/// The crash is a panic in the 3rd `release_id`, caught by the test. The reap never finishes, so
+/// the originator keeps its key, exactly as after a real crash there. PRE-REGISTERED (lane §8.9):
+/// stranded = `[]` at `e8909fa`; `[A1, A2]` under M28 and under M26.
+#[test]
+fn a_crash_between_two_releases_strands_no_ancestor() {
+    let f = fixture();
+    let c = &*f.catalog;
+    // T → A1 → A2 → A3 → A4 → L: four reaped interiors (D ≥ 4), k = 2 releases before the crash.
+    let mut chain: Vec<BranchId> = Vec::new();
+    let mut parent = BranchId::TRUNK;
+    for _ in 0..5 {
+        parent = c.fork(parent, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        chain.push(parent);
+    }
+    let l = chain[4];
+    let ancestors: Vec<u64> = chain[..4].iter().map(|b| b.id).collect();
+    // Pinned reaps through the INNER catalog, so the wrapper counts only the leaf's releases.
+    for b in chain[..4].iter().rev() {
+        f.reaper.reap(*b).unwrap();
+    }
+
+    let faulty = Arc::new(Faulty {
+        inner: Arc::clone(&f.catalog),
+        fail_detach_at: 0,
+        detaches: AtomicU64::new(0),
+        fail_get_raw_of: AtomicU64::new(u64::MAX),
+        panic_release_at: 3,
+        releases: AtomicU64::new(0),
+    });
+    let through = reaper_through(&f, &faulty);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| through.reap(l)));
+    assert!(crashed.is_err(), "fixture: the 3rd release was meant to crash the leaf's reap");
+
+    // PREMISE: a fork before the sweep recycles exactly the two slots the cascade released.
+    let recycled: Vec<BranchId> = (0..2)
+        .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id)
+        .collect();
+    for b in &recycled {
+        assert!(
+            b.generation != 0 && ancestors.contains(&b.id),
+            "fixture: fork {b:?} did not reuse a slot the crashed cascade had released"
+        );
+    }
+
+    let fresh = TwoTierReaper::new(Arc::clone(&f.catalog), Arc::clone(&f.store));
+    assert!(fresh.resume_interrupted_reaps().unwrap().is_empty());
+    // Drain whatever the sweep freed, so a slot still `Reaped` now is one nothing released.
+    for _ in 0..8 {
+        c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+    }
+
+    let keyed = c.unreleased_reaped_candidates().unwrap();
+    let stranded: Vec<u64> = chain
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| c.get_raw(*id).unwrap().state == BranchState::Reaped && !keyed.contains(id))
+        .collect();
+    assert!(
+        stranded.is_empty(),
+        "M28/M26: a crash between two releases stranded {stranded:?}: Reaped, unreleased and with no \
+         key, above a released slot that a fork recycled before the sweep"
     );
 }
