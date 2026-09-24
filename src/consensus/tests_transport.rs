@@ -2725,3 +2725,72 @@ fn a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt
     );
     assert_eq!(a.lost_in_flight(), 0, "the frame arrived, but a loss was counted on the way");
 }
+
+// D224, after the fix: the counters that make "busy links pay nothing" a count rather than a claim.
+// They need the new accessors, so their red evidence is the mutants in bench/d224/PREREG.md.
+
+#[test]
+fn a_busy_link_is_never_probed() {
+    // The control. The probe is for links consensus leaves silent, and a link it keeps busy must
+    // never reach the gate. That is a leader's link to a follower, which carries a heartbeat every
+    // 150 ms at the defaults. Here the link carries a frame every 100 ms for longer than twice the
+    // gate, which is `idle_deadline / 2` = 1 s. A link that skipped the refresh after each write would
+    // be probed within a second.
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_secs(2);
+    let (a, b) = pair(opts);
+    let started = Instant::now();
+    const FRAMES: u64 = 25;
+    for term in 1..=FRAMES {
+        a.send(&Message {
+            from: NodeId(1),
+            to: NodeId(2),
+            term,
+            body: Body::PreVoteResp { granted: true },
+        })
+        .unwrap();
+        assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, term);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Anti-vacuity: the link lived past the gate, so skipping the refresh would have shown here. A
+    // lower bound on elapsed time, which load can only lengthen.
+    assert!(started.elapsed() >= Duration::from_secs(2), "the link did not outlive the probe gate");
+    assert_eq!(
+        a.idle_probes(),
+        0,
+        "a link carrying a frame every 100 ms was probed; the gate is not only for idle links"
+    );
+}
+
+#[test]
+fn an_idle_closed_link_is_probed_once_and_redialled() {
+    // The fix's own path, counted. It is the scenario of
+    // `a_frame_sent_after_the_peer_idle_closed_the_link_arrives_on_the_first_attempt`, and it reads
+    // what that test cannot: the frame arrived because the link was probed and redialled, not by
+    // luck.
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_millis(300);
+    let (a, b) = pair(opts);
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    };
+    a.send(&msg(1)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 1);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && (b.idle_closed() == 0 || b.live_inbound_conns() > 0) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(b.idle_closed() >= 1 && b.live_inbound_conns() == 0, "B never closed A's idle link");
+
+    // Read around the one send, so a probe of the first frame on a loaded box cannot be mistaken for
+    // this one.
+    let (probes, redials) = (a.idle_probes(), a.idle_redials());
+    a.send(&msg(2)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 2);
+    assert_eq!(a.idle_probes() - probes, 1, "the idle link was not probed exactly once before the write");
+    assert_eq!(a.idle_redials() - redials, 1, "the probe did not find the close and redial");
+    assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
+}
