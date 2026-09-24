@@ -173,3 +173,50 @@ fn an_added_column_whose_name_the_catalog_cannot_hold_is_refused_and_wedges_noth
     assert_unchanged(&mut db, "ADD COLUMN");
     assert_not_wedged(&mut db, "ADD COLUMN", "after_add");
 }
+
+/// The ADD case again, on a table whose row layout an added column WOULD change.
+///
+/// A trailing NULL column occupies its type's width after the existing ones and, below nine
+/// columns, leaves the null bitmap at one byte. So a two-column row rewritten to three still reads
+/// back as its first two values, and the test above cannot tell "refused before the rewrite" from
+/// "refused after it". At the ninth column the bitmap grows to two bytes, and every value after it
+/// moves. A row rewritten under nine columns then does NOT read back under the old eight. This is
+/// the test that pins where the refusal happens, and not only that it happens (I19).
+#[test]
+fn an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten() {
+    let mut db = Db::new();
+    db.exec(
+        "CREATE TABLE t (id INTEGER NOT NULL, c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER, \
+         c5 INTEGER, c6 INTEGER, c7 INTEGER);",
+    )
+    .unwrap();
+    db.exec("INSERT INTO t VALUES (1, 2, 3, 4, 5, 6, 7, 8);").unwrap();
+    let long = over_long();
+
+    let err = db
+        .exec(&format!("ALTER TABLE t ADD COLUMN {long} INTEGER;"))
+        .err()
+        .expect("a ninth column with a 300-byte name must be refused, not written truncated");
+    assert_refused_by_name(&err, "ADD COLUMN (ninth)");
+
+    let columns = db.catalog.get_table("t").expect("the table is still there").schema.columns.len();
+    assert_eq!(
+        columns, 8,
+        "ADD COLUMN (ninth) was refused, but the catalog in memory holds {columns} columns"
+    );
+    let want: Vec<Value> = (1..=8).map(Value::Integer).collect();
+    match db.exec("SELECT * FROM t;") {
+        Ok(Outcome::Rows(rows)) => assert_eq!(
+            rows,
+            vec![want],
+            "ADD COLUMN (ninth) was refused, but the row no longer reads back under the old eight \
+             columns: it was rewritten under nine, whose null bitmap is a byte wider (I19)"
+        ),
+        Ok(_) => panic!("SELECT after the refusal returned something other than rows"),
+        Err(e) => panic!(
+            "SELECT after the refused ADD COLUMN (ninth) failed, so the row on disk is no longer in \
+             the shape the catalog describes: {e}"
+        ),
+    }
+    assert_not_wedged(&mut db, "ADD COLUMN (ninth)", "after_add_ninth");
+}
