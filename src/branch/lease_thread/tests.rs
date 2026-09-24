@@ -1355,3 +1355,50 @@ fn f1_a_clean_stop_records_the_moment_it_stopped_as_the_last_alive_mark() {
         other => panic!("the catalog lost its mark across a clean stop: {other:?}"),
     }
 }
+
+/// **C2b (lead, after the D198 adversary): the reap's own re-check must not decide expiry on a
+/// catalog that refuses the question.**
+///
+/// C2 made a marked catalog refuse `expired_before` and `enforced_lease` until it resumes, but
+/// `TwoTierReaper::reap_if_still_expired` re-decided expiry from `get_raw`, which is not refused.
+/// Both production callers reach it only after the refused candidate query, which is the same
+/// calling-convention protection C2 removed one level up. Called directly here, on a lapsed branch
+/// of a marked, unresumed catalog, it must decline — as a D127 refusal, counted and carrying the
+/// catalog's reason — and free nothing. Once the catalog resumes, the same call reaps.
+#[test]
+fn f1_an_unresumed_marked_catalog_is_not_reaped_by_the_recheck_either() {
+    let f = table_fixture();
+    let branch = branch_with_pages(&f, EXPIRED, 2);
+    let with_pages = f.h.store.live_page_count().unwrap();
+    // A lease authority ran here and stopped at 1000; this instance has not resumed.
+    f.h.catalog.record_lease_alive(1_000).unwrap();
+    assert!(
+        f.h.catalog.expired_before(LeaseDeadline::now_millis()).is_err(),
+        "premise: C2 must already refuse the candidate query on this catalog"
+    );
+
+    let before = f.reaper.refused_reaps();
+    match f.reaper.reap_if_still_expired(branch, LeaseDeadline::now_millis()).unwrap() {
+        ReapOutcome::Refused(why) => {
+            assert!(why.to_string().contains("has not resumed its lease clock"), "{why}")
+        }
+        other => panic!(
+            "the re-check answered {other:?} on a catalog that refuses expiry questions: it decided \
+             expiry from a raw read the catalog would not have answered (C2b)"
+        ),
+    }
+    assert_eq!(f.reaper.refused_reaps(), before + 1, "the refusal was not counted (D127)");
+    assert_eq!(state_of(&f, branch), BranchState::Live, "the refusal reaped the branch");
+    assert_eq!(f.h.store.live_page_count().unwrap(), with_pages, "the refusal freed a page");
+
+    // Resumed, the question is answered: deadline 0 plus the credited downtime is still long past.
+    f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap();
+    assert!(
+        matches!(
+            f.reaper.reap_if_still_expired(branch, LeaseDeadline::now_millis()).unwrap(),
+            ReapOutcome::Reaped
+        ),
+        "a resumed catalog must let the re-check reap an expired branch"
+    );
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+}
