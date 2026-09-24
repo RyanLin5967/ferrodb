@@ -1,0 +1,34 @@
+# 2026-09-24T03:16:32Z HEAD=f847f63 dirty=2
+# cmd: taskpolicy -b timeout 1800 cargo test --test integration_cherry_pick
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 46s
+     Running tests/integration_cherry_pick.rs (target/debug/deps/integration_cherry_pick-d4c8b390290d8ee6)
+
+running 8 tests
+test a_pick_spanning_two_tables_is_refused_rather_than_half_applied ... ok
+test one_op_of_several_lands_and_the_others_do_not ... ok
+test an_empty_selection_is_refused ... ok
+test a_pick_reads_the_target_branch_as_of_its_fork ... ok
+test a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it ... FAILED
+test a_selector_naming_no_op_is_refused ... ok
+test a_pick_whose_cell_the_target_already_moved_is_refused_and_writes_nothing ... ok
+test a_commuting_divergence_is_recovered_through_the_by_cell_index ... ok
+
+failures:
+
+---- a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it stdout ----
+
+thread 'a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it' (328966748) panicked at tests/integration_cherry_pick.rs:558:5:
+assertion `left == right` failed: the pick staged row 1 back onto a branch that had deleted it
+  left: Some(100)
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+error: test failed, to rerun pass `--test integration_cherry_pick`
+# rc=101 end=2026-09-24T03:19:21Z

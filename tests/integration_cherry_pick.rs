@@ -526,3 +526,44 @@ fn a_pick_reads_the_target_branch_as_of_its_fork() {
         "B's before-image for the picked row is not the row as B forked it"
     );
 }
+
+/// **A pick onto a row the target branch DELETED is refused — it does not resurrect the row.**
+///
+/// `cherry_pick` resolves the target's image of each touched row in two passes: the branch's own
+/// staged state first, then the shared tables for rows "the branch has never touched". A row the
+/// branch staged as `Deleted` contributes no image to the first pass, and the second pass only
+/// asked whether an image had been found — so it read the row back from the shared tables as if
+/// the branch had never touched it, and a cell op staged the deleted row back into existence.
+/// The target does not have the row; the engine's truth-table row 7 says that is `RowGone`.
+#[test]
+fn a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it() {
+    let mut db = Db::new();
+    db.seed();
+
+    let (a, mut sa) = db.agent("agent-a");
+    db.ok("UPDATE inventory SET price = 99 WHERE id = 1;", &mut sa);
+    db.merge(a);
+    let price_seq = db.seq_of("inventory", 1, 2);
+
+    let (b, mut sb) = db.agent("agent-b");
+    db.ok("DELETE FROM inventory WHERE id = 1;", &mut sb);
+    assert_eq!(db.cell("inventory", "qty", Some(b), 1), None, "fixture: b did not delete row 1");
+
+    let rt = db.rt();
+    let (bp, txn) = (db.bp.clone(), db.txn.clone());
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let result = rt.cherry_pick(&mut ctx, a, &[price_seq], b).unwrap();
+    drop(ctx);
+
+    assert_eq!(
+        db.cell("inventory", "qty", Some(b), 1),
+        None,
+        "the pick staged row 1 back onto a branch that had deleted it"
+    );
+    assert!(!result.is_applied(), "a cell op onto a row the target does not have was applied");
+    let kinds = result.refusal().unwrap().kinds();
+    assert!(
+        kinds.contains(&CherryConflictKind::RowGone),
+        "expected the RowGone refusal, got {kinds:?}"
+    );
+}
