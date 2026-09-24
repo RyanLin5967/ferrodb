@@ -209,11 +209,17 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let wal_checkpoint = txn.checkpoint();
     // Persist where the arena starts and what it has allocated. Without this the next open finds
     // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    store.checkpoint(Path::new(&arena_path))?;
+    // HELD too (review 3's caveat 4): returned at once, a failure here skipped the counters below and
+    // dropped the WAL's error. Both errors are reported; the WAL's is returned first.
+    let arena_checkpoint = store.checkpoint(Path::new(&arena_path));
     if let Some(line) = crate::wal::txn::failure_counters_line() {
         eprintln!("{line}");
     }
+    if let (Err(_), Err(a)) = (&wal_checkpoint, &arena_checkpoint) {
+        eprintln!("ferrodb: the arena checkpoint failed as well ({a})");
+    }
     wal_checkpoint?;
+    arena_checkpoint?;
     println!("bye bye");
     Ok(())
 }

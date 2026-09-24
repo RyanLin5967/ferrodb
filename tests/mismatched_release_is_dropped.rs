@@ -88,7 +88,8 @@ impl Db {
 #[test]
 fn a_release_that_can_never_succeed_does_not_hold_the_log() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::open(&dir.path().join("mismatch.db"));
+    let path = dir.path().join("mismatch.db");
+    let mut db = Db::open(&path);
     let mut main = Session::new();
     // Row 2 (3934 B) first, then row 1 (35 B), the lowest tuple; 96 B stay free.
     db.ok("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));", &mut main);
@@ -115,6 +116,14 @@ fn a_release_that_can_never_succeed_does_not_hold_the_log() {
     );
     // A guard added with the fix (the counter is new): the mismatch is counted where a reader sees it.
     assert_eq!(release_mismatches(), mismatches + 1, "the release that can never succeed was not counted as a mismatch");
+    // Review 3's decision 6: a LIVE slot where a retired one was expected is corruption evidence, and
+    // dropping the release lets the next checkpoint truncate the only record of it. So it is written
+    // durably first, beside the log: `<db>.wal.release-quarantine`, spelled out here.
+    let quarantine = format!("{}.wal.release-quarantine", path.display());
+    let recorded = std::fs::read_to_string(&quarantine)
+        .unwrap_or_else(|e| panic!("the mismatch was dropped without a durable record at {quarantine}: {e}"));
+    let entry = format!("page={} slot={} found=live", home.page_id, home.slot_num);
+    assert!(recorded.contains(&entry), "the quarantine file does not record `{entry}`:\n{recorded}");
 
     let base = db.o.wal.base_lsn.load(Ordering::SeqCst);
     db.o.txn.checkpoint().expect("the checkpoint was refused for a release that can never succeed");

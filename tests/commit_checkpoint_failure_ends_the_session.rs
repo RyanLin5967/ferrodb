@@ -103,8 +103,13 @@ fn wal_path(db: &Path) -> PathBuf {
 
 #[test]
 fn a_commit_whose_checkpoint_fails_after_the_transaction_ended_releases_the_session() {
-    // SAFETY: set before this binary's first commit reads it, and no other thread reads the
-    // environment here.
+    // SAFETY: set before this test's first commit, and so before any commit in this binary reads it
+    // (`checkpoint_interval` reads it once), since each test sets it first. The two tests run in
+    // parallel and set the same value, so their order does not matter. Other threads DO read the
+    // environment meanwhile (`tempfile::tempdir` reads `TMPDIR`, a commit reads this variable). Every
+    // one of those reads goes through `std::env`, which takes the lock `set_var` takes, so none races
+    // it. What that lock cannot cover is a read through libc's `getenv` directly. Nothing in this
+    // binary is known to make one (INFERRED, not checked). Review 3 found the earlier text false.
     unsafe { std::env::set_var("FERRODB_CHECKPOINT_INTERVAL", "1") };
 
     let dir = tempfile::tempdir().unwrap();
@@ -147,7 +152,7 @@ fn a_commit_whose_checkpoint_fails_after_the_transaction_ended_releases_the_sess
 /// written. FAILS at `368d0e1`: the INSERT returns the checkpoint's error.
 #[test]
 fn an_autocommit_statement_whose_checkpoint_fails_after_its_commit_reports_success() {
-    // SAFETY: as in the test above; both set the same value before any commit in this binary.
+    // SAFETY: as in the test above: std's own environment lock, and the same value in both tests.
     unsafe { std::env::set_var("FERRODB_CHECKPOINT_INTERVAL", "1") };
 
     let dir = tempfile::tempdir().unwrap();

@@ -14,9 +14,17 @@
 //!
 //! The release is made to fail by the page itself: the committed relocation's page is rewritten on
 //! disk without the retired slot and with an LSN past the whole log, so redo leaves it alone and the
-//! release finds no such slot. INFERRED from source and never run.
+//! release finds no such slot. That is a page/log MISMATCH, which review 2's Q3 drops rather than
+//! keeps pending, and review 3's decision 6 records durably first: one line in
+//! `<wal path>.release-quarantine`, fsynced, BEFORE the release leaves the pending list. A write that
+//! fails keeps the release pending. So a directory at that path makes open #1 OWE the release, which
+//! is the owed branch staged from outside the crate (review 3's caveat 5: this test asserted nothing
+//! about open #1). Open #2 runs with the path free, and must record the mismatch and settle it.
+//!
+//! This binary holds one test, because it reads process-wide counters and asserts exact deltas.
+//! INFERRED from source and never run.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use ferrodb::catalog::column::Value;
@@ -30,6 +38,7 @@ use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::heap_page::Page;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
+use ferrodb::wal::txn::{deferred_checkpoints, release_mismatches};
 
 struct Db {
     o: OpenedDatabase,
@@ -105,12 +114,33 @@ fn an_open_whose_owed_release_fails_leaves_a_database_the_next_open_can_read() {
     drop(t1);
     drop(db);
 
-    // Open #1 replays the log, owes the release, fails it, and rebuilds every index.
+    // Open #1 replays the log, owes the release, and finds the mismatch. Its record cannot be written,
+    // because a directory holds the quarantine file's path, so the release stays owed through open #1.
+    // Spelled out here rather than asked of the crate: `<db>.wal`, then `.release-quarantine`.
+    let quarantine = PathBuf::from(format!("{}.wal.release-quarantine", path.display()));
+    std::fs::create_dir(&quarantine).unwrap();
+    let deferred = deferred_checkpoints();
+    let mismatches = release_mismatches();
     let db = Db::open(&path).unwrap_or_else(|e| panic!("open #1 failed: {e}"));
+    assert!(db.o.recovered, "premise: open #1 replayed nothing, so no rebuild ran");
+    assert_eq!(
+        db.o.txn.retry_pending_releases(),
+        1,
+        "open #1 does not owe the release whose mismatch could not be recorded, so the only record of it went \
+         with the log"
+    );
+    assert_eq!(deferred_checkpoints() - deferred, 1, "open #1's checkpoint kept the log without counting one deferral");
+    assert_eq!(release_mismatches(), mismatches, "the mismatch was counted as settled although its record was never written");
     drop(db);
 
-    // Open #2 rebuilds again from what open #1 left on disk.
+    // Open #2 rebuilds again from what open #1 left on disk, with the quarantine path free.
+    std::fs::remove_dir(&quarantine).unwrap();
     let mut db = Db::open(&path).unwrap_or_else(|e| panic!("open #2 failed after an open whose owed release failed: {e}"));
     assert_eq!(db.by_key(1), vec![note(1, &"y".repeat(200))], "row 1 is not reachable by key after open #2");
     assert_eq!(db.by_key(2), vec![note(2, &"x".repeat(3900))], "row 2 is not reachable by key after open #2");
+    assert_eq!(release_mismatches() - mismatches, 1, "open #2 did not settle the mismatch it found");
+    let recorded = std::fs::read_to_string(&quarantine).unwrap_or_else(|e| panic!("open #2 dropped the mismatch without recording it: {e}"));
+    let entry = format!("page={} slot={} found=absent", home.page_id, home.slot_num);
+    assert!(recorded.contains(&entry), "the quarantine file does not record `{entry}`:\n{recorded}");
+    assert_eq!(db.o.txn.retry_pending_releases(), 0, "the recorded mismatch is still owed after open #2");
 }
