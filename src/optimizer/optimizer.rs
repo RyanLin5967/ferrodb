@@ -621,4 +621,55 @@ mod tests {
             _ => panic!()
         }
     }
+
+    /// D266 — `push` moves a conjunct below a join only into a side that join never NULL-extends:
+    /// the left side under INNER and LEFT, the right side under INNER and RIGHT, neither under FULL.
+    /// A conjunct over both sides always stays above. What stays is a `Filter` over the join, in the
+    /// order it was carried; what goes down is a `Filter` over that side's scan, in its own numbering.
+    ///
+    /// RIGHT and FULL are pinned here and not end to end, because `optimize` refuses both — after
+    /// `pushdown` has already run — so no query of theirs returns rows to be wrong.
+    #[test]
+    fn push_moves_a_conjunct_only_into_a_side_its_join_never_null_extends() {
+        let c = BoundColumn { qualifier: "t".into(), name: "x".into(), data_type: DataType::Integer, nullable: true};
+        let eq = |col: usize, v: i32| BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(col)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(v))) };
+        let on_left = eq(0, 5);
+        let on_right = eq(3, 7);
+        let both = BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Greater, right: Box::new(BoundExpr::Column(3)) };
+        for (join_type, left_down, right_down) in [
+            (JoinType::Inner, true, true),
+            (JoinType::Left, true, false),
+            (JoinType::Right, false, true),
+            (JoinType::Full, false, false),
+        ] {
+            let label = format!("{join_type:?}");
+            let plan = LogicalPlan::Join {
+                left: Box::new(LogicalPlan::Scan { table: "users".into(), alias: None, output: vec![c.clone(), c.clone()] }),
+                right: Box::new(LogicalPlan::Scan { table: "posts".into(), alias: None, output: vec![c.clone(), c.clone(), c.clone()] }),
+                join_type,
+                on: BoundExpr::Literal(Value::Boolean(true)),
+            };
+            let LogicalPlan::Filter { input, predicate } = push(plan, vec![on_left.clone(), on_right.clone(), both.clone()]) else {
+                panic!("{label}: the conjunct over both sides must stay in a Filter above the join")
+            };
+            let LogicalPlan::Join { left, right, .. } = *input else {
+                panic!("{label}: expected the join directly under the filter")
+            };
+            let pushed = |side: LogicalPlan| match side {
+                LogicalPlan::Filter { input, predicate } if matches!(*input, LogicalPlan::Scan { .. }) => Some(predicate),
+                LogicalPlan::Scan { .. } => None,
+                other => panic!("{label}: a side should be a scan, or a filter over one: {other:?}"),
+            };
+            assert_eq!(pushed(*left), left_down.then(|| eq(0, 5)), "{label}: the left-side conjunct");
+            assert_eq!(pushed(*right), right_down.then(|| eq(1, 7)), "{label}: the right-side conjunct");
+            let mut above = Vec::new();
+            split_and(predicate, &mut above);
+            let want: Vec<BoundExpr> = [(on_left.clone(), left_down), (on_right.clone(), right_down), (both.clone(), false)]
+                .into_iter()
+                .filter(|(_, down)| !down)
+                .map(|(e, _)| e)
+                .collect();
+            assert_eq!(above, want, "{label}: what stays above the join");
+        }
+    }
 }
