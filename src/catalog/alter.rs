@@ -1110,3 +1110,139 @@ fn commit_rewrite(
     // inventing a rule for it.
     Ok(primary.root_page_id.load(Ordering::Relaxed))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    use crate::branch::types::BranchId;
+    use crate::execution::executor::{run, Outcome};
+    use crate::execution::session::Session;
+    use crate::parser::parser::{Parser, Stmt};
+    use crate::parser::scanner::Scanner;
+    use crate::provenance::{DurableProvenanceStore, ProvId, ProvenanceFlush, RunEntity};
+    use crate::storage::disk_manager::DiskManager;
+    use crate::wal::log::WalManager;
+
+    fn parse(sql: &str) -> Stmt {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// A table of 41 rows that fill exactly one heap page, so ADD COLUMN relocates them (the
+    /// packing `tests/integration_alter_refusal_safety.rs` uses), and a durable provenance store.
+    struct Fixture {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<TxnManager>,
+        durable: Arc<DurableProvenanceStore>,
+        run: ProvId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn packed() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("alter.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("alter.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let mut session = Session::new();
+        let pad = "y".repeat(60);
+        let mut sql = vec!["CREATE TABLE p (id INTEGER NOT NULL, v VARCHAR(120));".to_string()];
+        sql.extend((1..=41).map(|i| format!("INSERT INTO p VALUES ({i}, '{pad}');")));
+        for s in &sql {
+            run(parse(s), &mut catalog, bp.clone(), txn.clone(), &mut session).unwrap();
+        }
+        let durable =
+            Arc::new(DurableProvenanceStore::open(dir.path().join("alter.provenance")).unwrap());
+        let run_id = durable
+            .intern(&RunEntity::new(ProvId::NONE, "a", "r", "m", "v", [0u8; 32], 1, BranchId::new(1, 0)))
+            .unwrap();
+        Fixture { catalog, bp, txn, durable, run: run_id, _dir: dir }
+    }
+
+    fn add_column(f: &mut Fixture, prov: &Arc<dyn ProvenanceStore>) -> Result<Vec<ColumnShape>, FerroError> {
+        let Stmt::AlterTable { table, action } = parse("ALTER TABLE p ADD COLUMN w VARCHAR(10);") else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        f.catalog.alter_table(&table, &action, &f.txn, Some(prov))
+    }
+
+    /// **D219: a rewrite that stamped nothing does not answer for records another statement left
+    /// pending.** A store poisoned by a failed append, with a stamp still queued — what a MERGE
+    /// whose final sync failed leaves behind — refuses every non-empty flush. A plain ALTER of an
+    /// UNATTRIBUTED table writes no stamp, so it must not flush, and must not fail: before D219 it
+    /// never touched the provenance store at all. Found by the fourth D219 review (F1).
+    #[test]
+    fn an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store() {
+        let mut f = packed();
+        f.durable.stamp_pending(RecordId { page_id: 9999, slot_num: 0 }, f.run).unwrap();
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
+        assert!(
+            f.durable.flush().is_err(),
+            "the fixture did not leave a poisoned store with a stamp pending, so it proves nothing"
+        );
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+
+        add_column(&mut f, &prov)
+            .expect("an ALTER that stamped nothing was refused for records another statement left");
+        assert_eq!(f.catalog.require_table("p").unwrap().schema.columns.len(), 3);
+    }
+
+    /// **D219: a flush that fails after a rewrite leaves the table consistently ALTERED, not the
+    /// I19 state.** The rewrite's stamps are queued through a MERGE's stamper and flushed after
+    /// `finish`, so an append failure there returns the error with the new schema installed and
+    /// every row readable in it. Flushed before `finish`, the same failure would leave every tuple
+    /// converted under the old catalog.
+    #[test]
+    fn a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered() {
+        let mut f = packed();
+        let dir_root = f.catalog.require_table("p").unwrap().first_directory_page_id;
+        let rids: Vec<RecordId> = HeapFileManager::open(dir_root, f.bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rids.len(), 41);
+        for rid in &rids {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        let guard = ProvenanceFlush::new(f.durable.clone());
+        let stamper = Arc::clone(guard.stamper());
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+
+        let err = add_column(&mut f, &stamper).expect_err(
+            "the ALTER succeeded: either the injected flush failure was swallowed, or the rewrite \
+             moved no attributed row and so never flushed (the fixture's premise)",
+        );
+        assert!(format!("{err}").contains("injected"), "it failed, but not at the flush: {err}");
+        assert_eq!(
+            f.catalog.require_table("p").unwrap().schema.columns.len(),
+            3,
+            "a failed flush left the rewritten rows under the OLD catalog: the I19 state"
+        );
+        let mut session = Session::new();
+        match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
+            .unwrap()
+        {
+            Outcome::Rows(rows) => {
+                assert_eq!(rows.len(), 41, "rows were lost");
+                assert!(rows.iter().all(|r| r.len() == 3), "a row did not read in the new shape");
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+    }
+}
