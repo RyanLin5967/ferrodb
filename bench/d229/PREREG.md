@@ -89,3 +89,10 @@ Amendments (append only):
 (a page being faulted in is refused, and `in_transit` is held to the end), so the one `free_pages` that survives
 a merge with `d237-pin-leak` has both halves. **The GREEN phase and mutant base is `652d7d0`**, not `f3d91d4`;
 every expectation above is unchanged, and each mutant expression still matches one site there (PATTERNS_ONLY).
+
+**Amendment 2 (after `6b70bbf`).** `6b70bbf` adds `a_drop_whose_mutation_fails_after_naming_its_pages_frees_none_of_them`
+(the lead's D250 lesson: a record written before an irreversible step is a commit point unless durable state decides it;
+here the durable catalog does). GREEN at the tip is now **13 run, 13 passed** for `wal::recovery::tests_crash_frees::`.
+New mutant **M12**: the intent is marked decided before the mutation's result is looked at; killed by that test (the
+checkpoint after the failed DROP frees pages the catalog still names). **The GREEN phase and mutant base is `6b70bbf`.**
+Everything else is unchanged; 11 expressions, one site each, at `6b70bbf` (PATTERNS_ONLY).
