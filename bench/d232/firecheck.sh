@@ -257,6 +257,9 @@ verdict() { # $1 label, $2 target, $3 sha, $4 selected (count or any), $5 requir
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     mt=${line%%|*}; mx=${line#*|}
+    # A label's messages cover all its rows; one for a test this row does not register belongs to the
+    # label's row on another target, and is asked there, not here (found by D263's self-test).
+    case " $(echo $req) " in *" $mt "*) ;; *) continue ;; esac
     if ! block_of "$label" "$t" "$mt" | grep -qF "$mx"; then
       echo "MISMATCH ($t; $mt did not fail with the registered message: $mx)"; return
     fi
@@ -470,6 +473,12 @@ self_test() {
   sha=005a7910e003cb1f1cfec99c5ce448e99570bcc5
   fail_file "$name" d232 "$sha" 30 other "$B2_IMAGE"
   expect "the killer failed with an unregistered message" "MISMATCH" "$(verdict "$name" d232 "$sha" 31 "$B2_IMAGE")"
+
+  # A message is asked only of the row that registers its test: this label's B2_IMAGE message is not asked of
+  # a row on another target whose killer is another test.
+  fail_file "$name" arena "$sha" 30 other "$B2_LOAD"
+  expect "a message registered for another row's test is not asked of this row" "AS-REGISTERED" \
+    "$(verdict "$name" arena "$sha" 31 "$B2_LOAD")"
 
   # Registration: every mutant has a required killer, a row, a base, and every message names a killer.
   for m in "${BASES[@]}"; do
