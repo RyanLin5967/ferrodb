@@ -142,6 +142,14 @@ pub struct TableBranchCatalog {
     ///   can file a witness from the old entries after the drop.
     /// - Or make `valid_witness` re-check ancestry.
     ///
+    /// ⚠ **F7 (wall21 review audit): the D200 flip makes a stale YES DURABLE.** The `Reaped` flip
+    /// asks `has_live_children`, and a pinned answer deletes the slot's UNRELEASED key in the same
+    /// sync. Before that, a wrongly pinned slot stayed keyed, and the next open re-asked with an
+    /// empty (in-memory) witness map. Now a stale witness YES at the flip turns a session-scoped
+    /// over-pin into a permanent keyless leak. It is latent, like the blind spot above: only an
+    /// epoch-preserving move produces a stale YES, and nothing in `src/` moves a branch. **A splice
+    /// must invalidate witnesses before any flip can consult them.**
+    ///
     /// Bounded by the nodes currently pinned through a reaped subtree: a witness is dropped when
     /// it fails validation, and when a walk from its node answers NO — which `detach_from_parent`
     /// asks of every node before it detaches it.
@@ -403,9 +411,18 @@ impl TableBranchCatalog {
         cat.next_id.store(max_id + 1, Ordering::SeqCst);
         cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
 
-        // D200: nothing goes on the UNRELEASED span here. `release_id` below frees every reaped
-        // slot with nothing alive below it; the rest are pinned, which the span does not hold. A
-        // later cascade that frees one runs for an originator whose own key covers it.
+        // D200: every reaped slot that is not clearly pinned goes on the UNRELEASED span BEFORE the
+        // releases below, as the `Reaped` flip would have left it. `release_id` takes each one it
+        // frees off again. **F5 (wall21 review audit):** without this, a release that FAILS (it
+        // swallows its errors, D124's `Corrupt` included) left the slot with no key and no text,
+        // because the migrated catalog is born with the build marker and the open sweep reads only
+        // the span. A pinned slot needs no key: a later cascade that frees it runs for an
+        // originator whose own key covers it. One liveness question per reaped record, once.
+        for id in &reaped {
+            if !matches!(cat.has_live_children(*id), Ok(true)) {
+                cat.upsert(keys::unreleased(*id), Vec::new())?;
+            }
+        }
         // Free ids last: `release_id` refuses while a slot still has live children, so it has to
         // see the child entries that were just attached.
         for id in reaped {
@@ -1662,8 +1679,10 @@ impl BranchCatalog for TableBranchCatalog {
     /// - The second held every PINNED reaped interior, up to live branches × chain depth, read
     ///   under the statement lock at every start.
     ///
-    /// Now a healthy catalog's span is EMPTY (`tag::UNRELEASED` says who puts a slot on it and who
-    /// takes it off), and a crash can leave the slots it interrupted. Pinned by
+    /// Now the span of a catalog only ever reaped by a reaper is EMPTY (`tag::UNRELEASED` says who
+    /// puts a slot on it and who takes it off), and a crash can leave the slots it interrupted.
+    /// After reaper-less use it holds every branch sealed without a reaper, until the first open
+    /// with one (F6 of the wall21 review audit). Pinned by
     /// `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`. Each
     /// entry's record is re-read, so only a `Reaped` slot is offered; `Reaping` ones belong to
     /// the resume, which runs first.
@@ -1721,13 +1740,21 @@ impl BranchCatalog for TableBranchCatalog {
         let _g = self.logical.lock().unwrap();
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
         // D200: this does NOT put a reaped parent whose last pin it removed back on the
-        // UNRELEASED span (`b7e8d4e` did; removed in the next commit). Every cascade that
-        // detaches here runs on behalf of an ORIGINATOR whose own key covers it: set at
-        // `Reaping`, kept by the flip because the originator is releasable, and removed only by
-        // its `release_id`, which runs after the cascade. A crash anywhere in the cascade
-        // therefore leaves the originator on the span, and the open sweep re-runs the cascade
-        // from it. The parent mark was a second guard that nothing could fire, costing one
-        // liveness question per detach.
+        // UNRELEASED span (`b7e8d4e` did; `23d8e97` removed it). Every cascade that detaches here
+        // runs on behalf of an ORIGINATOR whose own key covers it: set at `Reaping`, kept by the
+        // flip because the originator is releasable, and removed only by its `release_id`, which
+        // runs after the cascade.
+        //
+        // ⛔ RETRACTED (F1, wall21 review audit): `23d8e97` called the parent mark "a second guard
+        // that nothing could fire". Two schedules fire it at `23d8e97`:
+        // - the cascade released each ancestor mid-walk, so after a crash a fork could recycle a
+        //   released slot, the originator's re-walk stopped there, and every ancestor above it
+        //   was stranded with no key;
+        // - `get_raw` errors were swallowed as "not Reaped", so the originator was released anyway.
+        // The covering argument holds only since `reaper::detach_cascade` detaches everything first,
+        // releases top-down after the loop, and propagates errors. Then the unreleased ancestors are
+        // always a contiguous run next to the still-keyed originator. Red tests in
+        // `tests/d200_reap_releases_id_slots.rs` (the two `a_cascade_that_…` tests).
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -3101,8 +3128,12 @@ mod tests {
         let at = |r: &BranchRecord| BranchAt { id: r.branch_id.id, fork_epoch: r.fork_epoch };
         let held = || c.witnesses.lock().unwrap().len();
         // Since the D200 audit fix, the `Reaped` flip itself asks the liveness question (to decide
-        // the UNRELEASED span), and that files witnesses. Emptied here so that step 1 still proves
-        // the WALK files them: left in place, they would pass step 1 for a walk that filed nothing.
+        // the UNRELEASED span), and that files witnesses: the two flips above file one each. Emptied
+        // here so that step 1 proves the WALK files them. ⚠ CORRECTED (F4, wall21 review audit):
+        // this comment first said the leftovers "would pass step 1 for a walk that filed nothing".
+        // The actual failure was earlier: at `b7e8d4e` this test FAILED at the `held() == 0`
+        // assertion below (2 witnesses held), and `1a2853c` repaired it. That repair was not
+        // pre-registered.
         c.witnesses.lock().unwrap().clear();
         assert_eq!(held(), 0, "fixture: nothing has been asked yet");
 

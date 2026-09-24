@@ -83,7 +83,9 @@ pub mod tag {
     /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
     /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
     /// interiors number up to live branches × chain depth under MCTS pruning; neither is here. On
-    /// a healthy catalog the span is empty. The one-byte key `[0x08]` alone is not a slot: it
+    /// a catalog only ever reaped by a reaper the span is empty; after reaper-less use it holds
+    /// every branch sealed without one until the first open with a reaper releases them (F6 of the
+    /// wall21 review audit). The one-byte key `[0x08]` alone is not a slot: it
     /// marks the span as complete for this catalog (see `unreleased_index_built`).
     pub const UNRELEASED: u8 = 0x08;
 }

@@ -282,10 +282,13 @@ impl TwoTierReaper {
     /// - The candidate query is one range scan of the catalog's UNRELEASED span
     ///   (`TableBranchCatalog::unreleased_reaped_candidates`), which holds a slot only while it may
     ///   be RELEASABLE: mid-reap, or `Reaped` with nothing alive below it and not yet released. A
-    ///   pinned interior is off it until its last pin goes. **On a healthy catalog the span is
-    ///   empty**, so this is one empty-span probe, and that matters because `LeaseThread::start`
-    ///   runs it inside `with_lock`, the statement lock. A crash can leave the slots it
-    ///   interrupted. Pinned by
+    ///   pinned interior is off it until its last pin goes. **On a catalog only ever reaped by a
+    ///   reaper, the span is empty**, so this is one empty-span probe, and that matters because
+    ///   `LeaseThread::start` runs it inside `with_lock`, the statement lock. A crash can leave the
+    ///   slots it interrupted. ⚠ **F6 (review audit): not empty after reaper-less use.** The
+    ///   reaper-less `seal` arm keys every releasable branch it seals and releases none, so the
+    ///   first open WITH a reaper reads O(branches sealed without one), once, under that lock, and
+    ///   re-walks an ancestor shared by several such originators once per originator. Pinned by
     ///   `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`: 0 keys
     ///   read at every (released, pinned) cell. History: the first version merged the whole
     ///   `Reaped` and FREE_ID spans (one key per branch ever reaped); the second held every pinned
@@ -710,34 +713,61 @@ pub(crate) fn detach_cascade(
     release_ancestors: bool,
 ) -> Result<Vec<u64>, FerroError> {
     let mut cur = rec.clone();
-    let mut released = Vec::new();
+    // **F1 (wall21 review audit): every detach first, then the releases, top-down.** The first
+    // version released each ancestor inside the loop, right after its detach. A crash (or an
+    // error) later in the same cascade then left a RELEASED slot between the originator and the
+    // still-unreleased ancestors above it. A fork before the next sweep could recycle that slot,
+    // the sweep's re-walk from the originator stopped at the recycled record, and every ancestor
+    // above it was stranded: `Reaped`, unreleased, with no key, and nothing left that could reach
+    // it. Now nothing is released until the whole chain is detached, and the releases run from
+    // the TOP down. So at any crash point the unreleased ancestors form a contiguous run next to
+    // the originator, and the originator's re-walk reaches them through records nothing can
+    // recycle. Red tests: `d200_reap_releases_id_slots::a_cascade_that_fails_part_way_strands_no_ancestor`
+    // and `…::a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator`.
+    let mut ancestors: Vec<u64> = Vec::new();
     loop {
         if catalog.has_live_children(cur.branch_id.id)? {
-            return Ok(released);
+            break;
         }
-        let Some(parent) = cur.parent_id else { return Ok(released) };
+        let Some(parent) = cur.parent_id else { break };
         // One call rather than get/mutate/put. The old shape silently did nothing against any
         // catalog that keeps the live set in an index instead of inside the record - see
         // `BranchCatalog::detach_child`.
         catalog.detach_child(parent.id, cur.fork_epoch)?;
-
-        // **D200 — an ancestor the cascade detaches gets its id slot back HERE, or never.**
-        // Its own reap asked `release_id` while it was still pinned, and that refused; nothing
-        // else ever asks again (`release_id` has no other production caller, and the only
-        // other reaped-id sweep was `migrate_from`). So every pruned interior kept its slot for
-        // good. It is `Reaped` with nothing alive below it at this point, and `release_id`
-        // re-checks both. AFTER the detach, not before: a slot recycled while its old CHILD
-        // entry still named it would pin the old parent through the new branch.
-        if release_ancestors && cur.branch_id.id != rec.branch_id.id {
-            catalog.release_id(cur.branch_id.id);
-            released.push(cur.branch_id.id);
+        if cur.branch_id.id != rec.branch_id.id {
+            ancestors.push(cur.branch_id.id);
         }
+        // **F1, second half: an error is an error.** This was `match get_raw { Ok(Reaped) => climb,
+        // _ => return Ok }`, which read a failed read as "the parent is not Reaped". The cascade
+        // then returned `Ok`, the caller released the originator and removed the only key, and
+        // every reaped ancestor above was stranded. Propagated, the reap fails before that
+        // release and the originator stays on the UNRELEASED span for the next sweep.
+        let prec = catalog.get_raw(parent.id)?;
+        if prec.state != BranchState::Reaped {
+            break;
+        }
+        cur = prec;
+    }
 
-        match catalog.get_raw(parent.id) {
-            Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
-            _ => return Ok(released),
+    // **D200 — each ancestor the cascade detached gets its id slot back HERE, or never.** Its own
+    // reap asked `release_id` while it was still pinned, and that refused; nothing else ever asks
+    // again (`release_id` has no other production caller, and the only other reaped-id sweep was
+    // `migrate_from`). Each is `Reaped` with nothing alive below it now, and `release_id`
+    // re-checks both. AFTER every detach, never before: a slot recycled while its old CHILD entry
+    // still named it would pin the old parent through the new branch.
+    //
+    // ⚠ Residual, stated (lane §8.7): `release_id` swallows its own errors, so an ancestor whose
+    // release FAILS here is left keyless once its originator is released. That is an error-only
+    // leak, never a free. The trait's `release_id` returns `()`, so the cascade cannot see the
+    // failure.
+    let mut released = Vec::new();
+    if release_ancestors {
+        for id in ancestors.into_iter().rev() {
+            catalog.release_id(id);
+            released.push(id);
         }
     }
+    Ok(released)
 }
 
 /// **D83.** Carries a drain's `touched` set and records it for a later narrowed sweep **unless the
