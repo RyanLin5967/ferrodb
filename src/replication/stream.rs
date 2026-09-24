@@ -201,6 +201,26 @@ impl Pumped {
     }
 }
 
+/// **D276: how far one pump may grow its window, in multiples of `max_bytes`.**
+///
+/// A pump reads at most `max_bytes` past its cursor, and the cursor never passes an open
+/// transaction's first row. So a transaction whose rows span more than one window never had its
+/// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
+/// rule took for the end of the feed. Now a pump that would neither write anything nor advance,
+/// because an open transaction holds the cursor, re-reads with its window doubled, up to this many
+/// batches (64 MiB at the default `max_bytes`), and past that refuses by name. Bound to
+/// `max_bytes` so that raising one raises the other.
+///
+/// **What the cap measures, exactly:** how far past the OLDEST open transaction's first row one
+/// pump reads, other transactions' traffic included, not that transaction's own size. So an idle
+/// open session holding one staged row stops the feed with an `Err` once this much log follows it
+/// (at `00f4c39` it wedged the feed silently after one window). A crashed transaction resolves at
+/// the next open, because recovery aborts every loser. Removing the bound on span needs a decoder
+/// that keeps open transactions' staged rows across pumps, so its read position can run ahead of
+/// its restart cursor (PostgreSQL's `restart_lsn` and `confirmed_flush`): a design change, not
+/// made here.
+const MAX_WINDOW_BATCHES: u64 = 64;
+
 /// Follows a WAL, emitting committed changes as JSON Lines.
 ///
 /// A streamer is **stateless about position** on purpose: it decodes whatever range it is asked
@@ -208,16 +228,6 @@ impl Pumped {
 /// from exactly one starting cursor — so that lives on [`Subscription::following`], which takes the
 /// cursor from the boundary instead of from the caller. See [`SnapshotBoundary`] for why pairing a
 /// boundary with a cursor of one's own choosing loses data silently.
-/// **D276: how far one pump may grow its window, in multiples of `max_bytes`.**
-///
-/// A pump reads at most `max_bytes` past its cursor, and the cursor never passes an open
-/// transaction's first row. So a transaction whose rows span more than one window never had its
-/// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
-/// rule took for the end of the feed. Now a pump that cannot advance for an open transaction
-/// re-reads with its window doubled, up to this many batches (64 MiB at the default `max_bytes`),
-/// and past that refuses by name. Bound to `max_bytes` so that raising one raises the other.
-const MAX_WINDOW_BATCHES: u64 = 64;
-
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
@@ -310,7 +320,8 @@ impl FeedStreamer {
     }
 
     /// The pump, reading at most `window` bytes past `cursor`. It recurses with the window doubled
-    /// while an open transaction holds the cursor where it started (D276, `MAX_WINDOW_BATCHES`),
+    /// while an open transaction holds the cursor where it started and there is nothing new to
+    /// write (D276, `MAX_WINDOW_BATCHES`),
     /// and it writes nothing before the read it keeps: the decoder's history merges a re-read of
     /// a superset range idempotently, and nothing else is changed before the write.
     fn pump_window<W: Write>(
@@ -499,14 +510,25 @@ impl FeedStreamer {
         // stalls the feed on purpose and says so, and growing past it would report the wrong reason.
         // The bytes held for one pump are bounded by the cap; an in-flight transaction already
         // larger than it is refused too, since delivering it whole would need more.
-        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {
+        //
+        // Only when this pump would also write NOTHING (review 5): commits this window already
+        // holds are delivered first, and the next pump, where `emitted_through` filters them, grows.
+        // So each pump either delivers something new or grows, and a wedged one decodes the windows
+        // 1, 2, 4, …, at most twice its final one.
+        if next == cursor
+            && candidates.is_empty()
+            && decoded.open_from.is_some()
+            && refused_commit.is_none()
+            && to < frontier
+        {
             let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);
             if window >= cap {
                 return Err(FerroError::Wal(format!(
-                    "the change feed cannot advance past lsn {}: transaction(s) {:?} open there span \
-                     more than {cap} bytes of log ({MAX_WINDOW_BATCHES} times max_bytes {}) with no \
-                     Commit or Abort in reach, and delivering one needs it read whole. Nothing is \
-                     skipped: raise max_bytes (FeedStreamer::with_max_bytes) to deliver it.",
+                    "the change feed cannot advance past lsn {}: transaction(s) {:?} open there reach \
+                     no Commit or Abort within {cap} bytes of log from that point ({MAX_WINDOW_BATCHES} \
+                     times max_bytes {}; other transactions' records count toward it), and the feed \
+                     delivers a transaction only whole. Nothing is skipped: end or roll back that \
+                     transaction, or raise max_bytes (FeedStreamer::with_max_bytes).",
                     decoded.open_from.unwrap_or(cursor),
                     decoded.open,
                     self.max_bytes
