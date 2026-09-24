@@ -1938,6 +1938,15 @@ mod tests {
 
     /// ⛔ REVIEW FINDING 3. `heads` was keyed by the raw id slot, so a recycled slot chained onto
     /// the reaped branch's head — the exact inverse of the property the header claims.
+    ///
+    /// ⚠ **Rewritten for wall #19, deliberately: the one existing test whose assertions changed.**
+    /// It had the writer append a generation-1 `Commit` with no `Fork`, then checked that the
+    /// entry did not link to generation 0's reap and that `verify_chain` reported it. The writer
+    /// now refuses that append outright, because generation 1 has no live head. That is the
+    /// property in its strongest form: nothing chains, because nothing is written. Both halves are
+    /// kept: the writer's refusal, and the verifier's report on the shape the writer can no longer
+    /// produce, forged through `load_untrusted` with each link that could have been made — the
+    /// slot-keyed bug's (generation 0's reap) and the old fallback's (genesis).
     #[test]
     fn a_recycled_id_slot_does_not_inherit_the_reaped_branchs_chain() {
         let mut h = AttestedHistory::new();
@@ -1948,18 +1957,32 @@ mod tests {
         let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3))
             .expect("a legitimate append must not be refused");
 
-        // Generation 1 takes over the slot and writes without ever being forked.
-        h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4))
-            .expect("a legitimate append must not be refused");
-        let last = *h.entries().last().unwrap();
-        assert_ne!(
-            last.prev, reap_att,
-            "generation 1 chained onto generation 0's reap attestation"
+        // Generation 1 takes over the slot and tries to write without ever being forked.
+        assert_eq!(
+            h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4)),
+            Err(AppendRefused::NoLiveHead { branch: bid(7, 1) }),
+            "generation 1 wrote an entry with no Fork of its own"
         );
-        assert!(
-            h.verify_chain().is_err(),
-            "a generation-1 branch with no Fork entry must be reported, not inherited"
-        );
+        assert_eq!(h.len(), 3, "the refused entry reached the log");
+        h.verify_chain().expect("control: the log the writer produced verifies");
+
+        for prev in [reap_att, Attestation::genesis()] {
+            let mut forged = h.entries().to_vec();
+            forged.push(HistoryEntry {
+                prev,
+                branch: bid(7, 1),
+                content_cid: cid(4),
+                epoch: Epoch(4),
+                op: BranchOp::Commit,
+            });
+            assert!(
+                matches!(
+                    AttestedHistory::load_untrusted(forged).verify_chain(),
+                    Err(TamperFinding::DanglingBranch { index: 3, .. })
+                ),
+                "a generation-1 branch with no Fork, linked to {prev}, was not reported"
+            );
+        }
     }
 
     /// ⛔ REVIEW FINDING 6. `verify_consistency` short-circuited on `size == 0` without looking
@@ -2119,6 +2142,83 @@ mod tests {
         for i in 1..=N {
             assert_eq!(h.head_of(worker(i)), None, "reaped worker {i} still has a head");
         }
+    }
+
+    /// ⛔ **WALL #19 REGRESSION (the lead's review of `7ea940d`), WRITTEN TO FAIL FIRST.**
+    ///
+    /// Once a reap drops a branch's head, the writer's old fallback (a missing head means genesis)
+    /// turns a write after the reap into an entry rooted at the start of history. That entry cut
+    /// the reaped branch's ancestry walk at itself (`verify_branch` → `Ok(1)`), and a fork from the
+    /// reaped branch got an ancestry of nothing. Every non-trunk branch begins with a `Fork`, so a
+    /// non-trunk branch with no live head has nothing a new entry can honestly link to, whether a
+    /// reap sealed it or this log never saw it forked. The writer must refuse, and count it.
+    ///
+    /// Hand-worked: the log is `Merge 1 (trunk), Fork w, Reap w`, 3 entries. The worker's walk is
+    /// Reap, Fork, Merge 1, then genesis: 3 steps. Refusals: the two writes after the reap, the two
+    /// for a branch never forked here, and the trunk reap: 5.
+    ///
+    /// The walk is asserted FIRST, after both writes were attempted: on the unfixed writer it reads
+    /// `Ok(1)`, which is the hole itself rather than a symptom of it.
+    #[test]
+    fn a_branch_with_no_live_head_is_refused_and_a_reaped_walk_keeps_its_reap() {
+        let worker = bid(1, 0);
+        let mut h = AttestedHistory::new();
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Merge, cid(1))
+            .expect("trunk may open the log");
+        h.append_fork(worker, BranchId::TRUNK, Epoch(2), cid(2)).expect("a fork from trunk");
+        h.append(worker, Epoch(3), BranchOp::Reap, cid(3)).expect("a live worker may be reaped");
+
+        // The fork is attempted before the extension so that, on the unfixed writer, it links to
+        // the reaped parent's missing head and not to the head the extension would have given it.
+        let forked = h.append_fork(bid(2, 0), worker, Epoch(4), cid(4));
+        let extended = h.append(worker, Epoch(5), BranchOp::Merge, cid(5));
+
+        assert_eq!(
+            h.verify_branch(worker),
+            Ok(3),
+            "a write after the reap cut the reaped branch's walk short of its reap"
+        );
+        assert_eq!(
+            forked,
+            Err(AppendRefused::NoLiveParent { parent: worker }),
+            "a fork from a reaped parent was written"
+        );
+        assert_eq!(
+            extended,
+            Err(AppendRefused::NoLiveHead { branch: worker }),
+            "an entry after a reap was written"
+        );
+
+        // A branch this log never saw forked is refused the same way, for the same reason.
+        let stranger = bid(9, 0);
+        assert_eq!(
+            h.append(stranger, Epoch(6), BranchOp::Commit, cid(6)),
+            Err(AppendRefused::NoLiveHead { branch: stranger }),
+            "an entry for a branch with no Fork was written"
+        );
+        assert_eq!(
+            h.append_fork(bid(3, 0), stranger, Epoch(7), cid(7)),
+            Err(AppendRefused::NoLiveParent { parent: stranger }),
+            "a fork from a branch with no Fork was written"
+        );
+        // Trunk is the one branch that may begin without a Fork, so it is the one never sealed.
+        assert_eq!(
+            h.append(BranchId::TRUNK, Epoch(8), BranchOp::Reap, cid(8)),
+            Err(AppendRefused::TrunkReap),
+            "trunk was reaped"
+        );
+
+        // Nothing refused was written, each refusal was counted, and the log still verifies.
+        assert_eq!(h.len(), 3, "a refused write reached the log");
+        assert_eq!(h.refused(), 5, "refusals counted");
+        h.verify_chain().expect("the log the writer produced must verify");
+        assert_eq!(
+            h.verify_branch(bid(2, 0)),
+            Err(TamperFinding::NoSuchBranch { branch: bid(2, 0) }),
+            "the refused child left history behind"
+        );
+        // And trunk, still live, takes a legitimate write after all of that.
+        h.append(BranchId::TRUNK, Epoch(9), BranchOp::Merge, cid(9)).expect("trunk is live");
     }
 
     /// ⛔ REVIEW FINDING 10. The third-party story is "you hold 85 bytes and a proof", so those

@@ -236,13 +236,25 @@ fn main() {
     let reap_att =
         recycled.append(BranchId::new(7, 0), Epoch(3), BranchOp::Reap, ContentId::of(b"r"))
             .expect("a legitimate append must not be refused");
-    recycled.append(BranchId::new(7, 1), Epoch(4), BranchOp::Commit, ContentId::of(b"g1"))
-        .expect("a legitimate append must not be refused");
-    let g1 = *recycled.entries().last().unwrap();
-    c.expect("generation 1 does not chain onto generation 0's reap", g1.prev != reap_att);
+    // Wall #19: generation 1 has no live head, so the writer refuses it rather than link it to
+    // anything; the verifier still reports the shape when it is forged.
+    let refused =
+        recycled.append(BranchId::new(7, 1), Epoch(4), BranchOp::Commit, ContentId::of(b"g1"));
     c.expect(
-        "and a generation-1 branch with no Fork of its own is reported",
-        recycled.verify_chain().is_err(),
+        "generation 1 cannot write without a Fork of its own, so nothing chains onto the reap",
+        refused.is_err() && recycled.len() == 3,
+    );
+    let mut forged = recycled.entries().to_vec();
+    forged.push(HistoryEntry {
+        prev: reap_att,
+        branch: BranchId::new(7, 1),
+        content_cid: ContentId::of(b"g1"),
+        epoch: Epoch(4),
+        op: BranchOp::Commit,
+    });
+    c.expect(
+        "and a forged generation-1 entry chained onto generation 0's reap is reported",
+        AttestedHistory::load_untrusted(forged).verify_chain().is_err(),
     );
     println!();
 

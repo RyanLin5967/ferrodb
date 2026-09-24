@@ -658,3 +658,40 @@ fn a_reaped_branch_keeps_its_proofs_and_loses_its_head() {
     let reaped_heads: Vec<_> = [a, b, c].iter().map(|&x| db.runtime.attestation_of(x)).collect();
     assert_eq!(reaped_heads, vec![None, None, None], "a reaped branch still holds a head");
 }
+
+/// ⛔ **WALL #19 REGRESSION, WRITTEN TO FAIL FIRST: a branch this log never saw forked cannot
+/// parent a session, and retiring it writes no entry rooted at genesis.**
+///
+/// The attested log's scope is the branches it saw forked, plus trunk. A branch forked straight
+/// through the catalog is outside it. Before the refusal, a session forked from one got a `Fork`
+/// linked to genesis, an ancestry of nothing. Its abandon wrote a `Reap` as that branch's first
+/// entry, which `verify_chain` reports as `DanglingBranch`. Now the fork is refused, so the
+/// session never begins, and the reap commits in the catalog with no entry. Both refusals are
+/// counted.
+///
+/// Two different outside branches, so the refused session's staged child (discharged, not
+/// removed, by `ForkDurability`) cannot change what the abandon of the second one does.
+#[test]
+fn a_branch_outside_the_log_cannot_parent_a_session_and_its_reap_writes_nothing() {
+    use ferrodb::branch::types::LeaseDeadline;
+    use ferrodb::branch::BranchCatalog;
+
+    let mut db = Db::new();
+    db.seed();
+    let lease = LeaseDeadline::from_now(600_000);
+    let parent = db.runtime.branches().fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+    let retired = db.runtime.branches().fork(BranchId::TRUNK, lease).expect("fork").branch_id;
+
+    match db.runtime.begin_session("agent-x", Some("r_x"), parent) {
+        Ok(_) => panic!(
+            "a session forked from {parent}, which this log never saw forked, so its Fork entry \
+             names an ancestry the log does not hold"
+        ),
+        Err(e) => assert!(e.to_string().contains("attestation refused"), "wrong refusal: {e}"),
+    }
+    assert_eq!(db.runtime.attested_len(), 0, "a refused fork reached the log");
+
+    db.runtime.abandon(retired).expect("retiring a branch outside the log must still succeed");
+    assert_eq!(db.runtime.attested_len(), 0, "the reap of a branch outside the log was recorded");
+    assert_eq!(db.runtime.attestation_refusals(), 2, "the fork and the reap were not both counted");
+}
