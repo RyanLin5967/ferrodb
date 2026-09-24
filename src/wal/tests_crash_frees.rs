@@ -1304,3 +1304,48 @@ fn the_reset_keeps_a_page_a_directory_lists_whose_bytes_are_zeros() {
         "page {listed}, listed by u's time-travel heap, is not that heap's page any more"
     );
 }
+
+/// **A DROP whose mutation fails after naming its pages frees nothing, and the intent is decided by
+/// the durable catalog, not trusted** (the D250 lesson: a record written ahead of an irreversible
+/// step is a commit point unless something else decides it). Here the durable catalog decides: the
+/// intent is only a list of pages, and recovery never acts on it while the catalog still names the
+/// table. So the failure needs no fail-stop, and the next open rolls the intent back.
+///
+/// Mutant-only red: M12 marks the intent decided before looking at the mutation's result.
+#[test]
+fn a_drop_whose_mutation_fails_after_naming_its_pages_frees_none_of_them() {
+    let m = Machine::boot(fixture(), None);
+    let pages;
+    {
+        let mut d = m.open().expect("open the fixture");
+        pages = pages_of(&d.o, "t").expect("walk t");
+        let (dir_root, tt_root) = {
+            let e = d.o.catalog.get_table("t").expect("t");
+            (e.first_directory_page_id, e.time_travel_root)
+        };
+        let catalog = &d.o.catalog;
+        let failed = d.o.txn.drop_checkpointed(&[dir_root, tt_root], |intent| {
+            let named = catalog.table_pages("t")?;
+            intent.record("t", dir_root, named)?;
+            Err::<(), FerroError>(FerroError::Internal("injected: the DROP's mutation fails after naming its pages".into()))
+        });
+        assert!(failed.is_err(), "premise: the injected failure did not reach the caller");
+        assert!(d.o.catalog.get_table("t").is_some(), "premise: the mutation that failed dropped the table anyway");
+        d.o.txn.checkpoint().expect("a checkpoint after the failed DROP");
+        let bits = allocated(&d.o.bp).expect("read the bitmap");
+        let freed: Vec<u32> = pages.iter().copied().filter(|p| !bits.contains(p)).collect();
+        assert!(freed.is_empty(), "a DROP that failed freed {} page(s) of a table the catalog still names, e.g. {:?}", freed.len(), &freed[..freed.len().min(5)]);
+        assert!(m.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "premise: the failed DROP left no intent, so the open decides nothing");
+        // The crash: the process dies with the intent undecided.
+    }
+    let mut want = fixture_want();
+    want.present.remove("t");
+    want.either = Some(("t".to_string(), (0..ROWS).collect(), pages));
+    let m2 = Machine::boot(&m.snapshot(), None);
+    {
+        let mut d = m2.open().expect("the open after the failed DROP");
+        assert!(d.o.catalog.get_table("t").is_some(), "the open dropped a table whose DROP never took effect");
+        oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("after the open: {e}"));
+    }
+    assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "the open kept an intent whose table the catalog still names");
+}
