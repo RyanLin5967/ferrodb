@@ -1269,4 +1269,130 @@ use super::*;
             "writing a heap page whose own record was already durable flushed the log anyway"
         );
     }
+
+    /// **The same control for a page with no LSN: an index page whose changes' records are durable
+    /// does not flush the log.**
+    ///
+    /// The gate's first version flushed the whole log for every such page (the D216 adversary's
+    /// F4). A commit leaves its `TxnEnd` in the buffer, so the buffer is almost never empty, and
+    /// every eviction of a dirty index, directory or catalog page paid a log write and an fsync,
+    /// in a 1024-frame pool. The page needs only the records appended before it last changed.
+    /// Here those are the INSERT's, which its commit made durable, so writing the leaf must leave
+    /// the `TxnEnd` buffered.
+    ///
+    /// Passes at `00f4c39`, where the gate skipped these pages. Must keep passing.
+    #[test]
+    fn an_index_page_whose_records_are_durable_does_not_flush_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("precise_index.db");
+        d216_cleanly_closed(&db);
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+        let flushed = o.wal.flushed_lsn.load(Ordering::SeqCst);
+        assert!(
+            flushed < o.wal.next_lsn.load(Ordering::SeqCst),
+            "premise failed: nothing is waiting in the log buffer, so a flush it did not need could not be seen"
+        );
+        d216_flush_primary_root_holding(&o, 3);
+        assert_eq!(
+            o.wal.flushed_lsn.load(Ordering::SeqCst),
+            flushed,
+            "writing an index page whose changes were already durable flushed the log anyway"
+        );
+    }
+
+    /// **D216 adversary F1: a commit whose earlier records were already durable must make its own
+    /// `Commit` durable.**
+    ///
+    /// `WalManager::flush_up_to` returned early when `flushed_lsn >= lsn`. But an LSN is where a
+    /// record STARTS, and `flushed_lsn` is one past the last durable byte, so the record first in an
+    /// empty buffer starts exactly at `flushed_lsn` and was never written. `commit` then returned
+    /// `Ok` with its `Commit` only in memory, and a crash undid a transaction whose caller had been
+    /// told it committed. Any write-back that flushes the log between a transaction's last record
+    /// and its commit sets this up. The flush here is the one such a write-back does, and D216's
+    /// gate adds more of them.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the row count (0 against 1).
+    #[test]
+    fn a_commit_is_durable_when_everything_before_it_was_already_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, rid);
+        {
+            let (bp, wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            rid = heap.insert(Tuple::new(vec![4, 5, 6])).unwrap();
+            wal.flush().unwrap();
+            txn.commit(t).unwrap();
+            // The crash: nothing else is written.
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        recover(&txn).unwrap();
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "commit returned Ok, and after a crash the transaction was undone: its Commit never reached the log"
+        );
+        assert_eq!(heap.read(rid).unwrap().data, vec![4, 5, 6]);
+    }
+
+    /// **D216 adversary F1, the page half: a heap page is written only after its own record, even
+    /// when that record was the first in an empty buffer.** The gate asks `flush_up_to(page LSN)`,
+    /// and the page LSN is where its record starts, so this is the same off-by-one: it let a heap
+    /// page reach the disk ahead of the record that describes it, the one rule write-ahead logging
+    /// exists to enforce.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `flushed_lsn` assertion.
+    #[test]
+    fn a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, wal, txn) = setup(dir.path());
+        let t = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t);
+        wal.flush().unwrap();
+        let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
+        let rid = heap.insert(Tuple::new(vec![1, 2, 3])).unwrap();
+        let (first, _) = wal.read_record(flushed).unwrap();
+        assert!(
+            matches!(first.kind, RecKind::HeapInsert { .. }),
+            "premise failed: the record at the flushed point is {:?}, not the insert",
+            first.kind
+        );
+        bp.flush_page(rid.page_id).unwrap();
+        assert!(
+            wal.flushed_lsn.load(Ordering::SeqCst) > flushed,
+            "a heap page reached the disk while its own HeapInsert was still only in memory"
+        );
+        txn.abort(t).unwrap();
+    }
+
+    /// **D216 adversary F3: transaction id 0 is never handed out.**
+    ///
+    /// Recovery no longer takes id 0 for a loser, because DDL and run declarations are logged under
+    /// it. So a real transaction 0 that crashed would never be undone, and every log reader already
+    /// takes a record under id 0 for a declaration (`Snapshot::already_delivered`,
+    /// `replication::logical`). A fresh log's header starts ids at 1, but `WalManager::truncate`
+    /// writes whatever it is given, and a snapshot install passes 0 (`consensus::snapshot`).
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `assert_ne!`: the first id is 0.
+    #[test]
+    fn transaction_id_zero_is_never_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (_bp, wal, _txn) = setup(dir.path());
+            wal.truncate(0).unwrap();
+        }
+        let (_bp, wal, txn) = setup(dir.path());
+        assert_eq!(wal.header_txn_id, 0, "premise failed: the log's header does not say 0");
+        recover(&txn).unwrap();
+        let t = txn.begin().unwrap();
+        assert_ne!(t, 0, "a transaction was given id 0, which recovery never undoes and every log reader takes for a declaration");
+    }
 }
