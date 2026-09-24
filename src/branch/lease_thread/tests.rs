@@ -370,11 +370,16 @@ fn a_lease_expiry_reap_is_attested_exactly_once() {
     let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
     assert_eq!(ops(), vec![BranchOp::Fork], "control: the session's fork is attested");
     let fork_head = f.runtime.attestation_of(branch).expect("a live session has a head");
+    // From the catalog, before the reap: the epoch `seal` stamps on its Reap entries.
+    let fork_epoch = f.h.catalog.get(branch).unwrap().fork_epoch;
 
     let counters = Counters::default();
     scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
     assert_eq!(counters.snapshot().reaped, 1, "the scan reaped nothing, so this proves nothing");
     assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    // The epoch assertion below can only discriminate if "now" has moved past the fork.
+    // `write_pages` advanced it.
+    assert_ne!(f.h.catalog.current_epoch(), fork_epoch, "precondition: the epoch never moved");
 
     assert_eq!(
         ops(),
@@ -383,6 +388,11 @@ fn a_lease_expiry_reap_is_attested_exactly_once() {
     );
     let reap = *f.runtime.attested_entries(branch).last().unwrap();
     assert_eq!(reap.prev, fork_head, "the reap does not follow the branch's own fork");
+    assert_eq!(
+        reap.epoch, fork_epoch,
+        "a lease Reap must carry the branch's fork epoch, as seal's Reap entries do: the epoch is \
+         hashed into the entry, so one op with two epoch meanings is two formats"
+    );
     let mut closed = fork_head.0.to_vec();
     closed.push(0);
     assert_eq!(
