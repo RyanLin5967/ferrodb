@@ -1,0 +1,11 @@
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -516,7 +516,7 @@
+         for entry in sorted {
+             if !layout[layout.len() - 1].has_space(entry) {
+                 let fresh = CatalogPage::new(0);
+-                if !fresh.has_space(entry) {
++                if false && !fresh.has_space(entry) {
+                     refuse_unless_encodable(entry)?;
+                     return Err(FerroError::Internal(format!(
+                         "the catalog entry of table '{}' fits no empty page, yet the encoder accepted it",
