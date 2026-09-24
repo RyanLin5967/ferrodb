@@ -1545,6 +1545,15 @@ impl TxnManager {
             .map(|r| r.columns.clone())
     }
 
+    /// Declare a completed DROP again, durably, after a checkpoint truncated past its record: the
+    /// open's half of the rule `ddl_unit` follows after a DROP's truncation (D250 review 2's R2-4,
+    /// `wal::recovery::open_recovered`). Not retained in the schema: the running process's next
+    /// truncating checkpoint drops it, after the provenance forget it exists for has run.
+    pub(crate) fn declare_drop_again(&self, r: &DdlRecord) -> Result<(), FerroError> {
+        self.append_ddl(r)?;
+        self.wal.flush()
+    }
+
     fn append_ddl(&self, r: &DdlRecord) -> Result<(), FerroError> {
         self.wal.append(
             0,

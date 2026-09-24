@@ -313,9 +313,10 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
         }
         // E69 — the statement that makes the `DROP_TABLE` half of the feed reachable.
         //
-        // Same shape as `CreateTable` above and for the same reasons: DDL outside a transaction, a
-        // checkpoint, then the record logged AFTER the checkpoint through `log_ddl` so it is retained
-        // rather than truncated away by the next one.
+        // Same shape as `CreateTable` above in two respects: DDL outside a transaction, and the record
+        // logged through `log_ddl` so it is retained rather than truncated away by the next
+        // checkpoint. NOT in its order: since D250 the record is logged inside the barrier, durable
+        // BEFORE the first free and before the checkpoint (the D250 paragraph below).
         //
         // The record is logged even though the catalog is already authoritative for the running
         // database, because a consumer reading the log has no other way to learn the table is gone -
