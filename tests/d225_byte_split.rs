@@ -462,13 +462,19 @@ fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
 /// **The NOT NULL refusal of a multi-row UPDATE also comes before its first write.** Not D225's
 /// defect, the same shape: the check sat in the write loop, so a later row's NULL was refused
 /// after an earlier row was written and moved, and the abort undoes only the heap. It now runs in
-/// the pre-pass with the entry bound. Row `'a'` grows by 2020 characters beside a filler, so it
-/// cannot stay in place (INFERRED, not measured); row `'k'` would set a NOT NULL column to NULL.
+/// the pre-pass with the entry bound. Row `'k'` would set a NOT NULL column to NULL.
+///
+/// Row `'a'` must be one the heap MOVES, or the test cannot tell the two orders apart. By the
+/// tuple layout (24-byte header, 1-byte null bitmap, 2-byte length per VARCHAR) it is 2037 bytes
+/// as inserted and 4036 after `a = b`: under `MAX_TUPLE_SIZE` (4069), so the update is legal, and
+/// over the roughly 650 bytes its page has left beside the filler, so it relocates (INFERRED from
+/// `HeapFileManager::update`, not measured). A `b` of 2020 characters would make 4076 bytes, over
+/// the tuple limit, and the old order would then fail on that instead: a red for the wrong reason.
 #[test]
 fn a_multi_row_update_refused_for_not_null_writes_no_row_first() {
     let mut d = db();
     d.sql("CREATE TABLE u (id VARCHAR(100) NOT NULL, n INTEGER, a VARCHAR(3000) NOT NULL, b VARCHAR(3000));");
-    d.sql(&format!("INSERT INTO u VALUES ('a', 1, 'x', '{}');", "z".repeat(2020)));
+    d.sql(&format!("INSERT INTO u VALUES ('a', 1, 'x', '{}');", "z".repeat(2000)));
     d.sql("INSERT INTO u VALUES ('k', 2, 'x', NULL);");
     d.sql(&format!("INSERT INTO u VALUES ('f1', 10, '{}', NULL);", "f".repeat(1300)));
 
@@ -524,8 +530,13 @@ fn a_create_index_the_entry_bound_refuses_registers_nothing_and_leaks_nothing() 
 /// leave the catalog naming freed pages. It must refuse before the first free.
 ///
 /// The roots alone cannot show that: pages are reallocated lowest-first, so a rebuild that frees
-/// a root gets the same page back. What shows it is the primary tree's CONTENT. Row 2 went into
-/// the heap directly, so the old primary tree never held key 2, and any rebuild of it adds it.
+/// a root gets the same page back. Three things show it, one per place the refusal could land:
+///
+/// - after a refill: the old primary tree never held key 2 (row 2 went into the heap directly),
+///   and any rebuild adds it;
+/// - after a fresh tree is created on a freed root: that tree is empty, so key 1 is gone;
+/// - between a free and the next allocation: the freed root is the lowest free page, so the next
+///   page handed out is that root. This one holds whether or not the root's image reached disk.
 #[test]
 fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_freed() {
     let mut d = db();
@@ -552,6 +563,11 @@ fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_f
         primary.search(&Value::Integer(2)).unwrap(),
         None,
         "the primary tree holds key 2, which only a rebuild adds: it was freed and rebuilt before the refusal"
+    );
+    let next = d.bp.new_page().unwrap();
+    assert!(
+        next != entry.primary_index_root && next != index_before,
+        "page {next}, an old root, came back from the allocator: it was freed before the refusal"
     );
     assert_eq!(d.index_root("t", "v"), index_before, "the secondary tree was rebuilt");
     let old = Tree::open(index_before, d.bp.clone());
