@@ -64,7 +64,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // allocator. A rebuild that outgrew the table region was handed arena pages and wrote over
     // live branch data. See `ArenaPageStore::reserve_persisted_floor`.
     let arena_path = format!("{db_path}.arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
+    // MUTANT (fire-check only, never land): the CLI never reserves the floor before recovery.
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
