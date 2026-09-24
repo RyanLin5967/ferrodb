@@ -892,3 +892,98 @@ R1–R5, and what changes:**
    * The (f) list on the (e) command has 19 of them: all except `orphan-extent` (its own restart-only run) and
      `pinned-checkpoint` ((f2)).
    * New `#[test]`s over `9aa6968`: still 41.
+
+**A13, 2026-09-24, before any build or run. Review 5 of `e4094cc..94413b1` (artie-research
+`frontier/read_vs_n_review5.md` @ `b9c6147`) returned SOUND-WITH-CAVEATS. It found A12.1's integer judge sound, and
+moved `runs = M` and `a = 0` to READ. The lead's decisions on C1–C7, and what changes:**
+
+1. **C1: an in-path JUDGE fire, `ckpt-ddl`, proves A12.1's judge can move.**
+   * **What it does.** Right after axis (ii)'s `reopen_for_merges`, and before any merge, the harness runs one real
+     `CREATE TABLE ckpt_ddl (c INTEGER);` (`CKPT_DDL_SQL`).
+     * The executor logs that table's `Ddl` record AFTER the DDL's own checkpoint (`ddl_checkpointed`), which
+       truncates the log and zeroes the commit counter.
+     * `log_ddl` keeps the record in `schema_log`, so every axis-(ii) checkpoint re-appends it through
+       `replay_schema`.
+   * **D, the record's size, derived by hand from the encoder** (READ `wal/log.rs` `RecKind::serialize`'s `Ddl` arm
+     and its decoder; `execution/executor.rs`'s `CreateTable` arm):
+     * frame = 32, as in A12.1;
+     * kind = 1 tag (9) + 1 op (`CreateTable` = 0) + 4 `dir_root` (u32) + 4 `time_travel_root` (u32) + (2 + 8)
+       table `ckpt_ddl` + 2 column count (u16) + (2 + 1) column `c` + 1 type tag + 1 nullable = **27**;
+     * **D = 59 bytes.** The type tag is one byte for either integer type, and the nullable flag is one byte either
+       way, so D does not depend on how the parser maps `INTEGER` or on nullability.
+   * **Its run is (f3):** `CURVE_FIRECHECK=ckpt-ddl CURVE_ARMS=merge CURVE_MERGE_K=8 CURVE_MERGE_M=256,512` on
+     checkpoints `256,2048`. Pre-registered:
+     * `CKPT-DDL base_moved=1 bytes_past_base=59`: the record alone past the new base. The fire asserts that the base
+       moved and that the byte count is non-zero, and panics "did not inject" otherwise;
+     * `CKPT M=256 runs=256 replay_bytes=35899` and `CKPT M=512 runs=512 replay_bytes=71739`, i.e. `59 + 140·runs`,
+       each with `period=256`, because the DDL's checkpoint zeroed the counter before the first merge;
+     * the bytes fit reads slope = 140.000, intercept = 59.0, max |residual| = 0.0;
+     * rc = 0 and `GUARDS: every guard held`, because no harness guard reads the integer. The `FIRECHECK` line
+       names it a JUDGE fire.
+   * **The verdict script's A12.1 rule (intercept 0.0) must FAIL on (f3), with intercept 59.** That failure is the
+     fire-check: the ENGINE, not the harness, produced a non-zero intercept. If the rule passes on (f3), that is a
+     finding against the judge.
+   * `Fire` gains a fourth kind, JUDGE: a real state change that moves a judged integer, where no harness guard fires.
+2. **C2: (f0)'s "creates no run directory" is WITHDRAWN.** It cannot fail: `RemoveOnDrop` deletes the directory on
+   unwind too.
+   * **Chosen: print a line at the directory's creation, and assert it is ABSENT.** The harness prints
+     `RUN DIR <path>` to stderr on the line after `create_dir_all`. stderr leaves every stdout table unchanged, and
+     (f0) captures `2>&1`.
+   * Each (f0) command must therefore show rc = 101, its refusal text, and no `RUN DIR` line.
+   * The refusal already precedes the directory (READ: `Fire::refusal` runs before `temp_dir`). The line moves that
+     ORDER from read to measured. A refusal moved after the directory's creation would print the line first, and
+     (f0) would catch it.
+3. **C3: Q10's time bands are WITHDRAWN from judgment, on both axes.**
+   * **Why axis (ii):**
+     * its band is a log-log slope of the median over M in [−0.1, +0.2], and M rises with wall time, so box drift
+       aliases onto M;
+     * over one factor-4 row, a 13% drop in the median fails it (ln 0.87 / ln 4 = −0.100), and so does a 32% rise;
+     * there is no control arm.
+   * **Why axis (i):** it has the same defect, extending the lead's decision to the same row.
+     * Its ratio ns(10^6)/ns(1000) in [0.7, 1.5] compares two medians taken hours apart;
+     * a 30% drop or a 50% rise fails it;
+     * a ratio needs one instrument and one moment.
+   * **The judged content of "merge cost against N and M" is the INTEGERS:**
+     * Q1: `V_hi` = the `applied` length before the merge, exactly. That is the O(M) term, and it is flat in N;
+     * Q2–Q9: constants and zeros, on both axes;
+     * A12.1's replay bytes.
+   * **Q10's own claim, that the O(M) pass is invisible in TIME at M ≤ 16,384, is inherently a time claim. It is now
+     REPORTED.** Each arm-2 summary row prints:
+     * the median;
+     * the local log-log slope of the median, whose span is printed on a legend line (the previous row to this one:
+       axis (ii) 256 → 1024 → 4096 → 16384 at the defaults; axis (i) the N checkpoints);
+     * a new column, `typ ns ± SE`: the mean and sd/√n over the block's applied merges that did not checkpoint.
+   * **Why not a same-moment control arm for MERGE.** M grows only within one process lifetime (`State` resets at
+     every open, D212). A control at M = 0 measured at the same moment would be a second database interleaved with
+     this one. That doubles the arm's fsync load on the very box it is meant to control for, and the integers
+     already carry the claim.
+   * **Not changed, stated:**
+     * Arm 1's ns predictions keep G7, their drift control.
+     * Arm 3's time bands stay judged, because their spans are long and their bands wide:
+       * R5 and R8: a slope band of ±0.2 over N from 64,000 to 10^6 (a factor of 15.6) tolerates a drift of about
+         ±70% (ln 1.7 / ln 15.6 ≈ 0.19);
+       * A9.1's `rebuild` band spans 400× (0.5–200 ms);
+       * R7 is an absolute ≤ 50 ms bound.
+     * Each of those is also backed by a judged integer: R1–R4 and R10; `recovered`.
+4. **C4: withdrawn in the text, where A12.2 only relabelled them.** `recover_us ≤ 5,000` (A9.1; A11.1's "the bound
+   stands") and `rebuild_us < 1,000` (A9.1's "secondary", A9.3) are **reported, not judged** (A12.2).
+   * D216's AFTER half is judged on `recovered = 0` alone.
+   * The (e2) control is judged on `recovered = 0` and `wal B = 24`.
+5. **C5: A12.2's wording is corrected.** `rebuild_us` is timed AROUND the gate, not inside it: `t` starts before
+   `if recovered || stale`, and `rebuild` is the elapsed time after that block. With the gate false, it times an
+   empty block. The conclusion stands: the time is a consequence of the flag, not a check on it.
+6. **C6:** `stale_marker` is moved above `open_only_child`'s doc comment, which had been documenting it. Each item
+   now carries its own doc, and no attribute is orphaned.
+7. **C7: every applied checkpointing axis-(ii) merge is a CKPT point.**
+   * Before, a point needed a non-empty time period (`period_ns`), a TIME-fit requirement that also gated the
+     JUDGED bytes line.
+   * A point whose period is empty is reachable only at `FERRODB_CHECKPOINT_INTERVAL=1`. It prints
+     `period_median_ns=-` and `excess_ns=-`, and it is left out of the time fit only.
+   * The bytes line takes every point.
+   * The time fit's range labels read "n points, k with a period median".
+   * The run header now prints `FERRODB_CHECKPOINT_INTERVAL` (or "unset"), so a `period` that is not 256 can be read
+     against it.
+8. **Counts.**
+   * Fire modes: 22 = 10 comparison + 3 control + 8 in path + 1 judge. `ckpt-ddl` is new.
+   * The (f) list on the (e) command stays at 19. `ckpt-ddl` runs as (f3).
+   * New `#[test]`s over `9aa6968`: still 41.
