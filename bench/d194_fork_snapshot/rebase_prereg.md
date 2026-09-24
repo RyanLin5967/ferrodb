@@ -637,3 +637,68 @@ in debug builds. In release, M18 goes unkilled, and it is harmless there, as ite
 already gone during the publish window, so a pin taken inside it takes `apply_seq`: that is the
 Amendment 6 defect itself. Item 1's "harmless" is about the opposite mutant, an entry STRANDED after a
 failed publish. M18 is killed in debug, where the suite runs, and nowhere else.
+
+## Amendment 8 (append-only, before any run; written BEFORE the code it describes): third fresh-context review, of `3c52476..fa1193a`
+
+The review found nothing High or Medium, no wrong answer and no compile error, and it derived every test
+and every mutant as pre-registered. Its Low findings are fixed here.
+
+1. **Latent self-deadlock (Low).** `register` built the guard while the state lock was held, so a panic
+   between `register` and the end of the reservation block would drop the guard first. Its `Drop` would
+   then relock a mutex this thread still held. Production has no such exit, but test 3's fixture does.
+   - **Fix:** `register` now CONSUMES the `MutexGuard`. It inserts, releases the lock, and only then
+     returns the entry. No window exists in which the entry is alive and the lock is held, so the
+     precondition is enforced by the signature instead of stated in a doc.
+   - **Tests:** the three that register re-take the lock after `register` for any further setup.
+     Their assertions are unchanged.
+
+2. **Doc drift (Low/Info).**
+   - The reservation comment still said freshness is checked "before the publish transaction opens".
+   - The guard's doc said a stranded entry "would not harm pins". It would also refuse every
+     exact-version read through a pin above it, for ever. Stranding is reachable only through a
+     poisoned state mutex, and by then the runtime is already dead. Stated in the doc.
+   - The docs on tests 1 and 3 are corrected: begin first, and test 3 names `PublishingEntry::register`.
+
+3. **Both refusals in `record_read` ignored the access shape (Info).** A Range or FullScan inspection
+   keeps a predicate and `observed_at`, not versions, and `observed_at = F + 1` is exact for it.
+   - **Fix:** both refusals now fire only when the read names exact versions, i.e.
+     `Inspection && shape.form() == ExactVersions`. That is the outcome at risk.
+
+4. **Mutants that survive (Info).** No test caught any of these:
+   - `start < f` → `start <= f`;
+   - dropping the purpose conjunct;
+   - either `pin_seq` `debug_assert`.
+
+   Added:
+   - Test 3 gains three reads that must NOT be refused:
+     - one through a pin AT the entry's start (a pin taken inside the window), which kills `<=`;
+     - a RowTargeting read through the pin above;
+     - a FullScan inspection through it.
+
+     The last two kill the dropped conjunct and the shape restriction's removal.
+   - Two debug-only `should_panic` tests call `pin_seq` directly:
+     - `pin_seq_names_a_contained_merge_above_an_excluded_one`: expected panic "no single fork_seq".
+     - `pin_seq_names_a_recorded_version_above_its_seq`: expected panic "is recorded above".
+
+5. **Found, NOT fixed here, and why.** This one existed before D194. At the merge's
+   `ctx.txn.commit(publish_txn)?` a failed commit returns without an abort, and the txn stays in `att`.
+   Aborting is not obviously right: `commit` can fail AFTER its `Commit` record is flushed (at
+   `TxnEnd`), and there an abort would undo a durable commit. The fix needs `commit` to say which side
+   of the flush it failed on. That is a change to the WAL API outside this lane, so it goes to the
+   lead as a finding.
+
+### Mutants, added
+
+| id | edit | expected |
+|---|---|---|
+| M20 | the unrecorded refusal's `start < f` → `start <= f` | `version_history_is_not_asked_...` FAILS at the pin-at-start read (`Err` where `Ok` was expected) |
+| M21 | `names_versions` loses its `shape.form() == ExactVersions` conjunct | the same test FAILS at the FullScan read |
+| M22 | `names_versions` loses its `purpose == Inspection` conjunct | the same test FAILS at the RowTargeting read |
+
+### Counts, replacing Amendment 7's
+
+- `cargo test --lib version_history`: 8.
+- `cargo test --lib rebase`: 5.
+- `cargo test --lib pin_seq`: **2**, debug only.
+- Run of record at default QoS: **58 result lines, 2164 passed (2152 + 12), 1 failed, 2 ignored**.
+- Under `-b`: 2163 / 2.
