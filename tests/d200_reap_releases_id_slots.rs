@@ -302,6 +302,10 @@ struct Faulty {
     /// B-tree page failure is `Corruption` or `Io`, so this is what one bad leaf looks like.
     io_get_raw: Vec<u64>,
     io_liveness: Vec<u64>,
+    /// PERSISTENT `Io` WRITE errors (audit 5): the flip of these ids to `Reaped`, and every
+    /// `detach_child` under these parents. Nothing is written when one fires.
+    io_flip_of: Vec<u64>,
+    io_detach_under: Vec<u64>,
 }
 
 fn injected_io(what: &str, id: u64) -> FerroError {
@@ -327,6 +331,11 @@ impl BranchCatalog for Faulty {
         self.inner.get_raw(id)
     }
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        if self.io_detach_under.contains(&parent_id) {
+            return Err(FerroError::Io(format!(
+                "injected persistent I/O error: detach_child under slot {parent_id}"
+            )));
+        }
         let n = self.detaches.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.fail_detach_at {
             return Err(injected("detach_child"));
@@ -367,6 +376,9 @@ impl BranchCatalog for Faulty {
         expect: BranchState,
         to: BranchState,
     ) -> Result<(), FerroError> {
+        if to == BranchState::Reaped && self.io_flip_of.contains(&branch.id) {
+            return Err(injected_io("set_state to Reaped", branch.id));
+        }
         self.inner.set_state(branch, expect, to)
     }
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
@@ -445,6 +457,8 @@ fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
         releases: AtomicU64::new(0),
         io_get_raw: Vec::new(),
         io_liveness: Vec::new(),
+        io_flip_of: Vec::new(),
+        io_detach_under: Vec::new(),
     })
 }
 
@@ -459,6 +473,25 @@ fn faulty_with_io(f: &Fixture, io_get_raw: Vec<u64>, io_liveness: Vec<u64>) -> A
         releases: AtomicU64::new(0),
         io_get_raw,
         io_liveness,
+        io_flip_of: Vec::new(),
+        io_detach_under: Vec::new(),
+    })
+}
+
+/// A `Faulty` whose only faults are persistent `Io` WRITE errors (audit 5): the flip of
+/// `flip_of` to `Reaped`, and `detach_child` under `detach_under`.
+fn faulty_with_io_writes(f: &Fixture, flip_of: Vec<u64>, detach_under: Vec<u64>) -> Arc<Faulty> {
+    Arc::new(Faulty {
+        inner: Arc::clone(&f.catalog),
+        fail_detach_at: 0,
+        detaches: AtomicU64::new(0),
+        fail_get_raw_of: AtomicU64::new(u64::MAX),
+        panic_release_at: 0,
+        releases: AtomicU64::new(0),
+        io_get_raw: Vec::new(),
+        io_liveness: Vec::new(),
+        io_flip_of: flip_of,
+        io_detach_under: detach_under,
     })
 }
 
@@ -590,6 +623,8 @@ fn a_crash_between_two_releases_strands_no_ancestor() {
         releases: AtomicU64::new(0),
         io_get_raw: Vec::new(),
         io_liveness: Vec::new(),
+        io_flip_of: Vec::new(),
+        io_detach_under: Vec::new(),
     });
     let through = reaper_through(&f, &faulty);
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| through.reap(l)));
@@ -734,6 +769,99 @@ fn a_non_branch_error_at_open_is_that_slots_refusal() {
     let keyed = c.unreleased_reaped_candidates().unwrap();
     assert!(
         keyed.contains(&s1.id) && keyed.contains(&s2.id),
+        "a refused slot lost its key, so no later open would ask again: {keyed:?}"
+    );
+}
+
+/// **Audit 5 (A1 narrowed to READS): a WRITE error inside a unit at open fails the open.** The
+/// wide A1 absorbed it as "a crash at that point", and audit 5 showed that is false twice: an
+/// absorbed `free_arena` persist failure leaves memory ahead of the durable map (B1, D263), and an
+/// absorbed `write_record` failure leaves a record no STATE key names (B2, D264). So a write error
+/// inside a resumed reap (phase 1), or inside a swept slot's cascade (phase 2), must fail the open,
+/// as at `0e3c36a`. PRE-REGISTERED (lane §8.18): fails at phase 1's `expect_err` at `0c64402`.
+/// Kills M56 (phase 1) and M57 (phase 2).
+#[test]
+fn a_write_error_inside_a_unit_at_open_fails_the_open() {
+    {
+        let f = fixture();
+        let c = &*f.catalog;
+        let r3 = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        c.set_state(r3, BranchState::Live, BranchState::Reaping).unwrap();
+        let faulty = faulty_with_io_writes(&f, vec![r3.id], Vec::new());
+        let err = reaper_through(&f, &faulty).resume_interrupted_reaps().expect_err(
+            "audit 5: a resumed reap's WRITE error was absorbed as a refusal; it must fail the open",
+        );
+        assert!(
+            err.to_string().contains(&format!("set_state to Reaped of slot {}", r3.id)),
+            "the open failed, but not on the injected flip: {err}"
+        );
+    }
+    {
+        let f = fixture();
+        let c = &*f.catalog;
+        let p = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let s3 = c.fork(p, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        mark_reaped(c, s3);
+        assert!(
+            c.unreleased_reaped_candidates().unwrap().contains(&s3.id),
+            "fixture: S3 was flipped releasable, so it is keyed"
+        );
+        let faulty = faulty_with_io_writes(&f, Vec::new(), vec![p.id]);
+        let err = reaper_through(&f, &faulty).resume_interrupted_reaps().expect_err(
+            "audit 5: a swept slot's WRITE error was absorbed as a refusal; it must fail the open",
+        );
+        assert!(
+            err.to_string().contains(&format!("detach_child under slot {}", p.id)),
+            "the open failed, but not on the injected detach: {err}"
+        );
+    }
+}
+
+/// **Audit 5 (A1 narrowed to READS): a failed READ inside a swept slot's cascade is still that
+/// slot's refusal.** The cascade reads each parent's record and asks each ancestor's liveness;
+/// either may meet one bad leaf, which fails `Io`, not `Branch`. The narrowing wraps a non-`Branch`
+/// error at those read sites into a `Branch` error that names the slot read, so the unit arm's
+/// `Branch` → refusal still takes it. S4's cascade fails reading Q1's record; S5's fails asking
+/// Q2's liveness after S5's own detach. PRE-REGISTERED (lane §8.18): passes at `0c64402` (the wide
+/// A1 absorbed it too); kills M60 (S4) and M61 (S5).
+#[test]
+fn a_non_branch_read_inside_a_cascade_is_the_slots_refusal() {
+    let f = fixture();
+    let c = &*f.catalog;
+    let mut pairs = Vec::new();
+    for _ in 0..2 {
+        let q = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let s = c.fork(q, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        mark_reaped(c, q);
+        mark_reaped(c, s);
+        pairs.push((q, s));
+    }
+    let ((q1, s4), (q2, s5)) = (pairs[0], pairs[1]);
+    let keyed = c.unreleased_reaped_candidates().unwrap();
+    assert!(
+        keyed.contains(&s4.id) && keyed.contains(&s5.id),
+        "fixture: S4 and S5 were flipped releasable, so both are keyed: {keyed:?}"
+    );
+    assert!(
+        !keyed.contains(&q1.id) && !keyed.contains(&q2.id),
+        "fixture: Q1 and Q2 were flipped while pinned, so neither is keyed: {keyed:?}"
+    );
+
+    let faulty = faulty_with_io(&f, vec![q1.id], vec![q2.id]);
+    let opener = reaper_through(&f, &faulty);
+    opener.resume_interrupted_reaps().expect(
+        "a failed READ inside one slot's cascade failed the whole open; it must be that slot's refusal",
+    );
+    let why = opener.open_slot_refusals();
+    assert_eq!(why.len(), 2, "one refusal per faulty cascade was expected: {why:?}");
+    let named = |slot: u64, tail: String| {
+        why.iter().any(|w| w.starts_with(&format!("slot {slot}:")) && w.ends_with(&tail))
+    };
+    assert!(named(s4.id, format!("get_raw of slot {}", q1.id)), "S4's refusal: {why:?}");
+    assert!(named(s5.id, format!("has_live_children of slot {}", q2.id)), "S5's refusal: {why:?}");
+    let keyed = c.unreleased_reaped_candidates().unwrap();
+    assert!(
+        keyed.contains(&s4.id) && keyed.contains(&s5.id),
         "a refused slot lost its key, so no later open would ask again: {keyed:?}"
     );
 }

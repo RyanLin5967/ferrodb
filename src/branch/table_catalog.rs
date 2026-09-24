@@ -175,6 +175,11 @@ pub struct TableBranchCatalog {
     /// terminate into a failing test instead of a hung one.
     #[cfg(test)]
     liveness_walk_budget: AtomicU64,
+    /// **D264 (wall21 review audit 5), test-only failpoint.** Fails the next upsert of a RECORD key
+    /// once, with `Io`: the one write `write_record` makes between moving a branch's STATE key and
+    /// finishing, which is where a torn flip leaves its state.
+    #[cfg(test)]
+    fail_next_record_upsert: std::sync::atomic::AtomicBool,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -576,6 +581,8 @@ impl TableBranchCatalog {
             io_fault_core_of: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             liveness_walk_budget: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -610,6 +617,8 @@ impl TableBranchCatalog {
             io_fault_core_of: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             liveness_walk_budget: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -662,6 +671,12 @@ impl TableBranchCatalog {
     /// [`BPlusTreeManager::upsert`] closes the window at the layer that owns the latch.
     /// SCALE-DESIGN D126; probe in `tests/d126_atomic_upsert.rs` and `mod d126_record_key_probe`.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::RECORD)
+            && self.fail_next_record_upsert.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the RECORD upsert failed".into()));
+        }
         self.tree.upsert(key, value)
     }
 
@@ -3893,6 +3908,94 @@ mod tests {
         c.liveness_walk_budget.store(0, Ordering::SeqCst);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&main);
+    }
+
+    /// **D264 (wall21 review audit 5, B2): a failed record write must leave the slot in a STATE
+    /// span.** `write_record` removed STATE(old) before it upserted the new RECORD, so an error
+    /// between them left a `Reaping` record that no STATE key names: the resume enumerates the STATE
+    /// span, so nothing ever resumes it, and its parent reads it as a live child for ever. Any later
+    /// `durable` flushes that state, as the next unit's does at open or in a lease scan. Uses the
+    /// `fail_next_record_upsert` failpoint, which the red commit adds with this test.
+    /// PRE-REGISTERED (lane §8.18): fails at "D264: … no STATE key names it" at the red commit;
+    /// kills M62, and its `set_root` part kills M63.
+    #[test]
+    fn a_failed_record_write_leaves_the_slot_in_a_state_span() {
+        use crate::branch::types::BranchState::{Live, Reaped, Reaping};
+        let path = sidecar("d264");
+        let rid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let r = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            c.set_state(r.branch_id, Live, Reaping).unwrap();
+            c.fail_next_record_upsert.store(true, Ordering::SeqCst);
+            assert!(
+                c.set_state(r.branch_id, Reaping, Reaped).is_err(),
+                "fixture: the injected RECORD failure must fail the flip"
+            );
+            assert!(
+                !c.fail_next_record_upsert.load(Ordering::SeqCst),
+                "fixture: the injected RECORD failure never fired"
+            );
+            let rid = r.branch_id.id;
+            let named = [Live, Reaping, Reaped]
+                .into_iter()
+                .any(|s| c.ids_in_state(s).unwrap().contains(&rid));
+            assert!(
+                named,
+                "D264: the failed flip removed R's STATE key before rewriting its record, so no \
+                 STATE key names it: nothing will ever resume it"
+            );
+            // Any later `durable` flushes the pool, as any unit's would.
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            rid
+        };
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let (reaper, main) = reaper_over(&c, "d264");
+        let resumed = reaper.resume_interrupted_reaps().expect("the open must succeed");
+        assert!(
+            resumed.iter().any(|b| b.id == rid),
+            "D264: the torn flip's record was not resumed: resumed {resumed:?}, refusals {:?}",
+            reaper.open_slot_refusals()
+        );
+        assert_eq!(c.get_raw(rid).unwrap().state, Reaped, "the resumed reap did not finish");
+
+        // M63: a rewrite whose state and deadline are unchanged must keep both index keys.
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_root(l.branch_id, 7).unwrap();
+        assert!(
+            c.ids_in_state(Live).unwrap().contains(&l.branch_id.id),
+            "an unchanged state's STATE key was removed by its own rewrite"
+        );
+        assert!(
+            c.expired_before(1_000).unwrap().iter().any(|r| r.branch_id().id == l.branch_id.id),
+            "an unchanged deadline's DEADLINE key was removed by its own rewrite"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **B3 (wall21 review audit 5): a liveness question asked from ABOVE a cycle ends.** A5's test
+    /// asks only from inside the cycle, where the root check alone ends the walk, so M54′ (which
+    /// keeps only the root check and drops `pushed`) survived it. From P above A ↔ B, only `pushed`
+    /// stops the walk. The flips run BEFORE the cycle is planted, so no fixture step can loop under
+    /// the mutant. PRE-REGISTERED (lane §8.18): passes at `0c64402`; kills M54′ through the budget.
+    #[test]
+    fn a_question_from_above_a_cycle_ends() {
+        let path = sidecar("b3-above");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let p = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let a = c.fork(p.branch_id, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        for x in [&b, &a, &p] {
+            c.set_state(x.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(x.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        c.upsert(keys::child(b.branch_id.id, c.next_epoch().0), a.branch_id.id.to_be_bytes().to_vec())
+            .unwrap();
+        c.liveness_walk_budget.store(64, Ordering::SeqCst);
+        let got = c.has_live_children(p.branch_id.id);
+        assert!(matches!(got, Ok(false)), "B3: a question from above the cycle did not end: {got:?}");
+        c.liveness_walk_budget.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked
