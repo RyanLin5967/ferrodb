@@ -849,8 +849,18 @@ impl WalManager {
         Ok(())
     }
 
+    /// Make the record that STARTS at `lsn` durable, and everything before it. What `commit` asks
+    /// for its `Commit`, and what the buffer pool asks for a heap page whose LSN is `lsn`.
+    ///
+    /// **`>`, not `>=` (the D216 adversary's F1).** An LSN is where a record starts, and
+    /// `flushed_lsn` is one past the last durable byte, so a record that was first in an empty
+    /// buffer has `lsn == flushed_lsn` and is NOT durable. `>=` returned early for exactly that
+    /// record. `commit` then returned `Ok` with its `Commit` only in memory whenever something had
+    /// flushed the log since the transaction's previous record, and a heap page could be written
+    /// ahead of its own record. `flushed_lsn` only ever lands on a record boundary (a flush drains
+    /// whole frames), so `flushed_lsn > lsn` means the whole record is durable.
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
-        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
+        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {
             return Ok(());
         }
         self.flush()
@@ -1135,6 +1145,30 @@ mod tests {
         assert_eq!(wal.flushed_lsn.load(Ordering::SeqCst), flushed);
     }
 
+    /// **D236 (found as the D216 adversary's F1): a record that STARTS exactly at the flushed point
+    /// is not durable yet, and `flush_up_to` of its LSN must write it.** An LSN is where a record
+    /// starts, and `flushed_lsn` is one past the last durable byte, so the record first in an empty
+    /// buffer has `lsn == flushed_lsn`. `>=` returned early for exactly that record.
+    ///
+    /// Ported verbatim from `d216-clean-restart` (`c528509`). `test_flush_up_to_stops_when_durable`
+    /// above asks about a record whose END is the flushed point, so it passes under `>=` and `>`
+    /// alike and cannot tell them apart; this one is the equality case.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `9aa6968` at the second assertion.
+    #[test]
+    fn flush_up_to_writes_a_record_that_starts_at_the_flushed_point() {
+        let (wal, _dir) = setup();
+        wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.flush().unwrap();
+        let l1 = wal.append(1, 0, &RecKind::Commit).unwrap();
+        assert_eq!(l1, wal.flushed_lsn.load(Ordering::SeqCst), "premise failed: the record does not start at the flushed point");
+        wal.flush_up_to(l1).unwrap();
+        assert!(
+            wal.flushed_lsn.load(Ordering::SeqCst) > l1,
+            "flush_up_to({l1}) returned with the record at {l1} still only in memory"
+        );
+    }
+
     #[test]
     fn test_read_buffer_before_flush() {
         let (wal, _dir) = setup();
@@ -1357,5 +1391,33 @@ mod tests {
         bytes[2] = 99; // the alteration sub-tag
         let err = RecKind::deserialize(&bytes).expect_err("an unknown alteration tag was accepted");
         assert!(format!("{err}").contains("column alteration tag"), "{err}");
+    }
+
+    /// **D236's control, the other direction: `flush_up_to` of a record that IS durable leaves a
+    /// later, buffered record alone.**
+    ///
+    /// `test_flush_up_to_stops_when_durable` asks the same question with an EMPTY buffer, where a
+    /// flush writes nothing. So it passes even if `flush_up_to` flushed on every call, and it cannot
+    /// tell a correct `>` from a fix that over-corrected into "always flush" (mutant M2 in
+    /// `frontier/lane_d236.md`). Here a second record is waiting, so a needless flush shows.
+    ///
+    /// Pre-registered from source, UNBUILT: PASSES at `9aa6968` and at the fix, and FAILS under M2.
+    #[test]
+    fn flush_up_to_of_a_durable_record_leaves_a_later_one_buffered() {
+        let (wal, _dir) = setup();
+        let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.flush().unwrap();
+        let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
+        wal.append(1, l0, &RecKind::Commit).unwrap();
+        assert!(
+            flushed < wal.next_lsn.load(Ordering::SeqCst),
+            "premise failed: nothing is waiting in the buffer"
+        );
+        wal.flush_up_to(l0).unwrap();
+        assert_eq!(
+            wal.flushed_lsn.load(Ordering::SeqCst),
+            flushed,
+            "flush_up_to({l0}) of a record already on disk flushed a later record too"
+        );
     }
 }
