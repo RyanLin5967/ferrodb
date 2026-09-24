@@ -64,6 +64,16 @@ pub struct TableBranchCatalog {
     /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
     /// (measured x0.92, `bench/fork_concurrency_before.txt`).
     commit_group: CommitGroup,
+    /// Range scans issued over a CHILD span, by any of the three liveness readers
+    /// (`has_live_children` once per node it visits, `max_live_child`, `live_child_in_epoch_range`).
+    ///
+    /// **An instrument, not a statistic** — the role `reaper::sweep_descents` plays for D40. Wall
+    /// #21's claim is a COMPLEXITY CLASS: under a chain of reaped interior branches with a live
+    /// leaf, one liveness question visits every span down to the leaf. An integer proves a class
+    /// directly; a wall clock only illustrates it on a box that never goes quiet. Shape taken from
+    /// the parked D166 branch (`3cc71be`), widened from `has_live_children` alone to every CHILD
+    /// span reader, because the drain and the write path reach the walk through the other two.
+    child_spans: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -341,6 +351,14 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
+    /// CHILD-span range scans issued since this catalog was built. See the field's note.
+    ///
+    /// Read it twice around the operation under test and take the difference: it is
+    /// process-lifetime and monotonic, so an absolute value means nothing without the pair.
+    pub fn child_spans_scanned(&self) -> u64 {
+        self.child_spans.load(Ordering::Relaxed)
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
@@ -428,6 +446,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            child_spans: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -451,6 +470,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            child_spans: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -1238,6 +1258,7 @@ impl BranchCatalog for TableBranchCatalog {
         // consuming every child trunk has.
         // Entries are newest-first, so the first LIVE one is the maximum. Stale entries are
         // skipped rather than trusted; they are bounded by crashes and removed by the next reap.
+        self.child_spans.fetch_add(1, Ordering::Relaxed);
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
             let (k, v) = entry?;
             if let Some(e) = self.live_child_at(&k, &v)? {
@@ -1257,6 +1278,7 @@ impl BranchCatalog for TableBranchCatalog {
             // An empty window pins nothing.
             return Ok(false);
         };
+        self.child_spans.fetch_add(1, Ordering::Relaxed);
         for entry in self.tree.range_scan(Bound::Included(klo), Bound::Included(khi))? {
             let (k, v) = entry?;
             if self.live_child_at(&k, &v)?.is_some() {
@@ -1283,6 +1305,9 @@ impl BranchCatalog for TableBranchCatalog {
         let mut pending = vec![parent_id];
         while let Some(id) = pending.pop() {
             let (lo, hi) = keys::children_of(id);
+            // One per node VISITED, i.e. one range scan issued: wall #21 asks how many spans a
+            // liveness question touches, not how wide they are.
+            self.child_spans.fetch_add(1, Ordering::Relaxed);
             for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
                 let (k, v) = entry?;
                 match self.child_liveness(&k, &v)? {
