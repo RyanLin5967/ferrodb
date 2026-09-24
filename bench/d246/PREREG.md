@@ -185,3 +185,7 @@ A fresh-context review of A1–A3 found no BLOCKER and five DEFECTs. It also fou
 | M23 `await_after_the_schema_apply` | R3 | R1, R2, R4 |
 | M24 `failed_complete_keeps_the_session` | R4 | R1–R3 |
 | M25 `refused_restamp_leaves_stamps_pending` | the N-5 test | the other `catalog::alter::tests` |
+
+### A4a (2026-09-24T11:20Z): the N-5 test's refusal point, corrected before the test was written
+
+A4 says the N-5 test's store "refuses the 6th `stamp_pending`". The packed fixture guarantees only that SOME row moves, not how many, so a fixed 6th could miss the loop entirely. **Replaced by:** a twin ALTER counts the restamps `m`, with the premise `m >= 2`. The test's store then allows `m / 2` and refuses the next. The expectations are unchanged: refused by the test's store; the later `flush` issues 0 syncs; **RED at `efd3541`** (1 sync).
