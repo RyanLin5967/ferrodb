@@ -977,3 +977,62 @@ fn a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal() {
         );
     }
 }
+
+/// **Lane §8.22 (2): a persistent fault in the DRAIN's read about a parked page's owner fails no
+/// open.** Every reap drains the WHOLE pending log, and it asks two things about each parked page's
+/// owner: its record (`get_raw`) and its live children in the page's window. With those reads
+/// unmapped, one bad leaf under one parked page's owner failed every open that resumed an
+/// interrupted reap (and ended every lease scan after its first reap). This is E1's hazard reaching
+/// the open by a second exit. P's page is parked (P has a live child and was reaped on the slow
+/// path); R1 and R2 are left `Reaping`. Phase `window` faults the window read, phase `record`
+/// faults the record read. PRE-REGISTERED (lane §8.22): fails at the first open's `expect` at its
+/// red commit; kills M69 (window) and M70 (record).
+#[test]
+fn a_persistent_fault_in_the_drain_read_fails_no_open() {
+    for (phase, what) in [("window", "live_child_in_epoch_range"), ("record", "get_raw")] {
+        let f = fixture();
+        let c = &*f.catalog;
+        let p = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let page = f.store.alloc_for(p, PageType::BTreeLeaf, c.next_epoch()).unwrap();
+        {
+            let h = f.store.read_page(page).unwrap();
+            let mut fr = h.write();
+            fr.data[PAGE_HEADER_SIZE] = 0xAB;
+            stamp_checksum(&mut fr.data);
+        }
+        c.fork(p, LeaseDeadline(u64::MAX)).unwrap();
+        f.reaper.reap(p).unwrap();
+        assert_eq!(f.store.pending_len(), 1, "fixture ({phase}): P's page must be PARKED by its slow path");
+        for _ in 0..2 {
+            let r = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            c.set_state(r, BranchState::Live, BranchState::Reaping).unwrap();
+        }
+
+        let faulty = if phase == "window" {
+            let faulty = faulty_over(&f, 0);
+            faulty.io_window_of.lock().unwrap().push(p.id);
+            faulty
+        } else {
+            faulty_with_io(&f, vec![p.id], Vec::new())
+        };
+        let first = reaper_through(&f, &faulty);
+        first.resume_interrupted_reaps().unwrap_or_else(|e| {
+            panic!("§8.22 ({phase}): a persistent fault in the drain's read failed the first open: {e}")
+        });
+        let why = first.open_slot_refusals();
+        let tail = format!("{what} of slot {}", p.id);
+        assert!(
+            why.iter().any(|w| w.starts_with("resumed reap of ") && w.ends_with(&tail)),
+            "({phase}) no resumed reap's refusal carries the drain's fault: {why:?}"
+        );
+        let second = reaper_through(&f, &faulty);
+        second.resume_interrupted_reaps().unwrap_or_else(|e| {
+            panic!("§8.22 ({phase}): the second open failed on the same drain fault: {e}")
+        });
+        assert_eq!(
+            f.store.pending_len(),
+            1,
+            "({phase}) the drain's refusal must put P's parked page back in the log, not drop it"
+        );
+    }
+}
