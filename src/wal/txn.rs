@@ -220,6 +220,15 @@ pub fn release_mismatches() -> u64 {
     RELEASE_MISMATCHES.load(Ordering::Relaxed)
 }
 
+/// Commits whose `TxnEnd` record could not be written after the durable `Commit`, since process
+/// start (lane §21.18). The transaction ended anyway: see `TxnManager::commit`.
+pub static TXN_END_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`TXN_END_FAILURES`].
+pub fn txn_end_failures() -> u64 {
+    TXN_END_FAILURES.load(Ordering::Relaxed)
+}
+
 /// Mismatch lines written from a STORED observation, since process start (review 7's F4): a
 /// mismatch whose first quarantine write failed, recorded later by a retry that could not read the
 /// page. Its release stays owed, so it is not in [`RELEASE_MISMATCHES`], which counts a mismatch when
@@ -288,6 +297,7 @@ pub fn failure_counters_line() -> Option<String> {
         ("release failures", release_failures()),
         ("release mismatches", release_mismatches()),
         ("mismatches recorded from a stored observation", stored_mismatch_lines()),
+        ("commits whose TxnEnd could not be written", txn_end_failures()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
         ("drops that kept the log", kept_log_drops()),
@@ -665,11 +675,12 @@ impl TxnManager {
         // reported; what changes is that reporting it no longer wedges the database. See
         // `abandon_reader` for why a reader with no `TxnEnd` record is safe for recovery.
         //
-        // **Not reachable in production today, which is why the test forces it.** `append_chained`
-        // fails two ways: the entry is missing from `att`, which cannot happen here because it was
-        // just checked and would mean no leak anyway; or `WalManager::append` returns `Err`, which
-        // it never does today - it extends an in-memory buffer and ends in `Ok(lsn)`. Rather than
-        // leave the guard unproven, `WalManager::fail_next_append` (test-only) fires it on demand;
+        // **Rare in production, which is why the test forces it.** `append_chained` fails two ways:
+        // the entry is missing from `att`, which cannot happen here because it was just checked and
+        // would mean no leak anyway; or `WalManager::append` returns `Err`. It does no I/O, but it
+        // refuses on a POISONED log (F4(i), after another transaction's `Commit` flush failed) and
+        // for the two records whose meaning changed on a legacy log (Q5; not a `TxnEnd`). Rather
+        // than leave the guard unproven, `WalManager::fail_next_append` (test-only) fires it on demand;
         // see `a_reader_is_not_leaked_when_its_txn_end_cannot_be_written`. The guard earns its
         // place the day `append` does any IO - a bounded buffer that flushes when full, a direct
         // write - because then the failure is real and its cost is the whole database.
@@ -900,13 +911,32 @@ impl TxnManager {
         // `RELEASE_FAILURES`.
         let retired = self.retired.lock().unwrap().remove(&txn_id).unwrap_or_default();
         self.release_retired(txn_id, &retired);
-        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        // **Lane §21.18 (review 7 §8, the lead's decision): the transaction ends here whether or not
+        // its `TxnEnd` can be written**, `end_read_only`'s shape. The `Commit` is durable, so it HAS
+        // committed, and recovery counts a `Commit` alone as ended. With `?` here, a failed append
+        // returned `Err` before the id left `att`: every checkpoint and DDL was then refused for the
+        // life of the process, MERGE's publish and autocommit read "not committed", and a ROLLBACK
+        // appended an `Abort` after the durable `Commit` and undid a committed transaction. The
+        // append runs FIRST because `append_chained` looks the transaction up in `att`. Latent
+        // today: `append` does no I/O, and the poison's one caller is a `Commit` flush that failed.
+        let ended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
         // D202: committed, so nothing may ever undo these writes. Dropped here and not left for
         // a later abort to find: transaction ids restart from the log header after a restart, and
         // a stale list under a reissued id would repoint or remove a committed key.
         self.index_undo.lock().unwrap().remove(&txn_id);
+        if let Err(e) = ended {
+            use std::io::Write;
+            TXN_END_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: transaction {txn_id} committed, but its TxnEnd record could not be written ({e}); it has \
+                 ended anyway, and recovery counts its Commit as the end"
+            );
+            // No automatic checkpoint: it would meet the same log.
+            return Ok(());
+        }
         // **F4: the automatic checkpoint is a node-local decision, and on a cluster it is wrong.**
         //
         // `consensus::Command::Checkpoint` exists for this and says why in its own words:
