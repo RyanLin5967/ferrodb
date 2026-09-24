@@ -824,10 +824,21 @@ impl TxnManager {
         // runs, which is exactly what this function did before `ddl_checkpointed` existed. Every
         // existing caller therefore keeps its old concurrency behaviour; only the DDL path below
         // needs the answer to stay true while it is acted on, and only it pays for that.
-        if !self.att_read().is_empty() {
-            return Err(FerroError::Wal("checkpoint with active txns".into()));
-        }
-        self.checkpoint_locked()
+        //
+        // **D253: the fence is read inside that same short hold.** Releasing the attach table
+        // lets a transaction begin before the body runs. Its records then sit above the fence, so
+        // the truncation keeps the log instead of discarding them (see
+        // `WalManager::truncate_fenced`). Sampled any later, for instance inside
+        // `checkpoint_locked`, a transaction that began in between would sit BELOW the sample, and
+        // its records would be discarded while it was still active.
+        let fence = {
+            let att = self.att_read();
+            if !att.is_empty() {
+                return Err(FerroError::Wal("checkpoint with active txns".into()));
+            }
+            self.wal.next_lsn.load(Ordering::SeqCst)
+        };
+        self.checkpoint_locked(fence)
     }
 
     /// Do a DDL statement's irreversible catalog mutation and its checkpoint as ONE unit, with the
@@ -861,14 +872,18 @@ impl TxnManager {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
         let out = f()?;
-        self.checkpoint_locked()?;
+        // D253: the attach table is held throughout, so the fence can be read here, after `f`.
+        let fence = self.wal.next_lsn.load(Ordering::SeqCst);
+        self.checkpoint_locked(fence)?;
         Ok(out)
     }
 
-    /// The body of `checkpoint`, with the attach table ALREADY held shut by the caller.
+    /// The body of `checkpoint`, after the caller found the attach table empty and read `fence`
+    /// in the same hold. `ddl_checkpointed` keeps holding it; `checkpoint` has released it, and
+    /// `fence` is what makes that safe (D253).
     ///
-    /// Must not take `att` — the callers above hold it, and `Mutex` is not re-entrant.
-    fn checkpoint_locked(&self) -> Result<(), FerroError> {
+    /// Must not take `att` — `ddl_checkpointed` holds it, and `Mutex` is not re-entrant.
+    fn checkpoint_locked(&self, fence: u64) -> Result<(), FerroError> {
         #[cfg(test)]
         Self::pause(&self.checkpoint_pause_at_entry);
         self.wal.flush()?;
@@ -878,7 +893,9 @@ impl TxnManager {
         Self::pause(&self.checkpoint_pause_before_truncate);
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
-        self.wal.truncate(self.txn_ids.issued_through())?;
+        //
+        // D253: fenced, so a record appended since the attach table was seen empty keeps the log.
+        self.wal.truncate_fenced(self.txn_ids.issued_through(), Some(fence))?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.

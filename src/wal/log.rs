@@ -765,6 +765,29 @@ impl WalManager {
     /// alternative, which is discarding records a replica has been promised and only finding out
     /// when the replica is refused.
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
+        self.truncate_fenced(next_txn_id, None)
+    }
+
+    /// [`Self::truncate`], refusing to discard anything appended after `fence`.
+    ///
+    /// **D253.** A checkpoint may discard the log only up to what its page flush covers. It reads
+    /// `next_lsn` as the FENCE in the same critical section in which it finds no transaction
+    /// attached (`TxnManager::checkpoint`). So every record below the fence belongs to a
+    /// transaction that had already ended, and the checkpoint's `flush_all`, which runs after
+    /// that, wrote its pages. Anything appended since may belong to a transaction whose page change
+    /// the flush missed (a commit acknowledged inside the window), or whose uncommitted change it
+    /// wrote (a transaction that began inside it). Discarding those records loses the one or leaves
+    /// the other impossible to undo. If the end has moved, this keeps the whole log, exactly as a
+    /// pin does: the checkpoint succeeds and reclaims nothing this time.
+    ///
+    /// Checked under the buffer lock, where `next_lsn` cannot move, and after `flush`, so an append
+    /// that lands between that flush and this lock (the D236 review's W5) is caught by the same
+    /// comparison.
+    pub(crate) fn truncate_fenced(
+        &self,
+        next_txn_id: u64,
+        fence: Option<u64>,
+    ) -> Result<(), FerroError> {
         self.flush()?;
         // Taken first and held across the decision, so a pin cannot be registered against a range
         // this call is in the middle of discarding. `pin_durable` reads the frontier under this
@@ -779,6 +802,11 @@ impl WalManager {
                 // Something still needs records below the new base. Keep the log.
                 return Ok(());
             }
+        }
+        // D253: something was appended after the fence, so the page flush may not cover it. Keep
+        // the log. `next_lsn` never decreases, so "moved" and "grew" are the same test.
+        if fence.is_some_and(|f| f != next) {
+            return Ok(());
         }
 
         let mut header = [0u8; HEADER_SIZE];
