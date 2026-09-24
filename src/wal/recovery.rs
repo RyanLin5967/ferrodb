@@ -977,13 +977,18 @@ use super::*;
         (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst))
     }
 
+    /// What [`d216_cleanly_closed`] leaves: the log's bounds, and `t`'s primary root.
+    struct D216Closed {
+        bounds: (u64, u64),
+        root: u32,
+    }
+
     /// D216's fixture: table `t` with a secondary index on `v` and two committed rows, closed CLEANLY
-    /// the way `cli::run_cli` exits, with a checkpoint. Returns the log's bounds as the close left
-    /// them.
+    /// the way `cli::run_cli` exits, with a checkpoint.
     ///
     /// Checks the premise every D216 test stands on: the log is NOT empty (an empty log never
     /// rebuilt, so it could not show the defect), and it holds nothing but re-declarations.
-    fn d216_cleanly_closed(db: &Path) -> (u64, u64) {
+    fn d216_cleanly_closed(db: &Path) -> D216Closed {
         let lock = DbLock::acquire(db).unwrap();
         let mut o = open_recovered(db, &lock).unwrap();
         for sql in [
@@ -998,7 +1003,39 @@ use super::*;
         let log = d216_log(&o.wal);
         assert!(!log.is_empty(), "premise failed: the clean close left an empty log, and an empty log never rebuilt");
         assert!(d216_only_declarations(&log), "premise failed: the clean close left more than re-declarations: {log:?}");
-        d216_bounds(&o.wal)
+        let root = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell").load(Ordering::SeqCst);
+        assert_eq!(
+            root,
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            "premise failed: t's shared root cell and its catalog entry disagree, so the root on disk is not the one served"
+        );
+        D216Closed { bounds: d216_bounds(&o.wal), root }
+    }
+
+    /// **A tracer for "did this open rebuild `t`'s primary tree".** An entry for `key` is planted
+    /// in the root leaf ON DISK, naming slot 999 of a heap page that holds nowhere near that many.
+    /// No row has that key, so a rebuild from the heap drops the entry, and nothing else touches
+    /// it. The tree an open serves still holds it exactly when that open did not rebuild. It is the
+    /// state a failed index undo leaves, too: an entry for a row that is not there. Returns the
+    /// planted entry.
+    fn d216_plant_tracer(db: &Path, root: u32, key: i32) -> RecordId {
+        use crate::storage::index_page::BPlusTreeLeafPage;
+        let file = OpenOptions::new().read(true).write(true).open(db).unwrap();
+        let dm = DiskManager::new(file).unwrap();
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::deserialize(dm.read(root).unwrap()).unwrap();
+        assert!(!leaf.key_arr.contains(&Value::Integer(key)), "premise failed: key {key} is already in t's tree");
+        let tracer = RecordId::new(leaf.vals[0].page_id, 999);
+        leaf.insert_entry(Value::Integer(key), tracer);
+        dm.write(root, &leaf.serialize().unwrap()).unwrap();
+        dm.sync().unwrap();
+        tracer
+    }
+
+    /// The entry the open serves for `key` in `t`'s primary tree.
+    fn d216_primary_entry(o: &OpenedDatabase, key: i32) -> Option<RecordId> {
+        BPlusTreeManager::<Value, RecordId>::open_shared(o.catalog.root_cell("t", None).expect("a cell for t"), o.bp.clone())
+            .search(&Value::Integer(key))
+            .unwrap()
     }
 
     /// Write `t`'s primary root to disk through `flush_page` (the same write-back, `wal_gate` then
@@ -1018,13 +1055,16 @@ use super::*;
     ///
     /// A `Ddl` record changes no page (recovery does not replay DDL; the catalog lives outside the
     /// WAL), so there is nothing for a tree to be stale against. Observed through `recovered`, which
-    /// is what `open_recovered` rebuilds on (with the marker, absent here). Then the trees the open
-    /// did not rebuild must answer.
+    /// is what `open_recovered` rebuilds on (with the marker, absent here), and through a tracer
+    /// (`d216_plant_tracer`), which sees what the open DID: `recovered` is only what `recover`
+    /// returned, so an open that rebuilt anyway would pass it. Then the trees the open did not
+    /// rebuild must answer.
     ///
     /// ⚖ Amended in this lane before landing: the first version also asserted that the open left
     /// the log's bounds unchanged. The open now checkpoints any non-empty log without rebuilding
     /// (see `open_recovered`, D216 and D227), so that instrument no longer tells a rebuild from no
-    /// rebuild. Its other job, that recovery appends nothing under transaction 0, moved to
+    /// rebuild; the tracer replaced it (the D216 re-adversary's F2). Its other job, that recovery
+    /// appends nothing under transaction 0, moved to
     /// `recovery_appends_nothing_for_a_log_of_declarations`, which calls `recover` directly.
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
@@ -1032,13 +1072,19 @@ use super::*;
     fn a_clean_restart_after_ddl_does_not_rebuild_the_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("clean.db");
-        d216_cleanly_closed(&db);
+        let closed = d216_cleanly_closed(&db);
+        let tracer = d216_plant_tracer(&db, closed.root, 9);
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(
             !o.recovered,
             "a clean restart whose log held only DDL re-declarations reported a recovery, so the open rebuilt every index (D216)"
+        );
+        assert_eq!(
+            d216_primary_entry(&o, 9),
+            Some(tracer),
+            "the open rebuilt t's primary tree after a clean close: the tracer planted on disk is gone (D216)"
         );
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
         assert_eq!(d216_rows(&mut o, "SELECT id FROM t WHERE v = 10;"), vec![vec![Value::Integer(1)]], "a lookup by the indexed value");
@@ -1055,8 +1101,8 @@ use super::*;
     /// DDL, so a process that served one attributed MERGE also left a non-empty log at a clean
     /// close. The middle process here runs no DDL, so the log it leaves holds run declarations only.
     ///
-    /// ⚖ Amended in this lane before landing: the log-bounds assertion is withdrawn for the reason
-    /// given on `a_clean_restart_after_ddl_does_not_rebuild_the_indexes`.
+    /// ⚖ Amended in this lane before landing: the log-bounds assertion is withdrawn, and a tracer
+    /// added, for the reasons given on `a_clean_restart_after_ddl_does_not_rebuild_the_indexes`.
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
     #[test]
@@ -1066,7 +1112,7 @@ use super::*;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("runs.db");
         d216_cleanly_closed(&db);
-        {
+        let root = {
             let lock = DbLock::acquire(&db).unwrap();
             let o = open_recovered(&db, &lock).unwrap();
             let run = RunEntity::new(ProvId(1), "restock-agent", "run-1", "a-model", "v1", [0u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
@@ -1078,13 +1124,21 @@ use super::*;
                 "premise failed: the clean close re-declared no run: {log:?}"
             );
             assert!(d216_only_declarations(&log), "premise failed: the clean close left more than re-declarations: {log:?}");
-        }
+            // Read here, not from the fixture: at `00f4c39` this process's own open rebuilt.
+            o.catalog.root_cell("t", None).expect("a cell for t").load(Ordering::SeqCst)
+        };
+        let tracer = d216_plant_tracer(&db, root, 9);
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(
             !o.recovered,
             "a clean restart whose log held only run declarations reported a recovery, so the open rebuilt every index (D216)"
+        );
+        assert_eq!(
+            d216_primary_entry(&o, 9),
+            Some(tracer),
+            "the open rebuilt t's primary tree after a clean close: the tracer planted on disk is gone (D216)"
         );
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 1;"), vec![vec![Value::Integer(10)]], "a lookup by key");
     }
@@ -1240,18 +1294,26 @@ use super::*;
     ///
     /// Passes at `00f4c39`, where the log alone rebuilt, and must keep passing. (⚖ Amended before
     /// landing: a `base == end` check is withdrawn for the reason given on the loser control. The
-    /// marker is removed only inside the rebuild's branch, so its absence is the proof.)
+    /// proof of the rebuild is the tracer, the entry a failed index undo leaves: the marker's
+    /// absence alone did not prove it once the marker came to be removed in the checkpoint's
+    /// branch (the D216 re-adversary's F1).)
     #[test]
     fn the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("marked.db");
-        d216_cleanly_closed(&db);
+        let closed = d216_cleanly_closed(&db);
+        d216_plant_tracer(&db, closed.root, 9);
         let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
         std::fs::write(&marker, "planted by the test\n").unwrap();
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
+        assert_eq!(
+            d216_primary_entry(&o, 9),
+            None,
+            "the marker was honoured but t's tree still holds the tracer, so the rebuild it asks for did not run"
+        );
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
     }
 
@@ -1450,7 +1512,7 @@ use super::*;
     fn recovery_appends_nothing_for_a_log_of_declarations() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("zero.db");
-        let closed = d216_cleanly_closed(&db);
+        let closed = d216_cleanly_closed(&db).bounds;
         let file = OpenOptions::new().read(true).write(true).open(&db).unwrap();
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let wal = Arc::new(WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap());
@@ -1475,9 +1537,18 @@ use super::*;
     /// archived log or a log whose database is gone amounts to, reported every such row as
     /// unresolved.
     ///
-    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `unresolved` assertion.
+    /// Two checkpoints are checked. The open's own is one: the log held the clean close's
+    /// declarations, so the open checkpoints, and the table must be retained BEFORE that. A later
+    /// checkpoint is the other. The declaration's shape is compared with the `CREATE TABLE`
+    /// statement, not with the catalog the refill reads it from.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the first assertion (the open's
+    /// checkpoint declares nothing). ⚖ Amended before landing: the first version checked only the
+    /// later checkpoint and the decoder's `unresolved`, which a wrong column shape, or a refill
+    /// taken after the open's checkpoint, would have passed (the D216 re-adversary's F7 and F8).
     #[test]
     fn a_checkpoint_after_a_restart_still_declares_every_table() {
+        use crate::catalog::column::DataType;
         use crate::replication::logical::LogicalDecoder;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1486,17 +1557,56 @@ use super::*;
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
-        // The restarted process's own checkpoint, before it has run any DDL.
+        let at_open: Vec<Vec<(String, DataType, bool)>> = d216_log(&o.wal)
+            .into_iter()
+            .filter_map(|(_, txn, kind)| match kind {
+                RecKind::Ddl { op: crate::wal::log::DdlOp::CreateTable, table, columns, .. } if txn == 0 && table == "t" => Some(columns),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            at_open,
+            vec![vec![("id".to_string(), DataType::Integer, false), ("v".to_string(), DataType::Integer, true)]],
+            "the open's checkpoint did not declare t exactly once, with the shape CREATE TABLE gave it"
+        );
+
         o.txn.checkpoint().unwrap();
         d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
         let (base, end) = d216_bounds(&o.wal);
         let out = LogicalDecoder::blank().decode(&o.wal, base, end).unwrap();
         assert!(
-            out.unresolved.is_empty(),
-            "a reader starting at a checkpoint taken after the restart cannot name the table its rows belong to: {:?}",
-            out.unresolved
+            out.unresolved.is_empty() && out.undecodable.is_empty(),
+            "a reader starting at a checkpoint taken after the restart cannot decode t's rows: unresolved {:?}, undecodable {:?}",
+            out.unresolved,
+            out.undecodable
         );
         assert!(out.events.iter().any(|e| e.table == "t"), "premise failed: the INSERT did not decode as a change to t");
+    }
+
+    /// **The marker is honoured over an EMPTY log too.** Since D227 a database with a table
+    /// re-declares it at every checkpoint, so its log is never empty after one, and the other marker
+    /// tests run over declarations. A database with no table still leaves an empty log, and the
+    /// checkpoint that removes the marker must not depend on the log holding anything.
+    ///
+    /// Passes at `00f4c39` and must keep passing.
+    #[test]
+    fn the_stale_marker_is_honoured_over_an_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("empty.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            o.txn.checkpoint().unwrap();
+            let (base, end) = d216_bounds(&o.wal);
+            assert_eq!(base, end, "premise failed: a database with no table left a non-empty log");
+        }
+        let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
+        std::fs::write(&marker, "planted by the test\n").unwrap();
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(!o.recovered, "premise failed: an empty log gave recovery work");
+        assert!(!marker.exists(), "the marker survived an open over an empty log, so the rebuild it asks for did not run");
     }
 
     /// **D216 adversary F3: transaction id 0 is never handed out.**
