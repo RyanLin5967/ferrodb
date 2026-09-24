@@ -78,11 +78,14 @@ pub mod tag {
     /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
     ///   frees it runs for an originator whose own key covers it until that originator's release);
     /// - taken off by `release_id`, and only once the slot IS on the free list;
-    /// - put here by `release_id` on every error it swallows (the FREE_ID write, the liveness
-    ///   read, the record read), whatever the slot held before: C1, W1 and W2 of the wall21
-    ///   review audits. A key frees nothing: the sweep and `release_id` re-read before acting;
-    /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read
-    ///   (W3).
+    /// - put here by `release_id` on each error it swallows, whatever the slot held before (C1,
+    ///   W1 and W2 of the wall21 review audits): a record read that fails (any slot); a liveness
+    ///   read that fails, on a `Reaped` slot only; a FREE_ID write that fails, on a releasable
+    ///   one. (Audit 4 A6: this said "every error", which overstated the liveness arm.) A key
+    ///   frees nothing: the sweep and `release_id` re-read before acting, and since audit 4 A1 an
+    ///   error on that re-read is the slot's refusal, not a failed open;
+    /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read,
+    ///   whatever the error (W3, A1).
     ///
     /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
     /// reads only what it could release now. A released slot stays a `Reaped` record until a fork

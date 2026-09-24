@@ -23,7 +23,7 @@
 //!
 //! See `SCALE-DESIGN.md` D2b.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -163,6 +163,18 @@ pub struct TableBranchCatalog {
     /// does not fail on demand, and it does not exist outside `cfg(test)`.
     #[cfg(test)]
     fail_next_free_id_upsert: std::sync::atomic::AtomicBool,
+    /// **A1 (wall21 review audit 4), test-only failpoint.** Every `core(id)` of this id returns
+    /// `Io`, until reset to `u64::MAX`: what one unreadable B-tree leaf under one record looks
+    /// like, since a page failure is `Corruption` or `Io`, never `Branch`. Injected INSIDE `core`,
+    /// so every reader of the record meets it: the candidate query, the build, `get_raw`,
+    /// `release_id`.
+    #[cfg(test)]
+    io_fault_core_of: AtomicU64,
+    /// **A5 (audit 4), test-only.** A `has_live_children` walk that enters more than this many
+    /// nodes returns `Err` instead of going on; 0 = no limit. It turns a walk that would not
+    /// terminate into a failing test instead of a hung one.
+    #[cfg(test)]
+    liveness_walk_budget: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -560,6 +572,10 @@ impl TableBranchCatalog {
             candidate_keys: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            io_fault_core_of: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            liveness_walk_budget: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -590,6 +606,10 @@ impl TableBranchCatalog {
             candidate_keys: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            io_fault_core_of: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            liveness_walk_budget: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -680,7 +700,18 @@ impl TableBranchCatalog {
         }
     }
 
+    /// A5's test-only walk budget: has a walk that has entered `entered` nodes gone past it?
+    #[cfg(test)]
+    fn walk_over_budget(&self, entered: usize) -> bool {
+        let budget = self.liveness_walk_budget.load(Ordering::Relaxed);
+        budget != 0 && entered as u64 > budget
+    }
+
     fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
+        #[cfg(test)]
+        if id == self.io_fault_core_of.load(Ordering::SeqCst) {
+            return Err(FerroError::Io(format!("injected: the record of slot {id} cannot be read")));
+        }
         match self.tree.search(&keys::record(id))? {
             Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
             None => Ok(None),
@@ -1063,9 +1094,22 @@ impl TableBranchCatalog {
     /// - `Clear` otherwise.
     ///
     /// A pin found anywhere wins over an error. `has_live_children` could answer `Err` for a slot
-    /// whose live descendant sat after a dangling entry in scan order, and a genuinely pinned slot
-    /// must never be keyed. A back-edge, which only a cycle of stale entries through a recycled
-    /// slot can make, counts as nothing below; `has_live_children` has no visited set at all.
+    /// whose live descendant sat after a dangling entry in scan order.
+    ///
+    /// **The canonical keying rule (audit 4 A4): a slot is keyed unless a pin below it is KNOWN.**
+    /// This said "a genuinely pinned slot must never be keyed", which is stronger than the rule the
+    /// code follows. A key never frees anything, because the sweep and `release_id` both re-read
+    /// the state and ask liveness again before acting. So an UNKNOWN answer keys: `release_id`'s
+    /// liveness-error arm (C1, W7), `migrate_from`, and `Unknown` here. A KNOWN pin does not:
+    /// the `Reaped` flip, and pin-over-error here. A slot keyed while pinned costs reads, not
+    /// pages. Pinned by `the_one_time_build_scans_each_child_span_once` for the known pin.
+    ///
+    /// A back-edge, which only a cycle of stale entries through a recycled slot can make, counts
+    /// as nothing below it, so a cycle member with nothing else below it is keyed (the safe
+    /// direction; `the_build_keys_a_cycle_member_with_nothing_below` kills the mutant that counts
+    /// it as a pin, which leaves it keyless). The pass terminates on any graph: each id is entered
+    /// once. Since A5, so does `has_live_children`, which the open's sweep then asks of each
+    /// keyed member.
     fn liveness_below(&self, roots: &[u64]) -> HashMap<u64, Below> {
         let mut memo: HashMap<u64, Below> = HashMap::new();
         // Nodes entered but not yet finished: exactly the current DFS path, so a kid found here is
@@ -1174,9 +1218,9 @@ impl TableBranchCatalog {
                 Ok(Some(rec)) if rec.state() == BranchState::Reaped => reaped.push(id),
                 Ok(_) => {}
                 // W3 (wall21 review audit 3): keyed, not a failed open, as `release_id` keys a slot
-                // whose record it cannot read. The sweep records the refusal.
-                Err(FerroError::Branch(_)) => unreadable.push(id),
-                Err(e) => return Err(e),
+                // whose record it cannot read. The sweep records the refusal. A1 (audit 4): of any
+                // error type, because this read is about one slot; the span scans above stay `?`.
+                Err(_) => unreadable.push(id),
             }
         }
         for id in unreadable {
@@ -1698,12 +1742,31 @@ impl BranchCatalog for TableBranchCatalog {
     /// Every other step is the walk above, in the same order. So the witness can only turn the
     /// answer into YES earlier, never into NO: **every NO is still the exhaustive walk**, and
     /// nothing that frees pages is decided by anything new.
+    ///
+    /// # A5 (wall21 review audit 4): each slot is explored at most once
+    ///
+    /// A cycle of stale CHILD entries (one needs an entry naming a recycled slot) made this walk
+    /// run for ever, and the open's sweep asks it of every keyed slot, so a cycle would hang the
+    /// open. No producer is known. The walk now keeps the ids it has pushed and never pushes one
+    /// twice, the root included. That is exact, not an approximation: a slot is resolved by id to
+    /// its one current record, and a first visit either found something alive (the walk has
+    /// returned) or scanned the whole span and pushed everything below it. `HashSet::new` does not
+    /// allocate, so a parent with no reaped child pays nothing.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
         let mut visited: Vec<Visited> = Vec::new();
+        let mut pushed: HashSet<u64> = HashSet::new();
         let mut pending = vec![Visited { id: parent_id, fork_epoch: None, up: None }];
         while let Some(node) = pending.pop() {
             let here = visited.len();
             visited.push(node);
+            // The same `#[cfg(test)] if` shape as `wal/log.rs`'s `fail_next_append`.
+            #[cfg(test)]
+            if self.walk_over_budget(visited.len()) {
+                return Err(FerroError::Io(format!(
+                    "test walk budget exceeded: {} nodes entered below slot {parent_id}",
+                    visited.len()
+                )));
+            }
             let (lo, hi) = keys::children_of(node.id);
             // One per node VISITED, i.e. one range scan issued: wall #21 asks how many spans a
             // liveness question touches, not how wide they are.
@@ -1718,11 +1781,14 @@ impl BranchCatalog for TableBranchCatalog {
                     ChildLiveness::ReapedWithSubtree(child) => match self.valid_witness(child) {
                         Some(live) => Some(Some(live)),
                         None => {
-                            pending.push(Visited {
-                                id: child.id,
-                                fork_epoch: Some(child.fork_epoch),
-                                up: Some(here),
-                            });
+                            // A5: never the root again, and never a slot already pushed.
+                            if child.id != parent_id && pushed.insert(child.id) {
+                                pending.push(Visited {
+                                    id: child.id,
+                                    fork_epoch: Some(child.fork_epoch),
+                                    up: Some(here),
+                                });
+                            }
                             None
                         }
                     },
@@ -1785,9 +1851,13 @@ impl BranchCatalog for TableBranchCatalog {
         //   retries it and records a D127 refusal with its reason.
         // - READ side, the record itself (W2): its state is unknown, so it is keyed the same way.
         //   A key frees nothing by itself: the sweep and this method both re-read before acting.
-        // None of these fires on `Ok(true)`: a readable, pinned slot stays keyless (the lead audit
-        // of 17cbd4c). What is left is a failure of the key write or the sync itself, which no
-        // write in this method can cover.
+        // None of these fires on `Ok(true)`: `release_id` does not key a readable, pinned slot
+        // (the lead audit of 17cbd4c), though one keyed earlier stays keyed. What is left is a
+        // failure of the key write or the sync itself, which no write in this method can cover.
+        // A key written here on a non-`Branch` error used to fail every later open, because the
+        // open read the slot again with `?` (audit 4 A1). Since A1, each open-time read of one
+        // slot turns any error into that slot's refusal, so the key costs a refusal per open, not
+        // the open.
         let wrote = if reaped && matches!(live, Ok(false)) {
             #[cfg(test)]
             let freed = if self.fail_next_free_id_upsert.swap(false, Ordering::SeqCst) {
@@ -1857,10 +1927,13 @@ impl BranchCatalog for TableBranchCatalog {
                 // **W3 (wall21 review audit 3): offered, not propagated.** This was `core(id)?`, so
                 // one undecodable keyed record failed every open. A candidate list may be a
                 // superset: the sweep's own `get_raw` meets the same error per slot and records it
-                // as a refusal with its reason (D127). An error reading the TREE is not one slot's,
-                // and still fails the query, as it does the sweep.
-                Err(FerroError::Branch(_)) => out.push(id),
-                Err(e) => return Err(e),
+                // as a refusal with its reason (D127).
+                // **A1 (audit 4): of ANY error type.** W3 still propagated a non-`Branch` error
+                // here as "the tree's, not one slot's". But a page failure is `Corruption` or `Io`,
+                // never `Branch`, so one bad leaf under one keyed record failed every open. A point
+                // lookup is about one slot whatever its error says. The range scan's own `entry?`
+                // above is the catalog-wide read, and it stays.
+                Err(_) => out.push(id),
             }
         }
         Ok(out)
@@ -3399,8 +3472,9 @@ mod tests {
     }
 
     /// A sidecar catalog path, removed first. The tests below REOPEN the file before they assert,
-    /// so a key they check is shown DURABLE and not merely present in the pool (W9, wall21 review
-    /// audit 3).
+    /// so a key they check is shown WRITTEN TO THE FILE and not merely present in the pool (W9,
+    /// wall21 review audit 3). Not that it was fsynced: a same-process reopen reads through the OS
+    /// cache, so this proves `flush_all` ran, not `sync` (audit 4 A7, recorded as a known limit).
     fn sidecar(tag: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir()
             .join(format!("ferro-w21-{tag}-{}.branchcat", std::process::id()));
@@ -3733,6 +3807,92 @@ mod tests {
             "A4: the build left a cycle member with nothing below it keyless (M51, the leak direction)"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A1 (wall21 review audit 4): an `Io` error reading one keyed record is that slot's
+    /// refusal, at every per-slot read at open.** A page failure is `Corruption` or `Io`, never
+    /// `Branch`, so this is what one bad leaf under one record looks like. Uses the
+    /// `io_fault_core_of` failpoint, which is new API, so the test is added with the fix and is red
+    /// only under the mutants it kills (lane §8.16): M48 (the candidate query), M49 (the build) and
+    /// M46 (the sweep's read).
+    #[test]
+    fn an_io_error_reading_one_keyed_record_is_that_slots_refusal() {
+        let path = sidecar("a1-io");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let sid = s.branch_id.id;
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+        assert!(keyed(&c, sid), "fixture: a releasable flip keys S");
+        c.io_fault_core_of.store(sid, Ordering::SeqCst);
+        assert!(matches!(c.core(sid), Err(FerroError::Io(_))), "fixture: S's record read must fail with Io");
+
+        // The candidate query offers S (M48).
+        let offered =
+            c.unreleased_reaped_candidates().expect("A1: the candidate query failed on one slot's Io");
+        assert!(offered.contains(&sid), "A1: the candidate query dropped the unreadable slot: {offered:?}");
+
+        // The one-time build keys S (M49). S's key and the marker go first, so the build runs.
+        {
+            let _g = c.logical.lock().unwrap();
+            assert!(c.remove_if_present(&keys::unreleased(sid)).unwrap(), "fixture: S was keyed");
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+        }
+        c.build_unreleased_index_if_missing().expect("A1: the one-time build failed on one slot's Io");
+        assert!(
+            c.tree.search(&keys::unreleased(sid)).unwrap().is_some(),
+            "A1: the build left the unreadable slot off the span"
+        );
+
+        // The open refuses S, with its reason, and frees nothing (M46).
+        let (reaper, main) = reaper_over(&c, "a1-io");
+        let resumed = reaper.resume_interrupted_reaps().expect("A1: one slot's Io failed the whole open");
+        assert!(resumed.is_empty(), "nothing was Reaping, so nothing may be resumed: {resumed:?}");
+        let why = reaper.open_slot_refusals();
+        let tag = format!("slot {sid}:");
+        assert!(
+            why.iter().any(|w| w.starts_with(&tag) && w.contains("injected: the record of slot")),
+            "A1: S's refusal is missing or lost its reason: {why:?}"
+        );
+        assert!(c.tree.search(&keys::free_id(sid)).unwrap().is_none(), "an unreadable slot was freed");
+        c.io_fault_core_of.store(u64::MAX, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **A5 (wall21 review audit 4): a cycle of stale CHILD entries cannot hang an open.**
+    /// `has_live_children` had no visited set, and the open's sweep asks it of every keyed slot, so
+    /// a cycle hung the open one step after the build (whose pass already tolerated it). No
+    /// producer is known; the hang is made unrepresentable instead. The `liveness_walk_budget`
+    /// failpoint (new API, so this is added with the fix) turns a walk that goes round into an
+    /// `Err`, so M54, which removes the visited set, FAILS here instead of hanging (lane §8.16).
+    #[test]
+    fn a_cycle_of_stale_entries_cannot_hang_an_open() {
+        let path = sidecar("a5-cycle");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let (a, b) = cycle_of_two(&c);
+        assert!(keyed(&c, a) && keyed(&c, b), "fixture: both flips were releasable, so both are keyed");
+        // An exact walk here enters at most 2 nodes; one that goes round passes 64 at once.
+        c.liveness_walk_budget.store(64, Ordering::SeqCst);
+        for id in [a, b] {
+            let got = c.has_live_children(id);
+            assert!(matches!(got, Ok(false)), "A5: the liveness walk from slot {id} did not end: {got:?}");
+        }
+
+        let (reaper, main) = reaper_over(&c, "a5-cycle");
+        reaper.resume_interrupted_reaps().expect("A5: the open failed over a cycle");
+        let why = reaper.open_slot_refusals();
+        assert!(why.is_empty(), "the open refused a cycle member: {why:?}");
+        for id in [a, b] {
+            assert!(
+                c.tree.search(&keys::free_id(id)).unwrap().is_some(),
+                "A5: the open did not give back cycle member {id}"
+            );
+        }
+        c.liveness_walk_budget.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
     }
 
     /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked

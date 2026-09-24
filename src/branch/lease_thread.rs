@@ -30,9 +30,12 @@
 //! [`TwoTierReaper::resume_interrupted_reaps`] on the **calling** thread, before it spawns
 //! anything, and returns a catalog-wide error to the caller rather than letting it disappear into
 //! a background thread nobody is reading. One reap or slot the catalog cannot answer for is NOT
-//! such an error (D127; C2a and W3 of the wall21 review audits): it is declined, printed here
-//! with its reason, and asked again at the next open, so one bad record cannot stop the database
-//! from opening. (This rule said "returns its error" until audit 3 W6.)
+//! such an error (D127; C2a and W3 of the wall21 review audits; A1 of audit 4, whatever the
+//! error's type): it is declined, printed here with its reason, and asked again at every open,
+//! so one bad record cannot stop the database from opening. A fault that persists is refused at
+//! every open until it is repaired, and nothing in the engine repairs it (audit 4 A2). Only the
+//! enumerations that find the work are catalog-wide. (This rule said "returns its error" until
+//! audit 3 W6.)
 //!
 //! **2. Never reap inside a merge.** A merge is an optimistic read of a branch followed by a
 //! publication into its parent (`DESIGN.md` §4). Reaping the branch in that window frees its
@@ -392,8 +395,9 @@ impl LeaseThread {
     ///
     /// ⚠ **W6 (wall21 review audit 3): an `Ok` does NOT mean no half-reaped branch is left.**
     /// This said it did, which has been false since C2a: a resumed reap the catalog cannot answer
-    /// for, or (W3) a `Reaping` record that cannot be read, is declined and counted
-    /// (`TwoTierReaper::refused_reaps`), and the open goes on.
+    /// for, (W3) a `Reaping` record that cannot be read, and (audit 4 A3) a `Reaping` key whose
+    /// record is in another state are each declined and counted (`TwoTierReaper::refused_reaps`),
+    /// whatever the error's type (A1), and the open goes on.
     ///
     /// `reaper` is a concrete [`TwoTierReaper`] rather than a `dyn Reaper` because
     /// `resume_interrupted_reaps` is an inherent method: the trait carries only the steady-state
@@ -425,21 +429,10 @@ impl LeaseThread {
                  released (D200)"
             ));
         }
-        // C2a: this list also carries the resumed reaps the open declined. Worded per source (W6,
-        // wall21 review audit 3). The one line this printed for all of them said "the slot keeps
-        // its pages": false for a swept slot, which is `Reaped` and whose extents its reap already
-        // freed, and false for a resumed reap that failed after its flip.
+        // C2a: this list also carries the resumed reaps the open declined. Worded per source by
+        // `open_refusal_line`.
         for why in reaper.open_slot_refusals() {
-            let what = if why.starts_with("slot ") {
-                "did not give back an id slot (it stays reserved, and the next open asks again)"
-            } else if why.starts_with("interrupted reap of slot ") {
-                "did not resume an interrupted reap, because its record cannot be read (the next \
-                 open asks again)"
-            } else {
-                "a resumed reap stopped part-way (what it finished stays done; the slot sweep or \
-                 the next open retries the rest)"
-            };
-            report(format!("lease: at open, {what}: {why}"));
+            report(open_refusal_line(&why));
         }
 
         let counters = Arc::new(Counters::default());
@@ -818,6 +811,34 @@ fn scan_once(
              at open by `resume_interrupted_reaps`, and the cadence retries."
         ));
     }
+}
+
+/// **The operator line for one refusal at open**, worded by the source its prefix names
+/// (`TwoTierReaper::open_slot_refusals`), and ending with the refusal itself.
+///
+/// - W6 (wall21 review audit 3): one line printed for every source said "the slot keeps its
+///   pages". That was false for a swept slot, which is `Reaped` with its extents already freed,
+///   and for a resumed reap that failed after its flip.
+/// - Audit 4 A2 and A6: each line promised "the next open asks again", as if a retry could
+///   succeed. For a record that cannot be read, or a stale key, nothing in the engine repairs
+///   it, so the refusal repeats at every open. And a resumed reap that stopped in its drain is
+///   retried by a later drain, not by any open.
+///
+/// Pinned by `lease_thread::tests::each_open_refusal_is_worded_for_its_source`.
+fn open_refusal_line(why: &str) -> String {
+    let what = if why.starts_with("slot ") {
+        "did not give back an id slot. It stays reserved and on the list the next open asks \
+         about, so a fault that persists is refused again at every open until what the reason \
+         names is repaired"
+    } else if why.starts_with("interrupted reap of slot ") {
+        "did not resume an interrupted reap. This is refused again at every open until what the \
+         reason names is repaired, and nothing in the engine repairs it"
+    } else {
+        "a resumed reap stopped part-way. What it finished stays done, and the rest is retried \
+         where it was left: a record still `Reaping` by the next open, a keyed `Reaped` slot by \
+         this open's slot sweep, and parked pages by a later drain"
+    };
+    format!("lease: at open, {what}: {why}")
 }
 
 fn join_ids(ids: &[BranchId]) -> String {
