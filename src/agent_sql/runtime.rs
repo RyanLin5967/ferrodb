@@ -9690,4 +9690,197 @@ mod tests {
             );
         }
     }
+
+    // ---- D194 cost review Q7 (Amendment 11): an unpinned read names what its SCAN saw ----------
+    //
+    // `visible_rows_where` scans with no lock held and `record_read` relocks, so a merge can land
+    // between the two. A read through a pin was already answered as of the pin. These drive a read
+    // of TRUNK, which no workspace pins, through the same two calls `select` makes, and land the
+    // merge between them on one thread.
+
+    /// A branch forked from TRUNK and pinned, to own the capture a read is recorded against.
+    fn reader(rt: &AgentRuntime, txn: &TxnManager, run: &str) -> BranchId {
+        rt.begin_session_pinned(
+            RunIdentity { agent_id: "reader", run_id: Some(run), model: None, prompt: None },
+            BranchId::TRUNK,
+            txn,
+        )
+        .unwrap()
+        .branch
+    }
+
+    /// The versions a capture names for one row, from its exact read sets.
+    fn named_versions(st: &State, branch: BranchId, row: RowId) -> Vec<u64> {
+        use crate::provenance::readset::ReadSet;
+        let txn = st.workspaces[&branch].txn;
+        st.captures[&txn.0]
+            .read_sets()
+            .iter()
+            .filter_map(|rs| match rs {
+                ReadSet::ExactVersions(vs) => Some(vs.clone()),
+                ReadSet::Predicate(_) => None,
+            })
+            .flatten()
+            .filter(|v| v.row == row)
+            .map(|v| v.begin_ts)
+            .collect()
+    }
+
+    /// **The forward window:** R scans TRUNK and sees m0's version of row 1; W's merge then
+    /// publishes a newer one; only then is R's exact read recorded. The read may be refused, or may
+    /// name m0's version. It must never name W's, which is a version it did not see. That version
+    /// is what the merge premise check would compare against itself, and what would draw a REVERT
+    /// edge from W instead of from m0.
+    ///
+    /// R is forked before m0, so its own pin is not the scan's seq, and the read cannot be answered
+    /// through a live pin by coincidence.
+    ///
+    /// At `b4cfce3` the unpinned read carried no `seen_through`, and it named W's version.
+    #[test]
+    fn an_unpinned_read_never_names_a_version_published_after_its_scan() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("q7_forward", 2);
+        let r = reader(&rt, &txn, "r");
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            merge_round(&rt, &mut ctx, &txn, 2, "m0");
+        }
+        let tbl = table_id("t");
+        let saw = {
+            let st = rt.state.lock().unwrap();
+            st.applied.iter().filter(|a| a.tbl == tbl && a.row == RowId(1)).map(|a| a.seq).max()
+        };
+        let saw = saw.expect("fixture: m0 published no version of row 1");
+        let (rows, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            merge_round(&rt, &mut ctx, &txn, 1, "w");
+        }
+        let matched: Vec<(RowId, Vec<Value>)> =
+            rows.into_iter().filter(|(rid, _)| *rid == RowId(1)).collect();
+        assert_eq!(matched.len(), 1, "fixture: the scan did not return row 1");
+        assert_eq!(matched[0].1[1], Value::Integer(11), "fixture: the scan should have seen m0's value");
+        let out = rt.record_read(
+            r,
+            tbl,
+            AccessShape::IndexLookup,
+            &matched,
+            None,
+            None,
+            ReadPurpose::Inspection,
+            seen,
+        );
+        match out {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("was released while this read ran"), "refused for the wrong reason: {e}");
+            }
+            Ok(()) => assert_eq!(
+                named_versions(&rt.state.lock().unwrap(), r, RowId(1)),
+                vec![saw],
+                "the scan saw version {saw} of row 1, and the capture names another"
+            ),
+        }
+    }
+
+    /// **The reverse window:** a merge has committed but not recorded, so a snapshot taken now
+    /// contains its rows while `versions` does not yet hold its versions. It is modelled as a
+    /// registered reservation whose publish txn has committed. An exact read whose scan contains
+    /// that merge must refuse: the version it saw has no name yet.
+    ///
+    /// At `b4cfce3` the unpinned read carried no `seen_through`, so it was retained and named
+    /// whatever `versions` held.
+    #[test]
+    fn an_unpinned_read_whose_snapshot_holds_an_unrecorded_merge_refuses() {
+        let (_dir, bp, catalog, txn, rt) = sql_fixture("q7_reverse", 1);
+        let r = reader(&rt, &txn, "r");
+        let t = txn.begin().unwrap();
+        txn.commit(t).unwrap();
+        let entry = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 1;
+            PublishingEntry::register(st, &rt.state, start, t)
+        };
+        let (rows, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        let matched: Vec<(RowId, Vec<Value>)> =
+            rows.into_iter().filter(|(rid, _)| *rid == RowId(1)).collect();
+        assert_eq!(matched.len(), 1, "fixture: the scan did not return row 1");
+        let err = rt
+            .record_read(
+                r,
+                table_id("t"),
+                AccessShape::IndexLookup,
+                &matched,
+                None,
+                None,
+                ReadPurpose::Inspection,
+                seen,
+            )
+            .err()
+            .map(|e| e.to_string());
+        drop(entry);
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("has not recorded its versions yet")),
+            "an exact read whose snapshot contains an unrecorded merge must refuse: {err:?}"
+        );
+    }
+
+    /// **The predicate clock:** R full-scans TRUNK before W's merge and is recorded after it. A
+    /// scan's REVERT edges are decided by `observed_at` against each write's `begin_ts`, so R's
+    /// clock must be its scan's. Then `REVERT MERGE <W>` is not blocked by R, which never saw W's
+    /// write.
+    ///
+    /// The positive control: R2 scans after W and is blocked on, so the edge mechanism is live.
+    ///
+    /// At `b4cfce3` R's clock was taken at record time, after W, so the revert was blocked by R.
+    #[test]
+    fn an_unpinned_scan_is_not_a_dependent_of_a_merge_published_after_it() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("q7_revert", 2);
+        let r = reader(&rt, &txn, "r");
+        let r2 = reader(&rt, &txn, "r2");
+        let tbl = table_id("t");
+        let read_trunk = |catalog: &Catalog| {
+            let read = ReadCtx { catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        let (rows, seen) = read_trunk(&catalog);
+        let merge_id = {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            let w = reader(&rt, &txn, "w");
+            let n = rt.write(&mut ctx, w, parse_one("UPDATE t SET v = v + 1 WHERE id = 1;")).unwrap();
+            assert_eq!(n, 1, "fixture: W staged nothing");
+            let report = rt.merge(&mut ctx, w).unwrap();
+            assert!(report.applied_to_target, "fixture: W did not publish: {:?}", report.outcome);
+            report.merge_id
+        };
+        rt.record_read(r, tbl, AccessShape::FullScan, &rows, None, None, ReadPurpose::Inspection, seen)
+            .unwrap();
+        let (rows2, seen2) = read_trunk(&catalog);
+        rt.record_read(r2, tbl, AccessShape::FullScan, &rows2, None, None, ReadPurpose::Inspection, seen2)
+            .unwrap();
+        let (r_txn, r2_txn) = {
+            let st = rt.state.lock().unwrap();
+            (st.workspaces[&r].txn, st.workspaces[&r2].txn)
+        };
+        let plan = {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.revert_merge(&mut ctx, &merge_id, RevertMode::Halt).unwrap()
+        };
+        assert!(
+            plan.blocked_by.contains(&r2_txn),
+            "positive control: a scan recorded after W must block W's revert: {:?}",
+            plan.blocked_by
+        );
+        assert!(
+            !plan.blocked_by.contains(&r_txn),
+            "R scanned before W published and never saw W's write, yet it blocks W's revert: {:?}",
+            plan.blocked_by
+        );
+    }
 }
