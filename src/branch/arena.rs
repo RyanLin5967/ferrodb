@@ -285,7 +285,9 @@ struct StoreState {
     /// resolve_fill`], which recovers the true value by probing.
     fill_unknown: std::collections::HashSet<ArenaId>,
     /// Pages logically freed but still visible to some live child. Slow-path reaping parks here.
-    pending: Vec<PendingFree>,
+    ///
+    /// **D183 de-dup at push: one entry per `(page, arena)`, the first.** See [`PendingLog`].
+    pending: PendingLog,
     /// **D183.** Arenas whose `recycled` list or `next_free` has moved since the durable file was
     /// last brought level with memory, and which therefore have to ride the next tail record.
     ///
@@ -678,7 +680,7 @@ impl ArenaPageStore {
                 extents: HashMap::new(),
                 recycled: HashMap::new(),
                 current: HashMap::new(),
-                pending: Vec::new(),
+                pending: PendingLog::default(),
                 recycled_dirty: std::collections::HashSet::new(),
                 claim_epoch: HashMap::new(),
                 shadow_base: HashMap::new(),
@@ -1058,8 +1060,12 @@ impl ArenaPageStore {
     /// The caller must append a record covering `parks.parked` before the borrow ends, or route
     /// through [`Self::abandon_park`] — still holding it — if it cannot.
     fn push_pending_recorded(&self, parks: &mut RecordedParks<'_>, entry: PendingFree) {
-        self.state.lock().unwrap().pending.push(entry);
-        parks.parked.push(entry);
+        // **D183 de-dup at push.** A page already pending keeps its first entry, and the record must
+        // describe only what memory took, so a skipped push is not in `parked`. The replay would skip
+        // it first-wins anyway; leaving it out keeps the record equal to the change.
+        if self.state.lock().unwrap().pending.push_if_absent(entry) {
+            parks.parked.push(entry);
+        }
     }
 
     /// Push onto the pending-free log with NO record describing it, and say so durably.
@@ -1071,8 +1077,12 @@ impl ArenaPageStore {
     /// functions can be that.
     fn push_pending_unrecorded(&self, entry: PendingFree) {
         let mut st = self.state.lock().unwrap();
-        st.pending.push(entry);
-        self.pending_version.fetch_add(1, Ordering::SeqCst);
+        // **D183 de-dup at push.** A skipped push changed nothing, so it announces nothing. A bump here
+        // would force a full image rewrite of a log the file already holds: the rule `take_pending`
+        // keeps for a drain that took nothing.
+        if st.pending.push_if_absent(entry) {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Take the pending-free log for re-evaluation.
@@ -1116,7 +1126,7 @@ impl ArenaPageStore {
         // `park_or_release`, say) and removing from it would leave it missing.
         let version = self.pending_version.load(Ordering::SeqCst);
         let level = persist.durable_pending_version == version;
-        let taken = std::mem::take(&mut st.pending);
+        let taken = st.pending.take_all();
         if !taken.is_empty() {
             self.pending_version.fetch_add(1, Ordering::SeqCst);
         }
@@ -1167,7 +1177,11 @@ impl ArenaPageStore {
         let mark = persist.drain_mark.take();
         let (payload, dirty, covered, kind) = {
             let mut st = self.state.lock().unwrap();
-            st.pending.extend(entries);
+            // **D183 de-dup at push**: an entry whose page is already pending again is skipped, first
+            // wins. Only a park between the take and this put can do that, and such a park's record
+            // could not append: the take's bump left the log unlevel, so it rewrote the image, which
+            // moved `rewrites` and voids `mark` below. This put then restates the log, REPLACED.
+            st.pending.extend_absent(entries);
             let dirty = std::mem::take(&mut st.recycled_dirty);
             // ⚠ **`dirty` alone, where `retire_arenas_by_rule` passes `dirty ∪ rec.arenas`, and
             // the asymmetry is deliberate.** That site unions in the arenas it WALKED because it
@@ -1415,6 +1429,35 @@ impl ArenaPageStore {
         // released page — the same work `free_arena` already does under this lock — and not the
         // page reads and catalog queries, which stayed in phase 1.
         let mut persist = self.persist.lock().unwrap();
+        // ⭐ **D183 de-dup at push: a page already PENDING is decided by its entry, not again here.**
+        // `allocated_pages` lists a parked page, because parking does not recycle it, so this loop
+        // used to decide such a page a second time (`frontier/catalog_root_and_park_adversary.md` §B1
+        // @ `a4b48ea`). Two ways to get here:
+        //   * a resumed reap: this branch's own earlier attempt parked it, and the `Reaping ->
+        //     Reaped` flip never happened;
+        //   * its owner's `free_page` parked it while the owner was live.
+        // Still pinned, it was parked twice. Unpinned, it was RELEASED while its entry stayed in the
+        // log, so one page was both pending and recycled and the next drain released it again: a
+        // no-op only while nothing reissues it in between (§B2-B3).
+        //
+        // Skipping it moves nothing that matters. In-process the entry's free came first, so its range
+        // `[birth, e_f)` lies inside this call's `[birth, free_epoch)`: "unpinned here" implies
+        // "unpinned for the entry", and the drain `reap` runs next releases it in the same reap. What
+        // is lost is a pin for children forked after the page was freed, which cannot see it (§B3).
+        // After a restart the two epochs can be in either order, but the owner is Reaping, so no child
+        // of it forked between them and the two decisions are equal (§B2 point 1).
+        //
+        // Filtered under `persist` and `state` together. ⚠ Blind spot: between this filter and
+        // `release_page` below, only an UNRECORDED push can land, since recorded ones need `persist`.
+        // That is `free_page`, and `free_page` of a page whose owner is Reaping does not happen,
+        // because a Reaping owner writes nothing (§B2 reason 2). On the park arm, `push_if_absent`
+        // closes the gap anyway.
+        let plan: Vec<(PageId, ArenaId, Epoch, bool)> = {
+            let st = self.state.lock().unwrap();
+            plan.into_iter()
+                .filter(|&(page, arena, _, _)| !st.pending.contains((page, arena)))
+                .collect()
+        };
         let mut released = 0u32;
         let mut parks = RecordedParks { persist: &mut persist, parked: Vec::new() };
         for (page_id, arena, birth, pinned) in plan {
@@ -1793,7 +1836,9 @@ impl ArenaPageStore {
                 extents,
                 recycled,
                 current,
-                pending,
+                // **D183 de-dup at push**, applied to a log this process did not build: an image written
+                // before the rule can list a page twice, and it loads first-wins, as its tail replays.
+                pending: PendingLog::from_entries(pending),
                 // Nothing is dirty against a file this process did not write: `image_bytes` was
                 // just reset to 0 above, so the next persist is a full rewrite and carries
                 // everything anyway.
@@ -2663,6 +2708,117 @@ impl ArenaPageStore {
     }
 }
 
+use pending_log::PendingLog;
+
+/// **D183 de-dup at push: the pending-free log holds at most ONE entry per `(page, arena)`, the first.**
+///
+/// A module of its own so its two fields are private and cannot drift apart. Every way into the log
+/// goes through [`PendingLog::push_if_absent`], so a second entry for a page is unrepresentable rather
+/// than something each call site has to avoid. That includes a log restored from an image,
+/// or from a REPLACED record, written before this rule existed: [`PendingLog::from_entries`] keeps the
+/// first entry for each key, which is the rule the tail replay has always applied to PARKED records. So
+/// memory and its replayed file are built by the same rule and cannot disagree about a page's entry.
+///
+/// **Why the FIRST.** A page is logically freed once. A later entry for it comes from deciding it again:
+/// a resumed reap, or the owner's retire of a page it had already freed. In-process that decision is at
+/// a later free epoch, which can only widen the pin range, and only to children forked after the page was
+/// freed, which cannot see it (`frontier/catalog_root_and_park_adversary.md` §B3 @ `a4b48ea`). After a
+/// restart the epochs can be in either order, and for a Reaping owner the two decisions are equal (§B2).
+///
+/// Cost: `push_if_absent`, `contains` and `take_all` are O(1); `remove_arena` is the O(P) `retain` that
+/// `free_arena` always did. The key set is about 10-16 bytes per entry beside a 40-byte `PendingFree`
+/// (INFERRED from layout, not measured).
+mod pending_log {
+    use crate::branch::record::PendingFree;
+    use crate::branch::types::{ArenaId, PageId};
+    use std::collections::HashSet;
+
+    #[derive(Clone, Default)]
+    pub(super) struct PendingLog {
+        /// Log order: the order each key was first pushed.
+        entries: Vec<PendingFree>,
+        /// The keys of `entries`, exactly, one each.
+        keys: HashSet<(PageId, ArenaId)>,
+    }
+
+    impl PendingLog {
+        /// The first entry for each key, in order. Later entries for a key already seen are dropped.
+        pub(super) fn from_entries(entries: impl IntoIterator<Item = PendingFree>) -> PendingLog {
+            let mut log = PendingLog::default();
+            log.extend_absent(entries);
+            log
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        pub(super) fn contains(&self, key: (PageId, ArenaId)) -> bool {
+            self.keys.contains(&key)
+        }
+
+        pub(super) fn iter(&self) -> std::slice::Iter<'_, PendingFree> {
+            self.entries.iter()
+        }
+
+        /// Append `e` at the END unless an entry for its key is already in the log. Returns whether it
+        /// did, so a caller that records or announces its pushes can skip exactly the ones that changed
+        /// nothing.
+        pub(super) fn push_if_absent(&mut self, e: PendingFree) -> bool {
+            if !self.keys.insert((e.page_id, e.arena_id)) {
+                return false;
+            }
+            self.entries.push(e);
+            true
+        }
+
+        pub(super) fn extend_absent(&mut self, entries: impl IntoIterator<Item = PendingFree>) {
+            for e in entries {
+                self.push_if_absent(e);
+            }
+        }
+
+        /// Empty the log and hand back its entries in order. O(1): both fields are swapped out, not
+        /// cleared.
+        pub(super) fn take_all(&mut self) -> Vec<PendingFree> {
+            self.keys = HashSet::new();
+            std::mem::take(&mut self.entries)
+        }
+
+        /// Drop every entry of `arena`.
+        pub(super) fn remove_arena(&mut self, arena: ArenaId) {
+            let keys = &mut self.keys;
+            self.entries.retain(|p| {
+                if p.arena_id != arena {
+                    return true;
+                }
+                keys.remove(&(p.page_id, p.arena_id));
+                false
+            });
+        }
+
+        /// The entries, for a caller that takes the whole log apart.
+        pub(super) fn into_entries(self) -> Vec<PendingFree> {
+            self.entries
+        }
+    }
+
+    impl std::fmt::Debug for PendingLog {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list().entries(self.entries.iter()).finish()
+        }
+    }
+
+    /// Test-only: compare with the `Vec` this log used to be, so the tests written against it read
+    /// unchanged.
+    #[cfg(test)]
+    impl PartialEq<Vec<PendingFree>> for PendingLog {
+        fn eq(&self, other: &Vec<PendingFree>) -> bool {
+            &self.entries == other
+        }
+    }
+}
+
 use pending_replay::PendingReplay;
 
 /// **D183 tail replay: the pending-free log, indexed at most once for a whole replay.**
@@ -2685,7 +2841,15 @@ use pending_replay::PendingReplay;
 /// * [`PendingReplay::remove_key`] removes EVERY live entry with the key (a `retain`), and a
 ///   missing key is a no-op;
 /// * [`PendingReplay::remove_arena`] removes every live entry of the arena;
-/// * [`PendingReplay::replace`] takes the new log as given, duplicates included.
+/// * [`PendingReplay::replace`] takes the new log first-wins per key. Only a REPLACED record written
+///   before de-dup at push can carry a key twice, because it restated a memory log that held one twice.
+///
+/// **The result is a [`PendingLog`], built by [`PendingLog::from_entries`] in the one pass `finish`
+/// already made, so it holds each key once, the first, whatever the records said.** Every removal
+/// (DRAINED, EXTENT_FREED, REPLACED) removes all copies of a key, so the first copy always sits where the
+/// correct entry would. That makes PARKED's `contains` a bound on transient slots and no longer what
+/// keeps the result duplicate-free: mutant MC1 (`contains` always false) is EQUIVALENT from the de-dup
+/// fix on (lane AMENDMENT 2). The type owns de-dup, and a second guard in front of it could not be tested.
 ///
 /// Cost: indexing and `finish` are one pass each over the log, and only if some record touched it.
 /// Every other method is O(1) plus the entries it actually removes; `remove_arena` also walks that
@@ -2693,6 +2857,7 @@ use pending_replay::PendingReplay;
 /// most once, so a whole replay is O(P + records + the entries the records carry), and O(records)
 /// when no record touches the log.
 mod pending_replay {
+    use super::pending_log::PendingLog;
     use crate::branch::record::PendingFree;
     use crate::branch::types::{ArenaId, PageId};
     use std::collections::HashMap;
@@ -2700,7 +2865,7 @@ mod pending_replay {
     pub(super) struct PendingReplay {
         /// The log as the replay found it, until a record first touches it. [`Self::index`] moves
         /// it into `slots`.
-        untouched: Option<Vec<PendingFree>>,
+        untouched: Option<PendingLog>,
         /// Log order. `None` is an entry a later record removed; [`Self::finish`] drops the holes.
         slots: Vec<Option<PendingFree>>,
         /// LIVE slots per key, oldest first. A key is absent once its last live slot goes.
@@ -2715,7 +2880,7 @@ mod pending_replay {
 
     impl PendingReplay {
         /// Hold `log` unindexed. O(1).
-        pub(super) fn new(log: Vec<PendingFree>) -> PendingReplay {
+        pub(super) fn new(log: PendingLog) -> PendingReplay {
             PendingReplay {
                 untouched: Some(log),
                 slots: Vec::new(),
@@ -2728,6 +2893,7 @@ mod pending_replay {
         /// Index the log `new` was given, once, at the first call that needs it. O(its length).
         fn index(&mut self) {
             let Some(log) = self.untouched.take() else { return };
+            let log = log.into_entries();
             self.slots.reserve(log.len());
             self.by_key.reserve(log.len());
             for e in log {
@@ -2788,22 +2954,23 @@ mod pending_replay {
             }
         }
 
-        /// The log becomes exactly `log`, unindexed until something touches it. Costs dropping the
-        /// index it replaces.
+        /// The log becomes `log`, first-wins per key, unindexed until something touches it. Costs
+        /// dropping the index it replaces, plus one pass over `log`: the pass that decoding the record
+        /// already made, and uncounted like it.
         pub(super) fn replace(&mut self, log: Vec<PendingFree>) {
             let carried = self.visits + self.slots.len() as u64;
-            *self = PendingReplay::new(log);
+            *self = PendingReplay::new(PendingLog::from_entries(log));
             self.visits += carried;
         }
 
-        /// The log in order, holes dropped, and the visits this replay made. O(slots), or O(1) if
-        /// no record ever touched the log.
-        pub(super) fn finish(self) -> (Vec<PendingFree>, u64) {
+        /// The log in order, holes dropped, first-wins per key, and the visits this replay made.
+        /// O(slots), or O(1) if no record ever touched the log.
+        pub(super) fn finish(self) -> (PendingLog, u64) {
             if let Some(log) = self.untouched {
                 return (log, self.visits);
             }
             let visits = self.visits + self.slots.len() as u64;
-            (self.slots.into_iter().flatten().collect(), visits)
+            (PendingLog::from_entries(self.slots.into_iter().flatten()), visits)
         }
     }
 }
@@ -3254,7 +3421,7 @@ impl PageStore for ArenaPageStore {
         let mut st = self.state.lock().unwrap();
         let ext = st.extents.remove(&arena);
         st.recycled.remove(&arena);
-        st.pending.retain(|p| p.arena_id != arena);
+        st.pending.remove_arena(arena);
         st.claim_epoch.remove(&arena);
         // **D99 — the one per-arena map this used to leave behind.** `load_state` seeds
         // `fill_unknown` with EVERY restored extent and only `resolve_fill` ever clears an id
