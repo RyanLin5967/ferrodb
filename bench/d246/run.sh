@@ -15,9 +15,9 @@ set -u
 WT=/Users/idide/wt/ferrodb-d246.noindex
 FIRE=/Users/idide/wt/ferrodb-d246-fire.noindex
 OUT=$WT/bench/d246
-BASE=fbfe038   # D219's tip: pgserver on the in-memory provenance store
+BASE=fbfe038   # D219 tip when D246 was cut: pgserver on the in-memory provenance store (pgserver.rs identical through 1c226d8)
 RED=b6960d5    # the red test, before the fix
-FIX=57c4dc2    # the fix (7e39cb1), the path claim (b2af37e) and the slot claim
+FIX=f5154d1    # D246 (fix 7e39cb1, claims b2af37e, 57c4dc2) merged onto D219 tip 1c226d8
 T=d246_pgserver_provenance_survives_restart
 export CARGO_TARGET_DIR=$WT/target
 
