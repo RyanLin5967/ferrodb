@@ -1,0 +1,10 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -798,7 +798,6 @@
+             *budget
+         )));
+     }
+-    *budget -= count;
+     // Not pre-allocated from `count`, for the reason given in `decode_append`.
+     let mut out: Vec<NodeId> = Vec::new();
+     for _ in 0..count {

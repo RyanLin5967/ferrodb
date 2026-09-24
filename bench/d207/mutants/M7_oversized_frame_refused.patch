@@ -1,0 +1,13 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1224,6 +1224,10 @@
+     fn push(&self, frame: Vec<u8>) {
+         let mut st = self.state.lock().unwrap();
+         if st.stopped {
++            return;
++        }
++        if frame.len() > self.max_bytes {
++            self.dropped.fetch_add(1, Ordering::SeqCst);
+             return;
+         }
+         // Both bounds, whichever binds first. The loop stops at an empty queue whatever the bytes

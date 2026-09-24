@@ -1,0 +1,15 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1846,11 +1846,7 @@
+             if st.stopped {
+                 break;
+             }
+-            let taken = st.queue.pop_front();
+-            if let Some(f) = taken.as_ref() {
+-                st.bytes -= f.len();
+-            }
+-            taken
++            st.queue.pop_front()
+         };
+         let Some(frame) = frame else { continue };
+ 

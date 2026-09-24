@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -839,7 +839,7 @@
+     let version = take_u64(bytes, at)?;
+     let term = take_u64(bytes, at)?;
+     let members = decode_node_list(bytes, at, "member", budget)?;
+-    let learners = decode_node_list(bytes, at, "learner", budget)?;
++    let learners = decode_node_list(bytes, at, "learner", &mut usize::MAX)?;
+ 
+     // A node cannot be both. `with_learners` drops such a learner silently, which is the right
+     // thing for a *builder* — the voter entry is the stronger statement — and the wrong thing for a

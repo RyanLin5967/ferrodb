@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1231,7 +1231,7 @@
+         // made permanently unsendable by the bound that exists to keep sending possible.
+         while !st.queue.is_empty()
+             && (st.queue.len() >= self.depth
+-                || st.bytes.saturating_add(frame.len()) > self.max_bytes)
++                || (false && st.bytes.saturating_add(frame.len()) > self.max_bytes))
+         {
+             if let Some(old) = st.queue.pop_front() {
+                 st.bytes -= old.len();

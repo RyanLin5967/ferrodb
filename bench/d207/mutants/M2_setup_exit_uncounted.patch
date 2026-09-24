@@ -1,0 +1,10 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1986,7 +1986,6 @@
+                     // fails with EINVAL. `registration` is dropped by this `continue`, which
+                     // releases the slot; the refusal is counted, because an unserved connection
+                     // with no number attached is the silent loss this module does not allow.
+-                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                     let _ = stream.shutdown(Shutdown::Both);
+                     continue;
+                 }

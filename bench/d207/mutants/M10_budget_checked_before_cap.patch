@@ -1,0 +1,30 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -778,13 +778,6 @@
+     let count = take_u32(bytes, at)? as usize;
+     // Refused before a single id is read. See [`MAX_CONFIG_NODES`]: the frame limit bounds the
+     // bytes a peer can make this process hold, not the work it can make this process do.
+-    if count > MAX_CONFIG_NODES {
+-        return Err(FerroError::Wal(format!(
+-            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. A frame is \
+-             allowed to be large; the comparisons a configuration costs are quadratic in its two \
+-             list lengths, so a large one is a request for this node's CPU rather than a cluster"
+-        )));
+-    }
+     // ...and charged against the FRAME's budget, also before a single id is read. The cap above
+     // bounds each configuration and nothing else bounds how many a frame carries. Checked second,
+     // so a count over the cap is always refused by the cap: in the other order the budget would
+@@ -796,6 +789,13 @@
+              its own size, so bounding one configuration bounds nothing about a frame that carries \
+              a thousand of them",
+             *budget
++        )));
++    }
++    if count > MAX_CONFIG_NODES {
++        return Err(FerroError::Wal(format!(
++            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. A frame is \
++             allowed to be large; the comparisons a configuration costs are quadratic in its two \
++             list lengths, so a large one is a request for this node's CPU rather than a cluster"
+         )));
+     }
+     *budget -= count;

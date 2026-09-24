@@ -1,0 +1,21 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -450,17 +450,7 @@
+         }
+         // The frame's budget, for the same reason and in the same order as `decode_node_list`
+         // charges it: after the per-configuration cap, so each refusal names its own limit.
+-        if list.len() > *budget {
+-            return Err(FerroError::Wal(format!(
+-                "a configuration holds {} nodes, but only {} of this frame's \
+-                 {MAX_FRAME_CONFIG_NODES}-node budget is left; a peer would refuse this frame, so it \
+-                 is refused here where the cause is visible. Send fewer Membership entries per \
+-                 Append",
+-                list.len(),
+-                *budget
+-            )));
+-        }
+-        *budget -= list.len();
++        let _ = &budget;
+         room(b, 4 + list.len() * 4)?;
+         put_u32(b, u32::try_from(list.len()).map_err(|_| too_big(list.len()))?);
+         for n in list {
