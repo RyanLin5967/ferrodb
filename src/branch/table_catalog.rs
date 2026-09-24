@@ -4352,6 +4352,180 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **The wall age, never below the lease age.** Review 3's rule credits `W(now) − mtime` on the
+    /// premise that the lease clock never runs faster than the wall clock. A BACKWARD step of the
+    /// wall clock after this process anchored its lease clock breaks that premise — F2 exists
+    /// because NTP steps it — and the wall age then falls short by the step, below what the lease
+    /// clock alone credits. The credit is the larger of the two. Green against `1ec2deb`, whose
+    /// credit IS the lease age: this pins the fix's direction, and kills a pure wall-age credit.
+    #[test]
+    fn a_backward_wall_step_does_not_shrink_the_first_start_credit_below_the_lease_clocks() {
+        use crate::cluster::wall_step;
+        let path = sidecar("wall-stepped-back");
+        // Anchors the lease clock unstepped, before the step below.
+        let t = LeaseDeadline::now_millis();
+        let lapsed_in_outage = t - HOUR / 2;
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+        };
+        age_file(&path, t - HOUR);
+        // After the anchor, the wall clock steps back two hours: its age of the file is negative.
+        let _stepped = wall_step::by(-2 * HOUR as i64);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "a backward wall-clock step shrank the first start's credit below the lease clock's own \
+             age of the file, and a lease that lapsed inside the outage was charged it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Addendum 2's crash window, from the other side: the new magic on disk and no offset yet.**
+    /// The magic is made durable BEFORE the record that first holds `D > 0`, so a crash between the
+    /// two leaves the new magic over a catalog still at `D = 0`. `main` refuses it — the magic is
+    /// not its own — and this build must open it and read its leases unchanged. The new magic is
+    /// the literal pre-registered in PREREG amendment 10, not a value read from the subject. Red
+    /// against `1ec2deb`, which refuses any magic but `0xFE44_0B01`.
+    #[test]
+    fn a_crash_after_the_magic_switch_and_before_the_offset_leaves_a_catalog_this_build_opens() {
+        const OFFSET_MAGIC: u32 = 0xFE44_0B02;
+        let path = sidecar("magic-before-offset");
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id
+        };
+        write_magic_on_disk(&path, OFFSET_MAGIC);
+        assert_ne!(magic_on_disk(&path), MAIN_MAGIC, "premise: main's check refuses this catalog");
+
+        let re = TableBranchCatalog::open_sidecar(&path, 1)
+            .expect("this build refused a catalog that crashed after the magic switch");
+        assert_eq!(re.alive_state().unwrap(), None, "premise: no offset was ever recorded");
+        assert_eq!(lease(&re, b), 1_500, "a lease stored at D = 0 must read back unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The new magic outlives a root split.** `publish_root` rewrites the header page whenever the
+    /// tree's root moves; if it wrote the old magic back, the first split after `D` left zero would
+    /// silently reopen the catalog to `main`. Red against `1ec2deb`, which never switches; after the
+    /// fix, the killer of a `publish_root` that writes the old constant.
+    #[test]
+    fn the_new_magic_survives_a_root_split_after_the_offset_leaves_zero() {
+        let path = sidecar("magic-root-split");
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap();
+            c.record_lease_alive(1_000).unwrap();
+            c.resume_leases(4_000).unwrap(); // D = 3000
+            let root = c.root_page_id();
+            let mut forks = 0;
+            while c.root_page_id() == root {
+                assert!(forks < 5_000, "premise: 5000 forks never split the root");
+                // Staged, not awaited: the durable write below covers every one of them.
+                c.fork_staged(BranchId::TRUNK, LeaseDeadline(10_000)).unwrap();
+                forks += 1;
+            }
+            c.record_lease_alive(5_000).unwrap();
+        }
+        assert_ne!(
+            magic_on_disk(&path),
+            MAIN_MAGIC,
+            "a root split after D left zero wrote the magic main opens back onto the header page"
+        );
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_eq!(re.alive_state().unwrap(), Some((5_000, 3_000)), "and this build still opens it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Review 3, C4: an unresumed writer's own run is not downtime; the outage before it is.** A
+    /// process that writes an unmarked catalog and never resumes it — an embedder with no lease
+    /// thread, or a first start that fails before its resume — replaces the file's mtime with its
+    /// own. The credit owed at the next resume is the outage BEFORE that process plus the time
+    /// SINCE its last write, and not its run in between. Here: four hours before it, a two-hour run
+    /// (placed on the wall clock by the mtime and a thread-local step), one hour since. Owed: five.
+    /// Red against `1ec2deb`, which credits only since the last write, on the lease clock.
+    #[test]
+    fn the_downtime_before_an_unresumed_writer_is_kept_and_its_own_run_is_not_credited() {
+        use crate::cluster::wall_step;
+        let path = sidecar("accrual");
+        let t = LeaseDeadline::now_millis();
+        let lapsed = t - HOUR / 2;
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id
+        };
+        // The last authority before the writer wrote four hours ago.
+        age_file(&path, t - 4 * HOUR);
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.set_root(BranchId::TRUNK, 1).unwrap();
+        }
+        // The writer's last write, two hours into its run; then an hour with nothing running.
+        age_file(&path, t + 2 * HOUR);
+        let _later = wall_step::by(3 * HOUR as i64);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        let w0 = wall_now_millis() + 3 * HOUR;
+        c.resume_leases(now).unwrap();
+        let w1 = wall_now_millis() + 3 * HOUR;
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease").0;
+        let (lo, hi) = (
+            lapsed + 4 * HOUR + (w0 - (t + 2 * HOUR)),
+            lapsed + 4 * HOUR + (w1 - (t + 2 * HOUR)) + 2_000,
+        );
+        assert!(
+            (lo..=hi).contains(&lease),
+            "credited {} ms; owed four hours before the unresumed writer plus {}..{} ms since its \
+             last write, and nothing for its run",
+            lease.saturating_sub(lapsed),
+            w0 - (t + 2 * HOUR),
+            w1 - (t + 2 * HOUR)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Review 3, C6, with no recorded evidence.** A catalog finished by a build that records no
+    /// first-start key — `main` migrates too, and a catalog created fresh records none — found with
+    /// a legacy log beside it. Either file may be the later one, so the credit is from the EARLIER.
+    /// Red against `1ec2deb`, which prefers the log.
+    #[test]
+    fn a_switchover_with_no_recorded_evidence_credits_from_the_earlier_file() {
+        let t = LeaseDeadline::now_millis();
+        let lapsed = t - 3 * HOUR / 2;
+        let dir = std::env::temp_dir().join(format!("ferro-f1-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        let cat = dir.join("legacy.db.branchcat");
+        let legacy = dir.join("legacy.db.branches");
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&cat, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id
+        };
+        {
+            let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
+            log.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+        }
+        age_file(&cat, t - 2 * HOUR);
+        age_file(&legacy, t - HOUR);
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("the catalog's branch is live");
+        assert!(
+            !lease.is_expired_at(now),
+            "credited from the log's hour, not the catalog's two: a lease that lapsed 1.5 h ago was \
+             charged (C6)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
