@@ -544,6 +544,21 @@ impl Catalog {
         Ok(())
     }
 
+    /// **D250: finish a DROP that the log records but the catalog on disk does not**, without freeing
+    /// anything. Called only by `wal::recovery::open_recovered`, for a table whose `DropTable` record
+    /// is durable (it is written before the DROP's mutation) while the catalog change never reached
+    /// disk. Recovery has skipped the table's records, so it must not stay in the catalog.
+    ///
+    /// Its pages are not freed here. With D229 none of them was freed before the crash either: a
+    /// DROP frees only after the checkpoint that makes this very removal durable. If the DROP recorded
+    /// its intent, `open_recovered` decides it after this (the table is now absent) and the intent frees
+    /// the pages after the open's checkpoint; they were quarantined before recovery, so recovery took
+    /// none. A DROP that died before recording its intent leaks them (D250's stated cost, now
+    /// narrowed to that window). The rest is what [`Catalog::drop_table`] does.
+    pub fn forget_dropped_table(&mut self, name: &str) -> Result<(), FerroError> {
+        self.drop_table(name)
+    }
+
     // root split propagation called when a tree's root changes
     pub fn update_primary_root(&mut self, table: &str, new_root: u32) -> Result<(), FerroError> {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;

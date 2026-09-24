@@ -68,10 +68,6 @@ pub struct WalManager {
     pub header_txn_id: u64,
     /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
     pins: Mutex<std::collections::BTreeMap<u64, u64>>,
-    /// Taken shared by every new pin ([`WalManager::pin`], [`WalManager::pin_durable`]) and
-    /// exclusively by [`WalManager::fence_pins`]. Lock order: `pin_fence`, then `pins`, then
-    /// `buffer`, then `file`.
-    pin_fence: std::sync::RwLock<()>,
     next_pin_id: AtomicU64,
     /// **Test-only: make the next [`WalManager::append`] fail once.**
     ///
@@ -637,7 +633,7 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), pin_fence: std::sync::RwLock::new(()), next_pin_id: AtomicU64::new(1),
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1),
             #[cfg(test)]
             fail_next_append: std::sync::atomic::AtomicBool::new(false),
             format: AtomicU32::new(format), poisoned: AtomicBool::new(false), poison_reason: Mutex::new(None)})
@@ -727,7 +723,6 @@ impl WalManager {
     ///
     /// Lock order is pins -> buffer -> file, matching `truncate`.
     pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
-        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let lsn = self.flushed_lsn.load(Ordering::SeqCst);
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
@@ -741,7 +736,6 @@ impl WalManager {
     /// built on records that are gone, and silently moving the pin forward would hand it a
     /// plausible-looking claim over the wrong range.
     pub fn pin(self: &std::sync::Arc<Self>, lsn: u64) -> Result<WalPin, FerroError> {
-        let _fence = self.pin_fence.read().unwrap();
         let mut pins = self.pins.lock().unwrap();
         let base = self.base_lsn.load(Ordering::SeqCst);
         if lsn < base {
@@ -752,21 +746,6 @@ impl WalManager {
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
         pins.insert(id, lsn);
         Ok(WalPin { wal: std::sync::Arc::clone(self), id, lsn })
-    }
-
-    /// Hold every NEW pin off until the returned guard is dropped. Pins already held stay, and can
-    /// still be released.
-    ///
-    /// For a caller whose decision rests on "no pin is below the log's end" and that must still
-    /// hold at its [`WalManager::truncate`]: `truncate` keeps the log, and answers `Ok`, while any pin
-    /// is below the end. A DROP is that caller (`TxnManager::drop_checkpointed`, lane §21.6). It
-    /// checks [`WalManager::min_pinned_lsn`] and truncates under one guard, so a pin cannot land
-    /// between the two, which is the check-then-act shape [`WalManager::pin_durable`] warns about.
-    /// A pin that waited is taken against the truncated log, as if it had arrived after the
-    /// checkpoint: one below the new base is refused, as it always was. Never take a pin while
-    /// holding this guard: a pin waits on it.
-    pub fn fence_pins(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
-        self.pin_fence.write().unwrap()
     }
 
     /// The oldest LSN any pin still needs, if there are any.

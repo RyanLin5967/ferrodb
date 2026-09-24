@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::CatalogPage, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::{DiskManager, PAGE_SIZE}, index_page::{BPLUS_INTERNAL_TYPE, BPLUS_LEAF_TYPE}, page_directory::PageDirectory, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, storage::Storage, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -21,6 +21,19 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
     // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
     let legacy = wal.is_legacy();
+    // **D250: a record of a table that a LATER `DropTable` names is skipped, by redo, by the
+    // directory repair and by the owed-release set.** A DROP frees its table's pages on disk at once
+    // and only a truncation removes their records, and a truncation does not always happen: a WAL
+    // pin cancels it, and the DROP's checkpoint can fail after the frees. Replayed, those records
+    // would land on pages that are free, or already another table's: a reused page never flushed is
+    // a zero page, `Page::empty` with LSN 0 below, and every record applies to it. The `DropTable`
+    // record is durable before the first free (`TxnManager::drop_checkpointed`), so it is in the log
+    // whenever the frees could have happened. LSN order, not the root number alone: a later owner of
+    // the same page numbers writes after the DROP, and is never skipped.
+    let dropped = dropped_roots(&records);
+    let skipped = |kind: &RecKind, lsn: u64| {
+        heap_root(kind).is_some_and(|root| dropped.get(&root).is_some_and(|&at| at > lsn))
+    };
     let mut max_txn = 0u64;
     let mut last_lsn = HashMap::new();
     // The earliest record each transaction still has in the retained log. For a loser this is its
@@ -38,6 +51,10 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         max_txn = max_txn.max(rec.txn_id);
         last_lsn.insert(rec.txn_id, rec.lsn);
         first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
+        if skipped(&rec.kind, rec.lsn) {
+            // A dropped table's page: nothing owed, nothing touched (D250).
+            continue;
+        }
         match &rec.kind {
             RecKind::HeapDelete { dir_root, page_id, slot, .. } if !legacy => {
                 owed.entry(rec.txn_id).or_default().push(RetiredSlot { dir_root: *dir_root, page_id: *page_id, slot: *slot });
@@ -98,6 +115,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
     // came from a CLR (D213).
     for rec in &records {
+        if skipped(&rec.kind, rec.lsn) {
+            continue;
+        }
         match &rec.kind {
             RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
             | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
@@ -578,6 +598,62 @@ pub struct OpenedDatabase {
 /// Anything built on top, such as the agent runtime and its arena, comes AFTER this returns. The
 /// rebuild allocates pages, and the arena floor must sit above everything this has allocated
 /// (`cli::run_cli` explains the arena ordering).
+/// The heap a record writes, as its directory root: a `Heap*` record's own, or the one a CLR redoes.
+fn heap_root(kind: &RecKind) -> Option<u32> {
+    match kind {
+        RecKind::HeapInsert { dir_root, .. }
+        | RecKind::HeapDelete { dir_root, .. }
+        | RecKind::HeapUpdate { dir_root, .. }
+        | RecKind::HeapRelease { dir_root, .. } => Some(*dir_root),
+        RecKind::Clr { redo, .. } => heap_root(redo),
+        _ => None,
+    }
+}
+
+/// D250: every heap root a `DropTable` record names (the table's heap and its time-travel heap),
+/// mapped to the LSN of the LAST such record. A record of that root below that LSN belongs to a
+/// dropped table.
+fn dropped_roots(records: &[crate::wal::log::LogRecord]) -> HashMap<u32, u64> {
+    let mut dropped = HashMap::new();
+    for rec in records {
+        if let RecKind::Ddl { op: DdlOp::DropTable, dir_root, time_travel_root, .. } = &rec.kind {
+            dropped.insert(*dir_root, rec.lsn);
+            dropped.insert(*time_travel_root, rec.lsn);
+        }
+    }
+    dropped
+}
+
+/// D250 (b): the tables the retained log DROPPED that the catalog on disk still names, so their
+/// DROP never finished: its record is durable before its first free, but the catalog change reaches
+/// disk only with the checkpoint after. A table re-created at the same directory root after its
+/// DROP (a later `CreateTable` naming it) is a new table, and is left alone.
+fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Result<Vec<String>, FerroError> {
+    let mut drops: Vec<(String, u32, u64)> = Vec::new();
+    let mut created: HashMap<u32, u64> = HashMap::new();
+    let end = wal.next_lsn.load(Ordering::SeqCst);
+    let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+    while lsn < end {
+        let (rec, next) = wal.read_record(lsn)?;
+        match &rec.kind {
+            RecKind::Ddl { op: DdlOp::DropTable, table, dir_root, .. } => drops.push((table.clone(), *dir_root, rec.lsn)),
+            RecKind::Ddl { op: DdlOp::CreateTable, dir_root, .. } => {
+                created.insert(*dir_root, rec.lsn);
+            }
+            _ => {}
+        }
+        lsn = next;
+    }
+    Ok(drops
+        .into_iter()
+        .filter(|(table, dir_root, at)| {
+            created.get(dir_root).is_none_or(|&c| c < *at)
+                && catalog.get_table(table).is_some_and(|e| e.first_directory_page_id == *dir_root)
+        })
+        .map(|(table, _, _)| table)
+        .collect())
+}
+
 pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, FerroError> {
     if !lock.guards(db_path) {
         return Err(FerroError::Io(format!(
@@ -603,8 +679,23 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     } else {
         Catalog::create(bp.clone())?
     };
-    // D229: an intent whose table the durable catalog still names never took effect, and is dropped;
-    // one whose table is gone is carried out after the checkpoint below.
+    // D250 (b): finish every DROP the log records and the catalog on disk does not. `recover` has
+    // just skipped those tables' records, so keeping them in the catalog would serve a table whose
+    // recent writes were not replayed. Removed from the catalog WITHOUT freeing here. With D229 no page
+    // of it was freed before the crash (a DROP frees only after the checkpoint that makes its unlink
+    // durable, and this unlink never was), and its intent, written before the `DropTable` record, is
+    // decided just below and carried out after the checkpoint. Its pages were quarantined before
+    // `recover`, so the directory repair took none of them.
+    for table in logged_drops_the_catalog_missed(&wal, &catalog)? {
+        use std::io::Write;
+        catalog.forget_dropped_table(&table)?;
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: finished the DROP of `{table}`, which the log records but the catalog on disk did not"
+        );
+    }
+    // D229: an intent whose table the catalog still names never took effect, and is dropped; one whose
+    // table is gone, including a DROP completed just above, is carried out after the checkpoint below.
     txn.decide_free_intents(|dir_root| catalog.tables.values().any(|e| e.first_directory_page_id == dir_root))?;
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
@@ -646,8 +737,10 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     if recovered || stale || legacy {
         use std::io::Write;
         // Review 2's N1 (the lead's decision): the checkpoint ALWAYS runs, and always flushes every
-        // page. The rebuild above freed the old trees and reallocated their pages on disk, so a
-        // skipped flush left the next open reading a zeroed root. Only the truncation is refused
+        // page. Before D229 the rebuild freed the old trees and reallocated their pages on disk, so a
+        // skipped flush left the next open reading a zeroed root; the reset now reclaims them by
+        // identity and walks nothing, and the flush is what makes the rebuilt trees, the catalog and
+        // a DROP intent's unlink durable before `free_pending_frees`. Only the truncation is refused
         // while a release is still owed (F2): the log is then the only record of it. Without a retry
         // first: `recover` has just tried every owed release, and a retry would stand between the
         // rebuild's on-disk frees and the sync (D229's window; lane §21.2). A kept log is counted,
@@ -1206,6 +1299,10 @@ use super::*;
     /// onto the page's new owner. So a DROP must truncate even while a release is owed. Here the only
     /// owed release is the dropped table's own, which the DROP discards. Its red is mutant-only: it was
     /// added after the fix, and at `7cede54` this DROP was refused outright.
+    ///
+    /// D250: a DROP no longer needs its truncation for this, since recovery skips every record a later
+    /// DROP names. This test's DROP still truncates (nothing else keeps the log), so it covers the
+    /// truncating path; the kept-log paths are the two `after_a_..._drop_...` tests below.
     #[test]
     fn redo_after_dropping_the_table_that_owed_a_release_touches_no_freed_page() {
         use crate::execution::executor::{run, Outcome};
@@ -1296,5 +1393,222 @@ use super::*;
         assert!(o.catalog.get_table("notes").is_none(), "the dropped table came back");
         assert_eq!(rows("SELECT id, v FROM fresh;", &mut o), vec![v(1, 10), v(2, 20), v(3, 30)], "`fresh` after the reopen");
         assert_eq!(rows("SELECT id, v FROM fresh WHERE id = 2;", &mut o), vec![v(2, 20)], "`fresh` by key after the reopen");
+    }
+
+    /// One SQL statement through the executor, in a fresh session.
+    fn run_sql(sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>) -> Result<crate::execution::executor::Outcome, FerroError> {
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+        crate::execution::executor::run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut Session::new())
+    }
+
+    /// Every heap `(dir_root, page)` the retained log writes, looking through a CLR to what it redoes.
+    fn heap_writes(wal: &WalManager) -> Vec<(u32, u32)> {
+        fn heap_page(kind: &RecKind) -> Option<(u32, u32)> {
+            match kind {
+                RecKind::HeapInsert { dir_root, page_id, .. }
+                | RecKind::HeapDelete { dir_root, page_id, .. }
+                | RecKind::HeapUpdate { dir_root, page_id, .. }
+                | RecKind::HeapRelease { dir_root, page_id, .. } => Some((*dir_root, *page_id)),
+                RecKind::Clr { redo, .. } => heap_page(redo),
+                _ => None,
+            }
+        }
+        let mut out = Vec::new();
+        let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+        let end = wal.next_lsn.load(Ordering::SeqCst);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).unwrap();
+            out.extend(heap_page(&rec.kind));
+            lsn = next;
+        }
+        out
+    }
+
+    /// Every page `table` owns as far as its catalog entry and the log say: its heap's directory root,
+    /// its time-travel root, its primary root, and every page a record of either heap writes.
+    fn pages_of(catalog: &Catalog, wal: &WalManager, table: &str) -> Vec<u32> {
+        let e = catalog.get_table(table).expect("table");
+        let (heap, tt) = (e.first_directory_page_id, e.time_travel_root);
+        let mut pages = vec![heap, tt, e.primary_index_root];
+        pages.extend(heap_writes(wal).into_iter().filter(|(d, _)| *d == heap || *d == tt).map(|(_, p)| p));
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
+    /// The open after a crash must write none of `freed`, and leave them free: each holds the bytes it
+    /// held before the crash, and `allocate`, which hands out the lowest clear bit, returns one of them.
+    fn assert_reopen_leaves_freed_pages_alone(db: &Path, freed: &[u32], before: &[Vec<u8>]) {
+        let lock = DbLock::acquire(db).unwrap();
+        let o = open_recovered(db, &lock).expect("the open after the DROP and a crash failed");
+        assert!(o.catalog.get_table("t").is_none(), "the dropped table came back");
+        for (p, bytes) in freed.iter().zip(before) {
+            let now = o.bp.disk_manager.read(*p).unwrap();
+            assert!(now.as_slice() == bytes.as_slice(), "the open wrote page {p}, which the DROP freed: redo, the directory repair or a release replayed the dropped table onto it");
+        }
+        let next = o.bp.disk_manager.allocate().unwrap();
+        assert!(freed.contains(&next), "page {next} was handed out, so the pages the DROP freed are not all free any more");
+    }
+
+    /// **D250 (lane `lane_d250_drop_logged.md` §2 test 1): after a DROP that a WAL pin kept in the log
+    /// and a crash, the next open writes no page the DROP freed.** The pin cancels the DROP's
+    /// truncation (`WalManager::truncate`), so the log still holds the table's records. Redo takes a
+    /// freed page as it finds it: one never flushed is a zero page, `Page::empty` with LSN 0, and
+    /// every record applies. The fix: the DROP's record is durable before its frees, and recovery
+    /// skips every record a later DROP names. Red at `2c10f17`, where the DROP is refused for the pin;
+    /// the hazard half is red under the mutant that removes the skip.
+    #[test]
+    fn after_a_pinned_drop_and_a_crash_redo_writes_no_page_the_drop_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pinned_drop.db");
+        let (freed, before) = {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            for id in 1..=3 {
+                ok(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut o);
+            }
+            let freed = pages_of(&o.catalog, &o.wal, "t");
+            let heap = o.catalog.get_table("t").unwrap().first_directory_page_id;
+            let base = o.wal.base_lsn.load(Ordering::SeqCst);
+            let pin = o.wal.pin(base).expect("pin the log at its base");
+            ok("DROP TABLE t;", &mut o);
+            assert_eq!(o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+            assert!(
+                heap_writes(&o.wal).iter().any(|(d, _)| *d == heap),
+                "premise: the kept log no longer holds the dropped table's records, so redo has nothing to misapply"
+            );
+            let before: Vec<Vec<u8>> = freed.iter().map(|p| o.bp.disk_manager.read(*p).unwrap().to_vec()).collect();
+            drop(pin);
+            (freed, before)
+            // The crash: every handle goes, and no checkpoint runs.
+        };
+        assert_reopen_leaves_freed_pages_alone(&db, &freed, &before);
+    }
+
+    /// A page file whose syncs fail while `armed`, so a checkpoint can be made to fail after its flush.
+    struct SyncFailsWhenArmed {
+        file: std::fs::File,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::storage::storage::Storage for SyncFailsWhenArmed {
+        fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pwrite(&self.file, buf, offset)
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            crate::storage::storage::Storage::pread(&self.file, buf, offset)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: the page file's sync failed"));
+            }
+            crate::storage::storage::Storage::sync_all(&self.file)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: the page file's sync failed"));
+            }
+            crate::storage::storage::Storage::sync_data(&self.file)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            crate::storage::storage::Storage::set_len(&self.file, len)
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            crate::storage::storage::Storage::len(&self.file)
+        }
+    }
+
+    /// **D250 (lane §2 test 2): after a DROP whose checkpoint failed after its frees, and a crash, the
+    /// next open writes no page the DROP freed.** The same state as a pin, reached by an I/O error: the
+    /// pages are free on disk, the catalog change was written, and the log still holds the table's
+    /// records. Red at `2c10f17` at the page bytes: there the `DropTable` record was logged only after
+    /// a successful checkpoint, so the log held the inserts and no DROP, and redo replayed them onto
+    /// the table's zeroed data page.
+    #[test]
+    fn after_a_drop_whose_checkpoint_failed_and_a_crash_redo_writes_no_page_the_drop_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("failed_drop.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (freed, before) = {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&db).unwrap();
+            let dm = DiskManager::with_storage(Arc::new(SyncFailsWhenArmed { file, armed: armed.clone() })).unwrap();
+            let bp = Arc::new(BufferPoolManager::new(Arc::new(dm)));
+            let wal = Arc::new(WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap());
+            let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+            bp.attach_wal(wal.clone());
+            let mut catalog = Catalog::create(bp.clone()).unwrap();
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            for id in 1..=3 {
+                run_sql(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog, &bp, &txn).unwrap();
+            }
+            let freed = pages_of(&catalog, &wal, "t");
+            armed.store(true, Ordering::SeqCst);
+            let e = match run_sql("DROP TABLE t;", &mut catalog, &bp, &txn) {
+                Err(e) => e,
+                Ok(_) => panic!("premise failed: the DROP's checkpoint did not fail"),
+            };
+            assert!(e.to_string().contains("injected"), "premise failed: the DROP failed, but not at its checkpoint's sync: {e}");
+            assert!(catalog.get_table("t").is_none(), "premise failed: the DROP failed before its mutation, so it freed nothing");
+            armed.store(false, Ordering::SeqCst);
+            let before: Vec<Vec<u8>> = freed.iter().map(|p| bp.disk_manager.read(*p).unwrap().to_vec()).collect();
+            (freed, before)
+            // The crash: every handle goes, and no checkpoint runs.
+        };
+        assert_reopen_leaves_freed_pages_alone(&db, &freed, &before);
+    }
+
+    /// **D250 (lane `lane_d250_drop_logged.md` §2 test 5): a DROP whose mutation fails after its record
+    /// is durable poisons the log, and the next open completes the DROP.** The log then calls the
+    /// table dropped, and recovery skips its records, while the catalog still holds it. So the
+    /// running process stops writing (the poison), and the next open removes the table from the
+    /// catalog (`logged_drops_the_catalog_missed`). Red only under a mutant: it needs the new
+    /// `drop_checkpointed` signature.
+    #[test]
+    fn a_drop_whose_mutation_fails_after_its_record_is_durable_poisons_the_log_and_the_next_open_completes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("half_drop.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o.catalog, &o.bp, &o.txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut o.catalog, &o.bp, &o.txn).unwrap();
+            let record = {
+                let e = o.catalog.get_table("t").expect("t");
+                crate::wal::txn::DdlRecord {
+                    op: DdlOp::DropTable,
+                    table: "t".into(),
+                    dir_root: e.first_directory_page_id,
+                    time_travel_root: e.time_travel_root,
+                    columns: Vec::new(),
+                }
+            };
+            // D229: the DROP names its table's pages first, as the executor does.
+            let pages = o.catalog.table_pages("t").expect("t's pages");
+            let err = o
+                .txn
+                .drop_checkpointed(record, pages, || Err::<(), _>(FerroError::Internal("injected: the drop failed before it freed anything".into())))
+                .expect_err("premise failed: the DROP succeeded although its mutation failed");
+            assert!(err.to_string().contains("injected"), "premise failed: the DROP failed, but not in its mutation: {err}");
+            assert!(o.catalog.get_table("t").is_some(), "premise failed: the injected failure came after the mutation");
+            assert!(
+                o.wal.poisoned().is_some(),
+                "a DROP that failed after its record was durable left the log writable, so the session could keep \
+                 writing a table the log calls dropped"
+            );
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after a DROP that failed after its record failed");
+        assert!(
+            o.catalog.get_table("t").is_none(),
+            "the next open did not complete the logged DROP: recovery skipped the table's records and left it in the catalog"
+        );
     }
 }

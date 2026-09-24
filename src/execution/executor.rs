@@ -337,18 +337,25 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             // from the catalog with no `DROP_TABLE` record logged, so a consumer would keep the
             // table in its own schema forever and simply never hear of it again.
             //
-            // Lane §21: a DROP must TRUNCATE, not only flush, because it frees the pages the log's
-            // records name. So it names the heaps it frees, and is refused before the drop while
-            // another table owes a release. See `TxnManager::drop_checkpointed`.
+            // D250: the `DropTable` record is logged inside the barrier, DURABLE before the DROP's
+            // mutation, and recovery skips every record a later DROP names. It used to be logged here,
+            // after the checkpoint, so a DROP whose checkpoint a WAL pin cancelled (or that failed
+            // after the frees) left the table's records to be replayed onto its freed pages. See
+            // `TxnManager::drop_checkpointed`, which also re-declares the drop after a truncation.
             //
-            // D229: the table's pages are named in a durable intent BEFORE it is unlinked, while this
-            // process still trusts its trees, and freed only after the checkpoint has made the unlink
-            // durable and truncated the log. `drop_table` frees nothing.
-            txn.drop_checkpointed(&[dir_root, tt_root], |intent| {
-                let pages = catalog.table_pages(&table)?;
-                intent.record(&table, dir_root, pages)?;
-                catalog.drop_table(&table)
-            })?;
+            // D229: every page of the table is named here, while this process still trusts its trees,
+            // and the barrier makes that list a durable intent before the `DropTable` record. The pages
+            // are freed only after the checkpoint has made the unlink durable. `drop_table` frees
+            // nothing.
+            let pages = catalog.table_pages(&table)?;
+            let record = DdlRecord {
+                op: DdlOp::DropTable,
+                table: table.clone(),
+                dir_root,
+                time_travel_root: tt_root,
+                columns: Vec::new(),
+            };
+            txn.drop_checkpointed(record, pages, || catalog.drop_table(&table))?;
             // B9: the agent layer keys row authorship and version stamps by a hash of the table
             // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
             // would attribute the new table's rows to an agent that never touched it. See
@@ -359,13 +366,6 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             // above already checkpoints (`drop_checkpointed`), and a second
             // one would take a lock the first still holds.
             session.runtime.forget_table(&table);
-            txn.log_ddl(DdlRecord {
-                op: DdlOp::DropTable,
-                table: table.clone(),
-                dir_root,
-                time_travel_root: tt_root,
-                columns: Vec::new(),
-            })?;
             return Ok(Outcome::Ok)
         }
         // B11 — the column-level half of DDL. Same shape as `CreateTable` and `DropTable` above,
