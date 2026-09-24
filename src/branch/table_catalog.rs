@@ -3106,6 +3106,10 @@ mod tests {
         }
         let at = |r: &BranchRecord| BranchAt { id: r.branch_id.id, fork_epoch: r.fork_epoch };
         let held = || c.witnesses.lock().unwrap().len();
+        // Since the D200 audit fix, the `Reaped` flip itself asks the liveness question (to decide
+        // the UNRELEASED span), and that files witnesses. Emptied here so that step 1 still proves
+        // the WALK files them: left in place, they would pass step 1 for a walk that filed nothing.
+        c.witnesses.lock().unwrap().clear();
         assert_eq!(held(), 0, "fixture: nothing has been asked yet");
 
         // 1. FILED. A walk that reaches the leaf files it on every node it came down.
