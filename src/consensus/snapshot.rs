@@ -286,8 +286,8 @@ impl PayloadHeader {
     /// rather than trusted: `u32` alone permits 4 GiB apiece, which is precisely the footprint this
     /// module's header says a receiver must never hand a peer the choice of.
     ///
-    /// Derived, not picked: `MAX_ENTRY_BYTES` is what the transport can carry in one frame, and
-    /// 32 of them is far above any arena image (tens of bytes per extent), branch catalog (about a
+    /// Derived, not picked: `MAX_ENTRY_BYTES` is one transport frame (since D223 it is exactly
+    /// `MAX_FRAME_BYTES`, the consensus log's disk bound), and 32 of them is far above any arena image (tens of bytes per extent), branch catalog (about a
     /// hundred bytes per branch) or redo window this build produces, while staying two orders of
     /// magnitude below the page image it accompanies.
     pub const MAX_SIDECAR_BYTES: u64 = 32 * crate::consensus::log::MAX_ENTRY_BYTES as u64;

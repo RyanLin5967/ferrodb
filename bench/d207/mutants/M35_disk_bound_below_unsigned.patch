@@ -5,7 +5,7 @@
  /// condition from admission, strictly looser than anything a frame carries, so neither masks the
  /// other's failures; each is tested at its own layer.
 -pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES;
-+pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES - 4096;
++pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES - 69;
  
  /// The largest frame a scan will read from disk, **a constant of format version 2** (D223 review
  /// F2).

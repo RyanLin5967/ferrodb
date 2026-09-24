@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2067,7 +2067,6 @@
+@@ -2118,7 +2118,6 @@
                          // full cap had this thread spin accept-refuse-accept, a core of this process
                          // for free. One poll per refusal bounds that, and delays a stop by at most
                          // the poll the stop flag is already allowed (D207, from `207d362`).

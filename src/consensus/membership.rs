@@ -418,8 +418,10 @@ impl Consensus {
     // stopped being true when F2 merged; the removal condition below is still unmet, but for a
     // different and more serious reason, so do not read this allow as "waiting on a merge".
     //
-    // **Measured on this tree:** `on_propose` is implemented and appends *every* command — including
-    // `Command::Membership` — via `append_own_entry` without calling this gate or `check_membership`.
+    // **Measured on this tree:** `on_propose` is implemented and appends every command the wire can
+    // carry — including `Command::Membership` — via `append_own_entry` without calling this gate or
+    // `check_membership`. D223's admission check refuses only what cannot be encoded or framed; it
+    // is not a membership rule.
     // The only production caller of `check_membership` is `plan_change`, which is the *pure planner*
     // and documents in its own header that a check performed only in the planner is one a retry
     // walks around. So the proposal path is ungated: two membership changes can be in flight at

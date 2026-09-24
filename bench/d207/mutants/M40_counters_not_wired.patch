@@ -1,0 +1,13 @@
+--- a/src/consensus/node.rs
++++ b/src/consensus/node.rs
+@@ -405,7 +405,9 @@
+     /// A copy of the transport's meters (D223 review F3). The node discards every send the
+     /// transport refuses (see `perform`), so these counts are the only trace such a send leaves. A
+     /// copy, not the transport itself, which would also let the caller send on it or stop it.
+-    pub fn transport_counters(&self) -> TransportCounters { self.net.counters() }
++    pub fn transport_counters(&self) -> TransportCounters {
++        TransportCounters { unaddressable: 0, ..self.net.counters() }
++    }
+     pub fn take_refusals(&mut self) -> Vec<FerroError> { std::mem::take(&mut self.refusals) }
+     /// Where this node's log begins. Everything at or below it is covered by a snapshot.
+     pub fn snapshot_round(&self) -> Round { self.log.snapshot_round() }

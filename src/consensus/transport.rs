@@ -1869,6 +1869,56 @@ impl Drop for Transport {
     }
 }
 
+/// Every meter a transport keeps, as one read-only copy (D223 review F3).
+///
+/// A value rather than `&Transport`: [`Transport::send`] and [`Transport::shutdown`] take `&self`,
+/// so a reference handed out for reading meters would also let its holder send on, or stop, the
+/// node's transport. `Node::transport_counters` hands this out, so the meters that are the only
+/// trace of a refused send can be read from a running node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransportCounters {
+    pub sent: u64,
+    pub received: u64,
+    pub dropped: u64,
+    pub lost_in_flight: u64,
+    pub inbound_dropped: u64,
+    pub misrouted: u64,
+    pub refused_handshakes: u64,
+    pub refused_conns: u64,
+    pub idle_closed: u64,
+    pub refused_after_stop: u64,
+    pub connect_failures: u64,
+    pub unauthenticated: u64,
+    pub unencodable: u64,
+    pub unaddressable: u64,
+    pub live_inbound_conns: usize,
+    pub inbox_bytes: usize,
+}
+
+impl Transport {
+    /// A copy of every meter, taken now. See [`TransportCounters`].
+    pub fn counters(&self) -> TransportCounters {
+        TransportCounters {
+            sent: self.sent(),
+            received: self.received(),
+            dropped: self.dropped(),
+            lost_in_flight: self.lost_in_flight(),
+            inbound_dropped: self.inbound_dropped(),
+            misrouted: self.misrouted(),
+            refused_handshakes: self.refused_handshakes(),
+            refused_conns: self.refused_conns(),
+            idle_closed: self.idle_closed(),
+            refused_after_stop: self.refused_after_stop(),
+            connect_failures: self.connect_failures(),
+            unauthenticated: self.unauthenticated(),
+            unencodable: self.unencodable(),
+            unaddressable: self.unaddressable(),
+            live_inbound_conns: self.live_inbound_conns(),
+            inbox_bytes: self.inbox_bytes(),
+        }
+    }
+}
+
 /// Hand-written rather than derived: the meters are what a reader of a log or a failing assertion
 /// wants, and the queues, sockets and join handles are noise that would bury them.
 impl std::fmt::Debug for Transport {
@@ -1887,6 +1937,7 @@ impl std::fmt::Debug for Transport {
             .field("inbound_dropped", &self.inbound_dropped())
             .field("lost_in_flight", &self.lost_in_flight())
             .field("connect_failures", &self.connect_failures())
+            .field("refused_after_stop", &self.refused_after_stop())
             .field("unencodable", &self.unencodable())
             .field("unaddressable", &self.unaddressable())
             .field("idle_probes", &self.idle_probes())
