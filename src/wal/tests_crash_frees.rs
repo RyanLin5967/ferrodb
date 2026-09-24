@@ -1417,3 +1417,114 @@ fn a_stale_intent_for_a_dropped_root_frees_nothing_of_the_table_re_created_there
     }
     assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "the open left the stale intent in place");
 }
+
+/// A page file whose next sync fails once, when armed.
+struct FailNextSync {
+    inner: Arc<dyn Storage>,
+    armed: AtomicBool,
+}
+
+impl Storage for FailNextSync {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.pwrite(buf, offset)
+    }
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.pread(buf, offset)
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected: this sync fails, once"));
+        }
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// **An intent still pending at a crash frees nothing of the table re-created after its DROP**
+/// (the lead's schedule; PREREG amendment 7). Two arms: the CREATE's checkpoint sync succeeds, or
+/// fails (the table then exists while the statement reports failure, A8's shape).
+///
+/// `DROP t`'s frees clear their bits and then fail at their sync, so the intent stays pending with
+/// its pages quarantined; a freed page is then pinned, so every later retry is refused and the intent
+/// is still pending at the crash. `notes` takes two new pages and `t` is re-created. Its first
+/// directory page CANNOT be the dropped one, which is quarantined, so at the open no table sits at
+/// the intent's root and the intent is carried out. That is right only because the quarantine kept
+/// every page of it away from `notes` and the new `t`: the identity check alone would not.
+///
+/// Mutant-only red: M14 makes `allocate` ignore the quarantine.
+#[test]
+fn an_intent_left_pending_by_a_crash_frees_nothing_of_the_table_re_created_after_its_drop() {
+    for create_sync_fails in [false, true] {
+        let arm = if create_sync_fails { "the CREATE's sync failed" } else { "the CREATE's sync succeeded" };
+        let m = Machine::boot(&Snapshot::default(), None);
+        let after_bitmap = Arc::new(FailSyncAfterBitmap {
+            inner: m.fabric.open(FAB_DB),
+            armed: AtomicBool::new(false),
+            bitmap_written: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let next_sync = Arc::new(FailNextSync { inner: after_bitmap.clone(), armed: AtomicBool::new(false) });
+        let old_pages;
+        {
+            let mut d = m.open_on(next_sync.clone()).expect("open a new database");
+            let s = &mut Session::new();
+            must(&mut d.o, s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
+            for id in 1..=3 {
+                must(&mut d.o, s, &format!("INSERT INTO t VALUES ({id}, {});", id * 10));
+            }
+            must(&mut d.o, s, "CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));");
+            must(&mut d.o, s, &note_sql(0));
+            let old_root = d.o.catalog.get_table("t").expect("t").first_directory_page_id;
+            old_pages = d.o.catalog.table_pages("t").expect("t's pages");
+            after_bitmap.armed.store(true, Ordering::SeqCst);
+            must(&mut d.o, s, "DROP TABLE t;");
+            assert!(after_bitmap.fired.load(Ordering::SeqCst), "{arm}: premise: the sync after the DROP's frees never failed, so its intent was carried out");
+            let bits = allocated(&d.o.bp).expect("read the bitmap");
+            assert!(old_pages.iter().any(|p| !bits.contains(p)), "{arm}: premise: every page of the old t is still allocated, so the quarantine had nothing to keep");
+            // Every later retry of the batch is refused while this pin is held, which is to the crash.
+            d.o.bp.fetch_page(old_pages[0]).expect("pin a page of the old t");
+            must(&mut d.o, s, &note_sql(1));
+            must(&mut d.o, s, &note_sql(2));
+            next_sync.armed.store(create_sync_fails, Ordering::SeqCst);
+            let created = sql(&mut d.o, s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
+            assert_eq!(created.is_err(), create_sync_fails, "{arm}: premise: the CREATE's outcome is not this arm's: {:?}", created.err());
+            let new_root = d.o.catalog.get_table("t").expect("the re-created t").first_directory_page_id;
+            assert_ne!(new_root, old_root, "{arm}: premise: the re-created t took the dropped first directory page, which the quarantine holds");
+            for id in 1..=3 {
+                must(&mut d.o, s, &format!("INSERT INTO t VALUES ({id}, {});", id * 100));
+            }
+            assert!(m.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "{arm}: premise: the intent is not pending at the crash");
+            // The crash, with the pin and the intent still held.
+        }
+        let m2 = Machine::boot(&m.snapshot(), None);
+        {
+            let mut d = m2.open().unwrap_or_else(|e| panic!("{arm}: the open failed: {e}"));
+            assert!(d.o.completed_drops.is_empty(), "{arm}: the open completed a DROP: {:?}", d.o.completed_drops);
+            let bits = allocated(&d.o.bp).expect("read the bitmap");
+            let mut owned = pages_of(&d.o, "t").expect("walk the new t");
+            owned.extend(pages_of(&d.o, "notes").expect("walk notes"));
+            let lost: Vec<u32> = owned.iter().copied().filter(|p| !bits.contains(p)).collect();
+            assert!(lost.is_empty(), "{arm}: the open freed page(s) the re-created t or notes own: {lost:?}");
+            match sql(&mut d.o, &mut Session::new(), "SELECT v FROM t WHERE id = 2;") {
+                Ok(Outcome::Rows(rows)) => assert_eq!(rows, vec![vec![Value::Integer(200)]], "{arm}: row 2 of the re-created t"),
+                other => panic!("{arm}: SELECT of row 2 returned no rows: {:?}", other.err()),
+            }
+            let mut want = Want::default();
+            want.present.insert("t".to_string(), vec![1, 2, 3]);
+            want.present.insert("notes".to_string(), vec![0, 1, 2]);
+            oracle(&mut d.o, &want).unwrap_or_else(|e| panic!("{arm}: after the open: {e}"));
+            let r = walk(&d.o).expect("walk");
+            let left: Vec<u32> = old_pages.iter().copied().filter(|p| bits.contains(p) && !r.owner.contains_key(p)).collect();
+            assert!(left.is_empty(), "{arm}: the intent was not carried out: old t pages still allocated and unnamed: {left:?}");
+        }
+        assert!(!m2.dir.path().join(format!("{DB_NAME}.wal.drop-intent")).exists(), "{arm}: the open left the intent in place");
+    }
+}
