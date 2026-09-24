@@ -67,7 +67,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use crate::catalog::catalog::Catalog;
+use crate::catalog::catalog::{is_internal_table, Catalog};
 use crate::catalog::column::{Column, DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
@@ -395,6 +395,9 @@ struct ShapeAt {
     dir_root: u32,
     entry: Option<(String, Schema, Arc<Vec<String>>)>,
     time_travel_root: Option<u32>,
+    /// D212: `dir_root` is one of the database's own tables (`catalog::is_internal_table`), so its
+    /// records are bookkeeping in the same sense a time-travel heap's are, and `entry` is `None`.
+    internal: bool,
 }
 
 /// Reads a WAL range and produces committed row-level changes.
@@ -442,6 +445,15 @@ impl LogicalDecoder {
         let mut tables = HashMap::new();
         let mut time_travel = BTreeSet::new();
         for (name, entry) in &catalog.tables {
+            // D212: the database's own tables are not user data. Their rows describe merges (what
+            // `REVERT` reads), so a feed that emitted them would hand every consumer the runtime's
+            // bookkeeping as if an agent had written it. Recognised here and counted in
+            // `internal`, exactly as a time-travel heap's archived versions are.
+            if is_internal_table(name) {
+                time_travel.insert(entry.first_directory_page_id);
+                time_travel.insert(entry.time_travel_root);
+                continue;
+            }
             let columns: Vec<String> =
                 entry.schema.columns.iter().map(|c| c.name.clone()).collect();
             tables.insert(
@@ -536,6 +548,9 @@ impl LogicalDecoder {
                 tables.remove(&shape.dir_root);
             }
         }
+        if shape.internal {
+            time_travel.insert(shape.dir_root);
+        }
         if let Some(root) = shape.time_travel_root {
             time_travel.insert(root);
         }
@@ -570,8 +585,11 @@ impl LogicalDecoder {
                 )));
             }
         }
+        let internal = is_internal_table(table);
         let entry = match op {
             DdlOp::DropTable => None,
+            // D212: the database's own tables never decode as rows; see `LogicalDecoder::new`.
+            _ if internal => None,
             _ => {
                 let schema = Schema::new(
                     columns
@@ -595,6 +613,7 @@ impl LogicalDecoder {
                 DdlOp::DropTable => None,
                 _ => Some(time_travel_root),
             },
+            internal: internal && !matches!(op, DdlOp::DropTable),
         })
     }
 
@@ -839,6 +858,32 @@ impl LogicalDecoder {
                 continue;
             }
 
+            // D212: the declaration of one of the database's own tables. Learned — so a decoder that
+            // was built before the table existed, or built blank, still recognises its records as
+            // bookkeeping rather than reporting them `unresolved` — and never emitted: a consumer is
+            // told about the schemas of user tables, and this is not one.
+            if let RecKind::Ddl { op, table, dir_root, time_travel_root, .. } = &rec.kind {
+                if is_internal_table(table) && !matches!(op, DdlOp::DropTable) {
+                    tables.remove(dir_root);
+                    time_travel.insert(*dir_root);
+                    time_travel.insert(*time_travel_root);
+                    learned.push(ShapeAt {
+                        lsn,
+                        dir_root: *dir_root,
+                        entry: None,
+                        time_travel_root: Some(*time_travel_root),
+                        internal: true,
+                    });
+                    if next <= lsn {
+                        return Err(FerroError::Wal(format!(
+                            "log walk did not advance at lsn {lsn}; refusing to loop forever"
+                        )));
+                    }
+                    lsn = next;
+                    continue;
+                }
+            }
+
             match &rec.kind {
                 RecKind::HeapInsert { dir_root, tuple, .. } => {
                     match Self::row_in(&tables, *dir_root, tuple) {
@@ -1011,6 +1056,8 @@ impl LogicalDecoder {
                             DdlOp::DropTable => None,
                             _ => Some(*time_travel_root),
                         },
+                        // Internal tables never reach this arm; they are handled above the match.
+                        internal: false,
                     };
 
                     let change = match op {

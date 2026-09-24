@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_sql::persistent_map::PersistentMap;
+use crate::agent_sql::revert_store::{self, Meta, MERGE_ID_BLOCK};
 
 use crate::catalog::alter::{
     conform_row, refuse_if_the_row_cannot_land, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
@@ -898,6 +899,30 @@ struct State {
     /// in the test suite is a differential test of this index against the scan it replaced.
     txn_refs: BTreeMap<u64, u32>,
     policy: PolicyTable,
+    /// **D212/D217 — where this runtime stands against the durable REVERT counters**
+    /// (`agent_sql::revert_store`). `None` until [`AgentRuntime::attach_history`] has read them,
+    /// which every path that mints a merge id or answers a `REVERT` does first.
+    history: Option<HistoryCursor>,
+    /// **D218 — every txn a `REVERT` has undone, and the merge whose `REVERT` undid it.**
+    ///
+    /// The undo inverts the ops `applied` holds for a txn, and nothing about those ops changes when
+    /// they are inverted. So without this a second `REVERT MERGE` of one id inverted them again,
+    /// and an `Add` merge moved its cell twice (`tel/op.rs`: `Add` is not idempotent). It is also
+    /// what a cascade consults: a dependent an earlier cascade already undid has nothing left to
+    /// undo, and undoing it again is the same double application by another door.
+    reverted: BTreeMap<u64, String>,
+}
+
+/// **D217 — this runtime's position against the durable counters in `revert_store`.**
+#[derive(Debug, Clone)]
+struct HistoryCursor {
+    /// The counters as this runtime last committed or read them; `None` while no row exists.
+    meta: Option<Meta>,
+    /// The merge-id ceiling found when this runtime attached. Every id at or below it was issued, or
+    /// reserved, by an earlier server run. That is a POSITIVE fact read from the database, and it
+    /// is what a `REVERT` refusal keys on — never the absence of an entry in `merges`, which a
+    /// re-issued id walks straight past.
+    boot_merge_floor: u64,
 }
 
 impl State {
@@ -3397,7 +3422,7 @@ impl AgentRuntime {
         // No assertions: a production merge is scored by the gate's own checks. `SIMULATE` adds
         // declared invariants to this same list rather than scoring anywhere else.
         let eval = self.evaluate_merge(ctx, branch, &[])?;
-        let merge_id = self.next_merge_id();
+        let merge_id = self.next_merge_id(ctx)?;
 
         // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
         //
@@ -3426,10 +3451,189 @@ impl AgentRuntime {
 
     /// The next merge id. One per `MERGE` statement and one per admitted candidate, whatever the
     /// outcome, so an id names an admission attempt rather than only a success.
-    fn next_merge_id(&self) -> String {
+    ///
+    /// **D217: never an id an earlier server run issued.** The counter used to live only in
+    /// `State`, so a restarted server minted `m_1` again, and `REVERT MERGE m_1` typed from a
+    /// report written before the restart reverted the NEW merge. Ids are now minted below a
+    /// durable ceiling that is committed before any id above it is handed out (see
+    /// [`revert_store::MERGE_ID_BLOCK`]), and a runtime that attaches to a database starts above the
+    /// ceiling it finds.
+    fn next_merge_id(&self, ctx: &mut ExecCtx) -> Result<String, FerroError> {
+        self.attach_history(&ctx.read())?;
+        let exhausted = {
+            let state = self.state.lock().unwrap();
+            state.next_merge + 1 > merge_ceiling_of(&state)
+        };
+        if exhausted {
+            self.reserve_merge_ids(ctx)?;
+        }
         let mut state = self.state.lock().unwrap();
+        let ceiling = merge_ceiling_of(&state);
+        if state.next_merge + 1 > ceiling {
+            // Unreachable while the statements that mint hold the catalog exclusively. Refused
+            // rather than minted if that ever stops being true: an id above the durable ceiling is
+            // one a restart can issue again, which is D217 by another door.
+            return Err(FerroError::Internal(format!(
+                "no reserved merge id is left: the next would be m_{} and the durable ceiling is \
+                 m_{ceiling}",
+                state.next_merge + 1
+            )));
+        }
         state.next_merge += 1;
-        format!("m_{}", state.next_merge)
+        Ok(format!("m_{}", state.next_merge))
+    }
+
+    // ---- D212: the durable REVERT substrate ------------------------------------------------
+
+    /// **Read the durable REVERT counters, once per runtime.** Idempotent, and after the first call
+    /// it costs one lock and one `Option` test.
+    ///
+    /// # Why every path that mints or answers calls this first
+    ///
+    /// A runtime is built without a catalog (`AgentRuntime::new`, `reopen_with_storage`), so it
+    /// cannot read the database's counters when it is constructed; the first call that brings a
+    /// context is the earliest moment it can. Minting a merge id before that would start from zero
+    /// on a database whose earlier runs already issued `m_1`, which is D217 exactly.
+    ///
+    /// **Refuses** when this runtime minted merge ids of its own before attaching to a database
+    /// that has a ceiling: those ids were minted without knowing it and may repeat an earlier run's.
+    /// No SQL path can reach that state, because every minting path attaches first; the refusal is
+    /// the guard on a caller that drives the runtime directly.
+    pub fn attach_history(&self, ctx: &ReadCtx) -> Result<(), FerroError> {
+        if self.state.lock().unwrap().history.is_some() {
+            return Ok(());
+        }
+        // Read with the state lock NOT held: a scan takes buffer-pool latches, and nothing in this
+        // file does I/O under `state`.
+        let meta = revert_store::read_meta(ctx)?;
+        let mut state = self.state.lock().unwrap();
+        if state.history.is_some() {
+            return Ok(());
+        }
+        let floor = meta.map_or(0, |m| m.merge_ceiling);
+        if floor > 0 && state.next_merge > 0 {
+            return Err(FerroError::Merge(format!(
+                "this runtime minted merge ids up to m_{} before reading the database's merge-id \
+                 ceiling, and earlier server runs already issued or reserved ids up to m_{floor}; \
+                 the ids it minted may repeat theirs, so it will not attach",
+                state.next_merge
+            )));
+        }
+        state.next_merge = state.next_merge.max(floor);
+        state.history = Some(HistoryCursor { meta, boot_merge_floor: floor });
+        Ok(())
+    }
+
+    /// Create whichever of the internal tables do not exist yet, and make their declarations durable
+    /// before any row of theirs can be logged.
+    ///
+    /// **Flushed, not checkpointed**, for the reason `publish_evaluation_as` gives for its own schema
+    /// edits: a checkpoint refuses while any transaction in any session is open, and this runs in
+    /// the middle of a `MERGE`. The catalog is written outside the WAL, so the flush and sync are
+    /// what make a later redo of these tables' rows land in a table the reopened catalog knows.
+    ///
+    /// The `Ddl` record is what lets a change-feed decoder built before these tables existed, or
+    /// built blank, recognise their records as bookkeeping instead of `unresolved`
+    /// (`replication::logical`). The decoder never emits it as a schema change.
+    fn ensure_history_tables(&self, ctx: &mut ExecCtx) -> Result<(), FerroError> {
+        let missing: Vec<(&'static str, Schema)> = revert_store::tables()
+            .into_iter()
+            .filter(|(name, _)| ctx.catalog.get_table(name).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        for (name, schema) in &missing {
+            ctx.catalog.create_table(name.to_string(), schema.clone())?;
+        }
+        ctx.bp.flush_all()?;
+        ctx.bp.disk_manager.sync()?;
+        for (name, schema) in &missing {
+            let (dir_root, time_travel_root) = {
+                let entry = ctx.catalog.require_table(name)?;
+                (entry.first_directory_page_id, entry.time_travel_root)
+            };
+            ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
+                op: crate::wal::log::DdlOp::CreateTable,
+                table: name.to_string(),
+                dir_root,
+                time_travel_root,
+                columns: schema
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                    .collect(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Write the counters row inside the open transaction `txn_id`: an insert when none exists yet,
+    /// otherwise an update of the columns that changed.
+    ///
+    /// **Exactly one row must be affected.** An update that matched nothing reports success while
+    /// persisting nothing, and a ceiling that silently failed to persist is a re-issued merge id
+    /// after the next restart.
+    fn write_meta_in(
+        &self,
+        ctx: &mut ExecCtx,
+        txn_id: u64,
+        before: Option<Meta>,
+        after: Meta,
+    ) -> Result<(), FerroError> {
+        let write = match before {
+            Some(b) if b == after => return Ok(()),
+            Some(b) => PendingWrite::Update {
+                table: revert_store::META_TABLE.to_string(),
+                schema: Meta::schema(),
+                key: Value::Integer(Meta::KEY),
+                row: after.to_row()?,
+                before: b.to_row()?,
+            },
+            None => PendingWrite::Insert {
+                table: revert_store::META_TABLE.to_string(),
+                row: after.to_row()?,
+            },
+        };
+        let n = write.apply_in(ctx, txn_id, None)?;
+        if n != 1 {
+            return Err(FerroError::Internal(format!(
+                "writing {} affected {n} rows, not 1: the durable merge-id ceiling would not be what \
+                 this runtime believes it is",
+                revert_store::META_TABLE
+            )));
+        }
+        Ok(())
+    }
+
+    /// Commit a new merge-id ceiling, in a transaction of its own, before minting above the old one.
+    ///
+    /// The durable ceiling is RE-READ here rather than trusted from the cursor, so two runtimes
+    /// driving one database — a misuse D101 refuses wherever a `ServerContext` is involved — still
+    /// take disjoint blocks rather than the same one.
+    fn reserve_merge_ids(&self, ctx: &mut ExecCtx) -> Result<(), FerroError> {
+        self.ensure_history_tables(ctx)?;
+        let durable = revert_store::read_meta(&ctx.read())?;
+        let after = {
+            let state = self.state.lock().unwrap();
+            let taken = state.next_merge.max(durable.map_or(0, |m| m.merge_ceiling));
+            let mut m = durable.unwrap_or_default();
+            m.merge_ceiling = taken + MERGE_ID_BLOCK;
+            m
+        };
+        let txn_id = ctx.txn.begin()?;
+        if let Err(e) = self.write_meta_in(ctx, txn_id, durable, after) {
+            ctx.txn.abort(txn_id)?;
+            return Err(e);
+        }
+        ctx.txn.commit(txn_id)?;
+        let mut state = self.state.lock().unwrap();
+        // Past anything another run reserved since the cursor was read; never backwards.
+        state.next_merge = state.next_merge.max(after.merge_ceiling - MERGE_ID_BLOCK);
+        if let Some(h) = state.history.as_mut() {
+            h.meta = Some(after);
+        }
+        Ok(())
     }
 
     // ---- D103: CHERRY-PICK, on the production op log ----------------------------------------
@@ -4173,7 +4377,7 @@ impl AgentRuntime {
         }
 
         let outcome = MergeReport::aggregate(&row_outcomes, &[]);
-        let merge_id = self.next_merge_id();
+        let merge_id = self.next_merge_id(ctx)?;
         if outcome.is_conflict() {
             // Nothing is staged and both branches stay alive, so the agent can retry against the
             // predicate it was handed — the same contract a conflicting `MERGE` has.
@@ -4872,7 +5076,7 @@ impl AgentRuntime {
         ctx: &mut ExecCtx,
         eval: MergeEvaluation,
     ) -> Result<MergeReport, FerroError> {
-        let merge_id = self.next_merge_id();
+        let merge_id = self.next_merge_id(ctx)?;
         self.publish_evaluation_as(ctx, eval, merge_id)
     }
 
@@ -5799,54 +6003,83 @@ impl AgentRuntime {
     /// Halt is the default and reverts nothing: the caller is shown the dependency tree first.
     /// Under `Cascade` the downstream transactions are undone before the target, which is the only
     /// order that leaves a consistent state.
+    ///
+    /// # D218 — one transaction, and never twice
+    ///
+    /// Every inverse this revert writes goes into ONE transaction, committed once. It used to be one
+    /// commit per inverted op (`PendingWrite::apply`, "a transaction of its own"), so a cascade that
+    /// failed part-way — a row a later statement deleted, a `Max` that cannot be inverted — left
+    /// some ops inverted, nothing recording which, and a retry inverting the committed ones again.
+    /// Now a failure aborts the transaction and the revert changes nothing.
+    ///
+    /// Once it commits, every txn it undid is recorded in [`State::reverted`], and a second
+    /// `REVERT MERGE` of the same merge — or of a dependent a cascade already undid — is refused.
+    /// Before this the second one re-applied every inverse, so an `Add` merge moved its cell twice.
     pub fn revert_merge(
         &self,
         ctx: &mut ExecCtx,
         merge_id: &str,
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
-        let (targets, rec_branch, graph) = {
+        self.attach_history(&ctx.read())?;
+        let (target, graph, reverted) = {
             let state = self.state.lock().unwrap();
-            let rec = state
-                .merges
-                .get(merge_id)
-                .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
-        };
-        let target = *targets
-            .first()
-            .ok_or_else(|| {
+            let rec = match state.merges.get(merge_id) {
+                Some(rec) => rec.clone(),
+                None => return Err(no_such_merge(&state, merge_id)),
+            };
+            let target = *rec.txns.first().ok_or_else(|| {
                 FerroError::Merge(format!(
                     "merge {} of branch {} recorded no transaction",
-                    merge_id, rec_branch
+                    merge_id, rec.branch
                 ))
             })?;
-        let plan = graph.plan_revert(target, mode);
+            if let Some(by) = state.reverted.get(&target.0) {
+                return Err(already_reverted(merge_id, by));
+            }
+            (target, dependency_graph_of(&state.captures), state.reverted.clone())
+        };
+        let mut plan = graph.plan_revert(target, mode);
+        // A txn an earlier revert undid has no effect left to undo, or to protect. Filtered from
+        // the plan's LISTS only: reachability is still computed over the whole graph, so a dependent
+        // reached THROUGH an undone txn is still named.
+        plan.blocked_by.retain(|t| !reverted.contains_key(&t.0));
+        plan.cascade.retain(|t| !reverted.contains_key(&t.0));
         if plan.is_blocked() {
             return Ok(plan);
         }
         let mut order: Vec<TxnId> = plan.cascade.clone();
         order.push(target);
-        for txn in order {
-            self.undo_txn(ctx, txn)?;
+        let ops: Vec<AppliedOp> = {
+            let state = self.state.lock().unwrap();
+            order.iter().flat_map(|t| ops_of_txn(&state.applied, *t)).collect()
+        };
+        let revert_txn = ctx.txn.begin()?;
+        if let Err(e) = self.undo_txns_in(ctx, revert_txn, &ops) {
+            ctx.txn.abort(revert_txn)?;
+            return Err(e);
+        }
+        ctx.txn.commit(revert_txn)?;
+        let mut state = self.state.lock().unwrap();
+        for t in &order {
+            state.reverted.insert(t.0, merge_id.to_string());
         }
         Ok(plan)
     }
 
-    /// Undo one task's published writes.
+    /// Undo published ops inside the open transaction `txn_id`, in the order given — the caller
+    /// passes each txn's ops newest first, dependents before the txns they depend on.
     ///
     /// The versions this produces are deliberately **unattributed**. A revert is not a write by
     /// the agent whose work is being undone, and stamping it with that agent's `ProvId` would
     /// make the provenance query answer "this agent wrote this row" about a row the agent never
     /// wrote — the exact question criterion 9 exists to answer correctly.
-    fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
-        let ops: Vec<AppliedOp> = {
-            let state = self.state.lock().unwrap();
-            let mut v: Vec<AppliedOp> =
-                state.applied.iter().filter(|a| a.txn == txn).cloned().collect();
-            v.sort_by(|a, b| b.seq.cmp(&a.seq));
-            v
-        };
+    fn undo_txns_in(
+        &self,
+        ctx: &mut ExecCtx,
+        txn_id: u64,
+        ops: &[AppliedOp],
+    ) -> Result<(), FerroError> {
         for a in ops {
             let entry = ctx
                 .catalog
@@ -5856,17 +6089,20 @@ impl AgentRuntime {
             match (&a.kind, a.col) {
                 (OpKind::RowCreate(row), _) => {
                     PendingWrite::Delete { table: a.table.clone(), key: row[0].clone() }
-                        .apply(ctx, None)?;
+                        .apply_in(ctx, txn_id, None)?;
                 }
                 (OpKind::RowDelete, _) => {
                     let row = a.before_row.clone().ok_or_else(|| {
                         FerroError::Merge("cannot revert a delete with no before-image".into())
                     })?;
-                    PendingWrite::Insert { table: a.table.clone(), row }.apply(ctx, None)?;
+                    PendingWrite::Insert { table: a.table.clone(), row }
+                        .apply_in(ctx, txn_id, None)?;
                 }
                 (kind, Some(col)) => {
                     let inverse = invert(kind, a.before.as_ref())?;
-                    let rows = scan_table(&a.table, &ctx.read())?;
+                    // Read through THIS transaction: a cascade can invert two ops on one cell, and
+                    // the second inverse has to start from the first one's uncommitted result.
+                    let rows = scan_table_in_txn(&a.table, &ctx.read(), txn_id)?;
                     let cur = rows
                         .into_iter()
                         .find(|r| row_id_of(r) == a.row)
@@ -5887,7 +6123,7 @@ impl AgentRuntime {
                         row: new_row,
                         before: cur,
                     }
-                    .apply(ctx, None)?;
+                    .apply_in(ctx, txn_id, None)?;
                 }
                 (kind, None) => {
                     return Err(FerroError::Merge(format!(
@@ -6306,7 +6542,7 @@ fn blind_writes_of(
 ///
 /// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
 /// final element is not necessarily the largest. One pass per merge, the same order of cost
-/// `undo_txn` already pays per revert over the same vector.
+/// `ops_of_txn` already pays per reverted txn over the same vector.
 fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
     applied.iter().map(|a| a.seq).max()
 }
@@ -6332,6 +6568,57 @@ fn fresh_reservation(highest: Option<u64>, base: u64) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// The durable merge-id ceiling as this runtime last read or committed it. 0 before the first
+/// reservation, which is what makes the first mint reserve.
+fn merge_ceiling_of(state: &State) -> u64 {
+    state.history.as_ref().and_then(|h| h.meta).map_or(0, |m| m.merge_ceiling)
+}
+
+/// The number in a merge id `m_<n>`, or `None` for anything that is not one.
+fn merge_number(merge_id: &str) -> Option<u64> {
+    merge_id.strip_prefix("m_")?.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// **D217 — why an id names no merge this runtime can revert, as a fact about the id.**
+///
+/// The refusal this replaces keyed on the absence of the id from `merges` alone, and was therefore
+/// only as safe as the ids were unique: once a restarted server re-issued `m_1`, the lookup found
+/// the NEW merge and reverted it. Ids no longer repeat, and the earlier-run case is now decided by
+/// the durable ceiling read at attach ([`HistoryCursor::boot_merge_floor`]), which is a positive
+/// fact about the database rather than a miss in a map.
+fn no_such_merge(state: &State, merge_id: &str) -> FerroError {
+    let floor = state.history.as_ref().map_or(0, |h| h.boot_merge_floor);
+    match merge_number(merge_id) {
+        Some(n) if n <= floor => FerroError::Merge(format!(
+            "{merge_id} was issued by an earlier server run: every merge id up to m_{floor} was \
+             issued or reserved before this server started, and this run's ids start above it. \
+             REVERT reaches only the merges this server run published, so {merge_id} cannot be \
+             reverted here"
+        )),
+        Some(n) if n <= state.next_merge => FerroError::Merge(format!(
+            "unknown merge {merge_id}: it was issued by this server run but published nothing — a \
+             conflicting or quarantined MERGE, or a SIMULATE candidate that was not admitted"
+        )),
+        _ => FerroError::Merge(format!("unknown merge {merge_id}")),
+    }
+}
+
+/// **D218 — a second revert of a merge whose ops are already inverted.**
+fn already_reverted(merge_id: &str, by: &str) -> FerroError {
+    FerroError::Merge(format!(
+        "{merge_id} was already reverted, by REVERT MERGE {by}. Its ops have been inverted once, \
+         and inverting them again would apply every inverse a second time — an Add would move its \
+         cell twice — so this REVERT is refused and changes nothing"
+    ))
+}
+
+/// One txn's published ops, newest first: the order they have to be undone in.
+fn ops_of_txn(applied: &[AppliedOp], txn: TxnId) -> Vec<AppliedOp> {
+    let mut v: Vec<AppliedOp> = applied.iter().filter(|a| a.txn == txn).cloned().collect();
+    v.sort_by(|a, b| b.seq.cmp(&a.seq));
+    v
 }
 
 /// Why a read was taken, which is what decides whether it counts as an INSPECTION.
@@ -6662,14 +6949,10 @@ impl PendingWrite {
         apply_dml_in(stmt, ctx, txn_id, author)
     }
 
-    /// Publish in a transaction of its own.
-    fn apply(self, ctx: &mut ExecCtx, author: Author) -> Result<usize, FerroError> {
-        let stmt = match self.into_stmt(ctx)? {
-            Some(s) => s,
-            None => return Ok(0),
-        };
-        apply_dml(stmt, ctx, author)
-    }
+    // D218: `apply` — "publish in a transaction of its own" — was deleted with its only caller.
+    // `REVERT` used it once per inverted op, which is what made a failed cascade half-applied and
+    // left nothing recording which half. Every write now goes through `apply_in` into a transaction
+    // the caller owns, so there is no per-op-commit door left to reach for by accident.
 
     /// `None` when the write turned out to be a no-op.
     fn into_stmt(self, ctx: &mut ExecCtx) -> Result<Option<Stmt>, FerroError> {
@@ -6722,21 +7005,6 @@ impl PendingWrite {
     }
 }
 
-/// Run a DML statement against the shared tables in its own transaction.
-fn apply_dml(stmt: Stmt, ctx: &mut ExecCtx, author: Author) -> Result<usize, FerroError> {
-    let txn_id = ctx.txn.begin()?;
-    match apply_dml_in(stmt, ctx, txn_id, author) {
-        Ok(n) => {
-            ctx.txn.commit(txn_id)?;
-            Ok(n)
-        }
-        Err(e) => {
-            ctx.txn.abort(txn_id)?;
-            Err(e)
-        }
-    }
-}
-
 /// Run a DML statement inside an already-open transaction. The caller owns commit and abort.
 fn apply_dml_in(
     stmt: Stmt,
@@ -6761,6 +7029,37 @@ fn apply_dml_in(
 /// Every row of `table`, unfiltered. The callers that diff, merge and sweep want exactly that.
 pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
     scan_table_where(table, None, None, ctx)
+}
+
+/// Every row of `table` as the open transaction `txn_id` sees it — its own uncommitted writes
+/// included.
+///
+/// D218: `REVERT` is one transaction now, and a cascade can invert two ops on one cell. The second
+/// inverse has to be computed from the first one's result, which only this transaction can see; the
+/// committed snapshot [`scan_table`] reads would hand it the pre-revert value, and the first inverse
+/// would be overwritten without any error.
+fn scan_table_in_txn(
+    table: &str,
+    ctx: &ReadCtx,
+    txn_id: u64,
+) -> Result<Vec<Vec<Value>>, FerroError> {
+    let view = Arc::new(ReadView { snapshot: Arc::new(ctx.txn.snapshot_of(txn_id)?), txn_id });
+    let stmt = Stmt::Select {
+        from: TableRef::plain(table.to_string(), None),
+        columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],
+        where_clause: None,
+        joins: Vec::new(),
+    };
+    match plan(stmt, ctx.catalog, ctx.bp.clone(), None, view)? {
+        Plan::Read(mut root) => {
+            let mut out = Vec::new();
+            while let Some(next) = root.next() {
+                out.push(next?.1);
+            }
+            Ok(out)
+        }
+        Plan::Write(_) => Err(FerroError::Bind("expected a read plan".into())),
+    }
 }
 
 /// The rows of `table` that satisfy `where_clause`, with the predicate PUSHED INTO THE PLANNER.

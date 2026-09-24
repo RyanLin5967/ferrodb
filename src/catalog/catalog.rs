@@ -12,6 +12,23 @@ use crate::storage::index_fulltext::{indexed_text, post_tokens};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
+/// **D212 — the prefix of the tables the database keeps for itself.**
+///
+/// The agent runtime stores what `REVERT` reads in ordinary heap tables, so that a merge's
+/// history commits in the same WAL transaction as the rows it describes. Those tables are
+/// named with a `:` in them, and that character is the whole guard: the SQL scanner reads an
+/// identifier as `[A-Za-z_][A-Za-z0-9_]*` and has no quoted form, so no statement anyone can type
+/// names one of these tables. Writing to, altering or dropping them from SQL is not refused — it
+/// is not expressible. The only doors are the runtime's own, which build statements as syntax
+/// trees and never as text.
+pub const INTERNAL_TABLE_PREFIX: &str = "ferro:";
+
+/// Whether `name` is one of the database's own tables rather than a user's. See
+/// [`INTERNAL_TABLE_PREFIX`].
+pub fn is_internal_table(name: &str) -> bool {
+    name.starts_with(INTERNAL_TABLE_PREFIX)
+}
+
 #[derive(Clone)]
 pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
@@ -194,7 +211,10 @@ impl Catalog {
     /// message lived in the binder and the planner had its own literal. This is that message, moved
     /// to where the table list actually is so there is nothing left to reimplement.
     pub fn unknown_table(&self, name: &str) -> FerroError {
-        let mut known: Vec<&str> = self.tables.keys().map(|s| s.as_str()).collect();
+        // The database's own tables are not offered: their names cannot be typed, so listing them
+        // would suggest a table the reader has no way to reach (see `INTERNAL_TABLE_PREFIX`).
+        let mut known: Vec<&str> =
+            self.tables.keys().map(|s| s.as_str()).filter(|n| !is_internal_table(n)).collect();
         known.sort_unstable();
         FerroError::Bind(if known.is_empty() {
             format!("unknown table '{name}'; this database has no tables yet — CREATE TABLE one first")
