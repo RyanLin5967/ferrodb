@@ -713,7 +713,12 @@ def finish(code):
     except Exception as e:
         print(f"RESTORE FAILED ({e!r}); {LAST_PATH} may still hold a mutant. Exit 2.{interrupt_note()}")
         return 2
-    if LAST_PATH is not None and not at_head(LAST_PATH):
+    try:
+        verified = LAST_PATH is None or at_head(LAST_PATH)
+    except Exception as e:
+        print(f"Could not verify {LAST_PATH} against HEAD ({e!r}). Exit 2.{interrupt_note()}")
+        return 2
+    if not verified:
         print(f"{LAST_PATH} does NOT match HEAD. Exit 2.{interrupt_note()}")
         return 2
     if FOREIGN_EDIT:
