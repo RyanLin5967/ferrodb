@@ -9,7 +9,7 @@
  
          // The statistics are carried across the alteration by [`carried_stats`], and they are
          // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
-@@ -765,6 +765,9 @@
+@@ -784,6 +784,9 @@
              stats.columns = columns;
          }
          let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;

@@ -47,6 +47,14 @@ MUTANTS = [
         "        if self.require_table(&table)? != &read {\n",
         "        if false && self.require_table(&table)? != &read {\n",
     )]),
+    # PREREG amendment 6 (the D249 review 3, H1): the live schema overwritten before the compare,
+    # which is the form the check had at fa2e9a3.
+    ("E7_schema_overwritten_before_compare", ALTER, [(
+        "        if self.require_table(&table)? != &read {\n",
+        "        let mut live = self.require_table(&table)?.clone();\n"
+        "        live.schema = read.schema.clone();\n"
+        "        if live != read {\n",
+    )]),
 ]
 
 
