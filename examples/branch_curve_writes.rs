@@ -2695,10 +2695,13 @@ fn read_vs_n_summary(
     if fire == Fire::CkptDdl {
         println!(
             "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads the replay-bytes integer; the \
-             replay-bytes line above must carry the pre-registered intercept. Every NOT A RESULT below is GRADED \
-             (A18.3-A18.5): A14.1's refusal of a moved base = a finding (the premise changed; amend before \
-             reading); A13.9's refusal = DID_NOT_FIRE (the record was retained, but no axis-(ii) checkpoint \
-             truncated to re-append it); PARENT_PASS and a failed close = findings; any other = a finding."
+             replay-bytes line above must carry the pre-registered intercept. Every NOT A RESULT below is to be \
+             graded (A18.3-A18.5, A20.2-A20.4): `A14.1: ckpt-ddl's base MOVED ...` = a finding (the premise \
+             changed; amend before reading); `A12.1: CURVE_FIRECHECK=ckpt-ddl was requested but no axis-(ii) \
+             checkpoint truncated ...` (A13.9) = DID_NOT_FIRE (the record was retained, but nothing re-appended \
+             it); `the parent's first lease pass did not finish ...` (PARENT_PASS), `the production database did \
+             not close cleanly ...` (CLOSE) and `LEASE ...` = findings, each ALSO a finding beside A13.9's line \
+             (A20.2); any other = a finding."
         );
     } else if fire != Fire::None {
         // A20.1: what must fire and what is allowed beside it, by id, from `Fire::expects`.
