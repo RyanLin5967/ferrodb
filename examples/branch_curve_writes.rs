@@ -1517,7 +1517,10 @@ fn lease_end(stats: &LeaseStats, at: &str, failures: &mut Vec<String>) {
 fn reopen_for_merges(db: OpenDatabase, db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
     let (lease_stats, closed) = db.close();
     lease_end(&lease_stats, "(the close before a merge batch)", failures);
-    closed.expect("close cleanly before a merge batch");
+    // A21.1: returned to `main` through `failures`, not a panic, so the summary prints it.
+    if let Err(e) = closed {
+        failures.push(format!("CLOSE (the close before a merge batch): {e}"));
+    }
     parent_open(db_path, failures)
 }
 
@@ -2020,7 +2023,10 @@ fn main() {
                 // Not `lease`: that names the LeaseDeadline every fork in this loop uses.
                 let (lease_stats, closed) = db.take().expect("the production database is open").close();
                 lease_end(&lease_stats, &format!("N={done} (the parent's close before the restart)"), &mut failures);
-                closed.expect("close cleanly before the restart");
+                // A21.1: returned to `main` through `failures`, not a panic, so the summary prints it.
+                if let Err(e) = closed {
+                    failures.push(format!("CLOSE N={done} (the parent's close before the restart): {e}"));
+                }
                 // Every handle into the files goes before the child opens them.
                 drop(hd);
                 // What the child is about to replay (A7.1, A7.3), sized after the clean close.
