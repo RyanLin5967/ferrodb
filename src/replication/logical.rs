@@ -1901,4 +1901,90 @@ mod tests {
         assert_eq!(by_txn(2), vec![ChangeOp::Insert { new: row(7, 70) }]);
         assert_eq!(by_txn(1), vec![ChangeOp::Update { old: row(5, 50), new: row(5, 55) }]);
     }
+
+    /// U8 (review C1). The mark lasts exactly one record. A live `HeapDelete`, then a SQL DELETE of
+    /// row 6 (a killed `HeapUpdate`), then an INSERT of row 6 (an E63 reuse): the INSERT's
+    /// predecessor is a `Delete` of the same table and key, so only the mark's clearing stands
+    /// between it and a false UPDATE. U4 cannot see that, because its middle record is an `Update`,
+    /// which the fused path rejects by itself.
+    #[test]
+    fn a_mark_does_not_outlive_the_next_record() {
+        let (_d, w) = wal("mark_lifetime");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 1,
+                old: tuple_bytes(6, Some(60)),
+                new: dead_tuple_bytes(6, 60),
+            },
+        )
+        .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(6, Some(66)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        let ops: Vec<ChangeOp> = out.events.iter().map(|e| e.op.clone()).collect();
+        assert_eq!(
+            ops,
+            vec![
+                ChangeOp::Delete { old: row(5, 50) },
+                ChangeOp::Delete { old: row(6, 60) },
+                ChangeOp::Insert { new: row(6, 66) },
+            ],
+            "a mark outlived the record after it and fused a reuse into an UPDATE"
+        );
+    }
+
+    /// U9 (review C2). The fused UPDATE is stamped with the `HeapDelete`'s LSN, and that is
+    /// load-bearing: `open_from` is the minimum staged LSN, and `FeedStreamer::pump` never moves its
+    /// cursor past it. For a transaction still open where a range ends — a pump boundary — the
+    /// cursor must stay at the delete, or the next pump starts after it and ships a lone INSERT.
+    #[test]
+    fn a_pair_open_at_the_end_of_a_range_holds_the_cursor_at_the_delete() {
+        let (_d, w) = wal("open_pair");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let delete_lsn = w
+            .append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: tuple_bytes(5, Some(50)) })
+            .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+
+        // No Commit yet: the range ends with the transaction open, as at a pump boundary.
+        let out = decode_all(&decoder(), &w);
+        assert!(out.events.is_empty(), "an open transaction's change was emitted: {:?}", out.events);
+        assert_eq!(
+            out.open_from,
+            Some(delete_lsn),
+            "the cursor would be clamped past the relocation's first half"
+        );
+
+        // Committed, the one UPDATE carries the same LSN.
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"]);
+        assert_eq!(out.events[0].lsn, delete_lsn, "the UPDATE is not stamped where its first half sits");
+    }
+
+    /// U10 (review C4). A table is its `dir_root`; a name can be shared. Two roots under one name:
+    /// a live delete at one and an insert of the same key at the other are two different rows.
+    #[test]
+    fn a_same_named_table_at_another_dir_root_is_not_paired() {
+        let mut d = decoder();
+        d.tables.insert(
+            12u32,
+            ("inventory".to_string(), schema(), Arc::new(vec!["id".to_string(), "qty".to_string()])),
+        );
+        let (_d, w) = wal("same_name");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 12, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&d, &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"], "rows in two tables were fused by name");
+    }
 }
