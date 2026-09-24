@@ -501,7 +501,8 @@ impl TwoTierReaper {
             Err(_) if missing == MissingOwner::Gone && self.record_is_absent(owner.id) => true,
             Err(_) => {
                 self.unreadable_owners.fetch_add(1, Ordering::Relaxed);
-                false
+                // MUTANT (fire-check only, never land): an unreadable owner is taken as gone.
+                true
             }
         };
         if !owner_gone {
