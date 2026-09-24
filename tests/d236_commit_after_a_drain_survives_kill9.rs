@@ -13,58 +13,65 @@
 //! # The schedule, and why every step is there
 //!
 //! This is the single-session shape (b) from `frontier/d236_adversary.md` §3 in artie-research.
+//! 0. A CONTROL row, `c(7)`, committed the ordinary way. Its `Commit` follows its own `Begin` and
+//!    `HeapInsert`, so it is written under `>=` as well. After the reopen it must be there at every
+//!    commit, which separates "the drained COMMIT was lost" from "the reopen lost committed data".
 //! 1. `BEGIN`, then insert about 2.5x the buffer pool into one table: 2600 rows, one per heap page.
 //!    The pool is `MAX_BUFFER_POOL_PAGES` = 1024 frames at `9aa6968`. Evictions during the load
 //!    drain the log, but the load's last records are appended after the last drain.
-//! 2. A `SELECT` that scans every page and matches nothing. It appends no record, and faulting the
-//!    early pages back in cycles the whole pool. That evicts the load's most recent dirty pages,
-//!    whose LSNs are past `flushed_lsn`, so the gate drains the buffer. From here on,
-//!    `flushed_lsn == next_lsn`.
+//! 2. A `SELECT` that scans every page and matches nothing. It appends no record, and its faults
+//!    must evict at least one dirty page whose LSN is past `flushed_lsn`, which drains the buffer.
+//!    The pool is ARC, not LRU, so "must" is a premise, and the test checks it (below).
 //! 3. `COMMIT`. Its `Commit` starts exactly at `flushed_lsn`. Under `>=` it is acknowledged and not
 //!    written.
 //! 4. `kill -9` as soon as COMMIT is acknowledged, before anything else can flush.
-//! 5. Reopen (recovery runs) and look the first and last rows up.
+//! 5. Reopen (recovery runs), check the control, and look up the first and last rows.
 //!
-//! # How the test knows the drain happened (the premise)
+//! # The premises, each checked and each refusing rather than passing
 //!
-//! It watches the WAL FILE. The log is written only by `flush`, which appends the drained buffer
-//! at its end, so `<db>.wal` grows exactly when a flush writes something. The file's length is
-//! read after the load and again after the SELECT, and it MUST have grown: that growth is the
-//! drain step 3 depends on. Nothing else in the CLI flushes: the lease thread never touches the
-//! WAL, and the SELECT appends nothing. A drain empties the buffer, so it leaves
-//! `flushed_lsn == next_lsn`. Without the growth the test refuses, instead of passing or failing
-//! for a reason it did not create.
+//! * **The scan drained the log.** While a transaction is open, `<db>.wal` grows only by `flush`,
+//!   which always drains the whole buffer and appends it at the file's end. `new` runs only at
+//!   startup, and `truncate` only from a checkpoint, which needs no open transaction. So the file
+//!   growing during the scan means a full drain, and the scan appends nothing after it:
+//!   `flushed_lsn == next_lsn` at COMMIT.
+//! * **No checkpoint ran at COMMIT.** One would flush the `Commit` on its way to truncating, and
+//!   erase the red. `FERRODB_CHECKPOINT_INTERVAL` is removed from the child's environment for that
+//!   reason, and the file must not have shrunk at COMMIT, because a truncation can only shrink it.
+//! * **The reopen works.** The control row must be there.
 //!
-//! The length after COMMIT is also printed in the failure message. Under `>` it grows again (the
-//! `Commit` reached the disk); under `>=` it does not.
+//! The WAL length after COMMIT is also printed on failure. Under `>` it grows again (the `Commit`
+//! reached the disk); under `>=` it does not.
 //!
-//! Pre-registered from source, UNBUILT: FAILS at `9aa6968` at the "row is gone" assertion. The
-//! premise holds there.
+//! Pre-registered from source, UNBUILT: FAILS at `9aa6968` at "row 1 is gone", with every premise
+//! holding. PASSES with the fix.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-/// Heap pages this test's table occupies: one row per page (see `PAD`). About 2.5x the pool.
+/// Heap pages this test's table occupies: one row per page (see `PAD`). That is about 2.5x the
+/// 1024-frame pool, so the scan faults in more pages than the pool can hold.
 const ROWS: usize = 2600;
-/// The pool at `9aa6968` (`MAX_BUFFER_POOL_PAGES` in `src/buffer/buffer_pool.rs`). The scan must
-/// fault in more pages than this, or it may not cycle the pool at all.
-const POOL_FRAMES: usize = 1024;
 /// Two tuples of this size cannot share a 4 KiB page, so each row gets a heap page of its own.
 const PAD: usize = 2100;
 /// Ordinary-table pages below the arena floor. The table needs about `ROWS` of them plus its
 /// directory and index pages, and the floor is a hard ceiling (see `arena_headroom` in the CLI).
-const HEADROOM: u32 = 8192;
+const HEADROOM: u32 = 4096;
 /// A debug-build CLI loading and scanning a few thousand wide rows is slow. The bound is for a
-/// hang, not for speed.
+/// hang, not for speed, and it applies to every wait: no write here can block (see `Cli::send`).
 const PATIENCE: Duration = Duration::from_secs(900);
+/// The control row's key.
+const CONTROL: u32 = 7;
 
 struct Cli {
     child: Child,
     stdin: ChildStdin,
     lines: Receiver<String>,
+    /// The last lines the CLI printed on either stream, for every failure message.
+    recent: VecDeque<String>,
 }
 
 impl Cli {
@@ -72,6 +79,8 @@ impl Cli {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferrodb"))
             .arg(db)
             .env("FERRODB_ARENA_HEADROOM", HEADROOM.to_string())
+            // An inherited interval of 1 checkpoints at COMMIT and erases the red (see the header).
+            .env_remove("FERRODB_CHECKPOINT_INTERVAL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -79,8 +88,6 @@ impl Cli {
             .expect("spawn ferrodb");
         let stdin = child.stdin.take().unwrap();
         let (tx, lines) = channel();
-        // Both streams are read on their own threads for the whole life of the process. A load
-        // written to stdin while nothing reads stdout deadlocks once the pipe fills.
         let out = child.stdout.take().unwrap();
         let tx_out = tx.clone();
         std::thread::spawn(move || {
@@ -98,34 +105,92 @@ impl Cli {
                 }
             }
         });
-        Cli { child, stdin, lines }
+        Cli { child, stdin, lines, recent: VecDeque::new() }
     }
 
+    /// One statement at a time. Each is under 8 KiB, well inside a pipe's buffer, so the write
+    /// cannot block even on a CLI that has stopped reading. The wait for its output is bounded.
     fn send(&mut self, sql: &str) {
-        self.stdin.write_all(sql.as_bytes()).expect("write sql");
-        self.stdin.write_all(b"\n").expect("write sql");
-        self.stdin.flush().expect("flush stdin");
+        let wrote = self
+            .stdin
+            .write_all(sql.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush());
+        if let Err(e) = wrote {
+            let head: String = sql.chars().take(60).collect();
+            self.die(&format!("writing `{head}` to the CLI failed: {e}"));
+        }
     }
 
-    /// Read output until `count` lines have ended with `marker`. A failed statement fails the test
-    /// at once, because everything after one would mean nothing.
-    fn expect(&self, marker: &str, count: usize, what: &str) {
-        let mut seen = 0;
-        while seen < count {
-            let line = self
-                .lines
-                .recv_timeout(PATIENCE)
-                .unwrap_or_else(|_| panic!("{what}: no `{marker}` within {PATIENCE:?} ({seen} of {count})"));
-            assert!(!failed(&line), "{what}: the CLI reported {line}");
-            if !line.starts_with("stderr: ") && line.trim_end().ends_with(marker) {
-                seen += 1;
+    fn die(&mut self, msg: &str) -> ! {
+        // Whatever is already queued may be the cause: show it.
+        while let Ok(l) = self.lines.try_recv() {
+            self.remember(l);
+        }
+        let recent: Vec<&str> = self.recent.iter().map(|s| s.as_str()).collect();
+        panic!("{msg}\n--- the CLI's last lines ---\n{}", recent.join("\n"))
+    }
+
+    fn remember(&mut self, l: String) {
+        self.recent.push_back(l);
+        if self.recent.len() > 20 {
+            self.recent.pop_front();
+        }
+    }
+
+    fn next_line(&mut self, what: &str) -> String {
+        match self.lines.recv_timeout(PATIENCE) {
+            Ok(l) => {
+                self.remember(l.clone());
+                if failed(&l) {
+                    self.die(&format!("{what}: the CLI reported {l}"));
+                }
+                l
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.die(&format!("{what}: no output for {PATIENCE:?}"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = self.child.try_wait();
+                self.die(&format!("{what}: the CLI exited ({status:?})"))
+            }
+        }
+    }
+
+    /// Read until a stdout line ends with `marker`.
+    fn expect(&mut self, marker: &str, what: &str) {
+        loop {
+            let l = self.next_line(what);
+            if !l.starts_with("stderr: ") && l.trim_end().ends_with(marker) {
+                return;
+            }
+        }
+    }
+
+    /// The count line of a SELECT: `(1 row)` or `(N rows)`, whichever comes.
+    fn row_count(&mut self, what: &str) -> String {
+        loop {
+            let l = self.next_line(what);
+            let t = l.trim_end();
+            if !l.starts_with("stderr: ") && (t.ends_with("row)") || t.ends_with("rows)")) {
+                return l;
             }
         }
     }
 }
 
+impl Drop for Cli {
+    /// A wedged child must not outlive the test (memory: load harnesses must not orphan). After the
+    /// explicit kill or `.exit` below, this is a no-op.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A statement failed. The CLI reports failures on stderr as `error: ...`, `parser error: ...` or
-/// `fatal error: ...`, and nothing else it writes there says `error`.
+/// `fatal error: ...`. A crash's panic text is not caught here, but it ends the stream, and
+/// `next_line` reports the exit together with the last lines.
 fn failed(line: &str) -> bool {
     line.starts_with("stderr: ") && line.contains("error")
 }
@@ -136,42 +201,48 @@ fn wal_len(db: &Path) -> u64 {
 
 #[test]
 fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
-    assert!(ROWS > 2 * POOL_FRAMES, "fixture: the scan must fault in more than the pool holds");
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("d236.db");
     let pad = "x".repeat(PAD);
 
     // ---- the victim ------------------------------------------------------------------------
     let mut cli = Cli::open(&db);
+    cli.send("CREATE TABLE c (id INTEGER NOT NULL);");
+    cli.expect("ok", "CREATE TABLE c");
+    cli.send(&format!("INSERT INTO c VALUES ({CONTROL});"));
+    cli.expect("(1 row affected)", "the control row");
     cli.send("CREATE TABLE t (id INTEGER NOT NULL, pad VARCHAR(2100));");
-    cli.expect("ok", 1, "CREATE TABLE");
+    cli.expect("ok", "CREATE TABLE t");
     cli.send("BEGIN;");
-    cli.expect("ok", 1, "BEGIN");
-    let mut load = String::with_capacity(ROWS * (PAD + 48));
+    cli.expect("ok", "BEGIN");
     for id in 1..=ROWS {
-        load.push_str(&format!("INSERT INTO t VALUES ({id}, '{pad}');\n"));
+        cli.send(&format!("INSERT INTO t VALUES ({id}, '{pad}');"));
+        cli.expect("(1 row affected)", "the load");
     }
-    cli.send(load.trim_end());
-    cli.expect("(1 row affected)", ROWS, "the load");
 
     let after_load = wal_len(&db);
     cli.send("SELECT id FROM t WHERE pad = 'no row has this pad';");
-    cli.expect("(0 rows)", 1, "the scan");
+    cli.expect("(0 rows)", "the scan");
     let after_scan = wal_len(&db);
     assert!(
         after_scan > after_load,
         "premise failed: the WAL file did not grow during the scan ({after_load} -> {after_scan} \
          bytes), so the eviction gate never drained the log and COMMIT's record does not start at \
-         the flushed point. This run proves nothing either way"
+         the flushed point. This run proves nothing either way; raise ROWS"
     );
 
     cli.send("COMMIT;");
-    cli.expect("ok", 1, "COMMIT");
+    cli.expect("ok", "COMMIT");
     let after_commit = wal_len(&db);
     // Acknowledged. Kill before anything else can flush the log.
     cli.child.kill().expect("SIGKILL");
     let _ = cli.child.wait();
     drop(cli);
+    assert!(
+        after_commit >= after_scan,
+        "premise failed: the WAL file shrank at COMMIT ({after_scan} -> {after_commit} bytes), so a \
+         checkpoint truncated it and flushed the Commit on its way. This run proves nothing"
+    );
 
     // A SIGKILLed CLI leaves its lock file behind by design (`storage/db_lock.rs`). Removing it is
     // what an operator does once the process is known dead, and `wait` above established that.
@@ -179,26 +250,23 @@ fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
 
     // ---- the reopen: recovery runs here ---------------------------------------------------
     let mut cli = Cli::open(&db);
+    cli.send(&format!("SELECT id FROM c WHERE id = {CONTROL};"));
+    let control = cli.row_count("the control row after the reopen");
+    assert!(
+        control.trim_end().ends_with("(1 row)"),
+        "premise failed: after the reopen the control row, committed the ordinary way, is gone too. \
+         The reopen itself lost committed data, and says nothing about the drained COMMIT. Got: \
+         {control}"
+    );
     for id in [1, ROWS] {
         cli.send(&format!("SELECT id FROM t WHERE id = {id};"));
-        // `(1 row)` if the transaction survived; `(0 rows)` if recovery undid it. Read whichever
-        // comes, so the failure says which.
-        let line = loop {
-            let l = cli.lines.recv_timeout(PATIENCE).expect("the reopened CLI went quiet");
-            assert!(!failed(&l), "the reopened CLI reported {l}");
-            if l.starts_with("stderr: ") {
-                continue;
-            }
-            if l.trim_end().ends_with("row)") || l.trim_end().ends_with("rows)") {
-                break l;
-            }
-        };
+        let line = cli.row_count("the victim's rows after the reopen");
         assert!(
             line.trim_end().ends_with("(1 row)"),
-            "row {id} is gone after kill -9: COMMIT was acknowledged, but its Commit record never \
-             reached the log, and recovery undid the transaction. WAL bytes after the load \
-             {after_load}, after the scan {after_scan}, after COMMIT {after_commit} (equal to the \
-             scan's means COMMIT wrote nothing). Got: {line}"
+            "row {id} is gone after kill -9, while the control row survived: COMMIT was acknowledged, \
+             but its Commit record never reached the log, and recovery undid the transaction. WAL \
+             bytes after the load {after_load}, after the scan {after_scan}, after COMMIT \
+             {after_commit} (equal to the scan's means COMMIT wrote nothing). Got: {line}"
         );
     }
     cli.send(".exit");
