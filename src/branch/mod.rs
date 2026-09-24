@@ -336,6 +336,11 @@ pub trait BranchCatalog: Send + Sync {
     /// over pages parked under its name — a generation-checked read would refuse exactly when the
     /// answer matters most.
     ///
+    /// **One read-only exception (D199):** `AgentRuntime::attest_landed_reaps` reads the
+    /// `generation` alone, to tell a reap that has landed (`mark_reaped` bumped it) from one still
+    /// `Reaping`. `get` refuses both with the same stringified error. It acts on nothing in the
+    /// record.
+    ///
     /// On the trait rather than inherent on one implementation because `ArenaPageStore` and
     /// `TwoTierReaper` held `Arc<LogBranchCatalog>` *concretely* in order to reach it, which meant
     /// no other catalog could ever be installed under them.

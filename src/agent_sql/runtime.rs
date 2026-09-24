@@ -1276,8 +1276,8 @@ pub struct AgentRuntime {
     /// an entry for any other branch rather than root it at genesis: a fork from such a parent
     /// fails its `BEGIN AGENT SESSION`, and a merge into, or reap of, such a branch commits with
     /// no entry and is counted by [`AgentRuntime::attestation_refusals`]. A lease-expiry reap is
-    /// attested from the forget path that drops its workspace (D199,
-    /// [`AgentRuntime::attest_forgotten_reaps`]).
+    /// attested from the forget paths once it has landed (D199,
+    /// [`AgentRuntime::attest_landed_reaps`]).
     attested: Mutex<AttestedHistory>,
 }
 
@@ -3770,6 +3770,17 @@ impl AgentRuntime {
         published: bool,
     ) -> Result<(), AppendRefused> {
         let mut h = self.attested.lock().unwrap();
+        Self::append_reap(&mut h, branch, epoch, published)
+    }
+
+    /// The `Reap` entry itself, on a log the caller has already locked, so that a caller can
+    /// check the head and append under ONE acquisition ([`Self::attest_landed_reaps`]).
+    fn append_reap(
+        h: &mut AttestedHistory,
+        branch: BranchId,
+        epoch: Epoch,
+        published: bool,
+    ) -> Result<(), AppendRefused> {
         let head = h.head_of(branch).unwrap_or_else(Attestation::genesis);
         let mut buf = Vec::with_capacity(33);
         buf.extend_from_slice(&head.0);
@@ -3778,31 +3789,55 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// **D199: attest the reaps of branches a reaper took without the client**, i.e. every branch
-    /// whose workspace a forget path ([`Self::forget_branches`], [`Self::forget_reaped_branches`])
-    /// has just removed. Without this, a branch the lease reaper retired kept `[Fork]` as its
-    /// whole history: the log called it live, and its head was never dropped (wall #19).
+    /// **D199: attest the reap of every branch in `candidates` whose reap has LANDED and whose
+    /// history this log still holds open.** The callers are the two forget paths
+    /// ([`Self::forget_branches`], [`Self::forget_reaped_branches`]), which reach every branch a
+    /// reaper took without the client. Before this, such a branch kept `[Fork]` as its whole
+    /// history: the log called it live, and its head was never dropped (wall #19).
     ///
-    /// **Exactly once, by construction.** Attesting follows removing the workspace, and only one
-    /// path can remove a given workspace. `seal` removes it before its own [`Self::attest_reap`],
-    /// so a sealed branch never arrives here. A branch forgotten here is already reaped in the
-    /// catalog, so a later `seal` stops at the catalog. The log refuses a second `Reap` in any
-    /// case, and a refusal would show in [`Self::attestation_refusals`], not as a second entry.
+    /// **Landed, not in flight (the lead's rule 1).** `get` refuses a `Reaping` branch as well as
+    /// a `Reaped` one, as `FerroError::Branch(String)` in both cases, so the forget paths'
+    /// `get(..).is_err()` cannot tell them apart. What can is the generation: `mark_reaped` bumps
+    /// it in the same step that sets `Reaped` (all three catalogs land `Reaped` through it), a
+    /// `Reaping` record keeps it, and recycling the slot only moves it further. So "landed" is
+    /// `get_raw(id).generation > branch.generation`, read before the log is locked. A `get_raw`
+    /// error reads as "not landed": the branch is left for a later visit rather than guessed at.
     ///
-    /// **The epoch is the catalog's current one**, the epoch at which the reap is recorded.
-    /// `seal` stamps the branch's fork epoch, but that is unreadable here, because `get` on a
-    /// reaped id is a hard error. `published` is false: a branch the lease took published nothing.
+    /// **Exactly once, keyed by the log (rules 2 and 3).** A reap removes the branch's head
+    /// (wall #19), so the head is the idempotency key. It is checked and the `Reap` appended under
+    /// one lock, so two visitors cannot both append. A branch already sealed (by `seal`, or by an
+    /// earlier visit here) has no head and is skipped, not refused. So is a branch this log never
+    /// saw forked. Keying on "this call removed the workspace" instead, as the first version did,
+    /// missed a branch whose workspace an earlier sweep had dropped while its reap was still in
+    /// flight.
     ///
-    /// Called with neither `state` nor the catalog held, the leaf-lock rule on
-    /// [`AgentRuntime::attested`]. `current_epoch` is read and released before the log is locked.
-    fn attest_forgotten_reaps(&self, reaped: &[BranchId]) {
-        if reaped.is_empty() {
+    /// **The epoch is the catalog's current one**, the epoch at which the reap is recorded, which
+    /// is what `HistoryEntry::epoch` documents. It is not the record's `fork_epoch`, which `seal`
+    /// stamps: by the time a sweep visits, the reaper may have released the slot
+    /// (`TwoTierReaper::reap` calls `release_id`) and a fork may have recycled it, so the record
+    /// `get_raw` returns can be another branch's. `published` is false: a branch the lease took
+    /// published nothing.
+    ///
+    /// Called with neither `state` nor the catalog held (the leaf-lock rule on
+    /// [`AgentRuntime::attested`]). Every catalog read finishes before the log is locked.
+    fn attest_landed_reaps(&self, candidates: &[BranchId]) {
+        let landed: Vec<BranchId> = candidates
+            .iter()
+            .copied()
+            .filter(|b| self.branches.get_raw(b.id).is_ok_and(|r| r.generation > b.generation))
+            .collect();
+        if landed.is_empty() {
             return;
         }
         let epoch = self.branches.current_epoch();
-        for &branch in reaped {
-            // Counted, not returned, for the reason `seal`'s arms give: the reap has happened.
-            let _ = self.attest_reap(branch, epoch, false);
+        let mut h = self.attested.lock().unwrap();
+        for branch in landed {
+            if h.head_of(branch).is_none() {
+                continue;
+            }
+            // Cannot be refused: the branch has a live head and is not trunk (trunk is never
+            // reaped). Counted rather than unwrapped if it ever is, as in `seal`.
+            let _ = Self::append_reap(&mut h, branch, epoch, false);
         }
     }
 
@@ -5643,18 +5678,16 @@ impl AgentRuntime {
 
             // ---- phase 3: forget them, under the lock ---------------------------------------
             if !gone.is_empty() {
-                let mut sealed: Vec<BranchId> = Vec::with_capacity(gone.len());
                 {
                     let mut state = self.state.lock().unwrap();
                     for bid in &gone {
                         if forget_one_branch(&mut state, *bid) {
                             forgotten += 1;
-                            sealed.push(*bid);
                         }
                     }
                 }
-                // D199: attested once the state lock is released. See `attest_forgotten_reaps`.
-                self.attest_forgotten_reaps(&sealed);
+                // D199: only once the state lock is released. See `attest_landed_reaps`.
+                self.attest_landed_reaps(&gone);
             }
 
             // A short chunk means the range ran out, which is the only end condition: `examined`
@@ -5712,18 +5745,17 @@ impl AgentRuntime {
             if gone.is_empty() {
                 continue;
             }
-            let mut sealed: Vec<BranchId> = Vec::with_capacity(gone.len());
             {
                 let mut state = self.state.lock().unwrap();
-                for bid in gone {
+                for &bid in &gone {
                     if forget_one_branch(&mut state, bid) {
                         forgotten += 1;
-                        sealed.push(bid);
                     }
                 }
             }
-            // D199: attested once the state lock is released. See `attest_forgotten_reaps`.
-            self.attest_forgotten_reaps(&sealed);
+            // D199: every gone id, whether or not this call found its workspace, and only once
+            // the state lock is released. See `attest_landed_reaps`.
+            self.attest_landed_reaps(&gone);
         }
         forgotten
     }
