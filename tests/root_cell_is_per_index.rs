@@ -404,6 +404,66 @@ fn hops_from(d: &Db, from: u32, key: &(Value, Value)) -> usize {
     hops
 }
 
+/// **D214, principled: an ALTER plans from the primary index's shared CELL, so a record that lags
+/// the cell is caught up and the cell is never regressed.** T10, through the real ALTER path.
+///
+/// The record can lag the cell (the review's F1): an INSERT whose primary upsert splits the root
+/// stores the new root into the cell at once, and reaches `sync_roots` only after its index
+/// maintenance. If that maintenance fails, the record stays on the pre-split root. That one step is
+/// SIMULATED here: the table is grown until its primary root really splits, and then its in-memory
+/// record is set back to the pre-split page. Everything after it is SQL.
+///
+/// - The ALTER must leave the cell where it was, on the post-split root (the first D214 regressed it).
+/// - It must bring the record up to the cell (the compare-exchange version, `ad8adf3`, left it behind).
+/// - The behavioural half is the review's corruption. From a regressed cell, the next INSERT of a
+///   high key is written, under latches with no right walk, into the LEFT leaf. The left leaf then
+///   tops out above every key of the right one, so the optimistic lookup of a right-half key stops
+///   there and misses a row that exists.
+///
+/// FAILS at `ad8adf3` (INFERRED) at "left the record behind the cell".
+#[test]
+fn an_alter_after_a_lagging_record_keeps_the_cell_and_catches_the_record_up() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
+    let pre_split = d.catalog.get_table("t").unwrap().primary_index_root;
+    let mut id = 0;
+    while d.catalog.get_table("t").unwrap().primary_index_root == pre_split {
+        assert!(id < 5000, "premise failed: 5000 rows never split the primary root");
+        d.rows(&format!("INSERT INTO t VALUES ({id}, {id});"));
+        id += 1;
+    }
+    let right_half_key = id - 1; // ascending inserts: the last row sits in the right half
+    let cell = d.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+    let post_split = cell.load(Ordering::SeqCst);
+    assert_eq!(
+        d.catalog.get_table("t").unwrap().primary_index_root,
+        post_split,
+        "premise failed: sync_roots did not bring the record up to the split"
+    );
+
+    // The one simulated step: the record an INSERT leaves when it splits the root and fails
+    // before `sync_roots`.
+    d.catalog.tables.get_mut("t").unwrap().primary_index_root = pre_split;
+
+    d.rows("ALTER TABLE t RENAME COLUMN v TO w;");
+
+    assert!(Arc::ptr_eq(&cell, &d.catalog.root_cell("t", None).unwrap()), "the ALTER replaced the primary cell");
+    assert_eq!(cell.load(Ordering::SeqCst), post_split, "the ALTER regressed the primary cell to the lagging record");
+    assert_eq!(
+        d.catalog.get_table("t").unwrap().primary_index_root,
+        post_split,
+        "the ALTER left the record behind the cell it planned from"
+    );
+
+    let high = id + 1000;
+    d.rows(&format!("INSERT INTO t VALUES ({high}, 0);"));
+    let lookup = format!("SELECT id FROM t WHERE id = {right_half_key};");
+    let plan = d.explain(&lookup);
+    assert!(plan.contains("Index scan on t (col 0,"), "premise failed: the lookup is not a primary-key index scan:\n{plan}");
+    assert_eq!(d.ids(&lookup), vec![right_half_key], "after the ALTER, a row in the right half is missing by key");
+    assert_eq!(d.ids(&format!("SELECT id FROM t WHERE id = {high};")), vec![high], "the row inserted after the ALTER is missing by key");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cells themselves (D208's fix). These use `IndexTree`, so they compile only from the fix on;
 // the behavioural tests above are the red phase and compile against either API.
