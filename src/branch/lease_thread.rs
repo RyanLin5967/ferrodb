@@ -812,10 +812,23 @@ fn scan_once(
     // D98 note: this no longer needs a `sweep_at` carried out of a closure, because the reading it
     // must use is now an ordinary local — but the rule that produced that variable is unchanged
     // and is why `now` is read once for the whole pass rather than re-read here.
+    let slice_freed_before = reaper.slice_freed();
     if let Err(e) = reaper.collect_orphans_if_due(now) {
         out(format!(
             "lease: orphan sweep failed: {e}. Nothing is lost — the complete answer is recomputed \
              at open by `resume_interrupted_reaps`, and the cadence retries."
+        ));
+    }
+    // **D221 — the slice's detector must reach a reader.** An extent the steady-state slice frees
+    // is one no in-process producer recorded, so the first one is the finding. A counter only a
+    // test reads is the D127 defect again: a real event that reaches nobody.
+    let slice_found = reaper.slice_freed() - slice_freed_before;
+    if slice_found > 0 {
+        out(format!(
+            "lease: the orphan sweep's slice freed {slice_found} extent(s) that no in-process \
+             producer recorded. They are collected, so nothing is lost now, but the producer \
+             list at `TwoTierReaper::collect_orphans_if_due` is missing a case, or one of its \
+             stated cases has occurred (a no-reaper seal, a snapshot install). Expected: never."
         ));
     }
     // Last statement of the pass, so a reader that sees it knows the sweep above is over.

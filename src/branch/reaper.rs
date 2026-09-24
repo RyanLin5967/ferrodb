@@ -66,7 +66,9 @@ pub(crate) const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
 ///   delay instead of a leak. Every arena live when a rotation begins is examined within
 ///   `ceil(live / ORPHAN_SWEEP_SLICE)` due passes, and an arena claimed during one is examined
 ///   in the next. At 10^6 arenas a rotation is 977 passes, 16-24 hours at one due pass every
-///   60-90 s (arithmetic). The next open examines them all regardless.
+///   60-90 s (arithmetic). A pass that errors part-way delays the rotation by that pass without
+///   skipping an arena, since the cursor moves before each examination. The next open examines
+///   them all regardless.
 ///
 ///   The end is fixed because arena ids only grow. A slice that always took "the next ones up"
 ///   is outrun as soon as claims arrive faster than one slice per pass, about 11-17 a second, and
@@ -173,9 +175,16 @@ pub struct TwoTierReaper {
     /// can meet an extent in exactly that window, on a reap or drain a statement thread is in the
     /// middle of. Counting that in `slice_freed` would make the detector fire on healthy traffic,
     /// and freeing it would take work the guard's own sweep is about to do. So the slice skips
-    /// arenas held here. A guard registers an arena BEFORE the release that can empty it, and
-    /// on drop records it in `deferred` BEFORE unregistering it, so no such extent is ever in
-    /// neither place. The fresh-context review found this window in the first version.
+    /// arenas held here, and arenas already back in `deferred`. A guard registers an arena BEFORE
+    /// the release that can empty it, and on drop records it in `deferred` BEFORE unregistering
+    /// it. The one moment an arena is in neither is inside `collect_orphans_if_due`, between
+    /// taking the residue and arming the guard over it, and the only slice is the next statement
+    /// on that same thread. The fresh-context review found this window in the first version.
+    ///
+    /// The cost, stated: the slice holds this lock across one arena's examination (a catalog
+    /// read, a fill probe of up to `ARENA_EXTENT_PAGES` reads for a restored dead owner, and a
+    /// free's tail append), so a reap or drain arming a guard on a statement thread can wait
+    /// that long. One arena, never a slice: the lock is taken per arena.
     in_flight: Mutex<BTreeMap<ArenaId, u32>>,
     /// **D221.** Arenas per steady-state slice: [`ORPHAN_SWEEP_SLICE`], except in tests.
     sweep_slice: usize,
@@ -687,6 +696,13 @@ impl TwoTierReaper {
             if held.contains_key(&arena) {
                 continue;
             }
+            // Recorded after this pass took the residue: a guard on a statement thread failed
+            // and recorded it just now. The next residue pass collects it. Counting it here would
+            // name a recorded producer as an unrecorded one. Lock order `in_flight` then
+            // `deferred`; nothing holds `deferred` while it takes `in_flight`.
+            if self.deferred.lock().unwrap_or_else(PoisonError::into_inner).contains(&arena) {
+                continue;
+            }
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
             if self.extent_is_collectable(arena, owner) {
                 self.store.free_arena(arena)?;
@@ -864,9 +880,10 @@ impl Drop for DeferTouched<'_> {
         // Recorded BEFORE it is unregistered, so the slice never finds an arena this guard held
         // in neither place.
         if !self.swept && !self.touched.is_empty() {
-            if let Ok(mut d) = self.deferred.lock() {
-                d.extend(self.touched.iter().copied());
-            }
+            // Recorded even through a poisoned lock: dropping the set here is exactly the loss
+            // this guard exists to prevent, and a set of arena ids cannot be torn by a panic.
+            let mut d = self.deferred.lock().unwrap_or_else(PoisonError::into_inner);
+            d.extend(self.touched.iter().copied());
         }
         let mut held = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
         for arena in &self.touched {
@@ -2945,14 +2962,16 @@ mod tests {
         let rotation = live.div_ceil(SLICE);
         let t0 = 1_000_000u64;
         for pass in 0..rotation {
-            let expect = SLICE + if pass == 0 { residue.len() } else { 0 };
+            // A rotation's last pass visits only what is left of it. The orphans are the highest
+            // ids, so they are examined (and then freed) in that last pass, not before it.
+            let expect = SLICE.min(live - pass * SLICE) + if pass == 0 { residue.len() } else { 0 };
             let before = reaper.sweep_visits();
             reaper.collect_orphans_if_due(t0 + pass as u64 * ORPHAN_SWEEP_INTERVAL_MS).unwrap();
             assert_eq!(
                 reaper.sweep_visits() - before,
                 expect as u64,
                 "due pass {pass} visited the wrong number of arenas: it must be the residue plus \
-                 one slice, whatever the live count ({live})"
+                 one slice (or what is left of the rotation), whatever the live count ({live})"
             );
         }
         for a in orphan.iter().copied() {
@@ -3023,6 +3042,138 @@ mod tests {
              cursor was not reached in {PASSES} passes: the slice chases new ids and its rotation \
              never ends"
         );
+    }
+
+    /// **D221: a reap holds its own extents from BEFORE its `Reaped` mark.**
+    ///
+    /// The slice runs outside the statement lock, so a due pass can land between a slow-path
+    /// reap's `Reaped` mark and its drain, when the branch's own extents are already empty and
+    /// ownerless. The reap's guard must already hold them there, or the slice frees them and
+    /// counts a healthy reap as an unrecorded producer. The catalog below runs a due pass at
+    /// exactly that point, from inside `set_state`, so the window is hit deterministically.
+    #[test]
+    fn d221_a_sweep_right_after_the_reaped_mark_leaves_the_reaps_own_extents_alone() {
+        use std::sync::{OnceLock, Weak};
+        struct SweepsAfterTheMark {
+            inner: Arc<dyn BranchCatalog>,
+            reaper: OnceLock<Weak<TwoTierReaper>>,
+            /// The due time to sweep at once the mark lands; `0` means do not.
+            sweep_at: AtomicU64,
+            swept: std::sync::atomic::AtomicBool,
+        }
+        impl BranchCatalog for SweepsAfterTheMark {
+            fn next_epoch(&self) -> Epoch { self.inner.next_epoch() }
+            fn current_epoch(&self) -> Epoch { self.inner.current_epoch() }
+            fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+                self.inner.fork(p, l)
+            }
+            fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> { self.inner.get(b) }
+            fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
+                self.inner.add_arena(b, a)
+            }
+            fn reparent(&self, b: BranchId, p: BranchId, e: Epoch, r: PageId)
+                -> Result<BranchRecord, FerroError> {
+                self.inner.reparent(b, p, e, r)
+            }
+            fn restrict_envelope(
+                &self,
+                b: BranchId,
+                env: crate::branch::record::CapabilityEnvelope,
+            ) -> Result<(), FerroError> {
+                self.inner.restrict_envelope(b, env)
+            }
+            fn set_state(&self, b: BranchId, expect: BranchState, to: BranchState)
+                -> Result<(), FerroError> {
+                self.inner.set_state(b, expect, to)?;
+                let at = self.sweep_at.load(Ordering::SeqCst);
+                if to == BranchState::Reaped && at != 0 {
+                    if let Some(reaper) = self.reaper.get().and_then(Weak::upgrade) {
+                        reaper.collect_orphans_if_due(at)?;
+                        self.swept.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+            fn set_root(&self, b: BranchId, r: PageId) -> Result<(), FerroError> {
+                self.inner.set_root(b, r)
+            }
+            fn expired_before(&self, n: u64) -> Result<Vec<CoreRecord>, FerroError> {
+                self.inner.expired_before(n)
+            }
+            fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.in_state(s)
+            }
+            fn scan(&self)
+                -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+                self.inner.scan()
+            }
+            fn live_count(&self) -> usize { self.inner.live_count() }
+            fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> { self.inner.get_raw(id) }
+            fn release_id(&self, id: u64) { self.inner.release_id(id) }
+            fn max_live_child(&self, p: u64) -> Result<Option<Epoch>, FerroError> {
+                self.inner.max_live_child(p)
+            }
+            fn live_child_in_epoch_range(&self, p: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+                self.inner.live_child_in_epoch_range(p, lo, hi)
+            }
+            fn has_live_children(&self, p: u64) -> Result<bool, FerroError> {
+                self.inner.has_live_children(p)
+            }
+            fn attach_child(&self, p: u64, e: Epoch, c: u64) -> Result<(), FerroError> {
+                self.inner.attach_child(p, e, c)
+            }
+            fn detach_child(&self, p: u64, e: Epoch) -> Result<bool, FerroError> {
+                self.inner.detach_child(p, e)
+            }
+            fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+                self.inner.renew_lease(b, l)
+            }
+            fn envelope_of(&self, b: BranchId)
+                -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+                self.inner.envelope_of(b)
+            }
+            fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+                self.inner.charge_row_writes(b, n)
+            }
+        }
+
+        let (h, _r) = setup();
+        let hooked = Arc::new(SweepsAfterTheMark {
+            inner: Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            reaper: OnceLock::new(),
+            sweep_at: AtomicU64::new(0),
+            swept: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reaper = Arc::new(TwoTierReaper::new(
+            Arc::clone(&hooked) as Arc<dyn BranchCatalog>,
+            Arc::clone(&h.store),
+        ));
+        assert!(hooked.reaper.set(Arc::downgrade(&reaper)).is_ok(), "fixture: hook already set");
+
+        // The U1 shape: a live child forked BEFORE the parent writes, so the slow path runs and
+        // releases every page, which leaves the parent's own extents empty at the mark.
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let _child = h.catalog.fork(parent, LeaseDeadline::from_now(600_000)).unwrap();
+        write_pages(&h, parent, 3);
+        let own: Vec<ArenaId> = h.catalog.get(parent).unwrap().arenas.clone();
+        assert!(!own.is_empty(), "fixture: the parent owns no extent");
+
+        hooked.sweep_at.store(1_000_000, Ordering::SeqCst);
+        reaper.reap(parent).unwrap();
+
+        assert!(
+            hooked.swept.load(Ordering::SeqCst),
+            "fixture: no due pass ran between the mark and the drain, so the window was not hit"
+        );
+        assert_eq!(
+            reaper.slice_freed(),
+            0,
+            "a due pass between the Reaped mark and the drain freed the reap's own extents: the \
+             reap was not holding them, and a healthy reap was counted as an unrecorded producer"
+        );
+        for a in own.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "the reap's own drain did not collect {a}");
+        }
     }
 
     /// **D221: the slice leaves alone an extent a reap or drain is still holding.**

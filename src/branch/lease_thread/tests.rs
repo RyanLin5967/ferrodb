@@ -1391,3 +1391,39 @@ fn d221_a_due_pass_does_not_grow_with_the_live_arena_count() {
         2 * N
     );
 }
+
+/// **D221 — the slice's detector reaches a reader.** An extent the steady-state slice frees is
+/// one no in-process producer recorded, so the first one is the finding, and `scan_once` must
+/// say so rather than leave it in a counter only tests read (the D127 pattern). Forced to fire
+/// with an orphan no producer records (an empty extent whose owner is marked `Reaped` outside the
+/// reaper), then held silent on a pass with nothing to find.
+#[test]
+fn d221_a_slice_find_is_printed_not_only_counted() {
+    let f = fixture();
+    let b = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+    let orphan = f.h.store.arena_for(b).unwrap();
+    f.h.catalog.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+
+    let printed = Printed::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &Counters::default(), &|m| {
+        printed.push(m)
+    });
+    assert_eq!(f.h.store.arena_owner(orphan), None, "fixture: the slice did not collect it");
+    assert_eq!(f.reaper.slice_freed(), 1, "fixture: the slice's detector did not count it");
+    assert!(
+        printed.text().contains("slice freed 1 extent(s)"),
+        "the slice found an unrecorded orphan and no reader was told: {:?}",
+        printed.text()
+    );
+
+    // The control: a pass with nothing to find says nothing about the slice.
+    let g = fixture();
+    let quiet = Printed::default();
+    scan_once(&g.reaper, &g.runtime, &*TestGate::new(), &Counters::default(), &|m| quiet.push(m));
+    assert_eq!(g.reaper.slice_freed(), 0, "control: a clean store gave the slice something");
+    assert!(
+        !quiet.text().contains("slice freed"),
+        "control: a clean pass reported a slice find: {:?}",
+        quiet.text()
+    );
+}

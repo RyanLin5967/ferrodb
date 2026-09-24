@@ -333,7 +333,7 @@ struct StoreState {
     ///
     /// Changed at exactly the four sites that insert into or remove from `extents` (a claim, a
     /// free, and their two replays) and rebuilt wholesale by `load_state`.
-    /// [`ArenaPageStore::live_arenas_after`] checks the two agree.
+    /// [`ArenaPageStore::live_arenas_between`] checks the two agree.
     live_order: BTreeSet<ArenaId>,
 }
 
