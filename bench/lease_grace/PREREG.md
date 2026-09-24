@@ -512,3 +512,79 @@ FAILS.
 **Counts, per-target:** base + 30. Lib filter
 `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
 → **24** (14 + 5 + 3 + 1 + 1).
+
+## Amendment 9 — the D198 re-review (`frontier/d198_rereview.md` @ `f05b325`) and the lead's FirstStart policy. Written before their fixes.
+
+### Committed so far, with predictions
+
+| commit | test | at that commit | after the fixes | its red |
+|---|---|---|---|---|
+| `b5bf3a3` | `f1_lease_grace::a_pre_d198_catalog_credits_the_downtime_since_its_file_was_last_written` | **FAIL**: "a lease that lapsed only inside the outage before the first D198 start was charged that outage" | PASS | this commit |
+| `b5bf3a3` | `f1_lease_grace::a_migrated_legacy_log_credits_the_downtime_since_the_source_was_last_written` | **FAIL**: "a migrated lease that lapsed only inside the outage was charged it" | PASS | this commit |
+| `b5bf3a3` | `f1_lease_grace::a_pre_d198_catalog_with_no_live_branch_does_not_move_the_offset` | PASS (control) | PASS | M32 |
+| `b5bf3a3` | `f1_lease_grace::set_root_and_set_state_after_a_resume_leave_the_lease_where_it_was` | PASS (pin) | PASS | M24b, M24c |
+| `802d379` | `f1_lease_grace::expired_before_examines_only_the_rows_it_answers_even_when_the_offset_exceeds_every_lease` (with the instrument `expiry_rows_examined`) | PASS | PASS | **M3**: 25 examined vs 5 answered. M3 is now killable (re-review R1). |
+
+### The fixes that follow
+
+- **(5) FirstStart policy (lead).** At a `FirstStart` of a catalog whose DEADLINE index is non-empty
+  — that is, it holds a live non-trunk lease; checked in O(log N) by the group's first key — `D` is
+  credited `now − mtime` once, in the same key write as the first mark. The outcome is reported as a
+  new `LeaseResume::FirstStartFromFileTime { now_millis, file_mtime, credited_millis }`.
+  - `mtime` is the catalog file's own, read by `open_sidecar` BEFORE the open touches the file. For a
+    migration it is the SOURCE `.branches` log's, read by `default_for_database` before it migrates.
+  - Unknown in three cases, and then the result is a plain `FirstStart`, today's behaviour:
+    - a fresh file;
+    - a catalog built with `create` / `open` over a caller's pool;
+    - an unreadable mtime.
+- **(3) C1 residual.** `StoredRecord::inward` (the general `BranchRecord` → `StoredRecord`) becomes
+  `#[cfg(test)]`, beside the `Writable` impl that uses it. The catalog helper `inward` is removed.
+  Production's only door is `StoredRecord::inward_at_zero(rec, offset) -> Result`, which REFUSES
+  unless `D = 0`, the one case where a lease and its stored value coincide. Its callers are `create`
+  (trunk) and `migrate_from` (a brand-new catalog). A new test,
+  `f1_lease_grace::the_production_inward_door_refuses_once_the_offset_is_not_zero`, forces the guard
+  to fire (+1). The overclaiming doc on `TableBranchCatalog::lease_offset` is corrected.
+- **(4)** The C2 refusal text names `LeaseThread::start` and says that a bare `resume_leases` without
+  heartbeats is the credited-uptime residual. The asserted phrase "has not resumed its lease clock" is
+  kept.
+- **(6)** `reaper.rs`'s "adds no second opinion" paragraph is rewritten for C2b. ARM 4's comment gains
+  a sentence recording that the stale handle is now refused by the re-check. This is comment-only; no
+  assertion changes.
+- **(8)** A cluster member over a marked `TableBranchCatalog` refuses for ever. RECORDED only.
+
+### (7) Corrections to earlier amendments (re-review R6)
+
+- **M10**'s killers: only `a_lease_written_after_a_resume_reads_back_exactly_as_it_was_given`.
+  `an_offline_deadline_of_zero…` cannot kill it, because `renew(0)` stores 0 with or without the
+  subtraction.
+- **M11**'s mechanism: A' fails at `moved > deadline`. Since C2b the reaper's re-read is
+  `enforced_lease`, which is translated, so the "re-read then expires it early" clause is withdrawn.
+- **M25b**'s numbers: the mutant is on `renew_lease`'s line, so the failing read is **23000 where 20000
+  is due** (the renew half of `a_lease_written_after_a_resume…`). 13000 was M9's number.
+- **M5**'s kill line: M5 is killed at the premise `counters.snapshot().scans == 3` of
+  `f1_a_reaper_that_never_resumed_the_clock_writes_no_mark`, not at its named assertion. Under M5
+  the first scan's heartbeat marks the catalog, and C2 then refuses the later candidate queries.
+- **M29**'s kill has a timing premise: `t_seen − t_resume < 4000` ms. A server frozen after its
+  resume would let M29 survive, and quiet mode's fan guard SIGSTOPs `target/debug` binaries. That is a
+  false negative, never a false failure.
+
+### New mutants
+
+| mutant | must fail |
+|---|---|
+| M31 FirstStart credit ignores the mtime (`D = 0`) | both FirstStart tests |
+| M32 credit applied with no live lease | `…with_no_live_branch_does_not_move_the_offset` |
+| M33 migration uses the NEW file's mtime, not the source's | the migration test (the credit ≈ 0 and the lease is expired) |
+| M34 `inward_at_zero` accepts a non-zero offset | `the_production_inward_door_refuses…` |
+| M24b `set_root` writes `StoredRecord::inward_at_zero(raw_decoded, self.offset())?` | the `set_root`/`set_state` pin: `set_root` REFUSES at `D = 3000` |
+| M24c `set_root` does `rec.set_deadline(self.to_stored(raw_decoded.lease_deadline))` | the `set_root`/`set_state` pin: reads 1500 where 4500 is due |
+
+M24c compiles; it is a registered compile-survivor, killed by the pin.
+
+### Counts, per-target
+
+- **base + 36**: +4 at `b5bf3a3`, +1 at `802d379`, +1 for the inward-door test.
+- `f1_lease_grace` → **20**.
+- The lib filter
+  `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
+  → **30** (20 + 5 + 3 + 1 + 1).
