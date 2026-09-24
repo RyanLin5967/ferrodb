@@ -8110,4 +8110,309 @@ mod tests {
         let err = rt.rebase_commit(v).unwrap_err().to_string();
         assert!(err.contains("was sealed while REBASE was validating"), "wrong refusal: {err}");
     }
+
+    // ---- D194 audit, term 1: what `version_history` may forget -----------------------------------
+    //
+    // Pre-registered in `bench/d194_fork_snapshot/rebase_prereg.md`, Amendment 4, before any of
+    // these was written. The first five name only fields and functions that exist at `0570fe8`, so
+    // they compile against the tree that has no retention bound; four of them fail there.
+
+    /// A published version of row `row` of table 1, stamped `seq` — the shape `record_applied`
+    /// hands `publish_version`.
+    fn published(row: u64, seq: u64) -> VersionRef {
+        VersionRef {
+            tbl: TableId(1),
+            row: RowId(row),
+            rid: RecordId { page_id: 0, slot_num: 0 },
+            begin_ts: seq,
+        }
+    }
+
+    /// One op of one merge, published the way `merge` does it: the clock is reserved first
+    /// (`apply_seq` moves), then the version is stamped with the sequence it reserved.
+    fn publish_next(st: &mut State, row: u64) -> u64 {
+        st.apply_seq += 1;
+        let seq = st.apply_seq;
+        st.publish_version(published(row, seq));
+        seq
+    }
+
+    /// A workspace pinned at `seq`, as a fork through `begin_session_pinned*` leaves one.
+    fn pinned(name: &str, txn: u64, seq: u64) -> Workspace {
+        let mut w = ws(name, txn, &[]);
+        w.fork_seq = seq;
+        w.fork_snapshot =
+            Some(Arc::new(Snapshot { high_water: seq + 1, active: std::collections::HashSet::new() }));
+        w
+    }
+
+    fn held(st: &State) -> usize {
+        st.version_history.values().map(Vec::len).sum()
+    }
+
+    /// **With nothing pinned, the history is bounded by the rows, not by the publishes.**
+    ///
+    /// A pin at `F` needs the newest version at or below `F`, and a pin created later is at or above
+    /// `apply_seq`, so with no live pin nothing older than each row's newest entry can ever be asked
+    /// for. At `0570fe8` every publish appended a `u64` that nothing removed: memory O(ops ever).
+    #[test]
+    fn version_history_stays_flat_under_a_publish_loop_with_no_live_pin() {
+        const ROWS: u64 = 4;
+        const MERGES: u64 = 500;
+        let mut st = State::default();
+        for _ in 0..MERGES {
+            for row in 1..=ROWS {
+                publish_next(&mut st, row);
+            }
+        }
+        // The premise: every one of those publishes landed, and nothing was pinned while they did.
+        assert_eq!(st.apply_seq, ROWS * MERGES, "fixture: the clock did not move once per publish");
+        assert_eq!(st.versions.len(), ROWS as usize, "fixture: a row was never published");
+        assert_eq!(
+            st.versions[&(1, ROWS)].begin_ts,
+            ROWS * MERGES,
+            "fixture: `versions` does not hold the last publish"
+        );
+        assert!(st.workspaces.is_empty(), "fixture: a workspace is pinned");
+        assert!(
+            held(&st) <= ROWS as usize,
+            "`version_history` holds {} entries for {ROWS} rows after {MERGES} publishes of each with \
+             no live pin: it grows with publishes, not with rows",
+            held(&st)
+        );
+    }
+
+    /// **A live pin keeps the version it reads, and nothing below it.**
+    ///
+    /// The pin is taken at 3, when the newest version of row 1 was the one stamped 3 — so that is
+    /// what a read through it saw, derived here from the fixture and not from the code. Versions 1
+    /// and 2 are older than anything a pin at or above 3 can read.
+    #[test]
+    fn version_history_keeps_what_a_live_pin_reads_and_nothing_older() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let at = st.apply_seq;
+        assert_eq!(at, 3, "fixture");
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(3)).map(|v| v.begin_ts),
+            Some(3),
+            "a read through the pin at 3 must name the version it saw"
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), None).map(|v| v.begin_ts),
+            Some(103),
+            "a read of main as it stands must name the latest"
+        );
+        let len = st.version_history[&(1, 1)].len();
+        assert!(
+            len <= 101,
+            "row 1 holds {len} history entries. The only live pin is at 3 and reads version 3, so 1 \
+             and 2 are unreachable and at most 101 (3..=103) may be held"
+        );
+    }
+
+    /// **Sealing the oldest pin frees what only it held — without waiting for the row to be written
+    /// again.** Trimming only at publish would strand the history of every row nobody publishes
+    /// after the pin goes, which is O(ops published while the pin lived) that is never returned.
+    #[test]
+    fn version_history_is_freed_when_the_oldest_pin_is_sealed() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let old = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, old));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        let young = st.apply_seq;
+        st.insert_workspace(BranchId::new(8, 0), pinned("b_8", 101, young));
+        // The premise, identical at both commits: the old pin still reads its own version.
+        assert_eq!(st.version_seen(TableId(1), RowId(1), Some(old)).map(|v| v.begin_ts), Some(3));
+
+        assert!(st.remove_workspace(&BranchId::new(7, 0)).is_some(), "fixture: b_7 was not live");
+        // No publish after the seal: the row is never written again in this test.
+        assert_eq!(
+            st.version_history[&(1, 1)].len(),
+            1,
+            "the only remaining pin is at {young} and reads version {young}; everything older was \
+             held for the sealed pin alone"
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(young)).map(|v| v.begin_ts),
+            Some(young),
+            "freeing took the version the remaining pin reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(8, 0)).is_some(), "fixture: b_8 was not live");
+        assert_eq!(held(&st), 1, "with no pin left, one entry per published row");
+    }
+
+    /// **A read taken through a pin that is released before the read is recorded must not record a
+    /// version it did not see.**
+    ///
+    /// The interleaving is forced on one thread, the way the REBASE race test above forces its own:
+    /// the branch is pinned at 3, main publishes 4 and 5, and the branch is re-pinned to 5 (what a
+    /// `REBASE` from another connection does) — and only then does the read that went through the
+    /// pin at 3 reach `record_read`. The version it saw is 3, from the fixture.
+    ///
+    /// ⚠ No red state: at `0570fe8` nothing is pruned, so the history still names 3 and this passes.
+    /// It exists for the retention bound, which CAN drop 3 once no live pin is at or below it; the
+    /// pre-registered mutant M14 (the refusal removed) is what shows it discriminates.
+    #[test]
+    fn version_history_never_names_a_version_a_read_did_not_see() {
+        use crate::provenance::readset::ReadSet;
+
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let at = st.apply_seq;
+            st.insert_workspace(b, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+            publish_next(&mut st, 1);
+            publish_next(&mut st, 1);
+            let now = st.apply_seq;
+            let snap = Arc::new(Snapshot {
+                high_water: now + 1,
+                active: std::collections::HashSet::new(),
+            });
+            assert!(st.repin(b, snap, now), "fixture: the branch is not live");
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let out = rt.record_read(
+            b,
+            TableId(1),
+            AccessShape::IndexLookup,
+            &[(RowId(1), row)],
+            None,
+            None,
+            ReadPurpose::Inspection,
+            Some(3),
+        );
+        match out {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("was released while this read ran"), "refused for the wrong reason: {e}");
+            }
+            Ok(()) => {
+                let st = rt.state.lock().unwrap();
+                let named: Vec<u64> = st.captures[&100]
+                    .read_sets()
+                    .iter()
+                    .filter_map(|rs| match rs {
+                        ReadSet::ExactVersions(vs) => Some(vs.clone()),
+                        ReadSet::Predicate(_) => None,
+                    })
+                    .flatten()
+                    .filter(|v| v.row == RowId(1))
+                    .map(|v| v.begin_ts)
+                    .collect();
+                assert_eq!(
+                    named,
+                    vec![3],
+                    "the read went through the pin at 3 and saw version 3; recording anything else \
+                     is a premise it never had, and a REVERT edge to the wrong merge"
+                );
+            }
+        }
+    }
+
+    /// **The same bound, through real merges.** Each iteration forks a pinned branch, updates two
+    /// rows and merges — so while the merge publishes, its own pin IS live, and it is the seal right
+    /// after that has to free the entry the pin held. Measured at two points and compared: a slope,
+    /// not one number.
+    #[test]
+    fn version_history_stays_flat_under_a_merge_loop_through_sql() {
+        use crate::execution::executor::run;
+        use crate::execution::session::Session;
+
+        fn parse(sql: &str) -> Stmt {
+            let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+                .scan_tokens()
+                .unwrap();
+            let mut p = crate::parser::parser::Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+            stmts.remove(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("history_loop.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(
+            crate::wal::log::WalManager::new(dir.path().join("history_loop.wal")).unwrap(),
+        );
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = Session::with_runtime(rt.clone());
+        for sql in [
+            "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10);",
+            "INSERT INTO t VALUES (2, 20);",
+        ] {
+            if let Err(e) = run(parse(sql), &mut catalog, bp.clone(), txn.clone(), &mut main) {
+                panic!("{sql}: {e}");
+            }
+        }
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        // (history entries, rows in `versions`, live workspaces, ops ever applied)
+        let census = || {
+            let st = rt.state.lock().unwrap();
+            (held(&st), st.versions.len(), st.workspaces.len(), st.applied.len())
+        };
+
+        const MERGES: usize = 40;
+        let mut after_ten = None;
+        for i in 1..=MERGES {
+            let run_id = format!("r{i}");
+            let b = rt
+                .begin_session_pinned(
+                    RunIdentity { agent_id: "a", run_id: Some(run_id.as_str()), model: None, prompt: None },
+                    BranchId::TRUNK,
+                    &txn,
+                )
+                .unwrap()
+                .branch;
+            for id in [1, 2] {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                let n = rt.write(&mut ctx, b, parse(&sql)).unwrap();
+                assert_eq!(n, 1, "fixture: merge {i} staged nothing for row {id}");
+            }
+            let report = rt.merge(&mut ctx, b).unwrap();
+            assert!(report.applied_to_target, "fixture: merge {i} did not publish: {:?}", report.outcome);
+            if i == 10 {
+                after_ten = Some(census());
+            }
+        }
+        let (h10, ..) = after_ten.unwrap();
+        let (h40, rows, live, applied) = census();
+        assert_eq!(live, 0, "fixture: a branch is still live, so a pin is still held");
+        assert!(applied >= 2 * MERGES, "fixture: {MERGES} merges of 2 rows applied only {applied} ops");
+        assert_eq!(
+            h40, h10,
+            "`version_history` went from {h10} entries after 10 merges to {h40} after {MERGES}, with no \
+             pin live between merges: it grows with merges, not with rows"
+        );
+        assert!(h40 <= rows, "{h40} history entries for {rows} published rows");
+    }
 }
