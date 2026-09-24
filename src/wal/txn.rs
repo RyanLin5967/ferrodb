@@ -6,7 +6,6 @@ use crate::cluster::GrantedCounter;
 use crate::storage::atomic_file::{FileOps, OsFileOps};
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{free_intent::{self, FreeIntent}, log::{DdlOp, RecKind, WalManager, WalPin}}};
-use crate::storage::atomic_file::{FileOps, OsFileOps};
 
 /// Commits between automatic checkpoints.
 ///
