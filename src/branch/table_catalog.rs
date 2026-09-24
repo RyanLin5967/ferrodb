@@ -119,7 +119,28 @@ pub struct TableBranchCatalog {
     /// pinning child's entry below a reaped node: `detach_from_parent` detaches only a child with
     /// nothing alive below it, `AgentRuntime`'s reaper-less arm detaches only under a READABLE
     /// parent, and `reparent` moves no CHILD entry at all. So (2) is reachable only by a caller
-    /// that edits entries directly, which today means a test.
+    /// that edits entries directly, which today means a test — or by a future re-parent, below.
+    ///
+    /// # ⚠ Blind spot: a move that keeps the fork epoch
+    ///
+    /// `valid_witness` checks the live branch's IDENTITY (slot and fork epoch) and STATE, never
+    /// its ANCESTRY. It notices a move only when the move changes the fork epoch, and `reparent`
+    /// writes whatever epoch its caller passes. Nothing in `src/` calls `reparent` today. But the
+    /// one mover this project has designed, D16 option 2's **epoch-preserving splice**
+    /// (SCALE-DESIGN, "NON-STANDARD — epoch-preserving splice"), re-parents a reaped node's live
+    /// children onto the grandparent at the reaped node's OLD epoch, by design. After such a move,
+    /// a witness filed on a node that is no longer the moved branch's ancestor stays valid for as
+    /// long as that branch lives. That node then over-pins: it stays attached, and its parked
+    /// pages, and those of every ancestor it pins, stay parked. The cost is **a space leak for the
+    /// moved branch's lifetime, never a wrong free**, because a witness can only ever answer YES.
+    ///
+    /// ⇒ **Any future re-parent, the splice included, must do one of two things.**
+    /// - Invalidate the witnesses of the old ancestry. Do it by epoch, not by enumeration: the
+    ///   mover bumps a catalog-wide move counter AFTER its CHILD entries have moved; each witness
+    ///   records the counter as read BEFORE its walk began; a witness is valid only while the two
+    ///   match. Dropping entries alone is not enough: a lockless walk that began before the move
+    ///   can file a witness from the old entries after the drop.
+    /// - Or make `valid_witness` re-check ancestry.
     ///
     /// Bounded by the nodes currently pinned through a reaped subtree: a witness is dropped when
     /// it fails validation, and when a walk from its node answers NO — which `detach_from_parent`
@@ -919,10 +940,12 @@ impl TableBranchCatalog {
     ///
     /// Valid means: filed under THIS incarnation of `of` (its fork epoch; a recycled id is forked
     /// at a fresh one), and naming a branch whose own record, read now, is the same incarnation
-    /// (`reparent` rewrites the fork epoch too) and not `Reaped`. That record is the authority
-    /// `child_liveness` consults for a live child, so a valid witness rests on the same fact the
-    /// walk stops on, read from the same place. (When the two can still differ is stated on the
-    /// `witnesses` field.)
+    /// and not `Reaped`. A `reparent` whose caller passes a new epoch fails this; ⚠ one that
+    /// keeps the epoch does NOT, and neither does any move of an unchanged branch — this checks
+    /// identity, never ancestry (the blind spot on the `witnesses` field). That record is the
+    /// authority `child_liveness` consults for a live child, so a valid witness rests on the same
+    /// fact the walk stops on, read from the same place. (When the two can still differ is stated
+    /// on the `witnesses` field.)
     ///
     /// A record that cannot be read makes the witness invalid rather than an error: the walk that
     /// follows then runs exactly as it did before witnesses existed, so it reports whatever it
@@ -2944,8 +2967,9 @@ mod tests {
         assert_eq!(c.valid_witness(other), None, "a witness answered for another incarnation");
         assert!(!c.witnesses.lock().unwrap().contains_key(&a.branch_id.id), "stale witness kept");
 
-        // 3. THE LIVE BRANCH'S INCARNATION. `reparent` rewrites the leaf's fork epoch, so a
-        //    witness naming the old one names a branch that no longer exists as filed.
+        // 3. THE LIVE BRANCH'S INCARNATION. This `reparent` passes a NEW epoch, so a witness
+        //    naming the old one names a branch that no longer exists as filed. (A move that keeps
+        //    the epoch is not caught — the blind spot on `witnesses` — and is not tested here.)
         assert!(c.has_live_children(t).unwrap());
         c.reparent(leaf.branch_id, BranchId::TRUNK, c.next_epoch(), 321).unwrap();
         assert_eq!(c.valid_witness(at(&b)), None, "a witness answered for a reparented branch");
@@ -2983,9 +3007,10 @@ enum ChildLiveness {
 }
 
 
-/// One incarnation of a branch: its slot id and the epoch it was forked at. The pair outlives
-/// nothing it should not — a recycled slot is forked at a fresh epoch, and `reparent` rewrites
-/// the fork epoch — so a witness keyed by it cannot come to name a different branch.
+/// One incarnation of a branch: its slot id and the epoch it was forked at. A recycled slot is
+/// forked at a fresh epoch, so a witness keyed by the pair cannot come to name a different
+/// branch. ⚠ It does NOT pin the branch's PLACE: `reparent` keeps the epoch if its caller passes
+/// the old one, and the designed splice does exactly that (the blind spot on `witnesses`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BranchAt {
     id: u64,
