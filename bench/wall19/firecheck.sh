@@ -11,7 +11,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=3359f58           # the tree these mutants were written against
+SUBJECT_SHA=3ddb1a4           # the tree these mutants were written against
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -34,12 +34,14 @@ MUTANTS=(
   "M3_trunk_reap_allowed|$A|"'"        if op == BranchOp::Reap && branch.is_trunk() {\n            return self.refuse(AppendRefused::TrunkReap);\n        }\n"|""'
   "M4_refusal_not_counted|$A|"'"        self.refused += 1;\n"|""'
   "M5_trunk_exemption_removed|$A|"'"            None if branch.is_trunk() => Attestation::genesis(),\n"|""'
-  "M6_reap_keeps_head|$A|"'"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n        } else {\n            self.heads.insert(e.branch, att);\n        }\n"|"        self.heads.insert(e.branch, att);\n"'
+  "M6_reap_keeps_head|$A|"'"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n"|"        if false {\n            self.heads.remove(&e.branch);\n"'
   "M7_scan_forget_does_not_attest|$R|"'"\n            self.attest_landed_reaps(&gone);\n"|"\n"'
   "M8_sweep_forget_does_not_attest|$R|"'"\n                self.attest_landed_reaps(&gone);\n"|"\n"'
-  "M9_no_head_check|$R|"'"            if h.head_of(branch).is_none() {\n                continue;\n            }\n"|""'
-  "M10_lease_reap_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, epoch, true);\n"'
+  "M9_no_head_check|$R|"'"            let Some(fork_epoch) = h.opened_at(branch) else {\n                continue;\n            };\n"|"            let fork_epoch = h.opened_at(branch).unwrap_or_default();\n"'
+  "M10_lease_reap_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, fork_epoch, true);\n"'
   "M11_attest_before_landed|$R|"'".filter(\u007cb\u007c self.branches.get_raw(b.id).is_ok_and(\u007cr\u007c r.generation > b.generation))"|".filter(\u007c_\u007c true)"'
+  "M12_lease_reap_current_epoch|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, self.branches.current_epoch(), false);\n"'
+  "M13_opened_follows_latest|$A|"'"            let opened = self.heads.get(&e.branch).map_or(e.epoch, \u007ct\u007c t.opened);\n"|"            let opened = e.epoch;\n"'
 )
 
 run_targets() { # $1 = label
