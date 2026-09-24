@@ -395,3 +395,68 @@ Fixes to what the review found:
 
 Registered command: `timeout 14400 python3 bench/d16_chain/firecheck.py` (13 mutant rebuilds plus
 two baselines).
+
+---
+
+## Amendment 3 — 2026-09-24, after a second fresh-context review; committed before the change
+
+Still nothing compiled or run. The second reviewer traced all 54 cells of M8–M13 at `203e3f5` and
+confirmed every A2.3 and A2.4 registration, including M9's alternating pattern (levels 9, 7, 5, 3, 1
+parked at D=10). It confirmed that the G1b–G4b split changes no A1.6 row. It also confirmed that
+every anchor occurs once and every replacement type-checks by reading. Changes:
+
+### A3.1 Corrections to my own text
+
+- **A2.4 overclaimed G0.** `build=DIRTY` proves the binary came from a dirty tree, not from THIS
+  mutant. What identifies the mutant is that every mutant's registered pattern differs from the
+  baseline's and from every other mutant's, plus the exact values in A3.2.
+- **A2.5's reason for G4b was wrong.** The harness reports every failing guard, so a mutant that
+  reaped the survivor in sweep 1 would print G3 AND G4b. G4b is unfired because no single anchor can
+  make sweep 1 reap the survivor. Two independent filters exclude it: `expired_before`'s deadline
+  span, then `is_expired_at`. It is not unfired because G3 masks it.
+- **M9 proves less than a negative control usually does.** In every M9 cell where `compare` reads
+  `differ`, overwrite's own cell already reads MISMATCH on the same four keys. So M9 shows the
+  comparison can print `differ`. It does not show the comparison catches anything the cells miss.
+  Stated here rather than claimed.
+
+### A3.2 Exact values, now checked by the script (P = 2; INFERRED traces, now registered)
+
+| mutant | cell | values |
+|---|---|---|
+| M1 | chain, overwrite at D=3 and D=10 | retained_pages 2, retained_reserved 3, retained_extents 2, pending 2 |
+| M2 | chain, overwrite at D=3 | after_leaf_pages 4, _reserved 6, _extents 4, _pending 4, _drain 4 |
+| M2 | chain, overwrite at D=10 | after_leaf_pages 18, _reserved 27, _extents 18, _pending 18, _drain 18 |
+| M3 | fanout D=1 | after_leaf_pages 2, _reserved 3, _extents 2 |
+| M3 | fanout D=3 | retained_pages 4, _reserved 6, _extents 4; after_leaf_pages 6, _reserved 9, _extents 6 |
+| M3 | fanout D=10 | retained_pages 18, _reserved 27, _extents 18; after_leaf_pages 20, _reserved 30, _extents 20 |
+| M3 | chain, overwrite at every D | after_leaf_pages 2, _reserved 3, _extents 2 |
+| M8 | chain, overwrite at D=3, D=10 | after_leaf_orphans 4, 18 |
+| M9 | overwrite D=3 | retained_pages 2, retained_reserved 3, retained_extents 2, pending 2 |
+| M9 | overwrite D=10 | retained_pages 10, retained_reserved 15, retained_extents 10, pending 10 |
+
+### A3.3 Harness
+
+G7 is also checked after the sweep-2 probe. Every A1.6 and A2.3 guard-id set is unchanged: under M7
+the extra check prints G7 again, and at baseline it reads 0.
+
+### A3.4 Script
+
+- **Restore without git.** The script writes back the bytes it read, with SIGTERM and SIGHUP
+  ignored while it does, then checks the blob against HEAD. `git checkout --` needs the index lock,
+  and a stale lock left by a killed build would strand the mutant.
+- **HEAD is pinned at start.** It is re-checked before every build, and every verdict line's `sha=`
+  must equal it.
+- **Whole-tree cleanliness.** The start-up check covers every tracked file, not just `src/` and
+  `examples/`, because the build flag reads every tracked file.
+- **Which slot state is expected** is decided by the source: D200's
+  `unreleased_reaped_candidates` present in `src/` means D200, and absent means main lineage. This
+  replaces accepting either state.
+- **The two baselines must be identical.** Their `measured`, `slots` and `verdict` lines are
+  compared, not merely each checked against the registration.
+- **Pinned environment.** Harness runs pin `D16_PERSIST=1`. `RUSTFLAGS` is recorded in each run's
+  `ENV.txt`.
+- **M5's replacement** becomes `if true || (owns_it && header.birth_epoch >= barrier) {` so that it
+  leaves no unused variable and still builds under `-D warnings`. Its registered verdicts are
+  unchanged.
+- **Output and exit codes.** Build logs are saved next to the run's output. An interrupted run exits
+  3, distinct from 1 (differed) and 2 (could not run).
