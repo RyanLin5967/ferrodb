@@ -19,8 +19,9 @@ const MAGIC: u32 = 0xF3_EE_DB_01;
 /// relocation's bytes (the adversary's F1 on `115f0b7`, `frontier/rollback_adversary.md`). So
 /// the version travels with the log. A version-2 log is replayed with version-2 meaning, then
 /// checkpointed (`wal::recovery::open_recovered`), which rewrites its header as version 3. Until
-/// then no transaction may begin on it (`TxnManager::begin`), so no record with version-3 meaning
-/// can be written into a log labelled version 2.
+/// then no transaction may begin on it (`TxnManager::begin`), and the log itself refuses the two
+/// records whose meaning changed, a top-level `HeapDelete` and a `HeapRelease` ([`WalManager::append`],
+/// review 2's Q5), so no record with version-3 meaning can be written into a log labelled version 2.
 ///
 /// A binary before D213 refuses a version-3 log ("incorrect wal version") instead of misreading
 /// it, which also makes a downgrade a clean refusal (the adversary's F6).
@@ -660,15 +661,37 @@ impl WalManager {
     /// recovery decides from what actually reached disk. This is PostgreSQL's answer to an fsync
     /// failure (it PANICs), for the same reason.
     ///
-    /// Reads are not refused. The undecided transaction is still in the active set, so no other
-    /// snapshot sees its rows. A page write is refused only if it needs a flush, because
-    /// `flush_up_to` does not flush for an LSN that is already durable.
+    /// Reads are not refused while the pages they need are resident. The undecided transaction is
+    /// still in the active set, so no other snapshot sees its rows. A page write is refused only if it
+    /// needs a flush, because `flush_up_to` does not flush for an LSN that is already durable; so once
+    /// eviction picks a dirty page past the durable end, the fetch that needed the frame fails too.
+    ///
+    /// **It also marks every index stale** (review 2's C3, the lead's decision): the reopen is this
+    /// function's whole contract, and index pages are not logged. If the undecided transaction's
+    /// records never reached disk and the log holds nothing else, the reopen replays nothing and would
+    /// not rebuild, so an index page flushed with that transaction's entries would name slots the heap
+    /// never got. The marker makes `open_recovered` rebuild every tree.
     pub fn poison(&self, why: &str) {
-        let mut reason = self.poison_reason.lock().unwrap();
-        if reason.is_none() {
+        use std::io::Write;
+        {
+            let mut reason = self.poison_reason.lock().unwrap();
+            if reason.is_some() {
+                return;
+            }
             *reason = Some(why.to_string());
         }
         self.poisoned.store(true, Ordering::SeqCst);
+        let marked = crate::wal::txn::write_stale_indexes_marker(&self.path, &format!("the log was poisoned: {why}"));
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: the log refuses every write from now on ({why}); reopen the database{}",
+            match marked {
+                Ok(()) => ", and every index is rebuilt then".to_string(),
+                Err(e) => format!(
+                    "; the marker that makes that open rebuild every index could not be written ({e})"
+                ),
+            }
+        );
     }
 
     /// Why this log refuses writes, once it does. See [`WalManager::poison`].
@@ -803,6 +826,18 @@ impl WalManager {
             return Err(FerroError::Wal("injected append failure".into()));
         }
         self.refuse_if_poisoned()?;
+        // **Review 2's Q5: the log itself refuses the two records whose meaning changed, while it
+        // is version 2.** A top-level `HeapDelete` RETIRES its slot since D213 and FREED it before,
+        // and a `HeapRelease` did not exist. `TxnManager::begin_locked` already refuses a transaction
+        // on such a log, but that guard cannot see a direct `append`. Everything else means the same
+        // in both formats, including a `Clr` carrying a `HeapDelete` (an undone insert frees in both),
+        // so recovery's undo of a version-2 log's losers is unaffected.
+        if self.is_legacy() && matches!(kind, RecKind::HeapDelete { .. } | RecKind::HeapRelease { .. }) {
+            return Err(FerroError::Wal(format!(
+                "this log was written before D213 (format {LEGACY_VERSION}), where this record means \
+                 something else; it takes one only after open_recovered has replayed and upgraded it"
+            )));
+        }
         let mut buffer = self.buffer.lock().unwrap();
         let lsn = self.next_lsn.load(Ordering::SeqCst);
         let mut body = Vec::new();

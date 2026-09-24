@@ -459,34 +459,33 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
     let stale = marker.exists();
     // F1: a log written before D213 has just been replayed with its own meaning. The checkpoint
-    // rewrites it as version 3, and no transaction may run before that (`WalManager::append` refuses
-    // one), so it runs even for such a log with nothing in it.
+    // rewrites it as version 3. Until then `TxnManager::begin_locked` refuses a transaction and
+    // `WalManager::append` refuses the two records whose meaning changed, so it runs even for such a
+    // log with nothing in it.
     let legacy = wal.is_legacy();
     if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
     }
     if recovered || stale || legacy {
         use std::io::Write;
-        // F2: a release that recovery could not finish is still owed, and the log is the only record
-        // of it. So the checkpoint, which would truncate the log, is skipped: the database opens,
-        // the release waits in the pending list, and the next checkpoint or open retries it.
-        let pending = txn.retry_pending_releases();
-        if pending > 0 {
+        // Review 2's N1 (the lead's decision): the checkpoint ALWAYS runs, and always flushes every
+        // page. The rebuild above freed the old trees and reallocated their pages on disk, so a
+        // skipped flush left the next open reading a zeroed root. Only the truncation is refused
+        // while a release is still owed (F2): the log is then the only record of it.
+        let owed = txn.checkpoint_keeping_owed()?;
+        if owed > 0 {
             let _ = writeln!(
                 std::io::stderr(),
-                "ferrodb: {pending} release(s) owed by committed transactions could not be finished; \
-                 the log is kept, not checkpointed, and the next checkpoint or open retries them"
+                "ferrodb: {owed} release(s) owed by committed transactions could not be finished; \
+                 every page is flushed, the log is kept, and the next checkpoint or open retries them"
             );
-        } else {
-            txn.checkpoint()?;
-            if stale {
-                if let Err(e) = std::fs::remove_file(&marker) {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
-                        marker.display()
-                    );
-                }
+        } else if stale {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
+                    marker.display()
+                );
             }
         }
     }
@@ -889,5 +888,74 @@ use super::*;
         let o = open_recovered(&db, &lock).unwrap();
         assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
         assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
+    }
+
+    /// **Review 2's N1, on the path its red test cannot reach: a release that fails RETRYABLY at open.**
+    ///
+    /// `tests/owed_release_at_open_reopens.rs` stages a page/log mismatch, which since review 2's Q3
+    /// is dropped rather than kept pending, so it no longer reaches the open's owed branch. Here the
+    /// release fails as an I/O error would (the thread-local `wal::txn::FAIL_RELEASES`), twice: once in
+    /// recovery's `finish_releases`, once in the checkpoint's retry. So open #1 owes it, and must still
+    /// FLUSH every page while keeping the log. At `368d0e1` it skipped the flush, and open #2 then
+    /// walked a root the rebuild had already zeroed on disk. Its red is mutant-only: the seam is new.
+    #[test]
+    fn an_open_whose_release_fails_retryably_flushes_so_the_next_open_rebuilds_cleanly() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        use crate::wal::txn::FAIL_RELEASES;
+
+        fn exec(sql: &str, o: &mut OpenedDatabase, s: &mut Session) -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+        fn by_key(o: &mut OpenedDatabase, id: i32) -> Vec<Vec<Value>> {
+            match exec(&format!("SELECT id, note FROM notes WHERE id = {id};"), o, &mut Session::new()) {
+                Outcome::Rows(r) => r,
+                _ => panic!("SELECT did not return rows"),
+            }
+        }
+        let note = |id: i32, text: &str| vec![Value::Integer(id), Value::Varchar(text.to_string())];
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("owed_io.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let mut main = Session::new();
+            // Row 2 (3934 B), then row 1 (35 B), the lowest tuple; T1 relocates row 1 and commits.
+            exec("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));", &mut o, &mut main);
+            exec(&format!("INSERT INTO notes VALUES (2, '{}');", "x".repeat(3900)), &mut o, &mut main);
+            exec("INSERT INTO notes VALUES (1, 'a');", &mut o, &mut main);
+            let mut t1 = Session::new();
+            exec("BEGIN;", &mut o, &mut t1);
+            exec(&format!("UPDATE notes SET note = '{}' WHERE id = 1;", "y".repeat(200)), &mut o, &mut t1);
+            exec("COMMIT;", &mut o, &mut t1);
+            // The crash: the commit's HeapRelease is still in the log buffer, and is lost.
+        }
+
+        // Open #1 owes the release and fails it twice (finish_releases, then the checkpoint's retry).
+        FAIL_RELEASES.with(|f| f.set(2));
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("open #1 failed");
+            assert!(o.recovered, "premise: open #1 replayed nothing, so no rebuild ran");
+            assert_eq!(FAIL_RELEASES.with(|f| f.get()), 0, "premise: the injected failures were not both consumed");
+            // The log was kept, not truncated: the checkpoint found the release still owed. A
+            // truncating checkpoint in a process that ran no DDL leaves the header alone (24 bytes).
+            assert!(
+                std::fs::metadata(&o.wal.path).unwrap().len() > 24,
+                "premise: open #1's checkpoint truncated the log, so no release was owed"
+            );
+            // Dropped without another checkpoint: open #1's own is all that reached disk.
+        }
+        FAIL_RELEASES.with(|f| f.set(0));
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("open #2 failed after an open whose owed release failed");
+        assert_eq!(by_key(&mut o, 1), vec![note(1, &"y".repeat(200))], "row 1 is not reachable by key after open #2");
+        assert_eq!(by_key(&mut o, 2), vec![note(2, &"x".repeat(3900))], "row 2 is not reachable by key after open #2");
     }
 }

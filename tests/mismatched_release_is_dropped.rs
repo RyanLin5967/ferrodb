@@ -29,7 +29,7 @@ use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::heap_page::{Page, RETIRED};
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
-use ferrodb::wal::txn::release_failures;
+use ferrodb::wal::txn::{release_failures, release_mismatches};
 
 struct Db {
     o: OpenedDatabase,
@@ -106,12 +106,15 @@ fn a_release_that_can_never_succeed_does_not_hold_the_log() {
     // and would be at every retry.
     db.set_slot_length(home, 35);
     let failures = release_failures();
+    let mismatches = release_mismatches();
     db.ok("COMMIT;", &mut t1);
     assert_eq!(
         release_failures(),
         failures,
         "a release that can never succeed was counted as a retryable failure, so it is still pending"
     );
+    // A guard added with the fix (the counter is new): the mismatch is counted where a reader sees it.
+    assert_eq!(release_mismatches(), mismatches + 1, "the release that can never succeed was not counted as a mismatch");
 
     let base = db.o.wal.base_lsn.load(Ordering::SeqCst);
     db.o.txn.checkpoint().expect("the checkpoint was refused for a release that can never succeed");

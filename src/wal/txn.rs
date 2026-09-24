@@ -137,6 +137,11 @@ pub struct TxnManager {
     /// owed, and a restart re-derives the same list from it (`wal::recovery::recover`). A sweep of
     /// every page at open is not needed, and would have cost every restart O(pages), the D216 shape.
     pending_releases: Mutex<Vec<(u64, RetiredSlot)>>,
+    /// **Held across every attempt at a release and every checkpoint's truncation decision.**
+    /// Review 2's C1: a retry takes the whole pending list out and puts back only what still fails,
+    /// so without this lock a concurrent checkpoint could see nothing owed in that window and
+    /// truncate the record of a release that then fails again.
+    release_retry: Mutex<()>,
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -147,8 +152,10 @@ pub struct RetiredSlot {
     pub slot: u16,
 }
 
-/// Releases that failed, since process start: the slot is still retired on its page. D213. Each is
-/// counted once, when it first fails; a failed retry is not counted again.
+/// Releases that failed and may succeed on a retry (an I/O error, a poisoned log), since process
+/// start: the slot is still retired on its page, and the release is pending. D213. Each is counted
+/// once, when it first fails; a failed retry is not counted again. A release that can NEVER succeed
+/// is counted in [`RELEASE_MISMATCHES`] instead.
 ///
 /// A release runs after the `Commit` is durable, so the transaction HAS committed and
 /// [`TxnManager::commit`] must answer `Ok`: an `Err` makes the executor keep the session's
@@ -174,6 +181,59 @@ pub static DIRECTORY_UPDATE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// See [`DIRECTORY_UPDATE_FAILURES`].
 pub fn directory_update_failures() -> u64 {
     DIRECTORY_UPDATE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Releases that can NEVER succeed, since process start: the page disagrees with the log (the slot is
+/// past the page's slot array, or holds a live tuple). Review 2's Q3, and the lead's decision.
+/// Retrying such a release is futile, so it is NOT kept pending: a pending release holds the log
+/// against truncation, and this one would hold it for ever, with every restart replaying all of it.
+/// It is counted here and its page and slot are printed; its bytes stay retired.
+pub static RELEASE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`RELEASE_MISMATCHES`].
+pub fn release_mismatches() -> u64 {
+    RELEASE_MISMATCHES.load(Ordering::Relaxed)
+}
+
+/// Automatic checkpoints that did not truncate the log, since process start: they failed, or they
+/// kept the log because releases are owed. Review 2's C4. A deferral is not the commit's failure:
+/// `TxnManager::commit` has written `TxnEnd` by then and answers `Ok`. The trigger's counter is not
+/// reset, so the next due commit tries again.
+pub static DEFERRED_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`DEFERRED_CHECKPOINTS`].
+pub fn deferred_checkpoints() -> u64 {
+    DEFERRED_CHECKPOINTS.load(Ordering::Relaxed)
+}
+
+/// Every failure counter this module keeps that is not zero, as one line, or `None` when all are
+/// zero. The CLI and pgserver print it at exit, so a counted failure always reaches a reader
+/// (review 2: the counters had none outside tests).
+pub fn failure_counters_line() -> Option<String> {
+    let counts = [
+        ("index undo failures", index_undo_failures()),
+        ("release failures", release_failures()),
+        ("release mismatches", release_mismatches()),
+        ("directory update failures", directory_update_failures()),
+        ("deferred checkpoints", deferred_checkpoints()),
+    ];
+    let nonzero: Vec<String> = counts.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k} {n}")).collect();
+    (!nonzero.is_empty()).then(|| format!("ferrodb: {}", nonzero.join(", ")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// **Test-only: the next N releases on this thread fail as an I/O error would**, a retryable
+    /// failure, so the pending path (F2, N1) can be driven without a failing disk. Thread-local, so a
+    /// test that arms it cannot fail a release in a test running beside it.
+    pub(crate) static FAIL_RELEASES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How a release failed. A mismatch between the page and the log can never succeed; anything else
+/// (an I/O error, a poisoned log) may on a retry.
+enum ReleaseError {
+    Mismatch(FerroError),
+    Retry(FerroError),
 }
 
 /// Index undos at abort that failed, since process start. D205 (the adversary's C1).
@@ -337,7 +397,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -792,32 +852,40 @@ impl TxnManager {
         // decisions (`Command::Catalog`), so they are already ordered by the log; guarding them
         // here would refuse DDL on a cluster member for a reason that does not apply.
         //
-        // **F4(ii) (the adversary on `115f0b7`): the transaction has ENDED by here.** `TxnEnd` is
-        // written and `att` has let go, so a failed checkpoint must not read as a failed commit. It
-        // is still returned, worded as what it is, and the executor drops the session's id because
-        // the transaction is no longer open (`TxnManager::is_open`). Before, the session kept a dead
-        // id, and every statement, ROLLBACK and BEGIN failed until it disconnected.
-        //
-        // F2: a checkpoint that finds releases still failing keeps the log and retries at the next
-        // due commit. That deferral is not this commit's failure, so it is not attempted.
+        // **Review 2's C4 (the lead's decision): the transaction has ENDED by here, so `commit`
+        // answers `Ok` whatever the checkpoint does.** `TxnEnd` is written and `att` has let go. A
+        // checkpoint that fails, or keeps the log because releases are owed (F2), is a DEFERRAL: counted
+        // in `DEFERRED_CHECKPOINTS`, one line on stderr, and `commits_since_checkpoint` is not reset, so
+        // the next due commit tries again. At `368d0e1` a failed checkpoint here was returned as `Err`,
+        // and every caller but the executor's COMMIT arm read that as "not committed": the implicit
+        // commit of an autocommit statement, and MERGE's publish.
         let due = self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1
             >= checkpoint_interval()
             && self.att_read().is_empty();
-        if due && !crate::cluster::is_clustered() && self.retry_pending_releases() == 0 {
-            self.checkpoint().map_err(|e| {
-                FerroError::Txn(format!(
-                    "transaction {txn_id} COMMITTED; the automatic checkpoint after it failed ({e}), \
-                     and the next commit retries it"
-                ))
-            })?;
+        if due && !crate::cluster::is_clustered() {
+            use std::io::Write;
+            match self.checkpoint_keeping_owed() {
+                Ok(0) => {}
+                Ok(owed) => {
+                    DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: the automatic checkpoint after transaction {txn_id} flushed every page \
+                         but kept the log: {owed} release(s) owed by committed transactions still fail; \
+                         the next due commit retries"
+                    );
+                }
+                Err(e) => {
+                    DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: transaction {txn_id} committed; the automatic checkpoint after it \
+                         failed ({e}), and the next due commit retries it"
+                    );
+                }
+            }
         }
         Ok(())
-    }
-
-    /// Whether `txn_id` is still open: in the active-transaction table, running or rolling back. A
-    /// session drops its id once this is false, whatever `commit` or `abort` returned (F4(ii)).
-    pub fn is_open(&self, txn_id: u64) -> bool {
-        self.att_read().contains_key(&txn_id)
     }
 
     pub fn abort(&self, txn_id: u64) -> Result<(), FerroError> {
@@ -1004,7 +1072,7 @@ impl TxnManager {
     fn mark_indexes_stale(&self, txn_id: u64, e: &FerroError) {
         use std::io::Write;
         let marker = stale_indexes_marker(&self.wal.path);
-        let written = std::fs::write(&marker, format!("txn {txn_id}: {e}\n"));
+        let written = write_stale_indexes_marker(&self.wal.path, &format!("txn {txn_id}: {e}"));
         let _ = writeln!(
             std::io::stderr(),
             "ferrodb: the rollback of transaction {txn_id} could not undo its primary-index writes ({e}); \
@@ -1065,13 +1133,43 @@ impl TxnManager {
     /// not held by the transaction at all: those bytes were garbage before D213, and are now the
     /// slot's room to grow back into, so no page holds more than it did.
     fn release_retired(&self, txn_id: u64, retired: &[RetiredSlot]) {
-        use std::io::Write;
+        let _retry = self.release_retry.lock().unwrap();
         for r in retired {
-            match self.release_one(txn_id, r) {
-                Ok(page) => self.tell_directory(r, &page),
-                Err(e) => {
+            if self.settle_release(txn_id, *r, true) {
+                self.pending_releases.lock().unwrap().push((txn_id, *r));
+            }
+        }
+    }
+
+    /// Attempt one release and account for the outcome. Returns whether it is still owed (a
+    /// retryable failure). `first`: count a retryable failure only on the first attempt.
+    ///
+    /// **Blind spot, stated (review 2's Q3):** a page that PERMANENTLY fails to read, or a log that
+    /// stays poisoned, is a retryable failure by this classification. Its release stays pending,
+    /// every checkpoint keeps the log, and the log grows until the page is repaired. Only a mismatch
+    /// the page itself shows (a slot past its slot array, or a live tuple) is known to be futile.
+    fn settle_release(&self, txn_id: u64, r: RetiredSlot, first: bool) -> bool {
+        use std::io::Write;
+        match self.release_one(txn_id, &r) {
+            Ok(page) => {
+                self.tell_directory(&r, &page);
+                false
+            }
+            Err(ReleaseError::Mismatch(e)) => {
+                RELEASE_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: transaction {txn_id} committed, but slot {} of page {} does not match the \
+                     log ({e}), so it can never be released; it is dropped, not retried, and its bytes \
+                     stay out of use",
+                    r.slot,
+                    r.page_id
+                );
+                false
+            }
+            Err(ReleaseError::Retry(e)) => {
+                if first {
                     RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    self.pending_releases.lock().unwrap().push((txn_id, *r));
                     let _ = writeln!(
                         std::io::stderr(),
                         "ferrodb: transaction {txn_id} committed, but slot {} of page {} could not be \
@@ -1081,14 +1179,32 @@ impl TxnManager {
                         r.page_id
                     );
                 }
+                true
             }
         }
     }
 
-    /// Free one retired slot on its page, logged as a `HeapRelease` under `txn_id`, unchained.
-    fn release_one(&self, txn_id: u64, r: &RetiredSlot) -> Result<Page, FerroError> {
+    /// Free one retired slot on its page, logged as a `HeapRelease` under `txn_id`, unchained. The
+    /// error says whether the page disagrees with the log (futile to retry) or not.
+    fn release_one(&self, txn_id: u64, r: &RetiredSlot) -> Result<Page, ReleaseError> {
+        #[cfg(test)]
+        if FAIL_RELEASES.with(|f| {
+            let left = f.get();
+            f.set(left.saturating_sub(1));
+            left > 0
+        }) {
+            return Err(ReleaseError::Retry(FerroError::Io("injected release failure".into())));
+        }
         let rec = RecKind::HeapRelease { dir_root: r.dir_root, page_id: r.page_id, slot: r.slot };
-        self.apply_then_log(txn_id, r.page_id, &rec, false, |page| page.release(r.slot as usize))
+        let mismatch = std::cell::Cell::new(false);
+        self.apply_then_log(txn_id, r.page_id, &rec, false, |page| {
+            mismatch.set(match page.slot_arr.get(r.slot as usize) {
+                None => true,
+                Some(slot) => !slot.is_free() && !slot.is_retired(),
+            });
+            page.release(r.slot as usize)
+        })
+        .map_err(|e| if mismatch.get() { ReleaseError::Mismatch(e) } else { ReleaseError::Retry(e) })
     }
 
     /// Tell the page directory a released page's free space. A failure is counted apart from a
@@ -1108,23 +1224,25 @@ impl TxnManager {
         }
     }
 
-    /// Retry every pending release (F2), and return how many still fail. A retry that fails again is
-    /// not counted again in [`RELEASE_FAILURES`].
-    ///
-    /// Takes no lock that `ddl_checkpointed` holds: the releases are appended unchained, so `att` is
-    /// not touched, and the pending list is not held while a page is changed.
+    /// Retry every pending release (F2), and return how many are still owed. A retry that fails
+    /// again is not counted again; one that turns out to be a mismatch is dropped (Q3).
     pub fn retry_pending_releases(&self) -> usize {
+        let _retry = self.release_retry.lock().unwrap();
+        self.retry_pending_releases_held()
+    }
+
+    /// The body of [`TxnManager::retry_pending_releases`], with `release_retry` already held.
+    fn retry_pending_releases_held(&self) -> usize {
         let pending = std::mem::take(&mut *self.pending_releases.lock().unwrap());
         let mut still = Vec::new();
         for (txn_id, r) in pending {
-            match self.release_one(txn_id, &r) {
-                Ok(page) => self.tell_directory(&r, &page),
-                Err(_) => still.push((txn_id, r)),
+            if self.settle_release(txn_id, r, false) {
+                still.push((txn_id, r));
             }
         }
-        let left = still.len();
+        let owed = still.len();
         self.pending_releases.lock().unwrap().extend(still);
-        left
+        owed
     }
 
     /// Finish, during recovery, the releases a committed transaction did not get to log. D213.
@@ -1332,20 +1450,46 @@ impl TxnManager {
     ///
     /// Must not take `att` — the callers above hold it, and `Mutex` is not re-entrant.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
-        // F2: a release still owed must not be truncated out of the log, which is the only durable
-        // record of it. Retried first; while any still fails, the checkpoint is refused and the log
-        // is kept whole.
-        let owed = self.retry_pending_releases();
-        if owed > 0 {
-            return Err(FerroError::Wal(format!(
+        match self.checkpoint_or_keep_locked()? {
+            0 => Ok(()),
+            owed => Err(FerroError::Wal(format!(
                 "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
-                 truncating the log would lose the record of the bytes they hold; the log is kept, and \
-                 the next checkpoint retries them"
-            )));
+                 truncating the log would lose the record of the bytes they hold; every page was \
+                 flushed and the log is kept, and the next checkpoint retries them"
+            ))),
         }
+    }
+
+    /// A checkpoint that answers how many releases are still owed instead of refusing: `Ok(0)` when
+    /// the log was truncated, `Ok(n)` when every page was flushed and the log KEPT for `n` owed
+    /// releases. `open_recovered` and the automatic trigger use it; `checkpoint` turns `n > 0` into a
+    /// refusal. Refuses while a transaction is open, as `checkpoint` does.
+    pub fn checkpoint_keeping_owed(&self) -> Result<usize, FerroError> {
+        if !self.att_read().is_empty() {
+            return Err(FerroError::Wal("checkpoint with active txns".into()));
+        }
+        self.checkpoint_or_keep_locked()
+    }
+
+    /// **Review 2's N1 (the lead's decision): refuse the TRUNCATION, never the flush.**
+    ///
+    /// A release still owed must not be truncated out of the log, which is the only durable record of
+    /// it (F2). But the flush must still happen. At `368d0e1` the refusal returned before it. The
+    /// open's index rebuild had then freed every old tree and reallocated its pages, which
+    /// `deallocate` and `new_page` do ON DISK at once. The new nodes and the catalog stayed in the
+    /// pool, so the next open walked an old root that was now a zero page, and failed at every open
+    /// from then on. So: retry, then flush the log and every page and sync, and skip only the
+    /// truncation and the replays after it. `release_retry` is held across the retry and the decision
+    /// (C1).
+    fn checkpoint_or_keep_locked(&self) -> Result<usize, FerroError> {
+        let _retry = self.release_retry.lock().unwrap();
+        let owed = self.retry_pending_releases_held();
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
+        if owed > 0 {
+            return Ok(owed);
+        }
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
         self.wal.truncate(self.txn_ids.issued_through())?;
@@ -1356,7 +1500,7 @@ impl TxnManager {
         // And every run declaration, for the same reason: a reader starting at the new base would
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
-        Ok(())
+        Ok(0)
     }
 
     /// The transaction's snapshot, which every read and write inside it goes through, so this is also
@@ -1557,6 +1701,13 @@ pub fn stamp_page_lsn(bp: &BufferPoolManager, page_id: u32, lsn: u64) -> Result<
 
 /// Where a failed index undo leaves its marker: beside the log, `<wal path>.stale-indexes`. D205's
 /// C1 correction. `wal::recovery::open_recovered` rebuilds every tree when it finds one.
+/// Write the stale-indexes marker beside the log at `wal_path`, holding `why`. One writer for both
+/// callers: a failed index undo (`TxnManager::mark_indexes_stale`) and a poisoned log
+/// (`WalManager::poison`, review 2's C3).
+pub(crate) fn write_stale_indexes_marker(wal_path: &Path, why: &str) -> std::io::Result<()> {
+    std::fs::write(stale_indexes_marker(wal_path), format!("{why}\n"))
+}
+
 pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
     let mut marker = wal_path.as_os_str().to_os_string();
     marker.push(".stale-indexes");
@@ -2441,5 +2592,69 @@ use super::*;
             index_undo_failures() >= before + 1,
             "an index undo failed and nothing counted it: the failure is silent"
         );
+    }
+
+    /// A committed delete whose release fails `failures` times as an I/O error would: the heap, the
+    /// retired slot's rid, and the transaction manager's pieces. Row A goes in first and commits;
+    /// then a second transaction deletes it (retiring the slot) and commits.
+    fn owed_release(failures: u32) -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, HeapFileManager, RecordId, tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t1 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![7; 40])).unwrap();
+        txn.commit(t1).unwrap();
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.delete(rid).unwrap();
+        FAIL_RELEASES.with(|f| f.set(failures));
+        txn.commit(t2).expect("a commit whose release failed was reported as failed");
+        (bp, wal, txn, heap, rid, dir)
+    }
+
+    /// **F2 with review 2's N1: a release that fails RETRYABLY stays pending, and the checkpoint
+    /// still FLUSHES every page while it refuses to truncate.** Then, once the release can succeed,
+    /// the next checkpoint releases it and truncates. This is the pending path that
+    /// `tests/failed_release_is_kept.rs` covered before review 2's Q3 made its staged failure (a LIVE
+    /// slot) a mismatch. Its red is mutant-only: the seam is new.
+    #[test]
+    fn a_release_that_fails_retryably_is_kept_pending_and_the_checkpoint_flushes_but_keeps_the_log() {
+        // Two failures: the commit's release, then the first checkpoint's retry.
+        let (bp, wal, txn, heap, rid, _dir) = owed_release(2);
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+
+        assert!(txn.checkpoint().is_err(), "the checkpoint truncated the log past a release that is still owed");
+        assert_eq!(FAIL_RELEASES.with(|f| f.get()), 0, "premise: the injected failures were not both consumed");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "a refused checkpoint truncated the log");
+        // The flush happened anyway: the heap page is on disk, retired slot and all. Before the
+        // checkpoint it was only in the pool, and the file held the zero page `new_page` wrote.
+        let on_disk = bp.disk_manager.read(rid.page_id).unwrap();
+        assert_eq!(on_disk[1..5], rid.page_id.to_be_bytes(), "the refused checkpoint did not flush the heap page");
+        let page = Page::deserialize(on_disk).unwrap();
+        assert!(page.slot_arr[rid.slot_num as usize].is_retired(), "the flushed page does not hold the retired slot");
+        assert_eq!(wal.flushed_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst), "the refused checkpoint did not flush the log");
+
+        txn.checkpoint().expect("the checkpoint was refused although the release could now succeed");
+        assert!(wal.base_lsn.load(Ordering::SeqCst) > base, "the checkpoint did not truncate once nothing was owed");
+        assert!(matches!(heap.read(rid), Err(FerroError::SlotDeleted)), "the released slot reads as live");
+        FAIL_RELEASES.with(|f| f.set(0));
+    }
+
+    /// **DDL is refused BEFORE its mutation while a release is owed** (F2, for A8's reason). The
+    /// checkpoint a DDL needs refuses to truncate then, and a refusal after the mutation would leave
+    /// the DDL done and reported failed. Review 2's C6(b): a mutant deleting this pre-check survived
+    /// every listed test. Its red is mutant-only: the seam is new.
+    #[test]
+    fn ddl_is_refused_before_its_mutation_while_a_release_is_owed() {
+        // Two failures: the commit's release, then the DDL's pre-check retry.
+        let (_bp, _wal, txn, _heap, _rid, _dir) = owed_release(2);
+        let mutated = std::cell::Cell::new(false);
+        let refused = txn.ddl_checkpointed(|| {
+            mutated.set(true);
+            Ok(())
+        });
+        assert!(refused.is_err(), "DDL ran its checkpoint although a release is owed");
+        assert!(!mutated.get(), "DDL mutated before it was refused, so it is done and reported failed");
+        FAIL_RELEASES.with(|f| f.set(0));
     }
 }
