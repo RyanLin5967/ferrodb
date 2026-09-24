@@ -54,9 +54,11 @@ impl HeapFileManager {
     /// directory's figure is a hint: it can overstate a page (`d257-review1` R2 names two rollback
     /// routes at `9aa6968`; a forward path's own directory write can fail after its page write). A
     /// candidate is therefore read under its frame latch, and one whose real free space is short is
-    /// corrected in the directory and passed over. That ends: each correction puts an entry below
-    /// what is needed, so the first-fit search never returns that page again, and `add_empty_page`
-    /// is the last resort. Before this, the relocation in [`Self::update`] deleted a row and then
+    /// corrected in the directory and passed over. That ends: each correction puts EVERY listing of
+    /// that page below what is needed (D261 review 1's F2: correcting the first listing only let a
+    /// later, overstated listing of the same page be returned for ever), so the first-fit search
+    /// never returns that page again, and `add_empty_page` is the last resort. The check reads the
+    /// page's header, not the whole page (review 1's Q7, [`crate::storage::heap_page::free_space_of`]). Before this, the relocation in [`Self::update`] deleted a row and then
     /// found its destination full, which on an unlogged heap (ALTER's rewrite) lost the row, and an
     /// INSERT of one width was refused on the same page for good (`d257-review1` R2c).
     pub fn find_or_make_page(&self, tuple_len: usize) -> Result<u32, FerroError> {
@@ -66,20 +68,44 @@ impl HeapFileManager {
             if real >= needed {
                 return Ok(id);
             }
-            self.update_directory_entry(id, real)?;
+            self.correct_every_listing(id, real)?;
         }
         self.add_empty_page()
     }
 
-    /// `page_id`'s free space as the page itself holds it, read under its frame latch.
+    /// `page_id`'s free space as the page itself holds it, read from its header under its frame latch.
     fn real_free_space(&self, page_id: u32) -> Result<u16, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
-        let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
-        let page = Page::deserialize(frame.data);
-        drop(frame);
+        let free = crate::storage::heap_page::free_space_of(&self.buffer_pool_manager.frames[frame_i].read().unwrap().data);
         self.buffer_pool_manager.unpin_page(page_id, false);
-        let page = page?;
-        Ok(page.get_free_space_end() - page.get_free_space_start())
+        Ok(free)
+    }
+
+    /// Set EVERY listing of `page_id` in the directory chain to `free_space` (D261 review 1's F2). A
+    /// page is listed once by every known path; this does not rely on it, because a correction that
+    /// missed a second, overstated listing would leave `find_or_make_page` returning it for ever.
+    /// `KeyNotFound` when no listing exists.
+    fn correct_every_listing(&self, page_id: u32, free_space: u16) -> Result<(), FerroError> {
+        let mut dir_page_id = self.first_directory_page_id;
+        let mut found = false;
+        while dir_page_id != 0 {
+            let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
+            let mut frame = self.buffer_pool_manager.frame_write(frame_i);
+            let mut dir = PageDirectory::deserialize(frame.data);
+            let mut changed = false;
+            for entry in dir.entries.iter_mut().filter(|e| e.page_id == page_id) {
+                entry.free_space = free_space;
+                changed = true;
+            }
+            if changed {
+                frame.data = dir.serialize();
+                found = true;
+            }
+            drop(frame);
+            self.buffer_pool_manager.unpin_page(dir_page_id, changed);
+            dir_page_id = dir.next_page_directory;
+        }
+        if found { Ok(()) } else { Err(FerroError::KeyNotFound) }
     }
 
     /// Allocate one empty data page and record it in the directory. **Always allocates.**

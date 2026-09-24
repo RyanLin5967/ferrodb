@@ -352,11 +352,48 @@ impl SlotEntry {
     }
 }
 
+/// A heap page's free space, read from its header alone (D261 review 1's Q7): `free_space_start` at
+/// bytes 7..9 and `free_space_end` at 9..11, which [`Page::serialize`] writes with the same arithmetic
+/// as [`Page::get_free_space_start`] and [`Page::get_free_space_end`]. Four bytes instead of a whole
+/// [`Page::deserialize`]. A page that reads back as zeros (listed but never written: the D229/D268
+/// case) reads 0 free here, where `deserialize` panics on its slot-array slice.
+pub fn free_space_of(bytes: &[u8; PAGE_SIZE]) -> u16 {
+    let start = u16::from_be_bytes([bytes[7], bytes[8]]);
+    let end = u16::from_be_bytes([bytes[9], bytes[10]]);
+    end.saturating_sub(start)
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::storage::heap_page::Page;
     use crate::storage::heap_page::SlotEntry;
+
+    /// **D261 review 1's Q7 (lane `lane_d261_relocation_space.md` §4 T6): the header's free space
+    /// agrees with the page's own.** `HeapFileManager::find_or_make_page` checks a candidate through
+    /// [`super::free_space_of`] instead of deserialising it, so the two must never differ.
+    #[test]
+    fn the_header_free_space_agrees_with_the_page() {
+        use crate::storage::{disk_manager::PAGE_SIZE, heap_page::free_space_of, tuple::Tuple};
+        let check = |page: &Page, what: &str| {
+            assert_eq!(
+                free_space_of(&page.serialize().unwrap()),
+                page.get_free_space_end() - page.get_free_space_start(),
+                "the header's free space differs from the page's, for {what}"
+            );
+        };
+        let mut page = Page::empty(1);
+        check(&page, "an empty page");
+        for n in 0..3u8 {
+            page.insert(Tuple::new(vec![n; 100])).unwrap();
+        }
+        page.retire(1).unwrap();
+        page.delete(2).unwrap();
+        check(&page, "a page with live, retired and free slots");
+        while page.insert(Tuple::new(vec![9; 500])).is_ok() {}
+        check(&page, "a full page");
+        assert_eq!(free_space_of(&[0u8; PAGE_SIZE]), 0, "a page of zeros does not read as 0 free");
+    }
 
     #[test]
     fn test_basic() {
