@@ -4817,6 +4817,84 @@ mod f1_lease_grace {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **Review 3's schedule E1, closed by the soft mark (lead's decision after review 3).** An
+    /// embedder serves a catalog with no `LeaseThread`, so it writes no mark. Its host sleeps `S`:
+    /// its lease clock stops and the wall clock does not, so it writes a lease with 840 s left on ITS
+    /// clock while the wall reads `S` later than that clock — the OS stamps the file with the wall.
+    /// The next start, 10 s after that write, anchors its lease clock to the wall. The file's age
+    /// says 10 s; the lease is owed `S + 10 s`. Every unmarked commit leaves a soft mark on the
+    /// writer's own lease clock, and the next first start credits the time since it the way a mark
+    /// is credited, so the lease keeps what it had.
+    ///
+    /// Emulated in one process: the embedder's lease clock is this process's; its wall clock is
+    /// expressed by the mtime `t + S`; the next start's `now` and wall clock are both `S + 10 s`
+    /// later. Red against `bf15efb`, which credits the file's 10 s.
+    #[test]
+    fn an_unmarked_writer_whose_lease_clock_lagged_keeps_its_leases_across_the_next_start() {
+        use crate::cluster::wall_step;
+        const S: u64 = 2 * HOUR;
+        const LEFT: u64 = 840_000;
+        let path = sidecar("e1-slept-embedder");
+        let t = LeaseDeadline::now_millis();
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(t + LEFT)).unwrap().branch_id
+        };
+        age_file(&path, t + S);
+        let now = t + S + 10_000;
+        let _next_start = wall_step::by((S + 10_000) as i64);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "a lease with 840 s left on its writer's lease clock was expired at the next start: the \
+             credit was the file's wall-clock age, blind to the {S} ms that clock lagged (review 3, \
+             E1)"
+        );
+        let left = lease.0 - now;
+        assert!(
+            (LEFT - 60_000..=LEFT).contains(&left),
+            "the lease kept {left} ms; it had {LEFT} ms at its writer's last commit"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The soft mark is the writer's LAST commit, not its first.** A mark stamped once would credit
+    /// the writer's whole run after it as downtime. Two commits 200 ms apart; the file's own time is
+    /// put in the future, where it has no age, so only the soft mark speaks. The credit must lie
+    /// between `now` minus a reading taken just after the last commit and `now` minus one taken
+    /// just before it — reads ordered by the program, so no slack. Red against `bf15efb`, which
+    /// writes no soft mark for a catalog it created (the credit is 0, below the lower bound, which
+    /// a 50 ms pause keeps positive).
+    #[test]
+    fn the_soft_mark_is_the_last_commit_of_an_unresumed_writer_not_its_first() {
+        let path = sidecar("soft-mark-last");
+        let (before_last, after_last) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let before_last = LeaseDeadline::now_millis();
+            c.set_root(BranchId::TRUNK, 1).unwrap();
+            (before_last, LeaseDeadline::now_millis())
+        };
+        age_file(&path, LeaseDeadline::now_millis() + 24 * HOUR);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let (_, credited) = c.alive_state().unwrap().expect("the resume recorded a mark");
+        assert!(
+            credited >= now - after_last && credited <= now - before_last,
+            "credited {credited} ms; the writer's last commit was between {} and {} ms ago",
+            now - after_last,
+            now - before_last
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
