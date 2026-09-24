@@ -4986,4 +4986,213 @@ mod tests {
         assert_eq!(restarted.last_live_arena(), Some(live[3].0), "the restarted top id is wrong");
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---------------------------------------------------------------------------------------
+    // D232 — a claim's two durable writes, and what a failure between them may leave.
+    // ---------------------------------------------------------------------------------------
+
+    /// A path whose parent is a FILE, so nothing can be created under it and every persist aimed
+    /// at it fails through the store's own durability path (D128's trick).
+    fn d232_blocked_path(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let blocker = std::env::temp_dir().join(format!(
+            "ferro-arena-d232-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let target = blocker.join("map.arena");
+        (blocker, target)
+    }
+
+    /// **D232 (H2): a crash between a claim's two durable writes must not let a restart hand the
+    /// arena id to a second branch.**
+    ///
+    /// A claim makes two things durable: the catalog's ARENA key (`add_arena`) and the map's claim
+    /// record, which carries the raised arena-id watermark. With the catalog written first, a
+    /// crash between them leaves a catalog that lists arena A under X and a map that never issued
+    /// A. The restart's first claim is issued A again (the watermark came back below it), the
+    /// catalog lists A under two branches, and reaping X frees the other branch's live extent.
+    ///
+    /// The crash is taken at the one instant that decides it: the catalog wrapper copies the map
+    /// file the moment `add_arena` has made X's claim durable, and the restart opens exactly that
+    /// copy over the catalog that survived. Whatever order the claim writes in, this is what a
+    /// crash right after the catalog's write would leave.
+    #[test]
+    fn d232_a_crash_between_a_claims_two_writes_never_gives_one_arena_two_owners() {
+        use crate::branch::tests_faulty_catalog::FaultyCatalog;
+        let h = Harness::new();
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("ferro-arena-d232-claim-{pid}.bin"));
+        let crashed = std::env::temp_dir().join(format!("ferro-arena-d232-crashed-{pid}.bin"));
+        let _ = std::fs::remove_file(&path);
+        let faulty = FaultyCatalog::new(Arc::clone(&h.catalog));
+        let store = ArenaPageStore::new(
+            Arc::clone(&h.store.pool),
+            Arc::clone(&faulty) as Arc<dyn BranchCatalog>,
+            h.store.base_page(),
+        )
+        .unwrap();
+        store.checkpoint_to(path.clone());
+
+        // One claim first, so the file holds an image and the next claim's record is appended.
+        let w = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        store.alloc_arena(w).unwrap();
+
+        let at_crash: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        {
+            let at_crash = Arc::clone(&at_crash);
+            let path = path.clone();
+            faulty.after_add_arena(move |_, _| {
+                *at_crash.lock().unwrap() = Some(std::fs::read(&path).unwrap());
+            });
+        }
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = store.alloc_arena(x).unwrap();
+        let durable =
+            at_crash.lock().unwrap().take().expect("fixture: the catalog never took X's claim");
+        std::fs::write(&crashed, &durable).unwrap();
+
+        let restarted = ArenaPageStore::new(
+            Arc::clone(&h.store.pool),
+            Arc::clone(&h.catalog),
+            h.store.base_page(),
+        )
+        .unwrap();
+        assert!(restarted.restore(&crashed).unwrap(), "fixture: nothing was restored");
+
+        // Another branch makes the first claim after the restart.
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        restarted.alloc_arena(y).unwrap();
+
+        let x_arenas = h.catalog.get(x).unwrap().arenas;
+        let y_arenas = h.catalog.get(y).unwrap().arenas;
+        assert!(x_arenas.contains(&a), "fixture: the catalog does not list X's claim");
+        let shared: Vec<ArenaId> =
+            x_arenas.iter().copied().filter(|z| y_arenas.contains(z)).collect();
+        assert!(
+            shared.is_empty(),
+            "D232 H2: a crash right after the catalog made X's claim durable left the map without \
+             it, and the restart handed arena(s) {shared:?} to Y while the catalog still lists \
+             them under X. Reaping X would free Y's live extent."
+        );
+        for z in x_arenas.iter().copied() {
+            assert_ne!(restarted.arena_owner(z), Some(y), "D232 H2: the map charges X's {z} to Y");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&crashed);
+    }
+
+    /// **D232 (H2b): a claim whose map record fails to persist must leave no extent behind.**
+    ///
+    /// With the catalog written first and the extent published before the persist, a persist
+    /// failure (ENOSPC, EIO) returned `Err` with the extent left in the map as the branch's
+    /// current arena and listed in its catalog record. Later writes filled it, and a crash before
+    /// any later persist succeeded re-issued its id over pages that were written.
+    #[test]
+    fn d232_a_claim_whose_record_fails_to_persist_publishes_no_extent() {
+        let h = Harness::new();
+        let (blocker, target) = d232_blocked_path("h2b");
+        h.store.checkpoint_to(target);
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let live_before = h.store.live_arenas();
+
+        let err = h
+            .store
+            .alloc_arena(x)
+            .expect_err("fixture: the claim's record must fail to persist, or this proves nothing");
+
+        assert_eq!(
+            h.store.live_arenas(),
+            live_before,
+            "D232 H2b: the claim failed to persist ({err}) and its extent is still in the map"
+        );
+        assert!(
+            h.catalog.get(x).unwrap().arenas.is_empty(),
+            "D232 H2b: the catalog took a claim whose map record never persisted ({err})"
+        );
+        assert!(
+            h.store.arena_for(x).is_err(),
+            "D232 H2b: arena_for handed out an extent whose claim never persisted"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D232: a free whose map record fails to persist must not hand its range out again.**
+    ///
+    /// `free_arena` gave the extent's page range back to the free list BEFORE persisting the free.
+    /// When that persist failed, the durable map still charged the range to the freed extent while
+    /// the next claim was handed the same range: after a crash both extents replay over one
+    /// range. That is the order `free_arena`'s own note names as the one that aliases.
+    #[test]
+    fn d232_a_free_whose_record_fails_to_persist_does_not_hand_its_range_out_again() {
+        let h = Harness::new();
+        let good = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-free-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        h.store.checkpoint_to(good.clone());
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        let (a_start, _) = h.store.extent_range(a).unwrap();
+
+        let (blocker, target) = d232_blocked_path("free");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        h.store.checkpoint_to(good.clone());
+
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let b = h.store.alloc_arena(y).unwrap();
+        assert_ne!(
+            h.store.extent_range(b).unwrap().0,
+            a_start,
+            "D232: a free whose record never persisted handed its range to the next claim, while \
+             the durable map still charges that range to the freed extent"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D232 (H3): the fill probe stops only at a proven end of the written prefix.**
+    ///
+    /// `resolve_fill` raised `next_free` past pages that read and stopped at the FIRST page that
+    /// did not, of any kind, then cleared the suspicion for good. A page inside the written prefix
+    /// that fails to read (a bad checksum, an I/O error, a full pool) therefore ended the probe
+    /// early: `next_free` understated, the extent read as emptier than it is, and a live child's
+    /// pages above the stop were neither parked nor protected. D85's hazard, reopened by a
+    /// transient error. Its doc said the opposite direction.
+    #[test]
+    fn d232_a_fill_probe_that_hits_an_unreadable_page_leaves_the_fill_unknown() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+        let epoch = h.catalog.next_epoch();
+        // Extents of 1, 2 and 4 pages: the last is full, four written pages.
+        for _ in 0..7 {
+            h.store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+        }
+        let arena = *h.catalog.get(b.branch_id).unwrap().arenas.last().unwrap();
+        let written = h.store.allocated_pages(arena);
+        assert!(written.len() >= 3, "fixture: only {} written pages", written.len());
+        // The first page back, so a fill understated to 1 would read as empty.
+        h.store.release_page(written[0], arena);
+        h.store.flush().unwrap();
+        let image = h.store.state_bytes();
+
+        let re = h.fresh_store();
+        re.load_state(&image).unwrap();
+        // A page inside the written prefix that cannot be read: garbage on disk, and not cached.
+        let bad = written[1];
+        re.evict(bad);
+        re.pool.disk_manager.write(bad, &[0xA5u8; PAGE_SIZE]).unwrap();
+        assert!(re.read_page(bad).is_err(), "fixture: the bad page still reads");
+        // Probe from just below it (the image can understate the fill; D85).
+        re.debug_set_next_free(arena, 1);
+        re.resolve_fill(arena);
+
+        assert!(
+            !re.extent_is_empty(arena),
+            "D232 H3: the probe stopped at an unreadable page inside the written prefix and \
+             called the fill resolved, so an extent holding written pages above it reads as \
+             empty and can be freed"
+        );
+    }
 }

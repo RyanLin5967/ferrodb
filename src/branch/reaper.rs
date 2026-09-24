@@ -3214,6 +3214,112 @@ mod tests {
         assert_eq!(reaper.slice_freed(), 0, "the residue, not the slice, must have collected it");
     }
 
+    // ---------------------------------------------------------------------------------------
+    // D228 / D232 — what a sweep and a reap may free.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D232 (H1): the steady-state sweep must not free a live branch's extent because its
+    /// record could not be read.**
+    ///
+    /// `extent_is_collectable` answered `Err(_) => true`: any failure to read the owner's record
+    /// meant "owner gone". Since D126 no benign error reaches it, so every `Err` is a storage fault
+    /// or a corrupt catalog, and on a live branch whose current extent is empty (a fresh claim, or
+    /// one its own frees emptied) that verdict frees an extent the branch is about to write into.
+    /// The sweep runs off the statement lock (D88), so nothing stops the branch's first write
+    /// landing between the check and the free.
+    #[test]
+    fn d232_a_steady_state_sweep_does_not_free_a_live_extent_whose_owner_cannot_be_read() {
+        use crate::branch::tests_faulty_catalog::FaultyCatalog;
+        let (h, _r) = setup();
+        let faulty = FaultyCatalog::new(Arc::clone(&h.catalog));
+        let reaper =
+            TwoTierReaper::new(Arc::clone(&faulty) as Arc<dyn BranchCatalog>, Arc::clone(&h.store));
+        let x =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let fresh = h.store.arena_for(x).unwrap();
+        assert!(h.store.extent_is_empty(fresh), "fixture: a fresh claim should be empty");
+
+        faulty.fail_get_raw_for(x.id);
+        reaper.collect_orphans_if_due(1_000_000).unwrap();
+
+        assert_eq!(
+            h.catalog.get_raw(x.id).unwrap().state,
+            BranchState::Live,
+            "fixture: the owner is alive; only reading it failed"
+        );
+        assert_eq!(
+            h.store.arena_owner(fresh),
+            Some(x),
+            "D232 H1: the steady-state sweep freed live branch X's current extent because X's \
+             record could not be read. An unreadable owner is not a gone one."
+        );
+    }
+
+    /// **D232: a reap frees only extents the store says the reaped branch owns (fast path).**
+    ///
+    /// A crash between a claim's catalog write and its map record (H2) leaves the catalog listing
+    /// one arena under two branches once the restart re-issues the id. `reap` freed exactly
+    /// `record.arenas`, and `free_arena` checks no owner, so reaping the first branch freed the
+    /// second's live extent. The alias is made here directly, the way that crash leaves it: the
+    /// catalog lists Y's arena under X as well. Databases that already carry such a key need the
+    /// reap to refuse it whatever the claim order is now.
+    #[test]
+    fn d232_a_reap_over_an_aliased_arena_frees_only_its_own_extents() {
+        let (h, reaper) = setup();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        write_pages(&h, x, 1);
+        let own: Vec<ArenaId> = h.catalog.get(x).unwrap().arenas.clone();
+        let y =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        write_pages(&h, y, 1);
+        let ya = h.catalog.get(y).unwrap().arenas[0];
+        let y_pages = h.store.allocated_pages(ya);
+        assert!(!y_pages.is_empty(), "fixture: Y's extent holds no page");
+
+        h.catalog.add_arena(x, ya).unwrap();
+        reaper.reap(x).unwrap();
+
+        assert_eq!(
+            h.store.arena_owner(ya),
+            Some(y),
+            "D232: reaping X freed arena {ya}, which the store charges to live branch Y; the \
+             catalog listing it under X is an alias, not ownership"
+        );
+        assert_eq!(h.store.allocated_pages(ya), y_pages, "D232: Y's pages did not survive");
+        for a in own {
+            assert_eq!(h.store.arena_owner(a), None, "control: X's own extent {a} was not freed");
+        }
+    }
+
+    /// **D232: the same, on the slow path.** With a live child, `reap` hands `record.arenas` to
+    /// `retire_arenas_by_rule`, which releases every page no child of the REAPED branch can see.
+    /// Y's pages were born after X's child forked, so no child of X pins them, and they went back
+    /// onto Y's own recycled list while Y's tree still pointed at them.
+    #[test]
+    fn d232_a_slow_path_reap_over_an_aliased_arena_releases_none_of_its_pages() {
+        let (h, reaper) = setup();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let _child = h.catalog.fork(x, LeaseDeadline::from_now(600_000)).unwrap();
+        let y =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        write_pages(&h, y, 1);
+        let ya = h.catalog.get(y).unwrap().arenas[0];
+        let y_pages = h.store.allocated_pages(ya);
+        assert!(!y_pages.is_empty(), "fixture: Y's extent holds no page");
+
+        h.catalog.add_arena(x, ya).unwrap();
+        assert!(h.catalog.has_live_children(x.id).unwrap(), "fixture: the slow path is not taken");
+        reaper.reap(x).unwrap();
+
+        assert_eq!(
+            h.store.allocated_pages(ya),
+            y_pages,
+            "D232: the slow-path reap of X released pages of arena {ya}, which the store charges \
+             to live branch Y"
+        );
+        assert_eq!(h.store.arena_owner(ya), Some(y), "D232: Y's extent is no longer Y's");
+    }
+
             }
         };
     }
