@@ -211,8 +211,10 @@ impl Pumped {
 /// batches (64 MiB at the default `max_bytes`), and past that refuses by name. Bound to
 /// `max_bytes` so that raising one raises the other.
 ///
-/// **What the cap measures, exactly:** how far past the OLDEST open transaction's first row one
-/// pump reads, other transactions' traffic included, not that transaction's own size. So an idle
+/// **What the cap measures, exactly:** how far past its cursor one pump reads, other transactions'
+/// traffic included, not the open transaction's own size. The cursor sits at or below the oldest
+/// open transaction's first row (a `TxnEnd`, a `Begin` or a rolled-back transaction can lie
+/// between them and still count). So an idle
 /// open session holding one staged row stops the feed with an `Err` once this much log follows it
 /// (at `00f4c39` it wedged the feed silently after one window). A crashed transaction resolves at
 /// the next open, because recovery aborts every loser. Removing the bound on span needs a decoder
@@ -230,7 +232,8 @@ const MAX_WINDOW_BATCHES: u64 = 64;
 /// boundary with a cursor of one's own choosing loses data silently.
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
-    /// Largest batch of log to decode in one pump, in bytes.
+    /// A pump's first window of log, in bytes. It grows, up to `MAX_WINDOW_BATCHES` times this, only
+    /// when an open transaction would otherwise wedge the feed (D276).
     max_bytes: u64,
     /// The snapshot an initial read already delivered, when this streamer is following one.
     /// See [`FeedStreamer::resuming_after_snapshot`].
@@ -257,8 +260,8 @@ impl FeedStreamer {
         &self.publication
     }
 
-    /// Bound how much log one pump will decode. A consumer that has been away for a long time
-    /// should not cause one unbounded allocation.
+    /// Bound how much log one pump decodes in its first window. A consumer that has been away for
+    /// a long time should not cause one unbounded allocation.
     ///
     /// A single transaction larger than this is still read whole: the window grows until its
     /// `Commit` or `Abort` is in reach, up to `MAX_WINDOW_BATCHES` times this bound, and a pump that
@@ -508,8 +511,9 @@ impl FeedStreamer {
         // flight, which is caught up, not wedged), or the window reaches its cap, where the pump
         // refuses by name rather than answer a quiet `Ok`. Never over a refusal: a refused commit
         // stalls the feed on purpose and says so, and growing past it would report the wrong reason.
-        // The bytes held for one pump are bounded by the cap; an in-flight transaction already
-        // larger than it is refused too, since delivering it whole would need more.
+        // The bytes held for one pump are bounded by the cap, measured from the cursor, which sits
+        // at or below the oldest open transaction's first row; an in-flight transaction already
+        // reaching past it is refused too, since delivering it whole would need more.
         //
         // Only when this pump would also write NOTHING (review 5): commits this window already
         // holds are delivered first, and the next pump, where `emitted_through` filters them, grows.
@@ -524,16 +528,21 @@ impl FeedStreamer {
             let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);
             if window >= cap {
                 return Err(FerroError::Wal(format!(
-                    "the change feed cannot advance past lsn {}: transaction(s) {:?} open there reach \
-                     no Commit or Abort within {cap} bytes of log from that point ({MAX_WINDOW_BATCHES} \
-                     times max_bytes {}; other transactions' records count toward it), and the feed \
-                     delivers a transaction only whole. Nothing is skipped: end or roll back that \
-                     transaction, or raise max_bytes (FeedStreamer::with_max_bytes).",
+                    "the change feed cannot advance past lsn {cursor}: the oldest open transaction's \
+                     first row is at lsn {}, and no Commit or Abort of it lies within {cap} bytes of \
+                     log from lsn {cursor} ({MAX_WINDOW_BATCHES} times max_bytes {}; other \
+                     transactions' records count toward it). Transactions open at the end of that \
+                     read: {:?}. The feed delivers a transaction only whole and skips nothing: end or \
+                     roll back that transaction, or raise max_bytes (FeedStreamer::with_max_bytes).",
                     decoded.open_from.unwrap_or(cursor),
-                    decoded.open,
-                    self.max_bytes
+                    self.max_bytes,
+                    decoded.open
                 )));
             }
+            // This frame's decode is dropped before the larger one is made, so one pump holds one
+            // window's decode at a time, not the sum of them (review 6).
+            drop(candidates);
+            drop(decoded_events);
             return self.pump_window(wal, cursor, emitted_through, w, window.saturating_mul(2).min(cap));
         }
 
