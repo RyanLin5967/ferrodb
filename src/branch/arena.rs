@@ -1301,7 +1301,8 @@ impl ArenaPageStore {
         // as the consensus snapshot capture, serialised whatever it held at that moment. Counted
         // under the same hold as the extent walk below, the image cannot disagree with itself,
         // wherever and in whatever order the atomic is updated. See [`pages_reserved_by`].
-        b.extend_from_slice(&pages_reserved_by(&st.extents).to_be_bytes());
+        // MUTANT (fire-check only, never land): the image reads the counter again.
+        b.extend_from_slice(&self.reserved_pages.load(Ordering::SeqCst).to_be_bytes());
 
         // Sorted, for the same reason the two maps below are: this function decides the bytes of
         // a durable file and the CRC32 over them, and a `HashMap` iterated in hash order gives two
