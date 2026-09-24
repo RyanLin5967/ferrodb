@@ -458,7 +458,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // transaction manager, and every checkpoint keeps the log until a persist succeeds. Attached
     // before the rebuild below, whose own persist settles it too. This is the one production open
     // (`tests/open_path_allowlist.rs`), so every production catalog carries the debt.
-    catalog.owe_persists_to(txn.catalog_persist_debt());
+    let _ = &txn; // D230 MUTANT M16: open_recovered does not attach the debt
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
     // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
