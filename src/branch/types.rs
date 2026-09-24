@@ -219,6 +219,21 @@ impl LeaseDeadline {
     /// `resume_leases`) are computations too, and a restart must not be what forges the sentinel.
     /// `pub(crate)` for that reason; `31364b3` had it private because `from_now` was its only
     /// caller.
+    ///
+    /// # The rule: arithmetic never produces the sentinel; a caller may still state it
+    ///
+    /// **Decided by the lead, 2026-09-24 (D198/D206 review of `a34b92c`).** What this clamps is
+    /// ARITHMETIC — a sum that would saturate onto `u64::MAX`. A caller that passes
+    /// `LeaseDeadline(u64::MAX)` explicitly (`TRUNK_LEASE`, and the benches and tests that fork with
+    /// it to mean "never reap this") is stating "never" on purpose, and that value is kept exactly:
+    /// it is a fixed point of the table catalog's virtual-clock translations
+    /// (`table_catalog::stored`, `StoredDeadline::outward` / `inward`) and is not clamped here or
+    /// anywhere. Clamping explicit values would change what existing callers store, for no
+    /// correctness gain: the defect was forging, and forging is what this closes.
+    ///
+    /// **Blind spot, stated rather than solved:** a record ALREADY holding a forged `u64::MAX` —
+    /// written by a build before this fix with an over-long lease or an absurd tick — cannot be told
+    /// from an explicit "never", and stays un-reapable exactly as it is today. Nothing rewrites it.
     pub(crate) fn saturating_deadline(base: u64, millis: u64) -> u64 {
         base.saturating_add(millis).min(u64::MAX - 1)
     }
