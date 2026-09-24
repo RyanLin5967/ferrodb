@@ -340,3 +340,120 @@ amendment's claim.
 - `Writable for BranchRecord` means someone could build a `BranchRecord` by hand with a virtual
   deadline and write it. No path in the file does; the rule is at the trait.
 - `put` (cfg(test)) is one such path by design, and translates.
+
+## Amendment 6 — the D198 adversary's caveats C1–C4 (`artie-research/frontier/d198_adversary.md`). Written before their fix.
+
+**Red, at `7cd26ab` (tests only, compiled against `27b127d`'s API):**
+
+| test | at `7cd26ab` | first failing assertion |
+|---|---|---|
+| `f1_lease_grace::a_catalog_with_a_last_alive_mark_refuses_expiry_questions_until_it_resumes` (C2) | **FAIL** | panic "expired_before answered [..] on a catalog whose downtime since its last mark has not been credited in this process (C2)" |
+| `f1_lease_grace::a_heartbeat_carries_the_offset_on_disk_not_a_stale_copy_in_memory` (C3) | **FAIL** | left `Some((5000, 0))`, right `Some((5000, 3000))` |
+| `lease_thread::tests::f1_a_clean_stop_records_the_moment_it_stopped_as_the_last_alive_mark` (C4) | PASS; its red is **M26** | — |
+
+At the fix, all three PASS.
+
+**The fix will do:**
+
+- **C1.**
+  - `impl Writable for BranchRecord` becomes `#[cfg(test)]`. The adversary READ, and the lead
+    confirmed, that every production writer call passes a `StoredRecord`.
+  - **M25 is closed by a TYPE, not by a source-text test.** The offset becomes
+    `stored::LeaseOffset`. Its field is private to `stored`, and no public constructor exists. It
+    is produced only by:
+    - the catalog's in-memory cell (`OffsetCell::load`), which starts at 0 and is published only by
+      a resume;
+    - decoding the durable `[0x08]` record;
+    - `credit`, applied to an existing offset.
+
+    `inward` / `outward` take a `LeaseOffset`, so `StoredDeadline::inward(lease, 0)` is E0308 in
+    every build.
+  - **Why a type, not a text test.** A text test guards wording: `inward(lease, zero)` with a
+    `let zero = 0;` walks around it. The type guards what the call receives. The same reasoning
+    made the deadline a type.
+  - `CoreRecord::with_lease_deadline` goes from `pub` to `pub(crate)`.
+- **C3.** `record_lease_alive` reads the `[0x08]` record under `logical` and writes
+  `(now, that record's D)`, never the in-memory copy. With no record it writes `D = 0`, which is what
+  the disk says.
+- **C2, the narrow form.** A `TableBranchCatalog` that holds a last-alive record, and has NOT run
+  `resume_leases` on this instance, refuses `expired_before` and `enforced_lease` with "…has not
+  resumed its lease clock…".
+  - A catalog with no record answers as before.
+  - Reads (`get`, `get_raw`, `scan`, …) still answer.
+- **C4.**
+  - Test A gains an independent two-sided bound on the server's printed downtime:
+    `t_spawn − mark − 1000 ≤ downtime ≤ t_seen − mark + 1000`.
+    - `mark` is read offline, before the server starts, through a new read-only accessor
+      `TableBranchCatalog::last_alive_mark()`. It is an observing instrument.
+    - `t_spawn` and `t_seen` are the test's own wall-clock readings.
+    - The 1000 ms is cross-process clock slack.
+  - The exact-deadline assertion is unchanged.
+
+**C2 — the enumeration the lead required, and the ⚖ for Ryan.** From `git grep` in `src/` and `tests/`:
+
+- Callers of `expired_before`:
+  - production: `reaper.rs:844` (`expired_candidates`, reached from `scan_once` and
+    `Reaper::reap_expired`);
+  - test decorators: `lease_thread/tests.rs:841`, `reaper.rs:1700`, `:2134`, `tests/d124…:135`,
+    `tests/d41…:174`, `tests/w4_sweep…:121`;
+  - tests: `catalog.rs:1269–1353` (log catalog), `table_catalog.rs:2405`, `:2415`, `:2900–2902`, and
+    mine.
+- Callers of `enforced_lease`: production `runtime.rs:3028` (every agent write and non-trunk fork);
+  my tests.
+- Callers of `reap_expired`:
+  - `reaper.rs` suite (`:1040`–`:2281`, which runs against BOTH catalogs via `reaper_suite!`);
+  - `lease_thread/tests.rs:1150`;
+  - `tests/adv_f5_probe.rs:275`, `d15…:64`, `d19…:52`, `integration_cluster_grants.rs:162`, `:165`,
+    `:424`, `:432`, `:931`, `integration_simulate.rs:773`, `:778`, `:842`, `:1135`,
+    `integration_zero_copy_fork.rs:221`.
+
+**The adversary's strict form** refuses every unresumed catalog. That would turn every one of the
+above red that uses a `TableBranchCatalog` without a resume, plus every agent write through a runtime
+over one (`enforced_lease`): the `reaper_suite!` table half, `d15`, `d19`, `zero_copy_fork`,
+`integration_simulate`, `integration_cluster_grants`' `store`, and more. Per the lead's rule those
+tests are not edited. **⚖ Ryan: whether to take the strict form**, which means making every such test
+and embedder resume first. It is NOT done here.
+
+**The narrow form turns NONE of them red** (INFERRED from the same enumeration):
+
+- A last-alive record is written only by `resume_leases` and `record_lease_alive`. Those run only in:
+  - the two binaries, which resume before serving;
+  - the lease-thread and `f1` tests on this branch, each of which resumes before asking.
+- Every test that reopens a binary-marked catalog does so offline. These are
+  `integration_server_reaps`' `arena_state`, `expire_lease`, `set_lease` and `interrupt_reap`: they
+  read records and renew or set state, and ask no expiry question (READ).
+- `tests/integration_fork_kill9.rs:110` reopens a catalog written by `examples/fork_kill9`, which runs
+  no `LeaseThread`, so there is no mark (READ: `LeaseThread` appears in `examples/` only in
+  `pgserver` and `outer_runtime_lock`).
+- It closes the adversary's schedule, because that schedule requires a prior `pgserver` run and
+  therefore a mark.
+- **Residual:** an embedder that resumes and then never heartbeats. The next start credits its uptime
+  as downtime. That is the extension direction only; it is recorded.
+
+**One of my own tests changes, and the change is an ADDED line:**
+`the_mark_and_the_offset_survive_a_close_and_reopen_from_the_file_alone` asked `expired_before` of a
+reopened, marked, unresumed catalog, which is exactly what C2 now refuses. It gains
+`re.resume_leases(4_000)` before those two assertions: downtime 0 against the mark of 4000, so `D`
+stays 3000 and both assertions are unchanged. The durability of `D` is still asserted before the
+resume, through `get_raw` (4500).
+
+**Mutants, new:**
+
+| mutant | gate | must |
+|---|---|---|
+| M24 in `set_root`, decode raw bytes (`BranchRecord::deserialize_core(..)?.into_hydrated(..)`) and hand the `BranchRecord` to `write_record` — C1's named path | `cargo check --lib` (non-test) | FAIL: E0277, `BranchRecord: Writable` not satisfied. It COMPILES under `--tests` (the impl is `cfg(test)`), which is why the gate is non-test |
+| M24r in `scan`, return a raw-decoded `BranchRecord` without `outward` | `cargo test --lib a_resume_shifts_every_deadline` | compiles everywhere. **Registered compile-survivor.** Killed behaviourally: `scan` must read 4500, and the raw value reads 1500 |
+| M25 `renew_lease`: `rec.set_deadline(StoredDeadline::inward(lease, 0))` | `cargo check --lib --tests` | FAIL: E0308, expected `LeaseOffset`, found integer |
+| M26 delete `record_lease_alive` in `LeaseThread::shutdown` | `cargo test --lib f1_a_clean_stop` | FAIL |
+| M27 delete the C2 refusal in `expired_before` / `enforced_lease` | `cargo test --lib a_catalog_with_a_last_alive_mark` | FAIL |
+| M28 C3 reverted: heartbeat writes the in-memory `D` | `cargo test --lib a_heartbeat_carries_the_offset` | FAIL |
+| M29 resume inflates the measured downtime by 5000 ms in both the print and the shift | `cargo test --test integration_server_reaps a_lease_that_lapsed` | FAIL at the new upper bound; the exact-equality assertion alone passes it |
+
+**Correction to amendment 5's M23 text** (the adversary, Q2): M23 is still E0308. But
+`let mut out = Vec::new()` infers `Vec<StoredCore>`, so the error lands at `Ok(out)` as "expected
+`Vec<CoreRecord>`, found `Vec<StoredCore>`", not at the push. A verifier should match that text.
+
+**Counts, per-target:** RED `7cd26ab` = base + 29 (+2 `f1_lease_grace`, +1 `lease_thread`). FIX =
+base + 29. Lib filter
+`cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
+→ **23** (14 + 4 + 3 + 1 + 1).
