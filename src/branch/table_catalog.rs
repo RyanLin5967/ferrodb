@@ -4919,9 +4919,11 @@ mod f1_lease_grace {
     /// wrote four hours ago; the writer opens, commits and stops (its run is the milliseconds
     /// between readings `t0` and `t1`); the next start resumes an hour after `t1`, with its wall
     /// clock stepped the same hour. Owed: the time from the authority's write to the writer's open,
-    /// plus the hour. That the writer's run is never credited, however long, is
-    /// `the_soft_mark_is_the_last_commit_…`'s to pin. Red against `1ec2deb`, which credits only
-    /// since the last write.
+    /// plus the hour. The name's second clause — the writer's own run is not credited, to the NEXT
+    /// process (review 5, C4: a writer that resumes itself does credit it) — is pinned by two other
+    /// tests, not here: `the_soft_mark_is_the_last_commit_…` (where the mark sits, M50) and
+    /// `an_unresumed_writers_accrued_downtime_is_fixed_at_its_open_not_at_its_commit` (what it
+    /// carries, M64). Red against `1ec2deb`, which credits only since the last write.
     #[test]
     fn the_downtime_before_an_unresumed_writer_is_kept_and_its_own_run_is_not_credited() {
         use crate::cluster::wall_step;
