@@ -900,4 +900,30 @@ mod tests {
         assert_eq!(parts_in_log(), 0, "anti-vacuity: a checkpoint that wrote the store truncates");
         assert_eq!(store.records(), vec![rec(1, 1)]);
     }
+
+    /// **AMENDED 3, item 3.** A pruned record the log still holds is not brought back by the open's
+    /// catch-up: the prune floor is in the image, and membership applies only at or above it.
+    ///
+    /// Mutant: `enqueue` ignores the floor — the pruned records are queued, rewritten, and back.
+    #[test]
+    fn a_pruned_record_is_not_resurrected_by_the_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_in(&dir, 2);
+        for h in 1..=4 {
+            s.enqueue(vec![rec(h, h)]);
+            s.drain().unwrap();
+        }
+        let kept: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(kept, [3, 4], "fixture: W = 2 keeps the newest two publishes");
+        drop(s);
+        // Reopened with a wider window, so no prune can hide a resurrection by pruning it again.
+        let s = open_in(&dir, 8);
+        // The log outlived the window: the catch-up offers every committed record again.
+        s.enqueue((1..=4).map(|h| rec(h, h)).collect());
+        s.drain().unwrap();
+        drop(s);
+        let s = open_in(&dir, 8);
+        let kept: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(kept, [3, 4], "a pruned record came back from the log");
+    }
 }
