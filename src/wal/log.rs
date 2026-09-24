@@ -69,7 +69,7 @@ pub struct WalManager {
     /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
     pins: Mutex<std::collections::BTreeMap<u64, u64>>,
     next_pin_id: AtomicU64,
-    /// **Test-only: make the next [`WalManager::append`] fail once.**
+    /// **Test-only: make one [`WalManager::append`] fail: the n-th from now.**
     ///
     /// `append` cannot fail on its own — it extends an in-memory buffer and ends in `Ok`. That
     /// makes several error paths that guard against a failed append unreachable, and an unreachable
@@ -79,8 +79,10 @@ pub struct WalManager {
     ///
     /// `#[cfg(test)]` so it does not exist in any shipped build, nor in integration tests: this is
     /// a lever for the unit tests in this crate and nothing else.
+    /// A countdown since lane §21.18: 0 is disarmed, and n fails the n-th append from now, so a test
+    /// can fail a later append of a sequence (a commit's `TxnEnd`, after its `Commit`).
     #[cfg(test)]
-    pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
+    pub(crate) fail_next_append: std::sync::atomic::AtomicU32,
     /// The format this log was written in: [`VERSION`], or [`LEGACY_VERSION`] until a truncation
     /// rewrites the header.
     format: AtomicU32,
@@ -644,7 +646,7 @@ impl WalManager {
         }
         Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1),
             #[cfg(test)]
-            fail_next_append: std::sync::atomic::AtomicBool::new(false),
+            fail_next_append: std::sync::atomic::AtomicU32::new(0),
             format: AtomicU32::new(format), poisoned: AtomicBool::new(false), poison_reason: Mutex::new(None)})
     }
 
@@ -829,11 +831,18 @@ impl WalManager {
 
     // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
     pub fn append(&self, txn_id: u64, prev_lsn: u64, kind: &RecKind) -> Result<u64, FerroError> {
-        // One-shot, and it disarms itself so a test can fail exactly the append it means to and let
-        // the cleanup that follows succeed. Compiled out entirely outside this crate's unit tests.
+        // A countdown that disarms itself at the append it fails, so a test can fail exactly the
+        // append it means to and let the cleanup that follows succeed. Compiled out entirely outside
+        // this crate's unit tests.
         #[cfg(test)]
-        if self.fail_next_append.swap(false, Ordering::SeqCst) {
-            return Err(FerroError::Wal("injected append failure".into()));
+        {
+            let armed = self.fail_next_append.load(Ordering::SeqCst);
+            if armed > 0 {
+                self.fail_next_append.store(armed - 1, Ordering::SeqCst);
+                if armed == 1 {
+                    return Err(FerroError::Wal("injected append failure".into()));
+                }
+            }
         }
         self.refuse_if_poisoned()?;
         // **Review 2's Q5: the log itself refuses the two records whose meaning changed, while it
