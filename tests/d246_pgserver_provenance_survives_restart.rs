@@ -24,8 +24,9 @@
 //! | premise: second process names `agent-b` for row 2 | holds | holds |
 //! | second process names `agent-a` for row 1 | **fails**: the view has no row 1 | holds |
 //! | cold decode `[base_lsn, next_lsn)` | **fails**: slot 1 declared for `agent-a` and `agent-b` | Ok, `agent-a` and `agent-b` under two slots |
+//! | the runs are in `<db>.provenance`, the file the CLI opens | **fails**: no such store | holds |
 //!
-//! Both claims are collected before anything is asserted, so a red run shows both symptoms.
+//! The claims are collected before anything is asserted, so a red run shows every symptom.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -33,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 
+use ferrodb::provenance::DurableProvenanceStore;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::wal::log::WalManager;
 
@@ -261,6 +263,18 @@ fn pgserver_provenance_survives_a_restart_and_its_log_decodes_cold() {
                 )),
             }
         }
+    }
+    // Where the CLI keeps it, `<db>.provenance`, so either binary reopening this database reads the
+    // same attribution. A server that kept its runs in some other file would pass every check above
+    // and still leave the CLI blind to them.
+    let at_cli_path = DurableProvenanceStore::open(side(&db, "provenance"))
+        .map(|s| s.runs().unwrap_or_default().into_iter().map(|r| r.agent_id).collect::<Vec<_>>());
+    match &at_cli_path {
+        Ok(agents) if agents.iter().any(|a| a == "agent-a") && agents.iter().any(|a| a == "agent-b") => {}
+        other => failures.push(format!(
+            "the runs are not in {}, the file the CLI opens for this database: {other:?}",
+            side(&db, "provenance").display()
+        )),
     }
     assert!(
         failures.is_empty(),
