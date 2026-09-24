@@ -123,6 +123,13 @@ fn main() {
             )
             .expect("storage-backed runtime")
         }
+        // D246 — provenance on disk, as the CLI keeps it (`src/cli/cli.rs`) and for its reasons.
+        // On the in-memory store a restarted server interned runs from slot 1 again: `who_wrote_row`
+        // answered nothing for any row merged before the restart, and the log, which this open does
+        // not truncate, declared one slot for two actors, a range `LogicalDecoder` refuses for good.
+        // Applied here because this is the layer that owns the database's name.
+        .with_durable_provenance(format!("{db}.provenance"))
+        .expect("open the durable provenance store")
         // Retiring a branch now reclaims it. Without this, `seal` takes its no-reaper branch: a
         // merged or abandoned branch is marked `Reaped` and its extents are never freed, so every
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.

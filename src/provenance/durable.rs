@@ -14,7 +14,9 @@
 //! moved. What is true now:
 //!
 //! * `AgentRuntime::with_durable_provenance` exists (E79) and `src/cli/cli.rs` uses it, so the CLI
-//!   really does get a durable store.
+//!   really does get a durable store. So does `examples/pgserver.rs` since D246: until then the
+//!   server ran in memory, reissued slots from 1 after every restart, and left a log that declared
+//!   one slot for two actors.
 //! * The three plain constructors still default to `MemProvenanceStore`. That is deliberate — a
 //!   constructor that takes page stores is not given a database's name, so the layer that owns the
 //!   path applies it — and it means a runtime built any other way is still in-memory.
