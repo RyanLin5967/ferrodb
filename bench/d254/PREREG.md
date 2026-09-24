@@ -116,3 +116,25 @@ loop:
   makes U1, AI, CT, CI, CF and CP all panic in `serialize`.
 
 D254's run script runs E1 and E4 on `d249_alter_encodable` to confirm the moved assertion.
+
+---
+
+## Amendment 1 — the fix and mutants recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `1c20cbe` | red tests CT, CI, CF, CP (additions only, `279 0`) |
+| `d8bf380` | this PREREG |
+| `64d6d90` | **the fix**: `persist`'s pre-pass; the checks in `create_table` (before its three allocations), `create_index` and `create_fulltext_index` (before the tree); `refuse_unless_encodable`'s doc |
+| `1654b9b` | mutants P1–P4, cut from `64d6d90` by `bench/d254/make_mutants.py`, each passing `git apply --check`. D249's E1 and E4 (`bench/d249/mutants/`) also apply to this tree, since `alter.rs` is unchanged here |
+
+- **Code removed at `64d6d90`** (`git diff 06b0188 64d6d90 -- src/`): one import line, widened to add
+  `refuse_unless_encodable`, and `create_table`'s three allocations and entry literal.
+  - They are re-ordered, not deleted: the entry is built first with placeholder roots and checked, then the pages
+    are allocated and the roots filled in. The fields and values are unchanged.
+  - `catalog_page.rs` changes only a doc comment.
+- **Counts:**
+  - `d254_catalog_persist_bound` has **4** `#[test]`, with no `cfg`, `ignore` or macro;
+  - `git diff 06b0188 1654b9b` adds 4, and from `9aa6968` it adds 13, with 0 removed.
+- **Per-target: 2579 + 13 = 2592** (2579 measured on main's tree).
+- **The list step is the authority:** `cargo test --test d254_catalog_persist_bound -- --list` is predicted to show 4.
