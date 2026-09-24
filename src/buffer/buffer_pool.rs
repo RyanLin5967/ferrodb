@@ -1006,6 +1006,9 @@ impl BufferPoolManager {
             let mut cache = self.arc_locked();
             cache.request(page_id, &|id| self.is_pinned(id))
         };
+        // Test seam (D237 review 2, N1): a unit test can park this fault here, verdict in hand and no
+        // frame claimed yet. An empty stub outside tests; see `buffer::fault_hooks`.
+        let parked = crate::buffer::fault_hooks::park_before_claim(self, page_id);
 
         let frame_i = match verdict {
             ArcResult::Hit => {
@@ -1078,6 +1081,7 @@ impl BufferPoolManager {
         // never find the label already updated and the bytes not yet — that is serving another
         // page's contents, which is the one failure a storage engine cannot apologise for.
         self.frame_write(frame_i).data = data;
+        crate::buffer::fault_hooks::signal_filled(parked);
         self.page_table.write().unwrap().insert(page_id, frame_i);
         Ok(Some(frame_i))
     }
@@ -1510,6 +1514,10 @@ impl BufferPoolManager {
             taken.push((page_id, frame_i));
         }
 
+        // Test seam (D237 review 2, N1): a unit test can park the call here, between pass 1 and
+        // pass 2. An empty stub outside tests; see `buffer::fault_hooks`.
+        crate::buffer::fault_hooks::between_pass_1_and_2(self);
+
         // Pass 2: the disk, validated whole before any bit is cleared.
         if let Err(e) = self.disk_manager.deallocate_many(page_ids) {
             relabel(&taken[..]);
@@ -1790,5 +1798,169 @@ mod tests {
             "an accepted delete must actually evict"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- D237 review 2, N1: a fault that lands while `free_pages` holds a set ------------------
+    //
+    // The race, driven by `buffer::fault_hooks` rather than by timing: a fault of an unrelated page
+    // parks with its verdict in hand, `free_pages` parks between pass 1 and pass 2, and the test
+    // thread lets each go in turn. At 639ab19 pass 1 unlabelled the set's frames to `None`, the
+    // exact state `claim_free_frame` takes as free, so the fault claimed one; pass 3 then zeroed it
+    // and reset its pin, or a refusal wrote the set page's label back over the fault's.
+
+    /// The N1 tests share `fault_hooks`' two global slots, so they run one at a time.
+    static N1_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn n1_pool(tag: &str) -> (Arc<BufferPoolManager>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("ferro-bp-n1-{}-{}.db", std::process::id(), tag));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        (Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap()))), path)
+    }
+
+    fn stamp(bp: &BufferPoolManager, page: u32, byte: u8) {
+        let i = bp.fetch_page(page).unwrap();
+        bp.frame_write(i).data[0] = byte;
+        bp.unpin_page(page, true);
+    }
+
+    fn first_byte(bp: &BufferPoolManager, page: u32) -> u8 {
+        let i = bp.fetch_page(page).unwrap_or_else(|e| panic!("page {page} cannot be pinned: {e}"));
+        let byte = bp.frames[i].read().unwrap().data[0];
+        bp.unpin_page(page, false);
+        byte
+    }
+
+    /// Every table entry's frame carries that entry's label, and no two entries share a frame.
+    fn assert_table_consistent(bp: &BufferPoolManager, when: &str) {
+        let pt = bp.page_table.read().unwrap();
+        let mut owner: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for (&page, &frame) in pt.iter() {
+            let label = bp.frames[frame].read().unwrap().page_id;
+            assert_eq!(label, Some(page), "{when}: page {page}'s table entry names frame {frame}, labelled {label:?}");
+            if let Some(other) = owner.insert(frame, page) {
+                panic!("{when}: pages {other} and {page} both map to frame {frame}");
+            }
+        }
+    }
+
+    struct N1Run {
+        free_result: Result<(), FerroError>,
+        set_frames: Vec<usize>,
+        probe_pinned: bool,
+        fault_frame: usize,
+        fault_pins: u16,
+        fault_byte: u8,
+    }
+
+    /// Fault `faulted` (not resident) while `free_pages(set)` runs, with the fault's frame claim
+    /// placed inside the window between pass 1 and pass 2. `set[0]` must be resident.
+    fn run_n1(bp: &Arc<BufferPoolManager>, set: &[u32], faulted: u32) -> N1Run {
+        use crate::buffer::fault_hooks::{address, FaultPark, FreePark, FAULT, FREE};
+        use std::sync::mpsc::channel;
+
+        let _serial = N1_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let set_frames: Vec<usize> =
+            set.iter().filter_map(|p| bp.page_table.read().unwrap().get(p).copied()).collect();
+        let (arrived_tx, arrived_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (filled_tx, filled_rx) = channel();
+        let (open_tx, open_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        *FAULT.lock().unwrap() = Some(FaultPark {
+            pool: address(bp),
+            page: faulted,
+            arrived: arrived_tx,
+            release: release_rx,
+            filled: filled_tx,
+        });
+        *FREE.lock().unwrap() = Some(FreePark { pool: address(bp), window_open: open_tx, resume: resume_rx });
+
+        let faulter = {
+            let bp = Arc::clone(bp);
+            std::thread::spawn(move || {
+                let i = bp.fetch_page(faulted).unwrap();
+                let (pins, byte) = {
+                    let f = bp.frames[i].read().unwrap();
+                    (f.pin_counter.load(Ordering::Relaxed), f.data[0])
+                };
+                bp.unpin_page(faulted, false);
+                (i, pins, byte)
+            })
+        };
+        arrived_rx.recv().expect("the fault never reached its seam");
+        // The claim scans from here, so the set's frames come first.
+        bp.free_hint.store(0, Ordering::Relaxed);
+        let freer = {
+            let bp = Arc::clone(bp);
+            let set = set.to_vec();
+            std::thread::spawn(move || bp.free_pages(&set))
+        };
+        open_rx.recv().expect("free_pages never reached its seam");
+        // The window: pass 1 is done and pass 2 has not begun.
+        let probe_pinned = bp.pin_if_labelled(set_frames[0], set[0]).is_some();
+        release_tx.send(()).unwrap();
+        filled_rx.recv().expect("the fault never filled its frame");
+        resume_tx.send(()).unwrap();
+        let free_result = freer.join().unwrap();
+        let (fault_frame, fault_pins, fault_byte) = faulter.join().unwrap();
+        N1Run { free_result, set_frames, probe_pinned, fault_frame, fault_pins, fault_byte }
+    }
+
+    /// ⛔ **D237 review 2 N1, red first:** a fault of an unrelated page that claims its frame while
+    /// `free_pages` holds a set must keep that frame, its pin and its bytes, and a frame being
+    /// freed must refuse a pin.
+    #[test]
+    fn a_fault_that_claims_a_frame_while_a_set_is_freed_keeps_it() {
+        let (bp, path) = n1_pool("keeps");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x10 + n as u8);
+        }
+        let faulted = bp.disk_manager.allocate().unwrap();
+        bp.disk_manager.write(faulted, &[0xAB; PAGE_SIZE]).unwrap();
+        assert!(bp.page_table.read().unwrap().get(&faulted).is_none(), "premise: the faulted page is not resident");
+
+        let run = run_n1(&bp, &set, faulted);
+
+        assert!(run.free_result.is_ok(), "premise: the set was not freed: {:?}", run.free_result);
+        assert!(!run.probe_pinned, "pin_if_labelled pinned a frame free_pages was part way through freeing");
+        assert!(
+            !run.set_frames.contains(&run.fault_frame),
+            "the fault claimed frame {} of the set being freed ({:?})",
+            run.fault_frame,
+            run.set_frames
+        );
+        assert_eq!(run.fault_pins, 1, "the fault's own pin on frame {} was reset under it", run.fault_frame);
+        assert_eq!(run.fault_byte, 0xAB, "the faulted page's bytes were zeroed under it");
+        assert_table_consistent(&bp, "after the free");
+        assert_eq!(first_byte(&bp, faulted), 0xAB, "the faulted page does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ⛔ **D237 review 2 N1, red first, the refusal half:** when `free_pages` refuses after the
+    /// fault claimed its frame, the refusal must not write a set page's label over the fault's.
+    /// The set carries a page no bitmap page maps, so pass 2 refuses.
+    #[test]
+    fn a_refused_free_does_not_relabel_a_frame_a_fault_claimed() {
+        let (bp, path) = n1_pool("refused");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x10 + n as u8);
+        }
+        let faulted = bp.disk_manager.allocate().unwrap();
+        bp.disk_manager.write(faulted, &[0xAB; PAGE_SIZE]).unwrap();
+        let mut batch = set.clone();
+        batch.push((PAGE_SIZE as u32 - 4) * 8 * 4);
+
+        let run = run_n1(&bp, &batch, faulted);
+
+        assert!(run.free_result.is_err(), "premise: the batch with an unmapped page was freed");
+        assert_table_consistent(&bp, "after the refusal");
+        for (n, &p) in set.iter().enumerate() {
+            assert_eq!(first_byte(&bp, p), 0x10 + n as u8, "set page {p} does not read back its bytes after the refusal");
+        }
+        assert_eq!(first_byte(&bp, faulted), 0xAB, "the faulted page does not read back its bytes");
+        let _ = std::fs::remove_file(path);
     }
 }
