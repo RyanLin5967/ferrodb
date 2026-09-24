@@ -6,13 +6,13 @@
 //! merge of δ rows paid on the order of 2δ fsyncs while every other statement waited on the catalog
 //! lock it holds. Now it pays ONE, whatever δ is, plus one per altered table whose rewrite moved an
 //! attributed row, because each rewrite can reach the disk before the publish begins and so is a
-//! durability point of its own (`catalog::alter::commit_rewrite` flushes its stamps before it
-//! returns).
+//! durability point of its own (`Catalog::apply_plan` flushes a rewrite's stamps right after
+//! `finish` installs it).
 //!
 //! [`ProvenanceFlush`] is what the merge holds instead. The code that stamps through the trait —
 //! the executors and the rewrite, neither of which knows it is inside a merge — is handed
 //! [`ProvenanceFlush::stamper`], whose `stamp` is `stamp_pending`: applied to the index at once,
-//! with every guard, and written later. Each rewrite flushes its own stamps before it returns; the
+//! with every guard, and written later. Each rewrite's stamps are flushed as it is installed; the
 //! publish loop's ride the merge's final durable write (its row authorship), which carries every
 //! pending stamp ahead of its own records in one append and one sync; [`ProvenanceFlush::flush`]
 //! covers anything left.
@@ -38,16 +38,20 @@
 //! * A crash between the commit and the authorship sync: the rows and every physical stamp are
 //!   durable; row authorship is a prefix of the merge's records.
 //!
-//! **After:** each table's rewrite stamps are written in one sync at the END of that table's
-//! rewrite, before `finish` persists the catalog that makes it reachable and before any later table
-//! is rewritten. The publish loop's stamps and the row authorship reach the file only in the one
-//! append after the commit.
+//! **After:** each table's rewrite stamps are written in one sync right after `finish` installs
+//! that table's new schema, and before any later table is rewritten — after, not before, so a
+//! failed flush returns with the table consistently altered instead of leaving every tuple converted
+//! under the old catalog (the I19 state). The publish loop's stamps and the row authorship reach
+//! the file only in the one append after the commit.
 //!
 //! * A crash DURING a table's rewrite: that table's moved rows lose the stamps the eager path had
 //!   already synced for the rows moved so far. The table itself is then the half-rewritten heap
 //!   `catalog::alter` describes — rows converted under the old schema with no log to undo them —
 //!   so the attribution lost is of rows that are already unreadable; closing it needs the rewrite
 //!   logged, as that module says.
+//! * A crash between `finish` and that flush: `finish` writes the catalog only into the buffer pool,
+//!   so the new schema is on disk only if an eviction happened to write it in that window, which
+//!   allocates nothing; if it did, the moved rows reopen unattributed.
 //! * A crash after a rewrite's flush but before its heap reaches the disk: the file names new
 //!   `(page, slot)`s whose moves were not made durable — stale stamps, exactly as the eager path
 //!   could leave them.

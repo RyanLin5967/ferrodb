@@ -21,10 +21,12 @@
 //! store issued inside the MERGE, whatever it carried — and adds the one physical-stamp path the
 //! publish loop does not own: an ALTER's rewrite re-stamping the rows it moves.
 //!
-//! **The third test is the one exception, and why.** A merge that alters a table AND publishes
-//! rows has two durability points — the schema phase makes its heap rewrite durable before the
-//! publish begins — so it syncs twice, whatever δ is:
-//! `a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrite`.
+//! **The third and fourth tests are the one exception, and why.** Each table a merge ALTERS is a
+//! durability point of its own — its rewrite can reach the disk before the publish begins — so the
+//! merge syncs once per altered table whose rewrite moved an attributed row, plus once for the
+//! publish, whatever δ is:
+//! `a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrite` (one table, 2)
+//! and `each_altered_tables_rewrite_stamps_are_durable_before_the_next_rewrite` (two tables, 3).
 //!
 //! # Pre-registered, from reading the source at `9aa6968`, before this file was ever run
 //!

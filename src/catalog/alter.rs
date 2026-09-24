@@ -645,7 +645,7 @@ impl Catalog {
             HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
         }
 
-        let primary_root_now =
+        let (primary_root_now, stamped) =
             commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
 
         // An index records the column it covers by NAME (`IndexInfo.column_name`) and the planner
@@ -696,6 +696,27 @@ impl Catalog {
         // ALTER changed the schema, so every cached reader snapshot is stale. Root moves do NOT
         // bump this (D53 made the root cell shared); a column change must.
         self.epoch_bump();
+        // **D219 — this rewrite's stamps are durable before this returns, whoever called it.** A
+        // MERGE hands the rewrite a store whose `stamp` only queues (`ProvenanceFlush::stamper`),
+        // so the moved rows' stamps are in the index and not yet in the file, while the buffer
+        // pool may write this table's rewritten pages, and the catalog page `finish` just
+        // persisted, to the database file at any eviction; a merge altering a second table keeps
+        // allocating while it rewrites that one. Flushed here, the stamps are durable before any
+        // later table is touched: one sync per rewrite that stamped, not one per moved row.
+        //
+        // **After `finish`, and only if this rewrite stamped**, both deliberately. Before `finish`,
+        // a failed flush would leave every tuple converted under the old catalog — the I19 state
+        // `finish` exists to rule out; here it leaves the table consistently altered and returns
+        // the error. And a rewrite that stamped nothing must not answer for records someone else
+        // left pending: a store poisoned by an earlier failed append refuses every non-empty flush,
+        // and a plain `ALTER TABLE` of an unattributed table has no business failing on that. For
+        // a store that stamps eagerly (a plain `ALTER TABLE`), the stamps are already durable and
+        // nothing is pending, so this is not a write.
+        if stamped {
+            if let Some(store) = &prov {
+                store.flush()?;
+            }
+        }
         Ok(shapes[1..].iter().map(shape_of).collect())
     }
 
@@ -1041,9 +1062,12 @@ fn commit_rewrite(
     primary_root: u32,
     prepared: Vec<Prepared>,
     prov: Option<&Arc<dyn ProvenanceStore>>,
-) -> Result<u32, FerroError> {
+) -> Result<(u32, bool), FerroError> {
     let heap = HeapFileManager::open(dir_root, bp.clone());
     let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
+    // Whether this rewrite stamped anything, so the caller flushes exactly the stamps it wrote and
+    // never answers for records another statement left behind (D219; see `apply_plan`).
+    let mut stamped = false;
     for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
@@ -1074,22 +1098,9 @@ fn commit_rewrite(
             // the rewrite happened to move.
             if let (Some(store), Some(who)) = (prov, attribution) {
                 store.stamp(new_rid, who)?;
+                stamped = true;
             }
         }
-    }
-
-    // **D219 — this rewrite's stamps are durable when it returns, whoever called it.** A MERGE
-    // hands the rewrite a store whose `stamp` only queues (`ProvenanceFlush::stamper`), so the
-    // moved rows' stamps are in the index and not yet in the file. From here on the buffer pool may
-    // write this table's rewritten pages to the database file at any eviction, and the caller's
-    // `finish` persists the catalog that makes them reachable; a merge altering a second table does
-    // both while that table is rewritten. Flushing here, before `finish`, means no state in which
-    // this ALTER can be read from disk lacks its stamps — one sync per rewrite, not one per moved
-    // row. For a store that stamps eagerly (a plain `ALTER TABLE`) nothing is pending and this is
-    // not a write. A failure here is an environmental failure after the heap moved, the same class
-    // as a stamp failing inside the loop above always was.
-    if let Some(store) = prov {
-        store.flush()?;
     }
 
     // A split during the repointing above can move the tree's root, and the caller records it.
@@ -1108,7 +1119,7 @@ fn commit_rewrite(
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
     // inventing a rule for it.
-    Ok(primary.root_page_id.load(Ordering::Relaxed))
+    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))
 }
 
 #[cfg(test)]

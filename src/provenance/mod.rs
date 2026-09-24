@@ -185,7 +185,9 @@ pub trait ProvenanceStore: Send + Sync {
     fn stamp_pending(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
 
     /// Make every pending record durable: ONE append and ONE sync for all of them. Nothing pending
-    /// is not a write: no sync, and no refusal even from a store that is refusing writes.
+    /// is not a write: no sync, and no refusal even from a store that is refusing writes (a lock
+    /// poisoned by a panicking writer is the one exception: the durable store refuses it rather
+    /// than panic inside the `Drop`s that call this).
     fn flush(&self) -> Result<(), FerroError>;
 
     /// Every page that carries attribution, as `(page_id, distinct runs in its dictionary)`.

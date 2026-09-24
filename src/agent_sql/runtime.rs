@@ -5022,9 +5022,9 @@ impl AgentRuntime {
         // **D219 — this merge's provenance is made durable by one sync per durability point.** The
         // rewrite below re-stamps the rows it moves and the publish loop stamps every version it
         // writes, both through `prov`, which is the guard's stamper: applied to the index at once
-        // with every guard, and written later. Each table's rewrite flushes its own stamps before
-        // it returns (`catalog::alter::commit_rewrite`), because the rewrite can reach the disk
-        // before the publish begins; the publish loop's ride `record_applied`'s row authorship,
+        // with every guard, and written later. Each table's rewrite flushes its own stamps right
+        // after `finish` installs it (`Catalog::apply_plan`), because the rewrite can reach the
+        // disk before the publish begins; the publish loop's ride `record_applied`'s row authorship,
         // the merge's final durable write. `provenance.flush()` after it covers anything left, and
         // the guard's `Drop` covers every early return. So a merge syncs the provenance file once,
         // plus once per altered table whose rewrite moved an attributed row.
