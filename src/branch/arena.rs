@@ -2295,7 +2295,7 @@ impl PageStore for ArenaPageStore {
         // anyway. The order against the durable map is unchanged: the catalog write still
         // precedes the persist below, which is the order the note there depends on.
         if let Err(e) = self.catalog.add_arena(branch, arena) {
-            self.space.give_back(start, pages);
+            // MUTANT (fire-check only, never land): the refused range is not given back.
             return Err(e);
         }
         {
