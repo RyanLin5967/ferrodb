@@ -135,3 +135,42 @@ pre-existing, and NP asserts nothing about it.
 | **Q1 `first_page_written_before_allocating`** | writes page 1's new image between step 3 and step 4 | **NP** (its pages assertion). FR survives, because step 3 refuses before Q1's write |
 | **Q2 `first_page_written_before_the_walk`** | writes page 1's new image before step 3 | **FR and NP** |
 | **Q3 `layout_size_refusal_removed`** | step 1 no longer refuses an entry that fits no empty page | **CP** (D254's test): `add_entry` returns `NotEnoughSpace`, not the size `Constraint`. CT, CI and CF survive, because their DDL checks refuse first |
+
+---
+
+## Amendment 1 — the fix and mutants recorded; Q2's FR prediction corrected (nothing built)
+
+| commit | what |
+|---|---|
+| `1793298` | red tests NP, FR (additions only, `228 0`) |
+| `ce06adc` | this PREREG |
+| `05878dc` | **the fix**: `persist` in six phases; `stamped_catalog_page`, `release_catalog_pages`, `write_catalog_page`; `CatalogPage::stamp_links`, which `serialize` now uses; `refuse_unless_encodable`'s doc |
+| `3b37071` | mutants Q1–Q3, cut from `05878dc` by `bench/d270/make_mutants.py`, each passing `git apply --check` |
+
+- **What was removed at `05878dc`:** the old one-loop body of `persist`, including D254's per-entry pre-pass, which
+  the layout and the single serialize replace; and `serialize`'s two link lines, now one `stamp_links` call.
+  `git diff 6ead01b 05878dc -- src/` is `catalog.rs` `121 69` and `catalog_page.rs` `14 4`.
+- **Which D254 mutants still apply here.**
+  - P2, P3 and P4 apply, because the DDL checks are unchanged.
+  - P1 (the `persist` pre-pass) does not apply: the pre-pass no longer exists. Its role, refusing an oversized
+    entry inside `persist`, is Q3's here.
+  - Both facts are from `git apply --check`.
+- **Q2's FR prediction, corrected.** Q2 writes page 1's new image before the walk, with a `next` of 0, because the
+  walk has not yet read page 1's successor. That cuts the chain.
+  - The walk then never reaches the damaged page 2, the statement SUCCEEDS, and FR fails at its
+    `.expect("… cannot be rewritten")`, not at the page-1 assertion.
+  - NP fails at its pages assertion: page 1 holds `[aaa, b1, b2, b3]`, and allocating the two missing pages
+    refuses.
+  - **Q2 → FR (at the refusal expectation) and NP.**
+- **Counts:**
+  - `d270_catalog_persist_allocate_first` has **2** `#[test]`, with no `cfg`, `ignore` or macro;
+  - `git diff 6ead01b 3b37071` adds 2, and from `9aa6968` it adds 15, with 0 removed.
+- **Per-target: 2579 + 15 = 2594.**
+- **The list step is the authority:** `cargo test --test d270_catalog_persist_allocate_first -- --list` is predicted
+  to show 2.
+
+| mutant | fails |
+|---|---|
+| Q1 | NP (pages assertion) |
+| Q2 | FR (the statement succeeds) and NP (pages assertion) |
+| Q3 | CP, in D254's target: `NotEnoughSpace` instead of the size `Constraint` |
