@@ -612,6 +612,10 @@ impl WalManager {
             header[16..24].copy_from_slice(&1u64.to_be_bytes());
             pwrite_all(&*file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
+            // A fresh log is a new database at this path: its quarantine starts fresh too (review 5's F6).
+            crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
+                FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
+            })?;
             (INITIAL_LSN, 1u64, VERSION)
         } else {
             let mut header = [0u8; HEADER_SIZE];
@@ -721,7 +725,8 @@ impl WalManager {
     /// pin was added to prevent, reintroduced by the fix for it. [`WalManager::truncate`] takes
     /// the same lock, so there is no gap to land in.
     ///
-    /// Lock order is pins -> buffer -> file, matching `truncate`.
+    /// Lock order is pins -> buffer -> file, matching `truncate`. (D250 removed the pin fence that #16
+    /// put first.)
     pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
         let mut pins = self.pins.lock().unwrap();
         let lsn = self.flushed_lsn.load(Ordering::SeqCst);
