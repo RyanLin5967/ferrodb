@@ -11,9 +11,9 @@
 //! of a many-page tree (D222), so that rebuild needs more pages than it frees.
 //! `frontier/d229_candidates_adversary.md` E1 (artie-research `b3c3469`).
 //!
-//! The behavioural test drives the shipped binary. The pgserver entry point never rebuilds, so the
-//! same order is pinned there by reading the source, the way `open_path_allowlist` pins the open
-//! path.
+//! The behavioural test drives the shipped binary. The pgserver entry point never rebuilds, and
+//! `table_dump` never attaches the arena at all, so for them the same order is pinned by reading
+//! the source, the way `open_path_allowlist` pins the open path.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -31,6 +31,13 @@ const FILLER_ROWS: u32 = 3_000;
 
 const REGION_FULL: &str = "no free page below the reserved arena region";
 const OVERLAP_REFUSAL: &str = "overlaps pages the bitmap allocator owns";
+
+/// One stdout line with the CLI's prompts taken off. The binary prints `ferrodb=> ` with no newline
+/// before reading each line (`run_cli`'s read loop), so a statement's output lands on its prompt's
+/// line, and a statement that printed only to stderr leaves its prompt in front of the next one.
+fn without_prompts(line: &str) -> &str {
+    line.trim().trim_start_matches("ferrodb=> ").trim()
+}
 
 /// Run the real binary on `db` with `sql` as its stdin. The SQL goes through a file, not a pipe:
 /// a pipe written in full before the output is read deadlocks once the child's stdout fills.
@@ -72,8 +79,8 @@ fn changed_pages(before: &[u8], after: &[u8], base: u32) -> Vec<u32> {
 /// more pages than it frees. With the region unreserved during recovery those pages come from the
 /// arena. With it reserved, the rebuild refuses with the table-region-full message and the arena
 /// is untouched. That open still fails part-way through its rebuild (D229 schedule (a), not this
-/// row), so the test accepts either an open that succeeded or one refused for a full region, and
-/// nothing else.
+/// row). The refusal is also the fixture's proof that the rebuild really asked for more pages than
+/// the region had, so an open that succeeds fails the premise check at the end.
 #[test]
 fn an_open_that_rebuilds_into_a_full_table_region_never_writes_the_arena() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,12 +101,13 @@ fn an_open_that_rebuilds_into_a_full_table_region_never_writes_the_arena() {
     let err = String::from_utf8_lossy(&first.stderr).to_string();
     assert!(first.status.success(), "fixture: session one failed: {err}");
     assert_eq!(
-        out.lines().filter(|l| l.trim() == "ok").count(),
+        out.lines().filter(|l| without_prompts(l) == "ok").count(),
         3,
         "fixture: CREATE TABLE t, CREATE INDEX and CREATE TABLE f must all succeed: {err}"
     );
     assert!(
-        out.lines().filter(|l| l.trim() == "(1 row affected)").count() >= INDEXED_ROWS as usize,
+        out.lines().filter(|l| without_prompts(l) == "(1 row affected)").count()
+            >= INDEXED_ROWS as usize,
         "fixture: not every indexed row went in"
     );
     let errors: Vec<&str> = err.lines().filter(|l| l.starts_with("error:")).collect();
@@ -128,12 +136,17 @@ fn an_open_that_rebuilds_into_a_full_table_region_never_writes_the_arena() {
         "D239: the reopen was refused because the bitmap now owns arena pages, which it can only \
          have taken during recovery: {err2}"
     );
-    if !second.status.success() {
-        assert!(
-            err2.contains(REGION_FULL),
-            "the reopen failed for a reason other than a full table region: {err2}"
-        );
-    }
+    // The premise, checked last so that a claim failure above reports first: the reopen's rebuild
+    // needed more pages than the table region had, so it was refused for a full region (D229
+    // schedule (a) is why it fails rather than finishing). An open that SUCCEEDS means the rebuild
+    // fit, and then this fixture never reached the allocation D239 is about: a fix to D216 (no
+    // rebuild after a clean exit) or D222 (the rebuild frees the whole old tree) does that. Then
+    // re-derive the fixture; do not read the assertions above as evidence.
+    assert!(
+        !second.status.success() && err2.contains(REGION_FULL),
+        "premise: the reopen was not refused for a full table region, so its rebuild never asked \
+         for a page the region did not have and this test proved nothing about D239. stderr: {err2}"
+    );
 }
 
 /// Source lines with whole-line comments removed, so prose mentioning a call cannot satisfy or
@@ -147,20 +160,68 @@ fn code_of(path: &str) -> String {
         .join("\n")
 }
 
-/// **D239.** Both entry points register the persisted arena floor before `recover`.
+/// Every `.rs` file under `dir`, recursively, as a path relative to the crate root.
+fn rust_files(dir: &str, out: &mut Vec<String>) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let entries = std::fs::read_dir(root.join(dir)).unwrap_or_else(|e| panic!("read {dir}: {e}"));
+    for entry in entries {
+        let name = entry.unwrap().file_name().to_string_lossy().to_string();
+        let rel = format!("{dir}/{name}");
+        if root.join(&rel).is_dir() {
+            rust_files(&rel, out);
+        } else if name.ends_with(".rs") {
+            out.push(rel);
+        }
+    }
+}
+
+/// Does this `use` line import the function `recover` itself, as a whole word?
+fn imports_recover(line: &str) -> bool {
+    let line = line.trim_start();
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    line.starts_with("use ")
+        && line.contains("wal::recovery::")
+        && line.match_indices("recover").any(|(at, word)| {
+            !ident(line[..at].chars().next_back()) && !ident(line[at + word.len()..].chars().next())
+        })
+}
+
+/// Entry points that run recovery but whose runtime has no page store, so their databases never
+/// have an arena to protect. Each is checked to still import `recover`, so an entry cannot outlive
+/// its reason unnoticed.
+const NO_ARENA: &[&str] = &["examples/crash_mid_merge.rs"];
+
+/// **D239.** Every entry point that runs recovery registers the persisted arena floor first.
 ///
 /// pgserver never rebuilds, so the binary test above cannot reach it: its exposure is recovery's
-/// own allocations (a heap directory repair). This pins the order in the source of both.
+/// own allocations (`add_to_directory` takes a new page when a directory page is full).
+/// `table_dump` runs the same recovery and never attaches the arena at all. So the order is pinned
+/// in the source of every file under `src/` and `examples/` that imports `wal::recovery::recover`.
+/// Those files are found, not listed, so a new entry point is held to the order without anyone
+/// remembering to add it here. The three known ones must be among those found, which is what makes
+/// an empty or shrunken search fail.
 ///
-/// Stated blind spot: an entry point that stops calling `recover(&txn)` directly (a shared open
-/// function, D204's `open_recovered`) fails the first assertion, and this check must then be
-/// pointed at that function.
+/// Stated blind spot: an entry point that stops importing `recover` (a shared open function, D204's
+/// `open_recovered`) drops out of the search and fails the known-three assertion; the check must
+/// then be pointed at that function.
 #[test]
-fn both_entry_points_reserve_the_arena_floor_before_recovery() {
-    for path in ["src/cli/cli.rs", "examples/pgserver.rs"] {
-        let code = code_of(path);
+fn every_recovering_entry_point_reserves_the_arena_floor_first() {
+    let mut files = Vec::new();
+    rust_files("src", &mut files);
+    rust_files("examples", &mut files);
+    let mut checked = Vec::new();
+    let mut exempt = Vec::new();
+    for path in files {
+        let code = code_of(&path);
+        if !code.lines().any(imports_recover) {
+            continue;
+        }
+        if NO_ARENA.contains(&path.as_str()) {
+            exempt.push(path);
+            continue;
+        }
         let recover_at = code.find("recover(&txn)").unwrap_or_else(|| {
-            panic!("{path}: no `recover(&txn)` call; this check no longer describes the file")
+            panic!("{path}: imports `recover` but never calls `recover(&txn)`; point this at it")
         });
         match code.find("reserve_persisted_floor(") {
             Some(reserve_at) => assert!(
@@ -169,5 +230,14 @@ fn both_entry_points_reserve_the_arena_floor_before_recovery() {
             ),
             None => panic!("D239: {path} never reserves the arena floor before recovery"),
         }
+        checked.push(path);
     }
+    for known in ["src/cli/cli.rs", "examples/pgserver.rs", "examples/table_dump.rs"] {
+        assert!(
+            checked.iter().any(|p| p == known),
+            "{known} was not found by the search, which then proves nothing about it: {checked:?}"
+        );
+    }
+    exempt.sort();
+    assert_eq!(exempt, NO_ARENA, "a NO_ARENA entry no longer imports `recover`; drop it");
 }
