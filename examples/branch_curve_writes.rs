@@ -2142,6 +2142,17 @@ fn main() {
                 (base1 != base0) as u8,
                 retained as u8
             );
+            // A15.4: refused here, not only by the verdict script. A moved base means the reopen
+            // left records past it, so D227's premise is gone, and with it A12.1's `a = 0` and
+            // `runs = M` for every CKPT line this run prints.
+            if base1 != base0 {
+                failures.push(
+                    "A14.1: ckpt-ddl's base MOVED across the DDL, so the reopen left records past the base: \
+                     D227's premise, and with it A12.1's a = 0 and runs = M, no longer holds; amend the \
+                     pre-registration before reading (f3)"
+                        .into(),
+                );
+            }
         }
         let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let mut m_done = 0usize;
