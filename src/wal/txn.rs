@@ -300,6 +300,12 @@ fn injected_release_failure() -> bool {
     false
 }
 
+/// The history push's park seam, production half: never parks. The test half, which parks one
+/// manager's next commit so a test can run a checkpoint at exactly that point (AMENDED 3, item 7),
+/// is defined after the tests module for the reason [`FAIL_RELEASES`] is.
+#[cfg(not(test))]
+fn park_before_history_push(_manager: u64) {}
+
 /// How a release failed. A mismatch between the page and the log can never succeed; anything else
 /// (an I/O error, a poisoned log) may on a retry.
 enum ReleaseError {
@@ -984,6 +990,7 @@ impl TxnManager {
         // copy while its rows became durable.
         // Taken out first, so no other transaction's commit or abort waits on this map while a
         // bounded drain below fsyncs.
+        park_before_history_push(self.id);
         let bound = self.history_bindings.lock().unwrap().remove(&txn_id);
         if let Some(mut records) = bound {
             // AMENDED 3, item 2: each carries its `Commit`'s LSN, which only exists now.
@@ -3889,6 +3896,55 @@ use super::*;
         assert_eq!(held.len(), 1, "the open's catch-up did not take the committed record back");
         assert_eq!(held[0].commit_lsn, commit_lsn, "the re-queued record does not carry its Commit's LSN");
     }
+
+    /// Reopen `setup()`'s files after a crash — nothing checkpointed, every handle dropped — with a
+    /// history store beside them, through `recover`, as an entry point does.
+    fn reopened_with_history(dir: &tempfile::TempDir) -> (TxnManager, Arc<HistoryStore>) {
+        let file = OpenOptions::new().read(true).write(true).open(dir.path().join("txn.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp.clone());
+        bp.attach_wal(wal);
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        crate::wal::recovery::recover(&txn).unwrap();
+        (txn, store)
+    }
+
+    /// **D212 (a') AMENDED 3, item 7 (N3): the history push happens before the transaction leaves
+    /// `att`.** So no checkpoint can run between the `Commit` flush and the push: one that did would
+    /// drain a queue that does not hold the record yet and then truncate the log that does, and the
+    /// crash after it would keep the rows and lose their history.
+    ///
+    /// Two threads: T commits and parks immediately before its push; the other runs `checkpoint()`.
+    /// A GUARD: green wherever the push precedes `self.att_write().remove(&txn_id)`.
+    ///
+    /// Mutant: the push (with this park) moved below `self.att_write().remove(&txn_id)` — the
+    /// checkpoint runs while T is parked, and the crash loses T's history.
+    #[test]
+    fn a_checkpoint_cannot_run_between_the_commit_flush_and_the_history_push() {
+        let (bp, wal, txn, store, dir) = with_history();
+        let t = txn.begin().unwrap();
+        txn.bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .unwrap();
+        let (arrived, resume) = park_next_history_push(&txn);
+        let committer = {
+            let txn = Arc::clone(&txn);
+            std::thread::spawn(move || txn.commit(t))
+        };
+        arrived.wait();
+        // T's Commit is durable and its history is not yet queued.
+        let during = txn.checkpoint();
+        resume.wait();
+        committer.join().unwrap().unwrap();
+
+        // The crash: no checkpoint after the push, so the queue's copy dies with the process.
+        drop((bp, wal, txn, store));
+        let (_txn, store) = reopened_with_history(&dir);
+        let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(held, [1], "a checkpoint between T's Commit and its push lost T's history");
+        assert!(during.is_err(), "a checkpoint ran while a committed transaction's history was not yet queued");
+    }
 }
 
 // **The seam's test half, BELOW the tests module on purpose.** `tests/d53_private_root_allowlist.rs`
@@ -3911,4 +3967,38 @@ fn injected_release_failure() -> bool {
         f.set(left.saturating_sub(1));
         left > 0
     })
+}
+
+/// **Test-only: the manager whose next commit parks immediately before its history push**, and the
+/// two barriers it waits on there (arrived, then resume). Keyed by manager id, so a test running
+/// beside it never parks. Taken by the parked commit, so it parks once.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static HISTORY_PUSH_PARK: Mutex<Option<(u64, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>> =
+    Mutex::new(None);
+
+/// Park `txn`'s next commit immediately before its history push (AMENDED 3, item 7). The caller
+/// waits on the first barrier to know the commit is there, and on the second to let it go.
+#[cfg(test)]
+pub(crate) fn park_next_history_push(txn: &TxnManager) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+    let arrived = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *HISTORY_PUSH_PARK.lock().unwrap() = Some((txn.id, arrived.clone(), resume.clone()));
+    (arrived, resume)
+}
+
+/// The history push's park seam, test half. See [`park_next_history_push`].
+#[cfg(test)]
+fn park_before_history_push(manager: u64) {
+    let parked = {
+        let mut p = HISTORY_PUSH_PARK.lock().unwrap();
+        match p.as_ref() {
+            Some((id, _, _)) if *id == manager => p.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, arrived, resume)) = parked {
+        arrived.wait();
+        resume.wait();
+    }
 }
