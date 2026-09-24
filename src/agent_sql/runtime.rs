@@ -1084,7 +1084,8 @@ struct State {
     /// What `version_history` may forget, found without scanning. See [`HistoryRetention`].
     retention: HistoryRetention,
     /// **D194: every merge that has reserved sequence numbers and not yet recorded them.** Keyed by
-    /// `reserved.start`, with the merge's publish transaction once `begin` has returned.
+    /// `reserved.start`, with the merge's publish transaction, which is begun before the
+    /// reservation so that the two are registered in one step.
     ///
     /// A pin pairs a snapshot with a seq, and the two must describe one instant. `apply_seq` moves
     /// at a merge's RESERVATION, before its publish commits, so during that window it is ahead of
@@ -1093,14 +1094,15 @@ struct State {
     /// reads this map to stay below them.
     ///
     /// Writers:
-    /// - `merge` inserts the entry under the reservation's lock, and fills in the txn id after
-    ///   `begin`.
+    /// - `PublishingEntry::register` inserts the entry under the reservation's lock and returns
+    ///   the guard that removes it, all in one call.
     /// - `record_applied` removes it in the same lock acquisition that records the versions.
-    /// - A `PublishingEntry` guard removes it on every other way out of `merge`.
+    /// - The guard removes it on every other way out of `merge`.
     ///
-    /// Only reservations are recorded here. The map holds no per-branch state and admits no
-    /// write.
-    publishing: BTreeMap<u64, Option<u64>>,
+    /// `record_read` also reads it: a pin above an entry's start claims versions that the history
+    /// cannot name yet. Only reservations are recorded here. The map holds no per-branch state and
+    /// admits no write.
+    publishing: BTreeMap<u64, u64>,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.
     ///
@@ -1186,11 +1188,12 @@ impl State {
     /// was indexed when its workspace was inserted.
     fn pin(&mut self, branch: BranchId, txn: &TxnManager) -> Option<(Arc<Snapshot>, u64)> {
         let (publishing, apply_seq) = (&self.publishing, self.apply_seq);
+        let recorded = self.applied.last().map(|a| a.seq);
         let ws = self.workspaces.get_mut(&branch)?;
         let lazy = ws.fork_snapshot.is_none();
         let at = ws.pin(|| {
             let s = txn.read_snapshot_cached();
-            let seq = pin_seq(publishing, apply_seq, &s);
+            let seq = pin_seq(publishing, apply_seq, recorded, &s);
             (s, seq)
         });
         let seq = ws.fork_seq;
@@ -2280,7 +2283,8 @@ impl AgentRuntime {
             None => match base {
                 Some(txn) => {
                     let s = txn.read_snapshot_cached();
-                    (pin_seq(&state.publishing, state.apply_seq, &s), Some(s))
+                    let recorded = state.applied.last().map(|a| a.seq);
+                    (pin_seq(&state.publishing, state.apply_seq, recorded, &s), Some(s))
                 }
                 None => (state.apply_seq, None),
             },
@@ -3030,6 +3034,24 @@ impl AgentRuntime {
                  sealed while the read was in flight. The versions it saw can no longer be named, \
                  and a read that retained the wrong ones would be worse than none. Nothing was \
                  retained. Retry."
+            )));
+        }
+        // **And one whose pin claims a merge that has not recorded yet** (D194, Amendment 7). A pin
+        // taken between a merge's commit and its `record_applied` contains the merge, so
+        // `pin_seq` rightly gives it the merge's end. But `versions` and `version_history` do not
+        // have those versions until the record, and a read recorded in that gap would name the
+        // superseded one. A pin above some publishing entry's start is exactly that pin: one taken
+        // before the reservation sits at or below the start, and one taken inside the window sits
+        // at it. In-process only, like the case above.
+        let unrecorded = seen_through.filter(|&f| {
+            purpose == ReadPurpose::Inspection
+                && state.publishing.keys().next().is_some_and(|&start| start < f)
+        });
+        if let Some(f) = unrecorded {
+            return Err(FerroError::Branch(format!(
+                "the snapshot this read went through (main as of apply-seq {f}) contains a merge \
+                 that has not recorded its versions yet, so the versions this read saw cannot be \
+                 named. Nothing was retained. Retry."
             )));
         }
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
@@ -6170,19 +6192,14 @@ impl AgentRuntime {
         // ALREADY broken for a leaked reservation on every ORDINARY refusal — and the schema
         // refusals above fire whenever an agent stages an edit its table cannot take, which is a
         // thing that happens.
-        let reserved: std::ops::Range<u64> = {
-            let mut state = self.state.lock().unwrap();
-            let base = state.apply_seq;
-            fresh_reservation(highest_applied_seq(&state.applied), base)
-                .map_err(FerroError::Merge)?;
-            state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
-            // D194: from here until `record_applied`, a pin must not take `apply_seq` without
-            // asking whether its snapshot contains this publish (`pin_seq`).
-            state.publishing.insert(base, None);
-            base..state.apply_seq
-        };
-        let _publishing = PublishingEntry { state: &self.state, start: reserved.start };
-
+        //
+        // **The publish transaction begins FIRST (D194, Amendment 7)**, so the reservation can
+        // register it in the same step: from the reservation until `record_applied`, a pin must
+        // ask whether its snapshot contains this publish (`pin_seq`), and that needs the txn. It
+        // begins in the same place relative to everything a snapshot can see, because visibility
+        // comes at commit. A fork between the begin and the reservation sees neither, and pairs
+        // its snapshot with the old `apply_seq`.
+        //
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
@@ -6192,9 +6209,18 @@ impl AgentRuntime {
         // inside a transaction, so the edits could never have run inside this one; they ran
         // before it opened.
         let publish_txn = ctx.txn.begin()?;
-        // Named before anything is applied or committed, so an entry still reading `None` is one
-        // whose publish cannot be in anyone's snapshot.
-        self.state.lock().unwrap().publishing.insert(reserved.start, Some(publish_txn));
+        let (reserved, _publishing): (std::ops::Range<u64>, PublishingEntry<'_>) = {
+            let mut state = self.state.lock().unwrap();
+            let base = state.apply_seq;
+            if let Err(e) = fresh_reservation(highest_applied_seq(&state.applied), base) {
+                drop(state);
+                ctx.txn.abort(publish_txn)?;
+                return Err(FerroError::Merge(e));
+            }
+            state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
+            let entry = PublishingEntry::register(&self.state, &mut state, base, publish_txn);
+            (base..state.apply_seq, entry)
+        };
         // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
         //
         // The loop below already stamps each version's author through `apply_in`, and
@@ -6388,9 +6414,11 @@ impl AgentRuntime {
         reserved: std::ops::Range<u64>,
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
-        // **D194.** These versions become visible to a pin in this lock acquisition, so the merge
-        // stops counting as publishing in the same one. A pin taken after sees both; a pin taken
-        // before sees neither.
+        // **D194.** These versions become nameable in this lock acquisition, so the merge stops
+        // counting as publishing in the same one. A pin taken after this sees both. A pin taken
+        // before the commit excludes the merge and sits at its start. A pin taken between the
+        // commit and here contains the merge, so its reads are refused until this runs
+        // (`record_read`, Amendment 7).
         let registered = state.publishing.remove(&reserved.start);
         debug_assert!(
             registered.is_some(),
@@ -7366,42 +7394,65 @@ fn fresh_reservation(highest: Option<u64>, base: u64) -> Result<(), String> {
 /// of the earliest such reservation, so a pin never claims a version its snapshot lacks (see
 /// `State::publishing`).
 ///
-/// A merge whose txn is still `None` counts as not contained. The id is filled in before anything
-/// is applied or committed, and filling it in needs the lock the caller holds. A txn the snapshot
-/// includes has finished before it. If it committed, the snapshot holds its rows. If it aborted,
-/// no version will be recorded for it.
+/// A txn the snapshot includes has finished before it. If it committed, the snapshot holds its
+/// rows. If it aborted, no version will be recorded for it.
 ///
 /// ⚠ **Exact only while at most one merge is publishing.** A merge holds `&mut Catalog` from
-/// reservation to record, so one catalog guarantees that. Two catalogs over one database could
-/// commit two merges out of order. That would put an INCLUDED reservation above an excluded one,
-/// and no single seq is then consistent: the lower one treats the included merge as "theirs"
-/// although its rows are in the snapshot. The `debug_assert` names that case.
-fn pin_seq(publishing: &BTreeMap<u64, Option<u64>>, apply_seq: u64, snap: &Snapshot) -> u64 {
-    let contains = |t: &Option<u64>| t.is_some_and(|t| snap.includes(t));
-    let seq = publishing
+/// reservation to record, so one catalog guarantees that. Two catalogs over one database break it
+/// two ways, and each has a `debug_assert` that names it:
+/// - Two merges commit out of order, which puts a CONTAINED reservation above an excluded one. No
+///   single seq is then consistent: the lower one treats the contained merge as "theirs", although
+///   its rows are in the snapshot.
+/// - A later merge records while an earlier one is still publishing, which puts a recorded version
+///   (`recorded`, the last `applied` seq) above the seq this returns.
+fn pin_seq(
+    publishing: &BTreeMap<u64, u64>,
+    apply_seq: u64,
+    recorded: Option<u64>,
+    snap: &Snapshot,
+) -> u64 {
+    let excluded = publishing
         .iter()
-        .filter(|&(_, t)| !contains(t))
+        .filter(|&(_, &t)| !snap.includes(t))
         .map(|(&start, _)| start)
-        .min()
-        .unwrap_or(apply_seq);
+        .min();
+    if let Some(lowest) = excluded {
+        debug_assert!(
+            publishing.iter().all(|(&start, &t)| start < lowest || !snap.includes(t)),
+            "a merge the snapshot contains is publishing above one it does not ({publishing:?}): \
+             no single fork_seq matches this snapshot"
+        );
+    }
+    let seq = excluded.unwrap_or(apply_seq);
     debug_assert!(
-        publishing.iter().all(|(&start, t)| start < seq || !contains(t)),
-        "a merge the snapshot contains is publishing above one it does not ({publishing:?}): no \
-         single fork_seq matches this snapshot"
+        recorded.is_none_or(|r| r <= seq),
+        "version {recorded:?} is recorded above the seq {seq} a snapshot taken now pairs with \
+         ({publishing:?}): a pin at it would read that version as never published"
     );
     seq
 }
 
 /// **D194 — takes a merge's entry out of `State::publishing` on EVERY way out of `merge`.**
 ///
-/// `record_applied` removes the entry when it records the versions. Without this guard, every other
-/// exit would leave the entry behind: a refused `bind_run`, a failed `apply_in`, a failed commit.
-/// An entry left at `None` would hold every later pin at its start while snapshots moved on
-/// without it. That is the inverse of the defect the entry prevents: versions in the snapshot that
-/// the seq calls "theirs". Removing twice is a no-op.
+/// `register` inserts the entry and returns the guard in one call, so there is no way to write one
+/// without the other. `record_applied` removes the entry when it records the versions. Without the
+/// guard, every other exit would leave the entry behind: a refused `bind_run`, a failed `apply_in`,
+/// a failed commit. A stranded entry names an aborted txn, which every later snapshot contains, so
+/// pins would not be harmed. But it would refuse every `REBASE`, and it would read as a merge
+/// forever unrecorded. Removing twice is a no-op.
 struct PublishingEntry<'a> {
     state: &'a Mutex<State>,
     start: u64,
+}
+
+impl<'a> PublishingEntry<'a> {
+    /// Register a merge's reservation, with the lock already held as `locked`, and arm its removal.
+    /// `state` is the same mutex `locked` came from. The guard keeps it for the drop, which runs
+    /// after the caller has released `locked`.
+    fn register(state: &'a Mutex<State>, locked: &mut State, start: u64, txn: u64) -> Self {
+        locked.publishing.insert(start, txn);
+        PublishingEntry { state, start }
+    }
 }
 
 impl Drop for PublishingEntry<'_> {
@@ -8929,15 +8980,14 @@ mod tests {
             (ws.fork_seq, ws.fork_snapshot.clone().expect("fixture: the branch is not pinned"))
         };
 
-        let start = {
+        let t = txn.begin().unwrap();
+        let (start, entry) = {
             let mut st = rt.state.lock().unwrap();
             let start = st.apply_seq;
             st.apply_seq += 2;
-            st.publishing.insert(start, None);
-            start
+            let entry = PublishingEntry::register(&rt.state, &mut st, start, t);
+            (start, entry)
         };
-        let t = txn.begin().unwrap();
-        rt.state.lock().unwrap().publishing.insert(start, Some(t));
 
         let during = rt.begin_session_pinned(id("during"), BranchId::TRUNK, &txn).unwrap().branch;
         let (seq, snap) = pin_of(during);
@@ -8954,7 +9004,11 @@ mod tests {
         assert!(snap.includes(t), "fixture: a snapshot taken after the commit does not contain it");
         assert_eq!(seq, start + 2, "a fork after the commit must claim the publish it can see");
 
-        rt.state.lock().unwrap().publishing.remove(&start);
+        drop(entry);
+        assert!(
+            rt.state.lock().unwrap().publishing.is_empty(),
+            "the guard did not take its entry out"
+        );
     }
 
     /// **D194, Amendment 6: REBASE refuses, retryably, while a merge is publishing.** No consistent
@@ -8974,12 +9028,12 @@ mod tests {
             .branch;
         let ctx = ExecCtx { catalog: &mut catalog, bp, txn: txn.clone() };
 
-        let start = {
+        let t = txn.begin().unwrap();
+        let entry = {
             let mut st = rt.state.lock().unwrap();
             let start = st.apply_seq;
             st.apply_seq += 1;
-            st.publishing.insert(start, None);
-            start
+            PublishingEntry::register(&rt.state, &mut st, start, t)
         };
         let err = rt.rebase_validate(&ctx, branch).err().map(|e| e.to_string());
         assert!(
@@ -8987,8 +9041,58 @@ mod tests {
             "REBASE inside a publish window must refuse, and say why: {err:?}"
         );
 
-        rt.state.lock().unwrap().publishing.remove(&start);
+        drop(entry);
         assert!(rt.rebase_validate(&ctx, branch).is_ok(), "with no merge publishing, REBASE validates");
+    }
+
+    /// **D194, Amendment 7 item 4: a read through a pin that claims a merge the history has not
+    /// recorded yet refuses.**
+    ///
+    /// The fixture is the state between a merge's commit and its `record_applied`: an entry in
+    /// `publishing`, and a branch pinned above its start, as `pin_seq` pins a snapshot that
+    /// contains the merge. The history still ends at version 3, so a read through that pin could
+    /// only name 3 for a row whose image already carried the merge. The anti-vacuity half: once
+    /// the entry is gone, the same read is retained.
+    ///
+    /// Mutant-only red, because it names `publishing`. M19, with the refusal removed, fails the
+    /// first assertion.
+    #[test]
+    fn version_history_is_not_asked_for_a_merge_it_has_not_recorded() {
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        let (pinned_at, entry) = {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let start = st.apply_seq;
+            st.apply_seq += 2;
+            let entry = PublishingEntry::register(&rt.state, &mut st, start, 99);
+            let at = st.apply_seq;
+            st.insert_workspace(b, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+            (at, entry)
+        };
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let read = || {
+            rt.record_read(
+                b,
+                TableId(1),
+                AccessShape::IndexLookup,
+                &[(RowId(1), row.clone())],
+                None,
+                None,
+                ReadPurpose::Inspection,
+                Some(pinned_at),
+            )
+        };
+        let err = read().err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("has not recorded its versions yet")),
+            "a read through a pin above an unrecorded merge must refuse, and say why: {err:?}"
+        );
+        drop(entry);
+        assert!(read().is_ok(), "with no merge publishing, the same read is retained");
     }
 
     /// **The pin audit has to be able to FAIL at a door**, in the way `txn_refs`' audit is shown to
