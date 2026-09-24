@@ -18,8 +18,7 @@
 //! lagging value to the catalog page. An open that does not rebuild reads it back. A clean restart
 //! after a process that ran no DDL leaves an empty log, `recover` returns `false`, and `run_cli`
 //! rebuilds nothing. The shared cell is then seeded with the pre-split root, which is now only the
-//! left half of the tree. Every later INSERT whose key belongs to the right half lands in that left
-//! leaf, and from then on a key in the right half is invisible by lookup and admitted twice.
+//! left half of the tree, and lookups and writes descend from there (see "What D looks for").
 //!
 //! # The schedule each end-to-end test runs, one process per phase
 //!
@@ -36,14 +35,22 @@
 //! which later lanes consolidate that sequence into, does not exist at `9aa6968`, and a red test
 //! must compile there.
 //!
-//! # Why D INSERTs before it looks up
+//! # What D looks for, and why a lookup's answer depends on what is in memory
 //!
-//! Right after D's open, a lookup of a key in the right half is still answered: the descent starts
-//! at the stale root, which is the left LEAF, and the leaf walk (`read_leaf_for`, 64 hops) steps
-//! one leaf right to find it. That lookup is kept as a control. The defect shows once D writes. An
-//! INSERT descends from the stale root too, so a key greater than every other lands in the left
-//! leaf, which then ends with a key larger than anything in the right leaf. The walk stops at the
-//! first leaf whose largest key is not below the key sought, so the right leaf is never reached.
+//! At `9aa6968` the stale root D reads back is the LEFT LEAF of the split tree.
+//!
+//! - **The first lookup, on a cold pool.** `read_leaf_for` tries the lock-free descent first, and
+//!   that reads only pages already in the buffer pool (`read_page_optimistic` returns `None`
+//!   otherwise). D's pool is fresh, so all 16 restarts miss and the latched descent answers. It
+//!   stops at the first leaf it reaches, the stale root, and does NOT walk right. The scan opens at
+//!   the end of the left leaf, follows `next`, and yields every key from the right leaf's first up
+//!   to the one asked for, because nothing re-checks an inclusive lower bound. `id = 369` answers
+//!   184 rows. This is the first assertion to fire at the base.
+//! - **The same lookup once the pages are in memory** would be answered right: the lock-free walk
+//!   steps one leaf right. So D also WRITES and looks again, and that failure does not depend on
+//!   residency. An INSERT descends from the stale root too, so a key larger than every other lands
+//!   in the left leaf. That leaf then ends above everything in the right leaf, both descents stop
+//!   there, and a key in the right half is neither found nor refused as a duplicate.
 //!
 //! # Fixture arithmetic, from source
 //!
@@ -282,8 +289,7 @@ fn leave_exactly_two_free_pages(bp: &BufferPoolManager) {
 /// An INSERT whose primary `upsert` splits the root and whose secondary `insert` is then refused
 /// still records the primary's new root, so a later open that does not rebuild reads the real root.
 ///
-/// At `9aa6968` phase D's second lookup of row 369 returns nothing: the stale root is the left leaf,
-/// and D's own INSERT of 371 has landed in it.
+/// At `9aa6968` phase D's first lookup of row 369 answers rows 186..=369 (see the module doc).
 #[test]
 fn an_insert_refused_after_its_primary_root_split_still_records_the_new_root() {
     let dir = tempfile::tempdir().unwrap();
@@ -308,6 +314,7 @@ fn an_insert_refused_after_its_primary_root_split_still_records_the_new_root() {
              row {TRIGGER} splits its root"
         );
     }
+    let root_before = c.primary_root("t");
     leave_exactly_two_free_pages(&c.bp);
     let refused = c
         .try_sql(&format!("INSERT INTO t VALUES ({TRIGGER}, 'aaa');"))
@@ -317,13 +324,25 @@ fn an_insert_refused_after_its_primary_root_split_still_records_the_new_root() {
         refused.to_string().contains("the reserved arena region at page"),
         "premise failed: refused for another reason than the exhausted allocator: {refused}"
     );
-    let primary_after = leaf_chain::<Value, RecordId>(&c.bp, c.primary_root("t"));
-    assert_eq!(
-        primary_after.len(),
-        2,
-        "premise failed: the primary root did not split before the refusal (chain {primary_after:?}). \
-         The heap may have taken one of the two pages."
+    // The ROOT moved, not merely the leaf: if the heap had taken one of the two pages, the leaf
+    // split would have taken the other and the new root's allocation would have been refused,
+    // leaving two leaves under an unmoved root. The shared cell is where a published root lives.
+    let root_now = c
+        .catalog
+        .root_cell("t", None)
+        .expect("t's primary index has a shared root cell")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        root_now != root_before
+            && matches!(
+                BPlusTreeManager::<Value, RecordId>::open(root_now, c.bp.clone()).read_node(root_now),
+                Ok(BPlusTreePage::Internal(_))
+            ),
+        "premise failed: the primary root did not move to a new internal page before the refusal \
+         (was {root_before}, now {root_now})"
     );
+    let primary_after = leaf_chain::<Value, RecordId>(&c.bp, root_now);
+    assert_eq!(primary_after.len(), 2, "premise failed: one root split makes two leaves: {primary_after:?}");
     assert_eq!(
         leaf_chain::<(Value, Value), ()>(&c.bp, c.secondary_root("t", "v")).len(),
         1,
@@ -339,10 +358,13 @@ fn an_insert_refused_after_its_primary_root_split_still_records_the_new_root() {
         plan.contains("Index scan on t (col 0, [") && !plan.contains("Filter") && !plan.contains("Sequential scan"),
         "premise failed: `{lookup}` must be a bare primary index scan. Plan:\n{plan}"
     );
-    assert_eq!(
-        d.ids(&lookup),
-        vec![RIGHT_KEY],
-        "control: before any write in D, the leaf walk reaches the right leaf from either root"
+    let got = d.ids(&lookup);
+    assert!(
+        got == vec![RIGHT_KEY],
+        "right after the reopen, on a cold pool, `id = {RIGHT_KEY}` must answer exactly that row; it \
+         answered {} rows, starting {:?}",
+        got.len(),
+        &got[..got.len().min(5)]
     );
 
     d.sql("INSERT INTO t VALUES (371, 'aaa');");
@@ -366,8 +388,9 @@ fn an_insert_refused_after_its_primary_root_split_still_records_the_new_root() {
 ///
 /// `SET v = w` over rows 1..=250 in heap order: rows 1..=100 have a `w`, so each posts a new entry
 /// `('bNNNN', id)` and the 63rd fills the leaf (250 + 63 = 313 entries of 13 bytes, 27 + 313·13 =
-/// 4096) and splits the root. Row 101's `w` is NULL and `v` is NOT NULL, so the statement is refused
-/// there, after the split and before any sync. At `9aa6968` phase D's second lookup returns nothing.
+/// 4096) and splits the root, keeping `a0001..a0156` on the left. Row 101's `w` is NULL and `v` is
+/// NOT NULL, so the statement is refused there, after the split and before any sync. At `9aa6968`
+/// phase D's first lookup of `a0200` answers rows 157..=200 (see the module doc).
 #[test]
 fn an_update_refused_on_a_later_row_still_records_the_root_an_earlier_row_split() {
     const ROWS: i32 = 250;
@@ -412,7 +435,14 @@ fn an_update_refused_on_a_later_row_still_records_the_root_an_earlier_row_split(
         plan.contains("Index scan on u (col 1, [") && !plan.contains("Filter") && !plan.contains("Sequential scan"),
         "premise failed: `{lookup}` must be a bare secondary index scan. Plan:\n{plan}"
     );
-    assert_eq!(d.ids(lookup), vec![200], "control: before any write in D, the walk reaches it");
+    let got = d.ids(lookup);
+    assert!(
+        got == vec![200],
+        "right after the reopen, on a cold pool, `v = 'a0200'` must answer exactly row 200; it \
+         answered {} rows, starting {:?}",
+        got.len(),
+        &got[..got.len().min(5)]
+    );
 
     d.sql("INSERT INTO u VALUES (251, 'zzzz', NULL);");
     assert_eq!(
