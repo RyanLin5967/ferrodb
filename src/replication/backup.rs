@@ -63,6 +63,9 @@ use crate::wal::log::WalManager;
 /// The file names inside a backup directory.
 pub const BASE_IMAGE: &str = "base.db";
 pub const BACKUP_LABEL: &str = "backup_label";
+/// D212 (a') AMENDED 3, item 2: the primary's REVERT history, when a backup carries it
+/// ([`take_with_history`], [`restore_with_history`]).
+pub const HISTORY_IMAGE: &str = "history";
 
 /// Where a restored copy sits in the primary's log.
 ///
@@ -273,6 +276,46 @@ pub fn restore(dir: &Path, dest: &Path) -> Result<BackupLabel, FerroError> {
 
     std::fs::copy(&image_path, dest)
         .map_err(|e| FerroError::Io(format!("copy backup image to {}: {e}", dest.display())))?;
+    Ok(label)
+}
+
+/// [`take`], and the primary's REVERT history beside the image (D212 (a') AMENDED 3, item 2): the
+/// store's queue drained and its window copied (`HistoryStore::capture`) AFTER the label's `end_lsn`
+/// was read, so every record committed below it that had been pushed is in the copy. A record
+/// committed later rides along and is cut by [`restore_with_history`]. The one `capture` names as not
+/// covered (committed below `end_lsn`, not yet pushed) is missing here too; the replica's own log
+/// carries it once it streams past `start_lsn`, if its parts are in that range.
+pub fn take_with_history(
+    bp: &Arc<BufferPoolManager>,
+    wal: &Arc<WalManager>,
+    history: &crate::wal::history::HistoryStore,
+    dir: &Path,
+) -> Result<BackupHandle, FerroError> {
+    let handle = take(bp, wal, dir)?;
+    let image = history.capture()?;
+    let path = dir.join(HISTORY_IMAGE);
+    let mut f = std::fs::File::create(&path)
+        .map_err(|e| FerroError::Io(format!("create {}: {e}", path.display())))?;
+    f.write_all(&image).map_err(|e| FerroError::Io(format!("write the backup's history: {e}")))?;
+    f.sync_all().map_err(|e| FerroError::Io(format!("fsync the backup's history: {e}")))?;
+    Ok(handle)
+}
+
+/// [`restore`], and the backup's REVERT history written to `history_dest` cut at the label's
+/// `end_lsn` (D212 (a') AMENDED 3, item 2): the history of exactly the rows the restored image holds
+/// once replay reaches `end_lsn`. A record committed later belongs to rows the image does not have,
+/// and a REVERT of it would invert writes that were never restored. A backup taken without history
+/// restores an EMPTY history, replacing whatever `history_dest` held: that belonged to the database
+/// being replaced.
+pub fn restore_with_history(dir: &Path, dest: &Path, history_dest: &Path) -> Result<BackupLabel, FerroError> {
+    let label = restore(dir, dest)?;
+    let bytes = match std::fs::read(dir.join(HISTORY_IMAGE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(FerroError::Io(format!("read the backup's history: {e}"))),
+    };
+    let (floor, records) = crate::wal::history::HistoryStore::records_through(&bytes, label.end_lsn)?;
+    crate::wal::history::HistoryStore::write_image(history_dest, floor, &records)?;
     Ok(label)
 }
 
@@ -517,5 +560,40 @@ mod tests {
         // And a current one is accepted, or the check above would pass by always failing.
         let fresh = BackupLabel { start_lsn: 326145, end_lsn: 400000, page_count: 1 };
         assert!(fresh.assert_usable_with(326145).is_ok(), "a usable backup was refused");
+    }
+
+    /// **D212 (a') AMENDED 3, item 2.** A backup carries the primary's REVERT history, a record still
+    /// queued at the backup included, and the restore writes exactly the records committed below the
+    /// label's `end_lsn`, replacing whatever history the destination held.
+    ///
+    /// Mutants: `take_with_history` copies without draining (record 2 is missing); the restore keeps
+    /// records past `end_lsn` (record 3 arrives); the restore merges into the destination's own file
+    /// (record 9 survives).
+    #[test]
+    fn a_restore_keeps_only_the_history_committed_before_the_backups_end() {
+        use crate::wal::history::{HistoryRecord, HistoryStore};
+        let rec = |hseq: u64, commit_lsn: u64| HistoryRecord {
+            hseq,
+            ordinal: hseq,
+            commit_lsn,
+            body: format!("publish {hseq}").into_bytes(),
+        };
+        let p = primary("history");
+        seed(&p, 2);
+        let store = HistoryStore::open(p.dir.join("history.db.history"), 8).unwrap();
+        store.enqueue(vec![rec(1, 0)]);
+        store.drain().unwrap();
+        store.enqueue(vec![rec(2, 0), rec(3, u64::MAX - 1)]);
+
+        let out = p.dir.join("bk");
+        let _handle = take_with_history(&p.bp, &p.wal, &store, &out).unwrap();
+        let dest = p.dir.join("restored.db");
+        let dest_history = p.dir.join("restored.db.history");
+        HistoryStore::write_image(&dest_history, 0, &[rec(9, 0)]).unwrap();
+        restore_with_history(&out, &dest, &dest_history).unwrap();
+
+        let restored = HistoryStore::open(&dest_history, 8).unwrap();
+        let hseqs: Vec<u64> = restored.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(hseqs, [1, 2], "the restored history is not the primary's cut at end_lsn");
     }
 }

@@ -366,6 +366,11 @@ impl HistoryStore {
     /// records again behind possibly-written bytes; the reader keys on `hseq` either way.
     pub fn drain(&self) -> Result<(), FerroError> {
         let mut s = self.state.lock().unwrap();
+        self.drain_locked(&mut s)
+    }
+
+    /// [`HistoryStore::drain`]'s body, with F3 already held by the caller.
+    fn drain_locked(&self, s: &mut StoreState) -> Result<(), FerroError> {
         if s.queue.is_empty() {
             return Ok(());
         }
@@ -431,6 +436,73 @@ impl HistoryStore {
                 Ok(())
             }
         }
+    }
+
+    // ---- AMENDED 3, item 2: snapshot capture, install and restore ------------------------------
+
+    /// **The bytes a snapshot or a base backup ships** (AMENDED 3, item 2). Under F3, every queued
+    /// record is first made durable, exactly as the checkpoint hook's drain does, and then the durable
+    /// window is encoded as one image with its prune floor. One hold across both, so a record pushed
+    /// meanwhile waits for the next drain rather than landing between the drain and the copy.
+    ///
+    /// ⚠ **Stated, not covered:** a transaction whose `Commit` is below the image's `end_lsn` but that
+    /// has not yet PUSHED (it sits between its `Commit` flush and the push, still in `att`) is in
+    /// neither this copy nor, when its history parts precede the redo window's `start_lsn`, the
+    /// window the install re-queues from. Its rows ship and its history does not: REVERT of it is
+    /// then refused on the receiver (the safe direction). Closing it needs the capture to wait for
+    /// such transactions, which is not decided.
+    pub fn capture(&self) -> Result<Vec<u8>, FerroError> {
+        let mut s = self.state.lock().unwrap();
+        self.drain_locked(&mut s)?;
+        let window: Vec<HistoryRecord> = s.window.values().cloned().collect();
+        encode_image(&window, s.floor)
+    }
+
+    /// **A captured image cut to the history of exactly the rows an image consistent at `end_lsn`
+    /// holds** (AMENDED 3, item 2): the records whose `Commit` is below `end_lsn`, and the image's
+    /// prune floor. A record committed later is history of rows the receiver never gets, and a REVERT
+    /// of it would invert writes it does not have. Empty `bytes` (a sender with no store) is an empty
+    /// history.
+    pub fn records_through(bytes: &[u8], end_lsn: u64) -> Result<(u64, Vec<HistoryRecord>), FerroError> {
+        if bytes.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let (floor, all) = load(bytes)?;
+        Ok((floor, all.into_values().filter(|r| r.commit_lsn < end_lsn).collect()))
+    }
+
+    /// **Replace this store, file and memory, with `records`** (AMENDED 3, item 2), as a snapshot
+    /// install replaces the database under it. Records below `floor` are dropped and a repeated `hseq`
+    /// keeps its first copy, as the loader does. The queue is EMPTIED: it held the replaced
+    /// database's history. One full rewrite, under F3; on failure the store is unchanged, and the
+    /// install's marker (`consensus::snapshot::install_marker`) refuses the node until it is re-seeded.
+    pub fn install(&self, floor: u64, records: Vec<HistoryRecord>) -> Result<(), FerroError> {
+        let mut s = self.state.lock().unwrap();
+        let mut kept: BTreeMap<u64, HistoryRecord> = BTreeMap::new();
+        for r in records.into_iter().filter(|r| r.hseq >= floor) {
+            kept.entry(r.hseq).or_insert(r);
+        }
+        let list: Vec<HistoryRecord> = kept.values().cloned().collect();
+        let image = encode_image(&list, floor)?;
+        replace_atomically(&*self.ops, &self.path, &image)
+            .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))?;
+        let held = kept.values().filter(|r| r.ordinal > 0).count() as u64;
+        s.window = kept;
+        s.floor = floor;
+        s.queue.clear();
+        s.queued_bytes = 0;
+        s.image_written = true;
+        s.publishes_since_prune = held.saturating_sub(self.retention);
+        s.counters.rewrites += 1;
+        Ok(())
+    }
+
+    /// **Write `records` as the whole store at `path`**, for a restore with no store open (AMENDED 3,
+    /// item 2): one image, written through [`replace_atomically`].
+    pub fn write_image(path: &Path, floor: u64, records: &[HistoryRecord]) -> Result<(), FerroError> {
+        let image = encode_image(records, floor)?;
+        replace_atomically(&OsFileOps, path, &image)
+            .map_err(|e| FerroError::Io(format!("writing {}: {e}", path.display())))
     }
 }
 
@@ -561,6 +633,30 @@ fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError>
         by_hseq.entry(r.hseq).or_insert(r);
     }
     Ok((floor, by_hseq))
+}
+
+/// **The history records of the committed transactions among `records`** (AMENDED 3, item 2): each
+/// transaction's `RevertHistory` parts, reassembled, stamped with the LSN of its `Commit`. A
+/// transaction with no `Commit` among them contributes nothing. Shared by the open's catch-up
+/// (`wal::recovery::recover`) and a snapshot install's re-queue of its redo window, so the two
+/// cannot disagree about what "committed" means.
+pub(crate) fn committed_in(records: &[crate::wal::log::LogRecord]) -> Result<Vec<HistoryRecord>, FerroError> {
+    use crate::wal::log::RecKind;
+    let commit_lsns: std::collections::HashMap<u64, u64> =
+        records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| (r.txn_id, r.lsn)).collect();
+    let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
+        .iter()
+        .filter_map(|r| match (&r.kind, commit_lsns.get(&r.txn_id)) {
+            (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) => {
+                Some((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    assemble(parts)
 }
 
 /// **Reassemble tag-12 WAL parts into records**, for the open's catch-up.

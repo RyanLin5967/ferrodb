@@ -173,22 +173,9 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // F9; AMENDED 3, item 3). The open's checkpoint writes them. Each record carries its
     // transaction's `Commit` LSN (AMENDED 3, item 2); a transaction without one is not committed.
     // With no store attached, a log holding any was refused above (AMENDED 3, item 4).
-    let commit_lsns: HashMap<u64, u64> =
-        records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| (r.txn_id, r.lsn)).collect();
-    let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
-        .iter()
-        .filter_map(|r| match (&r.kind, commit_lsns.get(&r.txn_id)) {
-            (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) => {
-                Some((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    if !parts.is_empty() {
-        let history = crate::wal::history::assemble(parts)?;
-        if let Some(store) = txn.history_store() {
-            store.enqueue(history);
-        }
+    let history = crate::wal::history::committed_in(&records)?;
+    if let Some(store) = txn.history_store() {
+        store.enqueue(history);
     }
 
     // repair directory
