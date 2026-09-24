@@ -240,3 +240,103 @@ fn a_log_catalog_reopen_keeps_the_pin_of_a_reaped_interior() {
 fn a_table_catalog_reopen_keeps_the_pin_of_a_reaped_interior() {
     prune_restart_and_check("table", true);
 }
+
+/// **D235 review F3: a rebuild must not pin a recycled parent slot's new occupant.**
+///
+/// The running D16 reaper cannot build this shape: `release_id` refuses a slot with live children.
+/// A PRE-D16 reaper could, because it detached unconditionally, and so can D201's seal fallback.
+/// The shape: P -> X -> C, with X reaped and DETACHED from P although C lives. P, now childless, is
+/// reaped and its slot released and recycled into N, a child of Q, and N is reaped too. X still
+/// names P's OLD incarnation as its parent.
+///
+/// A rebuild that followed X's parent pointer by slot id alone would reach N, count it as holding
+/// an entry, and file N's epoch under Q, so Q would read as having a live child it never had. The
+/// rule compares the parent handle X recorded with the slot's current `branch_id` and stops.
+///
+/// Both rebuilders are asked: the log reopen (`index`) and a `migrate_from` of that reopened log.
+/// **PASS at `9aa6968`**: the base rule pinned no reaped record at all, so it never walked.
+/// **FAIL at `6589552`**: the rule's first version had no incarnation check. **PASS at the tip.**
+/// Only base API is named, so it compiles at all three. PREREG amendment 2.
+#[test]
+fn a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant() {
+    let files = Files::new("recycled");
+    let never = LeaseDeadline(NEVER);
+
+    let (q, p_slot, x, c, n) = {
+        let cat = LogBranchCatalog::open(&files.cat, 1).expect("open log catalog");
+        let q = cat.fork(BranchId::TRUNK, never).unwrap().branch_id;
+        let p = cat.fork(BranchId::TRUNK, never).unwrap();
+        let x = cat.fork(p.branch_id, never).unwrap();
+        let c = cat.fork(x.branch_id, never).unwrap().branch_id;
+
+        // The PRE-D16 reap of X: mark it, then detach it whatever still lives below it.
+        cat.set_state(x.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        cat.set_state(x.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        cat.detach_child(p.branch_id.id, x.fork_epoch).unwrap();
+        cat.release_id(x.branch_id.id); // refused: X still lists C
+        // P is childless in memory now, so it is reaped and its slot released...
+        cat.set_state(p.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        cat.set_state(p.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        cat.detach_child(BranchId::TRUNK.id, p.fork_epoch).unwrap();
+        cat.release_id(p.branch_id.id);
+        // ...and recycled into N, a child of Q, which is reaped in its turn.
+        let n = cat.fork(q, never).unwrap().branch_id;
+        assert_eq!(n.id, p.branch_id.id, "fixture: N must recycle P's slot");
+        assert_ne!(n.generation, p.branch_id.generation, "fixture: N must be a new incarnation");
+        cat.set_state(n, BranchState::Live, BranchState::Reaping).unwrap();
+        cat.set_state(n, BranchState::Reaping, BranchState::Reaped).unwrap();
+        cat.detach_child(q.id, cat.get_raw(n.id).unwrap().fork_epoch).unwrap();
+        cat.release_id(n.id);
+
+        // PREMISE, in memory: Q has no live child, and X still pins C.
+        assert!(!cat.has_live_children(q.id).unwrap(), "premise: Q is childless before any rebuild");
+        assert!(cat.has_live_children(x.branch_id.id).unwrap(), "premise: X still lists live C");
+        (q, p.branch_id.id, x.branch_id, c, n)
+        // `cat` drops here: the reopen below reads only the file.
+    };
+
+    // Rebuild 1: reopen the log, i.e. `LogBranchCatalog::index`.
+    let reopened = LogBranchCatalog::open(&files.cat, 1).expect("reopen log catalog");
+    // Rebuild 2: migrate that log into the shipped catalog, i.e. `TableBranchCatalog::migrate_from`.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&files.db)
+        .unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let (migrated, _header) =
+        TableBranchCatalog::migrate_from(pool, &reopened, 1).expect("migrate the reopened log");
+
+    let rebuilt: [(&dyn BranchCatalog, &str); 2] = [
+        (&reopened as &dyn BranchCatalog, "log reopen"),
+        (&migrated as &dyn BranchCatalog, "migration"),
+    ];
+    for (cat, name) in rebuilt {
+        // PREMISES after the rebuild: the slot holds N's incarnation, X is reaped, C lives, and the
+        // D16 pin X holds for C is intact.
+        assert_eq!(
+            cat.get_raw(p_slot).unwrap().branch_id,
+            n,
+            "{name}: premise: P's old slot must hold N's incarnation"
+        );
+        assert_eq!(cat.get_raw(x.id).unwrap().state, BranchState::Reaped, "{name}: premise: X");
+        assert_eq!(cat.get_raw(c.id).unwrap().state, BranchState::Live, "{name}: premise: C");
+        assert!(
+            cat.has_live_children(x.id).unwrap(),
+            "{name}: X must still pin the live C below it (the D16 pin itself)"
+        );
+        // THE CLAIM.
+        assert!(
+            !cat.has_live_children(q.id).unwrap(),
+            "{name}: Q reads as having a live child. The rebuild followed X's parent pointer by \
+             slot id into the recycled slot, counted its new occupant N as a pin, and filed N's \
+             entry under Q"
+        );
+        assert_eq!(
+            cat.max_live_child(q.id).unwrap(),
+            None,
+            "{name}: Q reports a live child's fork epoch it never had"
+        );
+    }
+}
