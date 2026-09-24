@@ -39,7 +39,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Insert { table, values } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles, fulltext) = open_table(entry, catalog, bp, txn, txn_id)?;
+            let (heap, tree, handles, fulltext) = open_table(entry, catalog, bp.clone(), txn.clone(), txn_id)?;
             let binder = Binder::new(catalog);
             let empty = Scope::new();
             // Positional: value i lands in column i, so column i's declared type is what decides
@@ -47,7 +47,11 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let column_types: Vec<&crate::catalog::column::DataType> =
                 entry.schema.columns.iter().map(|c| &c.data_type).collect();
             let bound_vals = binder.bind_row_against(values, &column_types, &empty)?;
-            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, fulltext_indexes: fulltext, view: view.clone()};
+            // A reused key archives its dead version here (see `execution::insert`), logged under
+            // this transaction exactly as UPDATE's archive is, so an abort takes it back.
+            let mut tt_heap = HeapFileManager::open(entry.time_travel_root, bp);
+            tt_heap.set_transaction(txn, txn_id);
+            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, fulltext_indexes: fulltext, view: view.clone(), tt_heap};
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {

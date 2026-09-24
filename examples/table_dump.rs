@@ -34,10 +34,7 @@
 //! `Publication::unrestricted()` every other pre-B7 call site names.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -45,12 +42,7 @@ use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_table_json;
 use ferrodb::replication::publication::Publication;
 use ferrodb::storage::db_lock::DbLock;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
-use ferrodb::wal::txn::TxnManager;
-
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -86,27 +78,13 @@ fn main() {
         eprintln!("table_dump: {db} does not exist");
         std::process::exit(1);
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&db)
-        .unwrap_or_else(|e| {
-            eprintln!("table_dump: open {db}: {e}");
-            std::process::exit(1);
-        });
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-    let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
     // Recovery before reading: an unclean shutdown leaves committed work in the log and not yet in the
     // pages, and dumping without replaying it would report rows the source considers written as
-    // missing.
-    recover(&txn).unwrap_or_else(|e| {
-        eprintln!("table_dump: recovery failed: {e}");
-        std::process::exit(1);
-    });
-    let mut catalog = Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap_or_else(|e| {
-        eprintln!("table_dump: open catalog: {e}");
+    // missing. Through the one open path (D204), so the trees are also rebuilt from the recovered
+    // heap. This dump reads by `SELECT *` and would not notice a stale tree, but the next binary to
+    // open the file might, and there is one way to open a database, not one per caller.
+    let OpenedDatabase { bp, txn, mut catalog, .. } = open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| {
+        eprintln!("table_dump: open {db}: {e}");
         std::process::exit(1);
     });
 
