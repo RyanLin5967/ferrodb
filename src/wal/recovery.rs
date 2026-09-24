@@ -341,7 +341,9 @@ pub struct OpenedDatabase {
 ///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
 ///    there because the rebuilt trees and the catalog page are then on disk, so the log that
 ///    produced them has nothing left to say; without it, the next open would replay the same
-///    records and rebuild every tree again (reasoning from `b9a0a75`).
+///    records and rebuild every tree again (reasoning from `b9a0a75`). Step 4 also runs when a
+///    marker says an earlier rollback's index undo failed (`TxnManager::mark_indexes_stale`), even
+///    if the log is empty.
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
@@ -385,9 +387,25 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     } else {
         Catalog::create(bp.clone())?
     };
-    if recovered {
+    // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
+    // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
+    // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
+    // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
+    let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
+    let stale = marker.exists();
+    if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
         txn.checkpoint()?;
+        if stale {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
+                    marker.display()
+                );
+            }
+        }
     }
     Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
 }

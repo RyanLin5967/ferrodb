@@ -194,6 +194,27 @@ impl Page {
                 self.slot_arr.len()
             )));
         }
+        // **D210 — refuse rather than splice into room the page does not have.** This spliced
+        // unconditionally and set `offset = PAGE_SIZE - tuples.len()`. Rolling back a relocation
+        // onto a page that other inserts had filled in the meantime ran the tuple region down over
+        // the slot array and the header, and `serialize` writes tuples LAST, so it silently
+        // overwrote them: a corrupt page for every row on it, reported as success (the fresh-context
+        // re-adversary, `frontier/d205_readversary.md`, `fffdc62`;
+        // `tests/abort_that_cannot_finish.rs`). The room is measured where the splice will land, from
+        // the start of the tuple region, not from a header field. The slot entry already exists, so
+        // no slot space is needed.
+        //
+        // What REDO does with this: recovery reaches it only through the CLR of an undone relocation
+        // (`redo_one`, a `HeapInsert` at an existing slot). Since D211 a CLR is logged only after its
+        // undo has applied (`TxnManager::undo_then_log`), and redo replays the page's history in LSN
+        // order, so it finds the same room the undo found. A refusal in redo therefore means the page
+        // and the log disagree, and it surfaces as a recovery error instead of a page quietly
+        // overwritten.
+        let tuples_start = PAGE_SIZE - self.tuples.len();
+        let room = tuples_start.saturating_sub(self.get_free_space_start() as usize);
+        if room < data.len() {
+            return Err(FerroError::NotEnoughSpace);
+        }
         self.tuples.splice(0..0, data.iter().copied());
         self.slot_arr[slot_num].offset = PAGE_SIZE as u16 - self.tuples.len() as u16;
         self.slot_arr[slot_num].length = data.len() as u16;
