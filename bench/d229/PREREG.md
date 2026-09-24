@@ -127,3 +127,15 @@ and therefore no in-process free, can follow. D229 (a)'s free-after-durable-unli
 D250's completion: recorded as a finding, not removed. `lane_d229_run.sh` carries 9 mutants (M1, M2, M4-M7, M9-M11), one
 site each at `4d37508`. GREEN: `wal::recovery::tests_crash_frees::` **13 run, 13 passed**, predicted. **The GREEN phase
 and mutant base is `4d37508`**; `src/` at this amendment's commit is identical to it.
+
+**Amendment 4 (after the D250 re-merge `9cc779f`).** `9cc779f` merges `d250-drop-logged` @ `f3f75af`: D250 review 1's
+fixes and #16 review 5 (`ed6e901`, via `cb00606`). The merge keeps the following:
+- `CheckpointOutcome` and `KEPT_LOG_DROPS` (a pin-kept DROP is counted), beside `FREE_FAILURES`.
+- A failed append or flush of the `DropTable` record poisons the log (D250 F1).
+- The open's completion skips a DROP whose root was written after it (D250 F2).
+- `OpenedDatabase.completed_drops`.
+
+D229's order is unchanged: intent, then the record, then the mutation, with the frees right after the checkpoint's sync.
+D250's new review-5 F3 test passes the pages argument (`Vec::new()`; assertions unchanged).
+No D229 test changes, and every expectation in amendment 3 stands.
+**The GREEN phase and mutant base is `9cc779f`**: 9 mutants, one site each there (PATTERNS_ONLY).
