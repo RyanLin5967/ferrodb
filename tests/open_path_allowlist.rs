@@ -66,7 +66,7 @@
 //! - The order check reads text order in the body, so `if false && ..` around the rebuild would
 //!   pass it. That the rebuild RUNS is measured by behaviour instead:
 //!   `tests/pgserver_crash_rebuilds_indexes.rs` and
-//!   `wal::recovery::tests::a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty`.
+//!   `wal::recovery::tests::a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_holds_no_heap_or_clr_record`.
 //!
 //! # If this fails
 //!

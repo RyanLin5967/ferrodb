@@ -859,7 +859,7 @@ use super::*;
     }
 
     /// **C1, made true: after an index undo fails, the NEXT OPEN rebuilds the indexes, even when
-    /// the log it opens is empty.**
+    /// the log it opens holds no heap or CLR record** (here: an empty log).
     ///
     /// `open_recovered` rebuilds when `recover` replays something. `recover` returns `false` for an
     /// empty log, and a clean restart can leave one: `schema_log` is filled only by `log_ddl` in the
@@ -871,8 +871,13 @@ use super::*;
     ///
     /// FAILS at `d7891d5` at "left no marker". The failure is forced with a recorded write whose root
     /// is past end-of-file, as in `txn.rs`'s C1 test.
+    ///
+    /// Named for what its premise needs, a log with no record that recovery replays, rather than an
+    /// empty one: at this tip that log is empty, and once D227 re-declares the schema at every
+    /// checkpoint it holds declarations too (lane §21.6; renamed from
+    /// `..._even_when_the_log_is_empty`, assertions unchanged).
     #[test]
-    fn a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty() {
+    fn a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_holds_no_heap_or_clr_record() {
         use crate::execution::executor::run;
         use crate::parser::{parser::Parser, scanner::Scanner};
 
@@ -903,7 +908,7 @@ use super::*;
         }
         let lock = DbLock::acquire(&db).unwrap();
         let o = open_recovered(&db, &lock).unwrap();
-        assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
+        assert!(!o.recovered, "premise failed: the open recovered, so the log held a record recovery replays and recovery alone would have rebuilt");
         assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
     }
 
