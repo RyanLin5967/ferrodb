@@ -1,6 +1,6 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -280,6 +280,78 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     catalog.persist()
 }
 
+/// The page the table catalog starts on, in every database file. One constant for the one open
+/// path. The CLI and three examples each used to declare their own.
+pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
+
+/// A database file, opened, recovered, and with every index rebuilt from the recovered heap.
+pub struct OpenedDatabase {
+    pub bp: Arc<BufferPoolManager>,
+    pub wal: Arc<WalManager>,
+    pub txn: Arc<TxnManager>,
+    pub catalog: Catalog,
+    /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
+    pub recovered: bool,
+}
+
+/// **D204 — THE way to open a database file.** Every binary calls this; none spells the sequence
+/// out for itself (`tests/open_path_allowlist.rs` enforces that).
+///
+/// The order is the whole content:
+/// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL;
+/// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
+/// 3. open the catalog, or create it for a new file;
+/// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
+///
+/// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
+/// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
+/// key and lets a second row take its key; or it can name a row recovery just undid. The
+/// sequence used to be spelled out in each entry point. `cli::run_cli` had step 4 and
+/// `examples/pgserver.rs` never did, from D9 until D204. That is the drift this function ends:
+/// `tests/pgserver_crash_rebuilds_indexes.rs`.
+///
+/// **The caller holds the single-writer lock**, and proves it by passing it: a lock on another
+/// path is refused. It is taken by the caller rather than here because the callers differ in
+/// what they do BEFORE it. `pgserver` reads its environment first, because its refusal path is
+/// `process::exit`, which skips `Drop`, and `table_dump` refuses a missing file first.
+///
+/// Anything built on top, such as the agent runtime and its arena, comes AFTER this returns. The
+/// rebuild allocates pages, and the arena floor must sit above everything this has allocated
+/// (`cli::run_cli` explains the arena ordering).
+pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, FerroError> {
+    if !lock.guards(db_path) {
+        return Err(FerroError::Io(format!(
+            "refusing to open {}: the lock passed in is for a different database, so this open is \
+             not protected against a second writer",
+            db_path.display()
+        )));
+    }
+    let existed = db_path.exists();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(db_path)
+        .map_err(|e| FerroError::Io(format!("open {}: {e}", db_path.display())))?;
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file)?)));
+    let mut wal_path = db_path.as_os_str().to_os_string();
+    wal_path.push(".wal");
+    let wal = Arc::new(WalManager::new(PathBuf::from(wal_path))?);
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    let recovered = recover(&txn)?;
+    let mut catalog = if existed {
+        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
+    } else {
+        Catalog::create(bp.clone())?
+    };
+    if recovered {
+        rebuild_indexes(&mut catalog, &bp)?;
+        txn.checkpoint()?;
+    }
+    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs::OpenOptions, path::Path};
@@ -408,5 +480,26 @@ use super::*;
         let entry = catalog.get_table("t").unwrap();
         let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
         assert!(tree.search(&Value::Integer(1)).unwrap().is_some());
+    }
+
+    /// **D204 — `open_recovered` refuses a lock held for another database, and opens with its own.**
+    ///
+    /// The lock is the caller's proof that no second writer shares the file. Without the refusal, a
+    /// caller holding the lock on one database could open another unprotected, and nothing on the
+    /// SQL path could tell. The second half is the anti-vacuity: a guard that refused every lock would
+    /// pass the first half and open nothing.
+    #[test]
+    fn open_recovered_refuses_a_lock_for_another_database_and_opens_with_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.db"), dir.path().join("b.db"));
+        let lock_a = DbLock::acquire(&a).unwrap();
+
+        let refused = open_recovered(&b, &lock_a).err().expect("a lock on a.db opened b.db");
+        assert!(format!("{refused}").contains("different database"), "refused for the wrong reason: {refused}");
+        assert!(!b.exists(), "the refusal created b.db before refusing");
+
+        let opened = open_recovered(&a, &lock_a).expect("a.db did not open under its own lock");
+        assert!(!opened.recovered, "a brand-new database reported a recovery");
+        assert!(a.exists(), "a.db was not created");
     }
 }

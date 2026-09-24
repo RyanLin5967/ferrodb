@@ -10,18 +10,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
-use ferrodb::wal::txn::TxnManager;
-
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
 
 /// The three rows a merge will publish. Row 1 is the sentinel the test reads back.
 const ROWS: [(i32, i32); 3] = [(1, 100), (2, 200), (3, 300)];
@@ -37,7 +31,6 @@ fn main() {
     let path = args[1].clone();
     let phase = args[2].clone();
 
-    let existed = Path::new(&path).exists();
     // Single-writer lock, taken before the file is opened. Two processes on one database both build
     // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
     // every such page still passes its checksum - so refusing here is the only detection point.
@@ -46,26 +39,10 @@ fn main() {
     let _db_lock = ferrodb::storage::db_lock::DbLock::acquire(std::path::Path::new(&path))
         .unwrap_or_else(|e| { eprintln!("crash_mid_merge: {e}"); std::process::exit(1); });
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .unwrap();
-    let dm = Arc::new(DiskManager::new(file).unwrap());
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{path}.wal").into()).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal.clone());
-
-    // Same opening sequence the CLI uses, so recovery is the real one.
-    let recovered = recover(&txn).unwrap();
-    let mut catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
-    } else {
-        Catalog::create(bp.clone()).unwrap()
-    };
-    let _ = recovered;
+    // The one open path the CLI and pgserver use (D204), so recovery is the real one. This comment
+    // said "same opening sequence the CLI uses" while the code skipped the CLI's index rebuild.
+    let OpenedDatabase { bp, txn, mut catalog, .. } = open_recovered(Path::new(&path), &_db_lock)
+        .unwrap_or_else(|e| panic!("crash_mid_merge: {e}"));
 
     let runtime = Arc::new(AgentRuntime::new());
     let mut session = Session::with_runtime(runtime);
