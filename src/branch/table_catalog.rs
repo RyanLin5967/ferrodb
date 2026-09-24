@@ -2413,6 +2413,38 @@ mod tests {
         let recycled = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
         assert_ne!(recycled.branch_id.generation, 0, "fixture: no recycled slot was produced");
 
+        // -- D235: a reaped INTERIOR node that still has a live child. This is the state D16's
+        // reaper leaves: `detach_from_parent` never detaches a branch with live children, so the
+        // grandparent's entry for it is a PIN, and `release_id` refuses its slot. It is built the
+        // way `reap` builds it: Live -> Reaping -> Reaped, no detach, then a release attempt. At
+        // `9aa6968` this fixture had no such node, so a migration that dropped every pin passed.
+        // It sits ABOVE the `spare` block on purpose: forking after `spare` is released would
+        // recycle that slot and silently empty the free list the `spare` block exists to leave.
+        let pin_gp = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let pinned = src.fork(pin_gp.branch_id, LeaseDeadline(5_000)).unwrap();
+        let _pin_leaf = src.fork(pinned.branch_id, LeaseDeadline(5_000)).unwrap();
+        // -- and two reaped interiors in a row, so the pin has to be derived TRANSITIVELY
+        let chain_gp = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let p1 = src.fork(chain_gp.branch_id, LeaseDeadline(5_000)).unwrap();
+        let p2 = src.fork(p1.branch_id, LeaseDeadline(5_000)).unwrap();
+        let _chain_leaf = src.fork(p2.branch_id, LeaseDeadline(5_000)).unwrap();
+        // Deepest first, the order `expired_candidates` reaps in.
+        for b in [pinned.branch_id, p2.branch_id, p1.branch_id] {
+            src.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+            src.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+            src.release_id(b.id);
+        }
+        // PREMISE: the source really holds both pins. Without this, the comparison below is vacuous
+        // over the very case it was extended for.
+        for gp in [pin_gp.branch_id.id, chain_gp.branch_id.id, p1.branch_id.id] {
+            assert!(
+                src.has_live_children(gp).unwrap(),
+                "fixture: {gp} does not pin in the SOURCE, so nothing below tests D235"
+            );
+        }
+        // The pins' own fork epochs get their own windows below, alongside the live kids'.
+        let pin_epochs = [pinned.fork_epoch, p1.fork_epoch, p2.fork_epoch];
+
         // -- and leave a slot STILL FREE at migration time. Without this the free list is empty
         // when the migration runs, so a migration that skipped recycling entirely was
         // indistinguishable from a correct one - a mutant proved exactly that. Having a recycled
@@ -2458,10 +2490,10 @@ mod tests {
                        "max_live_child for {id}");
             assert_eq!(src.has_live_children(*id).unwrap(), dst.has_live_children(*id).unwrap(),
                        "has_live_children for {id}");
-            // Windows that include and exclude each child, plus the whole range.
-            for k in &kids {
-                let lo = k.fork_epoch;
-                let hi = Epoch(k.fork_epoch.0 + 1);
+            // Windows that include and exclude each child, plus the whole range. D235 adds the
+            // pinned interiors' own epochs, which is where a dropped pin shows.
+            for lo in kids.iter().map(|k| k.fork_epoch).chain(pin_epochs) {
+                let hi = Epoch(lo.0 + 1);
                 assert_eq!(
                     src.live_child_in_epoch_range(*id, lo, hi).unwrap(),
                     dst.live_child_in_epoch_range(*id, lo, hi).unwrap(),
