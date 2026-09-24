@@ -64,7 +64,6 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // allocator. A rebuild that outgrew the table region was handed arena pages and wrote over
     // live branch data. See `ArenaPageStore::reserve_persisted_floor`.
     let arena_path = format!("{db_path}.arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
@@ -79,6 +78,8 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         rebuild_indexes(&mut catalog, &bp)?;
         txn.checkpoint()?;
     }
+    // MUTANT (fire-check only, never land): the floor is reserved only after recovery and its rebuild.
+    ArenaPageStore::reserve_persisted_floor(&bp.disk_manager, Path::new(&arena_path))?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`
