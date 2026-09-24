@@ -14,8 +14,8 @@
 //! # What Step 0 keeps here (D217)
 //!
 //! One row: the **merge-id ceiling**. Merge ids are minted for every admission attempt — a
-//! conflict, a quarantine and an unadmitted SIMULATE candidate all get one — and the id is handed
-//! to the client whether or not anything was published. So a counter persisted only when a merge
+//! conflicting or quarantined `MERGE` and a merge into a sibling branch all get one — and the id is
+//! handed to the client whether or not anything was published to the shared tables. So a counter persisted only when a merge
 //! PUBLISHES cannot stop a restarted server from re-issuing an id some client is still holding. The
 //! runtime therefore reserves ids in blocks of [`MERGE_ID_BLOCK`]: before it mints an id above the
 //! durable ceiling it commits a new ceiling, and a restarted runtime starts minting above whatever

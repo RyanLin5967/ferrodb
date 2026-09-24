@@ -17,9 +17,10 @@
 //! branch catalog and `AgentRuntime` are built from the files alone — the sequence `cli.rs` runs. No
 //! `Arc` survives the restart, so nothing a process happens to carry can stand in for durability.
 //!
-//! Every test compiles against the base `9aa6968` and is written to be RED there; the reason each
-//! one fails at the base is stated on it and pre-registered in `frontier/lane_d212_revert.md`. None
-//! of them names an API the fix adds.
+//! Every test compiles against the base `9aa6968`, and none names an API the fix adds. All but the
+//! last are written to be RED there; the reason each fails at the base is stated on it and
+//! pre-registered in `frontier/lane_d212_revert.md`. The last is a regression test for a defect the
+//! first Step 0 commit introduced (`3fd20eb`), so it is green at the base and red at that commit.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -174,9 +175,9 @@ fn plan(out: Outcome) -> RevertPlan {
 /// **The ledger's red test: merge, reopen, merge, and `REVERT MERGE m_1` must not touch the second
 /// merge.**
 ///
-/// RED at the base, twice over: the post-restart merge is named `m_1` again, and `REVERT MERGE m_1`
-/// then reverts it — row 2 goes back to 20. (At the base the second merge's txn is also `TxnId(1)`,
-/// so the plan's target is its txn and the `assert_ne!` below fails as well.)
+/// RED at the base, at `assert_ne!(second.merge_id, "m_1")`: the post-restart merge is named `m_1`
+/// again. The assertions after it are what that reuse would have cost — `REVERT MERGE m_1` reverting
+/// the post-restart merge, row 2 back to 20 — and they are not reached at the base.
 ///
 /// The assertions are the ones that must hold whether or not pre-restart merges are revertible: at
 /// Step 0 the revert of `m_1` is REFUSED as belonging to an earlier server run; under option (a) it
@@ -392,4 +393,42 @@ fn a_cascade_that_fails_part_way_changes_nothing() {
     assert!(!later.is_blocked(), "{later:?}");
     assert_eq!(later.target, b_txn);
     assert_eq!(db.qty_of(2), 5, "B's own revert did not undo it exactly once");
+}
+
+/// **A cascade marks only the txns whose ops it inverted.** A live session that read the target is
+/// in the cascade — it is a dependent — but it has published nothing, so nothing of it is undone.
+/// Marking it "reverted" anyway would refuse the revert of whatever it publishes LATER, while those
+/// writes stayed live.
+///
+/// Found by the fresh-context review of `3fd20eb`, which marked every txn in the cascade. GREEN at
+/// the base (nothing is marked there), RED at `3fd20eb`: `REVERT MERGE <L>` is refused as "already
+/// reverted" and row 2 stays 12.
+#[test]
+fn a_live_dependent_the_cascade_could_not_undo_stays_revertible_once_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    db.seed(&[(1, 20), (2, 5)]);
+
+    let (mut a, _) = db.agent("a");
+    db.ok("UPDATE inventory SET qty = qty + 5 WHERE id = 1;", &mut a);
+    let ma = db.merge(&mut a);
+    assert!(ma.applied_to_target, "{ma}");
+
+    // L reads A's row and stages a write, and is still open when A is reverted.
+    let (mut l, l_txn) = db.agent("live");
+    db.ok("SELECT qty FROM inventory WHERE id = 1;", &mut l);
+    db.ok("UPDATE inventory SET qty = qty + 7 WHERE id = 2;", &mut l);
+
+    let mut main = db.session();
+    let cascaded = plan(db.ok(&format!("REVERT MERGE {} CASCADE;", ma.merge_id), &mut main));
+    assert_eq!(cascaded.cascade, vec![l_txn], "the fixture needs the live task in the cascade");
+    assert_eq!((db.qty_of(1), db.qty_of(2)), (20, 5), "L published nothing, so only A moved");
+
+    let ml = db.merge(&mut l);
+    assert!(ml.applied_to_target, "L's merge after the cascade did not land: {ml}");
+    assert_eq!(db.qty_of(2), 12);
+
+    let later = plan(db.ok(&format!("REVERT MERGE {};", ml.merge_id), &mut main));
+    assert!(!later.is_blocked(), "{later:?}");
+    assert_eq!(db.qty_of(2), 5, "L's published write was not reverted");
 }
