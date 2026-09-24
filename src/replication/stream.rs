@@ -1640,4 +1640,74 @@ mod tests {
             .expect("the pump after a bound inside a record failed");
         assert_eq!(p2.emitted, 1, "the second transaction did not arrive: {p2:?}");
     }
+
+    /// **A refused transaction keeps its rows when another commits inside it (B7; found under D252).**
+    ///
+    /// A refusal is a stall, not a loss: the cursor stops behind the refused commit so the next
+    /// pump replays it. But it stopped at the last `commit_end_lsn` below that commit, and with
+    /// transactions interleaved that end can lie ABOVE the refused transaction's own rows: R writes,
+    /// A writes and commits, R commits and is refused. The cursor went to A's end, past R's row, and
+    /// when the publication was amended R's `Commit` arrived with nothing staged. The row was lost,
+    /// with a clean report. The cursor must not pass the refused transaction's first row, exactly as
+    /// it must not pass an open one's.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the last assertion (0 against 1).
+    #[test]
+    fn a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+
+        let (_d, w) = wal("interleaved_refusal");
+        // A second table, declared below the stream's start, so the decoder learns it from the log
+        // and no schema event of it is ever in a batch to be refused first.
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        let start = w.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+
+        // R writes the table no publication has decided about ...
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(1, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(5, 50) })
+            .unwrap();
+        // ... A writes a published one and commits inside R ...
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 1, 10);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        // ... and R commits.
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]);
+        let mut buf = Vec::new();
+        let p1 = narrow.pump(&w, start, 0, &mut buf).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: A's row was not delivered ahead of the refusal: {p1:?}");
+        assert!(p1.refused >= 1, "premise failed: R was not refused, so nothing needed replaying: {p1:?}");
+
+        // The operator decides about the table, and the stream resumes where the first pump said.
+        let amended = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics")
+                .publishing("inventory", ["id", "qty"])
+                .publishing("secret", ["id", "qty"]),
+        );
+        let mut buf2 = Vec::new();
+        let p2 = amended.pump(&w, p1.cursor, p1.emitted_through, &mut buf2).unwrap();
+        assert!(p2.is_clean(), "{p2:?}");
+        assert_eq!(
+            p2.emitted, 1,
+            "the refused transaction's row never arrived once the publication allowed it: the cursor {} \
+             stepped over it: {p2:?}",
+            p1.cursor
+        );
+    }
 }
