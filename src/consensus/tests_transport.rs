@@ -2951,8 +2951,17 @@ fn a_link_closed_by_a_peer_with_half_the_idle_deadline_is_still_probed() {
         b.idle_closed() >= 1 && b.live_inbound_conns() == 0,
         "B never closed A's idle link, so this test exercises nothing"
     );
-    // Let B's FIN reach A's kernel, as in I and P. The gap since A's last write is now at least
-    // 1.3 s: past A's 1 s gate, and short of the 2 s a gate of the whole deadline would wait for.
+    // Let B's FIN reach A's kernel, as in I and P. A's gate measures from its REFRESH, taken just
+    // after its write returned, and B's 1 s clock started when B finished reading that frame, which
+    // on loopback is usually a little earlier. So the gap the probe sees is about 1.3 s: past A's 1 s
+    // gate, and short of the 2 s a gate of the whole deadline would wait for. That pins the gate
+    // below about 0.65 of the deadline, not at exactly half.
+    //
+    // The fix can fail here in two narrow windows (D224 review 3). If A's refresh came more than
+    // about 300 ms after B's read (a stall or a SIGSTOP between the write returning and the
+    // refresh), nothing is probed: `idle_probes +0`. If B's FIN is still unprocessed after the
+    // settle, the probe finds the link open: `idle_probes +1, idle_redials +0`. Any other stall
+    // widens the gap, and can only let a whole-deadline gate pass.
     std::thread::sleep(Duration::from_millis(300));
 
     let (probes, redials) = (a.idle_probes(), a.idle_redials());
@@ -2973,5 +2982,129 @@ fn a_link_closed_by_a_peer_with_half_the_idle_deadline_is_still_probed() {
     );
     assert_eq!(a.idle_probes() - probes, 1, "the link was not probed exactly once before the write");
     assert_eq!(a.idle_redials() - redials, 1, "the probe did not find the close and redial");
+    assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+fn a_link_the_peer_reset_is_redialled_after_an_idle_gap() {
+    // **D224 review 3, R2.** The probe's third answer is a reset: `peek` returns an error that is
+    // not `WouldBlock`, and the link is closed. No other test reaches that arm, because I, P, T and
+    // K see a FIN and H sees unread bytes. A peer resets rather than closes when it closes with
+    // unread data, or with `SO_LINGER` at zero, which is how this one does it (the fixture of
+    // `a_peer_that_resets_before_accept_cannot_fill_the_connection_cap`). It is H's shape, with a
+    // reset in place of the refusal.
+    use std::os::fd::AsRawFd;
+
+    // std's `set_linger` is still unstable (rust#88494), so it is set directly. `struct linger` is
+    // `{ int l_onoff; int l_linger; }` on both platforms: two ints, laid out as `[i32; 2]`.
+    unsafe extern "C" {
+        fn setsockopt(
+            fd: i32,
+            level: i32,
+            name: i32,
+            value: *const std::ffi::c_void,
+            len: u32,
+        ) -> i32;
+    }
+    // Each platform's own <sys/socket.h> values: the macOS SDK's, and Linux's asm-generic ones,
+    // which x86_64 and aarch64 use.
+    #[cfg(target_os = "macos")]
+    const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(target_os = "macos")]
+    const SO_LINGER: i32 = 0x0080;
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: i32 = 1;
+    #[cfg(target_os = "linux")]
+    const SO_LINGER: i32 = 13;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_millis(300); // so the probe gate is 150 ms
+    let a = Transport::from_listener(
+        NodeId(1),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        BTreeMap::from([(NodeId(2), peer_addr)]),
+        opts,
+    )
+    .unwrap();
+    let mut ours = Vec::new();
+    crate::replication::write_handshake(&mut ours).unwrap();
+
+    // --- the first connection: a handshake, then a reset ------------------------------------
+    let (mut c1, _) = listener.accept().expect("the transport should dial on its own");
+    c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = [0u8; 6];
+    c1.read_exact(&mut hs).expect("the dialer sends its handshake first");
+    c1.write_all(&ours).unwrap();
+    let linger: [i32; 2] = [1, 0]; // l_onoff = 1, l_linger = 0
+    // SAFETY: `c1` is an open socket for the duration of the call, and `linger` is a live
+    // `struct linger` whose size is passed with it.
+    let rc = unsafe {
+        setsockopt(
+            c1.as_raw_fd(),
+            SOL_SOCKET,
+            SO_LINGER,
+            linger.as_ptr().cast::<std::ffi::c_void>(),
+            std::mem::size_of_val(&linger) as u32,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER: {}", std::io::Error::last_os_error());
+    drop(c1); // a reset, not a FIN
+
+    // --- an idle gap past the gate, then one frame ---------------------------------------------
+    std::thread::sleep(Duration::from_millis(600));
+    let (probes, redials) = (a.idle_probes(), a.idle_redials());
+    a.send(&Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 7,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    })
+    .unwrap();
+
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let c2 = loop {
+        match listener.accept() {
+            Ok((s, _)) => break Some(s),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break None,
+        }
+    };
+    let Some(mut c2) = c2 else {
+        panic!(
+            "A never redialled a link its peer reset (idle_probes +{}, idle_redials +{}, \
+             lost_in_flight {})",
+            a.idle_probes() - probes,
+            a.idle_redials() - redials,
+            a.lost_in_flight()
+        );
+    };
+    // On BSD and macOS an accepted socket inherits the listener's non-blocking mode.
+    c2.set_nonblocking(false).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c2.read_exact(&mut hs).expect("the redial sends its handshake first");
+    c2.write_all(&ours).unwrap();
+    c2.flush().unwrap();
+    let mut head = [0u8; 5];
+    c2.read_exact(&mut head).expect("the frame the probe carried should arrive on the new connection");
+    assert_eq!(head[0], CONSENSUS_TAG);
+    let n = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; n];
+    c2.read_exact(&mut body).unwrap();
+    assert_eq!(decode(&body).unwrap().term, 7, "the redialled link carried some other frame first");
+    assert_eq!(a.idle_redials() - redials, 1, "the frame arrived, but not through the probe's redial");
     assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
 }
