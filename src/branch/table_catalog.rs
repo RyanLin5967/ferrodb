@@ -158,6 +158,11 @@ pub struct TableBranchCatalog {
     /// life. The instrument for the open sweep's cost class: a healthy open must read only the
     /// slots that are genuinely unreleased, never one per branch ever reaped.
     candidate_keys: AtomicU64,
+    /// **C1 (wall21 review audit 2), test-only failpoint.** Fails the next FREE_ID write inside
+    /// `release_id` once. It is the only way to reach the write-side partial, because `upsert`
+    /// does not fail on demand, and it does not exist outside `cfg(test)`.
+    #[cfg(test)]
+    fail_next_free_id_upsert: std::sync::atomic::AtomicBool,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -553,6 +558,8 @@ impl TableBranchCatalog {
             child_spans: AtomicU64::new(0),
             witnesses: Mutex::new(HashMap::new()),
             candidate_keys: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -581,6 +588,8 @@ impl TableBranchCatalog {
             child_spans: AtomicU64::new(0),
             witnesses: Mutex::new(HashMap::new()),
             candidate_keys: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -1650,18 +1659,43 @@ impl BranchCatalog for TableBranchCatalog {
         // ⚠ D200: "recoverable" was FALSE until the open-time sweep existed — nothing ever asked
         // again. It is true now: `TwoTierReaper::reclaim_unreleased_slots` finds the slot at the
         // next open through `unreleased_reaped_candidates` below.
-        let reusable = match (self.core(id), self.has_live_children(id)) {
-            (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
-            _ => false,
+        let core = self.core(id);
+        let live = self.has_live_children(id);
+        let reaped = matches!(&core, Ok(Some(rec)) if rec.state() == BranchState::Reaped);
+        // **C1 (wall21 review audit 2): a swallowed error must still leave the slot where the open
+        // sweep looks.** Errors are swallowed because the trait returns `()`. Before C1 that
+        // could end a slot keyless and not free, stranded silently, in two ways. Both are closed
+        // here, under `logical` and in this call's one sync, with no trait change:
+        // - WRITE side: the UNRELEASED key came off whatever the FREE_ID upsert returned. Now it
+        //   comes off only once the slot IS on the free list.
+        // - READ side: a `Reaped` slot whose liveness read ERRED got nothing written. Now it goes
+        //   on the span, so the sweep retries it and records a D127 refusal with its reason. This
+        //   never happens on `Ok(true)`: a pinned slot stays keyless (the lead audit of 17cbd4c).
+        let wrote = if reaped && matches!(live, Ok(false)) {
+            #[cfg(test)]
+            let freed = if self.fail_next_free_id_upsert.swap(false, Ordering::SeqCst) {
+                Err(FerroError::Io("injected: the FREE_ID write failed".into()))
+            } else {
+                self.upsert(keys::free_id(id), Vec::new())
+            };
+            #[cfg(not(test))]
+            let freed = self.upsert(keys::free_id(id), Vec::new());
+            if freed.is_ok() {
+                // D200: off the UNRELEASED span, under the same lock and in the same sync as the
+                // free-list entry.
+                let _ = self.remove_if_present(&keys::unreleased(id));
+            }
+            true
+        } else if reaped && live.is_err() {
+            let _ = self.upsert(keys::unreleased(id), Vec::new());
+            true
+        } else {
+            false
         };
-        if reusable {
-            let _ = self.upsert(keys::free_id(id), Vec::new());
-            // D200: off the UNRELEASED span, under the same lock and in the same sync as the
-            // free-list entry.
-            let _ = self.remove_if_present(&keys::unreleased(id));
+        if wrote {
             // Same as the others: release the lock before the fsync. Errors stay swallowed
             // to match the log catalog's signature -- a failure here leaks an id slot,
-            // which is recoverable, while propagating would abort a reap midway.
+            // which the open sweep now recovers, while propagating would abort a reap midway.
             if let Ok(seq) = self.stage() {
                 drop(_g);
                 let _ = self.durable(seq);
@@ -3268,6 +3302,35 @@ mod tests {
             "C1: a release whose liveness read failed left the slot keyless and not free, so no \
              sweep will ever retry it"
         );
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **C1, write side: the key comes off only once the slot is on the free list.** Uses the
+    /// `cfg(test)` failpoint, so it is new API and is added with the fix (lane §8.10). It is not
+    /// red at any earlier commit, and it is M31's killer.
+    #[test]
+    fn a_failed_free_list_write_leaves_the_slot_keyed() {
+        let (c, p, _pool) = cat("c1-freefail");
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+        let keyed = |c: &TableBranchCatalog| {
+            c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id)
+        };
+        assert!(keyed(&c), "fixture: a releasable flip keeps the key");
+
+        c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
+        c.release_id(s.branch_id.id);
+        assert!(
+            !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
+            "fixture: the injected FREE_ID failure never fired"
+        );
+        assert!(keyed(&c), "C1: the key came off although the slot never reached the free list");
+
+        // And a release that succeeds takes it off.
+        c.release_id(s.branch_id.id);
+        assert!(!keyed(&c), "a successful release left the key on");
         let _ = std::fs::remove_file(p);
     }
 }

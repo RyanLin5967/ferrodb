@@ -141,7 +141,8 @@ pub struct TwoTierReaper {
     open_slots_reclaimed: AtomicU64,
     /// **D200.** Slots that sweep declined to decide, with the reason each one carried. D127's rule
     /// applied here: a refusal is absorbed so one bad slot cannot stop an open, and it is kept
-    /// WITH its text, because a count alone is a number nobody can act on.
+    /// WITH its text, because a count alone is a number nobody can act on. Since C2a it also holds
+    /// the resumed reaps the open declined (`resume_interrupted_reaps`).
     open_slot_refusals: Mutex<Vec<String>>,
 }
 
@@ -232,14 +233,29 @@ impl TwoTierReaper {
             .map(|r| BranchId::new(r.branch_id.id, r.generation))
             .collect();
         let mut done = Vec::with_capacity(interrupted.len());
+        // **C2a (wall21 review audit 2): D127's rule at open.** This was `self.reap(b)?`, so one
+        // resumed reap whose catalog could not answer (a `get_raw` or liveness error inside its
+        // cascade) failed the WHOLE open: the CLI returned it and pgserver panicked. One slot the
+        // catalog cannot answer for must not cost every other slot, or the database, its open.
+        // It is now a counted refusal (`refused_reaps`) with its reason, kept next to the sweep's.
+        // The sweep below finishes whatever of it the flip left releasable, and a record still
+        // `Reaping` is asked again at the next open. A non-`Branch` error still fails the open.
+        let mut resume_refusals: Vec<String> = Vec::new();
         for b in interrupted {
-            self.reap(b)?;
-            done.push(b);
+            match self.reap(b) {
+                Ok(_) => done.push(b),
+                Err(e @ FerroError::Branch(_)) => {
+                    resume_refusals.push(format!("resumed reap of {b}: {e}"));
+                    let _ = self.refuse(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // **D200 — AFTER the resumes**, which finish their own cascades and releases, so this
         // sees only slots no reap will ever come back for.
         self.reclaim_unreleased_slots()?;
+        self.open_slot_refusals.lock().unwrap().extend(resume_refusals);
 
         // **D40 — this is where the crash-orphan collector belongs.**
         //

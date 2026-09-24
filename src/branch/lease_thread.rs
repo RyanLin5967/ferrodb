@@ -416,10 +416,11 @@ impl LeaseThread {
                  released (D200)"
             ));
         }
+        // C2a: this list also carries the resumed reaps the open declined.
         for why in reaper.open_slot_refusals() {
             report(format!(
-                "lease: did not decide whether to give back an id slot, which stays reserved until \
-                 the next open: {why}"
+                "lease: at open, declined to decide (the slot keeps its pages and its id, and the \
+                 next open asks again): {why}"
             ));
         }
 
