@@ -354,3 +354,30 @@ takes its whole binary down with it.
 | replicate | 60 | all pass |
 
 **Per-target: 2613** on macOS = D207's 2608 at `1eaf1a7` (a prediction, never run) + I, B, P, H + K.
+
+---
+
+## Amendment 5 — the merge's obligation met, recorded before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `4462bd2` | merges D207's final `1eaf1a7` (`--no-ff`, no conflict) |
+| `420cda4` | amendment 4 |
+| `5445fa7` | `idle_probes` and `idle_redials` added to `TransportCounters` and `Transport::counters()` (`+4 −0`) |
+| `4a5c95c` | test K, additions only (`60 0`) |
+| `18b08a8` | N7 and N8 added; N1–N8 regenerated from `4a5c95c` |
+
+- **After `5445fa7`, `TransportCounters` has 18 fields and `Transport` has 18 counter accessors.** READ:
+  `grep -n 'pub fn [a-z_]*(&self) -> \(u64\|usize\)'` against the struct. Its "every meter" doc holds again. No other
+  struct literal of it exists in `src/`, `tests/` or `examples/` (READ, `git grep 'TransportCounters {'`). D207's
+  M40 builds one with `..self.net.counters()`, so it still compiles.
+- **Counts at `18b08a8`:** transport 62, **node 14**, log 58, replicate 60. Run G3 stands, and per-target is
+  **2613**.
+- **Mutants:** all eight patches pass `git apply --check` against `18b08a8`'s tree. N1–N6 keep their edits: each
+  patch's `^[-+]` lines were compared with its copy at `859f1b6`, and only hunk context moved.
+- **Commands:**
+  - N1–N6: the transport module, kill sets from amendment 2;
+  - N7 and N8: the node module, `timeout 1800 cargo test --no-fail-fast --lib consensus::node::tests_node::`,
+    each killed by K.
+- **D207's mutant patches under `bench/d207/`** were cut against D207's own tree. Their transport context predates
+  D224, so they are D207's run script's to apply, on `d207-transport-port`. They are not for this merged tree.
