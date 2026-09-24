@@ -80,7 +80,9 @@ fn open(dir: &Path) -> (Db, bool) {
     let existed = path.exists();
     let file = OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
     let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-    let wal = Arc::new(WalManager::new(dir.join("d230x.wal")).unwrap());
+    // `<db>.wal`, as `run_cli` (`format!("{db_path}.wal")`) and `open_recovered` name it, so a phase
+    // opened either way reads the same log (D230 review 8, R8-2).
+    let wal = Arc::new(WalManager::new(dir.join("d230x.db.wal")).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
     let recovered = recover(&txn).expect("recover");
