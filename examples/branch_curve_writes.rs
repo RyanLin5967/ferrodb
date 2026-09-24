@@ -2282,7 +2282,8 @@ fn g7_drift(read_rows: &[ReadRow], arm_ran: bool) -> String {
         return "G7: arm 1 ran but left no row, so no time here has a drift measure".into();
     }
     format!(
-        "G7 (arm 1's control, max/min across N; band 1.5): {}. It sees only arm 1's read phases: axis (ii) \
+        "G7 (arm 1's control, max/min across N; band 1.5: above it, every ns column at every T is NOT A \
+         RESULT, while arm 3's values and R7 are not voided by it): {}. It sees only arm 1's read phases: axis (ii) \
          runs after the last of them, arm 3's opens follow them rather than coincide, and a max/min across N \
          cannot see a shift common to every N",
         parts.join(", ")
@@ -2448,11 +2449,15 @@ fn read_vs_n_summary(
                 cs.iter().cloned().reduce(f64::max),
             ) {
                 let moved = hi / lo;
-                println!("  control ns max/min across N at T={t}: {moved:.3} over {} rows (band 1.5)", cs.len());
+                println!(
+                    "  control ns max/min across N at T={t}: {moved:.3} over {} rows (band 1.5: above it, every ns \
+                     column at every T is NOT A RESULT)",
+                    cs.len()
+                );
                 if moved > 1.5 {
                     ns_void.push(format!(
                         "G7 T={t}: the control moved {moved:.2}x across N (band 1.5x); the box moved, \
-                         so no ns column at T={t} can be read as a function of N"
+                         so no ns column at ANY T can be read as a function of N (PREREG G7, A16.3)"
                     ));
                 }
             }
