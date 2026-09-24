@@ -22,9 +22,15 @@
 //! first) and then `reap_if_still_expired` for each branch: the two halves
 //! `lease_thread::scan_once` runs. Every reap ends in its own drain. A D183 number was retracted
 //! because its test hand-rolled a reap that skipped `drain_pending`, so nothing here reaps any
-//! other way. After each sweep the harness also runs `drain_pending` and `collect_orphaned_extents`,
-//! the collectors production runs later, so what it reports is the steady state and not a
+//! other way. After each sweep the harness runs `collect_orphaned_extents`, the collector the lease
+//! thread runs, and only then takes the census, so what it reports is the steady state and not a
 //! transient.
+//!
+//! **`drain_pending()` runs only AFTER the census, as a probe.** Production never calls it outside a
+//! reap (PREREG amendment 1 corrects an earlier claim that it did). Run before the census, it would
+//! clean up after a reap that skipped its own drain, and the retention columns would read 0 while
+//! the defect was live. Run after, whatever it releases is reported as `extra_drain` /
+//! `after_leaf_drain`, which are predicted to be 0.
 //!
 //! **The instrument is the layer that pays: arena pages still allocated.** They are counted twice,
 //! once by the store's net counter and once by enumerating every live extent's allocated pages,
@@ -36,8 +42,16 @@
 //! on the order of P·D³ CHILD-span scans (PREREG, "Secondary"). Every phase prints a flushed
 //! `progress` line first, so a run stopped by `timeout` names the cell and phase it stopped in.
 //!
+//! **Fire-checks inject inside the engine, not here.** `bench/d16_chain/firecheck.py` applies one
+//! source mutant at a time to `src/` (the pin, a reap's drain, the fast path's free, the net
+//! counter, the copy, the candidate loop, the drain's disarm), rebuilds, and checks each cell's
+//! verdict against PREREG amendment 1's table. This file has no fault switch of its own. A forced
+//! result at the call site would test nothing inside the path being measured.
+//!
 //! Exit 0: every guard held and every prediction matched. Exit 1: the guards held but a prediction
-//! did not (that is a result, printed as MISMATCH). Exit 2: NOT A RESULT.
+//! did not (that is a result, printed as MISMATCH). Exit 2: NOT A RESULT. A dirty or unknown build
+//! stamp (G0) always exits 2. The per-cell verdicts are still printed, because a fire-check build is
+//! dirty by construction.
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -408,9 +422,25 @@ struct Cell {
     written: u64,
     reaped: usize,
     total_after_sweep1: u64,
+    /// Of the D forks made after sweep 2, how many were handed a slot id this fixture had used:
+    /// the number of id slots the reaps released. PREREG amendment 1, A1.4. Not judged here.
+    slots_recycled: usize,
     sweep1_ms: f64,
     sweep2_ms: f64,
     guard_failures: Vec<String>,
+}
+
+/// G7: a drain that returned early leaves its touched extents in `deferred`, for a later narrowed
+/// sweep that production runs only on the lease thread's cadence. None may be left after a sweep
+/// here.
+fn check_deferred(reaper: &TwoTierReaper, when: &str, fails: &mut Vec<String>) {
+    let left = reaper.deferred_len();
+    if left != 0 {
+        fails.push(format!(
+            "G7 {when}: {left} arenas were left in the reaper's deferred set by a drain that did \
+             not finish its sweep"
+        ));
+    }
 }
 
 /// One flushed line before each phase. A run killed by `timeout` then names the cell and phase it
@@ -478,13 +508,13 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
             built.doomed.len()
         ));
     }
-    // The collectors production runs after a sweep. Both are predicted to free nothing here: every
-    // retained page is still pinned, and no extent is both ownerless and empty.
-    let drained1 = rig.reaper.drain_pending().map_err(|e| format!("drain_pending after sweep 1: {e:?}"))?;
+    // The collector the lease thread runs after a sweep. Predicted to free nothing here: every
+    // retained page is still pinned, so no extent is both ownerless and empty.
     let orphans1 = rig
         .reaper
         .collect_orphaned_extents()
         .map_err(|e| format!("collect_orphaned_extents after sweep 1: {e:?}"))?;
+    check_deferred(&rig.reaper, "after sweep 1", &mut fails);
 
     // ---- G4: the survivor lives and the doomed are gone ----------------------------------------
     match rig.catalog.get(survivor) {
@@ -502,6 +532,11 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
     }
     let after1 = census(&rig.store, &doomed, survivor.id)?;
     check_census(&after1, "after sweep 1", &mut fails);
+    // The probe, AFTER the census: anything it releases was reclaimable and left parked by a reap.
+    let drained1 = rig
+        .reaper
+        .drain_pending()
+        .map_err(|e| format!("drain_pending probe after sweep 1: {e:?}"))?;
 
     // ---- sweep 2, control (a): the survivor goes too -------------------------------------------
     progress(tag, "sweep2");
@@ -515,17 +550,39 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
         let got: Vec<String> = reaped2.iter().map(|b| b.to_string()).collect();
         fails.push(format!("G3: sweep 2 reaped [{}], expected only {survivor}", got.join(", ")));
     }
-    let drained2 = rig.reaper.drain_pending().map_err(|e| format!("drain_pending after sweep 2: {e:?}"))?;
     let orphans2 = rig
         .reaper
         .collect_orphaned_extents()
         .map_err(|e| format!("collect_orphaned_extents after sweep 2: {e:?}"))?;
+    check_deferred(&rig.reaper, "after sweep 2", &mut fails);
     let after2 = census(&rig.store, &doomed, survivor.id)?;
     check_census(&after2, "after sweep 2", &mut fails);
+    let drained2 = rig
+        .reaper
+        .drain_pending()
+        .map_err(|e| format!("drain_pending probe after sweep 2: {e:?}"))?;
 
     let refused = rig.reaper.refused_reaps();
     if refused != 0 {
         fails.push(format!("G3: the reaper refused {refused} reaps"));
+    }
+
+    // ---- the id-slot probe (A1.4), after every census ------------------------------------------
+    // `fork` hands out a released slot before it mints a new id, so of D fresh forks, the ones that
+    // land on an id this fixture used are exactly the slots the reaps released. Nothing is counted
+    // after this, so the forks cannot move a page number.
+    progress(tag, "slots");
+    let fixture_ids: BTreeSet<u64> = doomed.iter().copied().chain([survivor.id]).collect();
+    let mut slots_recycled = 0usize;
+    for k in 0..depth {
+        match rig.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)) {
+            Ok(r) if fixture_ids.contains(&r.branch_id.id) => slots_recycled += 1,
+            Ok(_) => {}
+            Err(e) => {
+                fails.push(format!("G8: slot probe fork {k} failed after both sweeps: {e:?}"));
+                break;
+            }
+        }
     }
 
     Ok(Cell {
@@ -549,6 +606,7 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
         written: before.enum_pages,
         reaped: reaped1.len(),
         total_after_sweep1: after1.enum_pages,
+        slots_recycled,
         sweep1_ms,
         sweep2_ms,
         guard_failures: fails,
@@ -594,8 +652,18 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let prov = ferrodb::build_provenance();
     let sha = prov.split_whitespace().nth(1).unwrap_or("unknown").to_string();
-    // G0. A row that cannot name the code it ran is not attributable to anything.
-    let provenance_failure = if sha == "unknown" || prov.contains("+DIRTY") {
+    // G0, RUN-LEVEL. A row that cannot name the code it ran is not attributable to anything, so the
+    // run exits 2. The per-cell verdicts are still computed: a fire-check build is dirty by
+    // construction, and its cells are what it exists to read. Every line's tag carries `build=`, so a
+    // row copied out of this output still says what it was taken on.
+    let build = if sha == "unknown" {
+        "unknown"
+    } else if prov.contains("+DIRTY") {
+        "DIRTY"
+    } else {
+        "clean"
+    };
+    let provenance_failure = if build != "clean" {
         Some(format!("G0: build provenance is {prov:?}, so no row can be attributed to a commit"))
     } else {
         None
@@ -619,8 +687,11 @@ fn main() {
         if persist { "ON (as cli.rs ships it)" } else { "OFF (D16_PERSIST=0)" }
     );
     println!("reap: Reaper::reap_expired only, i.e. expired_candidates (deepest first) + reap_if_still_expired,");
-    println!("  the halves lease_thread::scan_once runs. Every reap ends in its own drain; each sweep is then");
-    println!("  followed by drain_pending and collect_orphaned_extents, so retention is the steady state.");
+    println!("  the halves lease_thread::scan_once runs. Every reap ends in its own drain. Each sweep is then");
+    println!("  followed by collect_orphaned_extents (the lease thread's collector) and the census; a");
+    println!("  drain_pending PROBE runs after the census, and whatever it releases is reported, not hidden.");
+    println!("slots: after both sweeps, D forks off trunk; `slots_recycled` = how many reused a slot this");
+    println!("  fixture had used, i.e. id slots released. Predicted per tree in PREREG A1.4, not judged here.");
     println!(
         "P = {p} pages per level. depths {depths:?}. arms [{}]. Extent model {MODEL_FIRST_EXTENT} doubling to \
          {MODEL_EXTENT_CAP}: {p} pages -> {model_extents} extents, {model_reserved} reserved pages per branch",
@@ -640,9 +711,9 @@ fn main() {
     let mut mismatches = 0usize;
     for &depth in &depths {
         for &arm in &arms {
-            let tag = format!("arm={} D={depth} P={p} sha={sha}", arm.name());
+            let tag = format!("arm={} D={depth} P={p} sha={sha} build={build}", arm.name());
             progress(&tag, "build");
-            let mut cell = match run_cell(arm, depth, p, persist, &tag) {
+            let cell = match run_cell(arm, depth, p, persist, &tag) {
                 Ok(c) => c,
                 Err(e) => {
                     not_a_result += 1;
@@ -650,9 +721,6 @@ fn main() {
                     continue;
                 }
             };
-            if let Some(f) = &provenance_failure {
-                cell.guard_failures.push(f.clone());
-            }
             let want = Outcome::predicted(arm, depth, p);
             print_fields("measured ", &tag, &cell.measured);
             print_fields("predicted", &tag, &want);
@@ -680,14 +748,28 @@ fn main() {
                 cell.sweep1_ms,
                 cell.sweep2_ms,
             );
+            println!(
+                "slots     {tag} slots_recycled={} of fixture_ids={depth} (A1.4: main lineage predicts \
+                 chain/overwrite 1, fanout D; D200 predicts D in every arm)",
+                cell.slots_recycled
+            );
+            // The cell's own verdict, from G1-G8 and the predictions. G0 is appended, never
+            // substituted, so a fire-check can still read what the cell said.
+            let run_level = match &provenance_failure {
+                Some(f) => format!(" [run is NOT A RESULT: {f}]"),
+                None => String::new(),
+            };
             if !cell.guard_failures.is_empty() {
                 not_a_result += 1;
-                println!("verdict   {tag} NOT A RESULT: {}", cell.guard_failures.join(" | "));
+                println!(
+                    "verdict   {tag} NOT A RESULT: {}{run_level}",
+                    cell.guard_failures.join(" | ")
+                );
             } else if !wrong.is_empty() {
                 mismatches += 1;
-                println!("verdict   {tag} MISMATCH {}", wrong.join(","));
+                println!("verdict   {tag} MISMATCH {}{run_level}", wrong.join(","));
             } else {
-                println!("verdict   {tag} MATCH");
+                println!("verdict   {tag} MATCH{run_level}");
             }
             cells.push(cell);
         }
@@ -752,6 +834,13 @@ fn main() {
     }
 
     let planned = depths.len() * arms.len();
+    if let Some(f) = &provenance_failure {
+        println!(
+            "NOT A RESULT: {f}. The {planned} cell verdicts above ({not_a_result} guard or harness \
+             failures, {mismatches} mismatches) describe unattributable code. Exit 2."
+        );
+        std::process::exit(2);
+    }
     if not_a_result > 0 || cells.is_empty() {
         println!("NOT A RESULT: {not_a_result} of {planned} cells failed a guard or the harness. Exit 2.");
         std::process::exit(2);
