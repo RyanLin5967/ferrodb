@@ -1323,3 +1323,35 @@ fn f1_a_reaper_that_never_resumed_the_clock_writes_no_mark() {
         "an unarmed reaper recorded a last-alive mark"
     );
 }
+
+/// **The shutdown mark, pinned (D198 adversary, C4).** `LeaseThread::shutdown` records the moment
+/// the thread stopped as the last-alive mark; without it the next start measures the outage from
+/// the last SCAN and hands every live lease up to one scan interval extra. No test failed when it
+/// was removed. Here the interval is `NEVER`, so the one scan runs at start and nothing else marks
+/// until `stop`: the mark the next resume measures from must be at or after a reading taken just
+/// before `stop` was called. Its red is mutant M26: delete the `record_lease_alive` in `shutdown`.
+#[test]
+fn f1_a_clean_stop_records_the_moment_it_stopped_as_the_last_alive_mark() {
+    let f = table_fixture();
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the one scan a NEVER interval runs", || lease.stats().scans >= 1);
+    std::thread::sleep(Duration::from_millis(50));
+    let before_stop = LeaseDeadline::now_millis();
+    lease.stop();
+
+    match f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap() {
+        LeaseResume::Resumed { last_alive, .. } => assert!(
+            last_alive >= before_stop,
+            "the last-alive mark is {last_alive}, before the stop at >= {before_stop}: a clean stop \
+             recorded nothing, so the next start would credit the time since the last scan as \
+             downtime"
+        ),
+        other => panic!("the catalog lost its mark across a clean stop: {other:?}"),
+    }
+}

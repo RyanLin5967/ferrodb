@@ -3232,12 +3232,16 @@ mod f1_lease_grace {
             stored_before,
             "the resume rewrote a record; the offset exists so that it never has to"
         );
-        // The stored value is exactly the inward translation of what it now reads as. (Typed since
-        // D198's follow-up: a stored deadline is not a `LeaseDeadline` and has no raw accessor.)
-        assert_eq!(
-            c.core(running.id).unwrap().unwrap().deadline(),
-            c.to_stored(LeaseDeadline(4_500)),
-            "the stored deadline moved"
+        // The stored value, pinned WITHOUT the subject's own translation (D198 adversary, C4): the
+        // DEADLINE index is keyed in virtual time, so the key a resume must leave alone is the one
+        // filed at the value the branch was forked with, and none may exist at the lease-clock one.
+        assert!(
+            c.tree.search(&keys::deadline(1_500, running.id)).unwrap().is_some(),
+            "the DEADLINE key filed at 1500 is gone: the resume rewrote the index"
+        );
+        assert!(
+            c.tree.search(&keys::deadline(4_500, running.id)).unwrap().is_none(),
+            "a DEADLINE key exists at the lease-clock value 4500: something stored a translated deadline"
         );
 
         // The expiry question gets the same answers the per-branch rewrite gave, at the same
@@ -3506,6 +3510,77 @@ mod f1_lease_grace {
         assert_eq!(lease(&c, b), 4_500, "reparent moved a deadline it did not name");
         assert!(expired_ids(&c, 4_499).is_empty());
         assert_eq!(expired_ids(&c, 4_500), vec![b.id], "the DEADLINE key moved with the rewrite");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **C2 (D198 adversary): a catalog that has enforced leases before answers no expiry question
+    /// until THIS instance has resumed its lease clock.**
+    ///
+    /// The mark says a lease authority ran here and stopped. Until a resume credits the time since,
+    /// every answer charges that downtime to the lease — F1's defect, back through any process that
+    /// opens the catalog and asks without running a `LeaseThread`. Reads that decide nothing still
+    /// answer, so an inspector can look. A catalog that has never had a mark answers as before D198:
+    /// there is no downtime it could be charging.
+    #[test]
+    fn a_catalog_with_a_last_alive_mark_refuses_expiry_questions_until_it_resumes() {
+        let path = sidecar("unresumed");
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+            c.record_lease_alive(1_000).unwrap(); // an authority ran here and stopped at 1000
+            b
+        };
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        match re.expired_before(1_700_000_000_000) {
+            Ok(ids) => panic!(
+                "expired_before answered {ids:?} on a catalog whose downtime since its last mark has \
+                 not been credited in this process (C2)"
+            ),
+            Err(e) => assert!(e.to_string().contains("has not resumed its lease clock"), "{e}"),
+        }
+        match re.enforced_lease(b) {
+            Ok(d) => panic!("enforced_lease answered {d:?} before this process resumed (C2)"),
+            Err(e) => assert!(e.to_string().contains("has not resumed its lease clock"), "{e}"),
+        }
+        assert_eq!(lease(&re, b), 1_500, "a read that decides nothing must still answer");
+
+        re.resume_leases(4_000).unwrap();
+        assert_eq!(re.enforced_lease(b).unwrap(), Some(LeaseDeadline(4_500)));
+        assert!(expired_ids(&re, 4_499).is_empty());
+        assert_eq!(expired_ids(&re, 4_500), vec![b.id]);
+
+        // Never marked: answers without a resume, exactly as before D198.
+        let fresh_path = sidecar("never-marked");
+        let fresh = TableBranchCatalog::open_sidecar(&fresh_path, 1).unwrap();
+        let f = fresh.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        assert_eq!(fresh.enforced_lease(f).unwrap(), Some(LeaseDeadline(1_500)));
+        assert_eq!(expired_ids(&fresh, 1_500), vec![f.id]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fresh_path);
+    }
+
+    /// **C3 (D198 adversary): a heartbeat carries the offset that is ON DISK, not a copy in memory.**
+    ///
+    /// A resume writes `(mark, D + downtime)` durably and only then publishes `D` in memory. A
+    /// heartbeat that landed in between with the in-memory copy would durably write the OLD `D`
+    /// back, and every deadline stored against the new one would read `downtime` early after the
+    /// next restart. The window is reproduced directly: the key says `D = 3000`, memory says 0.
+    #[test]
+    fn a_heartbeat_carries_the_offset_on_disk_not_a_stale_copy_in_memory() {
+        let path = sidecar("heartbeat-d");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let mut on_disk = Vec::with_capacity(16);
+        on_disk.extend_from_slice(&1_000u64.to_be_bytes());
+        on_disk.extend_from_slice(&3_000u64.to_be_bytes());
+        c.upsert(keys::alive(), on_disk).unwrap();
+
+        c.record_lease_alive(5_000).unwrap();
+        assert_eq!(
+            c.alive_state().unwrap(),
+            Some((5_000, 3_000)),
+            "the heartbeat wrote a stale in-memory offset over the durable one (C3): every deadline \
+             stored against D = 3000 would read 3000 ms early after the next restart"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
