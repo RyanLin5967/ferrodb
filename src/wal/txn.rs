@@ -2997,6 +2997,69 @@ use super::*;
         FAIL_RELEASES.with(|f| f.set(0));
     }
 
+    /// A table `t` with one row, and what its DROP would free: its heap's directory root, its
+    /// time-travel root and its primary root.
+    fn table_to_drop() -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, Catalog, [u32; 3], tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let mut s = Session::new();
+        for text in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            sql(text, &mut catalog, &bp, &txn, &mut s).unwrap_or_else(|e| panic!("`{text}` failed: {e}"));
+        }
+        let owned = {
+            let e = catalog.get_table("t").expect("t");
+            [e.first_directory_page_id, e.time_travel_root, e.primary_index_root]
+        };
+        (bp, wal, txn, catalog, owned, dir)
+    }
+
+    /// **A DROP is refused BEFORE its mutation while a WAL pin would keep the log** (lane §21.6; the
+    /// lead's interim decision after `rollback-review4` and the D216 lane). `WalManager::truncate`
+    /// keeps the log, and answers `Ok`, while any pin is below its end. A DROP under a pin therefore
+    /// freed its pages and left their records in the log, and the next open replayed them onto
+    /// whatever reused those pages. `allocate` hands out the lowest clear bit, so a page the refused
+    /// DROP had freed would be the next one handed out.
+    #[test]
+    fn a_drop_is_refused_before_its_mutation_while_a_pin_would_keep_the_log() {
+        let (bp, wal, txn, mut catalog, owned, _dir) = table_to_drop();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        // A reader (a replication stream, a base backup, a snapshot handoff) holds the log from its base.
+        let pin = wal.pin(base).expect("pin the log at its base");
+        assert!(base < wal.next_lsn.load(Ordering::SeqCst), "premise: the pin is not below the log's end, so it keeps nothing");
+        let e = match sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new()) {
+            Err(e) => e,
+            Ok(_) => panic!("DROP ran while a pin kept the log, so the log still holds the records of the pages it freed"),
+        };
+        assert!(e.to_string().contains("pin"), "the DROP was refused, but not for the pin: {e}");
+        assert!(catalog.get_table("t").is_some(), "the refused DROP had already dropped the table");
+        let next = bp.disk_manager.allocate().unwrap();
+        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `t`, which still names it");
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the refused DROP moved the log's base");
+
+        drop(pin);
+        sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new())
+            .unwrap_or_else(|e| panic!("DROP was refused after the pin was released: {e}"));
+        assert!(catalog.get_table("t").is_none(), "DROP answered Ok without dropping the table");
+        assert!(wal.base_lsn.load(Ordering::SeqCst) > base, "the DROP did not truncate once nothing pinned the log");
+    }
+
+    /// **A DROP is refused BEFORE its mutation on a poisoned log** (lane §21.6). A poisoned log
+    /// refuses the flush, so the DROP's checkpoint would fail after the drop: the table gone, its
+    /// pages freed, the statement reported failed, and the log holding the table's records.
+    #[test]
+    fn a_drop_is_refused_before_its_mutation_on_a_poisoned_log() {
+        let (bp, wal, txn, mut catalog, owned, _dir) = table_to_drop();
+        wal.poison("test: a Commit record could not be made durable");
+        let e = match sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new()) {
+            Err(e) => e,
+            Ok(_) => panic!("DROP succeeded on a poisoned log"),
+        };
+        assert!(catalog.get_table("t").is_some(), "the refused DROP had already dropped the table: {e}");
+        assert!(e.to_string().contains("poison"), "the DROP was refused, but not for the poisoned log: {e}");
+        let next = bp.disk_manager.allocate().unwrap();
+        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `t`, which still names it");
+    }
+
     /// A page file that counts its syncs. Only a checkpoint syncs the page file
     /// (`bp.disk_manager.sync()`), so on one database this counts checkpoint flushes.
     struct SyncCountingFile {
