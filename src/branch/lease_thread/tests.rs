@@ -409,8 +409,11 @@ fn a_lease_expiry_reap_is_attested_exactly_once() {
     assert_eq!(f.runtime.forget_reaped_branches(), 0, "a workspace outlived the scan's forget");
     assert_eq!(f.runtime.forget_branches(&[branch]), 0, "a forgotten branch was forgotten again");
     // And a later `seal` of the reaped branch (a client ABANDON arriving after the lease took it)
-    // must not append a second Reap. This runtime has no reaper, so `seal` takes its fallback
-    // arm, whose `get` refuses a reaped id before anything is attested.
+    // must not append a second Reap. Its read before the reap sees a bumped generation, so it
+    // cannot be the call that flips, and it takes the landed-reap path, which finds no head (the
+    // lease's Reap removed it) and skips. The reaper-less arm's `get` then refuses the reaped id
+    // (D199 seal review F6: that refusal is not what stops the second Reap; M18 is the mutant that
+    // shows it).
     assert!(f.runtime.abandon(branch).is_err(), "abandoning a reaped branch succeeded");
     assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
     assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");

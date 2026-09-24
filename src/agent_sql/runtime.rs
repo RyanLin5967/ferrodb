@@ -3792,8 +3792,10 @@ impl AgentRuntime {
     /// **D199: attest the reap of every branch in `candidates` whose reap has LANDED and whose
     /// history this log still holds open.** The callers are the two forget paths
     /// ([`Self::forget_branches`], [`Self::forget_reaped_branches`]), which reach every branch a
-    /// reaper took without the client. Before this, such a branch kept `[Fork]` as its whole
-    /// history: the log called it live, and its head was never dropped (wall #19).
+    /// reaper took without the client, and `seal`, for a branch whose record it could not read as
+    /// its own live generation before the reap (D199 seal review F1/F2). Before this, such a
+    /// branch kept `[Fork]` as its whole history: the log called it live, and its head was never
+    /// dropped (wall #19).
     ///
     /// **Landed, not in flight (the lead's rule 1).** `get` refuses a `Reaping` branch as well as
     /// a `Reaped` one, as `FerroError::Branch(String)` in both cases, so the forget paths'
@@ -3822,12 +3824,13 @@ impl AgentRuntime {
     /// the branch's `Fork` entry, which `attest_fork` took from the catalog record), not from
     /// `get_raw(id).fork_epoch`. By the time a sweep visits, the reaper may have released the slot
     /// (`TwoTierReaper::reap` calls `release_id`) and a fork may have recycled it, so the record
-    /// `get_raw` returns can be another branch's. `published` is false: a branch the lease took
-    /// published nothing.
+    /// `get_raw` returns can be another branch's. `published` is the caller's: the forget paths
+    /// pass `false` (a branch the lease took published nothing), and `seal` passes its own, which
+    /// is `true` for a MERGE.
     ///
     /// Called with neither `state` nor the catalog held (the leaf-lock rule on
     /// [`AgentRuntime::attested`]). Every catalog read finishes before the log is locked.
-    fn attest_landed_reaps(&self, candidates: &[BranchId]) {
+    fn attest_landed_reaps(&self, candidates: &[BranchId], published: bool) {
         let mut landed: Vec<BranchId> = Vec::new();
         let mut unreadable: Vec<BranchId> = Vec::new();
         for &b in candidates {
@@ -3855,7 +3858,7 @@ impl AgentRuntime {
             };
             // Cannot be refused: the branch has a live head and is not trunk (trunk is never
             // reaped). Counted rather than unwrapped if it ever is, as in `seal`.
-            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);
+            let _ = Self::append_reap(&mut h, branch, fork_epoch, published);
         }
     }
 
@@ -5705,7 +5708,7 @@ impl AgentRuntime {
                     }
                 }
                 // D199: only once the state lock is released. See `attest_landed_reaps`.
-                self.attest_landed_reaps(&gone);
+                self.attest_landed_reaps(&gone, false);
             }
 
             // A short chunk means the range ran out, which is the only end condition: `examined`
@@ -5773,7 +5776,7 @@ impl AgentRuntime {
             }
             // D199: every gone id, whether or not this call found its workspace, and only once
             // the state lock is released. See `attest_landed_reaps`.
-            self.attest_landed_reaps(&gone);
+            self.attest_landed_reaps(&gone, false);
         }
         forgotten
     }
@@ -5869,21 +5872,38 @@ impl AgentRuntime {
         // right after the flip instead, because with a reaper the flip is inside `Reaper::reap`.
         // So the reap runs in `retire`, and the attestation follows it on every exit, `Ok` or `Err`.
         //
-        // **Only the call that flipped this generation attests.** The record is read BEFORE the
-        // reap: if it is not this branch's live generation, this call cannot flip it (a retried
-        // seal; a branch the lease already took) and attests nothing. After the reap, a bumped
-        // generation means the flip landed here, because `set_state` flips a generation once.
-        // Together with the log's own key (a `Reap` removes the head, and a second one is refused)
-        // that makes the attestation exactly once. The epoch comes from the record read before the
-        // reap, as it always did (D103: the reap can recycle the slot).
+        // **Two paths, decided by the record read BEFORE the reap.**
+        // - It is this branch's live generation: this call can flip it, and after the reap a
+        //   bumped generation means the flip landed here, because `set_state` flips a generation
+        //   once. `attest_this_calls_reap` attests it. The epoch comes from this read, as it always
+        //   did (D103: the reap can recycle the slot).
+        // - Anything else (unreadable, or already landed): this call cannot tell, before the reap,
+        //   whether it will flip anything. After the reap it applies the forget paths' rule to this
+        //   one id, `attest_landed_reaps`: a landed reap is attested while the log still holds a
+        //   head, an unreadable record is counted, and the epoch is the log's own `opened_at`.
+        //   `seal` is the last holder of the branch's workspace, so it must not leave a landed reap
+        //   unattested (D199 seal review F1: a failed read here used to suppress the attestation
+        //   while the reaper-less arm flipped anyway; F2: a reap the lease flipped and then reported
+        //   `Refused` was never attested, and this seal removed the only handle that could).
+        // Either way the log's own key (a `Reap` removes the head, and a second one is refused)
+        // keeps it to one entry, and a retried seal finds no head and skips.
+        //
+        // **The premise "only the call that flipped attests" (F3).** It holds while seals are
+        // serialised with the lease scan's reap-and-forget, which run inside `with_lock` (the
+        // statement lock, `lease_thread.rs` `scan_once`). Without that lock the log still gets
+        // exactly one entry, but a seal can attest a flip the lease made, and the loser's attempt
+        // is refused and counted. The reconciliation's third phase already runs outside the lock,
+        // so a merged branch it attests first is recorded as `published = false`; that is a lease-
+        // route item, recorded in `lane_wall19_attested.md` §13, not fixed here.
         let before = self
             .branches
             .get_raw(branch.id)
             .ok()
             .filter(|r| r.generation == branch.generation && r.state != BranchState::Reaped);
         let retired = self.retire(branch);
-        if let Some(before) = before {
-            self.attest_this_calls_reap(branch, before.fork_epoch, published);
+        match before {
+            Some(before) => self.attest_this_calls_reap(branch, before.fork_epoch, published),
+            None => self.attest_landed_reaps(&[branch], published),
         }
         retired
     }
@@ -5954,6 +5974,10 @@ impl AgentRuntime {
     /// - The generation did not move: the reap failed before its flip, or the reaper is built over
     ///   another catalog. Nothing to attest.
     /// - The record cannot be read: counted if the branch still holds a head, never guessed (D199).
+    ///   **The count is final unless a later visitor comes** (D199 seal review F4). On this route
+    ///   the visitor is a retried seal, which takes `attest_landed_reaps` because it reads a bumped
+    ///   generation before its reap. `forget_branches` is not one (its only production caller is
+    ///   `scan_once`), and `forget_reaped_branches` walks workspaces, which this seal removed.
     fn attest_this_calls_reap(&self, branch: BranchId, fork_epoch: Epoch, published: bool) {
         match self.branches.get_raw(branch.id) {
             Ok(after) if after.generation > branch.generation => {
