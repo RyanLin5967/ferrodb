@@ -205,3 +205,46 @@ fn a_recycled_slot_leaves_the_reaped_span() {
         "the recycled slot is still in the Reaped span"
     );
 }
+
+/// Keys the open sweep's candidate query reads on a HEALTHY catalog: `released` reaped-and-freed
+/// leaves (forked first, so each holds its own slot), plus one pinned interior — the only slot a
+/// healthy catalog legitimately keeps unreleased.
+fn keys_read_by_a_healthy_open(released: usize) -> u64 {
+    let f = fixture();
+    let c = &*f.catalog;
+    let leaves: Vec<BranchId> = (0..released)
+        .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id)
+        .collect();
+    for b in leaves {
+        f.reaper.reap(b).unwrap();
+    }
+    let p = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+    let _child = c.fork(p.branch_id, LeaseDeadline(u64::MAX)).unwrap();
+    f.reaper.reap(p.branch_id).unwrap();
+
+    let before = f.concrete.candidate_keys_scanned();
+    assert!(f.reaper.resume_interrupted_reaps().unwrap().is_empty());
+    assert_eq!(f.reaper.open_slots_reclaimed(), 0, "fixture: a healthy catalog had a leak");
+    f.concrete.candidate_keys_scanned() - before
+}
+
+/// **The open sweep is O(unreleased), not O(ever reaped).** A released slot stays a `Reaped`
+/// record until a fork recycles it, so a candidate query over the whole Reaped span (and the whole
+/// free list) reads one key per branch ever reaped, at every open — a branch-count wall at open,
+/// paid to find leaks that, once the cascade releases its ancestors, only a crash can make.
+///
+/// PRE-REGISTERED at the commit that adds this test (the merge over both spans): 2N+1 keys, i.e.
+/// **17 at N=8 and 129 at N=64**; it fails at the first assertion. After the UNRELEASED span:
+/// **1 and 1** — the pinned interior's key, and nothing for any released slot.
+#[test]
+fn a_healthy_open_reads_no_released_slot() {
+    let small = keys_read_by_a_healthy_open(8);
+    let large = keys_read_by_a_healthy_open(64);
+    eprintln!("d200 open sweep keys read: N=8 -> {small}, N=64 -> {large}");
+    assert_eq!(
+        large, small,
+        "the open sweep read {large} keys with 64 released slots against {small} with 8: it pays \
+         for every branch ever reaped, not for what is unreleased"
+    );
+    assert_eq!(small, 1, "a healthy catalog's only unreleased slot is its one pinned interior");
+}

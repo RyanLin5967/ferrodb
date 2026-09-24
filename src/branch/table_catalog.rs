@@ -146,6 +146,10 @@ pub struct TableBranchCatalog {
     /// it fails validation, and when a walk from its node answers NO — which `detach_from_parent`
     /// asks of every node before it detaches it.
     witnesses: Mutex<HashMap<u64, Witness>>,
+    /// **D200.** Id-bearing keys `unreleased_reaped_candidates` has read, over this catalog's
+    /// life. The instrument for the open sweep's cost class: a healthy open must read only the
+    /// slots that are genuinely unreleased, never one per branch ever reaped.
+    candidate_keys: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -431,6 +435,11 @@ impl TableBranchCatalog {
         self.child_spans.load(Ordering::Relaxed)
     }
 
+    /// **D200.** Id-bearing keys the open sweep's candidate query has read. Difference two reads.
+    pub fn candidate_keys_scanned(&self) -> u64 {
+        self.candidate_keys.load(Ordering::Relaxed)
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
@@ -520,6 +529,7 @@ impl TableBranchCatalog {
             published_root: std::sync::atomic::AtomicU32::new(0),
             child_spans: AtomicU64::new(0),
             witnesses: Mutex::new(HashMap::new()),
+            candidate_keys: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -545,6 +555,7 @@ impl TableBranchCatalog {
             published_root: std::sync::atomic::AtomicU32::new(0),
             child_spans: AtomicU64::new(0),
             witnesses: Mutex::new(HashMap::new()),
+            candidate_keys: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -1560,11 +1571,13 @@ impl BranchCatalog for TableBranchCatalog {
     fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
         let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
         let reaped = self.ids_in_span(lo, hi)?;
+        self.candidate_keys.fetch_add(reaped.len() as u64, Ordering::Relaxed);
         let (flo, fhi) = keys::whole_group(keys::tag::FREE_ID);
         let mut free: Vec<u64> = Vec::new();
         for entry in self.tree.range_scan(Bound::Included(flo), Bound::Excluded(fhi))? {
             let (k, _) = entry?;
             if let Some(id) = keys::free_id_from_key(&k) {
+                self.candidate_keys.fetch_add(1, Ordering::Relaxed);
                 free.push(id);
             }
         }
