@@ -319,7 +319,8 @@ pub trait ProvenanceStore: Send + Sync {
 /// `state` lock — and one number could not say which of the two moved.
 ///
 /// **Each sync is booked once, under the write path that ISSUED it**, so the fields sum to the
-/// syncs issued and `total()` is that count. Since D219 a sync also carries every PENDING record
+/// syncs issued and `total()` is that count. One exception: a group sync `await_run` issues that
+/// its post-fsync poison check then refuses is not booked, because it vouched for nothing. Since D219 a sync also carries every PENDING record
 /// (`stamp_pending`) ahead of its own, so a MERGE's physical stamps ride in the one sync its row
 /// authorship issues and are booked under `row_authors`; a merge with no row to attribute (a
 /// schema-only merge whose rewrite re-stamped moved rows) makes them durable with `flush`, booked

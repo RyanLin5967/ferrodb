@@ -1557,8 +1557,9 @@ mod tests {
     /// report that refusal (a swallowed one returns `Ok` with every moved row unattributed at its new
     /// rid) and must leave the table in the NEW shape, not the I19 state.
     ///
-    /// Since A1 this is the only test that reaches `apply_plan`'s restamp with a refusing store:
-    /// test 3's store is refused by the probe first.
+    /// Since A1, test 3's store is refused by the probe first, so this and D246's
+    /// `a_rewrite_refused_mid_restamp_still_writes_the_stamps_before_it` are the tests that reach
+    /// `apply_plan`'s restamp with a refusing store.
     #[test]
     fn a_store_poisoned_between_plan_and_apply_leaves_the_table_consistently_altered() {
         let mut f = packed();

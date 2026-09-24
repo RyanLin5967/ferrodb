@@ -625,14 +625,19 @@ impl DurableProvenanceStore {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(FerroError::Provenance(format!("sync {}: {e}", self.path.display())));
         }
-        // **Checked AFTER the fsync, under the file lock (A4, review D-1).** `sync_handle` shares
-        // one open file description with the append descriptor, so on Linux an fsync error is
-        // reported to whichever of them syncs first, once: an in-lock writer whose own fsync failed
-        // can consume the error for pages this leader's records were in, and this fsync then
-        // returns 0. Every in-lock writer holds the lock from its fsync to its `poisoned.store`,
-        // so once this lock is taken, any error that writer consumed is visible here. The same
-        // check refuses a follower the group makes leader after a failed sync, rather than trust a
-        // second fsync the kernel may answer with success for pages it already dropped.
+        // **Checked AFTER the fsync, under the file lock (A4 D-1, A4c).** Its jobs:
+        // * Refuse a follower the group makes leader after a failed sync, rather than trust a
+        //   second fsync the kernel may answer with success for pages it already dropped.
+        // * Refuse a sync that overlapped a failed in-lock append: every in-lock writer holds the
+        //   lock from its fsync to its `poisoned.store`, so once this lock is taken, a failure it
+        //   saw is visible here. Where a kernel reports a writeback error to only ONE of two open
+        //   file descriptions, that writer can have consumed the error for pages this leader's
+        //   records were in; `sync_handle` being its own description (A4c) covers that on Linux
+        //   ≥ 4.13, and this check covers it wherever the writer saw the error first.
+        // ⚠ STATED BLIND SPOT: the reverse, on a kernel that reports once per FILE (Linux < 4.13;
+        // others unverified). This leader's fsync can consume an error for pages an in-lock
+        // writer wrote, and that writer's fsync then returns 0 and acknowledges them. Nothing
+        // here can see it, and no test can make a real fsync fail (M31 is a registered survivor).
         let _file = self.file.lock().map_err(|_| {
             FerroError::Provenance(format!(
                 "{}: the provenance lock was poisoned by a panicking writer; refusing to sync",
@@ -1970,10 +1975,10 @@ mod tests {
 
     // ---- D246 A4: the fresh review's D-1, D-3 and N-9, pre-registered in `bench/d246/PREREG.md` --
 
-    /// **U5 (D-1): a run sync that overlaps a failed append is not acknowledged.** The sync handle
-    /// is a duplicate of the append descriptor, so on Linux an fsync error reported to an in-lock
-    /// writer is NOT reported to the group leader: the leader's own fsync can return 0 for pages
-    /// the kernel dropped. The injected failure below stands in for that writer's EIO, and the
+    /// **U5 (D-1): a run sync that overlaps a failed append is not acknowledged.** Where a writeback
+    /// error is reported to only one of two open file descriptions, an in-lock writer's failed
+    /// fsync can consume the error for pages the group leader's records were in, and the leader's
+    /// own fsync then returns 0. The injected failure below stands in for that writer's EIO, and the
     /// poison flag it leaves is the only trace the leader can see.
     #[test]
     fn a_run_sync_overlapping_a_failed_append_is_not_acknowledged() {
