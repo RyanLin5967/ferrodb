@@ -1337,7 +1337,15 @@ impl TxnManager {
         for w in writes.into_iter().rev() {
             let tree = BPlusTreeManager::<Value, RecordId>::open_shared(w.root, self.bp.clone());
             let undone = match w.prev {
-                // Replacing a present key never grows the leaf, so this cannot split and move the root.
+                // Replacing a present key never grows the leaf, so it does not split, EXCEPT on a
+                // leaf already exactly full (4069 bytes of entries), which the count split
+                // (`BPlusTreeLeafPage::split`, before D225) can leave. The same-size image is then
+                // full, `try_write_without_split` answers `Ok(false)`, and the upsert splits once,
+                // which can cascade and move the root. `open_shared` publishes a moved root through
+                // the cell, so the move is safe; before D225 the split is the count split, with
+                // D225's own defect. After D225 (`d225-byte-split`, its review 5 R6), a legacy full
+                // leaf holding an entry over `MAX_ENTRY_BYTES` can find no cut, and the upsert
+                // refuses: reported below as an undo failure (`first_err`, then `mark_indexes_stale`).
                 Some(rid) => tree.upsert(w.key, rid),
                 // A net removal, which nothing did before D202. `delete` never rebalances
                 // (`handle_underflow` has no caller) and the descent already walks past an
