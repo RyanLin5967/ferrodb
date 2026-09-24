@@ -228,3 +228,25 @@ Amendment 1's kill map stands for steps 1-25.
 
 The exit condition becomes: exit 0 requires FAIL = 0 and PASS = 64, and a run that reaches anything other than 64
 verdicts exits 2.
+
+## Amendment 2a (before any run): how step 29 makes `git status` fail
+
+Amendment 2 said step 29 makes the index unreadable. That would not isolate the N4 rule. An unreadable index also
+fails the `ls-files -v` of the N2 check, and N2 answers `unknown` too, so the mutant "a failed status keeps the sha"
+would pass step 29 through N2. That is two guards, one of which cannot be tested.
+
+Step 29 instead sets `status.aheadBehind = bogus` in the clone's repository config, then touches the index to force a
+re-run. That config value makes `git status` fail and leaves every other call build.rs makes working. MEASURED on git
+2.50.1, with the value set:
+
+| call | exit code |
+|---|---|
+| `git status --porcelain --untracked-files=no` | 128 |
+| `git ls-files -v` | 0 |
+| `git rev-parse --short=12 HEAD` | 0 |
+| `git config --bool core.ignoreStat` | 1, the normal answer for an unset key |
+
+The value is unset right after the build. Step 29's predictions are unchanged:
+* the tip stamps `at unknown +DIRTY`, with rerun yes;
+* the base FAILs with `at S0 +DIRTY`;
+* the N4 mutant FAILs the same way.
