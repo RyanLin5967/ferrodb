@@ -2445,14 +2445,13 @@ fn start_fresh_quarantine_at(wal_path: &Path, nanos: u128) -> std::io::Result<()
 ///   would adopt it, find its table absent from the new catalog, and free those ids after its
 ///   checkpoint, which may be live pages of the new database.
 ///
-/// Moved, not deleted: both are evidence. In this order, at one clock reading, and idempotent: a retry
-/// after a failure finds the quarantine already gone and moves the intent. The quarantine's stated
+/// Moved, not deleted: both are evidence. In this order, and idempotent: a retry after a failure finds
+/// the quarantine already gone and moves the intent. The quarantine's stated
 /// restore gap (an in-place `replication::backup::restore` outside the install moves neither) holds
 /// for the intent too.
 pub(crate) fn start_fresh_database(wal_path: &Path) -> std::io::Result<()> {
-    let nanos = now_nanos();
-    start_fresh_quarantine_at(wal_path, nanos)?;
-    move_aside_at(&free_intent::intent_path(wal_path), nanos)
+    start_fresh_quarantine(wal_path)?;
+    move_aside_at(&free_intent::intent_path(wal_path), now_nanos())
 }
 
 /// The clock reading an aside name carries (see [`aside_path`]).
