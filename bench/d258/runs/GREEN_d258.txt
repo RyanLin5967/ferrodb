@@ -1,0 +1,24 @@
+# 2026-09-24T22:07:03Z tree=/Users/idide/wt/ferrodb-d258.noindex HEAD=dfa3c793aed18faafc56b5928e4e44fdddc232ae
+# cmd: lockrun d258 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d258_stage_atomic
+2026-09-24T22:07:03Z d258 acquiring (5s poll), pid 47331
+2026-09-24T22:07:03Z d258 ACQUIRED: 47331 d258 2026-09-24T22:07:03Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d258.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.80s
+     Running tests/d258_stage_atomic.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d258_stage_atomic-288d6c220e7fde21)
+
+running 9 tests
+test an_oversized_row_is_refused_and_merge_publishes_nothing ... ok
+test a_refused_statement_spends_neither_escrow_nor_row_write_budget ... ok
+test a_row_at_the_entry_cap_still_stages_mirrors_and_merges ... ok
+test a_row_write_that_lands_and_then_fails_is_put_back_too ... ok
+test a_log_limit_refusal_does_not_wedge_the_branch ... ok
+test a_refused_statement_leaves_no_trace_and_its_retry_applies_once ... ok
+test a_failed_log_write_leaves_no_trace_and_restores_the_page_tree ... ok
+test a_sibling_merge_that_refuses_on_its_second_table_stages_nothing ... ok
+test a_page_tree_failure_mid_statement_leaves_no_trace ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+2026-09-24T22:07:24Z d258 rc=0
+2026-09-24T22:07:24Z d258 released (owner matched)
+# rc=0 end=2026-09-24T22:07:24Z HEAD_after=dfa3c793aed18faafc56b5928e4e44fdddc232ae
