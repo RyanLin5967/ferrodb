@@ -987,3 +987,7 @@ moved `runs = M` and `a = 0` to READ. The lead's decisions on C1–C7, and what 
    * Fire modes: 22 = 10 comparison + 3 control + 8 in path + 1 judge. `ckpt-ddl` is new.
    * The (f) list on the (e) command stays at 19. `ckpt-ddl` runs as (f3).
    * New `#[test]`s over `9aa6968`: still 41.
+9. **A13.9, the same pattern as A11.6.** If `ckpt-ddl` is requested but no axis-(ii) checkpoint truncated (the M
+   targets stop below one interval), the run prints NOT A RESULT naming that. The judge was never moved, so a run
+   that exits 0 cannot be read as the fire having happened. The (e) command's M targets (64, 128) would do exactly
+   this, which is why `ckpt-ddl` runs as (f3).
