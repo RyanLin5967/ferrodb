@@ -49,11 +49,37 @@ impl HeapFileManager {
     /// table region below the copy-on-write arena floor is full — a real limit, fixed when the
     /// database is created (`cli::DEFAULT_ARENA_HEADROOM`), not a test contrivance. See the
     /// relocation branch of [`Self::update`] for what that cost before this split existed.
+    ///
+    /// **D261: the page returned has the room on the REAL page, not only in the directory.** The
+    /// directory's figure is a hint: it can overstate a page (`d257-review1` R2 names two rollback
+    /// routes at `9aa6968`; a forward path's own directory write can fail after its page write). A
+    /// candidate is therefore read under its frame latch, and one whose real free space is short is
+    /// corrected in the directory and passed over. That ends: each correction puts an entry below
+    /// what is needed, so the first-fit search never returns that page again, and `add_empty_page`
+    /// is the last resort. Before this, the relocation in [`Self::update`] deleted a row and then
+    /// found its destination full, which on an unlogged heap (ALTER's rewrite) lost the row, and an
+    /// INSERT of one width was refused on the same page for good (`d257-review1` R2c).
     pub fn find_or_make_page(&self, tuple_len: usize) -> Result<u32, FerroError> {
-        if let Some(id) = self.find_page_with_space(tuple_len as u16 + SLOT_ENTRY_SIZE as u16)? {
-            return Ok(id);
+        let needed = tuple_len as u16 + SLOT_ENTRY_SIZE as u16;
+        while let Some(id) = self.find_page_with_space(needed)? {
+            let real = self.real_free_space(id)?;
+            if real >= needed {
+                return Ok(id);
+            }
+            self.update_directory_entry(id, real)?;
         }
         self.add_empty_page()
+    }
+
+    /// `page_id`'s free space as the page itself holds it, read under its frame latch.
+    fn real_free_space(&self, page_id: u32) -> Result<u16, FerroError> {
+        let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
+        let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
+        let page = Page::deserialize(frame.data);
+        drop(frame);
+        self.buffer_pool_manager.unpin_page(page_id, false);
+        let page = page?;
+        Ok(page.get_free_space_end() - page.get_free_space_start())
     }
 
     /// Allocate one empty data page and record it in the directory. **Always allocates.**
@@ -222,9 +248,16 @@ impl HeapFileManager {
                 // allocate, and holding this frame's write lock across that would deadlock the
                 // moment the allocator handed back a page whose frame is this one.
                 //
-                // A fresh page can hold any tuple up to `MAX_TUPLE_SIZE`, so with the destination
-                // in hand `insert_into` cannot fail for want of space. Obtaining it FIRST is what
-                // makes the size guard above sufficient: the guard answers "can any page hold
+                // With the destination in hand `insert_into` cannot fail for want of space, because
+                // `find_or_make_page` checked the room on the REAL page under its latch, not on the
+                // directory's figure (D261; a fresh page holds any tuple up to `MAX_TUPLE_SIZE`).
+                // That holds up to the insert because nothing else writes this heap in between:
+                // statements are serialised, and ALTER's rewrite runs under the exclusive catalog
+                // lock. The destination is never this page: one with room for the tuple and its slot
+                // would have taken the in-place growth above, which needs only the tuple's bytes.
+                // Before D261 an overstated directory entry made the insert refuse AFTER the delete
+                // below, and on an unlogged heap the row was lost (`d257-review1` R2). Obtaining the
+                // destination FIRST is what makes the size guard above sufficient: the guard answers "can any page hold
                 // this tuple", and this answers "is there a page at all", which is a different
                 // question with a different answer. `DiskManager::allocate` refuses once the table
                 // region below the copy-on-write arena floor is full, and that floor is fixed when
@@ -370,6 +403,17 @@ impl HeapFileManager {
                 }
                 Err(e) => return Err(e)
             }
+        }
+    }
+
+    /// Set `page_id`'s entry to `free_space`, adding the entry when the directory has none. The
+    /// directory is not logged, so after a crash a page added since the last checkpoint is not
+    /// listed. Recovery's directory repair did this inline; a rollback's undo does it too (D261),
+    /// and recovery runs that undo BEFORE its repair.
+    pub fn set_directory_entry(&self, page_id: u32, free_space: u16) -> Result<(), FerroError> {
+        match self.update_directory_entry(page_id, free_space) {
+            Err(FerroError::KeyNotFound) => self.add_to_directory(page_id, free_space),
+            other => other,
         }
     }
 

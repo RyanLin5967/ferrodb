@@ -187,7 +187,8 @@ pub fn release_failures() -> u64 {
 /// apart from [`RELEASE_FAILURES`] (the adversary's F3 on `115f0b7`): the slot IS free, on the page
 /// and in the log, and only `find_page_with_space` does not offer its bytes yet. They are offered
 /// once the page's entry is next rewritten: by the next write to that page, or by recovery's
-/// directory repair.
+/// directory repair. Since D261 a rolled-back page's failed directory update is counted here too:
+/// the undo stands, and only the entry is stale.
 pub static DIRECTORY_UPDATE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// See [`DIRECTORY_UPDATE_FAILURES`].
@@ -1017,19 +1018,22 @@ impl TxnManager {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn , undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapDelete{ dir_root, page_id, slot, old: Vec::new() })
                     };
-                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_insert(page, slot))?;
+                    let page = self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_insert(page, slot))?;
+                    self.tell_directory_of_undo(dir_root, page_id, &page);
                 }
                 RecKind::HeapDelete { dir_root, page_id, slot, old } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapInsert { dir_root, page_id, slot, tuple: old.to_vec() })
                     };
-                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_delete(page, slot, &old))?;
+                    let page = self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_delete(page, slot, &old))?;
+                    self.tell_directory_of_undo(dir_root, page_id, &page);
                 }
                 RecKind::HeapUpdate { dir_root, page_id, slot, old, new } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapUpdate { dir_root, page_id, slot, old: new.clone(), new: old.clone() })
                     }; 
-                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_update(page, slot, &old))?;
+                    let page = self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_update(page, slot, &old))?;
+                    self.tell_directory_of_undo(dir_root, page_id, &page);
                 }
                 RecKind::Clr {undo_next, .. } => {
                     if undo_next == 0 {
@@ -1339,6 +1343,26 @@ impl TxnManager {
                  its bytes are offered again once the page's entry is next rewritten",
                 r.slot,
                 r.page_id
+            );
+        }
+    }
+
+    /// **D261: tell the page directory an undone page's free space.** An undo can change it: undoing
+    /// an insert frees the slot, and when that tuple was the page's lowest the page gains the bytes
+    /// back. Nothing told the directory before, so the entry understated the page until its next
+    /// write or the next open's repair. Through [`HeapFileManager::set_directory_entry`], which adds a
+    /// missing entry: recovery runs this undo BEFORE its repair lists the pages added since the last
+    /// checkpoint. A failure is counted in [`DIRECTORY_UPDATE_FAILURES`] and printed, and not
+    /// returned: the undo itself stands, as a release's does in [`TxnManager::tell_directory`].
+    fn tell_directory_of_undo(&self, dir_root: u32, page_id: u32, page: &Page) {
+        use std::io::Write;
+        let free = page.get_free_space_end() - page.get_free_space_start();
+        if let Err(e) = HeapFileManager::open(dir_root, self.bp.clone()).set_directory_entry(page_id, free) {
+            DIRECTORY_UPDATE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: page {page_id} was rolled back, but the page directory was not told its free space \
+                 ({e}); the entry stays as it was until the page is next written or the next open repairs it"
             );
         }
     }

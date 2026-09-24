@@ -158,11 +158,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         drop(frame);
         bp.unpin_page(*page_id, false);
         let free = page.get_free_space_end() - page.get_free_space_start();
-        match hfm.update_directory_entry(*page_id, free) {
-            Ok(()) => {}
-            Err(FerroError::KeyNotFound) => hfm.add_to_directory(*page_id, free)?,
-            Err(e) => return Err(e)
-        }
+        hfm.set_directory_entry(*page_id, free)?;
     }
 
     // D213: finish the releases a crash cut off. A committed transaction's retired slots are freed
