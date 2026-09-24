@@ -2066,6 +2066,10 @@ mod tests {
         let arms = fifo_lease_churn(&c, 170, &[0, 405, 810]);
         let _ = std::fs::remove_file(p);
         let base = arms[0].1;
+        // Amendment 5: a counter that never counts reads 0 <= 1 and passes the bound below, so the
+        // instrument has to show it saw the pass at all. A lease pass reads at least the tree's
+        // height in pages.
+        assert!(base > 0, "premise: the page-read counter saw no read in the first lease pass: {arms:?}");
         assert!(
             arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
             "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}: the lease pass \
@@ -2085,6 +2089,10 @@ mod tests {
         let arms = fifo_lease_churn(&c, 170, &[0, 5_500]);
         let _ = std::fs::remove_file(p);
         let base = arms[0].1;
+        // Amendment 5: a counter that never counts reads 0 <= 1 and passes the bound below, so the
+        // instrument has to show it saw the pass at all. A lease pass reads at least the tree's
+        // height in pages.
+        assert!(base > 0, "premise: the page-read counter saw no read in the first lease pass: {arms:?}");
         assert!(
             arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
             "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}"
