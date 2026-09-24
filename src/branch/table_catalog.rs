@@ -35,6 +35,7 @@ use crate::branch::types::{
 };
 use crate::branch::BranchCatalog;
 use crate::buffer::buffer_pool::BufferPoolManager;
+use crate::cluster::FileWallStamp;
 use crate::error::FerroError;
 use crate::storage::index::BPlusTreeManager;
 
@@ -529,14 +530,12 @@ pub struct TableBranchCatalog {
     /// then credits nothing. Set at open, never changed; read only by `resume_leases`, and only
     /// when no mark exists. See [`FirstStartEvidence`].
     first_start: Option<FirstStartEvidence>,
-    /// The downtime owed before this process opened the catalog — `first_start`'s credit at open,
-    /// if the catalog held a live lease then, else 0. Every soft mark this process writes carries
-    /// it as `accrued`, so the next first start credits it plus the time since this process's LAST
-    /// commit, and never this process's own run. 0 for a fresh catalog. Set at open, never changed.
+    /// The downtime owed before this process opened the catalog, ON THIS PROCESS'S LEASE CLOCK —
+    /// [`FirstStartEvidence::owed_at_open`], if the catalog held a live lease then, else 0 (review
+    /// 4, C1). Every soft mark this process writes carries it as `accrued`, so the next first start
+    /// credits it plus the time since this process's LAST commit, and never this process's own run.
+    /// 0 for a fresh catalog. Set at open, never changed.
     first_start_owed: u64,
-    /// Set by `resume_leases` and `record_lease_alive` before they write the mark: from then on the
-    /// mark is the evidence, and `stage` writes no soft mark. Written only under `logical`.
-    soft_mark_superseded: AtomicBool,
     /// **The header page's magic, as this catalog last wrote it** (SCALE-DESIGN "D198 addendum
     /// 2"): [`HEADER_PAGE_MAGIC`] while `D` has never left 0, [`HEADER_PAGE_MAGIC_OFFSET`] from
     /// before the first record that holds `D > 0`. `publish_root` writes this, never a constant: a
@@ -566,30 +565,17 @@ const HEADER_PAGE_MAGIC_OFFSET: u32 = 0xFE44_0B02;
 pub const SIDECAR_HEADER_PAGE: u32 = 1;
 
 /// A file's last modification, in unix milliseconds on the WALL clock, or `None` if it cannot be
-/// read. The FirstStart policy's evidence (see [`FirstStartEvidence`]); `None` is no evidence.
+/// read. Production reads file times only as [`FileWallStamp`]s; this is the C5 test's premise.
+#[cfg(test)]
 fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    u64::try_from(since.as_millis()).ok()
+    FileWallStamp::of(path).map(FileWallStamp::millis)
 }
 
-/// **How long ago a file time was — review 3, C1.** `stamp` is a WALL-clock time (an mtime);
-/// `lease_now` is on the lease clock, which lags the wall clock by host sleep (F2). `lease_now −
-/// stamp` mixes the two and falls short of the outage by up to the lag of the lease clock that
-/// wrote the file. The lead's corrected rule is the wall age, `W(now) − stamp`, which falls short
-/// only by that lag minus this process's own. The rule assumes the lease clock never runs faster
-/// than the wall clock, which a BACKWARD wall step after this process anchored its lease clock
-/// breaks — F2 exists because NTP steps it — and then the wall age is short by the step while the
-/// lease age is not. So the larger of the two, each saturating at 0: never below either, and never
-/// below what `1ec2deb` credited.
-///
-/// Neither term can see how far the file's LAST writer's lease clock lagged (PREREG amendment 10).
-/// For a D198 writer that is what its soft mark carries (see [`SoftMark`]); a file time is the
-/// evidence only where there is no soft mark — a catalog no D198 build wrote — or beside one, in
-/// the `max` of [`FirstStartEvidence::credit`], where it can only over-credit.
-fn file_age_millis(stamp: u64, lease_now: Option<u64>) -> u64 {
-    let wall = crate::cluster::wall_millis_since(stamp);
-    lease_now.map_or(wall, |now| wall.max(now.saturating_sub(stamp)))
+/// Sync the directory that holds `path`, so a rename into it survives a power cut — through the
+/// validated `storage::atomic_file` implementation, whose Windows no-op is stated there.
+fn sync_dir_of(path: &std::path::Path) -> std::io::Result<()> {
+    use crate::storage::atomic_file::{parent_dir, FileOps, OsFileOps};
+    OsFileOps.sync_dir(parent_dir(path))
 }
 
 /// **The soft mark, `[0x09]`** (the lead's decision after review 3, closing its schedule E1): what
@@ -633,33 +619,72 @@ impl SoftMark {
     }
 }
 
-/// **The FirstStart policy's evidence for a catalog with no mark** (review 3, C1 and C4–C6, and the
-/// soft mark): a soft mark, a file time, or both.
+/// **The FirstStart policy's evidence for a catalog with no mark** (review 3, C1 and C4–C6; the
+/// soft mark; review 4, C1): a soft mark, a file time, or both.
 ///
-/// The credit is `accrued + max(now − mark, file_age(file time))`. The first term is the soft
-/// mark's, and exact for a D198 writer whatever its lease clock's lag. The file time is the only
-/// evidence for a catalog no D198 build wrote (a pre-D198 catalog, a `main`-migrated one); beside a
-/// soft mark it can only over-credit, because every soft-mark write is a file write and so the file
-/// is never older than the last soft mark on the wall clock. An ACCRUAL, not a frozen stamp:
-/// nothing here credits an unresumed writer's own run.
+/// **Every term, with its clock** (review 4 asked for this beside the formula; the D198 addendum's
+/// retracted argument and review 4's C1 were both one expression across two clocks). `L_p` is
+/// process `p`'s lease clock, `W` the wall clock, `lag_p = W − L_p`:
+///
+/// | term | clock |
+/// |---|---|
+/// | `s.mark` | the writer `w`'s lease clock, `L_w`, at its last commit |
+/// | `s.accrued` | a duration on `L_w`: what `w` owed at its open ([`Self::owed_at_open`]) |
+/// | `m` = `file` | `W`: an OS mtime |
+/// | `now` | this process's lease clock, `L_new` |
+///
+/// **At an unresumed writer's open, lease terms only** — [`Self::owed_at_open`]:
+/// `accrued + max(L_w(open) − s.mark, L_w(open) − m)`. **At the resume** —
+/// [`Self::resume_credit`]: `accrued + max(now − s.mark, W(now) − m, now − m)`, the wall half
+/// being the lead's review-3 rule.
+///
+/// The relations the bound relies on (PREREG amendment 12):
+/// - **R1** `L_p = W − lag_p` with `lag_p ≥ 0`, non-decreasing within `p` unless the wall clock
+///   steps back after `p` anchored (the reason the file term also takes the lease half, `now − m`).
+/// - **R2** a pre-D198 writer, and a legacy log's, has `lag = 0`: its lease clock IS the wall
+///   clock.
+/// - **R3** `m ≤ W(last moment its writer was alive)`, and every soft mark is written in a commit,
+///   so the file is never older, on `W`, than its last soft mark.
+/// - **R4** `s.mark ≤ L_w(last moment w was alive)`.
+///
+/// So a lease on `w`'s clock, owed `L_new(now) − L_w(last alive)`, is credited at least that
+/// (R4), over by `w`'s idle tail only; a lease of a pre-D198 writer is credited at least
+/// `L_new(now) − m`, its owed (R2, R3). With a soft mark present, `L − m ≤ L − s.mark` (R3, R1),
+/// so at an open the maximum IS the soft term: no lag counted twice. The one wall term, at the
+/// resume, over-credits by the resumer's own lag. Every route over-credits without bound; none
+/// under-credits below the policy's 0 (PREREG amendment 12's table).
+///
+/// An ACCRUAL, not a frozen stamp: nothing here credits an unresumed writer's own run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FirstStartEvidence {
     /// The last unresumed D198 writer's soft mark, if any.
     soft: Option<SoftMark>,
-    /// The wall-clock file time the rest of the outage runs from, if one is evidence.
-    file: Option<u64>,
+    /// The file time the rest of the outage runs from, if one is evidence.
+    file: Option<FileWallStamp>,
 }
 
 impl FirstStartEvidence {
-    /// The credit owed at lease-clock `lease_now`, clamped by D206's rule.
-    fn credit(&self, lease_now: Option<u64>) -> u64 {
-        let since_soft = match (self.soft, lease_now) {
-            (Some(s), Some(now)) => now.saturating_sub(s.mark),
-            _ => 0,
-        };
-        let since_file = self.file.map_or(0, |m| file_age_millis(m, lease_now));
-        let accrued = self.soft.map_or(0, |s| s.accrued);
-        LeaseDeadline::saturating_deadline(accrued, since_soft.max(since_file))
+    /// **What an unresumed writer owes at its open, on ITS lease clock `lease_now`** — lease terms
+    /// only (review 4, C1). A wall term here would add the writer's own lag to a quantity the next
+    /// start reads on the same lagging clock again. Clamped by D206's rule.
+    fn owed_at_open(&self, lease_now: u64) -> u64 {
+        let since_soft = self.soft.map_or(0, |s| lease_now.saturating_sub(s.mark));
+        let since_file = self.file.map_or(0, |m| lease_now.saturating_sub(m.millis()));
+        LeaseDeadline::saturating_deadline(self.accrued(), since_soft.max(since_file))
+    }
+
+    /// **The credit at this process's resume, at lease-clock `now`**: the lease terms, and the
+    /// file's wall-clock age besides (the lead's review-3 rule), which over-credits by this
+    /// process's own lag and by nothing else. Clamped by D206's rule.
+    fn resume_credit(&self, now: u64) -> u64 {
+        let since_soft = self.soft.map_or(0, |s| now.saturating_sub(s.mark));
+        let since_file =
+            self.file.map_or(0, |m| m.wall_age_millis().max(now.saturating_sub(m.millis())));
+        LeaseDeadline::saturating_deadline(self.accrued(), since_soft.max(since_file))
+    }
+
+    fn accrued(&self) -> u64 {
+        self.soft.map_or(0, |s| s.accrued)
     }
 }
 
@@ -672,12 +697,12 @@ enum FileTimes {
     /// mark, the earlier of the two mtimes: either file may be the later, and the earlier is the
     /// larger, conservative credit (review 3, C6). With a soft mark, the catalog's own: a D198
     /// build wrote the catalog, and if it migrated it, its soft mark already measured the source.
-    OwnOrLegacy(Option<u64>),
+    OwnOrLegacy(Option<FileWallStamp>),
     /// Only the SOURCE log's mtime: THIS process just wrote the catalog by migrating it, so neither
     /// its own mtime nor the soft mark its migration wrote says anything about the outage. An
     /// unreadable source is no evidence at all — never a fallback to the catalog's own mtime
     /// (review 3, C5).
-    Source(Option<u64>),
+    Source(Option<FileWallStamp>),
 }
 
 impl TableBranchCatalog {
@@ -792,7 +817,7 @@ impl TableBranchCatalog {
         let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
         // Read before the open: `open_from_header` WRITES the file when it switches a torn
         // header's magic (addendum 2), and every write after that is this process's own.
-        let own_mtime = if fresh { None } else { file_mtime_millis(path) };
+        let own_mtime = if fresh { None } else { FileWallStamp::of(path) };
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -835,7 +860,7 @@ impl TableBranchCatalog {
     /// lease is not carried forward).
     fn take_first_start_evidence(
         &mut self,
-        own_mtime: Option<u64>,
+        own_mtime: Option<FileWallStamp>,
         times: FileTimes,
     ) -> Result<(), FerroError> {
         let soft = self.soft_mark()?;
@@ -852,8 +877,8 @@ impl TableBranchCatalog {
             (soft.is_some() || file.is_some()).then_some(FirstStartEvidence { soft, file });
         self.first_start = evidence;
         let live = self.holds_a_live_lease()?;
-        self.first_start_owed = match evidence {
-            Some(e) if live => e.credit(LeaseDeadline::try_now_millis().ok()),
+        self.first_start_owed = match (evidence, crate::cluster::standalone_lease_millis()) {
+            (Some(e), Some(lease_now)) if live => e.owed_at_open(lease_now),
             _ => 0,
         };
         Ok(())
@@ -873,6 +898,13 @@ impl TableBranchCatalog {
     /// keys absent after its reopen, as a premise (PREREG amendment 11).
     #[cfg(test)]
     fn as_written_before_d198(&self) -> Result<(), FerroError> {
+        // Review 4, C7(a): at `D > 0` the deadlines are stored as `lease − D` under the new magic,
+        // and stripping the keys would leave a catalog that is not pre-D198, silently.
+        assert!(
+            self.offset().is_zero() && !self.header_admits_offset(),
+            "as_written_before_d198 turns only a catalog still at D = 0, under the old magic, into \
+             a pre-D198 one: this one's offset has left 0"
+        );
         let _g = self.logical.lock().unwrap();
         self.remove_if_present(&keys::alive())?;
         self.remove_if_present(&keys::first_start())?;
@@ -911,8 +943,11 @@ impl TableBranchCatalog {
             // is FirstStart evidence beside the catalog's own (`FileTimes::OwnOrLegacy`, C6).
             let mut legacy_mtime = None;
             if has(&legacy_path) {
-                legacy_mtime = file_mtime_millis(Path::new(&legacy_path));
-                let _ = std::fs::rename(&legacy_path, &retired_path);
+                legacy_mtime = FileWallStamp::of(Path::new(&legacy_path));
+                if std::fs::rename(&legacy_path, &retired_path).is_ok() {
+                    // Best effort, as the rename itself is: the retirement survives a power cut.
+                    let _ = sync_dir_of(Path::new(&cat_path));
+                }
             }
             return Self::open_sidecar_at(
                 Path::new(&cat_path),
@@ -925,7 +960,7 @@ impl TableBranchCatalog {
             // The FirstStart policy's evidence is the SOURCE's last write: the migrated file is
             // written now and says nothing about the outage before it. Read before the log is
             // opened.
-            let source_mtime = file_mtime_millis(Path::new(&legacy_path));
+            let source_mtime = FileWallStamp::of(Path::new(&legacy_path));
             // A previous attempt may have died partway; its tmp is garbage by construction.
             let _ = std::fs::remove_file(&tmp_path);
             {
@@ -957,21 +992,34 @@ impl TableBranchCatalog {
                 // since, all of which its mtime would credit. Written after `migrate_from`, whose
                 // own commits soft-marked the new catalog with nothing accrued; not on a cluster
                 // member, for `record_soft_mark`'s reason.
-                if let (Some(m), Ok(now)) = (source_mtime, LeaseDeadline::try_now_millis()) {
-                    if !crate::cluster::is_clustered() && cat.holds_a_live_lease()? {
-                        let accrued = file_age_millis(m, Some(now));
+                //
+                // `accrued` is on THIS process's lease clock, `L_mig − m`, never the wall age
+                // (review 4, C1): the next start adds `now − mark` on the same clock, and a wall
+                // term here would count this process's lag twice. Exact for the source's writer,
+                // whose lease clock was the wall clock (R2 in `FirstStartEvidence`).
+                let lease_now = crate::cluster::standalone_lease_millis();
+                if let (Some(m), Some(now)) = (source_mtime, lease_now) {
+                    if cat.holds_a_live_lease()? {
+                        let accrued = now.saturating_sub(m.millis());
                         cat.upsert(keys::first_start(), SoftMark { mark: now, accrued }.encode())?;
                         cat.publish_root()?;
                     }
                 }
-                // Everything must be on disk BEFORE the rename publishes it.
+                // Everything must be on disk BEFORE the rename publishes it: written, then synced
+                // (review 4, C5(d): `flush_all` alone leaves the pages in the OS cache, and a
+                // power cut after the rename would publish a catalog whose bytes never reached the
+                // disk).
                 cat.pool.flush_all()?;
+                cat.pool.disk_manager.sync()?;
             }
             std::fs::rename(&tmp_path, &cat_path)
                 .map_err(|e| FerroError::Io(format!("publish {cat_path}: {e}")))?;
             // Only now is the log redundant.
             std::fs::rename(&legacy_path, &retired_path)
                 .map_err(|e| FerroError::Io(format!("retire {legacy_path}: {e}")))?;
+            // Both renames survive a power cut only once the directory holding them is synced.
+            sync_dir_of(Path::new(&cat_path))
+                .map_err(|e| FerroError::Io(format!("sync the directory of {cat_path}: {e}")))?;
             return Self::open_sidecar_at(
                 Path::new(&cat_path),
                 trunk_root,
@@ -1097,6 +1145,16 @@ impl TableBranchCatalog {
         Ok(self.commit_group.ticket())
     }
 
+    /// [`Self::stage`] for **the commit that writes the mark itself** (`resume_leases`,
+    /// `record_lease_alive`): no soft mark, which the mark supersedes. Review 4, C5(b): this
+    /// replaced a flag set BEFORE the mark's write and never cleared when it failed, which left a
+    /// catalog whose mark never landed writing no soft mark either. `marked` is set only after the
+    /// mark's `durable`, so a failed mark leaves the catalog soft-marking.
+    fn stage_mark(&self) -> Result<u64, FerroError> {
+        self.publish_root()?;
+        Ok(self.commit_group.ticket())
+    }
+
     /// **The soft mark: every commit of an unmarked catalog records the writer's lease-clock
     /// reading and the downtime owed before it opened the catalog** (`[0x09]`; see [`SoftMark`]),
     /// in the same stage and the same fsync as whatever it is committing — no extra sync. It closes
@@ -1105,18 +1163,15 @@ impl TableBranchCatalog {
     /// outage before a start that writes and then fails (review 3, C4).
     ///
     /// On EVERY commit, not the first: a stamp from the first would credit the writer's run after
-    /// it as downtime. Not once the catalog is marked, or once `resume_leases` or
-    /// `record_lease_alive` has set `soft_mark_superseded`; not on a cluster member, whose lease
-    /// clock is the replicated tick and which writes no mark either; and not when the lease clock
-    /// cannot be read, which leaves the file time as the next start's evidence.
+    /// it as downtime. Not once the catalog is marked, nor in the mark's own commit
+    /// ([`Self::stage_mark`]); not on a cluster member, whose lease time is the replicated tick and
+    /// which writes no mark either. One acquisition of the process lock for the clock
+    /// (`cluster::standalone_lease_millis`), under `logical`, plus one upsert (review 4, C6).
     fn record_soft_mark(&self) -> Result<(), FerroError> {
-        if self.marked.load(Ordering::SeqCst)
-            || self.soft_mark_superseded.load(Ordering::SeqCst)
-            || crate::cluster::is_clustered()
-        {
+        if self.marked.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let Ok(now) = LeaseDeadline::try_now_millis() else {
+        let Some(now) = crate::cluster::standalone_lease_millis() else {
             return Ok(());
         };
         self.upsert(
@@ -1241,7 +1296,6 @@ impl TableBranchCatalog {
             resumed: AtomicBool::new(false),
             first_start: None,
             first_start_owed: 0,
-            soft_mark_superseded: AtomicBool::new(false),
             header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
         // Through `inward_at_zero`, the production door from a `BranchRecord`, which opens only at
@@ -1278,7 +1332,6 @@ impl TableBranchCatalog {
             resumed: AtomicBool::new(false),
             first_start: None,
             first_start_owed: 0,
-            soft_mark_superseded: AtomicBool::new(false),
             header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
@@ -1753,8 +1806,19 @@ impl TableBranchCatalog {
         Ok(())
     }
 
-    /// Whether any `Live`, non-trunk lease exists: the DEADLINE index's first key, one descent.
-    /// The FirstStart policy credits only a catalog that has a lease to protect.
+    /// Whether any `Live`, non-trunk lease exists: the DEADLINE group's first key. The FirstStart
+    /// policy credits only a catalog that has a lease to protect.
+    ///
+    /// **Not one descent** (lead's new-wall audit; READ `storage/range_scan.rs`:
+    /// `RangeScanner::next` follows `leaf.next` through every EMPTY leaf until it finds a key or
+    /// passes the bound). The cost is one descent plus every empty leaf at the head of the
+    /// DEADLINE group, and deadline keys only move forward, so those accumulate with the deadline
+    /// keys ever deleted there if `delete` never frees or merges a leaf — which
+    /// `deadline-leaf-adversary` is testing, and which would put the fix in the tree, not here.
+    /// `expired_before` pays the same walk on every lease pass. Called from three places:
+    /// `take_first_start_evidence`, at EVERY open of an existing sidecar with no mark (so on every
+    /// open by an embedder that never resumes); the legacy migration in `default_for_database`;
+    /// and `resume_leases`, once per start.
     fn holds_a_live_lease(&self) -> Result<bool, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::DEADLINE);
         Ok(self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?.next().transpose()?.is_some())
@@ -1767,7 +1831,7 @@ impl TableBranchCatalog {
             file_mtime: e.file,
             writer_mark: e.soft.map(|s| s.mark),
             recorded_millis: e.soft.map_or(0, |s| s.accrued),
-            credited_millis: e.credit(Some(now_millis)),
+            credited_millis: e.resume_credit(now_millis),
         })
     }
 
@@ -2431,13 +2495,11 @@ impl BranchCatalog for TableBranchCatalog {
                 self.durable(seq)?;
                 continue;
             }
-            // The mark supersedes the soft mark; nothing writes `[0x09]` after it.
-            self.soft_mark_superseded.store(true, Ordering::SeqCst);
             // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
             // leaves the old mark beside the new offset, and the next start credits the same outage
-            // a second time.
+            // a second time. Its commit writes no soft mark: the mark supersedes it.
             self.upsert(keys::alive(), next.encode())?;
-            let seq = self.stage()?;
+            let seq = self.stage_mark()?;
             drop(_g);
             self.durable(seq)?;
             // Published only once durable. If the write fails, `LeaseThread::start` refuses to
@@ -2465,10 +2527,9 @@ impl BranchCatalog for TableBranchCatalog {
         // early after the next restart.
         let _g = self.logical.lock().unwrap();
         let next = AliveState::heartbeat(self.alive_record()?, now_millis);
-        // A mark supersedes the soft mark; nothing writes `[0x09]` after it.
-        self.soft_mark_superseded.store(true, Ordering::SeqCst);
+        // The mark's own commit writes no soft mark: the mark supersedes it.
         self.upsert(keys::alive(), next.encode())?;
-        let seq = self.stage()?;
+        let seq = self.stage_mark()?;
         drop(_g);
         self.durable(seq)?;
         self.marked.store(true, Ordering::SeqCst);

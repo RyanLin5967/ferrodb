@@ -393,17 +393,56 @@ fn local_wall_millis() -> u64 {
     real
 }
 
-/// **How long ago a WALL-clock stamp was, on the wall clock**, saturating at 0 for a stamp in the
-/// future. The FirstStart policy's measure of a file's age (D198 review 3, C1): a file's mtime is a
-/// wall stamp, and subtracting it from the LEASE clock, which lags the wall clock by host sleep,
-/// mixes two clocks and can under-credit the outage.
+/// **A file's modification time, as the OS stamped it — on the WALL clock** — and the only thing in
+/// this crate that measures an age against the wall clock (D198 reviews 3 and 4, C1 and C3).
 ///
-/// A duration, never a reading: nothing it returns is on the scale of a lease deadline, so it does
-/// not reopen the door [`local_wall_millis`]'s privacy closes — a lease DECISION still reads only
-/// [`local_lease_millis`]. It goes through `local_wall_millis`, the one `SystemTime::now()` reader,
-/// so a test's `wall_step` moves it as it moves everything else.
-pub(crate) fn wall_millis_since(stamp_millis: u64) -> u64 {
-    local_wall_millis().saturating_sub(stamp_millis)
+/// The FirstStart policy needs the wall-clock age of a catalog's (or a legacy log's) last write. A
+/// function from a stamp to its age would hand out a wall READING to any caller that passes 0 — the
+/// door [`local_wall_millis`]'s privacy closes, reopened by a comment. So the stamp is a type, and
+/// its one constructor reads a FILE: no caller can make a `FileWallStamp` from an integer, and
+/// `wall_age_millis` is the only way it touches the clock. The rule is a type, not a comment.
+///
+/// Why a stamp and not `fn(&Path) -> age`: the evidence is the file's time when the catalog was
+/// OPENED, and its age is needed at the resume, after this process may have written the file
+/// itself. Stated hole: the age of a file whose mtime is the epoch IS a wall reading; obtaining one
+/// means creating such a file, which no path in this crate does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileWallStamp(u64);
+
+impl FileWallStamp {
+    /// `path`'s last modification, in unix milliseconds, or `None` if it cannot be read — including
+    /// a time before 1970, which is no evidence of anything.
+    pub(crate) fn of(path: &std::path::Path) -> Option<FileWallStamp> {
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        u64::try_from(since.as_millis()).ok().map(FileWallStamp)
+    }
+
+    /// The stamp, in unix milliseconds on the wall clock. A time in the past, never "now".
+    pub(crate) fn millis(self) -> u64 {
+        self.0
+    }
+
+    /// How long ago, on the wall clock, the file was written: `W(now) − stamp`, saturating at 0 for
+    /// a stamp in the future. Through `local_wall_millis`, the one `SystemTime::now()` reader, so a
+    /// test's `wall_step` moves it as it moves everything else.
+    pub(crate) fn wall_age_millis(self) -> u64 {
+        local_wall_millis().saturating_sub(self.0)
+    }
+}
+
+/// **This node's lease clock if it is standalone, else `None` — one acquisition of the process
+/// lock** (D198 review 4, C6). The soft mark's reading: a cluster member's lease time is the
+/// replicated tick, and it writes no mark of either kind. One acquisition, not `is_clustered()`
+/// then `try_now_millis()`: those are two, on a path that runs inside `logical` on every commit of
+/// an unmarked catalog, and between them a `join` plus an applied tick could stamp a tick as a
+/// standalone reading.
+pub(crate) fn standalone_lease_millis() -> Option<u64> {
+    let authority = lock().authority;
+    match authority {
+        Authority::Standalone => Some(local_lease_millis()),
+        Authority::Member(_) => None,
+    }
 }
 
 /// **A test's hand on the wall clock — THIS THREAD's view of it only, and only in `cfg(test)`.**

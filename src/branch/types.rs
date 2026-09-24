@@ -311,12 +311,18 @@ pub enum LeaseResume {
     ///   resumed it found owed when it opened it, carried in its soft mark (`[0x09]`) — 0 if none;
     /// - plus the larger of two measures of the time since:
     ///   - `now_millis − writer_mark`, where `writer_mark` is that writer's LEASE-clock reading at
-    ///     its last commit — a mark's own arithmetic, exact whatever that clock's lag;
+    ///     its last commit — a mark's own arithmetic, lease clock minus lease clock, exact whatever
+    ///     that clock's lag;
     ///   - the age of `file_mtime` (unix ms, wall clock): the catalog file's last write before this
     ///     process opened it; for a migration, the SOURCE log's; with a legacy log beside a catalog
     ///     no D198 build wrote, the earlier of the two. The age is
     ///     `max(W(now) − mtime, L(now) − mtime)`, so a backward wall-clock step after this process
-    ///     started cannot shrink it below the lease clock's own reading.
+    ///     started cannot shrink it below the lease clock's own reading. Its wall half over-credits
+    ///     by this process's own lag; it is the only wall term (review 4, C1: `recorded_millis` is
+    ///     on the writer's lease clock).
+    ///
+    /// The clock of every term, and the relations the bound relies on, are in
+    /// `table_catalog::FirstStartEvidence`'s doc.
     ///
     /// **What it is not** (review 3, C1/C7): it is not "never an early reap". A D198 writer's soft
     /// mark makes the credit exact, plus the time between its last commit and its end — the
