@@ -23,9 +23,12 @@
 # any name is read: TIMEOUT (rc 124), COMPILE-FAIL (no `test result:` line), INCOMPLETE (no file, no rc
 # line, or more than one result line), RC-MISMATCH (the rc and the FAILED lines disagree).
 #
-# src/ is restored from GIT on every exit (an EXIT trap; never from a copy), and every cargo command runs
-# in the background and is waited on, so a TERM or INT reaches the traps at once: bash defers a trap until
-# a foreground child exits, and `timeout` puts cargo in its own process group (D237 e8054dc).
+# src/ is restored from GIT on every exit (an EXIT trap; never from a copy; `--no-overlay`, so a restore
+# also deletes a file the arm's tree had and the subject lacks: D237 judge review J6). Every cargo command
+# runs in the background and is waited on, so a TERM, INT, HUP or QUIT reaches the traps at once and stops
+# the child first: bash defers a trap until a foreground child exits, and `timeout` puts cargo in its own
+# process group (D237 e8054dc; HUP and QUIT per its judge review J5). `waited` refuses to run inside
+# `$(...)`, where the traps could not see its child (J4).
 #
 # Blind spots, stated: two targets, not the whole suite (the per-target suite is the FAN-QUEUE row's own
 # step); the judge reads cargo's own lines, so a test printing a line of exactly that shape would be
@@ -71,8 +74,16 @@ BASE_REASONS=(
 
 # ---- Running. A command runs in the background and is waited on; see the header. ----
 child=""
-waited() { # the command's rc
-  local rc
+waited() { # the command's rc. REFUSES in a subshell (D237 judge review J4): there `child` is set in
+  # the subshell, the script's traps see it empty, and a TERM waits for the command or orphans it.
+  # `$(exec sh -c 'echo "$PPID"')` is the pid of the shell running this line; `BASHPID` would say
+  # the same, but /bin/bash 3.2 has none.
+  local rc me
+  me=$(exec sh -c 'echo "$PPID"')
+  if [ "$me" != "$$" ]; then
+    echo "REFUSED: waited ran in a subshell (pid $me, script $$), where no trap can stop its child" >&2
+    exit 2
+  fi
   "$@" &
   child=$!
   wait "$child"
@@ -206,6 +217,21 @@ base_verdict() { # $1 label
 
 as_registered() { case "$1" in KILLED-AS-REGISTERED*|SURVIVED-AS-REGISTERED) return 0 ;; *) return 1 ;; esac; }
 
+# The control: `clean`, or `VOID (why)`. Three separate gates, each with its own self-test case: the
+# file states, no FAILED line, and the pre-registered passed counts.
+control_verdict() { # $1 label
+  local st f
+  st=$(arm_state "$1" $TARGETS)
+  [ "$st" = OK ] || { echo "VOID ($st)"; return; }
+  f=$(failed_names "$1" $TARGETS)
+  [ -z "$f" ] || { echo "VOID (a test FAILED: $(echo $f))"; return; }
+  if [ "$(passed_in "$1" d257)" != 7 ] || [ "$(passed_in "$1" alter)" != 16 ]; then
+    echo "VOID (passed d257=$(passed_in "$1" d257) alter=$(passed_in "$1" alter); expected 7/16)"
+    return
+  fi
+  echo clean
+}
+
 killers_of() { # $1 mutant: sets req and opt; returns 1 if it has no row
   local k kname kreq kopt
   req=""; opt=""
@@ -244,6 +270,23 @@ expect() { # $1 case, $2 expected verdict prefix, $3 actual verdict
     "$2"*) echo "self-test PASS  $1: $3" ;;
     *) echo "self-test FAIL  $1: expected '$2', got '$3'"; st_bad=$((st_bad + 1)) ;;
   esac
+}
+expect_not_registered() { # $1 case, $2 actual verdict: anything but an as-registered verdict
+  if as_registered "$2"; then echo "self-test FAIL  $1: got '$2', which counts as registered"; st_bad=$((st_bad + 1))
+  else echo "self-test PASS  $1: $2"; fi
+}
+# Plant one arm's outputs from a list of `target::test` names that FAILED (`target::*` plants one
+# test of that target); every target with none gets a clean file.
+plant_set() { # $1 label, then names
+  local label=$1 t n list
+  shift
+  for t in $TARGETS; do
+    list=()
+    for n in "$@"; do
+      case "$n" in "$t::*") list+=("a_planted_${t}_test|planted") ;; "$t::"*) list+=("${n#*::}|planted") ;; esac
+    done
+    if [ ${#list[@]} -eq 0 ]; then ok_file "$label" "$t" 5; else fail_file "$label" "$t" 5 "${list[@]}"; fi
+  done
 }
 
 self_test() {
@@ -288,6 +331,67 @@ self_test() {
   expect "a target with no rc line" "INCOMPLETE (d257: no rc line)" "$(verdict norc "d257::a" "" $TARGETS)"
   ok_file rcm alter 16; plant rcm d257 0 "test a ... FAILED" "test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
   expect "rc=0 with a FAILED line" "RC-MISMATCH" "$(verdict rcm "d257::a" "" $TARGETS)"
+  # J3: the file states that had no planted case.
+  ok_file two alter 16
+  plant two d257 0 "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out" \
+    "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  expect "two result lines" "INCOMPLETE (d257: 2 result lines)" "$(verdict two "d257::a" "" $TARGETS)"
+  ok_file rc2 alter 16; plant rc2 d257 2 "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  expect "an rc cargo does not use" "RC-2 (d257)" "$(verdict rc2 "d257::a" "" $TARGETS)"
+  ok_file r101 alter 16; plant r101 d257 101 "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  expect "rc=101 with nothing FAILED" "RC-MISMATCH (d257: rc=101 and nothing FAILED)" "$(verdict r101 "d257::a" "" $TARGETS)"
+  # The rc is the file's LAST line: a test that prints `rc=0` must not make a timeout read as a result.
+  ok_file rclast alter 16; plant rclast d257 124 "running 7 tests" "rc=0" "test $T3 has been running for over 60 seconds"
+  expect "the rc is read from the last line" "TIMEOUT (d257)" "$(verdict rclast "d257::a" "" $TARGETS)"
+
+  # J3: the control, one gate at a time. Each VOID case passes the other two gates.
+  ok_file ctl d257 7; ok_file ctl alter 16
+  expect "control, clean" "clean" "$(control_verdict ctl)"
+  ok_file ctlfail alter 16; fail_file ctlfail d257 7 "$T2|planted"
+  expect "control with a FAILED test and the counts still 7/16" "VOID (a test FAILED" "$(control_verdict ctlfail)"
+  ok_file ctlcount d257 6; ok_file ctlcount alter 16
+  expect "control with a short count and nothing FAILED" "VOID (passed d257=6" "$(control_verdict ctlcount)"
+  ok_file ctlrc alter 16; plant ctlrc d257 101 "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  expect "control with rc=101, nothing FAILED, counts 7/16" "VOID (RC-MISMATCH" "$(control_verdict ctlrc)"
+  for t in $TARGETS; do plant ctlcf "$t" 101 "error: could not compile \`ferrodb\`"; done
+  expect "control that did not compile" "VOID (COMPILE-FAIL" "$(control_verdict ctlcf)"
+
+  # J3: every registered mutant, from KILLERS itself: its full set, a partial kill, optional-only,
+  # nothing, and the full set plus an unregistered test.
+  for k in "${KILLERS[@]}"; do
+    IFS='|' read -r name req opt <<< "$k"
+    if [ -z "$req" ]; then
+      plant_set "$name.none"
+      expect "$name (registered equivalent), nothing FAILED" SURVIVED-AS-REGISTERED "$(verdict "$name.none" "$req" "$opt" $TARGETS)"
+      plant_set "$name.any" "d257::$T1"
+      expect_not_registered "$name (registered equivalent), a test FAILED" "$(verdict "$name.any" "$req" "$opt" $TARGETS)"
+      continue
+    fi
+    plant_set "$name.full" $req
+    expect "$name, its full required set" KILLED-AS-REGISTERED "$(verdict "$name.full" "$req" "$opt" $TARGETS)"
+    plant_set "$name.part" $(printf '%s\n' $req | sed '$d')
+    expect_not_registered "$name, all but one required" "$(verdict "$name.part" "$req" "$opt" $TARGETS)"
+    if [ -n "$opt" ]; then
+      plant_set "$name.opt" $opt
+      expect_not_registered "$name, only its optional killers" "$(verdict "$name.opt" "$req" "$opt" $TARGETS)"
+    fi
+    plant_set "$name.nothing"
+    expect "$name, nothing FAILED" SURVIVED "$(verdict "$name.nothing" "$req" "$opt" $TARGETS)"
+    plant_set "$name.extra" $req "d257::not_a_registered_killer"
+    expect "$name, its full set plus an unregistered test" MISMATCH "$(verdict "$name.extra" "$req" "$opt" $TARGETS)"
+  done
+
+  # J4: `waited` refuses inside `$(...)`, where no trap could stop its child.
+  r=$(waited true 2>&1)
+  rc=$?
+  case "$rc/$r" in
+    2/REFUSED:*subshell*) echo "self-test PASS  waited refuses in a subshell" ;;
+    *) echo "self-test FAIL  waited in a subshell: rc=$rc, '$r'"; st_bad=$((st_bad + 1)) ;;
+  esac
+  waited true
+  rc=$?
+  [ "$rc" = 0 ] && echo "self-test PASS  waited runs in the script's own shell" \
+    || { echo "self-test FAIL  waited in the script's own shell: rc=$rc"; st_bad=$((st_bad + 1)); }
 
   # R6a: the base arm, with the registered reasons, a wrong reason, and a missing block.
   base_ok=()
@@ -360,9 +464,9 @@ if ! self_test > "$OUT/selftest.log" 2>&1; then
 fi
 
 on_exit() {
-  git checkout "$SUBJECT_SHA" -- src/ 2>/dev/null
+  git checkout --no-overlay "$SUBJECT_SHA" -- src/ 2>/dev/null
   git diff --quiet "$SUBJECT_SHA" -- src/ tests/ ||
-    echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout $SUBJECT_SHA -- src/" >&2
+    echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout --no-overlay $SUBJECT_SHA -- src/" >&2
 }
 on_signal() { # $1 the exit status
   if [ -n "$child" ]; then
@@ -374,9 +478,11 @@ on_signal() { # $1 the exit status
 trap on_exit EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP  # D237 judge review J5
+trap 'on_signal 131' QUIT
 
 restore() { # $1 what was just run
-  git checkout "$SUBJECT_SHA" -- src/
+  git checkout --no-overlay "$SUBJECT_SHA" -- src/
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: src/ not restored after $1" >&2; exit 3; }
 }
 
@@ -384,16 +490,12 @@ bad=0
 
 echo "== control: $SUBJECT_SHA"
 for t in $TARGETS; do run_target control "$t"; done
-st=$(arm_state control $TARGETS)
-if [ "$st" != OK ] || [ -n "$(failed_names control $TARGETS)" ] \
-   || [ "$(passed_in control d257)" != 7 ] || [ "$(passed_in control alter)" != 16 ]; then
-  echo "control: VOID (state: $st; failed: $(failed_names control $TARGETS | tr '\n' ' '); passed d257=$(passed_in control d257) alter=$(passed_in control alter); expected 7/16)" | tee "$OUT/summary.txt"
-  exit 2
-fi
-echo "control: clean (7/16 passed)" | tee "$OUT/summary.txt"
+v=$(control_verdict control)
+echo "control: $v" | tee "$OUT/summary.txt"
+[ "$v" = clean ] || exit 2
 
 echo "== base: src/ at $BASE_SHA"
-git checkout "$BASE_SHA" -- src/
+git checkout --no-overlay "$BASE_SHA" -- src/
 for t in $TARGETS; do run_target base "$t"; done
 restore base
 v=$(base_verdict base)
