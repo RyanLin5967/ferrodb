@@ -96,9 +96,11 @@ pub struct OpenDatabase {
     pub lease: LeaseThread,
     pub arena_path: String,
     pub timings: OpenTimings,
-    /// Whether `open_recovered` found log records to replay, which is also whether it rebuilt every
-    /// index. **Observing only — READ-VS-N arm 3** judges D216 on this rather than on a timer: a clean
-    /// shutdown should leave nothing to replay, and before D216 it does.
+    /// Whether `open_recovered` found log records to replay. NOT whether it rebuilt the indexes: it
+    /// also rebuilds when the stale-index marker is present, with this false. **Observing only —
+    /// READ-VS-N arm 3** judges D216 on this rather than on a timer (a clean shutdown should leave
+    /// nothing to replay, and before D216 it does), and cross-checks it with the rebuild's own time,
+    /// because after D216 this is the fixed `recover`'s own verdict.
     pub recovered: bool,
     /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
     /// the lock file goes and another process may open the database. That covers THIS struct's

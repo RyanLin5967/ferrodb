@@ -9,13 +9,21 @@
 //! * `LeaseStats::finished` must rise only AFTER a pass's orphan sweep (the restart arm reads R3's
 //!   first-pass visits the moment it sees `finished`), and must NOT rise for a pass that refused
 //!   before that sweep (a cluster member with no `LeaseTick`), which is the path the restart arm's H5
-//!   fire mode takes. PREREG A7.5 and A9.5.
+//!   fire mode takes. PREREG A7.5, A9.5 and A11.2.
+//!
+//! **Why a seam and not a poll (A11.2).** A six-extent sweep takes microseconds, and a 10 ms poll
+//! almost never lands inside it, so "`finished` bumped before the sweep" passed a polling version.
+//! The reaper here asks its catalog through [`ParkFirstPassSweep`], which holds the lease thread's
+//! first `get_raw` — the first pass's orphan sweep, on its first extent — until the test releases it.
+//! While it is parked, `finished` must still be 0. That is deterministic, `tests/w4_sweep_slot_recycle.rs`'s
+//! reason for the same shape.
 //!
 //! One test, in its own binary: the refusing half joins a cluster, which is process-wide state.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
@@ -23,12 +31,14 @@ use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::lease_thread::{LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
-use ferrodb::branch::types::{BranchId, LeaseDeadline};
+use ferrodb::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+use ferrodb::branch::types::{ArenaId, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cluster::ClusterScope;
 use ferrodb::consensus::NodeId;
 use ferrodb::cow::PageStore;
+use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
 
@@ -42,6 +52,167 @@ impl RuntimeLock for NoGate {
 }
 
 const PATIENCE: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Park {
+    Waiting,
+    Parked,
+    Released,
+}
+
+/// The reaper's catalog: `inner`, except that the FIRST `get_raw` made off the thread that built it
+/// waits until [`Self::release`]. `LeaseThread::start` runs the open sweep on the caller's thread
+/// and the passes on its own, and a pass with nothing expired reaches `get_raw` only in the orphan
+/// sweep (`extent_is_collectable`), so the one call parked is the first pass's sweep, first extent.
+/// The test asserts that premise (`sweep_visits == live + 1`) rather than trusting it.
+///
+/// The wait is bounded by `PATIENCE`, so a test that fails while the pass is parked cannot hang the
+/// thread `LeaseThread::stop` joins.
+struct ParkFirstPassSweep {
+    /// A trait object, so every call below is the trait's method: `TableBranchCatalog` has
+    /// inherent methods of the same names with other signatures (`live_count` returns a `Result`).
+    inner: Arc<dyn BranchCatalog>,
+    opener: ThreadId,
+    park: Mutex<Park>,
+    changed: Condvar,
+}
+
+impl ParkFirstPassSweep {
+    fn new(inner: Arc<dyn BranchCatalog>) -> ParkFirstPassSweep {
+        ParkFirstPassSweep {
+            inner,
+            opener: std::thread::current().id(),
+            park: Mutex::new(Park::Waiting),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Whether the first pass reached `get_raw` within `PATIENCE`.
+    fn wait_parked(&self) -> bool {
+        let guard = self.park.lock().unwrap();
+        let (guard, _) = self
+            .changed
+            .wait_timeout_while(guard, PATIENCE, |p| *p == Park::Waiting)
+            .unwrap();
+        *guard == Park::Parked
+    }
+
+    fn release(&self) {
+        *self.park.lock().unwrap() = Park::Released;
+        self.changed.notify_all();
+    }
+}
+
+impl BranchCatalog for ParkFirstPassSweep {
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        if std::thread::current().id() != self.opener {
+            let mut park = self.park.lock().unwrap();
+            if *park == Park::Waiting {
+                *park = Park::Parked;
+                self.changed.notify_all();
+                let _ = self
+                    .changed
+                    .wait_timeout_while(park, PATIENCE, |p| *p == Park::Parked)
+                    .unwrap();
+            }
+        }
+        self.inner.get_raw(id)
+    }
+
+    // Everything else delegates, the defaulted methods included, so the reaper sees `inner`'s own
+    // implementations and not the trait's generic ones.
+    fn next_epoch(&self) -> Epoch {
+        self.inner.next_epoch()
+    }
+    fn current_epoch(&self) -> Epoch {
+        self.inner.current_epoch()
+    }
+    fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        self.inner.fork(parent, lease)
+    }
+    fn fork_staged(
+        &self,
+        parent: BranchId,
+        lease: LeaseDeadline,
+    ) -> Result<(BranchRecord, Option<u64>), FerroError> {
+        self.inner.fork_staged(parent, lease)
+    }
+    fn await_fork_durable(&self, seq: Option<u64>) -> Result<(), FerroError> {
+        self.inner.await_fork_durable(seq)
+    }
+    fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
+        self.inner.get(branch)
+    }
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(branch, parent, fork_epoch, root)
+    }
+    fn restrict_envelope(&self, branch: BranchId, envelope: CapabilityEnvelope) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(branch, envelope)
+    }
+    fn set_state(&self, branch: BranchId, expect: BranchState, to: BranchState) -> Result<(), FerroError> {
+        self.inner.set_state(branch, expect, to)
+    }
+    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
+        self.inner.set_root(branch, root)
+    }
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        self.inner.expired_before(now_millis)
+    }
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        self.inner.in_state(state)
+    }
+    fn scan(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan()
+    }
+    fn scan_ids(
+        &self,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan_ids(lo, hi)
+    }
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        self.inner.max_live_child(parent_id)
+    }
+    fn live_child_in_epoch_range(&self, parent_id: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+        self.inner.live_child_in_epoch_range(parent_id, lo, hi)
+    }
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        self.inner.has_live_children(parent_id)
+    }
+    fn live_count(&self) -> usize {
+        self.inner.live_count()
+    }
+    fn release_id(&self, id: u64) {
+        self.inner.release_id(id)
+    }
+    fn attach_child(&self, parent_id: u64, fork_epoch: Epoch, child_id: u64) -> Result<(), FerroError> {
+        self.inner.attach_child(parent_id, fork_epoch, child_id)
+    }
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        self.inner.detach_child(parent_id, fork_epoch)
+    }
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(branch, arena)
+    }
+    fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
+        self.inner.renew_lease(branch, lease)
+    }
+    fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        self.inner.envelope_of(branch)
+    }
+    fn charge_row_writes(&self, branch: BranchId, n: u64) -> Result<(), FerroError> {
+        self.inner.charge_row_writes(branch, n)
+    }
+}
 
 #[test]
 fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
@@ -76,7 +247,9 @@ fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
     }
     let live = claimed.len() as u64;
     assert!(live >= 5, "the fixture claimed {live} extents; the sweep would have nothing to visit");
-    let reaper = Arc::new(TwoTierReaper::new(catalog.clone() as Arc<dyn BranchCatalog>, store.clone()));
+    // Built on THIS thread, which `LeaseThread::start` runs the open sweep on.
+    let park = Arc::new(ParkFirstPassSweep::new(catalog.clone() as Arc<dyn BranchCatalog>));
+    let reaper = Arc::new(TwoTierReaper::new(park.clone() as Arc<dyn BranchCatalog>, store.clone()));
 
     // ---- a standalone open: the open sweep's share, then a pass that finishes ----------------
     let lease = LeaseThread::start(
@@ -87,14 +260,31 @@ fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
     )
     .unwrap();
     assert_eq!(reaper.open_sweep_visits(), live, "the open sweep visits every extent that exists, once");
+    // ⚠ R3's BEFORE-D209 shape: the first pass sweeps every extent again. D209's fix makes the
+    // first pass sweep nothing, so it never parks, and D209's own red test replaces this block
+    // (PREREG A9.5, A11.2).
+    assert!(park.wait_parked(), "the first lease pass never reached its orphan sweep: {:?}", lease.stats());
+    // The premise: parked INSIDE the sweep, on its first extent. `sweep_visits` counts an extent
+    // before asking the catalog about it, so it holds the open sweep's `live` plus this one.
+    assert_eq!(
+        reaper.sweep_visits(),
+        live + 1,
+        "parked somewhere other than the first pass's orphan sweep"
+    );
+    assert_eq!(
+        lease.stats().finished,
+        0,
+        "`finished` rose while the pass was still inside its orphan sweep"
+    );
+    park.release();
     let deadline = Instant::now() + PATIENCE;
     while lease.stats().finished == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // `finished` rises AFTER the pass's orphan sweep. At the first sighting, that sweep is over and
-    // no third can have begun (the interval is a day), so both sweeps are fully counted.
-    // ⚠ R3's BEFORE-D209 shape: the first pass sweeps every extent again. D209's fix makes the
-    // first pass sweep nothing, so this becomes `live` in D209's own red test (PREREG A9.5).
+    let first = lease.stats();
+    assert!(first.finished >= 1, "a standalone pass never reached the end of scan_once: {first:?}");
+    // At the first sighting, the pass's sweep is over and no third can have begun (the interval is
+    // a day), so both sweeps are fully counted.
     let at_first_finish = reaper.sweep_visits();
     let done = lease.stop();
     assert_eq!(
@@ -102,7 +292,6 @@ fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
         2 * live,
         "at the first finished pass, the open sweep and the first pass's sweep are both complete"
     );
-    assert!(done.finished >= 1, "a standalone pass never reached the end of scan_once: {done:?}");
     assert!(done.finished <= done.attempts, "more passes finished than began: {done:?}");
 
     // A later sweep moves the shared count, and must not move the open's share.

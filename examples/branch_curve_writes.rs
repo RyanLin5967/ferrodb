@@ -272,43 +272,49 @@ impl Arms {
 }
 
 /// `CURVE_FIRECHECK=<mode>`: break exactly one guard's premise on purpose, so the guard is seen to
-/// fire (PREREG section 4). Two kinds, labelled on each variant: COMPARISON checks offset or swap
-/// the expected value at the harness's own comparison — they prove the comparison and its NOT A
-/// RESULT line work, and nothing more — and IN-PATH modes (A7.5, A8) make a real state change the
-/// measured code then sees.
+/// fire (PREREG section 4). Three kinds (A11.5), labelled on each variant:
+///
+/// * COMPARISON: offsets or swaps the expected value, or drops a measured delta, at the harness's
+///   own comparison. It proves that comparison and its NOT A RESULT line work, and nothing more.
+/// * CONTROL: changes what the timed CONTROL arm does (arm 1), so the guard watching the control
+///   sees real work move. The measured branch path is untouched.
+/// * IN PATH (A7.5, A8, A11.6): a real state change that the measured code then sees.
+///
+/// Every mode breaks a READ-VS-N guard, so a mode without `CURVE_ARMS` is refused (A11.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fire {
     None,
-    /// G2: the branch arm expects its NEIGHBOUR's value.
+    /// G2 (comparison): the branch arm expects its NEIGHBOUR's value.
     WrongPage,
-    /// G3: the branch arm's census deltas are discarded.
+    /// G3 (comparison): the branch arm's census deltas are discarded before the comparison.
     CensusOff,
-    /// G4: the control also asks the catalog.
+    /// G4 (control): the control also asks the catalog.
     ControlCatalog,
-    /// G5: the control reads a random branch's page by id, which misses at large N.
+    /// G5 (control): the control reads a random branch's page by id, which misses at large N.
     ControlCold,
-    /// G6: the identity is checked against height + 1.
+    /// G6 (comparison): the identity is checked against height + 1.
     WrongHeight,
-    /// G7: the control spins 10·2^checkpoint µs per read, so it grows with N.
+    /// G7 (control): the control spins 10·2^checkpoint µs per read, so it grows with N.
     ControlDrift,
-    /// H2: the parent expects one arena more than it counted.
+    /// H2 (comparison): the parent expects one arena more than it counted.
     WrongArenas,
-    /// H3: the parent expects one live branch more than it counted.
+    /// H3 (comparison): the parent expects one live branch more than it counted.
     WrongLive,
-    /// M1: every merge's branch is quarantined first, so it returns `Ok` having published nothing.
+    /// M1 (in path): every merge's branch is really quarantined first, so `MERGE` returns `Ok`
+    /// having published nothing.
     MergeQuarantined,
-    /// M2: axis (i) expects its batch to start at one applied entry, not zero.
+    /// M2 (comparison): axis (i) expects its batch to start at one applied entry, not zero.
     WrongStart,
-    /// M3: the identity expects one visit more than the log held.
+    /// M3 (comparison): the identity expects one visit more than the log held.
     WrongVisits,
-    /// M4: the constant-delta check expects one op more than the first merge appended.
+    /// M4 (comparison): the constant-delta check expects one op more than the first merge appended.
     WrongDelta,
-    /// M5: the parent expects one live branch more after a merge batch than before it.
+    /// M5 (comparison): the parent expects one live branch more after a merge batch than before it.
     WrongLiveMerge,
     /// M6 (comparison check, A9.4): the counter-derived `checkpointed` flag is inverted before it is
     /// compared with `wal.base_lsn`.
     WrongCkptFlag,
-    // ---- IN PATH (PREREG A7 item 5): a real state change that the measured code sees ---------
+    // ---- IN PATH (PREREG A7 item 5), besides M1 above: a real state change the measured code sees
     /// G1: a real fork at the first checkpoint that `branches` never records.
     ExtraBranch,
     /// H1: the parent HOLDS `{db}.lock` while the child opens, so the child's `DbLock::acquire`
@@ -326,6 +332,10 @@ enum Fire {
     /// H5: at the LAST checkpoint the child is a cluster member with no applied `LeaseTick`, so its
     /// lease passes refuse before the orphan sweep and `LeaseStats::finished` never rises.
     NoClusterTime,
+    /// M6 (A11.6): axis (ii) runs holding a real WAL pin (`pin_durable`), so each auto-checkpoint
+    /// resets the commit counter while `truncate` keeps the log: A10.2's one legitimate
+    /// disagreement, produced for real. Needs an M target of at least one checkpoint interval.
+    PinnedCheckpoint,
 }
 
 impl Fire {
@@ -359,12 +369,13 @@ impl Fire {
             "extra-extent" => Fire::ExtraExtent,
             "orphan-extent" => Fire::OrphanExtent,
             "no-cluster-time" => Fire::NoClusterTime,
+            "pinned-checkpoint" => Fire::PinnedCheckpoint,
             other => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
                  wrong-live-merge, wrong-ckpt-flag, extra-branch, child-locked, extra-extent, \
-                 orphan-extent, no-cluster-time"
+                 orphan-extent, no-cluster-time, pinned-checkpoint"
             ),
         }
     }
@@ -761,7 +772,8 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
     let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
-    // A9.3: D216's state judge. Did `open_recovered` find records to replay (and so rebuild)?
+    // A9.3/A11.1: D216's judge. Did `open_recovered` find records to replay? Not "did it rebuild":
+    // the stale-index marker also forces a rebuild, and `rebuild_us` is the independent cross-check.
     let recovered = db.recovered;
     let (_, closed) = db.close();
     closed.expect("close the database cleanly");
@@ -1062,6 +1074,74 @@ fn merge_guards(at: &str, one: &MergeOne, fire: Fire, delta: &mut Option<u64>, f
     }
 }
 
+/// One axis-(ii) auto-checkpoint (A11.3): the merge that paid it, against the median of the merges
+/// in its own period. EVERY checkpoint is kept, not only those in a printed block, so the linearity
+/// fit has one point per checkpoint interval instead of one per M target.
+#[derive(Clone, Copy, Debug)]
+struct CkptPoint {
+    /// Merges since the open when it ran: the run declarations it re-appended (A7.4).
+    m: usize,
+    ns: u128,
+    /// The median ns of the applied merges since the previous checkpoint that did not checkpoint.
+    median: f64,
+    period: u64,
+}
+
+impl CkptPoint {
+    fn excess(&self) -> f64 {
+        self.ns as f64 - self.median
+    }
+}
+
+/// A11.3: is the checkpoint's excess over the typical merge linear in M? A least-squares line WITH an
+/// intercept over every axis-(ii) checkpoint. The intercept takes the M-independent flushes and
+/// fsyncs, which bend a log-log slope below 1 (A9.1's band) however linear the replay is. Linearity
+/// is judged by the two halves' slopes agreeing. The raw points print first, so any other fit can be
+/// redone from the output.
+fn print_ckpt_fit(points: &[CkptPoint]) {
+    println!("arm 2, axis (ii): every auto-checkpoint (A11.3); excess = ns - the median of its own period");
+    for p in points {
+        println!(
+            "  CKPT M={} ns={} period_median_ns={:.0} excess_ns={:.0} period={}",
+            p.m,
+            p.ns,
+            p.median,
+            p.excess(),
+            p.period
+        );
+    }
+    // (slope a in ns per merge of M, intercept c in ns)
+    let fit = |pts: &[CkptPoint]| -> Option<(f64, f64)> {
+        let n = pts.len() as f64;
+        if pts.len() < 2 {
+            return None;
+        }
+        let mx = pts.iter().map(|p| p.m as f64).sum::<f64>() / n;
+        let my = pts.iter().map(CkptPoint::excess).sum::<f64>() / n;
+        let sxx: f64 = pts.iter().map(|p| (p.m as f64 - mx).powi(2)).sum();
+        if sxx == 0.0 {
+            return None;
+        }
+        let sxy: f64 = pts.iter().map(|p| (p.m as f64 - mx) * (p.excess() - my)).sum();
+        let a = sxy / sxx;
+        Some((a, my - a * mx))
+    };
+    let show = |f: Option<(f64, f64)>| {
+        f.map(|(a, c)| format!("a = {a:.3} ns per merge of M, c = {c:.0} ns")).unwrap_or_else(|| "-".into())
+    };
+    let (lo, hi) = points.split_at(points.len() / 2);
+    let (f_lo, f_hi) = (fit(lo), fit(hi));
+    println!("  fit, all {} points: {}", points.len(), show(fit(points)));
+    println!("  fit, lower half (M <= {}): {}", lo.last().map(|p| p.m).unwrap_or(0), show(f_lo));
+    println!("  fit, upper half: {}", show(f_hi));
+    match (f_lo, f_hi) {
+        (Some((a_lo, _)), Some((a_hi, _))) if a_lo != 0.0 => {
+            println!("  halves: a_hi / a_lo = {:.3} (A11.3 judges a > 0 and this in [0.5, 2.0])", a_hi / a_lo)
+        }
+        _ => println!("  halves: not computable (fewer than 4 checkpoints, or a flat lower half)"),
+    }
+}
+
 /// One printed MERGE row: the per-merge MEANS of a batch (axis i) or of a block (axis ii).
 struct MergeRow {
     axis: &'static str,
@@ -1165,6 +1245,11 @@ fn main() {
     }
     let arms = Arms::from_env();
     let fire = Fire::from_env();
+    // A11.4: every mode breaks a READ-VS-N guard, and without `CURVE_ARMS` none of them runs, so
+    // the fire could only ever pass unseen.
+    if fire != Fire::None && arms.is_none() {
+        panic!("CURVE_FIRECHECK={fire:?} is refused without CURVE_ARMS: every mode breaks a READ-VS-N guard");
+    }
     // A9.2: a combination the fire's premise forbids is refused, not documented. Merges free
     // extents, and a recycled extent can hold a stale checksummed page that the open sweep's fill
     // probe counts, so it would rightly not free the orphan and H4 would stay silent.
@@ -1288,6 +1373,7 @@ fn main() {
     // Arm 2: every printed MERGE row, the next never-used row id, and the first merge's append
     // count, which every later merge is held to (M4).
     let mut merge_rows: Vec<MergeRow> = Vec::new();
+    let mut ckpt_points: Vec<CkptPoint> = Vec::new();
     let mut next_merge_row: i64 = 1;
     // Rows published into table `m`: the heap every recovering open rebuilds over (A7.1).
     let mut m_rows: u64 = 0;
@@ -1800,6 +1886,11 @@ fn main() {
         let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let mut m_done = 0usize;
         let mut since_ckpt = 0u64;
+        // A11.3: the ns of this period's applied merges that did not checkpoint.
+        let mut period_ns: Vec<u128> = Vec::new();
+        let mut axis_ckpts = 0usize;
+        // A11.6's in-path fire: a real pin held across the whole axis, so no checkpoint truncates.
+        let pin = (fire == Fire::PinnedCheckpoint).then(|| open.txn.wal.pin_durable());
         for &target in &merge_targets {
             let mut block = Vec::new();
             while m_done < target {
@@ -1808,6 +1899,21 @@ fn main() {
                 m_rows += one.applied_to_target as u64;
                 m_done += 1;
                 merge_guards(&format!("axis ii M={m_done}"), &one, fire, &mut merge_delta, &mut failures);
+                if one.applied_to_target && one.checkpointed {
+                    axis_ckpts += 1;
+                    period_ns.sort_unstable();
+                    if let Some(&median) = period_ns.get(period_ns.len() / 2) {
+                        ckpt_points.push(CkptPoint {
+                            m: m_done,
+                            ns: one.nanos,
+                            median: median as f64,
+                            period: one.period.unwrap_or(0),
+                        });
+                    }
+                    period_ns.clear();
+                } else if one.applied_to_target {
+                    period_ns.push(one.nanos);
+                }
                 if m_done + MERGE_BLOCK > target {
                     block.push(one);
                 }
@@ -1815,6 +1921,14 @@ fn main() {
             let row = MergeRow { axis: "ii", n: done, m: m_done, ones: block };
             print_merge_row(&row);
             merge_rows.push(row);
+        }
+        drop(pin);
+        if fire == Fire::PinnedCheckpoint && axis_ckpts == 0 {
+            failures.push(format!(
+                "M6: CURVE_FIRECHECK=pinned-checkpoint was requested but no axis-(ii) merge \
+                 checkpointed under the pin ({m_done} merges; the targets must reach one checkpoint \
+                 interval), so M6 was not tested in path"
+            ));
         }
         let live_after = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let want = live_before + (fire == Fire::WrongLiveMerge) as u64;
@@ -1829,7 +1943,21 @@ fn main() {
         // and a 32,736-page hole below the arena floor, so bytes/branch here is not its question.
         println!("(D61's space verdict is not printed: the production layout puts the arena above a");
         println!(" headroom region, so file bytes/branch is not the quantity that verdict judges.)");
-        read_vs_n_summary(arms, &read_rows, &restart_rows, &merge_rows, fire, &mut failures, &mut ns_void);
+        read_vs_n_summary(
+            arms,
+            &read_rows,
+            &restart_rows,
+            &merge_rows,
+            &ckpt_points,
+            fire,
+            &mut failures,
+            &mut ns_void,
+        );
+    } else {
+        // Only the summary prints `failures`; without it a non-zero exit would carry no reason (A11.4).
+        for f in failures.iter() {
+            println!("NOT A RESULT: {f}");
+        }
     }
     let code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
     if let Some(open) = db.take() {
@@ -1856,6 +1984,7 @@ fn read_vs_n_summary(
     read_rows: &[ReadRow],
     restart_rows: &[RestartRow],
     merge_rows: &[MergeRow],
+    ckpt_points: &[CkptPoint],
     fire: Fire,
     failures: &mut Vec<String>,
     ns_void: &mut Vec<String>,
@@ -1876,10 +2005,9 @@ fn read_vs_n_summary(
             println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN:");
             println!(
                 "         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  \
-                 seq tup  c.fault  ret runs  ckpts    ckpt ns  slope(ckpt-med)  period   amort ns"
+                 seq tup  c.fault  ret runs  ckpts    ckpt ns  period   amort ns"
             );
             let mut prev: Option<(usize, f64, f64)> = None;
-            let mut prev_excess: Option<(usize, f64)> = None;
             for r in &rows {
                 let x = if axis == "i" { r.n } else { r.m };
                 let (ns, vhi) = (r.ns_median(), r.mean(|o| o.v_hi));
@@ -1894,13 +2022,9 @@ fn read_vs_n_summary(
                 };
                 let last = r.ones.last().copied().unwrap_or_default();
                 let (ckpts, ckpt_ns, _) = r.ckpt();
-                // The checkpoint's O(M) excess over the typical merge (A9.1: log-log slope in
-                // [0.5, 1.2] over axis (ii)'s M), and the amortized cost it implies.
+                // The checkpoint's excess over the typical merge, and the amortized cost it implies.
+                // Its linearity in M is judged on `print_ckpt_fit`, over every checkpoint (A11.3).
                 let excess = ckpt_ns.map(|c| c - ns);
-                let s_ex = match (prev_excess, excess) {
-                    (Some((px, pe)), Some(e)) if pe > 0.0 && e > 0.0 => format!("{:>16.3}", slope(pe, e, px, x)),
-                    _ => format!("{:>16}", "-"),
-                };
                 let periods: Vec<u64> = r.ones.iter().filter_map(|o| o.period).collect();
                 let period = (!periods.is_empty())
                     .then(|| periods.iter().sum::<u64>() as f64 / periods.len() as f64);
@@ -1911,7 +2035,7 @@ fn read_vs_n_summary(
                 let period = period.map(|p| format!("{p:>7.1}")).unwrap_or_else(|| format!("{:>7}", "-"));
                 println!(
                     "  {:>8} {:>8} {:>10.0} {s_ns} {:>10.0} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3} {:>9} {:>6} \
-                     {:>10} {s_ex} {period} {amort}",
+                     {:>10} {period} {amort}",
                     r.n,
                     r.m,
                     ns,
@@ -1927,14 +2051,14 @@ fn read_vs_n_summary(
                     ckpt_ns.map(|c| format!("{c:.0}")).unwrap_or_else(|| "-".into()),
                 );
                 prev = Some((x, ns, vhi));
-                if let Some(e) = excess {
-                    prev_excess = Some((x, e));
-                }
             }
             println!(
                 "  axis ({axis}): `period` = merge cycles since the previous checkpoint (or the open), \
                  the checkpointing one included; `amort ns` = median + (ckpt ns - median) / period (A10.1)."
             );
+            if axis == "ii" {
+                print_ckpt_fit(ckpt_points);
+            }
             if rows.len() < 2 {
                 failures.push(format!("arm 2 axis ({axis}): {} row(s); one point is not a curve", rows.len()));
             }
@@ -1999,9 +2123,10 @@ fn read_vs_n_summary(
     }
     if arms.restart {
         println!("arm 3 (fresh-process open; microsecond timers in the child, printed here in ms):");
-        // A7.1/A9.3: `recovered` and `wal B` judge D216's before/after pair; `recover`, `rebuild` and
-        // `m rows` size it. A9.1: warmth is `child net` (total less recover and rebuild, which only the
-        // child pays before D216) against `parent total`.
+        // A7.1/A9.3/A11.1: `recovered` judges D216's before/after pair. `wal B` = 24 judges only the
+        // merge-OFF control, since after D216 a merge-on log still holds re-appended declarations.
+        // `recover`, `rebuild` and `m rows` size it. A9.1: warmth is `child net` (total less recover
+        // and rebuild, which only the child pays before D216) against `parent total`.
         println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows  recovered  child net ms");
         let mut prev: Option<(usize, f64, f64)> = None;
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
