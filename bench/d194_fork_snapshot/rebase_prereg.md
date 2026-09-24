@@ -958,3 +958,97 @@ call `record_read`, using the current signatures. So they compile at the current
 Run of record at default QoS: **59 result lines, 2173 passed (2170 + 3), 2 failed** (the envelope
 tripwire, and `a_pinned_index_read_...` until #16), **2 ignored**. Under `-b`: 2172 / 3.
 `cargo test --lib version_history`: 13. `cargo test --lib an_unpinned`: 3.
+
+## Amendment 12 (append-only; written BEFORE the tests and code it describes): a fresh review of `4436e7f..ff971ee`
+
+The review traced all seven new tests by hand. Each passes at `ff971ee` and fails where Amendments 10
+and 11 say it fails. It found the retention scheme correct with one catalog and found no compile
+error. Its findings:
+
+1. **F1, Medium: a stamp failure left the merge half-finished.** `record_applied(...)?` returned
+   before `attest_merge` and `seal`. The ordering already existed at `4436e7f`.
+   - **What that left:** a merge that is committed and whose versions are recorded, with the branch
+     still LIVE and not in `published_txns`. A second `MERGE` of it would publish again. A later
+     ABANDON would drop the capture of a published merge, and REVERT would lose that merge's edges.
+   - **Fix:** `publish_evaluation_as` keeps `record_applied`'s result, runs `attest_merge` and
+     `seal`, and only then returns the error. The error reads "merge m_N was published and sealed,
+     but recording who wrote its rows failed: …".
+   - **Red test:** `a_merge_whose_author_stamp_fails_is_still_sealed`, the C2 fixture. It asserts:
+     the branch has no live workspace; its txn is in `published_txns`; a second `MERGE` of it is
+     refused; and main's values moved once (`v = 10·id + 1`).
+     - At `ff971ee` it FAILS, because the workspace is live.
+     - It names only existing items, so it compiles at `ff971ee`.
+
+2. **F2, Medium: a finding for the lead, not fixed here.** `TxnManager::commit` removes the
+   transaction from `att`, which makes its rows visible, and only then may run
+   `self.checkpoint()?` (`wal/txn.rs:646` on this base). A checkpoint failure therefore returns `Err`
+   after the publish is visible. `record_applied` is then skipped, and the guard removes the
+   publishing entry, so this is the C2 state reached through another door.
+   - **Why not here:**
+     - The contract bug is in `commit`: a committed transaction must not report failure. `commit` is
+       also the code #16 rewrote.
+     - Patching around it in `merge`, by checking whether the txn is still active after an `Err`,
+       would add a guard no test here can fire. The one WAL injection, `fail_next_append`, fails the
+       NEXT append, which is `commit`'s own, not the checkpoint's.
+   - Routed to the lead.
+
+3. **F3, Low: a sweep's budget did not count empty intervals.** `continue` skipped past an interval
+   with no `readers` key without spending budget, so one call could walk every queued interval.
+   - **Fix:** each interval visited costs one unit of budget, found or not. The stall is then at most
+     `budget` range probes and entry tests per call, plus amortised compactions.
+   - **Test:** `version_history_sweep_budget_counts_empty_intervals`. It queues 10 disjoint empty
+     intervals and sweeps with budget 2, then expects 8 still queued.
+     - At `ff971ee` it FAILS: 0 are left.
+     - Compiles at `ff971ee`.
+
+4. **F4, Low: two mechanisms had no test.** Two mutant-only tests, each of which passes at `ff971ee`:
+   - `version_history_pending_intervals_merge_when_they_overlap_or_touch`: `add_pending`'s interval
+     algebra, covering disjoint, overlapping, touching and spanning several intervals.
+   - `an_unpinned_scan_inside_a_publish_window_pairs_with_its_start`: with a registered reservation
+     whose txn has NOT committed, an unpinned scan's `seen_through` is the reservation's `start`,
+     not `apply_seq`. A mutant with `read_now` returning `apply_seq` fails it.
+
+5. **F5, Low: stale comments.** Three are corrected:
+   - "an exact-shape read that matched no rows is still refused" now applies to the `unrecorded`
+     refusal only;
+   - `visible_rows_where`'s second return value is now always `Some`;
+   - `resolve_visibility` "counts nothing" but pays one drop.
+
+6. **F6, Low: `None` was still representable.** `record_read` now REFUSES a read that carries no
+   `seen_through`. Every read path pairs one, so a caller that passes `None` would bring Q7 back.
+   - Narrowing the type to `u64` would edit committed tests that pass `Some(..)`, so the refusal is
+     the change.
+   - **Test:** `a_read_without_a_paired_seq_is_refused`.
+     - At `ff971ee` it FAILS, returning `Ok`.
+     - Compiles at `ff971ee`.
+
+7. **F7, Low, two catalogs only.** The out-of-order arm counted garbage with no compaction check. It
+   now compacts through the same check `free_entry` uses.
+
+8. **F8, Low: corrections to this file.**
+   - **Amendment 10's M26 row:** W3 fails with len **51**, not 26.
+   - **M25:** W2 also fails.
+   - **"W1–W3 and C2 compile at `0570fe8`":** this is literally false for the test HELPERS.
+     `txn_fixture` arrived at `3c52476`, and `publish_next` and `pinned` at `9462d3b`. What is true
+     is that they name no `src` item newer than `0570fe8`. The red commit that matters, `24a3961`,
+     carries every helper.
+
+### Counts, replacing Amendment 11's
+
+- `cargo test --lib version_history`: **15**, all pass (13 + the sweep-budget test + the interval
+  test).
+- `cargo test --lib an_unpinned`: **4**.
+- New lib tests: `a_merge_whose_author_stamp_fails_is_still_sealed` and
+  `a_read_without_a_paired_seq_is_refused`.
+- Run of record at default QoS: **59 result lines, 2178 passed (2173 + 5), 2 failed, 2 ignored**.
+  Under `-b`: 2177 / 3.
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M34 | `seal` runs only on `Ok` again | `a_merge_whose_author_stamp_fails_is_still_sealed` FAILS |
+| M35 | the sweep's empty-interval visit is free again | `version_history_sweep_budget_counts_empty_intervals` FAILS (0 left) |
+| M36 | `add_pending` inserts without merging | the interval test FAILS |
+| M37 | `read_now` returns `apply_seq` | `an_unpinned_scan_inside_a_publish_window_pairs_with_its_start` FAILS |
+| M38 | the `None` refusal is removed | `a_read_without_a_paired_seq_is_refused` FAILS |
