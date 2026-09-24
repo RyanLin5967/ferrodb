@@ -2258,8 +2258,25 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
 /// (`replication::backup::restore` on its own) does not carry the quarantine and does not move it, so
 /// the file left at the path is the REPLACED database's.
 pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
-    let current = release_quarantine(wal_path);
-    match std::fs::symlink_metadata(&current) {
+    move_aside(&release_quarantine(wal_path))
+}
+
+/// **D212 (a') AMENDED 3, item 10: a fresh log starts a fresh REVERT history**, for the reason
+/// [`start_fresh_quarantine`] gives: a fresh log is a new database at this path, and the history
+/// beside it (`<db>.history` for a log at `<db>.wal`, `HistoryStore::path_for_wal`) belongs to the
+/// one it replaces. Inherited, an earlier incarnation's merge ids would be revertible against the new
+/// database's rows. Moved aside, not deleted, and called from the same place, before the fresh log's
+/// header. A log not named `<db>.wal` has no history by that convention, and nothing moves.
+pub(crate) fn start_fresh_history(wal_path: &Path) -> std::io::Result<()> {
+    match crate::wal::history::HistoryStore::path_for_wal(wal_path) {
+        Some(history) => move_aside(&history),
+        None => Ok(()),
+    }
+}
+
+/// Move `current` to the first free [`aside_path`], durably, or do nothing when it does not exist.
+fn move_aside(current: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(current) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
         Ok(_) => {}
@@ -2268,8 +2285,8 @@ pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::fs::rename(&current, aside_path(&current, nanos))?;
-    sync_directory_of(&current)
+    std::fs::rename(current, aside_path(current, nanos))?;
+    sync_directory_of(current)
 }
 
 /// Where [`start_fresh_quarantine`] moves `current`: the first of `<current>.before-<nanos>`,

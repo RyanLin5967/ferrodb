@@ -228,6 +228,15 @@ impl HistoryStore {
         PathBuf::from(p)
     }
 
+    /// The history file beside the log at `wal_path`: `<db>.history` for `<db>.wal`, the pair
+    /// `open_recovered` opens (AMENDED 3, item 10). `None` for a log not named that way, or whose
+    /// name is not UTF-8 (stated: such a log's history, if any, is not moved aside).
+    pub fn path_for_wal(wal_path: &Path) -> Option<PathBuf> {
+        let name = wal_path.file_name()?.to_str()?;
+        let db = name.strip_suffix(".wal")?;
+        Some(wal_path.with_file_name(format!("{db}.history")))
+    }
+
     /// **What `wal::recovery::open_recovered` calls, before `recover`** (AMENDED 3, item 4):
     /// `<db>.history` with the window from `FERRODB_REVERT_RETENTION_MERGES`.
     ///

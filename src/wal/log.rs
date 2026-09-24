@@ -670,6 +670,10 @@ impl WalManager {
             crate::wal::txn::start_fresh_quarantine(&path).map_err(|e| {
                 FerroError::Wal(format!("a fresh log could not move the earlier release quarantine aside ({e})"))
             })?;
+            // D212 (a') AMENDED 3, item 10: the REVERT history beside it goes aside the same way.
+            crate::wal::txn::start_fresh_history(&path).map_err(|e| {
+                FerroError::Wal(format!("a fresh log could not move the earlier REVERT history aside ({e})"))
+            })?;
             let mut header = [0u8; HEADER_SIZE];
             header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
