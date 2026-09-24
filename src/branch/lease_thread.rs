@@ -629,10 +629,10 @@ fn scan_once(
     counters: &Counters,
     out: &dyn Fn(String),
 ) {
-    // D265's unit-test seam: a no-op outside `cargo test`. One line on purpose, because
-    // `tests/open_path_allowlist.rs` stops reading a file at a bare `#[cfg(test)]` line, and this
-    // sits in the middle of production code it must still read.
-    #[cfg(test)] scan_seam::fire(reaper);
+    // D265's unit-test seam: an empty inline fn outside `cargo test` (both definitions are at the
+    // file's end). No attribute here: `tests/d53_private_root_allowlist.rs` stops reading at the
+    // first `#[cfg(test)]` it finds anywhere in a line, and this is the middle of production code.
+    scan_seam::fire(reaper);
 
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
@@ -909,10 +909,22 @@ fn report(msg: String) {
     let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
+/// **D265's test seam, outside `cargo test`: nothing.** `scan_once` calls `fire` unconditionally so
+/// no attribute line sits in the production region (PREREG A22.2); here it compiles to nothing.
+/// Placed before the `#[cfg(test)]` definition below, which is where both tripwires stop reading.
+#[cfg(not(test))]
+mod scan_seam {
+    use crate::branch::TwoTierReaper;
+
+    #[inline(always)]
+    pub(super) fn fire(_reaper: &TwoTierReaper) {}
+}
+
 /// **D265's test seam, compiled into unit tests only.** A scan whose reaper sits at an armed
 /// address panics once, first thing, so a test can kill ONE lease thread and no other in the same
-/// test binary. Placed last so the open-path tripwire, which stops at the first bare
-/// `#[cfg(test)]` line, still reads every line of production code above it.
+/// test binary. Placed last so both tripwires (`open_path_allowlist`, which stops at the first
+/// bare `#[cfg(test)]` line, and `d53_private_root_allowlist`, which stops at the first
+/// `#[cfg(test)]` substring) still read every line of production code above it.
 #[cfg(test)]
 pub(crate) mod scan_seam {
     use std::sync::{Mutex, PoisonError};
