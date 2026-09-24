@@ -2605,9 +2605,10 @@ fn read_vs_n_summary(
         );
         println!(
             "  arm 3: R7's step times (files, lock, recover, sql_catalog, branch_catalog, effect_log, runtime, \
-             provenance) are REPORTED, not judged (A16.4). They are printed in the RESTART rows above, not in this \
-             table, so L2 (this table) and G7 (this section's head) sit beside them only by joining the rows on N \
-             (A17.3). recover_us is reported too; `recovered` judges its fact (A16.5)."
+             provenance) are REPORTED, not judged (A16.4). This table carries `recover` only; the other seven are \
+             printed in the RESTART rows above, so L2 (this table) and G7 (this section's head) sit beside those \
+             seven only by joining the rows on N (A18.6). recover_us is reported too; `recovered` judges its fact \
+             (A16.5)."
         );
         // A18.1: an H6 row is no point of the curve (A17.2), so it is not counted here either.
         let measured = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
