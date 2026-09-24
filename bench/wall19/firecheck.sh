@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
 # lease-reap attestation, and must turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
-# section 10.4 (supersedes 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
+# section 10.6 (supersedes 10.4, 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
-# Blind spots, stated: it runs three selections per mutant (the attest lib module, the three D199
-# lease tests (`is_attested`), and integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
+# Blind spots, stated: it runs three selections per mutant (the attest lib module, the whole lease-thread
+# test module (its four D199 tests and the rest), and integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
 # a survivor here. It judges kills by cargo's own "test result" line and FAILED names, not by exit
 # code alone: a compile error is recorded as COMPILE-FAIL, which is not a kill.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=3ddb1a4           # the tree these mutants were written against
+SUBJECT_SHA=5918d90           # the tree these mutants were written against
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -39,22 +39,24 @@ MUTANTS=(
   "M8_sweep_forget_does_not_attest|$R|"'"\n                self.attest_landed_reaps(&gone);\n"|"\n"'
   "M9_no_head_check|$R|"'"            let Some(fork_epoch) = h.opened_at(branch) else {\n                continue;\n            };\n"|"            let fork_epoch = h.opened_at(branch).unwrap_or_default();\n"'
   "M10_lease_reap_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, fork_epoch, true);\n"'
-  "M11_attest_before_landed|$R|"'".filter(\u007cb\u007c self.branches.get_raw(b.id).is_ok_and(\u007cr\u007c r.generation > b.generation))"|".filter(\u007c_\u007c true)"'
+  "M11_attest_before_landed|$R|"'"                Ok(r) if r.generation > b.generation => landed.push(b),\n"|"                Ok(_) => landed.push(b),\n"'
   "M12_lease_reap_current_epoch|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, self.branches.current_epoch(), false);\n"'
   "M13_opened_follows_latest|$A|"'"            let opened = self.heads.get(&e.branch).map_or(e.epoch, \u007ct\u007c t.opened);\n"|"            let opened = e.epoch;\n"'
+  "M14_unreadable_not_counted|$R|"'"                h.count_refusal();\n"|""'
+  "M15_unreadable_as_landed|$R|"'"                Err(_) => unreadable.push(b),\n"|"                Err(_) => landed.push(b),\n"'
 )
 
 run_targets() { # $1 = label
   timeout 1800 cargo test --lib branch::attest > "$OUT/$1.lib.txt" 2>&1
   echo "lib_rc=$?" >> "$OUT/$1.lib.txt"
-  timeout 1800 cargo test --lib is_attested > "$OUT/$1.d199.txt" 2>&1
-  echo "d199_rc=$?" >> "$OUT/$1.d199.txt"
+  timeout 1800 cargo test --lib lease_thread::tests:: > "$OUT/$1.lease.txt" 2>&1
+  echo "lease_rc=$?" >> "$OUT/$1.lease.txt"
   timeout 1800 cargo test --test integration_branch_attestation > "$OUT/$1.integ.txt" 2>&1
   echo "integ_rc=$?" >> "$OUT/$1.integ.txt"
 }
 
 summarise() { # $1 = label
-  for t in lib d199 integ; do
+  for t in lib lease integ; do
     f="$OUT/$1.$t.txt"
     res=$(grep -E "^test result:" "$f" | tail -1)
     [ -z "$res" ] && res="COMPILE-FAIL or no result line"
@@ -93,7 +95,7 @@ EOF
     exit 3
   fi
   summarise "$name" | tee -a "$OUT/summary.txt"
-  if ! grep -qE "^test .* FAILED$" "$OUT/$name.lib.txt" "$OUT/$name.d199.txt" "$OUT/$name.integ.txt"; then
+  if ! grep -qE "^test .* FAILED$" "$OUT/$name.lib.txt" "$OUT/$name.lease.txt" "$OUT/$name.integ.txt"; then
     echo "$name: SURVIVED (no test failed)" | tee -a "$OUT/summary.txt"
     survivors=$((survivors + 1))
   fi
