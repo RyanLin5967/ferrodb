@@ -78,6 +78,12 @@
 //!   tracked `.gitmodules`, or an untracked file inside it (measured by D231's review 5, which
 //!   corrected this sentence). A submodule among the build INPUTS stamps `unknown`, because it has
 //!   no bytes to compare. ferrodb has no submodules.
+//! * The byte comparison assumes a checkout writes each blob's bytes unchanged. A smudge filter,
+//!   or line endings converted on checkout (`core.autocrlf`, `eol=crlf`), makes every converted
+//!   file differ from its blob, so a clean tree stamps `+DIRTY` on that machine: the safe
+//!   direction, but a flag that then means nothing there. ferrodb's `.gitattributes` pins
+//!   `* text=auto eol=lf`, which checks out LF on every platform, CI's Windows runner included
+//!   (from gitattributes(5); not run on Windows here).
 //! * Untracked files that are NOT build inputs, and ignored files among the inputs that do not end
 //!   in `.rs`, are not counted: nothing compiles them. A `.cargo/` or `rust-toolchain*` in a parent
 //!   directory is not seen at all, and one that appears at the package root where none existed is

@@ -109,8 +109,9 @@
 #   36 untracked-removed   it removed; touch                              at S0          yes
 #   37 ignored-rs-input    tests/d231_ignored.rs, excluded in info/exclude at S0 +DIRTY   yes
 #   38 ignored-rs-removed  it and the exclude line removed; touch         at S0          yes
-#   39 clean-filter        a clean filter deletes a line appended to
-#                          src/lib.rs, so `git status` reads it clean     at S0 +DIRTY   yes
+#   39 clean-filter        a same-size edit to a comment in src/lib.rs
+#                          that a clean filter reverses, so `git status`
+#                          reads it clean                                 at S0 +DIRTY   yes
 #   40 filter-removed      filter and attribute removed, file restored;
 #                          touch                                          at S0          yes
 #   41 skip-worktree       src/lib.rs edited, marked skip-worktree        at unknown +DIRTY yes
@@ -154,7 +155,7 @@
 #   path per question; the depth cap (git resolves 4 links and refuses 5; the walk collects at
 #   most 5); core.preferSymlinkRefs, a known limit (review 4, N7).
 #
-# PRE-REGISTERED (bench/d231_PREREG.md, amendments 1, 2, 2a, 3 and 3a): 2 arms x 52 steps = 104
+# PRE-REGISTERED (bench/d231_PREREG.md, amendments 1, 2, 2a, 3, 3a and 3b): 2 arms x 52 steps = 104
 # verdicts.
 #   AT THE D231 TIP: 104 PASS, exit 0. No step depends on timing.
 #   AT 9aa6968: nominally 51 PASS / 53 FAIL, exit 1.
@@ -711,12 +712,25 @@ for arm in clone linked; do
   check "$arm" "$probe" "$tgt" 38-ignored-rs-removed "at $S0" yes
 
   # 39-40 (U2): a clean filter hides an edit from `git status`; the bytes still differ from HEAD.
+  # The edit keeps the file's size, because git reads a size change as a modification without
+  # asking the filter (PREREG amendment 3b, MEASURED on a toy repository with git 2.50.1: an
+  # appended line stayed visible through a filter that deletes it, and a same-size edit that the
+  # filter reverses read clean). So one word of a comment in src/lib.rs changes case, and the
+  # filter changes it back.
   attrs=$(gpath "$ck" info/attributes) || harness "no info/attributes path"
   [ ! -e "$attrs" ] || harness "$attrs exists already"
   mkdir -p "$(dirname "$attrs")" || exit 2
   printf '%s\n' "src/lib.rs filter=d231" > "$attrs" || harness "could not write $attrs"
-  g "$ck" config filter.d231.clean "sed '/d231 filter-hidden line/d'" || harness "could not configure the clean filter"
-  printf '%s\n' "// d231 filter-hidden line" >> "$ck/src/lib.rs" || harness "could not append to src/lib.rs"
+  g "$ck" config filter.d231.clean "sed 's/EVERY harness in/Every harness in/'" \
+    || harness "could not configure the clean filter"
+  python3 - "$ck/src/lib.rs" <<'PY' || harness "could not make the same-size edit to src/lib.rs"
+import sys
+p = sys.argv[1]
+b = open(p, "rb").read()
+if b.count(b"Every harness in") != 1 or b"EVERY harness in" in b:
+    sys.exit(1)
+open(p, "wb").write(b.replace(b"Every harness in", b"EVERY harness in"))
+PY
   st_path hidden "$ck" src/lib.rs
   [ -z "$hidden" ] || harness "git status sees the filtered edit; step 39 would not discriminate"
   head_blob=$(git -C "$ck" rev-parse HEAD:src/lib.rs) || harness "no HEAD blob for src/lib.rs"

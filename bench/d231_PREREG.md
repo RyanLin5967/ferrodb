@@ -390,3 +390,31 @@ fans"). Both commits are now run for real, under the fleet lock (`~/wt/logs/lead
 builds in its own target directory under `$WORK`, never a shared one. That is the lead's instruction, after the
 lease-grace lane measured, on toy crates, a shared target running one tree's code with another tree's stamp. The
 result files are committed before they are read.
+
+## Amendment 3b (before any real run; after an interrupted model batch): step 39's edit keeps the file's size
+
+**What happened.** The first model batch at `fcf3cdb` (stub cargo, not a real build) reached step 39 in both base
+runs, and exited 2 there with "git status sees the filtered edit; step 39 would not discriminate". The premise refused
+before any verdict was scored. The other runs in that batch were stopped by hand once the cause was known. No real run
+had started: the queued one was still waiting for the fleet lock, and was stopped too. The raw `.out` files of that
+batch, including the partial ones, are committed with the model (`d231_model/batch3/runs-interrupted/`).
+
+**Why.** git reads a change in a file's size as a modification without asking the clean filter. MEASURED on a toy
+repository with this machine's git (2.50.1, Apple Git-155):
+* an appended line, under a filter that deletes that line, still reads ` M` in `status --porcelain`;
+* a same-size edit that the filter reverses reads clean, and `hash-object --no-filters` gives a different blob from
+  HEAD's.
+
+**The change.** Step 39 now changes the case of one word in a comment in `src/lib.rs`: `Every harness in` becomes
+`EVERY harness in`. That string occurs exactly once at both commits, and the edit asserts it. The filter is
+`sed 's/EVERY harness in/Every harness in/'`. The premises are unchanged and still asserted: `git status` hides the
+edit, and the bytes differ from HEAD's blob. The predictions are unchanged: at the tip `at S0 +DIRTY` with a re-run,
+and at the base a FAIL.
+
+**Also in this commit, documentation only:** `build.rs` states that the byte comparison assumes a checkout writes each
+blob's bytes unchanged. A smudge filter, or line endings converted on checkout, make a clean tree stamp `+DIRTY`. That
+is the safe direction, but the flag then means nothing on that machine. `.gitattributes` pins `* text=auto eol=lf`.
+This changes the tip's `build.rs` blob, so M1's pin moves to the new blob.
+
+**A dry run before this commit**, under the model only: the uncommitted harness with this fix, against `fcf3cdb`'s
+tree, gave 104 PASS / 0 FAIL, rc 0. Both arms' step-45 NOTE lines read `shim_refused_ls_files_v=yes`.
