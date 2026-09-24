@@ -9,7 +9,7 @@
 //!
 //! The lead's decision: version the WAL. New logs are version 3. A version-2 log is replayed with
 //! version-2 semantics (a forward delete frees), then checkpointed, which rewrites it as version 3.
-//! Until then it accepts nothing but the compensation recovery itself writes.
+//! Until then no transaction may begin on it; recovery's own compensation needs none.
 //!
 //! The version-2 log here is built by hand, record by record, as the older binary wrote it, and
 //! then labelled version 2 in its header. INFERRED from source and never run.

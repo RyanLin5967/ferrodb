@@ -129,6 +129,14 @@ pub struct TxnManager {
     /// and finishes the releases a committed transaction did not get to log
     /// (`wal::recovery::recover`, [`TxnManager::finish_releases`]).
     retired: Mutex<HashMap<u64, Vec<RetiredSlot>>>,
+    /// Releases that failed and are still owed, as `(committed transaction, slot)`. The adversary's
+    /// F2 on `115f0b7`, and the lead's decision.
+    ///
+    /// A checkpoint retries them BEFORE it truncates the log, and refuses to truncate while any still
+    /// fails ([`TxnManager::retry_pending_releases`]). So the log stays the durable record of what is
+    /// owed, and a restart re-derives the same list from it (`wal::recovery::recover`). A sweep of
+    /// every page at open is not needed, and would have cost every restart O(pages), the D216 shape.
+    pending_releases: Mutex<Vec<(u64, RetiredSlot)>>,
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -139,20 +147,33 @@ pub struct RetiredSlot {
     pub slot: u16,
 }
 
-/// Releases at commit that failed, since process start. D213.
+/// Releases that failed, since process start: the slot is still retired on its page. D213. Each is
+/// counted once, when it first fails; a failed retry is not counted again.
 ///
 /// A release runs after the `Commit` is durable, so the transaction HAS committed and
 /// [`TxnManager::commit`] must answer `Ok`: an `Err` makes the executor keep the session's
 /// transaction, and a ROLLBACK would then undo committed work. A failure is counted here instead,
-/// with one line on stderr. What it leaves behind is lost space, not a wrong answer: the retired
-/// slot reads as deleted, as it should, and its bytes stay out of use. The next open's recovery
-/// finishes the release if the log still holds the delete; after a checkpoint it does not, and
-/// the bytes stay out of use for good. Read twice and subtract to scope it to a phase.
+/// with one line on stderr, and the release waits in the pending list. What it holds is space,
+/// not a wrong answer: the retired slot reads as deleted, as it should. It holds it only until a
+/// retry succeeds, because no checkpoint truncates the log past it (the adversary's F2 on `115f0b7`).
+/// Read twice and subtract to scope it to a phase.
 pub static RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// See [`RELEASE_FAILURES`].
 pub fn release_failures() -> u64 {
     RELEASE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Releases that succeeded, but whose page-directory update failed, since process start. Counted
+/// apart from [`RELEASE_FAILURES`] (the adversary's F3 on `115f0b7`): the slot IS free, on the page
+/// and in the log, and only `find_page_with_space` does not offer its bytes yet. They are offered
+/// once the page's entry is next rewritten: by the next write to that page, or by recovery's
+/// directory repair.
+pub static DIRECTORY_UPDATE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`DIRECTORY_UPDATE_FAILURES`].
+pub fn directory_update_failures() -> u64 {
+    DIRECTORY_UPDATE_FAILURES.load(Ordering::Relaxed)
 }
 
 /// Index undos at abort that failed, since process start. D205 (the adversary's C1).
@@ -316,7 +337,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -334,6 +355,19 @@ impl TxnManager {
         wal: &WalManager,
         att: &mut HashMap<u64, TxnEntry>,
     ) -> Result<u64, FerroError> {
+        // **F1: no transaction on a log written before D213** (`wal::log::VERSION`). Recovery replays
+        // such a log with its own meaning and undoes its losers without beginning anything, and
+        // `open_recovered` then checkpoints it, which rewrites it as version 3. A writer that opened
+        // the log some other way would otherwise log records with D213's meaning into a log labelled
+        // with the older one, and the next replay would read them wrongly. Every heap record needs a
+        // transaction, so refusing here covers them all.
+        if wal.is_legacy() {
+            return Err(FerroError::Wal(
+                "this log was written before D213 (format 2) and has not been replayed and upgraded \
+                 yet; open the database through wal::recovery::open_recovered, which does both"
+                    .into(),
+            ));
+        }
         // **Refuses; it does not fetch.** A cluster member holding no granted range fails here
         // rather than asking a leader, because this runs with the active-transaction table locked
         // — the lock every checkpoint and every snapshot handoff waits on — and a network
@@ -703,7 +737,24 @@ impl TxnManager {
             self.append_chained(txn_id, &RecKind::RunIdentity { run })?;
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
-        self.wal.flush_up_to(commit_lsn)?;
+        // **F4(i) (the adversary on `115f0b7`; the lead's decision): past this point the only
+        // outcomes are "committed" and fail-stop.** The `Commit` record is in the log buffer. If
+        // the flush fails, it may or may not be on disk, and a later flush can still make it
+        // durable. So a ROLLBACK now would log an Abort after a `Commit` that may land, and
+        // recovery would treat the transaction as committed with its pages rolled back, while the
+        // change feed had already shipped its rows at the `Commit`. The log is poisoned instead:
+        // every later write is refused, and the database must be reopened, where recovery decides
+        // from what reached disk. This is PostgreSQL's PANIC on an fsync failure, for the same
+        // reason. The session keeps its id (the transaction is not known to have ended), and its
+        // ROLLBACK is refused with every other write.
+        if let Err(e) = self.wal.flush_up_to(commit_lsn) {
+            let why = format!("transaction {txn_id}'s Commit record could not be made durable ({e})");
+            self.wal.poison(&why);
+            return Err(FerroError::Wal(format!(
+                "{why}. The log now refuses every write, and the database must be reopened: recovery \
+                 decides from what reached disk whether transaction {txn_id} committed"
+            )));
+        }
         // **D213: decided, so the space its deletes held for their undo is free now.** After the
         // flush, never before: a slot freed while the `Commit` could still be lost would let
         // another transaction take the bytes this one's rollback needs. Before `att` lets go of the
@@ -740,13 +791,33 @@ impl TxnManager {
         // `executor.rs`, clean exit in `cli.rs` — sit on paths that are themselves replicated
         // decisions (`Command::Catalog`), so they are already ordered by the log; guarding them
         // here would refuse DDL on a cluster member for a reason that does not apply.
+        //
+        // **F4(ii) (the adversary on `115f0b7`): the transaction has ENDED by here.** `TxnEnd` is
+        // written and `att` has let go, so a failed checkpoint must not read as a failed commit. It
+        // is still returned, worded as what it is, and the executor drops the session's id because
+        // the transaction is no longer open (`TxnManager::is_open`). Before, the session kept a dead
+        // id, and every statement, ROLLBACK and BEGIN failed until it disconnected.
+        //
+        // F2: a checkpoint that finds releases still failing keeps the log and retries at the next
+        // due commit. That deferral is not this commit's failure, so it is not attempted.
         let due = self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1
             >= checkpoint_interval()
             && self.att_read().is_empty();
-        if due && !crate::cluster::is_clustered() {
-            self.checkpoint()?;
+        if due && !crate::cluster::is_clustered() && self.retry_pending_releases() == 0 {
+            self.checkpoint().map_err(|e| {
+                FerroError::Txn(format!(
+                    "transaction {txn_id} COMMITTED; the automatic checkpoint after it failed ({e}), \
+                     and the next commit retries it"
+                ))
+            })?;
         }
         Ok(())
+    }
+
+    /// Whether `txn_id` is still open: in the active-transaction table, running or rolling back. A
+    /// session drops its id once this is false, whatever `commit` or `abort` returned (F4(ii)).
+    pub fn is_open(&self, txn_id: u64) -> bool {
+        self.att_read().contains_key(&txn_id)
     }
 
     pub fn abort(&self, txn_id: u64) -> Result<(), FerroError> {
@@ -818,19 +889,19 @@ impl TxnManager {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn , undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapDelete{ dir_root, page_id, slot, old: Vec::new() })
                     };
-                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_insert(page, slot))?;
+                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_insert(page, slot))?;
                 }
                 RecKind::HeapDelete { dir_root, page_id, slot, old } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapInsert { dir_root, page_id, slot, tuple: old.to_vec() })
                     };
-                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_delete(page, slot, &old))?;
+                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_delete(page, slot, &old))?;
                 }
                 RecKind::HeapUpdate { dir_root, page_id, slot, old, new } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapUpdate { dir_root, page_id, slot, old: new.clone(), new: old.clone() })
                     }; 
-                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_update(page, slot, &old))?;
+                    self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_update(page, slot, &old))?;
                 }
                 RecKind::Clr {undo_next, .. } => {
                     if undo_next == 0 {
@@ -882,7 +953,12 @@ impl TxnManager {
     /// appended. After the append the only change is the LSN, so nothing can fail between logging
     /// the CLR and publishing the page. Holding the frame latch across the WAL append is the order
     /// `HeapFileManager::insert_into` already uses (frame, then `append_chained`).
-    fn apply_then_log<F>(&self, txn_id: u64, page_id: u32, rec: &RecKind, undo: F) -> Result<Page, FerroError>
+    ///
+    /// `chained`: an undo's CLR goes on the transaction's chain (`append_chained`), because a resumed
+    /// abort walks it. A `HeapRelease` does not: nothing walks a committed transaction's chain, and a
+    /// release may be logged after the transaction has left `att`, by a checkpoint's retry or by
+    /// recovery (F2). It is appended under the transaction's id with no previous LSN.
+    fn apply_then_log<F>(&self, txn_id: u64, page_id: u32, rec: &RecKind, chained: bool, undo: F) -> Result<Page, FerroError>
     where
         F: FnOnce(&mut Page) -> Result<(), FerroError>,
     {
@@ -901,7 +977,8 @@ impl TxnManager {
                 return Err(e);
             }
         };
-        let clr_lsn = match self.append_chained(txn_id, rec) {
+        let appended = if chained { self.append_chained(txn_id, rec) } else { self.wal.append(txn_id, 0, rec) };
+        let clr_lsn = match appended {
             Ok(lsn) => lsn,
             Err(e) => {
                 drop(frame);
@@ -971,15 +1048,18 @@ impl TxnManager {
     /// `HeapFileManager::find_page_with_space` reads the directory and not the page. D213.
     ///
     /// It never fails. The transaction has committed, so the only honest answer to its caller is
-    /// `Ok`, and a failure is counted in [`RELEASE_FAILURES`] with a line on stderr (see there for
-    /// what it leaves behind).
+    /// `Ok`. A release that fails is counted in [`RELEASE_FAILURES`], with a line on stderr, and
+    /// waits in the pending list for a checkpoint to retry it (F2). A directory update that fails
+    /// after a release succeeded is counted in [`DIRECTORY_UPDATE_FAILURES`] instead (F3).
     ///
     /// **The cost this pays for, stated.** A page may fill sooner than before: a relocated tuple's
     /// old bytes stay occupied until its transaction ends, where they used to be free at once, so a
     /// long transaction holds on to every byte its relocations and deletes vacated. The bound is
     /// that transaction's own writes: the bytes held are at most the old images its `HeapDelete`
-    /// records carry, which it has already paid for in the log. Nothing is held past the commit or
-    /// the abort. Freed bytes are only ever reusable when they are the lowest on their page, since
+    /// records carry, which it has already paid for in the log. Nothing is held past the abort, and
+    /// nothing past the commit EXCEPT a release that fails: its slot stays retired until a retry
+    /// succeeds, and meanwhile no checkpoint truncates the log, which then grows as a pinned log
+    /// does (the adversary's F2 on `115f0b7` corrected "nothing is held past the commit"). Freed bytes are only ever reusable when they are the lowest on their page, since
     /// nothing compacts a page, and that is unchanged. The log carries one more record per retired
     /// slot, written after the `Commit` and flushed with the next one. A shrink's kept capacity is
     /// not held by the transaction at all: those bytes were garbage before D213, and are now the
@@ -987,25 +1067,64 @@ impl TxnManager {
     fn release_retired(&self, txn_id: u64, retired: &[RetiredSlot]) {
         use std::io::Write;
         for r in retired {
-            let rec = RecKind::HeapRelease { dir_root: r.dir_root, page_id: r.page_id, slot: r.slot };
-            let released = self
-                .apply_then_log(txn_id, r.page_id, &rec, |page| page.release(r.slot as usize))
-                .and_then(|page| {
-                    let free = page.get_free_space_end() - page.get_free_space_start();
-                    HeapFileManager::open(r.dir_root, self.bp.clone()).update_directory_entry(r.page_id, free)
-                });
-            if let Err(e) = released {
-                RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ferrodb: transaction {txn_id} committed, but slot {} of page {} could not be released \
-                     ({e}); its bytes stay out of use, and the next open releases them only if the log \
-                     still holds the delete",
-                    r.slot,
-                    r.page_id
-                );
+            match self.release_one(txn_id, r) {
+                Ok(page) => self.tell_directory(r, &page),
+                Err(e) => {
+                    RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    self.pending_releases.lock().unwrap().push((txn_id, *r));
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: transaction {txn_id} committed, but slot {} of page {} could not be \
+                         released ({e}); it is retried at every checkpoint, and none truncates the log \
+                         until it succeeds",
+                        r.slot,
+                        r.page_id
+                    );
+                }
             }
         }
+    }
+
+    /// Free one retired slot on its page, logged as a `HeapRelease` under `txn_id`, unchained.
+    fn release_one(&self, txn_id: u64, r: &RetiredSlot) -> Result<Page, FerroError> {
+        let rec = RecKind::HeapRelease { dir_root: r.dir_root, page_id: r.page_id, slot: r.slot };
+        self.apply_then_log(txn_id, r.page_id, &rec, false, |page| page.release(r.slot as usize))
+    }
+
+    /// Tell the page directory a released page's free space. A failure is counted apart from a
+    /// failed release, because the release itself stands (F3; see [`DIRECTORY_UPDATE_FAILURES`]).
+    fn tell_directory(&self, r: &RetiredSlot, page: &Page) {
+        use std::io::Write;
+        let free = page.get_free_space_end() - page.get_free_space_start();
+        if let Err(e) = HeapFileManager::open(r.dir_root, self.bp.clone()).update_directory_entry(r.page_id, free) {
+            DIRECTORY_UPDATE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: slot {} of page {} was released, but the page directory was not told ({e}); \
+                 its bytes are offered again once the page's entry is next rewritten",
+                r.slot,
+                r.page_id
+            );
+        }
+    }
+
+    /// Retry every pending release (F2), and return how many still fail. A retry that fails again is
+    /// not counted again in [`RELEASE_FAILURES`].
+    ///
+    /// Takes no lock that `ddl_checkpointed` holds: the releases are appended unchained, so `att` is
+    /// not touched, and the pending list is not held while a page is changed.
+    pub fn retry_pending_releases(&self) -> usize {
+        let pending = std::mem::take(&mut *self.pending_releases.lock().unwrap());
+        let mut still = Vec::new();
+        for (txn_id, r) in pending {
+            match self.release_one(txn_id, &r) {
+                Ok(page) => self.tell_directory(&r, &page),
+                Err(_) => still.push((txn_id, r)),
+            }
+        }
+        let left = still.len();
+        self.pending_releases.lock().unwrap().extend(still);
+        left
     }
 
     /// Finish, during recovery, the releases a committed transaction did not get to log. D213.
@@ -1013,18 +1132,10 @@ impl TxnManager {
     /// Its `HeapRelease` records follow its `Commit` and wait in the log buffer for the next flush,
     /// so a crash in between loses them, and the slots stay retired: nothing would ever free them.
     /// `wal::recovery::recover` works out from the log which slots are still owed, and this
-    /// releases them as the commit would have, logged. `apply_then_log` appends through the
-    /// active-transaction table, so the transaction is held there for the length of the call, the
-    /// way `recover` holds each loser for its abort.
-    pub fn finish_releases(&self, txn_id: u64, last_lsn: u64, begin_lsn: u64, retired: &[RetiredSlot]) {
-        self.att_write().insert(txn_id, TxnEntry {
-            status: TxnStatus::Commiting,
-            last_lsn: AtomicU64::new(last_lsn),
-            begin_lsn,
-            snapshot: None,
-        });
+    /// releases them as the commit would have, logged. One that fails waits in the pending list,
+    /// and `open_recovered` then keeps the log rather than checkpoint it (F2).
+    pub fn finish_releases(&self, txn_id: u64, retired: &[RetiredSlot]) {
         self.release_retired(txn_id, retired);
-        self.att_write().remove(&txn_id);
     }
 
     /// Undo `writes` newest first, so a key moved twice in one transaction ends where it started.
@@ -1203,6 +1314,15 @@ impl TxnManager {
         if !att.is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
+        // F2: decided before the mutation too, for A8's reason. `checkpoint_locked` refuses while a
+        // release is still owed, and a refusal after `f` would leave the DDL done and reported failed.
+        let owed = self.retry_pending_releases();
+        if owed > 0 {
+            return Err(FerroError::Wal(format!(
+                "DDL refused: {owed} release(s) owed by committed transactions still fail, so the \
+                 checkpoint it needs cannot truncate the log"
+            )));
+        }
         let out = f()?;
         self.checkpoint_locked()?;
         Ok(out)
@@ -1212,6 +1332,17 @@ impl TxnManager {
     ///
     /// Must not take `att` — the callers above hold it, and `Mutex` is not re-entrant.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
+        // F2: a release still owed must not be truncated out of the log, which is the only durable
+        // record of it. Retried first; while any still fails, the checkpoint is refused and the log
+        // is kept whole.
+        let owed = self.retry_pending_releases();
+        if owed > 0 {
+            return Err(FerroError::Wal(format!(
+                "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
+                 truncating the log would lose the record of the bytes they hold; the log is kept, and \
+                 the next checkpoint retries them"
+            )));
+        }
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
