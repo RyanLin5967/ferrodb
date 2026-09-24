@@ -1243,8 +1243,10 @@ impl Outbox {
         self.woken.notify_all();
     }
 
-    /// Wait up to `delay` before the sender redials, returning early if woken. `false` means the
-    /// transport is stopping, and the sender must leave its loop rather than dial again.
+    /// Wait up to `delay` before the sender redials, returning early if woken — or at once if the
+    /// transport is already stopping, in which case the sender's loop head sees the stop flag and
+    /// leaves. (`stopped` is only ever set after the stop flag, so that check suffices; a returned
+    /// flag here would be a second guard on the same exit, and nothing could tell if it broke.)
     ///
     /// **The stop flags are read under the lock BEFORE waiting.** `shutdown` notifies once, and a
     /// notify that lands while the sender is still inside `dial` finds nobody waiting; a wait begun
@@ -1252,13 +1254,12 @@ impl Outbox {
     /// lost wakeup (D207, from F3-transport's `207d362`). `stopped` is set under this same lock, so
     /// it lands either before this check or while the wait below is parked, never between them.
     /// Both redial waits in `sender_loop` go through here, so there is one copy to get right.
-    fn wait_before_redial(&self, stop: &AtomicBool, delay: Duration) -> bool {
+    fn wait_before_redial(&self, stop: &AtomicBool, delay: Duration) {
         let st = self.state.lock().unwrap();
         if st.stopped || stop.load(Ordering::SeqCst) {
-            return false;
+            return;
         }
         let _ = self.woken.wait_timeout(st, delay);
-        true
     }
 }
 
@@ -1852,9 +1853,7 @@ fn sender_loop(
                             // immediately is a 100%-CPU loop and a connection storm against a peer
                             // that has done nothing wrong.
                             counters.connect_failures.fetch_add(1, Ordering::SeqCst);
-                            if !ob.wait_before_redial(&stop, opts.reconnect_delay) {
-                                break;
-                            }
+                            ob.wait_before_redial(&stop, opts.reconnect_delay);
                             continue;
                         }
                     }
@@ -1864,9 +1863,7 @@ fn sender_loop(
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
                     // Wait on the condvar rather than sleeping, so a shutdown does not have to
                     // wait out a reconnect delay it has already made pointless.
-                    if !ob.wait_before_redial(&stop, opts.reconnect_delay) {
-                        break;
-                    }
+                    ob.wait_before_redial(&stop, opts.reconnect_delay);
                     continue;
                 }
             }
