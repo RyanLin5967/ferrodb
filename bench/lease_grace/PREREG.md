@@ -457,3 +457,16 @@ resume, through `get_raw` (4500).
 base + 29. Lib filter
 `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
 → **23** (14 + 4 + 3 + 1 + 1).
+
+## Amendment 7 — one more survivor, found while writing the M25 type (before the fix commit)
+
+M25b: `rec.set_deadline(StoredDeadline::inward(lease, OffsetCell::new().load()))` COMPILES.
+
+- A new catalog must be able to start at `D = 0`, so `OffsetCell::new()` is reachable from the rest
+  of `table_catalog.rs`, and a fresh cell yields a zero offset.
+- The type does stop the literal (M25's `0`) and any `u64`. It does not stop someone who builds a
+  new cell on purpose.
+- M25b is **a registered compile-survivor**, killed behaviourally by M10's test,
+  `a_lease_written_after_a_resume_reads_back_exactly_as_it_was_given`, which reads 13000 where
+  10000 is due.
+- Of the same deliberate class: `AliveState::decode(&[0; 16])?.offset()`.
