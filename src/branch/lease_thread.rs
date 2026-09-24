@@ -306,7 +306,9 @@ pub struct LeaseStats {
     pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
-    /// Passes that reached the END of `scan_once`, the D88 orphan sweep included.
+    /// Passes that REACHED the end of `scan_once`, after the D88 orphan sweep was ATTEMPTED. A sweep
+    /// that failed is reported and the pass still counts: this says the sweep is over, not that it
+    /// succeeded.
     ///
     /// `scans` cannot say that: it is counted before the orphan sweep runs, and a pass that
     /// refused or failed early reaches neither. READ-VS-N's restart arm waits on this to know the

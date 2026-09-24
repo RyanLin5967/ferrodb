@@ -272,8 +272,10 @@ impl Arms {
 }
 
 /// `CURVE_FIRECHECK=<mode>`: break exactly one guard's premise on purpose, so the guard is seen to
-/// fire (PREREG section 4). Each mode is an injection at the harness call site, which is where each
-/// of these guards lives — it tests the guard, not the engine.
+/// fire (PREREG section 4). Two kinds, labelled on each variant: COMPARISON checks offset or swap
+/// the expected value at the harness's own comparison — they prove the comparison and its NOT A
+/// RESULT line work, and nothing more — and IN-PATH modes (A7.5, A8) make a real state change the
+/// measured code then sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fire {
     None,
@@ -303,6 +305,9 @@ enum Fire {
     WrongDelta,
     /// M5: the parent expects one live branch more after a merge batch than before it.
     WrongLiveMerge,
+    /// M6 (comparison check, A9.4): the counter-derived `checkpointed` flag is inverted before it is
+    /// compared with `wal.base_lsn`.
+    WrongCkptFlag,
     // ---- IN PATH (PREREG A7 item 5): a real state change that the measured code sees ---------
     /// G1: a real fork at the first checkpoint that `branches` never records.
     ExtraBranch,
@@ -348,6 +353,7 @@ impl Fire {
             "wrong-visits" => Fire::WrongVisits,
             "wrong-delta" => Fire::WrongDelta,
             "wrong-live-merge" => Fire::WrongLiveMerge,
+            "wrong-ckpt-flag" => Fire::WrongCkptFlag,
             "extra-branch" => Fire::ExtraBranch,
             "child-locked" => Fire::ChildLocked,
             "extra-extent" => Fire::ExtraExtent,
@@ -357,8 +363,8 @@ impl Fire {
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
-                 wrong-live-merge, extra-branch, child-locked, extra-extent, orphan-extent, \
-                 no-cluster-time"
+                 wrong-live-merge, wrong-ckpt-flag, extra-branch, child-locked, extra-extent, \
+                 orphan-extent, no-cluster-time"
             ),
         }
     }
@@ -755,16 +761,19 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
     let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
+    // A9.3: D216's state judge. Did `open_recovered` find records to replay (and so rebuild)?
+    let recovered = db.recovered;
     let (_, closed) = db.close();
     closed.expect("close the database cleanly");
     let us = |d: Duration| d.as_micros() as u64;
     println!(
-        "RESTART_RESULT total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
+        "RESTART_RESULT recovered={} total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
          rebuild_us={} branch_catalog_us={} arena_us={} effect_log_us={} runtime_us={} \
          provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
          descents_total={} live={} c_desc={} c_att={} c_opt={} c_omiss={} c_lat={} c_fetch={} \
          c_fault={} c_hop={}",
+        recovered as u64,
         us(t.total),
         us(t.lock),
         us(t.boot.files),
@@ -832,7 +841,7 @@ fn print_restart_header() {
         "  RESTART       N   arenas   total ms  lease_st ms   arena ms  br_cat ms  recover ms  \
          tel ms  prov ms  open visits  1st-pass visits  1st-pass ms  c.desc/v  c.att/v  c.fault/v  \
          freed  live  parent ms  lock ms  files ms  sqlcat ms  rebuild ms  runtime ms  descents  \
-         wal B  tel B  prov B  m rows"
+         wal B  tel B  prov B  m rows  recovered"
     );
     println!("  RESTART-RAW N=<n> <the child's RESTART_RESULT line, verbatim: every field it measured>");
 }
@@ -845,7 +854,7 @@ fn print_restart_row(r: &RestartRow) {
     println!(
         "  RESTART {:>8} {:>8} {:>10.3} {:>12.3} {:>10.3} {:>10.3} {:>11.3} {:>7.3} {:>8.3} {:>12} \
          {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3} {:>8.3} {:>9.3} {:>9.3} \
-         {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7}",
+         {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7} {:>10}",
         r.n,
         r.expect_arenas,
         ms("total_us"),
@@ -874,6 +883,7 @@ fn print_restart_row(r: &RestartRow) {
         r.tel_bytes,
         r.prov_bytes,
         r.m_rows,
+        r.get("recovered"),
     );
     // A7.2: every field the child measured, verbatim, whether or not a column above shows it.
     println!("  RESTART-RAW N={} {}", r.n, r.raw);
@@ -952,12 +962,21 @@ struct MergeOne {
     runs_before: u64,
     runs_after: u64,
     /// The publish commit's automatic checkpoint ran inside this `MERGE;` (A7.4): the commit counter
-    /// did not rise, which only a checkpoint's reset explains.
+    /// did not rise, which only a checkpoint's reset explains. Exact on APPLIED merges only; a merge
+    /// that committed nothing also leaves the counter where it was (A9.4).
     checkpointed: bool,
+    /// The state cross-check for `checkpointed` (A9.4, guard M6): the log's `base_lsn` moved, which
+    /// only a checkpoint's truncation does.
+    base_lsn_moved: bool,
+    /// On an applied merge that checkpointed: the merge cycles since the previous checkpoint (or
+    /// the open), this one included. The period the checkpoint amortizes over, counted in the unit
+    /// being amortized, so a deferred trigger or a cycle that commits twice shows here (A10.1).
+    period: Option<u64>,
 }
 
 /// One agent task: `BEGIN AGENT SESSION`, one INSERT of a row nobody has written, `MERGE;`.
-fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
+/// `since_ckpt` counts cycles since the last checkpoint; the caller zeroes it at every open.
+fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire, since_ckpt: &mut u64) -> MergeOne {
     let mut sess = Session::with_runtime(Arc::clone(&db.runtime));
     exec_sql(db, &mut sess, &format!("BEGIN AGENT SESSION AS 'mc{id}';")).expect("begin");
     exec_sql(db, &mut sess, &format!("INSERT INTO {MERGE_TABLE} VALUES ({id}, {id});"))
@@ -969,6 +988,7 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
     let before = db.runtime.state_sizes();
     let runs_before = db.txn.retained_runs() as u64;
     let commits0 = db.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst);
+    let base0 = db.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
     let (v0, c0) = merge_log_counters();
     let seq0 = seq_scan_counters().1;
     let ix0 = index_scan_counters().0;
@@ -983,10 +1003,14 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
     let seq_tuples = seq_scan_counters().1 - seq0;
     let (v1, c1) = merge_log_counters();
     let commits1 = db.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst);
+    let base1 = db.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
     let runs_after = db.txn.retained_runs() as u64;
     let after = db.runtime.state_sizes();
     let applied_to_target =
         matches!(&out, Ok(Outcome::Agent(AgentOutput::Merge(r))) if r.applied_to_target);
+    let checkpointed = commits1 <= commits0;
+    *since_ckpt += 1;
+    let period = (applied_to_target && checkpointed).then(|| std::mem::take(since_ckpt));
     MergeOne {
         nanos,
         applied_to_target,
@@ -1001,12 +1025,14 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
         census,
         runs_before,
         runs_after,
-        checkpointed: commits1 <= commits0,
+        checkpointed,
+        base_lsn_moved: base1 != base0,
+        period,
     }
 }
 
-/// The per-merge guards (PREREG A3: M1, M3, M4). `delta` holds the first merge's append count for
-/// the whole run, so M4 compares every merge against the same number.
+/// The per-merge guards (PREREG A3: M1, M3, M4; A9.4: M6). `delta` holds the first merge's append
+/// count for the whole run, so M4 compares every merge against the same number.
 fn merge_guards(at: &str, one: &MergeOne, fire: Fire, delta: &mut Option<u64>, failures: &mut Vec<String>) {
     if !one.applied_to_target {
         failures.push(format!("M1 {at}: a MERGE did not reach the target, so it measured nothing"));
@@ -1025,6 +1051,15 @@ fn merge_guards(at: &str, one: &MergeOne, fire: Fire, delta: &mut Option<u64>, f
     if appended != want {
         failures.push(format!("M4 {at}: this merge appended {appended} ops; the run's first appended {want}"));
     }
+    // M6: the counter-derived flag against state. On an applied merge, a checkpoint and only a
+    // checkpoint both resets the commit counter and truncates the log.
+    let flag = one.checkpointed != (fire == Fire::WrongCkptFlag);
+    if flag != one.base_lsn_moved {
+        failures.push(format!(
+            "M6 {at}: the commit counter says checkpointed={flag}, but the log's base_lsn {} moved",
+            if one.base_lsn_moved { "DID" } else { "did NOT" }
+        ));
+    }
 }
 
 /// One printed MERGE row: the per-merge MEANS of a batch (axis i) or of a block (axis ii).
@@ -1040,6 +1075,19 @@ impl MergeRow {
     fn mean(&self, f: impl Fn(&MergeOne) -> u64) -> f64 {
         self.ones.iter().map(|o| f(o) as f64).sum::<f64>() / self.ones.len().max(1) as f64
     }
+    /// The block's APPLIED merges that paid the auto-checkpoint (A9.4: `ckpts` counts applied ones
+    /// only), and their mean ns and fsyncs — the O(M) replay the median leaves out (A9.1).
+    fn ckpt(&self) -> (usize, Option<f64>, Option<f64>) {
+        let paid: Vec<&MergeOne> =
+            self.ones.iter().filter(|o| o.applied_to_target && o.checkpointed).collect();
+        if paid.is_empty() {
+            return (0, None, None);
+        }
+        let n = paid.len() as f64;
+        let ns = paid.iter().map(|o| o.nanos as f64).sum::<f64>() / n;
+        let fs = paid.iter().map(|o| o.fsyncs as f64).sum::<f64>() / n;
+        (paid.len(), Some(ns), Some(fs))
+    }
     fn ns_median(&self) -> f64 {
         let mut v: Vec<u128> = self.ones.iter().map(|o| o.nanos).collect();
         v.sort_unstable();
@@ -1051,15 +1099,18 @@ fn print_merge_header() {
     println!(
         "  MERGE axis        N        M  merges   ns/merge  ns median     V_hi   V_cell  d.applied  \
          applied  captures   merges  versions  wkspaces  attested  seq tup  ix scans   fsyncs   \
-         c.desc  c.fault    c.att  ret runs  d.runs  ckpts"
+         c.desc  c.fault    c.att  ret runs  d.runs  ckpts    ckpt ns  ckpt fsync"
     );
 }
 
 fn print_merge_row(r: &MergeRow) {
     let last = r.ones.last().copied().unwrap_or_default();
+    let (ckpts, ckpt_ns, ckpt_fs) = r.ckpt();
+    let or_dash = |v: Option<f64>, prec: usize| v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "-".into());
     println!(
         "  MERGE {:>4} {:>8} {:>8} {:>7} {:>10.0} {:>10.0} {:>8.1} {:>8.2} {:>10.2} {:>8} {:>9} \
-         {:>8} {:>9} {:>9} {:>9} {:>8.2} {:>9.2} {:>8.2} {:>8.2} {:>8.3} {:>8.2} {:>9} {:>7.2} {:>6}",
+         {:>8} {:>9} {:>9} {:>9} {:>8.2} {:>9.2} {:>8.2} {:>8.2} {:>8.3} {:>8.2} {:>9} {:>7.2} {:>6} \
+         {:>10} {:>11}",
         r.axis,
         r.n,
         r.m,
@@ -1083,7 +1134,9 @@ fn print_merge_row(r: &MergeRow) {
         r.mean(|o| o.census.attempts),
         last.runs_after,
         r.mean(|o| o.runs_after - o.runs_before),
-        r.ones.iter().filter(|o| o.checkpointed).count(),
+        ckpts,
+        or_dash(ckpt_ns, 0),
+        or_dash(ckpt_fs, 2),
     );
 }
 
@@ -1112,6 +1165,16 @@ fn main() {
     }
     let arms = Arms::from_env();
     let fire = Fire::from_env();
+    // A9.2: a combination the fire's premise forbids is refused, not documented. Merges free
+    // extents, and a recycled extent can hold a stale checksummed page that the open sweep's fill
+    // probe counts, so it would rightly not free the orphan and H4 would stay silent.
+    if fire == Fire::OrphanExtent && arms.is_some_and(|a| a.merge) {
+        panic!(
+            "CURVE_FIRECHECK=orphan-extent is refused with the merge arm on: its orphan could land \
+             in a recycled extent that still holds a readable page (PREREG A9.2). Run it with \
+             CURVE_ARMS=restart."
+        );
+    }
     let read_k: usize = std::env::var("CURVE_READ_K").ok().and_then(|v| v.parse().ok()).unwrap_or(16_384);
     // Arm 2 (PREREG A3): K merges per checkpoint on axis (i), and the M targets of axis (ii).
     let merge_k: usize = std::env::var("CURVE_MERGE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
@@ -1219,6 +1282,8 @@ fn main() {
     let mut trunk_root: PageId = 0;
     let mut read_rows: Vec<ReadRow> = Vec::new();
     let mut restart_rows: Vec<RestartRow> = Vec::new();
+    // H5's fire injects only at the LAST checkpoint; a run that stops before it never fired (A9.6).
+    let mut no_cluster_time_injected = false;
     let mut checkpoint_index = 0usize;
     // Arm 2: every printed MERGE row, the next never-used row id, and the first merge's append
     // count, which every later merge is held to (M4).
@@ -1543,7 +1608,18 @@ fn main() {
                 // child's open sweep must free it. Done BEFORE the arena count, which includes it.
                 if fire == Fire::OrphanExtent {
                     let orphan = hd.cat.fork(BranchId::TRUNK, lease).expect("orphan fire: fork").branch_id;
-                    hd.store.arena_for(orphan).expect("orphan fire: claim an extent");
+                    let arena = hd.store.arena_for(orphan).expect("orphan fire: claim an extent");
+                    // A9.2: the premise, asserted. The child restores this extent with its fill
+                    // unknown, and `resolve_fill` probes from page 0 and stops at the first page
+                    // that fails to read. So the extent is empty to the open sweep exactly when its
+                    // FIRST page does not read. Same probe, same page, here.
+                    let (start, _) = hd.store.extent_range(arena).expect("orphan fire: the extent exists");
+                    assert!(
+                        hd.store.read_page(start).is_err(),
+                        "orphan-extent fire did not inject: page {start}, the first of the claimed \
+                         extent, reads as a valid page, so the open sweep's fill probe would count \
+                         it and rightly leave the orphan alone"
+                    );
                     hd.cat
                         .set_state(orphan, BranchState::Live, BranchState::Reaped)
                         .expect("orphan fire: mark reaped");
@@ -1590,6 +1666,7 @@ fn main() {
                     Fire::NoClusterTime if is_last => "no-cluster-time",
                     _ => "none",
                 };
+                no_cluster_time_injected |= child_fire == "no-cluster-time";
                 match run_child(&db_path_str, child_fire) {
                     Ok((child, raw)) => {
                         row.child = child;
@@ -1630,8 +1707,10 @@ fn main() {
                     ));
                 }
                 let mut ones = Vec::with_capacity(merge_k);
+                // Right after an open, whose fresh `TxnManager` counts commits from zero.
+                let mut since_ckpt = 0u64;
                 for _ in 0..merge_k {
-                    let one = merge_cycle(open, next_merge_row, fire);
+                    let one = merge_cycle(open, next_merge_row, fire, &mut since_ckpt);
                     next_merge_row += 1;
                     m_rows += one.applied_to_target as u64;
                     merge_guards(&format!("axis i N={done}"), &one, fire, &mut merge_delta, &mut failures);
@@ -1668,6 +1747,13 @@ fn main() {
                 break;
             }
         }
+    }
+    if fire == Fire::NoClusterTime && !no_cluster_time_injected {
+        failures.push(
+            "H5: CURVE_FIRECHECK=no-cluster-time was requested but never injected: the run stopped \
+             before the last checkpoint (or the restart arm is off), so H5 was not tested"
+                .into(),
+        );
     }
 
     println!();
@@ -1713,10 +1799,11 @@ fn main() {
         let open = db.as_ref().expect("the production database is open");
         let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let mut m_done = 0usize;
+        let mut since_ckpt = 0u64;
         for &target in &merge_targets {
             let mut block = Vec::new();
             while m_done < target {
-                let one = merge_cycle(open, next_merge_row, fire);
+                let one = merge_cycle(open, next_merge_row, fire, &mut since_ckpt);
                 next_merge_row += 1;
                 m_rows += one.applied_to_target as u64;
                 m_done += 1;
@@ -1782,9 +1869,17 @@ fn read_vs_n_summary(
             let rows: Vec<&MergeRow> = merge_rows.iter().filter(|r| r.axis == axis).collect();
             // A7.4: Q10 is judged on the MEDIAN. The mean is printed beside it and not judged,
             // because each axis-(ii) block's last merge pays the auto-checkpoint (`ckpts`).
+            // A10.1: the checkpoint is amortized over its MEASURED period (`MergeOne::period`), not
+            // over 256: the trigger waits for an empty active-transaction table, and a cycle may
+            // commit more than once. Not over the printed blocks' checkpoint share either: axis
+            // (ii)'s blocks end at multiples of 256 on purpose, so they over-sample that merge.
             println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN:");
-            println!("         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  seq tup  c.fault  ret runs  ckpts");
+            println!(
+                "         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  \
+                 seq tup  c.fault  ret runs  ckpts    ckpt ns  slope(ckpt-med)  period   amort ns"
+            );
             let mut prev: Option<(usize, f64, f64)> = None;
+            let mut prev_excess: Option<(usize, f64)> = None;
             for r in &rows {
                 let x = if axis == "i" { r.n } else { r.m };
                 let (ns, vhi) = (r.ns_median(), r.mean(|o| o.v_hi));
@@ -1798,8 +1893,25 @@ fn read_vs_n_summary(
                     None => (format!("{:>7}", "-"), format!("{:>13}", "-")),
                 };
                 let last = r.ones.last().copied().unwrap_or_default();
+                let (ckpts, ckpt_ns, _) = r.ckpt();
+                // The checkpoint's O(M) excess over the typical merge (A9.1: log-log slope in
+                // [0.5, 1.2] over axis (ii)'s M), and the amortized cost it implies.
+                let excess = ckpt_ns.map(|c| c - ns);
+                let s_ex = match (prev_excess, excess) {
+                    (Some((px, pe)), Some(e)) if pe > 0.0 && e > 0.0 => format!("{:>16.3}", slope(pe, e, px, x)),
+                    _ => format!("{:>16}", "-"),
+                };
+                let periods: Vec<u64> = r.ones.iter().filter_map(|o| o.period).collect();
+                let period = (!periods.is_empty())
+                    .then(|| periods.iter().sum::<u64>() as f64 / periods.len() as f64);
+                let amort = match (excess, period) {
+                    (Some(e), Some(p)) => format!("{:>10.0}", ns + e / p),
+                    _ => format!("{:>10}", "-"),
+                };
+                let period = period.map(|p| format!("{p:>7.1}")).unwrap_or_else(|| format!("{:>7}", "-"));
                 println!(
-                    "  {:>8} {:>8} {:>10.0} {s_ns} {:>10.0} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3} {:>9} {:>6}",
+                    "  {:>8} {:>8} {:>10.0} {s_ns} {:>10.0} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3} {:>9} {:>6} \
+                     {:>10} {s_ex} {period} {amort}",
                     r.n,
                     r.m,
                     ns,
@@ -1811,10 +1923,18 @@ fn read_vs_n_summary(
                     r.mean(|o| o.seq_tuples),
                     r.mean(|o| o.census.faults),
                     last.runs_after,
-                    r.ones.iter().filter(|o| o.checkpointed).count(),
+                    ckpts,
+                    ckpt_ns.map(|c| format!("{c:.0}")).unwrap_or_else(|| "-".into()),
                 );
                 prev = Some((x, ns, vhi));
+                if let Some(e) = excess {
+                    prev_excess = Some((x, e));
+                }
             }
+            println!(
+                "  axis ({axis}): `period` = merge cycles since the previous checkpoint (or the open), \
+                 the checkpointing one included; `amort ns` = median + (ckpt ns - median) / period (A10.1)."
+            );
             if rows.len() < 2 {
                 failures.push(format!("arm 2 axis ({axis}): {} row(s); one point is not a curve", rows.len()));
             }
@@ -1879,8 +1999,10 @@ fn read_vs_n_summary(
     }
     if arms.restart {
         println!("arm 3 (fresh-process open; microsecond timers in the child, printed here in ms):");
-        // A7.1: `recover` and `rebuild` are D216's before/after pair; `wal B` and `m rows` are their input.
-        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows");
+        // A7.1/A9.3: `recovered` and `wal B` judge D216's before/after pair; `recover`, `rebuild` and
+        // `m rows` size it. A9.1: warmth is `child net` (total less recover and rebuild, which only the
+        // child pays before D216) against `parent total`.
+        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows  recovered  child net ms");
         let mut prev: Option<(usize, f64, f64)> = None;
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
             let total = r.get("total_us") as f64 / 1000.0;
@@ -1893,7 +2015,7 @@ fn read_vs_n_summary(
                 None => (format!("{:>7}", "-"), format!("{:>7}", "-")),
             };
             println!(
-                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3} {:>12.3} {:>12.3} {:>8} {:>8}",
+                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3} {:>12.3} {:>12.3} {:>8} {:>8} {:>10} {:>13.3}",
                 r.n,
                 total,
                 lease,
@@ -1906,6 +2028,8 @@ fn read_vs_n_summary(
                 r.get("rebuild_us") as f64 / 1000.0,
                 r.wal_bytes,
                 r.m_rows,
+                r.get("recovered"),
+                total - r.get("recover_us").saturating_add(r.get("rebuild_us")) as f64 / 1000.0,
             );
             prev = Some((r.n, total, lease));
         }

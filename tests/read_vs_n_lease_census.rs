@@ -1,16 +1,19 @@
 //! READ-VS-N arm 3 — the restart arm's two new counters, forced to move and held still
 //! (`bench/read_vs_n/PREREG.md` A7 item 5).
 //!
-//! * `TwoTierReaper::open_sweep_visits` must equal the live extents the open sweep walked, counted
-//!   independently through `live_arenas()`, and must NOT move when a later sweep moves the shared
-//!   `sweep_visits` — that scoping is the whole reason it exists (D209: the lease thread's first
-//!   pass sweeps again).
-//! * `LeaseStats::finished` must rise when a pass reaches the end of `scan_once`, and must NOT rise
-//!   for a pass that refused before the orphan sweep (a cluster member with no `LeaseTick`), which is
-//!   the path the restart arm's H5 fire mode takes.
+//! * `TwoTierReaper::open_sweep_visits` must equal the extents that exist, counted INDEPENDENTLY of
+//!   the list the sweep iterates (`live_arenas()`): the `ArenaId`s this test's own claims returned,
+//!   plus trunk's arenas as the CATALOG records them. It must NOT move when a later sweep moves the
+//!   shared `sweep_visits` — that scoping is the whole reason it exists (D209: the lease thread's
+//!   first pass sweeps again).
+//! * `LeaseStats::finished` must rise only AFTER a pass's orphan sweep (the restart arm reads R3's
+//!   first-pass visits the moment it sees `finished`), and must NOT rise for a pass that refused
+//!   before that sweep (a cluster member with no `LeaseTick`), which is the path the restart arm's H5
+//!   fire mode takes. PREREG A7.5 and A9.5.
 //!
 //! One test, in its own binary: the refusing half joins a cluster, which is process-wide state.
 
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,12 +67,14 @@ fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
         .unwrap(),
     );
     // Live branches that each own an extent, claimed while this process is standalone (a cluster
-    // member may not claim without a leader's grant).
+    // member may not claim without a leader's grant). The ids the claims return are the test's own
+    // record of what exists; trunk's come from the CATALOG's record, not from the store's list.
+    let mut claimed: BTreeSet<_> = catalog.get(BranchId::TRUNK).unwrap().arenas.into_iter().collect();
     for _ in 0..5 {
         let b = catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
-        store.arena_for(b).unwrap();
+        claimed.insert(store.arena_for(b).unwrap());
     }
-    let live = store.live_arenas().len() as u64;
+    let live = claimed.len() as u64;
     assert!(live >= 5, "the fixture claimed {live} extents; the sweep would have nothing to visit");
     let reaper = Arc::new(TwoTierReaper::new(catalog.clone() as Arc<dyn BranchCatalog>, store.clone()));
 
@@ -81,12 +86,22 @@ fn the_open_sweep_count_is_its_own_and_finished_counts_only_completed_passes() {
         Duration::from_secs(86_400),
     )
     .unwrap();
-    assert_eq!(reaper.open_sweep_visits(), live, "the open sweep visits every live extent once");
+    assert_eq!(reaper.open_sweep_visits(), live, "the open sweep visits every extent that exists, once");
     let deadline = Instant::now() + PATIENCE;
     while lease.stats().finished == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+    // `finished` rises AFTER the pass's orphan sweep. At the first sighting, that sweep is over and
+    // no third can have begun (the interval is a day), so both sweeps are fully counted.
+    // ⚠ R3's BEFORE-D209 shape: the first pass sweeps every extent again. D209's fix makes the
+    // first pass sweep nothing, so this becomes `live` in D209's own red test (PREREG A9.5).
+    let at_first_finish = reaper.sweep_visits();
     let done = lease.stop();
+    assert_eq!(
+        at_first_finish,
+        2 * live,
+        "at the first finished pass, the open sweep and the first pass's sweep are both complete"
+    );
     assert!(done.finished >= 1, "a standalone pass never reached the end of scan_once: {done:?}");
     assert!(done.finished <= done.attempts, "more passes finished than began: {done:?}");
 

@@ -96,6 +96,10 @@ pub struct OpenDatabase {
     pub lease: LeaseThread,
     pub arena_path: String,
     pub timings: OpenTimings,
+    /// Whether `open_recovered` found log records to replay, which is also whether it rebuilt every
+    /// index. **Observing only — READ-VS-N arm 3** judges D216 on this rather than on a timer: a clean
+    /// shutdown should leave nothing to replay, and before D216 it does.
+    pub recovered: bool,
     /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
     /// the lock file goes and another process may open the database. That covers THIS struct's
     /// handles only: an `Arc` cloned out of it and held elsewhere outlives the lock, so its holder
@@ -141,7 +145,7 @@ pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, 
     // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
     // function every binary opens through. It times its own steps and hands them back
     // (`BootTimings`), so they are measured where they run and not re-spelled here.
-    let OpenedDatabase { bp, txn, catalog, timings: boot, .. } =
+    let OpenedDatabase { bp, txn, catalog, recovered, timings: boot, .. } =
         open_recovered(Path::new(db_path), &lock)?;
     timings.boot = boot;
 
@@ -270,6 +274,7 @@ pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, 
         lease,
         arena_path,
         timings,
+        recovered,
         _lock: lock,
     })
 }
