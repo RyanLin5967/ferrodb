@@ -314,8 +314,9 @@ pub fn restore_with_history(dir: &Path, dest: &Path, history_dest: &Path) -> Res
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(FerroError::Io(format!("read the backup's history: {e}"))),
     };
-    let (floor, records) = crate::wal::history::HistoryStore::records_through(&bytes, label.end_lsn)?;
-    crate::wal::history::HistoryStore::write_image(history_dest, floor, &records)?;
+    let (incarnation, floor, records) =
+        crate::wal::history::HistoryStore::records_through(&bytes, label.end_lsn)?;
+    crate::wal::history::HistoryStore::write_image(history_dest, incarnation, floor, &records)?;
     Ok(label)
 }
 
@@ -589,7 +590,7 @@ mod tests {
         let _handle = take_with_history(&p.bp, &p.wal, &store, &out).unwrap();
         let dest = p.dir.join("restored.db");
         let dest_history = p.dir.join("restored.db.history");
-        HistoryStore::write_image(&dest_history, 0, &[rec(9, 0)]).unwrap();
+        HistoryStore::write_image(&dest_history, 0, 0, &[rec(9, 0)]).unwrap();
         restore_with_history(&out, &dest, &dest_history).unwrap();
 
         let restored = HistoryStore::open(&dest_history, 8).unwrap();

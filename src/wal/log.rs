@@ -257,6 +257,12 @@ pub enum RecKind {
     /// have written it there. `bytes` are opaque here; a record over
     /// [`REVERT_HISTORY_PART_BYTES`] arrives as parts `0, 1, ..`, the last one marked.
     RevertHistory { hseq: u64, ordinal: u64, part: u32, last: bool, bytes: Vec<u8> },
+    /// **D212 (a') AMENDED 3, item 10a — the database incarnation REVERT's history belongs to**
+    /// (tag 14, per the lead's WAL tag registry in `LANDING-QUEUE`; 13 is D268's `HeapInitPage`). A declaration, written as transaction 0 after every truncation
+    /// (`TxnManager::declare_history`), as `RunIdentity` declares runs; the open refuses a
+    /// `<db>.history` that names another (`wal::history::HistoryStore::adopt_or_check`). Describes no
+    /// page and no row: recovery, the change feed and a replica skip it.
+    IncarnationDecl { incarnation: u64 },
 }
 
 pub struct LogRecord {
@@ -508,6 +514,10 @@ impl RecKind {
                 buffer.extend_from_slice(&len.to_be_bytes());
                 buffer.extend_from_slice(bytes);
             }
+            RecKind::IncarnationDecl { incarnation } => {
+                buffer.push(14);
+                buffer.extend_from_slice(&incarnation.to_be_bytes());
+            }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
@@ -636,6 +646,10 @@ impl RecKind {
                     .and_then(|end| bytes.get(at..end))
                     .ok_or_else(|| short(at, len, bytes.len()))?;
                 Ok(RecKind::RevertHistory { hseq, ordinal, part, last, bytes: body.to_vec() })
+            }
+            14 => {
+                let mut at = 1usize;
+                Ok(RecKind::IncarnationDecl { incarnation: take_u64(bytes, &mut at)? })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -1516,6 +1530,19 @@ mod tests {
         rec.serialize(&mut bytes).unwrap();
         assert_eq!(bytes[0], 12, "tag 12, the next free number after HeapRelease's 11");
         assert!(RecKind::deserialize(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// **D212 (a') AMENDED 3, item 10a: an incarnation declaration round-trips under tag 14 (the lead's
+    /// registry), and a truncated one is refused.**
+    #[test]
+    fn an_incarnation_declaration_round_trips_under_tag_14() {
+        let rec = RecKind::IncarnationDecl { incarnation: 0x0123_4567_89ab_cdef };
+        assert_eq!(round_trip(&rec), rec);
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes[0], 14, "tag 14, the number the lead's WAL tag registry assigned");
+        assert_eq!(bytes.len(), 9, "a tag and a u64");
+        assert!(RecKind::deserialize(&bytes[..8]).is_err());
     }
 
     /// **Breaking shape: an alteration whose payload is not recoverable from the resulting shape.**

@@ -927,6 +927,19 @@ impl TxnManager {
         self.run_log.lock().unwrap().len()
     }
 
+    /// **D212 (a') AMENDED 3, item 10a — declare the REVERT history's incarnation into the log**, after
+    /// every truncation, as `replay_runs` declares runs: a transaction-0 `IncarnationDecl` record
+    /// (tag 14) carrying the store's incarnation (`HistoryStore::incarnation`, drawn before the first
+    /// image or declaration). The open reads the last one back and refuses a store that names another
+    /// (`HistoryStore::adopt_or_check`). Nothing without a store. Cost: one fixed-size record (a
+    /// u64 payload) and one flush per truncation.
+    fn declare_history(&self) -> Result<(), FerroError> {
+        let Some(store) = self.history.get() else { return Ok(()) };
+        let incarnation = store.incarnation();
+        self.wal.append(0, 0, &RecKind::IncarnationDecl { incarnation })?;
+        self.wal.flush()
+    }
+
     /// Re-declare every known run at the head of the log, after a truncation discarded them.
     ///
     /// Transaction id 0, matching [`TxnManager::append_ddl`]: a declaration says "this run exists",
@@ -2015,6 +2028,9 @@ impl TxnManager {
         // And every run declaration, for the same reason: a reader starting at the new base would
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
+        // And the REVERT history's incarnation (AMENDED 3, item 10a), so the next open can tell this
+        // database's history from another's.
+        self.declare_history()?;
         Ok(CheckpointOutcome::Truncated)
     }
 

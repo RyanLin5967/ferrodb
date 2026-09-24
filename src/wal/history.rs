@@ -33,7 +33,7 @@
 //! drops a torn tail the crashed session left.
 //!
 //! ```text
-//! image  = MAGIC u32 | VERSION u8 | floor u64 | count u32 | record{count} | crc32 u32 (over all before it)
+//! image  = MAGIC u32 | VERSION u8 | incarnation u64 | floor u64 | count u32 | record{count} | crc32 u32 (over all before it)
 //! record = hseq u64 | ordinal u64 | commit_lsn u64 | len u32 | body[len] | crc32 u32 (over hseq..body)
 //! tail   = record*
 //! ```
@@ -97,11 +97,11 @@ pub fn retention_from_env() -> Result<u64, FerroError> {
 }
 
 const MAGIC: u32 = 0x4652_4831; // "FRH1"
-/// 2 since AMENDED 3 (the floor, then the Commit LSN). No build wrote version 1: the branch that
-/// had it was never built.
+/// 2 since AMENDED 3 (the incarnation, the floor, then the Commit LSN). No build wrote version 1:
+/// the branch that had it was never built.
 const IMAGE_VERSION: u8 = 2;
-/// `MAGIC | VERSION | floor | count`.
-const IMAGE_HEADER: usize = 4 + 1 + 8 + 4;
+/// `MAGIC | VERSION | incarnation | floor | count`.
+const IMAGE_HEADER: usize = 4 + 1 + 8 + 8 + 4;
 /// An image's bytes beyond its records: the header and the trailing checksum.
 pub const IMAGE_OVERHEAD: usize = IMAGE_HEADER + 4;
 /// `hseq | ordinal | commit_lsn | len` in front of a body, `crc32` behind it.
@@ -201,6 +201,10 @@ struct StoreState {
     /// the image. A committed record below it is one the window has already dropped, so the open's
     /// catch-up must not bring it back from a log that outlived `W` merges.
     floor: u64,
+    /// **The database incarnation this history belongs to** (AMENDED 3, item 10a), persisted in the
+    /// image, and declared into the log after every truncation (`TxnManager::declare_history`). 0
+    /// until one is known: drawn at the first declaration, or adopted from the log's at the open.
+    incarnation: u64,
     counters: HistoryCounters,
 }
 
@@ -282,9 +286,9 @@ impl HistoryStore {
             ));
         }
         let path = path.into();
-        let ((floor, window), read) = match std::fs::read(&path) {
+        let ((incarnation, floor, window), read) = match std::fs::read(&path) {
             Ok(bytes) => (load(&bytes)?, bytes.len() as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ((0, BTreeMap::new()), 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ((0, 0, BTreeMap::new()), 0),
             Err(e) => {
                 return Err(FerroError::Io(format!("reading {}: {e}", path.display())));
             }
@@ -297,6 +301,7 @@ impl HistoryStore {
             image_written: false,
             publishes_since_prune: held.saturating_sub(retention),
             floor,
+            incarnation,
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
         Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
@@ -390,7 +395,8 @@ impl HistoryStore {
                 .collect();
             kept.sort_by_key(|r| r.hseq);
             let floor = if prune { cut } else { s.floor };
-            encode_image(&kept, floor).and_then(|image| {
+            let incarnation = known_incarnation(s);
+            encode_image(&kept, incarnation, floor).and_then(|image| {
                 replace_atomically(&*self.ops, &self.path, &image)
                     .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))
             })
@@ -438,6 +444,36 @@ impl HistoryStore {
         }
     }
 
+    // ---- AMENDED 3, item 10a: the database incarnation --------------------------------------
+
+    /// **The incarnation this history belongs to, drawn now if none is known yet** (AMENDED 3, item
+    /// 10a). Drawn in memory and written with the next image; `TxnManager::declare_history` puts it
+    /// in the log after every truncation, so an open reads it back from there even if no image was
+    /// ever written.
+    pub fn incarnation(&self) -> u64 {
+        known_incarnation(&mut self.state.lock().unwrap())
+    }
+
+    /// **The open's check** (AMENDED 3, item 10a): the log declares `declared` as its database's
+    /// incarnation. A store that knows none adopts it; a store that knows another is REFUSED: it is
+    /// another database's REVERT history, and its merge ids would be revertible against these rows.
+    pub(crate) fn adopt_or_check(&self, declared: u64) -> Result<(), FerroError> {
+        let mut s = self.state.lock().unwrap();
+        match s.incarnation {
+            0 => {
+                s.incarnation = declared;
+                Ok(())
+            }
+            held if held == declared => Ok(()),
+            held => Err(FerroError::Internal(format!(
+                "{} is the REVERT history of database incarnation {held:#018x}, and this database's log \
+                 declares incarnation {declared:#018x}: it is another database's history, and reading it \
+                 as this one's would let a REVERT invert rows it never wrote. Move it away to open",
+                self.path.display()
+            ))),
+        }
+    }
+
     // ---- AMENDED 3, item 2: snapshot capture, install and restore ------------------------------
 
     /// **The bytes a snapshot or a base backup ships** (AMENDED 3, item 2). Under F3, every queued
@@ -455,20 +491,24 @@ impl HistoryStore {
         let mut s = self.state.lock().unwrap();
         self.drain_locked(&mut s)?;
         let window: Vec<HistoryRecord> = s.window.values().cloned().collect();
-        encode_image(&window, s.floor)
+        let incarnation = known_incarnation(&mut s);
+        encode_image(&window, incarnation, s.floor)
     }
 
     /// **A captured image cut to the history of exactly the rows an image consistent at `end_lsn`
-    /// holds** (AMENDED 3, item 2): the records whose `Commit` is below `end_lsn`, and the image's
-    /// prune floor. A record committed later is history of rows the receiver never gets, and a REVERT
-    /// of it would invert writes it does not have. Empty `bytes` (a sender with no store) is an empty
-    /// history.
-    pub fn records_through(bytes: &[u8], end_lsn: u64) -> Result<(u64, Vec<HistoryRecord>), FerroError> {
+    /// holds** (AMENDED 3, item 2): the image's incarnation and prune floor, and the records whose
+    /// `Commit` is below `end_lsn`. A record committed later is history of rows the receiver never
+    /// gets, and a REVERT of it would invert writes it does not have. Empty `bytes` (a sender with no
+    /// store) is an empty history with no incarnation.
+    pub fn records_through(
+        bytes: &[u8],
+        end_lsn: u64,
+    ) -> Result<(u64, u64, Vec<HistoryRecord>), FerroError> {
         if bytes.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, 0, Vec::new()));
         }
-        let (floor, all) = load(bytes)?;
-        Ok((floor, all.into_values().filter(|r| r.commit_lsn < end_lsn).collect()))
+        let (incarnation, floor, all) = load(bytes)?;
+        Ok((incarnation, floor, all.into_values().filter(|r| r.commit_lsn < end_lsn).collect()))
     }
 
     /// **Replace this store, file and memory, with `records`** (AMENDED 3, item 2), as a snapshot
@@ -476,19 +516,21 @@ impl HistoryStore {
     /// keeps its first copy, as the loader does. The queue is EMPTIED: it held the replaced
     /// database's history. One full rewrite, under F3; on failure the store is unchanged, and the
     /// install's marker (`consensus::snapshot::install_marker`) refuses the node until it is re-seeded.
-    pub fn install(&self, floor: u64, records: Vec<HistoryRecord>) -> Result<(), FerroError> {
+    /// The store takes the sender's incarnation (AMENDED 3, item 10a): the database is the sender's.
+    pub fn install(&self, incarnation: u64, floor: u64, records: Vec<HistoryRecord>) -> Result<(), FerroError> {
         let mut s = self.state.lock().unwrap();
         let mut kept: BTreeMap<u64, HistoryRecord> = BTreeMap::new();
         for r in records.into_iter().filter(|r| r.hseq >= floor) {
             kept.entry(r.hseq).or_insert(r);
         }
         let list: Vec<HistoryRecord> = kept.values().cloned().collect();
-        let image = encode_image(&list, floor)?;
+        let image = encode_image(&list, incarnation, floor)?;
         replace_atomically(&*self.ops, &self.path, &image)
             .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))?;
         let held = kept.values().filter(|r| r.ordinal > 0).count() as u64;
         s.window = kept;
         s.floor = floor;
+        s.incarnation = incarnation;
         s.queue.clear();
         s.queued_bytes = 0;
         s.image_written = true;
@@ -499,8 +541,13 @@ impl HistoryStore {
 
     /// **Write `records` as the whole store at `path`**, for a restore with no store open (AMENDED 3,
     /// item 2): one image, written through [`replace_atomically`].
-    pub fn write_image(path: &Path, floor: u64, records: &[HistoryRecord]) -> Result<(), FerroError> {
-        let image = encode_image(records, floor)?;
+    pub fn write_image(
+        path: &Path,
+        incarnation: u64,
+        floor: u64,
+        records: &[HistoryRecord],
+    ) -> Result<(), FerroError> {
+        let image = encode_image(records, incarnation, floor)?;
         replace_atomically(&OsFileOps, path, &image)
             .map_err(|e| FerroError::Io(format!("writing {}: {e}", path.display())))
     }
@@ -522,7 +569,7 @@ fn window_start(s: &StoreState, retention: u64) -> u64 {
     }
 }
 
-fn encode_image(records: &[HistoryRecord], floor: u64) -> Result<Vec<u8>, FerroError> {
+fn encode_image(records: &[HistoryRecord], incarnation: u64, floor: u64) -> Result<Vec<u8>, FerroError> {
     let count = u32::try_from(records.len()).map_err(|_| FerroError::Unrepresentable {
         what: "a REVERT history image's record count".to_string(),
         len: records.len(),
@@ -531,6 +578,7 @@ fn encode_image(records: &[HistoryRecord], floor: u64) -> Result<Vec<u8>, FerroE
     let mut out = Vec::with_capacity(IMAGE_HEADER + 4);
     out.extend_from_slice(&MAGIC.to_be_bytes());
     out.push(IMAGE_VERSION);
+    out.extend_from_slice(&incarnation.to_be_bytes());
     out.extend_from_slice(&floor.to_be_bytes());
     out.extend_from_slice(&count.to_be_bytes());
     for r in records {
@@ -570,8 +618,9 @@ fn take_record(bytes: &[u8], at: usize) -> Result<Option<(HistoryRecord, usize)>
 
 /// Load a whole `<db>.history`: the image, then every intact tail record behind it — the arena's
 /// rule (`ArenaPageStore::replay_tail`): a torn LAST record is dropped, a checksum failure with
-/// more bytes behind it is corruption and refused. Returns the image's prune floor and the records.
-fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError> {
+/// more bytes behind it is corruption and refused. Returns the image's incarnation, its prune floor
+/// and the records.
+fn load(bytes: &[u8]) -> Result<(u64, u64, BTreeMap<u64, HistoryRecord>), FerroError> {
     let mut at = 0usize;
     let magic = take_u32(bytes, &mut at).map_err(|_| corrupt("too short for an image".into()))?;
     if magic != MAGIC {
@@ -583,6 +632,7 @@ fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError>
             "image version {version} was written by another build (this one reads {IMAGE_VERSION})"
         )));
     }
+    let incarnation = take_u64(bytes, &mut at)?;
     let floor = take_u64(bytes, &mut at)?;
     let count = take_u32(bytes, &mut at)? as usize;
     let mut out: Vec<HistoryRecord> = Vec::new();
@@ -632,7 +682,48 @@ fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError>
     for r in out {
         by_hseq.entry(r.hseq).or_insert(r);
     }
-    Ok((floor, by_hseq))
+    Ok((incarnation, floor, by_hseq))
+}
+
+/// `s`'s incarnation, drawn now if none is known: before the first image this process writes, and
+/// before the first declaration, so the file and the log never disagree about a drawn one.
+fn known_incarnation(s: &mut StoreState) -> u64 {
+    if s.incarnation == 0 {
+        s.incarnation = fresh_incarnation();
+    }
+    s.incarnation
+}
+
+/// A random, non-zero database incarnation (AMENDED 3, item 10a), drawn as the runtime draws its
+/// merge-id nonce: std's OS-seeded `RandomState`, a per-process counter, the pid and the clock.
+fn fresh_incarnation() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(DRAWN.fetch_add(1, Ordering::Relaxed));
+        h.write_u32(std::process::id());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        h.write_u128(now);
+        let n = h.finish();
+        if n != 0 {
+            return n;
+        }
+    }
+}
+
+/// **The incarnation a log declares** (AMENDED 3, item 10a): its last `IncarnationDecl` record,
+/// which `TxnManager::declare_history` writes after every truncation. `None` for a log with no
+/// declaration (fresh, or never truncated since a store was attached).
+pub(crate) fn declared_incarnation(records: &[crate::wal::log::LogRecord]) -> Option<u64> {
+    use crate::wal::log::RecKind;
+    records.iter().rev().find_map(|r| match r.kind {
+        RecKind::IncarnationDecl { incarnation } => Some(incarnation),
+        _ => None,
+    })
 }
 
 /// **The history records of the committed transactions among `records`** (AMENDED 3, item 2): each

@@ -1612,7 +1612,7 @@ impl SnapshotStore for PageStoreSnapshots {
         // rewrite, which also empties this node's queue: it held the replaced database's history, as
         // the log truncated above did. Inside the marker's window, like every file above.
         if let Some(store) = &self.history {
-            let (floor, mut records) =
+            let (incarnation, floor, mut records) =
                 crate::wal::history::HistoryStore::records_through(&history, header.end_lsn)?;
             let (window, _) = crate::replication::decode_frames(header.start_lsn, &redo)?;
             let window: Vec<crate::wal::log::LogRecord> = window.into_iter().map(|(_, r)| r).collect();
@@ -1621,7 +1621,7 @@ impl SnapshotStore for PageStoreSnapshots {
                     .into_iter()
                     .filter(|r| r.commit_lsn < header.end_lsn),
             );
-            store.install(floor, records)?;
+            store.install(incarnation, floor, records)?;
         }
 
         // The live objects, not only the files. A node that replaced its durable state and went on

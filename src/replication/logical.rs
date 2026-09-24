@@ -1120,7 +1120,8 @@ impl LogicalDecoder {
                 | RecKind::Checkpoint
                 | RecKind::Clr { .. }
                 | RecKind::HeapRelease { .. }
-                | RecKind::RevertHistory { .. } => {}
+                | RecKind::RevertHistory { .. }
+                | RecKind::IncarnationDecl { .. } => {}
             }
 
             if next <= lsn {

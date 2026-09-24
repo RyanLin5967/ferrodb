@@ -33,6 +33,15 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             )));
         }
     }
+    // **AMENDED 3, item 10a: the store must be this database's.** The log declares its database's
+    // incarnation after every truncation (`TxnManager::declare_history`); a store that names another
+    // is refused here, before recovery writes anything. A log with no declaration (fresh, or never
+    // truncated since a store was attached) is not checked: stated, not covered.
+    if let (Some(store), Some(declared)) =
+        (txn.history_store(), crate::wal::history::declared_incarnation(&records))
+    {
+        store.adopt_or_check(declared)?;
+    }
 
     // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
     // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
