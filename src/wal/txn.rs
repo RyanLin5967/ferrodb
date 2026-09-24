@@ -3405,6 +3405,46 @@ use super::*;
             1,
             "the same mismatch was recorded twice, so the file grows by one line per open until the log truncates"
         );
+        // Review 7's F1 (the lead's decision): counting lines cannot see a dedupe branch that FAILS. At
+        // `fe2fd84` it fsynced a read-only handle, which Windows refuses, so the mismatch found again
+        // stayed owed and unrecorded for good while this test still counted one line.
+        assert_eq!(
+            txn.owed_releases(),
+            0,
+            "the mismatch found again is still owed: recording it once failed, so no checkpoint truncates the log"
+        );
+    }
+
+    /// **Review 7's F4 (lane §21.16 test F4): a `Retry` after a SUCCESSFUL read records what the page
+    /// shows now, not the stored observation.** The stored line is the last observation of a page
+    /// that could not be read. When the retry DID read the page and found the slot releasable, and
+    /// failed later (here at the log append, on a poisoned log), the mismatch is gone. At `fe2fd84`
+    /// the `Retry` arm wrote the stored `found=live` line anyway.
+    #[test]
+    fn a_retry_after_a_successful_read_records_what_the_page_shows_now() {
+        let (bp, wal, txn, t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        std::fs::remove_dir(&quarantine).unwrap();
+        let frame_i = bp.fetch_page(r.page_id).unwrap();
+        {
+            let mut frame = bp.frame_write(frame_i);
+            let mut page = Page::deserialize(frame.data).unwrap();
+            page.slot_arr[r.slot as usize] = crate::storage::heap_page::SlotEntry { offset: 0, length: 0 };
+            frame.data = page.serialize().unwrap();
+        }
+        bp.unpin_page(r.page_id, true);
+        wal.poison("injected: the release reads the page, then its append is refused");
+        txn.retry_pending_releases();
+        let key = format!("txn={t2} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+        let recorded = std::fs::read_to_string(&quarantine).expect("the retry recorded nothing");
+        let line = recorded
+            .lines()
+            .find(|l| l.starts_with(&key))
+            .unwrap_or_else(|| panic!("the quarantine does not record `{key}`:\n{recorded}"));
+        assert!(
+            line.contains("found=free") && !line.contains("found=live"),
+            "a retry that read the page and found the slot free recorded an out-of-date observation: {line}"
+        );
     }
 
     /// **Review 4's finding 4: a DROP must not discard a mismatch it could not record.** The DROP
