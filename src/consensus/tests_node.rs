@@ -300,6 +300,66 @@ fn the_transport_meters_are_readable_from_a_running_node() {
     n.shutdown();
 }
 
+#[test]
+fn the_idle_probe_meters_are_readable_from_a_running_node() {
+    // **D224, merged with D207.** `TransportCounters` is every meter the transport keeps, and D224
+    // added two: `idle_probes` and `idle_redials`. They are the only count of the probe, so they must
+    // reach a running node's snapshot.
+    //
+    // Peer 2 is a hand-rolled listener. It completes the node's handshake and then closes, as an idle
+    // close does. The node sends nothing until it is polled, so its link to 2 sits idle past the
+    // probe gate. One poll then makes it campaign, and its first frame to 2 is probed, finds the
+    // close, and redials.
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let peer = listener();
+    let peers = BTreeMap::from([(NodeId(2), peer.local_addr().unwrap())]);
+    let mut opts = NodeOptions::new(dir.path(), peers, 1).tick_of(Duration::from_millis(1));
+    opts.transport.idle_deadline = Duration::from_millis(300); // so the probe gate is 150 ms
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2)], 1, 0),
+        listener(),
+        opts,
+        RecordingApplier::default(),
+    )
+    .unwrap();
+
+    let (mut c1, _) = peer.accept().expect("the node's transport dials its peer on its own");
+    c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = [0u8; 6];
+    c1.read_exact(&mut hs).expect("the dialler sends its handshake first");
+    let mut ours = Vec::new();
+    crate::replication::write_handshake(&mut ours).unwrap();
+    c1.write_all(&ours).unwrap();
+    // Everything the node sent has been read, so this close is a FIN, not a reset.
+    drop(c1);
+
+    // Past the gate, with room for the FIN to reach the node's kernel before the probe.
+    std::thread::sleep(Duration::from_millis(400));
+    n.next_tick = Instant::now() - Duration::from_millis(50);
+    n.poll(Duration::ZERO).unwrap();
+
+    // The premise, read from the transport itself rather than through the snapshot under test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (n.net.idle_probes() == 0 || n.net.idle_redials() == 0) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        n.net.idle_probes() >= 1 && n.net.idle_redials() >= 1,
+        "the probe never fired and redialled (probes {}, redials {}), so this tests nothing",
+        n.net.idle_probes(),
+        n.net.idle_redials()
+    );
+
+    // Both counters only rise, and the premise was read first, so the snapshot must show both.
+    let c = n.transport_counters();
+    assert!(c.idle_probes >= 1, "the node's snapshot hides the transport's idle probes: {c:?}");
+    assert!(c.idle_redials >= 1, "the node's snapshot hides the transport's idle redials: {c:?}");
+    drop(peer);
+    n.shutdown();
+}
+
 use crate::consensus::snapshot as snap6;
 use crate::consensus::{Body, Message};
 
