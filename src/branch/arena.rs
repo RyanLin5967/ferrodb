@@ -4777,4 +4777,39 @@ mod tests {
         }
         assert_eq!(h.store.persist_counters(), (0, 0));
     }
+
+    /// **D221, producer U2: a claim the catalog refuses.**
+    ///
+    /// `alloc_arena` inserted the extent into the store's map, and made it the branch's current
+    /// arena, BEFORE `catalog.add_arena`. When the catalog refused, which it does for a handle
+    /// that is `Reaping`, `Reaped` or of an older generation, the claim returned `Err` and left
+    /// the extent behind. That extent is empty, charged to a branch that is already gone, and in
+    /// no record's arena list. So nothing names it, and until D221 only a scan of every live
+    /// arena found it. The steady-state sweep may stop doing that scan only if this state cannot
+    /// exist, so the claim must leave the store exactly as it found it.
+    #[test]
+    fn d221_a_claim_the_catalog_refuses_leaves_no_extent_behind() {
+        use crate::branch::types::BranchState;
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.catalog.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+        let live_before = h.store.live_arenas();
+        let reserved_before = h.store.reserved_page_count();
+
+        let err = h
+            .store
+            .alloc_arena(b)
+            .expect_err("fixture: the catalog must refuse a claim for a reaped handle");
+
+        assert_eq!(
+            h.store.live_arenas(),
+            live_before,
+            "D221 U2: the refused claim ({err}) left an extent in the store that no record names"
+        );
+        assert_eq!(
+            h.store.reserved_page_count(),
+            reserved_before,
+            "D221 U2: the refused claim ({err}) left its pages counted as reserved"
+        );
+    }
 }

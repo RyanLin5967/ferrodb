@@ -1336,3 +1336,57 @@ fn d209_the_open_stamp_holds_the_cadence_one_interval_from_the_sweep_and_no_long
          the residue of an in-process error path waits on it"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D221 — a steady-state pass costs the residue, not the live arena count.
+// -------------------------------------------------------------------------------------------
+
+/// Claim one EMPTY extent for each of `n` new live branches. An empty extent of a LIVE owner is
+/// never collectable, so a sweep over these visits and descends and frees nothing: the fixture
+/// moves only the count a scan of every live arena would pay for.
+fn claim_live_extents(f: &Fixture, n: usize) {
+    for _ in 0..n {
+        let b = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+        f.h.store.arena_for(b).unwrap();
+    }
+}
+
+/// **D221.** A due pass of the cadence ran the full O(live arenas) scan. With the lease loop's
+/// 30 s wait and the 60 s interval, every pass is due once reaping plus sweeping takes 30 s, so at
+/// 10^6 arenas the lease thread would spend at least half its time sweeping (read-vs-n PREREG R5
+/// puts one sweep at 10-90 s; inferred, unmeasured).
+///
+/// Stated as a slope rather than a ratio: a due pass at N live arenas, then one at 2N, with no
+/// residue either time. Before the fix the second visits twice as many. After it, both visit the
+/// fix's fixed slice (1,024, below N here), so they are equal. Each is the FIRST due pass of a
+/// fresh reaper, so the second does not inherit the first's progress through the arenas: a pass
+/// finishing a slice rotation the first began would visit fewer, which is cheaper, not "flat". It
+/// observes only `sweep_visits`, `deferred_len` and `collect_orphans_if_due`, which all exist
+/// without the fix, so it compiles against the unfixed tree and fails there.
+#[test]
+fn d221_a_due_pass_does_not_grow_with_the_live_arena_count() {
+    const N: usize = 1_500;
+    // Below every lease `FAR_FUTURE` hands out, so the due-check decides the sweep and nothing
+    // else.
+    let t0 = 1_000_000u64;
+    let f = fixture();
+    let first_due_pass = || {
+        let reaper = TwoTierReaper::new(Arc::clone(&f.h.catalog), Arc::clone(&f.h.store));
+        assert_eq!(reaper.deferred_len(), 0, "fixture: no residue, so every visit is the scan's");
+        reaper.collect_orphans_if_due(t0).unwrap();
+        reaper.sweep_visits()
+    };
+
+    claim_live_extents(&f, N);
+    let at_n = first_due_pass();
+    claim_live_extents(&f, N);
+    let at_2n = first_due_pass();
+
+    assert!(at_n > 0, "the first due pass visited nothing, so it says nothing about its cost");
+    assert_eq!(
+        at_2n, at_n,
+        "doubling the live arenas ({N} -> {} new branches) moved one due pass from {at_n} to \
+         {at_2n} arena visits with no residue: the steady-state sweep is O(live arenas) (D221)",
+        2 * N
+    );
+}

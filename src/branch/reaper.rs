@@ -2484,6 +2484,163 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // D221 — every in-process producer of a collectable extent must reach the residue.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D221, producer U1: a reap that fails AFTER it marked the branch `Reaped`.**
+    ///
+    /// The steady-state sweep may only stop scanning every live arena if every in-process way
+    /// to orphan an extent records that extent in `deferred`. This is one that did not. `reap`
+    /// captures the branch's own arenas as the drain's seed, and the seed is handed to the
+    /// `DeferTouched` guard only inside `drain_pending_seeded`. Between the `Reaped` mark and that
+    /// call sits `detach_from_parent`, whose `has_live_children` is a catalog read that can fail.
+    /// A failure there returned with the seed in a local. On the slow path the retire has already
+    /// released every unpinned page, so the extents are EMPTY and charged to a branch that is now
+    /// `Reaped`: collectable, named by nothing, and until D221 found only because the cadence
+    /// scanned every live arena.
+    ///
+    /// The fixture forks the child BEFORE the parent writes, so none of the parent's pages is
+    /// visible to it. A live child sends the reap down the slow path, and nothing it can see means
+    /// every page is released. The first `has_live_children` ask (the slow-path decision) answers;
+    /// the second (in `detach_from_parent`, after the mark) fails.
+    #[test]
+    fn d221_a_reap_that_fails_after_marking_reaped_records_its_own_extents() {
+        struct FailsLiveChildrenAsk {
+            inner: Arc<dyn BranchCatalog>,
+            /// Asks that still answer before every later one fails. `u64::MAX`: never fail.
+            answer: AtomicU64,
+        }
+        impl BranchCatalog for FailsLiveChildrenAsk {
+            fn next_epoch(&self) -> Epoch { self.inner.next_epoch() }
+            fn current_epoch(&self) -> Epoch { self.inner.current_epoch() }
+            fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+                self.inner.fork(p, l)
+            }
+            fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> { self.inner.get(b) }
+            fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
+                self.inner.add_arena(b, a)
+            }
+            fn reparent(&self, b: BranchId, p: BranchId, e: Epoch, r: PageId)
+                -> Result<BranchRecord, FerroError> {
+                self.inner.reparent(b, p, e, r)
+            }
+            fn restrict_envelope(
+                &self,
+                b: BranchId,
+                env: crate::branch::record::CapabilityEnvelope,
+            ) -> Result<(), FerroError> {
+                self.inner.restrict_envelope(b, env)
+            }
+            fn set_state(&self, b: BranchId, expect: BranchState, to: BranchState)
+                -> Result<(), FerroError> {
+                self.inner.set_state(b, expect, to)
+            }
+            fn set_root(&self, b: BranchId, r: PageId) -> Result<(), FerroError> {
+                self.inner.set_root(b, r)
+            }
+            fn expired_before(&self, n: u64) -> Result<Vec<CoreRecord>, FerroError> {
+                self.inner.expired_before(n)
+            }
+            fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.in_state(s)
+            }
+            fn scan(&self)
+                -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+                self.inner.scan()
+            }
+            fn live_count(&self) -> usize { self.inner.live_count() }
+            fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> { self.inner.get_raw(id) }
+            fn release_id(&self, id: u64) { self.inner.release_id(id) }
+            fn max_live_child(&self, p: u64) -> Result<Option<Epoch>, FerroError> {
+                self.inner.max_live_child(p)
+            }
+            fn live_child_in_epoch_range(&self, p: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+                self.inner.live_child_in_epoch_range(p, lo, hi)
+            }
+            fn has_live_children(&self, p: u64) -> Result<bool, FerroError> {
+                let left = self.answer.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Err(FerroError::Internal("injected: has_live_children".into()));
+                }
+                if left != u64::MAX {
+                    self.answer.store(left - 1, Ordering::SeqCst);
+                }
+                self.inner.has_live_children(p)
+            }
+            fn attach_child(&self, p: u64, e: Epoch, c: u64) -> Result<(), FerroError> {
+                self.inner.attach_child(p, e, c)
+            }
+            fn detach_child(&self, p: u64, e: Epoch) -> Result<bool, FerroError> {
+                self.inner.detach_child(p, e)
+            }
+            fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+                self.inner.renew_lease(b, l)
+            }
+            fn envelope_of(&self, b: BranchId)
+                -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+                self.inner.envelope_of(b)
+            }
+            fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+                self.inner.charge_row_writes(b, n)
+            }
+        }
+
+        let (h, _r) = setup();
+        let failing = Arc::new(FailsLiveChildrenAsk {
+            inner: Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            answer: AtomicU64::new(u64::MAX),
+        });
+        let reaper = TwoTierReaper::new(
+            Arc::clone(&failing) as Arc<dyn BranchCatalog>,
+            Arc::clone(&h.store),
+        );
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let child = h.catalog.fork(parent, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        write_pages(&h, parent, 3);
+        let own: Vec<ArenaId> = h.catalog.get(parent).unwrap().arenas.clone();
+        assert!(!own.is_empty(), "fixture: the parent owns no extent, so nothing can be orphaned");
+
+        failing.answer.store(1, Ordering::SeqCst);
+        let err = reaper
+            .reap(parent)
+            .expect_err("fixture: the injected ask must fail the reap, or this proves nothing");
+
+        // Premises, each of which the property below needs: the reap got PAST the mark, the
+        // extents are still charged, and they are empty, so a sweep would free them.
+        assert_eq!(
+            h.catalog.get_raw(parent.id).unwrap().state,
+            BranchState::Reaped,
+            "fixture: the reap failed ({err}) before its Reaped mark, which is a different \
+             producer (a Reaping record, resumed at open)"
+        );
+        assert_eq!(
+            h.catalog.get_raw(child.id).unwrap().state,
+            BranchState::Live,
+            "fixture: the child must still be live, or the slow path was not the one taken"
+        );
+        for a in own.iter().copied() {
+            assert!(h.store.arena_owner(a).is_some(), "fixture: extent {a} is no longer charged");
+            assert!(
+                h.store.extent_is_empty(a),
+                "fixture: extent {a} still holds pages, so it is not an orphan any sweep frees"
+            );
+        }
+
+        let recorded: Vec<ArenaId> = own
+            .iter()
+            .copied()
+            .filter(|a| reaper.deferred.lock().unwrap().contains(a))
+            .collect();
+        assert_eq!(
+            recorded, own,
+            "D221 U1: the reap failed after marking the branch Reaped ({err}), and its own \
+             emptied extents are not in the residue. Nothing names them any more; only a scan of \
+             every live arena, or the next open, can find them."
+        );
+    }
+
             }
         };
     }
