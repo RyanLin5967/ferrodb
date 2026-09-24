@@ -244,7 +244,8 @@ fn a_table_catalog_reopen_keeps_the_pin_of_a_reaped_interior() {
 /// **D235 review F3: a rebuild must not pin a recycled parent slot's new occupant.**
 ///
 /// The running D16 reaper cannot build this shape: `release_id` refuses a slot with live children.
-/// A PRE-D16 reaper could, because it detached unconditionally, and so can D201's seal fallback.
+/// A PRE-D16 reaper could, because it detached unconditionally. So can the reaper-less `seal`
+/// fallback in `runtime.rs` (SCALE-LEDGER D201), which detaches without asking about live children.
 /// The shape: P -> X -> C, with X reaped and DETACHED from P although C lives. P, now childless, is
 /// reaped and its slot released and recycled into N, a child of Q, and N is reaped too. X still
 /// names P's OLD incarnation as its parent.
@@ -254,15 +255,21 @@ fn a_table_catalog_reopen_keeps_the_pin_of_a_reaped_interior() {
 /// rule compares the parent handle X recorded with the slot's current `branch_id` and stops.
 ///
 /// Both rebuilders are asked: the log reopen (`index`) and a `migrate_from` of that reopened log.
-/// **PASS at `9aa6968`**: the base rule pinned no reaped record at all, so it never walked.
-/// **FAIL at `6589552`**: the rule's first version had no incarnation check. **PASS at the tip.**
-/// Only base API is named, so it compiles at all three. PREREG amendment 2.
+/// It also asserts the pin the rule KEEPS on purpose: X's entry under P's old slot, because pages
+/// old P parked are judged by the slot id. Without that assertion the test could not tell "the walk
+/// stopped at the recycled slot" from "the walk never ran".
+///
+/// - **FAIL at `9aa6968`**, at that kept pin: the base rule derived no reaped record's entry.
+/// - **FAIL at `6589552`**, at Q: the rule's first version had no incarnation check.
+/// - **PASS at the tip.**
+///
+/// Only base API is named, so it compiles at all three. PREREG amendments 2–3.
 #[test]
 fn a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant() {
     let files = Files::new("recycled");
     let never = LeaseDeadline(NEVER);
 
-    let (q, p_slot, x, c, n) = {
+    let (q, p_slot, x, x_fork, c, n) = {
         let cat = LogBranchCatalog::open(&files.cat, 1).expect("open log catalog");
         let q = cat.fork(BranchId::TRUNK, never).unwrap().branch_id;
         let p = cat.fork(BranchId::TRUNK, never).unwrap();
@@ -291,7 +298,7 @@ fn a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant() {
         // PREMISE, in memory: Q has no live child, and X still pins C.
         assert!(!cat.has_live_children(q.id).unwrap(), "premise: Q is childless before any rebuild");
         assert!(cat.has_live_children(x.branch_id.id).unwrap(), "premise: X still lists live C");
-        (q, p.branch_id.id, x.branch_id, c, n)
+        (q, p.branch_id.id, x.branch_id, x.fork_epoch, c, n)
         // `cat` drops here: the reopen below reads only the file.
     };
 
@@ -313,8 +320,8 @@ fn a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant() {
         (&migrated as &dyn BranchCatalog, "migration"),
     ];
     for (cat, name) in rebuilt {
-        // PREMISES after the rebuild: the slot holds N's incarnation, X is reaped, C lives, and the
-        // D16 pin X holds for C is intact.
+        // PREMISES after the rebuild: the slot holds N's incarnation, X is reaped, C lives, and C's
+        // own entry under X survived (a live child's entry: true at every tree).
         assert_eq!(
             cat.get_raw(p_slot).unwrap().branch_id,
             n,
@@ -324,7 +331,20 @@ fn a_rebuild_does_not_pin_a_recycled_parent_slot_s_new_occupant() {
         assert_eq!(cat.get_raw(c.id).unwrap().state, BranchState::Live, "{name}: premise: C");
         assert!(
             cat.has_live_children(x.id).unwrap(),
-            "{name}: X must still pin the live C below it (the D16 pin itself)"
+            "{name}: premise: C's own entry under X must survive the rebuild"
+        );
+        // THE PIN THE RULE KEEPS ON PURPOSE: X is reaped with live C below it, so it holds an entry
+        // under the slot it forked from, even though that slot now holds N. Pages old P parked are
+        // judged by the slot id (`record::parent_entry_holders`' doc).
+        assert!(
+            cat.has_live_children(p_slot).unwrap(),
+            "{name}: X's entry must stay under P's old slot (now N's). X is a D16 pin, since C lives \
+             below it, and the base rule dropped every reaped record's entry"
+        );
+        assert_eq!(
+            cat.max_live_child(p_slot).unwrap(),
+            Some(x_fork),
+            "{name}: the kept pin must report X's own fork epoch"
         );
         // THE CLAIM.
         assert!(
