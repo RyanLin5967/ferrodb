@@ -1087,7 +1087,8 @@ impl Reaper for TwoTierReaper {
         if !foreign.is_empty() {
             self.foreign_arenas_skipped.fetch_add(foreign.len() as u64, Ordering::Relaxed);
         }
-        rec.arenas = owned;
+        // MUTANT (fire-check only, never land): the catalog's list is freed unfiltered.
+        let _ = owned;
 
         let own_arenas = DeferTouched::armed(self, rec.arenas.iter().copied().collect());
 
