@@ -12,10 +12,12 @@
 //! version upserts off a picture of the file that is no longer true.
 //!
 //! Pre-registered mutants (in `src/agent_sql/runtime.rs`), each RED here:
-//! - `poison_history` does nothing: the MERGE after the reservation failure is accepted.
-//! - `next_merge_id` skips `history_usable()`: the same MERGE reserves again and is accepted.
-//! - `reserve_merge_ids`, or the publish path after `write_history`, does not poison on the write
-//!   failure: the MERGE after it is accepted.
+//! - `poison_history` does nothing, `next_merge_id` skips `history_usable()`, or
+//!   `reserve_merge_ids` does not poison on its write failure: the MERGE after the reservation
+//!   failure is not refused for the poison. It reserves again and reaches the publish, where the
+//!   still-armed `publish` injection fails it with a message that names no poison.
+//! - the publish path does not poison when `write_history` fails: the MERGE after it is accepted
+//!   (both injections before it are spent).
 //! - `revert_merge` does not poison when `write_revert_record` fails: the second REVERT is accepted.
 //! - `revert_merge` skips `history_usable()`: the first REVERT answers about `m_1` (an id never
 //!   minted), not about the history.

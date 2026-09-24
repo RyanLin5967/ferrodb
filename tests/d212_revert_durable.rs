@@ -14,7 +14,8 @@
 //! | (3b) | inherited captures | `plan_history` plans the merging task's capture only |
 //! | (4) | `next_txn` | `attach_history` skips `state.next_txn = max(..)` |
 //! | (5) | `next_merge`, `merges`, `applied`, revert markers | skip `state.next_merge = max(..)`; or no `MERGES_TABLE` row; or no `APPLIED` record; or `write_revert_record` writes no `REVERTED` record |
-//! | two runtimes (both tests) | the durable counters, compared with this runtime's view | `durable_history_unmoved` returns the row without comparing; or `reserve_merge_ids` adopts the whole durable row into the cursor |
+//! | two runtimes (both MERGE tests) | the durable counters, compared with this runtime's view | `durable_history_unmoved` returns the row without comparing; or `reserve_merge_ids` adopts the whole durable row into the cursor |
+//! | two runtimes, REVERT | the same, at REVERT | `revert_merge` skips `durable_history_unmoved` |
 //! | capture encodable | E82: every refusal before the first write | `publish_evaluation_as` skips `captures_encodable` |
 //!
 //! Every restart here is real: the files are checkpointed, every in-process object — sessions
@@ -410,6 +411,37 @@ fn a_runtime_is_refused_after_another_published_a_merge_with_no_rows() {
     );
     drop(b);
     assert_eq!(db.qty_of(2), 20, "the refused merge published its row");
+}
+
+/// **Two runtimes: a REVERT on the one another runtime overtook is refused as well.** Unchecked, it
+/// answers from its own memory — here, that the other runtime's merge id was "issued by this server
+/// run but published nothing", which is false — and a REVERT of its own merge would miss the
+/// dependents only the other runtime captured.
+#[test]
+fn a_revert_on_a_runtime_another_runtime_overtook_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    db.seed(&[(1, 10), (2, 20)]);
+
+    // The database's own runtime attaches, at its first agent statement, on an empty history.
+    let (a, _) = db.agent("a");
+    drop(a);
+    // A second runtime publishes.
+    let mut b = Session::with_runtime(Arc::new(AgentRuntime::new()));
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("UPDATE inventory SET qty = 21 WHERE id = 2;", &mut b);
+    let mb = db.merge(&mut b).merge_id;
+    drop(b);
+    assert_eq!(db.qty_of(2), 21, "fixture premise: the second runtime's merge landed");
+
+    let mut s = db.session();
+    let refused = db.exec(&format!("REVERT MERGE {mb};"), &mut s).err().map(|e| e.to_string());
+    drop(s);
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains("since this one last read it")),
+        "a REVERT on a runtime another one overtook was not refused for that: {refused:?}"
+    );
+    assert_eq!(db.qty_of(2), 21, "the refused REVERT inverted the row");
 }
 
 /// **E82 for the history: a capture it cannot encode refuses the merge before ANY write — the

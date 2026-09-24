@@ -6513,7 +6513,7 @@ impl AgentRuntime {
         self.attach_history(&ctx.read())?;
         self.history_usable()?;
         // Another runtime's history would be read as this one's; see `durable_history_unmoved`.
-        let durable = self.durable_history_unmoved(&ctx.read(), "revert")?;
+        let meta_on_disk = self.durable_history_unmoved(&ctx.read(), "revert")?;
 
         // ---- which merge, and whether its history is in memory or only on disk ----------------
         let found = {
@@ -6629,7 +6629,7 @@ impl AgentRuntime {
         // reached through a restart.
         self.ensure_history_tables(ctx)?;
         // Built on the row as it is on disk, as a publish's is (`plan_history`).
-        let meta_before = durable;
+        let meta_before = meta_on_disk;
         let base = meta_before.unwrap_or_default();
         let marker = revert_store::reverted_record(merge_id, &undone)?;
         let (marker_rows, log_high) = revert_store::log_rows(base.log_high, &[marker])?;
