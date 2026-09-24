@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2015,8 +2015,6 @@
+             }
+             drop(st);
+             conn = None;
+-        } else {
+-            last_used = Instant::now();
+         }
+     }
+ 

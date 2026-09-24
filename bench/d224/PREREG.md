@@ -109,3 +109,40 @@ never a false green. On a loaded box, a B failure is read as "re-run quieter".
 ## Per-target
 
 **2598 + 3 = 2601** on macOS: the D207 lane's 2598 (INFERRED; not yet run) plus I, B and P.
+
+---
+
+## Amendment 1 — the fix, tests and mutants recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `3cbbc80` | the fix |
+| `12fb897` | post-fix tests **B** and **P** |
+
+The transport module now has 61 `#[test]`, as Run G predicted. The mutants N1–N5 are generated from `12fb897` by
+`bench/d224/make_mutants.py 12fb897`, and every patch passes `git apply --check`.
+
+- **N1 and N3** are written as `if false && …`, so the helpers stay referenced and the mutant builds without new
+  warnings.
+- **N2** is `if true || …`, which opens the gate for every frame.
+- **N4** drops the frame instead of carrying it.
+- **N5** removes the refresh after a successful write.
+
+**P, refined:** it reads `idle_probes` and `idle_redials` just before the one send and asserts that each rose by
+**exactly 1**, so on a loaded box a probe of the first frame cannot be mistaken for this one. `lost_in_flight` must
+be 0.
+
+**B, refined:** it is 25 frames 100 ms apart, closer to a heartbeat's 150 ms pace, with a lower-bound check that the
+link lived at least 2 s, which is twice the 1 s gate.
+
+**Collateral** (every test must pass):
+
+- `timeout 1800 cargo test --no-fail-fast --lib consensus::`, which covers `tests_signing` (real transports),
+  `tests_node` and the rest;
+- `timeout 1800 cargo build --examples`, then
+  `timeout 1800 cargo test --no-fail-fast --test integration_cluster_agents --test integration_cluster_snapshot --test integration_consensus_failover`.
+
+**Errata to the original registration** (append-only):
+
+- `heartbeat: 3` is at `consensus/mod.rs:472`, not `:473`;
+- `election_base` and the jittered timeout are at `:452-454`, not `:453-455` (READ at `12fb897`).

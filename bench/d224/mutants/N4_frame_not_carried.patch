@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1994,7 +1994,7 @@
+                 }
+                 drop(st);
+                 conn = None;
+-                carried = Some(frame);
++                drop(frame);
+                 continue;
+             }
+         }

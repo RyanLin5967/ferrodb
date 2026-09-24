@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1984,7 +1984,7 @@
+         // attached, and only the next write would fail. Consensus leaves follower-to-follower links
+         // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
+         // leader died. A link consensus keeps busy never reaches this gate, so it costs them nothing.
+-        if last_used.elapsed() >= probe_gap {
++        if true || last_used.elapsed() >= probe_gap {
+             counters.idle_probes.fetch_add(1, Ordering::SeqCst);
+             if peer_has_closed(s) {
+                 counters.idle_redials.fetch_add(1, Ordering::SeqCst);
