@@ -72,6 +72,7 @@
 use std::{marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}, range_scan::RangeScanner}};
+use crate::buffer::read_census::{self, Event};
 use crate::storage::index_page::BPlusTreePage;
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::storage::page_latch::{PageLatches, PageReadGuard, PageWriteGuard};
@@ -299,7 +300,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         const RESTARTS: usize = 16;
         const RIGHT_WALK: usize = 64;
+        // READ-VS-N. Per-thread counts, observing only — see `read_census`. A descent whose path
+        // meets a non-resident page shows here as RESTARTS attempts plus one latched descent.
+        read_census::bump(Event::Descent);
         'restart: for _ in 0..RESTARTS {
+            read_census::bump(Event::Attempt);
             let root = self.root_page_id.load(Ordering::Acquire);
             let Some(page) = self.buffer_pool.read_page_optimistic(root) else { continue 'restart };
             // A root split moved the root cell; the page read was the OLD root, which is now an
@@ -317,6 +322,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                 None => continue 'restart,
             }
         }
+        read_census::bump(Event::Latched);
         self.read_leaf_for_latched(key)
     }
 
@@ -377,6 +383,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     while leaf.key_arr.last().is_none_or(|max| max < key) {
                         let Some(next) = leaf.next else { break };
                         hops += 1;
+                        read_census::bump(Event::RightWalk);
                         if hops > right_walk {
                             return Ok(None);
                         }
