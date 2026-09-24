@@ -1040,6 +1040,14 @@ impl MergeDb {
             })
             .collect()
     }
+
+    /// Every row a trunk SELECT returns.
+    fn rows(&mut self, sql: &str) -> Vec<Vec<Value>> {
+        match self.sql(sql) {
+            Outcome::Rows(r) => r,
+            _ => panic!("`{}` did not return rows", abbreviate(sql)),
+        }
+    }
 }
 
 /// **H2: a MERGE whose row would land over the bound is refused before the schema moves.**
@@ -1181,4 +1189,77 @@ fn a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_
     // Red here on d225 alone: "cannot build the index".
     d.sql("CREATE INDEX iv ON t (v);");
     assert_eq!(d.ids("SELECT id FROM t WHERE v = 'kept';"), vec![2]);
+}
+
+// ---- PREREG amendment 5: the bound asked when a row is typed on a branch --------------------------
+
+/// **A branch INSERT over the bound in the branch's own shape is refused when it is typed.** The
+/// branch stages `n TYPE BIGINT` FIRST, so `('p' x 2023, 7)` would land with a secondary entry of
+/// 9 + 2026 = 2035 bytes, one over the bound, although it is 5 + 2026 = 2031 in the table's shape
+/// as it stands. The agent is told when it types the row, and nothing is staged. The control,
+/// `('p' x 2022, 8)`, is 2034 and is taken. Red at `c96d166`: the INSERT is accepted.
+///
+/// The MERGE's landing check is the second guard, for a row typed BEFORE the edit that pushes it
+/// over, which this check cannot see; its own test is
+/// `a_merge_whose_row_would_land_over_the_bound_is_refused_before_the_schema_moves`.
+#[test]
+fn a_branch_insert_over_the_bound_in_the_branch_shape_is_refused_when_typed() {
+    let mut d = merge_db();
+    d.sql("CREATE TABLE t (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("CREATE INDEX i ON t (n);");
+
+    let mut agent = d.branch("agent-typed-insert");
+    d.exec("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;", &mut agent).expect("the branch stages the retype");
+    let msg = match d.exec(&format!("INSERT INTO t VALUES ('{}', 7);", "p".repeat(2023)), &mut agent) {
+        Ok(_) => panic!("the branch took a row whose index entry is over the bound in its own shape"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("index entry too large: 2035 bytes")
+            && msg.contains("on this branch")
+            && msg.contains("Nothing has been staged"),
+        "not the typing-time refusal: {}",
+        abbreviate(&msg)
+    );
+    d.exec(&format!("INSERT INTO t VALUES ('{}', 8);", "p".repeat(2022)), &mut agent)
+        .expect("the control, 2034 bytes in the branch's shape, is taken");
+
+    d.exec("MERGE;", &mut agent).expect("the merge lands the retype and the control row");
+    assert_eq!(d.shape("t")[1].1, DataType::BigInt, "the merge did not land the retype");
+    let rows = d.rows("SELECT n FROM t;");
+    assert!(
+        matches!(rows.as_slice(), [r] if matches!(r.as_slice(), [Value::BigInt(8)])),
+        "the trunk must hold exactly the control row: {rows:?}"
+    );
+}
+
+/// **A branch UPDATE to a value over the bound is refused when it is typed.** `v` is indexed and
+/// `'x' x 2027` makes the entry (3 + 2027) + 5 = 2035 bytes. The UPDATE writes that entry, so it is
+/// asked, as the UPDATE executor and the landing check ask it. The control, `'x' x 2026`, is 2034
+/// and is taken. Red at `c96d166`: the UPDATE is accepted.
+#[test]
+fn a_branch_update_over_the_bound_is_refused_when_typed() {
+    let mut d = merge_db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    d.sql("INSERT INTO t VALUES (1, 'short');");
+
+    let mut agent = d.branch("agent-typed-update");
+    let msg = match d.exec(&format!("UPDATE t SET v = '{}' WHERE id = 1;", "x".repeat(2027)), &mut agent) {
+        Ok(_) => panic!("the branch took an UPDATE whose index entry is over the bound"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("index entry too large: 2035 bytes")
+            && msg.contains("on this branch")
+            && msg.contains("Nothing has been staged"),
+        "not the typing-time refusal: {}",
+        abbreviate(&msg)
+    );
+    let at = "x".repeat(2026);
+    d.exec(&format!("UPDATE t SET v = '{at}' WHERE id = 1;"), &mut agent)
+        .expect("the control, 2034 bytes, is taken");
+
+    d.exec("MERGE;", &mut agent).expect("the merge lands the control");
+    assert_eq!(d.rows("SELECT v FROM t WHERE id = 1;"), vec![vec![Value::Varchar(at)]], "the trunk row is not the control");
 }
