@@ -321,7 +321,7 @@ pub(crate) enum CheckpointPausePoint {
 
 /// D253's checkpoint pause seam, production half: a checkpoint never pauses. The test half, which
 /// runs a closure a test handed to one manager, is defined after the tests module at the end of this
-/// file, like the release seam above and for its reason (no `#[cfg(test)]` above the tests module).
+/// file, like the release seam above and for its reason (nothing test-only above the tests module).
 #[cfg(not(test))]
 fn checkpoint_pause(_txn: u64, _at: CheckpointPausePoint) {}
 
