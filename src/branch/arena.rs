@@ -1401,8 +1401,10 @@ impl ArenaPageStore {
         bytes: &[u8],
     ) -> Result<(), FerroError> {
         let parsed = self.parse_state(bytes)?;
+        // MUTANT (fire-check only, never land): the file is written before persist is taken.
+        let written = ops.write(path, bytes);
         let mut persist = self.persist.lock().unwrap();
-        if let Err(e) = ops.write(path, bytes) {
+        if let Err(e) = written {
             // The file may now be partly written, so no persist may append behind it: the next one
             // rewrites. The map in memory is untouched.
             persist.image_bytes = 0;
