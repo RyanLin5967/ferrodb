@@ -248,7 +248,8 @@ pub fn exit_sequence(
     store: &ArenaPageStore,
     arena_path: &Path,
 ) -> Result<(), FerroError> {
-    let wal_checkpoint = crate::catalog::clean_exit::checkpoint_for_exit(catalog, txn);
+    let _ = catalog; // D230 MUTANT M9: the exit checkpoints without persisting the catalog
+    let wal_checkpoint = txn.checkpoint();
     let arena_checkpoint = store.checkpoint(arena_path);
     let mut errors = [wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
     let first = errors.next();
