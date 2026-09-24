@@ -59,8 +59,9 @@
 //! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
 //! the next write that fails. Since D224 a sender probes a link it has left idle before writing to
 //! it, and redials if the peer closed it ([`Transport::idle_probes`], [`Transport::idle_redials`]).
-//! So an idle close costs frames (two, the first uncounted) only in the narrow race
-//! `idle_probe_gap` describes. The same is
+//! So an idle close costs frames (two, the first uncounted) only in the cases `idle_probe_gap`
+//! lists: the narrow race at the peer's close, the band of gaps a violated deadline premise leaves
+//! unprobed, and a redial that lands on a peer shutting down mid-handshake. The same is
 //! true of the receiving side. A connection closed on a frame with an
 //! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
 //! whatever the peer sends after it; of those closes, only the idle one is counted
@@ -1967,7 +1968,10 @@ fn sender_loop(
     // whether the link is probed before the next write (D224; the gate is just before the write).
     let mut last_used = Instant::now();
     // A frame already taken from the queue whose link the probe found closed. It is written first on
-    // the next connection, so finding the close costs the frame nothing. It sits outside the queue's
+    // the next connection, so finding the close does not itself lose the frame. The dial resets
+    // `last_used`, though, so the carried frame goes out unprobed, and a redial that lands on a peer
+    // shutting down mid-handshake still loses it (`idle_probe_gap`, "a redial onto a refusal").
+    // It sits outside the queue's
     // drop-oldest bound while the peer is down, so on return the stalest frame goes first, against
     // `push`'s policy. Consensus refuses a stale term, so one such frame is harmless.
     let mut carried: Option<Vec<u8>> = None;
@@ -2103,9 +2107,11 @@ fn sender_loop(
 /// leader several election timeouts ago.
 ///
 /// **At most the peer's `idle_deadline`, so every link the peer may have closed is probed.** The peer
-/// closes a link only after hearing nothing for longer than its `idle_deadline`, counted from its
-/// last read, which is no earlier than this sender's last write. So a gap under this cannot have
-/// been closed, as long as the peer's deadline is at least this gate.
+/// closes a link only after hearing nothing for longer than its `idle_deadline`, counted from the
+/// last complete frame it read, which began no earlier than this sender's last write. So a gap under
+/// this cannot have been closed, as long as the peer's deadline is at least this gate. The refresh
+/// after a write comes a scheduling delay after the write itself; that slack sits inside the residual
+/// race below.
 ///
 /// **Premise, stated and not enforced: no node's `idle_deadline` is below half of another's.** That
 /// is the receiver's `D_r ≥ D_s / 2`, where `D_s` is this sender's; equal deadlines are not needed.
@@ -2122,6 +2128,19 @@ fn sender_loop(
 /// uncounted. It also refreshes the gap, so the next frame is not probed: it fails against the reset
 /// and is counted. That is two frames, the whole pre-D224 cost, at a small probability. A
 /// follower-to-follower link idle for a whole term is far outside that window.
+///
+/// **A redial onto a refusal** (D224 review 2, G2). A dial resets the gap, so the frame the probe
+/// carried, and any queued behind it, goes out unprobed. If the redial lands on a peer that is
+/// shutting down mid-handshake, `dial` succeeds with that peer's `Error` frame and FIN waiting. The
+/// carried frame is then lost uncounted, and the next one fails and is counted: the same two frames.
+/// A peek at the end of `dial` would catch only an `Error` that arrived with the handshake; closing
+/// this fully needs the acceptor to send a verdict, which is a protocol change.
+///
+/// **What bounds every one of these losses is consensus retransmission, not this transport.** A
+/// pre-candidate re-campaigns each time its countdown reaches `election_timeout`, and a campaign
+/// restarts the countdown (`election.rs`, `voter_tick` and `start_precampaign`). A leader re-sends
+/// from each peer's `next` on every heartbeat (`leader_tick`, then `bcast_append` in
+/// `replicate.rs`). So a lost frame costs one retransmission interval, never a round.
 ///
 /// **A restarted peer is caught only across a gap of at least this**, which in practice means an idle
 /// follower-to-follower link. It is not caught on a busy link, where it costs two heartbeats, nor
@@ -2150,7 +2169,7 @@ fn peer_has_closed(s: &TcpStream) -> bool {
     let closed = match s.peek(&mut probe) {
         Ok(0) => true,
         // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
-        // link. Either way the frame is carried to a redial, which costs it nothing.
+        // link. Either way the frame is carried to a redial rather than written into a closed link.
         Ok(_) => true,
         Err(e) => !matches!(
             e.kind(),
