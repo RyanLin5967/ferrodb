@@ -512,20 +512,11 @@ fn attach_built_index(
     txn: &TxnManager,
     built: crate::catalog::catalog::BuiltIndex,
 ) -> Result<Outcome, FerroError> {
-    // Held outside the unit, so a unit refused before its closure runs still has the tree to free.
-    let mut unattached = Some(built);
-    let unit = txn.ddl_checkpointed(|| {
-        let built = unattached.take().expect("ddl_checkpointed runs its closure at most once");
-        catalog.attach_index(built).map_err(|(e, back)| {
-            unattached = back;
-            e
-        })
-    });
-    match (unit, unattached) {
-        (Ok(()), _) => Ok(Outcome::Ok),
-        (Err(e), Some(built)) => Err(catalog.discard_after(e, built)),
-        (Err(e), None) => Err(e),
-    }
+    // D271 MUTANT MB: attach first, then checkpoint, as the base did (`checkpoint_keeping_owed` has
+    // the deleted `ddl_checkpoint`'s refusal and keep behaviour)
+    catalog.attach_index(built).map_err(|(e, _)| e)?;
+    txn.checkpoint_keeping_owed()?;
+    Ok(Outcome::Ok)
 }
 
 /// Roll back the transaction a failed statement ran in, and return the error the caller reports.
