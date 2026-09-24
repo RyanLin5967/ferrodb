@@ -120,3 +120,46 @@ A MERGE on a poisoned store whose altered tables carry no attributed row skips t
 - b7 (A1's red at `e60c5be`) is unchanged: that commit's test 3 still carries its `next_lsn` line and still fails at the column count.
 - Mutants: every one except M4 and M11 is KILLED, M23 by the F1 test.
 - Lib: +19 over `9aa6968`, not +18.
+
+## A3 (2026-09-24T21:48Z, before any code): review 7 F5 FIXED, on the lead's decision
+
+**Decided by:** the lead, 2026-09-24 ("FIX IT, on D219, where F5 originates"). This replaces A2's "F5: recorded as known and not fixed here". A2's F5 text stays as written. This entry supersedes it.
+
+**The defect (review 7 F5).**
+1. A MERGE on a poisoned provenance store whose altered tables carry no attributed row skips `plan_alters`' probe (it asks only when a prepared row is attributed).
+2. It installs its schema (`apply_plan`), flushes, and logs the DDL records (`log_ddl`).
+3. Only then is it refused, at the first publish stamp.
+
+So a statement returning `Err` has changed the target's schema and told the change feed. That is E82's forbidden shape.
+
+**The change being tested.**
+- In `publish_evaluation_as`'s plan phase, before any table is planned, add `prov.check_writable()?` whenever the merge will publish anything.
+- "Publish anything" means `pending` is non-empty. Every published write is stamped (a run's version) or recorded by `record_applied`'s `stamp_rows`, which with `ProvId::NONE` clears the row's author, and that is a write too.
+- A merge that publishes nothing is not probed. It writes no provenance, so a store refusing writes has nothing to refuse (D219 F1's principle, test 1's for ALTER).
+
+**Tests,** in `src/agent_sql/runtime.rs`'s `mod tests`. They drive the runtime API (`begin_session_as`, `write`, `stage_schema_edit`, `merge`), not dispatch, so `designated::tests` cannot refuse them.
+
+The rig:
+- a durable store installed in the runtime;
+- `CREATE TABLE t (id INTEGER NOT NULL, v INTEGER)`, with nothing on the target;
+- a completed session for run `r1`;
+- a staged `ALTER TABLE t ADD COLUMN w INTEGER`;
+- the store then poisoned (`fail_next_append`, then a `stamp_row`).
+
+- **P1** `a_merge_that_will_stamp_on_a_poisoned_store_is_refused_before_its_schema_installs`: the session also INSERTs `(1, 10)`. The MERGE must return `Err` containing "refusing further writes", `t` must keep **2** columns, and the WAL's `next_lsn` must be unchanged (no DDL record, no publish transaction).
+  - **RED at the red commit** (D219 `1dfe13f`'s code): the MERGE is refused only at the publish stamp, after the ADD COLUMN is installed. The first failing assertion is the column count, **3 vs 2**. The error text matches either way, so the column count is what discriminates.
+  - **GREEN** after the fix.
+- **P2** `a_merge_that_publishes_nothing_on_a_poisoned_store_is_not_refused`: no INSERT. The MERGE must succeed, and `t` must have **3** columns. It holds at the red commit and after the fix, non-discriminating on purpose: it pins the probe's condition.
+
+**Mutants** (`bench/d219/mutants.py`):
+- **M30** `no_merge_writable_probe` (the probe deleted): must fail P1 at its column count.
+- **M31** `merge_probe_unconditional` (probe even when nothing is published): must fail P2 (`Err` where it expects `Ok`).
+
+**Counts after A3:**
+- lib **+21** over `9aa6968` (A2's +19, plus P1 and P2);
+- `agent_sql::runtime::tests` +2;
+- every other expectation unchanged.
+
+**Two guards, two conditions.** `plan_alters`' probe asks when a REWRITE would re-stamp an attributed row. This one asks when the PUBLISH would stamp. A merge that does both is refused by whichever runs first, which is this one. Each has its own test and mutant: test 3 and M28 for the rewrite, P1 and M30 for the publish. So neither masks the other's mutant.
+
+**⚖16 (for Ryan, recorded by the lead):** D136's design would turn D219's "exactly one sync per MERGE" test into "at most one" once D219 is on main.
