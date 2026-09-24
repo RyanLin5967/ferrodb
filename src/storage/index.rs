@@ -58,7 +58,11 @@
 //!   split must start again. Every descent loop re-reads `root_page_id` under its first latch.
 //!
 //! Acquisition order is **down** the tree and **rightward** along the leaf chain, never upward or
-//! leftward, so the wait-for graph is ordered by depth and then by key and cannot cycle.
+//! leftward, so the wait-for graph is ordered by depth and then by key and cannot cycle. **One
+//! exception, D233:** unlinking an emptied leaf write-latches its LEFT neighbour to splice the
+//! chain, while holding the root-to-leaf path. `remove_and_unlink` argues why that cannot cycle:
+//! no holder of a leaf latch waits on anything, and every other writer that could, first needs the
+//! root latch this thread holds.
 //!
 //! # What this does NOT make safe, stated rather than implied
 //!
@@ -170,16 +174,47 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         }
     }
 
-    /// Remove one entry.
+    /// Remove one entry. **An entry whose removal empties a leaf takes the leaf out of the tree**
+    /// (free-at-empty, D233).
     ///
-    /// Takes the same latches as a non-splitting insert, and for the same reason: a removal never
-    /// splits, and `handle_underflow` is unreachable (see its doc comment), so no ancestor is ever
-    /// touched and the parent's read latch plus the leaf's write latch is the whole requirement.
+    /// The common case takes the same latches as a non-splitting insert: the parent's read latch
+    /// until the leaf's write latch is in hand, then the leaf alone. A removal that would leave a
+    /// leaf empty, when that leaf has a neighbour (so it is not the root), writes nothing and
+    /// restarts on [`Self::delete_unlinking`], exactly as a splitting insert restarts on
+    /// [`Self::write_splitting`].
+    ///
+    /// # Why an emptied leaf leaves the tree (Johnson & Shasha's free-at-empty)
+    ///
+    /// Before D233 an emptied leaf stayed in the chain for ever. A key space that drains from one
+    /// end — the branch catalog's DEADLINE span, whose deadlines only move forward — therefore
+    /// piled empty leaves exactly where every lease pass starts, and each pass walked all of
+    /// them: about one leaf per 81 reaps, plus ~1,000 page reads past the 64-hop bound of
+    /// [`Self::read_leaf_for`] (`frontier/deadline_leaf_adversary.md` §0). Johnson & Shasha
+    /// ("B-trees with inserts and deletes: why free-at-empty is better than merge-at-half")
+    /// remove a node only when it is empty and never rebalance at half; a queue-shaped key
+    /// space drains every leaf completely, so free-at-empty reclaims every one of them.
+    ///
+    /// The unlinked page is **not freed** ([`Self::delete_unlinking`] says why), so it stays on
+    /// disk exactly as it does today; what changes is that no descent and no chain reaches it.
     pub fn delete(&self, key: &K) -> Result<(), FerroError> {
-        let (page_id, _latch) = self.latch_leaf_for_write(key)?;
-        let mut leaf = self.read_leaf_raw(page_id)?;
-        leaf.remove_entry(key)?;
-        self.write_page(page_id, leaf.serialize()?)
+        {
+            let (page_id, _latch) = self.latch_leaf_for_write(key)?;
+            let mut leaf = self.read_leaf_raw(page_id)?;
+            leaf.remove_entry(key)?;
+            if !Self::would_unlink(&leaf) {
+                return self.write_page(page_id, leaf.serialize()?);
+            }
+            // Nothing written, and the leaf's latch drops here: the removal is redone under the
+            // whole path's write latches, which is where an unlink can be done.
+        }
+        self.delete_unlinking(key)
+    }
+
+    /// Whether a leaf image, after a removal, is one [`Self::delete`] takes out of the tree: empty,
+    /// and with a neighbour on the leaf chain. A leaf with no neighbour is the only leaf, which is
+    /// the root, and a tree always keeps one leaf.
+    fn would_unlink(leaf: &BPlusTreeLeafPage<K, V>) -> bool {
+        leaf.key_arr.is_empty() && (leaf.prev.is_some() || leaf.next.is_some())
     }
 
     /// Insert one entry.
@@ -293,9 +328,13 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// Both loops are bounded; past the bound, or on any page that is not resident under its
     /// hint, the latched path answers. It is always correct, only slow.
     ///
-    /// What makes a snapshot safe to descend: leaves never go underfull (nothing frees a tree
-    /// page except `free_all`, under the exclusive catalog lock with readers drained), so a page
-    /// this reader copied cannot have been reused as something else mid-descent.
+    /// What makes a snapshot safe to descend: **nothing frees a tree page** except `free_all`,
+    /// under the exclusive catalog lock with readers drained, so a page this reader copied cannot
+    /// have been reused as something else mid-descent. That is the load-bearing half. This used
+    /// to say "leaves never go underfull", which was never what made it safe and stopped being
+    /// true at D233: `delete` now takes an emptied leaf out of the tree, and it does so WITHOUT
+    /// freeing the page (`delete_unlinking`), precisely so that this sentence keeps holding. A
+    /// reader that lands on an unlinked leaf finds it empty and walks its intact `next`.
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         const RESTARTS: usize = 16;
         const RIGHT_WALK: usize = 64;
@@ -368,11 +407,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     // false for an empty leaf, so the walk stopped there and returned it, and the
                     // key read as absent. `BPlusTreeManager::delete` removes an entry and writes
                     // the page back with no rebalance (`handle_underflow` is an honest refusal),
-                    // and `execution::insert`'s key reuse does exactly `delete(key)` then
-                    // `insert(key, rid)` — so a leaf holding one key is empty between those two
+                    // and `execution::insert`'s key reuse did exactly `delete(key)` then
+                    // `insert(key, rid)` — so a leaf holding one key was empty between those two
                     // writes, and a concurrent optimistic reader walking past it saw the gap.
                     // Found by a fresh-context review; `no_workload_drives_a_leaf_underfull` pins
                     // occupancy for the SQL paths and says nothing about this window.
+                    //
+                    // Still load-bearing after D233, for two reasons. `delete` publishes an emptied
+                    // leaf before it unlinks it (`remove_and_unlink`, step 1), and a reader that
+                    // descended through a parent from before the unlink can land on an unlinked
+                    // leaf, which stays empty with its `next` intact.
                     let mut hops = 0;
                     while leaf.key_arr.last().is_none_or(|max| max < key) {
                         let Some(next) = leaf.next else { break };
@@ -620,6 +664,156 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         self.insert_into_parent(stack, leaf_id, split_key, new_page_id)
     }
 
+    /// The slow path of [`Self::delete`]: write latches on the whole root-to-leaf path, then the
+    /// removal and, if it empties a linked leaf, the unlink. The same latch shape as
+    /// [`Self::write_splitting`], and the same reason: the parent is about to change.
+    ///
+    /// # Nothing is freed, on purpose
+    ///
+    /// The latch-free descent is sound only because no tree page is freed while it runs
+    /// ([`Self::read_leaf_for`]): a reader holding a stale page id could otherwise read a recycled
+    /// page whose own header still names that id. So the unlinked leaf keeps its bytes, including
+    /// `next`. A reader that descended through a parent from before the unlink lands on it, finds
+    /// it empty, and walks right, which is the walk the empty case already took. A reader that
+    /// descends afterwards never reaches it.
+    ///
+    /// **Each unlink leaks the leaf page, plus each internal page the cascade empties.** That is no
+    /// more disk than before D233, where the same pages stayed allocated in the chain. Returning
+    /// them waits on D229's reclamation mechanism (a durable pending-free list, or a reachability
+    /// sweep at open when no reader exists), which this change does not pre-empt.
+    fn delete_unlinking(&self, key: &K) -> Result<(), FerroError> {
+        loop {
+            let root = self.root_page_id.load(Ordering::Acquire);
+            let mut guards: Vec<PageWriteGuard<'_>> = vec![self.latches().write(root)];
+            if self.root_page_id.load(Ordering::Acquire) != root {
+                continue; // `guards` is dropped here
+            }
+            let mut stack: Vec<u32> = Vec::new();
+            let mut curr = root;
+            let leaf_id = loop {
+                match self.read_node_raw(curr)? {
+                    BPlusTreePage::Leaf(_) => break curr,
+                    BPlusTreePage::Internal(n) => {
+                        stack.push(curr);
+                        let child = n.find_child(key);
+                        guards.push(self.latches().write(child));
+                        curr = child;
+                    }
+                }
+            };
+            let result = self.remove_and_unlink(leaf_id, &mut stack, key);
+            drop(guards);
+            return result;
+        }
+    }
+
+    /// Remove `key` from a leaf whose whole root-to-leaf path this thread holds write latches on,
+    /// and take the leaf out of the tree if that empties it.
+    ///
+    /// # Order of the writes, each one a state a latch-free reader may see
+    ///
+    /// 1. The emptied leaf, `next` intact: the state every reader already copes with (it walks
+    ///    past an empty leaf).
+    /// 2. The chain splice, `prev.next = next` then `next.prev = prev`: a scan from the left now
+    ///    skips the leaf, and a reader that still lands on it walks its intact `next`.
+    /// 3. The parent drops its pointer and one separator ([`Self::unlink_from_parent`]): from here
+    ///    no descent reaches the leaf.
+    ///
+    /// # The one LEFTWARD latch in this file, and why it cannot deadlock
+    ///
+    /// The splice write-latches `prev`, which is leftward along the chain, against this file's
+    /// acquisition order (down, then rightward). It is safe because of who can hold a leaf latch
+    /// while this thread waits for it:
+    ///
+    /// - a reader (`load_leaf`, or a latched descent's last step) copies the leaf and releases it,
+    ///   and waits on nothing while holding it;
+    /// - a fast-path writer (`latch_leaf_for_write`) holds the leaf write latch and waits on nothing
+    ///   while holding it: it either writes and releases, or releases and restarts;
+    /// - a pessimistic writer (a split, or another unlink) would need the ROOT's write latch first,
+    ///   and this thread holds it for the whole operation, so no such writer is running.
+    ///
+    /// So every holder of `prev`'s latch releases it without waiting on anything this thread holds,
+    /// and the wait cannot close a cycle. The branch catalog also serialises every writer under
+    /// `TableBranchCatalog::logical`, but this argument does not rely on that.
+    fn remove_and_unlink(&self, leaf_id: u32, stack: &mut Vec<u32>, key: &K) -> Result<(), FerroError> {
+        let mut leaf = self.read_leaf_raw(leaf_id)?;
+        leaf.remove_entry(key)?;
+        // Decided again under the path's write latches: a writer may have refilled the leaf between
+        // the fast path letting go of it and this thread taking the path.
+        let unlink = Self::would_unlink(&leaf);
+        self.write_page(leaf_id, leaf.serialize()?)?;
+        if !unlink {
+            return Ok(());
+        }
+        // The splice. `prev`/`next` are stable here: they change only in a split or an unlink, and
+        // both hold the root's write latch, which this thread holds.
+        if let Some(prev_id) = leaf.prev {
+            let _left = self.latches().write(prev_id);
+            let mut left = self.read_leaf_raw(prev_id)?;
+            left.next = leaf.next;
+            self.write_page(prev_id, left.serialize()?)?;
+        }
+        if let Some(next_id) = leaf.next {
+            let _right = self.latches().write(next_id);
+            let mut right = self.read_leaf_raw(next_id)?;
+            right.prev = leaf.prev;
+            self.write_page(next_id, right.serialize()?)?;
+        }
+        self.unlink_from_parent(stack, leaf_id)
+    }
+
+    /// Drop `doomed` from its parent, cascading while a parent is left with no child.
+    /// **The caller must hold write latches on every page in `stack`**, which is the path from the
+    /// root down to `doomed`'s parent.
+    ///
+    /// The separator rule is `cow::btree::unlink_up`'s (D104), the in-repo precedent: removing a
+    /// child that is not the leftmost removes the separator to its LEFT, so its key range joins its
+    /// left sibling's; removing the leftmost removes the separator to its RIGHT, so the next child
+    /// takes the range and becomes the leftmost. Either way the parent's own range is unchanged, so
+    /// nothing above it moves. A parent whose ONLY child goes is itself empty: it is left as it is,
+    /// unreachable and not freed, and removed from its own parent in turn.
+    ///
+    /// The cascade cannot empty the root. [`Self::remove_and_unlink`] unlinks only a leaf with a
+    /// neighbour, and the lowest common ancestor of the leaf and that neighbour has at least two
+    /// children, one of which survives. Reaching the root with nothing left is therefore refused
+    /// as a broken invariant rather than turned into an empty tree. The root is also never
+    /// collapsed onto a single child; like `unlink_up`, this keeps a level a shrunken tree no
+    /// longer needs.
+    fn unlink_from_parent(&self, stack: &mut Vec<u32>, doomed: u32) -> Result<(), FerroError> {
+        let mut doomed = doomed;
+        loop {
+            let Some(parent_id) = stack.pop() else {
+                return Err(FerroError::Io(format!(
+                    "unlinking page {doomed} would leave the B+tree with no leaf; only a leaf with a \
+                     neighbour is unlinked, so the tree's links are inconsistent"
+                )));
+            };
+            let mut parent = match self.read_node_raw(parent_id)? {
+                BPlusTreePage::Internal(n) => n,
+                BPlusTreePage::Leaf(_) => return Err(FerroError::Io(format!(
+                    "page {parent_id} was reached as an internal node but holds a leaf"
+                ))),
+            };
+            let Some(slot) = parent.child_ptrs.iter().position(|&c| c == doomed) else {
+                return Err(FerroError::Io(format!(
+                    "page {parent_id} is on the path to page {doomed} but does not point at it"
+                )));
+            };
+            if parent.child_ptrs.len() == 1 {
+                doomed = parent_id;
+                continue;
+            }
+            if slot == 0 {
+                parent.key_arr.remove(0);
+            } else {
+                parent.key_arr.remove(slot - 1);
+            }
+            parent.child_ptrs.remove(slot);
+            parent.num_keys = parent.key_arr.len() as u16;
+            return self.write_page(parent_id, parent.serialize()?);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // RAW PAGE ACCESS — every one of these requires the caller to hold the page's latch
     // ---------------------------------------------------------------------------------------
@@ -805,8 +999,23 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// parent, recursing up; and if the root is internal and falls to a single child, make that child
     /// the new root. None of it is written.
     ///
-    /// **Nothing can reach this, because no code path net-removes a key from a tree.** Measured
-    /// 2026-08-17 (`tests/integration_index_debt.rs`):
+    /// ⛔ **CORRECTED by D233. The sentence below used to read "no code path net-removes a key
+    /// from a tree", and at `9aa6968` that was false.** The branch catalog's tree net-removes keys:
+    /// every reap drops a DEADLINE key, every detach a CHILD key, every recycled fork a FREE_ID
+    /// key, and every state change moves a STATE key (`TableBranchCatalog::write_record`,
+    /// `table_catalog.rs`). E70 measured the SQL paths only, and the comment generalised it to
+    /// every tree. The consequence was a chain of empty leaves at the head of the DEADLINE span
+    /// that every lease pass walked (`frontier/deadline_leaf_adversary.md`).
+    ///
+    /// **What is true, and why this is still not called:** `delete` now frees at empty (Johnson &
+    /// Shasha): an emptied leaf leaves the tree, and nothing rebalances at half. That is the whole
+    /// answer for a tree that drains, and merge-at-half is not needed to bound a walk. For the SQL
+    /// trees nothing changes, because **no SQL path calls `delete` at all**: key reuse is `upsert`
+    /// (D126: `execution::insert`, `execution::update`, `catalog::alter`), and a SQL `DELETE` stamps
+    /// `end_ts` and keeps the entry. So no SQL leaf ever empties, `delete` never unlinks one, and
+    /// `no_workload_drives_a_leaf_underfull` still holds and still pins it.
+    ///
+    /// **What was measured for the SQL paths**, 2026-08-17 (`tests/integration_index_debt.rs`):
     ///
     /// - `execution::delete` holds a `primary_index` field and never calls `delete` on it. A SQL
     ///   `DELETE` stamps `end_ts` on the version in place and leaves the entry, because a reader whose
@@ -828,11 +1037,10 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// on a full index scan at 50 live rows in 400 entries, scaling with the dead-to-live ratio.
     pub fn handle_underflow(&self, _path: &mut Vec<u32>, node_id: u32) -> Result<(), FerroError> {
         Err(FerroError::Io(format!(
-            "B+tree node {node_id} is underfull and rebalancing is not implemented. This should be \
-             unreachable: no write path removes a key without re-inserting it, so occupancy never \
-             drops (see tests/integration_index_debt.rs). If you are reading this, that invariant \
-             broke - a new caller removes entries outright - and borrow-or-merge now has to be \
-             written."
+            "B+tree node {node_id} is underfull and merge-at-half is not implemented. Nothing calls \
+             this: an EMPTY leaf is taken out of the tree by delete (free-at-empty, D233), and an \
+             underfull one is left as it is by design. If you are reading this, a new caller wants \
+             rebalancing at half, which has to be written first."
         )))
     }
 }
