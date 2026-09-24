@@ -1951,4 +1951,47 @@ mod tests {
             Err(_) => panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on its own latch"),
         }
     }
+
+    /// **Review 3 L2, red first against `f6909db`.** The unlinker holds every page on its descent path
+    /// in WRITE, so a `prev` or `next` naming one of them makes it wait on its own latch while holding
+    /// the root, exactly as G6's shape does. Only arbitrary corruption produces it (no tree page is
+    /// freed and reused, so a leaf's id never becomes an internal page's), and the check is
+    /// O(height), so it is checked rather than documented. Here a middle leaf's `prev` is rewritten
+    /// to the ROOT's id. The delete runs on its own thread; one that has not returned after 10 s is
+    /// taken to be waiting on itself, and on a red run that thread stays blocked on a latch of this
+    /// test's own tree.
+    #[test]
+    fn a_neighbour_on_the_descent_path_is_refused_not_waited_on() {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert_eq!(height(&tree), 2, "premise: the root is the one internal page on every path");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let mid = chain[1].page_id;
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        rewrite_leaf(&tree, mid, |l| l.prev = Some(root));
+        let last = keys.last().unwrap().clone();
+
+        let tree = Arc::new(tree);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.delete(&last).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(refused) => assert!(refused, "an unlink whose prev is the root was not refused"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on the root's latch, which it holds")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the unlink of page {mid} panicked before returning")
+            }
+        }
+    }
 }

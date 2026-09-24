@@ -3033,6 +3033,39 @@ mod tests {
         assert_eq!(c.tree.search(&malformed).unwrap(), None, "the malformed FREE_ID key was not removed");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **Review 3 §6 N1, red first against `f6909db`: a refused fork keeps the free slot it chose.**
+    /// fork's own gate (`check_readable`) accepts a `Quarantined` parent, but building the child
+    /// (`fork_child_from_core`) refuses any parent that is not `Live`. `f6909db` removed the chosen
+    /// slot's FREE_ID first and built the child second, so the refusal left the removal in the pool:
+    /// the slot was neither live nor free, and every retried refused fork stranded another. Here
+    /// slot X is released, a fork of quarantined P must fail with X's FREE_ID still present, and once
+    /// P is `Live` again the next fork reuses X.
+    #[test]
+    fn a_refused_fork_of_a_quarantined_parent_keeps_the_free_slot() {
+        let (c, p, _pool) = cat("refused-fork-keeps-free-slot");
+        let parent = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let x = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        c.detach_child(BranchId::TRUNK.id, x.fork_epoch).unwrap();
+        c.set_state(x.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        c.release_id(x.branch_id.id);
+        let free = keys::free_id(x.branch_id.id);
+        assert!(c.tree.search(&free).unwrap().is_some(), "premise: slot X is free");
+        c.set_state(parent, BranchState::Live, BranchState::Quarantined).unwrap();
+
+        assert!(c.fork(parent, LeaseDeadline(9_000)).is_err(), "premise: a fork of a quarantined parent is refused");
+        assert!(
+            c.tree.search(&free).unwrap().is_some(),
+            "the refused fork removed slot {}'s FREE_ID: the slot is stranded, neither live nor free",
+            x.branch_id.id
+        );
+
+        c.set_state(parent, BranchState::Quarantined, BranchState::Live).unwrap();
+        let child = c.fork(parent, LeaseDeadline(9_000)).unwrap();
+        assert_eq!(child.branch_id.id, x.branch_id.id, "the next fork did not reuse the free slot");
+        assert_eq!(c.tree.search(&free).unwrap(), None, "the reused slot's FREE_ID was not removed");
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
