@@ -33,7 +33,7 @@ impl HeapFileManager {
     // fetches page, reads slot, unpins
     pub fn read(&self, record_id: RecordId) -> Result<Tuple, FerroError>{
         let pin = self.buffer_pool_manager.pin(record_id.page_id)?;
-        let frame = self.buffer_pool_manager.frames[pin.frame()].read().unwrap();
+        let frame = pin.read();
         let page = Page::deserialize(frame.data)?;
         let tuple = page.read(record_id.slot_num as usize)?;
         drop(frame);
@@ -396,7 +396,7 @@ impl HeapFileManager {
         while dir_page_id != 0 {
             let dir = {
                 let pin = self.buffer_pool_manager.pin(dir_page_id)?;
-                let frame = self.buffer_pool_manager.frames[pin.frame()].read().unwrap();
+                let frame = pin.read();
                 PageDirectory::deserialize(frame.data)
             };
             out.extend(dir.entries.iter().map(|e| e.page_id));

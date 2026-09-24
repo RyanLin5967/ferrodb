@@ -741,23 +741,14 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(())
     }
 
-    pub fn free_subtree(&self, page_id: u32) -> Result<(), FerroError> {
-        if let BPlusTreePage::Internal(internal) = self.read_node(page_id)? {
-            for child in &internal.child_ptrs {
-                self.free_subtree(*child)?;
-            }
-        }
-        self.buffer_pool.free_page(page_id)
-    }
-
     /// Free every page of this tree, or none of them. See [`Self::page_ids`].
     pub fn free_all(&self) -> Result<(), FerroError> {
         self.buffer_pool.free_pages(&self.page_ids()?)
     }
 
-    /// Every page of this tree, children before their parent, which is the order `free_subtree`
-    /// frees them in. Collected in full before anything is freed (D237), so `Catalog::drop_table`
-    /// can refuse a table having freed none of it.
+    /// Every page of this tree, children before their parent. Collected in full before anything is
+    /// freed (D237), so `Catalog::drop_table` can refuse a table having freed none of it. This is
+    /// the one traversal that frees a tree: `free_all` and `free_tree` both go through it.
     pub fn page_ids(&self) -> Result<Vec<u32>, FerroError> {
         let mut out = Vec::new();
         self.collect_subtree(self.root_page_id.load(Ordering::Acquire), &mut out)?;
@@ -806,17 +797,13 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         }
     }
 
+    /// Free every page of this tree, or none of them: the same as [`Self::free_all`].
+    ///
+    /// Kept under its own name for `recovery::rebuild_indexes`' three calls, which D229's design
+    /// removes. Until D237 review F7 this was a third copy of the traversal, freeing page by page,
+    /// so a refusal part way freed half an index tree; it now shares `free_all`'s all-or-none path.
     pub fn free_tree(&self) -> Result<(), FerroError> {
-        self.free_from(self.root_page_id.load(Ordering::SeqCst))
-    }
-
-    fn free_from(&self, page_id: u32) -> Result<(), FerroError> {
-        if let BPlusTreePage::Internal(node) = self.read_node(page_id)? {
-            for child in &node.child_ptrs {
-                self.free_from(*child)?;
-            }
-        }
-        self.buffer_pool.free_page(page_id)
+        self.free_all()
     }
 
     /// Rebalance an underfull node — **unimplemented, and E70 measured why that is currently safe.**

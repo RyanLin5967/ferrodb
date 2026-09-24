@@ -33,7 +33,7 @@ const ALLOWED: &[&str] = &[
     "src/storage/index.rs",         // defines the API, and its own tests
     "src/wal/recovery.rs",          // nothing else runs during recovery
     "src/catalog/alter.rs",         // in-place rewrite under the exclusive catalog lock
-    "src/catalog/catalog.rs",       // drop_table's free_all, under the exclusive lock
+    "src/catalog/catalog.rs",       // drop_table's page collection (`page_ids`), under the exclusive lock
     "src/storage/index_fulltext.rs",// builds the tree it returns; the caller registers it
     "src/branch/table_catalog.rs",  // the branch catalog's own long-lived tree (one handle)
 ];

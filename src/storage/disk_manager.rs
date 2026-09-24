@@ -214,6 +214,63 @@ impl DiskManager{
         Ok(())
     }
 
+    /// Free every page in `page_ids`, **or none of them, as far as that can be decided before a
+    /// write** (D237 review F4).
+    ///
+    /// [`Self::deallocate`] refuses in three ways: a page inside a reserved region, a page no
+    /// bitmap page maps, and I/O. The first two are deterministic, and calling `deallocate` per page
+    /// met them part way through a batch, with the pages before already freed. A caller retrying
+    /// then freed those pages again, from under whoever had been handed them in between. Here every
+    /// page is validated, and each touched bitmap page's new image is built, before anything is
+    /// written. Then each image is written once. In a database whose pages all fall inside bitmap
+    /// page 0's span, that is one write where a per-page loop made one read and one write per page.
+    ///
+    /// **Not all-or-none:** an I/O failure writing the second of two touched bitmap pages leaves the
+    /// first written. A torn single write is the disk's to answer.
+    pub fn deallocate_many(&self, page_ids: &[u32]) -> Result<(), FerroError> {
+        if page_ids.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.bitmap_lock.lock().unwrap();
+        // Local bit indexes, grouped by which bitmap page holds them.
+        let mut by_bitmap: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+        for &page_id in page_ids {
+            // An arena page has no bit here, as in `deallocate`.
+            if let Some(r) = self.region_containing(page_id) {
+                return Err(FerroError::Io(format!(
+                    "page {} is inside the reserved '{}' region [{}, {}) and is not this allocator's \
+                     to free",
+                    page_id, r.name, r.lo, r.hi
+                )));
+            }
+            by_bitmap.entry(page_id / BITS_PER_BITMAP).or_default().push(page_id % BITS_PER_BITMAP);
+        }
+        let mut images: Vec<(u32, [u8; PAGE_SIZE])> = Vec::with_capacity(by_bitmap.len());
+        let mut current_bitmap_id = 0;
+        let mut index = 0;
+        let mut page_bitmap = self.read(current_bitmap_id)?;
+        for (&bitmap_index, locals) in &by_bitmap {
+            while index < bitmap_index {
+                let next_bitmap_id = u32::from_le_bytes(page_bitmap[0..4].try_into().unwrap());
+                if next_bitmap_id == 0 {
+                    return Err(FerroError::Io(String::from("can't deallocate an unmapped page")));
+                }
+                current_bitmap_id = next_bitmap_id;
+                page_bitmap = self.read(current_bitmap_id)?;
+                index += 1;
+            }
+            let mut image = page_bitmap;
+            for &local in locals {
+                image[(local / 8) as usize + 4] &= !(1 << (local % 8));
+            }
+            images.push((current_bitmap_id, image));
+        }
+        for (bitmap_id, image) in &images {
+            self.write(*bitmap_id, image)?;
+        }
+        Ok(())
+    }
+
     /// Highest page the **bitmap allocator** has handed out, plus one.
     ///
     /// Distinct from [`DiskManager::high_water`], which additionally clamps with `next_page_id`.

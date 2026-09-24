@@ -111,7 +111,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     for (dir_root, page_id) in &touched {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
         let pin = bp.pin(*page_id)?;
-        let frame = bp.frames[pin.frame()].read().unwrap();
+        let frame = pin.read();
         let page = Page::deserialize(frame.data)?;
         drop(frame);
         pin.unpin(false);

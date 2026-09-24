@@ -626,11 +626,26 @@ impl Drop for FrameWriteGuard<'_> {
 /// the life of the process, and the next `DROP TABLE` stopped part way at `free_page`'s refusal.
 /// The shape is `wal::log::WalPin`'s, applied to a page.
 ///
-/// # Declare it before the frame guard
+/// # A frame guard borrows its pin (D237 review F3)
 ///
-/// Locals drop in reverse order, so a pin declared first is released after the frame lock taken
-/// from it. The unpin takes that frame's lock itself (`release_pin_if_labelled`), so the other
-/// order would block on a lock this thread still holds.
+/// [`PagePin::read`] and [`PagePin::write`] return guards that borrow the pin, and there is no bare
+/// frame index to take out of one. The unpin takes the frame's lock itself
+/// (`release_pin_if_labelled`), so releasing a pin while one of its guards is alive would block on
+/// a lock this thread holds; that, and reading a frame through a pin already dropped, no longer
+/// compile:
+///
+/// ```compile_fail
+/// # fn f(pool: &ferrodb::buffer::buffer_pool::BufferPoolManager) -> Result<(), ferrodb::error::FerroError> {
+/// let pin = pool.pin(1)?;
+/// let frame = pin.write();
+/// pin.unpin(true); // E0505: `pin` is borrowed by `frame`
+/// drop(frame);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// (A `compile_fail` doctest passes on ANY compile error, so the snippet holds nothing but that one
+/// borrow; with `write` returning a guard tied to the pool instead, as it first did, it compiles.)
 ///
 /// # Dirtiness
 ///
@@ -656,6 +671,7 @@ impl Drop for FrameWriteGuard<'_> {
 /// poisons it, the unpin would then panic on that lock, and a panic inside a drop during
 /// unwinding aborts the process. So a panic leaks the pin, which is what it did before this guard
 /// existed.
+#[must_use = "a pin that is not kept is released at once"]
 pub struct PagePin<'a> {
     pool: &'a BufferPoolManager,
     page_id: u32,
@@ -664,18 +680,17 @@ pub struct PagePin<'a> {
     stated: Option<bool>,
 }
 
-impl<'a> PagePin<'a> {
-    /// The frame holding the page, for a read through `frames[..]` or `frame_read`.
-    pub fn frame(&self) -> usize {
-        self.frame_i
+impl PagePin<'_> {
+    /// Read-lock the frame, through the tracked accessor. The guard borrows the pin.
+    pub fn read(&self) -> FrameGuard<RwLockReadGuard<'_, Frame>> {
+        self.pool.frame_read(self.frame_i)
     }
 
     /// Write-lock the frame. The only way to write through a pin, because it is how the pin knows
-    /// the page may be dirty.
-    pub fn write(&self) -> FrameWriteGuard<'a> {
+    /// the page may be dirty. The guard borrows the pin.
+    pub fn write(&self) -> FrameWriteGuard<'_> {
         self.wrote.set(true);
-        let pool: &'a BufferPoolManager = self.pool;
-        pool.frame_write(self.frame_i)
+        self.pool.frame_write(self.frame_i)
     }
 
     /// Release the pin now, marking the page dirty or not exactly as asked.
@@ -1426,40 +1441,91 @@ impl BufferPoolManager {
 
     /// Free every page in `page_ids`, **or none of them** (D237).
     ///
-    /// Refuses whole, before it frees anything, if any one of them is pinned or being faulted in:
-    /// [`BufferPoolManager::invalidate_all`]'s rule, applied to a set. [`BufferPoolManager::free_page`]
-    /// refuses one page at a time, so a caller freeing a structure in a loop stopped part way.
-    /// `Catalog::drop_table` did: it freed the heap, met a leaked pin further on, and returned with
-    /// the heap's pages free while the catalog still named them. The next allocation handed them to
-    /// another table, and a retried DROP freed them from under it.
+    /// [`BufferPoolManager::free_page`] refuses one page at a time, so a caller freeing a structure
+    /// in a loop stopped part way. `Catalog::drop_table` did: it freed the heap, met a leaked pin
+    /// further on, and returned with the heap's pages free while the catalog still named them. The
+    /// next allocation handed them to another table, and a retried DROP freed them from under it.
     ///
-    /// **What it does not cover** (both are left to D229's durable pending-free list):
-    /// - A pin taken between the check and the frees. The check lets go of its locks before
-    ///   freeing, because `free_page` takes the table's write lock. So the caller has to keep other
-    ///   users of these pages out: `drop_table` runs under the statement exclusion with the attach
-    ///   table shut (`TxnManager::ddl_checkpointed`). If one got in anyway, `free_page`'s own check
-    ///   would refuse its page, part way through.
-    /// - `DiskManager::deallocate` failing part way, on I/O or on a page inside a reserved region.
+    /// # All or none by construction, not by the caller's exclusion (D237 review F2)
+    ///
+    /// The first version checked every pin, let go of its locks, then called `free_page` per page,
+    /// and said the caller keeps other pinners out. A hot base backup does not:
+    /// `replication::backup::take` pins every page through `fetch_page` outside the statement lock.
+    /// A pin landing between the check and page k's free made `free_page` refuse part way. So:
+    ///
+    /// - `in_transit`, the ARC cache and `page_table` (write) are taken in the module's order and
+    ///   HELD from the first check to the last frame reset. Every miss, fault-in, eviction, flush and
+    ///   table lookup waits.
+    /// - Pass 1 write-locks each resident page's frame in turn. A pin refuses the whole call: the
+    ///   frames already taken get their labels back, and nothing has been freed. An unpinned frame
+    ///   is **unlabelled**. That closes the one pin path that takes none of the three locks: a hit
+    ///   pins under the frame's READ lock after checking the label (`pin_if_labelled`), and an
+    ///   unlabelled frame fails that check and falls to the miss path, which needs `in_transit`.
+    /// - Pass 2 is the disk: [`DiskManager::deallocate_many`] validates every page before it clears
+    ///   any bit (review F4). A refusal there gives the labels back too.
+    /// - Pass 3 forgets the frames: table entry, bytes, pin count, dirty flag, ARC entry.
+    ///
+    /// A pinner therefore either pinned before the check, and the call refuses whole, or waits until
+    /// the frees are done. Costs: the three locks are held across one bitmap read and one bitmap
+    /// write per touched bitmap page, so every miss in the process stalls for that long, once per
+    /// call. A page listed twice is freed once.
+    ///
+    /// **Not covered:** an I/O failure on the second of two touched bitmap pages (see
+    /// `deallocate_many`); and anything after the frees in the caller, which is D229's durable
+    /// pending-free list.
     pub fn free_pages(&self, page_ids: &[u32]) -> Result<(), FerroError> {
-        {
-            // Lock-order: `in_transit -> page_table -> frame`, the module's order, as in
-            // `invalidate_all`. See src/storage/page_latch.rs.
-            let _pool = enter_pool();
-            let transit = self.in_transit.lock().unwrap();
-            let pt = self.page_table.read().unwrap();
-            for page_id in page_ids {
-                if transit.contains(page_id) {
-                    return Err(FerroError::PagePinned);
-                }
-                if let Some(&frame_i) = pt.get(page_id) {
-                    if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
-                        return Err(FerroError::PagePinned);
-                    }
-                }
-            }
+        // Lock-order: `in_transit -> arc_cache -> page_table -> frame`, the module's order, as in
+        // `invalidate_all`, and all three pool locks are held to the end. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
+        let transit = self.in_transit.lock().unwrap();
+        if page_ids.iter().any(|p| transit.contains(p)) {
+            return Err(FerroError::PagePinned);
         }
+        let mut cache = self.arc_locked();
+        let mut pt = self.page_table.write().unwrap();
+
+        // Gives pass 1's frames their labels back, when the call refuses after taking some.
+        let relabel = |taken: &[(u32, usize)]| {
+            for &(page_id, frame_i) in taken {
+                self.frame_write(frame_i).page_id = Some(page_id);
+            }
+        };
+
+        // Pass 1: refuse on any pin; unlabel every other resident frame.
+        let mut taken: Vec<(u32, usize)> = Vec::new();
         for &page_id in page_ids {
-            self.free_page(page_id)?;
+            let Some(&frame_i) = pt.get(&page_id) else { continue };
+            let mut frame = self.frame_write(frame_i);
+            if frame.page_id != Some(page_id) {
+                continue; // listed twice, and an earlier turn already took its frame
+            }
+            if frame.pin_counter.load(Ordering::Relaxed) > 0 {
+                drop(frame);
+                relabel(&taken[..]);
+                return Err(FerroError::PagePinned);
+            }
+            frame.page_id = None;
+            drop(frame);
+            taken.push((page_id, frame_i));
+        }
+
+        // Pass 2: the disk, validated whole before any bit is cleared.
+        if let Err(e) = self.disk_manager.deallocate_many(page_ids) {
+            relabel(&taken[..]);
+            return Err(e);
+        }
+
+        // Pass 3: forget the frames.
+        for &(page_id, frame_i) in &taken {
+            pt.remove(&page_id);
+            let mut frame = self.frame_write(frame_i);
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+        }
+        for &(page_id, _) in &taken {
+            cache.remove(page_id)?;
         }
         Ok(())
     }

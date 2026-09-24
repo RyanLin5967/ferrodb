@@ -346,6 +346,12 @@ impl Catalog {
     ///
     /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
     /// where those pages are.
+    ///
+    /// **D237: all of the table's pages, or none.** Every page of every tree is collected first,
+    /// then freed in one [`BufferPoolManager::free_pages`] call, which refuses whole before it frees
+    /// anything and keeps pinners out for the duration. A refusal therefore leaves the table in the
+    /// catalog with every page still its own. This used to free one structure after another with
+    /// `?`, so a pin leaked on the primary tree refused after the heap was already free.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;
@@ -373,6 +379,10 @@ impl Catalog {
         for root in sec_roots {
             pages.extend(BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).page_ids()?);
         }
+        // A page reached twice (two trees sharing one, which a sound catalog never has) is freed
+        // once. Order kept, so the frees still run leaves and data pages first.
+        let mut seen = std::collections::HashSet::with_capacity(pages.len());
+        pages.retain(|p| seen.insert(*p));
         self.buffer_pool.free_pages(&pages)?;
         self.tables.remove(name);
         self.stats.remove(name);
@@ -494,7 +504,7 @@ impl Catalog {
             let pin = self.buffer_pool.pin(curr_page_id)?;
 
             let mut page = {
-                let frame = self.buffer_pool.frames[pin.frame()].read().unwrap();
+                let frame = pin.read();
                 CatalogPage::deserialize(frame.data)?
             };
 
@@ -547,7 +557,7 @@ impl Catalog {
                 while free_id != 0 {
                     let pin = self.buffer_pool.pin(free_id)?;
                     let next_orphan = {
-                        let frame = self.buffer_pool.frames[pin.frame()].read().unwrap();
+                        let frame = pin.read();
                         CatalogPage::deserialize(frame.data)?.next_catalog_page
                     };
 
@@ -568,7 +578,7 @@ impl Catalog {
         loop{
             let pin = self.buffer_pool.pin(curr_page_id)?;
             let cat_page = {
-                let frame = self.buffer_pool.frames[pin.frame()].read().unwrap();
+                let frame = pin.read();
                 CatalogPage::deserialize(frame.data)?
             };
             pin.unpin(false);

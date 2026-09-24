@@ -42,7 +42,7 @@ impl<K: Ord + Clone + BTreeSerialize, V: Clone + BTreeSerialize> RangeScanner<K,
         let node = {
             // Tracked accessor: the read latch above is held across this, so an inverted order
             // here must fail loudly rather than deadlock. See src/storage/page_latch.rs.
-            let frame = self.buffer_pool.frame_read(pin.frame());
+            let frame = pin.read();
             BPlusTreePage::<K, V>::deserialize(frame.data)?
         };
         pin.unpin(false);

@@ -15,7 +15,7 @@ impl HeapScanner {
     pub fn load_page(&self, page_id: u32) -> Result<Page, FerroError> {
         let pin = self.buffer_pool.pin(page_id)?;
         let page = {
-            let frame = self.buffer_pool.frames[pin.frame()].read().unwrap();
+            let frame = pin.read();
             Page::deserialize(frame.data)?
         };
         pin.unpin(false);
