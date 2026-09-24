@@ -2492,3 +2492,56 @@ fn the_frame_budget_is_four_maximal_member_lists() {
     // same. This pins that premise to the constants, so moving either limit fails here, by name.
     assert_eq!(MAX_FRAME_CONFIG_NODES, 4 * MAX_CONFIG_NODES);
 }
+
+#[test]
+fn an_open_connection_holds_its_slot_until_it_closes() {
+    // The guard's LIFETIME is the cap. `ConnRegistration` gives the slot back when it is dropped, and
+    // since D207 it is made in `accept_loop` and moved into the connection thread. Drop it any earlier
+    // and the cap counts nothing, while the older cap test (which asserts only "some refused" and
+    // "at most 4 live") can still pass on a refusal won by timing before the early drop ran. So this
+    // counts exactly: four slots, twenty-four connections held open, four live and twenty refused.
+    //
+    // It passes on 9aa6968 too; it is here because nothing else pins the guard's lifetime (mutant M3
+    // in bench/d207/PREREG.md).
+    let mut opts = fast();
+    opts.max_inbound_conns = 4;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    const OPENED: u64 = 24;
+    let mut held = Vec::new();
+    for _ in 0..OPENED {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let mut hs = Vec::new();
+        crate::replication::write_handshake(&mut hs).unwrap();
+        let _ = s.write_all(&hs);
+        let _ = s.flush();
+        held.push(s);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.refused_conns() < OPENED - 4 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        t.refused_conns(),
+        OPENED - 4,
+        "{OPENED} connections held open against a cap of 4, and {} were refused",
+        t.refused_conns()
+    );
+    // Settled: nothing else connects, and the four admitted connections are idle but open.
+    assert_eq!(
+        t.live_inbound_conns(),
+        4,
+        "four connections are open and {} hold a slot, so a slot is given back before its \
+         connection ends",
+        t.live_inbound_conns()
+    );
+
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && t.live_inbound_conns() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(t.live_inbound_conns(), 0, "the slots were not given back when the connections closed");
+}
