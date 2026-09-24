@@ -33,7 +33,7 @@
 //! drops a torn tail the crashed session left.
 //!
 //! ```text
-//! image  = MAGIC u32 | VERSION u8 | count u32 | record{count} | crc32 u32 (over all before it)
+//! image  = MAGIC u32 | VERSION u8 | floor u64 | count u32 | record{count} | crc32 u32 (over all before it)
 //! record = hseq u64 | ordinal u64 | len u32 | body[len] | crc32 u32 (over hseq..body)
 //! tail   = record*
 //! ```
@@ -45,6 +45,13 @@
 //! and more than `W` are held, the drain rewrites the image with the window only: the file is
 //! bounded by about `(W + W/8)` publishes whatever the number ever made, a prune reads nothing
 //! (the window is in memory), and it costs one rewrite per `W/8` publishes — flat per merge.
+//!
+//! **The prune floor is persisted** (AMENDED 3, item 3): the image names the lowest `hseq` its last
+//! prune kept, and the open's catch-up queues a record only if it is absent AND at or above that
+//! floor. The log can outlive `W` merges (a pin, owed releases, a kept truncation), and without the
+//! floor its copies of pruned records would come back at the next open, growing the file with the log
+//! and putting merges past the window back in reach. The window, the counters and C1 are all taken
+//! by `hseq`, never by a record's position in the file.
 //!
 //! # What this file does not know
 //!
@@ -81,9 +88,11 @@ pub fn retention_from_env() -> Result<u64, FerroError> {
 }
 
 const MAGIC: u32 = 0x4652_4831; // "FRH1"
-const IMAGE_VERSION: u8 = 1;
-/// `MAGIC | VERSION | count`.
-const IMAGE_HEADER: usize = 4 + 1 + 4;
+/// 2 since AMENDED 3 (the floor, then the Commit LSN). No build wrote version 1: the branch that
+/// had it was never built.
+const IMAGE_VERSION: u8 = 2;
+/// `MAGIC | VERSION | floor | count`.
+const IMAGE_HEADER: usize = 4 + 1 + 8 + 4;
 /// `hseq | ordinal | len` in front of a body, `crc32` behind it.
 const RECORD_FRAME: usize = 8 + 8 + 4 + 4;
 
@@ -168,6 +177,10 @@ struct StoreState {
     image_written: bool,
     /// Publishes drained since the last prune (or held beyond `W` at open).
     publishes_since_prune: u64,
+    /// **The prune floor** (AMENDED 3, item 3): the lowest `hseq` the last prune kept, persisted in
+    /// the image. A committed record below it is one the window has already dropped, so the open's
+    /// catch-up must not bring it back from a log that outlived `W` merges.
+    floor: u64,
     counters: HistoryCounters,
 }
 
@@ -237,9 +250,9 @@ impl HistoryStore {
             ));
         }
         let path = path.into();
-        let (window, read) = match std::fs::read(&path) {
+        let ((floor, window), read) = match std::fs::read(&path) {
             Ok(bytes) => (load(&bytes)?, bytes.len() as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ((0, BTreeMap::new()), 0),
             Err(e) => {
                 return Err(FerroError::Io(format!("reading {}: {e}", path.display())));
             }
@@ -251,6 +264,7 @@ impl HistoryStore {
             queued_bytes: 0,
             image_written: false,
             publishes_since_prune: held.saturating_sub(retention),
+            floor,
             counters: HistoryCounters { bytes_read_at_open: read, ..HistoryCounters::default() },
         };
         Ok(Arc::new(HistoryStore { path, retention, ops, state: Mutex::new(state) }))
@@ -268,16 +282,18 @@ impl HistoryStore {
         s.queue.keys().next_back().copied().map_or(durable, |q| q.max(durable))
     }
 
-    /// Queue committed records for the next drain, skipping any whose `hseq` is already held.
+    /// Queue committed records for the next drain, skipping any whose `hseq` is already held or is
+    /// below the prune floor.
     ///
     /// By MEMBERSHIP, not by "above the tail" (AMENDED 2, F9): a committed record whose `hseq` is
-    /// absent is queued wherever it falls, so a record that missed the file for any reason is
-    /// recovered from the log rather than skipped for being older than a later one. Skipping what is
-    /// held is what makes the open's catch-up idempotent.
+    /// absent is queued wherever it falls at or above the floor, so a record that missed the file for
+    /// any reason is recovered from the log rather than skipped for being older than a later one.
+    /// Below the floor it was pruned, and stays pruned (AMENDED 3, item 3). Skipping what is held is
+    /// what makes the open's catch-up idempotent.
     pub fn enqueue(&self, records: Vec<HistoryRecord>) {
         let mut s = self.state.lock().unwrap();
         for r in records {
-            if !s.holds(r.hseq) {
+            if r.hseq >= s.floor && !s.holds(r.hseq) {
                 s.queued_bytes += RECORD_FRAME + r.body.len();
                 s.queue.insert(r.hseq, r);
             }
@@ -331,11 +347,12 @@ impl HistoryStore {
                 .cloned()
                 .collect();
             kept.sort_by_key(|r| r.hseq);
-            encode_image(&kept).and_then(|image| {
+            let floor = if prune { cut } else { s.floor };
+            encode_image(&kept, floor).and_then(|image| {
                 replace_atomically(&*self.ops, &self.path, &image)
                     .map_err(|e| FerroError::Io(format!("writing {}: {e}", self.path.display())))
             })
-            .map(|()| Some(kept))
+            .map(|()| Some((kept, floor)))
         } else {
             let mut tail = Vec::new();
             s.queue.values().try_for_each(|r| r.encode_into(&mut tail)).and_then(|()| {
@@ -351,8 +368,9 @@ impl HistoryStore {
                 s.counters.failed_drains += 1;
                 Err(e)
             }
-            Ok(Some(kept)) => {
+            Ok(Some((kept, floor))) => {
                 s.window = kept.into_iter().map(|r| (r.hseq, r)).collect();
+                s.floor = floor;
                 s.queue.clear();
                 s.queued_bytes = 0;
                 s.image_written = true;
@@ -395,7 +413,7 @@ fn window_start(s: &StoreState, retention: u64) -> u64 {
     }
 }
 
-fn encode_image(records: &[HistoryRecord]) -> Result<Vec<u8>, FerroError> {
+fn encode_image(records: &[HistoryRecord], floor: u64) -> Result<Vec<u8>, FerroError> {
     let count = u32::try_from(records.len()).map_err(|_| FerroError::Unrepresentable {
         what: "a REVERT history image's record count".to_string(),
         len: records.len(),
@@ -404,6 +422,7 @@ fn encode_image(records: &[HistoryRecord]) -> Result<Vec<u8>, FerroError> {
     let mut out = Vec::with_capacity(IMAGE_HEADER + 4);
     out.extend_from_slice(&MAGIC.to_be_bytes());
     out.push(IMAGE_VERSION);
+    out.extend_from_slice(&floor.to_be_bytes());
     out.extend_from_slice(&count.to_be_bytes());
     for r in records {
         r.encode_into(&mut out)?;
@@ -441,8 +460,8 @@ fn take_record(bytes: &[u8], at: usize) -> Result<Option<(HistoryRecord, usize)>
 
 /// Load a whole `<db>.history`: the image, then every intact tail record behind it — the arena's
 /// rule (`ArenaPageStore::replay_tail`): a torn LAST record is dropped, a checksum failure with
-/// more bytes behind it is corruption and refused.
-fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
+/// more bytes behind it is corruption and refused. Returns the image's prune floor and the records.
+fn load(bytes: &[u8]) -> Result<(u64, BTreeMap<u64, HistoryRecord>), FerroError> {
     let mut at = 0usize;
     let magic = take_u32(bytes, &mut at).map_err(|_| corrupt("too short for an image".into()))?;
     if magic != MAGIC {
@@ -454,6 +473,7 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
             "image version {version} was written by another build (this one reads {IMAGE_VERSION})"
         )));
     }
+    let floor = take_u64(bytes, &mut at)?;
     let count = take_u32(bytes, &mut at)? as usize;
     let mut out: Vec<HistoryRecord> = Vec::new();
     for i in 0..count {
@@ -500,7 +520,7 @@ fn load(bytes: &[u8]) -> Result<BTreeMap<u64, HistoryRecord>, FerroError> {
     for r in out {
         by_hseq.entry(r.hseq).or_insert(r);
     }
-    Ok(by_hseq)
+    Ok((floor, by_hseq))
 }
 
 /// **Reassemble tag-12 WAL parts into records**, for the open's catch-up.
