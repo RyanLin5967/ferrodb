@@ -290,6 +290,14 @@ impl ProvenanceStore for MemProvenanceStore {
         Ok(())
     }
 
+    /// This store refuses a write only when its lock was poisoned by a panicking writer.
+    fn check_writable(&self) -> Result<(), FerroError> {
+        if self.inner.is_poisoned() {
+            return Err(Self::poisoned());
+        }
+        Ok(())
+    }
+
     /// A batch of one. There is ONE implementation of the row-attribution guards, in `stamp_rows`,
     /// so the single and batched paths cannot drift apart.
     fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {

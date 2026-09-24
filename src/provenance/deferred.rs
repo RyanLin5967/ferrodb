@@ -150,6 +150,10 @@ impl ProvenanceStore for Deferred {
         self.0.flush()
     }
 
+    fn check_writable(&self) -> Result<(), FerroError> {
+        self.0.check_writable()
+    }
+
     fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
         self.0.page_dictionary_lens()
     }

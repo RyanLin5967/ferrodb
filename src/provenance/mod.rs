@@ -190,6 +190,19 @@ pub trait ProvenanceStore: Send + Sync {
     /// than panic inside the `Drop`s that call this).
     fn flush(&self) -> Result<(), FerroError>;
 
+    /// Refuse NOW if this store would refuse a write now.
+    ///
+    /// For a caller about to make a change it cannot undo and will have to record here afterwards:
+    /// an ALTER's rewrite moves rows and must then re-stamp them at their new rids. Asked before the
+    /// change, a store that is refusing writes (a durable store poisoned by a failed append) stops
+    /// the change instead of leaving it made and unrecorded (D219, PREREG A1).
+    ///
+    /// Advisory, not a reservation: the write itself still checks under its own lock, so a store
+    /// that starts refusing between this and the write is refused there. **Required, with no
+    /// default**, for the reason `page_dictionary_lens` is: a default `Ok` would claim every store
+    /// writable.
+    fn check_writable(&self) -> Result<(), FerroError>;
+
     /// Every page that carries attribution, as `(page_id, distinct runs in its dictionary)`.
     ///
     /// The per-page dictionary refuses past [`MAX_PAGE_DICT_ENTRIES`], so *how close a workload

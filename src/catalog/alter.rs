@@ -578,6 +578,24 @@ impl Catalog {
 
         let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
 
+        // **D219 (PREREG A1) — a rewrite that may re-stamp attributed rows is refused HERE when the
+        // provenance store is refusing writes, before the first heap byte moves.** The rows it
+        // moves are re-stamped after `finish` (see `apply_plan`); a store poisoned by an earlier
+        // failed append refuses that, and the ALTER was then installed and returning `Err`, which
+        // both callers answer by NOT logging its DDL record — a schema change the log never hears
+        // of. Asked here, the refusal is E82's: made while nothing has changed.
+        //
+        // Conditioned on an attributed row, because a rewrite that will stamp nothing has no
+        // business failing on the store's state (`an_alter_that_stamps_nothing_is_not_refused_by_
+        // a_poisoned_provenance_store`). Every attributed row, not only the ones that will move,
+        // because which rows move is decided while writing; refusing a rewrite that would have moved
+        // none of them is the conservative direction on a store refusing every write anyway.
+        if let Some(store) = prov {
+            if prepared.iter().any(|p| p.prov.is_some()) {
+                store.check_writable()?;
+            }
+        }
+
         Ok(AlterPlan {
             table: table.to_string(),
             shapes,
@@ -704,7 +722,8 @@ impl Catalog {
         // catalog — the I19 state `finish` exists to rule out. Here a refusal, or a failed sync,
         // returns with the catalog and the heap agreeing on the new shape. What it does NOT
         // restore is the caller's DDL record: both callers log it only after this returns `Ok`,
-        // so the change feed never hears of this ALTER (see "Not closed here" below).
+        // so the change feed never hears of this ALTER — which is why a store already refusing
+        // writes is refused in `plan_alters` instead (below).
         //
         // **One sync for all of them, before any later table is touched.** They are queued with
         // `stamp_pending` and made durable with one `flush`: this table's rewritten pages, and the
@@ -727,10 +746,11 @@ impl Catalog {
         // rewrite. And a `persist` failure inside `finish` (itself the I19 state) now returns
         // before any moved row is re-stamped.
         //
-        // Not closed here: a refusal after the install leaves the ALTER applied and its DDL record
-        // unlogged (both callers log only on `Ok`). Refusing the ALTER in `plan_alters`, before the
-        // heap moves, whenever its rewrite would stamp and the store is refusing writes would
-        // close it; that is lane D219's proposal, not this change.
+        // A store ALREADY refusing writes never gets here with attributed rows: `plan_alters`
+        // refused the ALTER before the heap moved (`check_writable`, PREREG A1). What can still
+        // fail here is a store that was healthy when planned and whose sync fails NOW — an I/O
+        // failure — and that returns with the ALTER applied and its DDL record unlogged (both
+        // callers log only on `Ok`), the environmental class of the heap flush that follows.
         if let Some(store) = &prov {
             if !moved.is_empty() {
                 for (rid, who) in &moved {
