@@ -1,7 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
 
 use crate::catalog::column::{DataType, Value};
-use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
+use crate::storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager};
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
@@ -117,15 +117,53 @@ pub struct TxnManager {
     /// does every tree it could repair. After a crash, the trees are rebuilt from the recovered heap
     /// (`wal::recovery::rebuild_indexes`), which is correct whatever this held.
     index_undo: Mutex<HashMap<u64, Vec<PrimaryWrite>>>,
+    /// Open transaction -> every heap slot its logged deletes RETIRED. D213; see
+    /// `storage::heap_page::RETIRED`.
+    ///
+    /// A retired slot's bytes stay counted as occupied until its transaction ends, so the rollback
+    /// can restore the tuple in place. [`TxnManager::commit`] frees them, each logged as a
+    /// `HeapRelease` after the `Commit`. An abort needs nothing from here: its undo restores each
+    /// slot from the log.
+    ///
+    /// In memory, like `index_undo`. After a crash, recovery rebuilds the same list from the log
+    /// and finishes the releases a committed transaction did not get to log
+    /// (`wal::recovery::recover`, [`TxnManager::finish_releases`]).
+    retired: Mutex<HashMap<u64, Vec<RetiredSlot>>>,
+}
+
+/// A heap slot retired by a logged delete, as the commit must release it. D213.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredSlot {
+    pub dir_root: u32,
+    pub page_id: u32,
+    pub slot: u16,
+}
+
+/// Releases at commit that failed, since process start. D213.
+///
+/// A release runs after the `Commit` is durable, so the transaction HAS committed and
+/// [`TxnManager::commit`] must answer `Ok`: an `Err` makes the executor keep the session's
+/// transaction, and a ROLLBACK would then undo committed work. A failure is counted here instead,
+/// with one line on stderr. What it leaves behind is lost space, not a wrong answer: the retired
+/// slot reads as deleted, as it should, and its bytes stay out of use. The next open's recovery
+/// finishes the release if the log still holds the delete; after a checkpoint it does not, and
+/// the bytes stay out of use for good. Read twice and subtract to scope it to a phase.
+pub static RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`RELEASE_FAILURES`].
+pub fn release_failures() -> u64 {
+    RELEASE_FAILURES.load(Ordering::Relaxed)
 }
 
 /// Index undos at abort that failed, since process start. D205 (the adversary's C1).
 ///
 /// A failure here is not returned by [`TxnManager::abort`], because the transaction has ended and
 /// every caller reads `Err` as "the abort did not happen". It is counted instead, so it is never
-/// silent. What it leaves behind is fail-stop: the entry it could not repair names a freed slot,
-/// so a reader of that key gets `SlotDeleted`, and the next open rebuilds every tree
-/// (`wal::recovery::open_recovered`). Read twice and subtract to scope it to a phase.
+/// silent. It is not the only surface: each failure also writes one line to stderr and a marker
+/// file beside the log (`TxnManager::mark_indexes_stale`). What it leaves behind is fail-stop: the
+/// entry it could not repair names a freed slot, so a reader of that key gets `SlotDeleted`, and
+/// the next open rebuilds every tree because of the marker (`wal::recovery::open_recovered`). Read
+/// twice and subtract to scope it to a phase.
 pub static INDEX_UNDO_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// See [`INDEX_UNDO_FAILURES`].
@@ -278,7 +316,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -653,6 +691,10 @@ impl TxnManager {
     }
 
     pub fn commit(&self, txn_id: u64) -> Result<(), FerroError> {
+        // D211: a transaction whose rollback began may not commit its half-undone rows.
+        if self.is_aborting(txn_id) {
+            return Err(Self::rolling_back(txn_id));
+        }
         // **Immediately before the `Commit`, with no append between them.** See `bind_run` for what
         // any other position costs. Read rather than removed, so a failed append leaves the binding
         // intact for the abort that follows.
@@ -662,6 +704,14 @@ impl TxnManager {
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
         self.wal.flush_up_to(commit_lsn)?;
+        // **D213: decided, so the space its deletes held for their undo is free now.** After the
+        // flush, never before: a slot freed while the `Commit` could still be lost would let
+        // another transaction take the bytes this one's rollback needs. Before `att` lets go of the
+        // transaction, so a checkpoint, which refuses to start while `att` is not empty, cannot
+        // start between the `Commit` and its releases. Never fails the commit; see
+        // `RELEASE_FAILURES`.
+        let retired = self.retired.lock().unwrap().remove(&txn_id).unwrap_or_default();
+        self.release_retired(txn_id, &retired);
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
@@ -716,27 +766,46 @@ impl TxnManager {
         // `session.current = None`, and the caller's own error is replaced by this one. Returned
         // after `TxnEnd`, as it was at `c21eaff`, it left a session holding a dead id and hid the
         // statement's error. The transaction does end, so `Ok` is the true answer. The failure is
-        // not silent: [`INDEX_UNDO_FAILURES`] counts it. The entry it failed to repair names a
-        // freed slot, so readers of that key fail with `SlotDeleted` rather than guessing, and the
-        // next open rebuilds every tree from the heap (`open_recovered`).
+        // not silent: [`INDEX_UNDO_FAILURES`] counts it, a line goes to stderr, and a marker beside the
+        // log makes the next open rebuild every tree from the heap even if the log is then empty
+        // (`mark_indexes_stale`; this sentence claimed the rebuild without the marker until the
+        // re-adversary's C1 correction). Until then, the entry it failed to repair names a freed
+        // slot, so readers of that key fail with `SlotDeleted` rather than guessing.
         //
-        // **D205 C2 — a heap undo that fails AFTER this has succeeded is recoverable**, and the
-        // `Err` below says so to the caller truthfully, because the transaction has NOT ended:
-        // - it stays in the ATT as `Aborting`, and the CLRs already written make the heap undo
-        //   resumable. A second `abort`, which is `ROLLBACK` in an explicit transaction whose session
-        //   kept it (`executor.rs`), finds this list gone (already applied, and re-applying is not
-        //   needed) and resumes the heap undo at `undo_next`;
-        // - a crash instead makes it a loser: recovery finishes the heap undo, and
-        //   `open_recovered` rebuilds every tree from that heap;
-        // - until one of those happens, a key this undo restored names the before-image's slot,
-        //   which the unfinished heap undo has not refilled yet. That reads as `SlotDeleted`, which
-        //   fails stop, and a row whose INSERT was not yet undone is uncommitted and invisible to
-        //   every snapshot. Nothing answers wrongly.
-        // A heap undo that fails permanently (e.g. `restore_at` into a page with no room) was
-        // unrecoverable in-process before D202 too. Only a restart repairs it.
+        // ⛔ **WITHDRAWN — the D205 C2 note that stood here (`d81f080`..`d7891d5`) was FALSE.** It said a
+        // heap undo that failed after this was "recoverable", that `ROLLBACK` "resumes the heap undo at
+        // `undo_next`", and that "nothing answers wrongly in between". The fresh-context re-adversary
+        // (`frontier/d205_readversary.md`, `fffdc62`; ledger D211) showed all three wrong:
+        // - the CLR was appended BEFORE its undo applied, so a resumed abort followed `undo_next`
+        //   past the failed record and never retried it;
+        // - `Aborting` was written and never read, so the stuck transaction could run statements or
+        //   COMMIT;
+        // - `ROLLBACK` dropped the session's id before aborting.
+        //
+        // **What is true since the D211 fix:**
+        // - `apply_then_log` logs a CLR only for an undo that is on the page, so a retry reaches the
+        //   failed record itself;
+        // - an `Aborting` transaction is refused everything but ROLLBACK (`snapshot_of`, `commit`);
+        // - the executor keeps the session's id when a rollback fails (`tests/abort_that_cannot_finish.rs`).
+        //
+        // **What was still NOT recoverable at `00f4c39`, and is unrepresentable since D213:** an undo
+        // that never finds room, for instance because other transactions committed rows into the
+        // page it needs. The transaction then stayed `Aborting` holding its rows, every checkpoint
+        // was refused while it was open, and at the next open recovery's undo of this loser met the
+        // same refusal and the open FAILED (ledger D213). The lead decided the design: space freed by
+        // an uncommitted transaction is not reusable until it commits. A logged delete retires its
+        // slot and a shrink keeps its capacity (`storage::heap_page::RETIRED`), so every undo below
+        // writes into bytes this transaction still holds and needs no room
+        // (`tests/undo_space_is_reserved.rs`).
+        //
+        // What can still fail an undo is an I/O error, a failed log append, or a page that
+        // disagrees with the log. For those, everything above holds: the transaction stays
+        // `Aborting`, refuses all but ROLLBACK, and a retry reaches the failed record itself
+        // (`tests/undo_refused_is_held.rs`).
         let writes = self.index_undo.lock().unwrap().remove(&txn_id).unwrap_or_default();
-        if self.undo_primary_writes(writes).is_err() {
+        if let Err(e) = self.undo_primary_writes(writes) {
             INDEX_UNDO_FAILURES.fetch_add(1, Ordering::Relaxed);
+            self.mark_indexes_stale(txn_id, &e);
         }
         let mut lsn = {
             self.att_read().get(&txn_id).unwrap().last_lsn.load(Ordering::Acquire)
@@ -749,22 +818,19 @@ impl TxnManager {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn , undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapDelete{ dir_root, page_id, slot, old: Vec::new() })
                     };
-                    let clr_lsn = self.append_chained(txn_id, &clr)?;
-                    undo_insert(&self.bp, page_id, slot, clr_lsn)?;
+                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_insert(page, slot))?;
                 }
                 RecKind::HeapDelete { dir_root, page_id, slot, old } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapInsert { dir_root, page_id, slot, tuple: old.to_vec() })
                     };
-                    let clr_lsn = self.append_chained(txn_id, &clr)?;
-                    undo_delete(&self.bp, page_id, slot, &old, clr_lsn)?;
+                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_delete(page, slot, &old))?;
                 }
                 RecKind::HeapUpdate { dir_root, page_id, slot, old, new } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
                         redo: Box::new(RecKind::HeapUpdate { dir_root, page_id, slot, old: new.clone(), new: old.clone() })
                     }; 
-                    let clr_lsn = self.append_chained(txn_id, &clr)?;
-                    undo_update(&self.bp, page_id, slot, &old, clr_lsn)?;
+                    self.apply_then_log(txn_id, page_id, &clr, |page| undo_update(page, slot, &old))?;
                 }
                 RecKind::Clr {undo_next, .. } => {
                     if undo_next == 0 {
@@ -782,11 +848,95 @@ impl TxnManager {
         }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att_write().remove(&txn_id);
+        // D213: every slot this transaction retired has been restored by the undo above, so there
+        // is nothing left to release.
+        self.retired.lock().unwrap().remove(&txn_id);
         // The run bound to this transaction described work that has been rolled back. No identity
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
         self.run_bindings.lock().unwrap().remove(&txn_id);
         Ok(())
+    }
+
+    /// Apply one undo to its page, and log its CLR ONLY IF it applied. Both happen under the page's
+    /// write latch. D211. Returns the page as published.
+    ///
+    /// A commit's releases go through here too (D213, `HeapRelease` in `rec`): the obligation is
+    /// the same, a record in the log only for a change that is on the page.
+    ///
+    /// This was "append the CLR, then apply the undo with `?`". A refused undo (no room, D210's
+    /// `restore_at`, or an update growing back into a page others have filled) then returned with
+    /// the CLR already in the log. That CLR says "undone" for a record that was not, so:
+    /// - a resumed abort followed its `undo_next` straight PAST the failed record and never
+    ///   retried it;
+    /// - recovery's redo pass replayed the CLR onto the same page, met the same refusal, and failed
+    ///   the open.
+    ///
+    /// The re-adversary's proposed fix, re-applying the chain-head CLR when the page's LSN is behind
+    /// it, was not taken. That gate cannot tell "not applied" from "applied" once another
+    /// transaction has written the same page after the failure, and nothing stops one doing so. So
+    /// the skipped undo could still be skipped. Here instead no CLR exists unless its undo is on the
+    /// page, and a retry reaches the failed record itself, with no gate to misjudge.
+    ///
+    /// The page is changed in a deserialised COPY and proven to serialise before the CLR is
+    /// appended. After the append the only change is the LSN, so nothing can fail between logging
+    /// the CLR and publishing the page. Holding the frame latch across the WAL append is the order
+    /// `HeapFileManager::insert_into` already uses (frame, then `append_chained`).
+    fn apply_then_log<F>(&self, txn_id: u64, page_id: u32, rec: &RecKind, undo: F) -> Result<Page, FerroError>
+    where
+        F: FnOnce(&mut Page) -> Result<(), FerroError>,
+    {
+        let frame_i = self.bp.fetch_page(page_id)?;
+        let mut frame = self.bp.frame_write(frame_i);
+        let undone = Page::deserialize(frame.data).and_then(|mut page| {
+            undo(&mut page)?;
+            page.serialize()?;
+            Ok(page)
+        });
+        let mut page = match undone {
+            Ok(page) => page,
+            Err(e) => {
+                drop(frame);
+                self.bp.unpin_page(page_id, false);
+                return Err(e);
+            }
+        };
+        let clr_lsn = match self.append_chained(txn_id, rec) {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                drop(frame);
+                self.bp.unpin_page(page_id, false);
+                return Err(e);
+            }
+        };
+        page.lsn = clr_lsn;
+        let published = page.serialize().map(|data| frame.data = data);
+        drop(frame);
+        self.bp.unpin_page(page_id, published.is_ok());
+        published.map(|()| page)
+    }
+
+    /// The durable and the visible half of an index-undo failure (the re-adversary's C1
+    /// corrections).
+    ///
+    /// Durable: a marker beside the log, which the next `wal::recovery::open_recovered` honours by
+    /// rebuilding every tree, even when the log it opens is empty. `recover` returns `false` for an
+    /// empty log, and a clean restart can leave one, so without this "the next open rebuilds" was
+    /// false. Visible: one line on stderr, written with `writeln!` and not `eprintln!` (which panics
+    /// on a closed stderr; `branch::lease_thread` records why), plus [`INDEX_UNDO_FAILURES`].
+    fn mark_indexes_stale(&self, txn_id: u64, e: &FerroError) {
+        use std::io::Write;
+        let marker = stale_indexes_marker(&self.wal.path);
+        let written = std::fs::write(&marker, format!("txn {txn_id}: {e}\n"));
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: the rollback of transaction {txn_id} could not undo its primary-index writes ({e}); \
+             the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open{}",
+            match &written {
+                Ok(()) => String::new(),
+                Err(w) => format!(", but the marker {} that asks for that rebuild could not be written ({w})", marker.display()),
+            }
+        );
     }
 
     /// Record that `txn_id` is about to move the primary-index entry for `key` away from `prev`.
@@ -802,6 +952,79 @@ impl TxnManager {
             .entry(txn_id)
             .or_default()
             .push(PrimaryWrite { root, key, prev });
+    }
+
+    /// Record that `txn_id`'s logged delete retired `slot` of `page_id`, so its commit frees it.
+    /// D213; see `storage::heap_page::RETIRED`. Called by `HeapFileManager` once the `HeapDelete`
+    /// is in the log.
+    pub fn record_retired(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16) {
+        self.retired
+            .lock()
+            .unwrap()
+            .entry(txn_id)
+            .or_default()
+            .push(RetiredSlot { dir_root, page_id, slot });
+    }
+
+    /// Free the slots a COMMITTED transaction retired. Each is applied and logged as a
+    /// `HeapRelease` through [`TxnManager::apply_then_log`], and the page directory is told, because
+    /// `HeapFileManager::find_page_with_space` reads the directory and not the page. D213.
+    ///
+    /// It never fails. The transaction has committed, so the only honest answer to its caller is
+    /// `Ok`, and a failure is counted in [`RELEASE_FAILURES`] with a line on stderr (see there for
+    /// what it leaves behind).
+    ///
+    /// **The cost this pays for, stated.** A page may fill sooner than before: a relocated tuple's
+    /// old bytes stay occupied until its transaction ends, where they used to be free at once, so a
+    /// long transaction holds on to every byte its relocations and deletes vacated. The bound is
+    /// that transaction's own writes: the bytes held are at most the old images its `HeapDelete`
+    /// records carry, which it has already paid for in the log. Nothing is held past the commit or
+    /// the abort. Freed bytes are only ever reusable when they are the lowest on their page, since
+    /// nothing compacts a page, and that is unchanged. The log carries one more record per retired
+    /// slot, written after the `Commit` and flushed with the next one. A shrink's kept capacity is
+    /// not held by the transaction at all: those bytes were garbage before D213, and are now the
+    /// slot's room to grow back into, so no page holds more than it did.
+    fn release_retired(&self, txn_id: u64, retired: &[RetiredSlot]) {
+        use std::io::Write;
+        for r in retired {
+            let rec = RecKind::HeapRelease { dir_root: r.dir_root, page_id: r.page_id, slot: r.slot };
+            let released = self
+                .apply_then_log(txn_id, r.page_id, &rec, |page| page.release(r.slot as usize))
+                .and_then(|page| {
+                    let free = page.get_free_space_end() - page.get_free_space_start();
+                    HeapFileManager::open(r.dir_root, self.bp.clone()).update_directory_entry(r.page_id, free)
+                });
+            if let Err(e) = released {
+                RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: transaction {txn_id} committed, but slot {} of page {} could not be released \
+                     ({e}); its bytes stay out of use, and the next open releases them only if the log \
+                     still holds the delete",
+                    r.slot,
+                    r.page_id
+                );
+            }
+        }
+    }
+
+    /// Finish, during recovery, the releases a committed transaction did not get to log. D213.
+    ///
+    /// Its `HeapRelease` records follow its `Commit` and wait in the log buffer for the next flush,
+    /// so a crash in between loses them, and the slots stay retired: nothing would ever free them.
+    /// `wal::recovery::recover` works out from the log which slots are still owed, and this
+    /// releases them as the commit would have, logged. `apply_then_log` appends through the
+    /// active-transaction table, so the transaction is held there for the length of the call, the
+    /// way `recover` holds each loser for its abort.
+    pub fn finish_releases(&self, txn_id: u64, last_lsn: u64, begin_lsn: u64, retired: &[RetiredSlot]) {
+        self.att_write().insert(txn_id, TxnEntry {
+            status: TxnStatus::Commiting,
+            last_lsn: AtomicU64::new(last_lsn),
+            begin_lsn,
+            snapshot: None,
+        });
+        self.release_retired(txn_id, retired);
+        self.att_write().remove(&txn_id);
     }
 
     /// Undo `writes` newest first, so a key moved twice in one transaction ends where it started.
@@ -1005,8 +1228,28 @@ impl TxnManager {
         Ok(())
     }
 
+    /// The transaction's snapshot, which every read and write inside it goes through, so this is also
+    /// where an `Aborting` transaction is refused (D211). A transaction whose rollback did not finish
+    /// holds half-undone rows; letting it keep reading or writing is how it would act on them.
     pub fn snapshot_of(&self, txn_id: u64) -> Result<Snapshot, FerroError> {
-        self.att_read().get(&txn_id).and_then(|e| e.snapshot.clone()).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
+        let att = self.att_read();
+        let entry = att.get(&txn_id).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))?;
+        if matches!(entry.status, TxnStatus::Aborting) {
+            return Err(Self::rolling_back(txn_id));
+        }
+        entry.snapshot.clone().ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
+    }
+
+    /// Whether `txn_id` is open and its rollback began but did not finish. D211.
+    pub fn is_aborting(&self, txn_id: u64) -> bool {
+        self.att_read().get(&txn_id).is_some_and(|e| matches!(e.status, TxnStatus::Aborting))
+    }
+
+    fn rolling_back(txn_id: u64) -> FerroError {
+        FerroError::Txn(format!(
+            "transaction {txn_id} is rolling back and its undo has not finished; only ROLLBACK is \
+             accepted, and it retries the undo"
+        ))
     }
 
     /// Apply a committed [`crate::consensus::Command::TxnIdRange`].
@@ -1156,20 +1399,37 @@ impl TxnManager {
     }
 }
 
-pub fn undo_insert(bp: &BufferPoolManager, page_id: u32, slot: u16, clr_lsn: u64) -> Result<(), FerroError> {
-    with_page(bp, page_id, clr_lsn, |page| page.delete(slot as usize))
+/// Undo a `HeapInsert` on its page: free the slot. Page-level only. `TxnManager::apply_then_log`
+/// owns the latch, the ordering against the CLR, and the LSN (D211).
+pub fn undo_insert(page: &mut Page, slot: u16) -> Result<(), FerroError> {
+    page.delete(slot as usize)
 }
 
-pub fn undo_delete(bp: &BufferPoolManager, page_id: u32, slot: u16, old: &[u8], clr_lsn: u64) -> Result<(), FerroError> {
-    with_page(bp, page_id, clr_lsn, |page| page.restore_at(slot as usize, old))
+/// Undo a `HeapDelete` (the relocation arm of an update): put the old bytes back in the slot.
+/// Since D213 the slot is RETIRED, so this is in place and needs no room. It can still be REFUSED
+/// when the page disagrees with the log, or, for a free slot on a page from before D213, for want
+/// of room (`Page::restore_at`, D210), and then nothing is logged.
+pub fn undo_delete(page: &mut Page, slot: u16, old: &[u8]) -> Result<(), FerroError> {
+    page.restore_at(slot as usize, old)
 }
 
-pub fn undo_update(bp: &BufferPoolManager, page_id: u32, slot: u16, old: &[u8], clr_lsn: u64) -> Result<(), FerroError> {
-    with_page(bp, page_id, clr_lsn, |page| page.update(slot as usize, Tuple::new(old.to_vec())))
+/// Undo a `HeapUpdate`: write the old image back into the slot. The old image is the slot's whole
+/// capacity as it was when the update read it, and since D213 a slot's capacity never shrinks
+/// (`Page::update` keeps it on a shrink), so this is in place and needs no room.
+pub fn undo_update(page: &mut Page, slot: u16, old: &[u8]) -> Result<(), FerroError> {
+    page.update(slot as usize, Tuple::new(old.to_vec()))
 }
 
 pub fn stamp_page_lsn(bp: &BufferPoolManager, page_id: u32, lsn: u64) -> Result<(), FerroError> {
     with_page(bp, page_id, lsn, |_| Ok(()))
+}
+
+/// Where a failed index undo leaves its marker: beside the log, `<wal path>.stale-indexes`. D205's
+/// C1 correction. `wal::recovery::open_recovered` rebuilds every tree when it finds one.
+pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
+    let mut marker = wal_path.as_os_str().to_os_string();
+    marker.push(".stale-indexes");
+    PathBuf::from(marker)
 }
 
 pub fn with_page<F>(bp: &BufferPoolManager, page_id: u32, lsn: u64, f: F) -> Result<(), FerroError> 
