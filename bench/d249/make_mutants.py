@@ -44,8 +44,8 @@ MUTANTS = [
         "",
     )]),
     ("E5_staleness_check_removed", ALTER, [(
-        "            if now != checked {\n",
-        "            if false && now != checked {\n",
+        "        if self.require_table(&table)? != &read {\n",
+        "        if false && self.require_table(&table)? != &read {\n",
     )]),
 ]
 
