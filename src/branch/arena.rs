@@ -5610,29 +5610,44 @@ mod tests {
 
         let parked = ArenaPageStore::TAIL_PAGES_PARKED;
         let replaced = ArenaPageStore::TAIL_PENDING_REPLACED;
-        let mut tail = Vec::new();
-        // [x1 x2 x3] -> x2 already there, y1 twice in one record, one dead arena -> [x1 x2 x3 y1]
-        tail.extend(with_entries(parked, &[x2, y1, y1, e(901, dead)]));
-        // x1 goes, an absent key is a no-op -> [x2 x3 y1]
-        tail.extend(drained(&[key(&x1), (999, a3)]));
-        // x1 again goes to the END -> [x2 x3 y1 x1]
-        tail.extend(with_entries(parked, &[x1]));
-        // wholesale: duplicates kept, dead arena dropped -> [x3 x3 w]
-        tail.extend(with_entries(replaced, &[x3, x3, w, e(902, dead)]));
-        // one key, two entries: both go -> [w]
-        tail.extend(drained(&[key(&x3)]));
-        // -> [w v1 v2]
-        tail.extend(with_entries(parked, &[v1, v2]));
-        // a2 freed: w and v2 go, and a2 is dead from here on -> [v1]
-        tail.extend(freed_a2);
-        // a park into the freed arena is skipped; one into a live arena lands -> [v1 x3]
-        tail.extend(with_entries(parked, &[u, x3]));
+        // Two replays, with the log checked BETWEEN them. The REPLACED record in the second half
+        // overwrites everything the first half did, so a single check at the end cannot see a
+        // first-wins or in-record de-dup failure: fresh-context review F1 traced a `contains`
+        // that always answered "absent" passing the one-replay version of this test.
+        let replay = |tail: &[u8]| {
+            let applied = h.store.replay_tail(tail).unwrap();
+            assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+            h.store.state.lock().unwrap().pending.clone()
+        };
 
-        let applied = h.store.replay_tail(&tail).unwrap();
-        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end of the tail");
-        let log = h.store.state.lock().unwrap().pending.clone();
+        let mut first = Vec::new();
+        // [x1 x2 x3] -> x2 already there, y1 twice in one record, one dead arena -> [x1 x2 x3 y1]
+        first.extend(with_entries(parked, &[x2, y1, y1, e(901, dead)]));
+        // x1 goes, an absent key is a no-op -> [x2 x3 y1]
+        first.extend(drained(&[key(&x1), (999, a3)]));
+        // x1 again goes to the END -> [x2 x3 y1 x1]
+        first.extend(with_entries(parked, &[x1]));
         assert_eq!(
-            log,
+            replay(&first),
+            vec![x2, x3, y1, x1],
+            "first-wins, in-record de-dup, the dead-arena skip or re-park-goes-last is broken"
+        );
+
+        let mut second = Vec::new();
+        // wholesale: duplicates kept, dead arena dropped -> [x3 x3 w]
+        second.extend(with_entries(replaced, &[x3, x3, w, e(902, dead)]));
+        // one key, two entries: both go -> [w]
+        second.extend(drained(&[key(&x3)]));
+        // -> [w v1 v2]
+        second.extend(with_entries(parked, &[v1, v2]));
+        // v1 is live, in an arena that stays live: first wins, so nothing changes -> [w v1 v2]
+        second.extend(with_entries(parked, &[v1]));
+        // a2 freed: w and v2 go, and a2 is dead from here on -> [v1]
+        second.extend(freed_a2);
+        // a park into the freed arena is skipped; one into a live arena lands -> [v1 x3]
+        second.extend(with_entries(parked, &[u, x3]));
+        assert_eq!(
+            replay(&second),
             vec![v1, x3],
             "the replayed pending log breaks a rule the per-record scans kept (order, first-wins, \
              dead-arena skip, duplicate handling)"
