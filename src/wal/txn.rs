@@ -252,11 +252,17 @@ pub enum CheckpointOutcome {
     /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
     /// and answers `Ok`, while one is held).
     KeptByPin,
+    /// **D253.** A record was appended after the checkpoint's fence: `next_lsn`, read in the same
+    /// attach-table hold that found no transaction. Its page change may be in no page this
+    /// checkpoint flushed, or its uncommitted change in one it did, so the truncation kept the
+    /// log. Nothing was discarded and nothing is replayed, as for `KeptByPin`.
+    KeptByAppend,
 }
 
-/// DROPs whose checkpoint a WAL pin kept from truncating, since process start (review 5's F4). The
-/// dropped table's records then stay in the log. On this branch the pin refusal and its fence make
-/// this unreachable; it is counted so that, if it ever happens, it is not silent.
+/// DROPs whose checkpoint a WAL pin, or (D253) a record appended after its fence, kept from
+/// truncating, since process start (review 5's F4). The dropped table's records then stay in the
+/// log. On this branch the pin refusal and its fence make this unreachable, and so does the
+/// attach-table hold the DROP keeps; it is counted so that, if it ever happens, it is not silent.
 pub static KEPT_LOG_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// See [`KEPT_LOG_DROPS`].
@@ -578,20 +584,22 @@ impl TxnManager {
             // Claimed before this returns, so the resume point is never *published* unclaimed. See
             // `SnapshotHandoff::pin` for what leaving this to the caller cost.
             //
-            // **It is not claimed from the moment it exists, and the gap is real rather than
-            // theoretical.** The `Begin` above went in under the `att` lock, which was then
-            // released; the pin is taken here, without it. A concurrent `checkpoint` samples
-            // `att.is_empty()` and *drops that lock before truncating*, so one that found the table
-            // empty a moment before this reader was inserted can truncate in between - and then
-            // this `pin` fails. It is tempting to write that a checkpoint cannot truncate while a
-            // transaction is open; it is not true as written, because the check and the truncation
-            // are not one critical section.
+            // **It is not claimed from the moment it exists.** The `Begin` above went in under the
+            // `att` lock, which was then released; the pin is taken here, without it. Before D253 a
+            // concurrent checkpoint that found the table empty a moment before this reader was
+            // inserted could truncate in between, and this `pin` then failed, because the check and
+            // the truncation were not one critical section.
             //
-            // Which is precisely why the failure below closes the reader instead of returning `?`.
-            // The race is narrow, its outcome is a clean refusal the caller can retry, and the
-            // alternative - holding `att` across a checkpoint's flush, page writes and fsync - buys
-            // atomicity here at the cost of blocking every begin and commit on disk IO. The error
-            // path is the cheaper correct answer; it just has to not leak.
+            // **D253 closed that for every checkpoint.** The one checkpoint body
+            // (`checkpoint_or_keep_locked`, and `ddl_unit`) reads its fence in the same hold as the
+            // emptiness check, so this reader's `Begin` lands above the fence and the truncation keeps
+            // the log (`WalManager::truncate_fenced`); `ddl_unit` excludes the `Begin` outright. What
+            // can still discard the log under this reader is the UNFENCED `WalManager::truncate`: the
+            // consensus snapshot install discards on purpose.
+            //
+            // So the failure below still closes the reader instead of returning `?`: it is the
+            // defence for that path and for a failed `flush`, its outcome is a clean refusal the
+            // caller can retry, and it just has to not leak.
             self.wal.pin(resume_lsn)
         })();
 
@@ -946,7 +954,11 @@ impl TxnManager {
             match self.checkpoint_keeping_owed() {
                 Ok(CheckpointOutcome::Truncated) => {}
                 // Counted where the log was kept (`checkpoint_or_keep_held`).
-                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptByPin) => {
+                Ok(
+                    CheckpointOutcome::KeptForOwed(_)
+                    | CheckpointOutcome::KeptByPin
+                    | CheckpointOutcome::KeptByAppend,
+                ) => {
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst)
                 }
                 Err(e) => {
@@ -1508,13 +1520,8 @@ impl TxnManager {
     }
 
     pub fn checkpoint(&self) -> Result<(), FerroError> {
-        // Deliberately a SHORT hold — the guard is a temporary and is released before the body
-        // runs, which is exactly what this function did before `ddl_checkpointed` existed. Every
-        // existing caller therefore keeps its old concurrency behaviour; only the DDL path below
-        // needs the answer to stay true while it is acted on, and only it pays for that.
-        if !self.att_read().is_empty() {
-            return Err(FerroError::Wal("checkpoint with active txns".into()));
-        }
+        // The attach-table check is in the one body, `checkpoint_or_keep_locked`, which reads the
+        // truncation's fence in the same hold (D253).
         self.checkpoint_locked()
     }
 
@@ -1648,15 +1655,27 @@ impl TxnManager {
         if !frees.is_empty() {
             self.discard_releases_on(frees);
         }
-        let outcome = self.checkpoint_or_keep_held(false)?;
-        if !frees.is_empty() && outcome == CheckpointOutcome::KeptByPin {
-            // Review 5's F4. Unreachable on this branch (the pin refusal and the fence run first), and
-            // counted and printed so that it is not silent if that ever changes.
+        // D253: `att` is held throughout, so the fence is read here, AFTER `f`. Records `f` appends
+        // are then below it and discarded exactly as before (a retained declaration is re-appended by
+        // `replay_schema`). Read before `f`, they would keep the log at every DDL checkpoint.
+        // `a_ddl_checkpoint_whose_body_appends_still_truncates` pins this.
+        let owed = self.owed_releases();
+        let fence = self.wal.next_lsn.load(Ordering::SeqCst);
+        let outcome = self.checkpoint_or_keep_held(owed, fence)?;
+        let kept_by = match outcome {
+            CheckpointOutcome::KeptByPin => Some("a WAL pin"),
+            CheckpointOutcome::KeptByAppend => Some("a record appended after the checkpoint's fence"),
+            CheckpointOutcome::Truncated | CheckpointOutcome::KeptForOwed(_) => None,
+        };
+        if let Some(why) = kept_by.filter(|_| !frees.is_empty()) {
+            // Review 5's F4. Unreachable on this branch (the pin refusal and the fence run first, and
+            // `att` is held, so no transaction appends), and counted and printed so that it is not
+            // silent if that ever changes.
             use std::io::Write;
             KEPT_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
             let _ = writeln!(
                 std::io::stderr(),
-                "ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in \
+                "ferrodb: {why} cancelled this DROP's truncation, so the dropped table's records stay in \
                  the log, and the next open would replay them onto pages the DROP freed"
             );
         }
@@ -1696,17 +1715,16 @@ impl TxnManager {
     /// transaction elsewhere therefore still refuses them after the index is built. That is A8's
     /// shape for indexes, it predates this lane, and it is unchanged here.
     pub fn ddl_checkpoint(&self) -> Result<(), FerroError> {
-        if !self.att_read().is_empty() {
-            return Err(FerroError::Wal("checkpoint with active txns".into()));
-        }
         self.checkpoint_or_keep_locked(true).map(|_| ())
     }
 
     /// The body of `checkpoint`: a checkpoint that keeps the log for owed releases is REFUSED here,
-    /// after it flushed. Takes no `att`; `checkpoint` asks it first.
+    /// after it flushed. The attach-table check is in `checkpoint_or_keep_locked`.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
         match self.checkpoint_or_keep_locked(true)? {
-            CheckpointOutcome::Truncated | CheckpointOutcome::KeptByPin => Ok(()),
+            CheckpointOutcome::Truncated
+            | CheckpointOutcome::KeptByPin
+            | CheckpointOutcome::KeptByAppend => Ok(()),
             CheckpointOutcome::KeptForOwed(owed) => Err(FerroError::Wal(format!(
                 "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
                  truncating the log would lose the record of the bytes they hold; every page was \
@@ -1722,9 +1740,6 @@ impl TxnManager {
     /// is open, as `checkpoint` does. (It answered `Ok(0)` for both "truncated" and "kept by a pin"
     /// until review 5's F4.)
     pub fn checkpoint_keeping_owed(&self) -> Result<CheckpointOutcome, FerroError> {
-        if !self.att_read().is_empty() {
-            return Err(FerroError::Wal("checkpoint with active txns".into()));
-        }
         self.checkpoint_or_keep_locked(true)
     }
 
@@ -1734,9 +1749,6 @@ impl TxnManager {
     /// and log writes between those frees and the sync. The window then holds what `9aa6968`'s
     /// checkpoint held: the log flush, the pool flush and the sync (lane §21.2).
     pub fn checkpoint_after_frees(&self) -> Result<CheckpointOutcome, FerroError> {
-        if !self.att_read().is_empty() {
-            return Err(FerroError::Wal("checkpoint with active txns".into()));
-        }
         self.checkpoint_or_keep_locked(false)
     }
 
@@ -1746,10 +1758,37 @@ impl TxnManager {
         self.pending_releases.lock().unwrap().len()
     }
 
-    /// [`TxnManager::checkpoint_or_keep_held`], taking `release_retry` for it.
+    /// **The ONE checkpoint body (D253, SCALE-DESIGN "D253 CORRECTED 2").** `checkpoint`,
+    /// `ddl_checkpoint`, `checkpoint_keeping_owed` (the automatic trigger) and `checkpoint_after_frees`
+    /// all come here; `ddl_checkpointed` and `drop_checkpointed` do the same steps in `ddl_unit`, where
+    /// `att` is held throughout.
+    ///
+    /// In ONE attach-table hold: find no transaction attached, take `release_retry` (#16's lock order,
+    /// `att` then `release_retry`), retry the owed releases, and read the FENCE, `next_lsn`. Then let
+    /// `att` go. Every record below the fence belongs to a transaction that ended before the check,
+    /// or is one of the retry's own releases, or a txn-0 declaration; the flush below covers them
+    /// all. A transaction that begins after `att` is released appends above the fence, and
+    /// `WalManager::truncate_fenced` then keeps the log instead of discarding it.
+    ///
+    /// Why the retry is INSIDE the hold: it appends, so a fence read before it would keep the log
+    /// after every successful retry, and a fence read after it with `att` released would let a
+    /// transaction begin and append below it. Nothing on the retry path takes `att`: `settle_release`
+    /// logs through `apply_then_log(.., chained = false)`, a plain `wal.append`, and tells the
+    /// directory through the pool (`ddl_unit` already held `att` across this retry).
+    ///
+    /// **Cost, stated:** `att` is now held across the retry in EVERY checkpoint, not only in DDL, so
+    /// `begin` waits while owed releases are retried. With nothing owed it is one lock and an empty
+    /// take.
     fn checkpoint_or_keep_locked(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
+        let att = self.att_read();
+        if !att.is_empty() {
+            return Err(FerroError::Wal("checkpoint with active txns".into()));
+        }
         let _retry = self.release_retry.lock().unwrap();
-        self.checkpoint_or_keep_held(retry)
+        let owed = if retry { self.retry_pending_releases_held() } else { self.owed_releases() };
+        let fence = self.wal.next_lsn.load(Ordering::SeqCst);
+        drop(att);
+        self.checkpoint_or_keep_held(owed, fence)
     }
 
     /// **Review 2's N1 (the lead's decision): refuse the TRUNCATION, never the flush.**
@@ -1759,18 +1798,21 @@ impl TxnManager {
     /// open's index rebuild had then freed every old tree and reallocated its pages, which
     /// `deallocate` and `new_page` do ON DISK at once. The new nodes and the catalog stayed in the
     /// pool, so the next open walked an old root that was now a zero page, and failed at every open
-    /// from then on. So: retry (when `retry`), then flush the log and every page and sync, and skip
-    /// only the truncation and the replays after it. The caller holds `release_retry` across the retry
-    /// and the decision (C1).
+    /// from then on. So: retry, then flush the log and every page and sync, and skip only the
+    /// truncation and the replays after it. The CALLER retries, in its attach-table hold, and holds
+    /// `release_retry` across the retry and the decision (C1; D253 moved the retry into that hold,
+    /// see `checkpoint_or_keep_locked`).
     ///
     /// A kept log is counted in `DEFERRED_CHECKPOINTS`. The stderr line is printed only when the
     /// log-keeping state CHANGES: once when a checkpoint first keeps the log, and once when one
     /// truncates again (review 3's decision 3).
-    fn checkpoint_or_keep_held(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
+    ///
+    /// `owed` and `fence` come from the caller's attach-table hold (`checkpoint_or_keep_locked`,
+    /// `ddl_unit`); the truncation keeps the log if anything was appended after `fence` (D253).
+    fn checkpoint_or_keep_held(&self, owed: usize, fence: u64) -> Result<CheckpointOutcome, FerroError> {
         use std::io::Write;
         #[cfg(test)]
         Self::pause(&self.checkpoint_pause_at_entry);
-        let owed = if retry { self.retry_pending_releases_held() } else { self.owed_releases() };
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
@@ -1791,24 +1833,26 @@ impl TxnManager {
             }
             return Ok(CheckpointOutcome::KeptForOwed(owed));
         }
-        // Read before `truncate`, which keeps the log, and answers `Ok`, while a WAL pin is below its
-        // end (review 4's finding 5).
-        let base = self.wal.base_lsn.load(Ordering::SeqCst);
-        let end = self.wal.next_lsn.load(Ordering::SeqCst);
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
-        self.wal.truncate(self.txn_ids.issued_through())?;
+        //
+        // D253: fenced, and it answers whether it discarded the log. That answer replaces the
+        // `base`/`end` reads that used to detect a pin's keep, and with them their stated residual
+        // (an empty log appended to between those reads and the truncation read as truncated).
+        // `consensus/snapshot.rs` still detects by reading; D216's `Truncation` is to replace both.
+        let truncated = self.wal.truncate_fenced(self.txn_ids.issued_through(), Some(fence))?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
-        if base < end && self.wal.base_lsn.load(Ordering::SeqCst) == base {
-            // CANCELLED by a pin: nothing was discarded, so nothing is replayed (a replay would put a
-            // second copy of every declaration into the kept log), the owed state is not "settled",
-            // and it is counted as the deferral it is. **Residual, stated:** an empty log that gets an
-            // append between the reads above and `truncate` can be misread as truncated;
-            // `truncate` does not report its decision. The log IS empty after every restart until the
-            // first DDL (review 5's F5), and `consensus/snapshot.rs` detects the same fact with the
-            // opposite residual: D216's `Truncation` result is to replace both.
+        if !truncated {
+            // CANCELLED, by a pin or (D253) by an append after the fence: nothing was discarded, so
+            // nothing is replayed (a replay would put a second copy of every declaration into the kept
+            // log), the owed state is not "settled", and it is counted as the deferral it is. Named by
+            // the end having moved; a pin that ALSO held is then reported as the append.
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-            return Ok(CheckpointOutcome::KeptByPin);
+            return Ok(if self.wal.next_lsn.load(Ordering::SeqCst) != fence {
+                CheckpointOutcome::KeptByAppend
+            } else {
+                CheckpointOutcome::KeptByPin
+            });
         }
         if self.keeping_log.swap(false, Ordering::SeqCst) {
             let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");

@@ -928,16 +928,18 @@ impl WalManager {
     /// alternative, which is discarding records a replica has been promised and only finding out
     /// when the replica is refused.
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
-        self.truncate_fenced(next_txn_id, None)
+        self.truncate_fenced(next_txn_id, None).map(|_| ())
     }
 
-    /// [`Self::truncate`], refusing to discard anything appended after `fence`.
+    /// [`Self::truncate`], refusing to discard anything appended after `fence`, and answering whether
+    /// it discarded the log (`false`: a pin or the fence kept it).
     ///
     /// **D253.** A checkpoint may discard the log only up to what its page flush covers. It reads
     /// `next_lsn` as the FENCE in the same critical section in which it finds no transaction
-    /// attached (`TxnManager::checkpoint`). So every record below the fence either belongs to a
-    /// transaction that had already ended, whose pages the checkpoint's later `flush_all` writes,
-    /// or is a txn-0 declaration, which is discarded as it always was and re-appended from the
+    /// attached (`TxnManager::checkpoint_or_keep_locked`, the one checkpoint body, and `ddl_unit`).
+    /// So every record below the fence belongs to a transaction that had already ended, or is one
+    /// of the release retries that hold ran, whose pages the checkpoint's later `flush_all` writes;
+    /// or it is a txn-0 declaration, which is discarded as it always was and re-appended from the
     /// retained lists. Anything appended since may belong to a transaction whose page change the
     /// flush missed (a commit acknowledged inside the window), or whose uncommitted change it wrote
     /// (a transaction that began inside it). Discarding those records loses the one or leaves the
@@ -958,7 +960,7 @@ impl WalManager {
         &self,
         next_txn_id: u64,
         fence: Option<u64>,
-    ) -> Result<(), FerroError> {
+    ) -> Result<bool, FerroError> {
         self.flush()?;
         // Taken first and held across the decision, so a pin cannot be registered against a range
         // this call is in the middle of discarding. `pin_durable` reads the frontier under this
@@ -971,13 +973,13 @@ impl WalManager {
         if let Some(&oldest) = pins.values().min() {
             if oldest < next {
                 // Something still needs records below the new base. Keep the log.
-                return Ok(());
+                return Ok(false);
             }
         }
         // D253: something was appended after the fence, so the page flush may not cover it. Keep
         // the log. `next_lsn` never decreases, so "moved" and "grew" are the same test.
         if fence.is_some_and(|f| f != next) {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut header = [0u8; HEADER_SIZE];
@@ -996,7 +998,7 @@ impl WalManager {
         buffer.bytes.clear();
         buffer.start_lsn = next;
         self.flushed_lsn.store(next, Ordering::SeqCst);
-        Ok(())
+        Ok(true)
 
     }
 
