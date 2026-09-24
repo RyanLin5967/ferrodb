@@ -1392,4 +1392,32 @@ mod tests {
         let err = RecKind::deserialize(&bytes).expect_err("an unknown alteration tag was accepted");
         assert!(format!("{err}").contains("column alteration tag"), "{err}");
     }
+
+    /// **D236's control, the other direction: `flush_up_to` of a record that IS durable leaves a
+    /// later, buffered record alone.**
+    ///
+    /// `test_flush_up_to_stops_when_durable` asks the same question with an EMPTY buffer, where a
+    /// flush writes nothing. So it passes even if `flush_up_to` flushed on every call, and it cannot
+    /// tell a correct `>` from a fix that over-corrected into "always flush" (mutant M2 in
+    /// `frontier/lane_d236.md`). Here a second record is waiting, so a needless flush shows.
+    ///
+    /// Pre-registered from source, UNBUILT: PASSES at `9aa6968` and at the fix, and FAILS under M2.
+    #[test]
+    fn flush_up_to_of_a_durable_record_leaves_a_later_one_buffered() {
+        let (wal, _dir) = setup();
+        let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.flush().unwrap();
+        let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
+        wal.append(1, l0, &RecKind::Commit).unwrap();
+        assert!(
+            flushed < wal.next_lsn.load(Ordering::SeqCst),
+            "premise failed: nothing is waiting in the buffer"
+        );
+        wal.flush_up_to(l0).unwrap();
+        assert_eq!(
+            wal.flushed_lsn.load(Ordering::SeqCst),
+            flushed,
+            "flush_up_to({l0}) of a record already on disk flushed a later record too"
+        );
+    }
 }
