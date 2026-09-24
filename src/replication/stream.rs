@@ -19,10 +19,11 @@
 //! because a feed that is missing records looks exactly like a feed that had none.
 //!
 //! So while a transaction is in flight the cursor advances **only to the highest `commit_end_lsn`
-//! actually emitted**, and never past that transaction's first record. If such a pump emits nothing,
-//! the cursor does not move at all, however much log it just read. Re-reading the records of an
-//! in-flight transaction on the next pump is pure waste and is the correct waste: the alternative is
-//! losing them.
+//! the batch decided about** (emitted, or dropped by the publication or the snapshot boundary), and
+//! never past that transaction's first record. If such a batch decided about nothing, the cursor does
+//! not move at all, however much log it just read. Re-reading the records of an in-flight
+//! transaction on the next pump is pure waste and is the correct waste: the alternative is losing
+//! them.
 //!
 //! **With nothing in flight and nothing refused, the cursor moves to where the read stopped (D252).**
 //! Every record below there has been decided about, including those that yield no event: the
@@ -279,9 +280,10 @@ impl FeedStreamer {
     /// Decode everything committed between `cursor` and the durable frontier, write it, and return
     /// the new cursor.
     ///
-    /// See the module docs: the returned cursor is **not** the frontier. While a transaction is open
-    /// or an event is refused it is the highest `commit_end_lsn` it may pass, unchanged when nothing
-    /// was emitted; otherwise it is where the read stopped (D252).
+    /// See the module docs: the returned cursor is **not** the frontier. It never passes the first
+    /// record of a transaction still open, nor the start of a refused commit, and while either holds
+    /// it passes only the commits the batch decided about. With neither, it is where the read
+    /// stopped (D252).
     pub fn pump<W: Write>(
         &self,
         wal: &WalManager,

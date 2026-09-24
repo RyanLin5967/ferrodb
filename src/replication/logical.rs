@@ -626,12 +626,16 @@ impl LogicalDecoder {
     /// This is the gap fill behind `Learned::covered_through`. It reads records rather than rows:
     /// no tuple is deserialized, nothing is staged, and no event is produced, so the cost is one
     /// pass over the record headers of a range the caller was going to skip anyway.
+    ///
+    /// Returns where it stopped: a record boundary at or past `to`, because a record that starts
+    /// below `to` is read whole. `to` itself is a caller's cursor and may lie inside a record; the
+    /// position returned never does (the second D252 review's finding 1).
     fn scan_ddl(
         wal: &WalManager,
         from: u64,
         to: u64,
         shapes: &mut Vec<ShapeAt>,
-    ) -> Result<(), FerroError> {
+    ) -> Result<u64, FerroError> {
         let mut lsn = from;
         while lsn < to {
             let (rec, next) = wal.read_record(lsn)?;
@@ -654,7 +658,7 @@ impl LogicalDecoder {
             }
             lsn = next;
         }
-        Ok(())
+        Ok(lsn)
     }
 
     /// Fold newly-seen DDL into the remembered history.
@@ -819,13 +823,16 @@ impl LogicalDecoder {
             if history.covered_through < from_lsn {
                 let gap_from = history.covered_through;
                 let mut found = Vec::new();
-                Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
+                let scanned_to = Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
                 // Through the shared merge: a decoder that walked an UPPER range first already holds
                 // shapes inside the gap, and appending blindly would duplicate them.
                 let mut shapes = std::mem::take(&mut history.shapes);
                 Self::merge_shapes(&mut shapes, found);
                 history.shapes = shapes;
-                history.covered_through = from_lsn;
+                // Where the scan stopped, not `from_lsn`: a cursor handed in from outside (a client's
+                // resume position) can lie inside a record, and the watermark must stay on a
+                // boundary. The walk below then fails on that cursor, as it should.
+                history.covered_through = scanned_to;
             }
 
             for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
