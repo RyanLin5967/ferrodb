@@ -411,3 +411,108 @@ has a registered prediction: **they pass**.
   removes 0 (READ). **Per-target: 2587.**
 - **The D249 mutant tree is `bed42db`** (this commit's parent carries no code change after it; amendment 4's G1
   table applies to it). It does not contain D254's fix.
+
+---
+
+## Amendment 6 — review 3's H1–H3, written BEFORE their code (nothing built)
+
+Source: `artie-research frontier/d249_review3.md` @ `5094f19`, with its erratum @ `4233eb0`. It reviews this tip,
+`9b291ac`. Verdict: SOUND-WITH-CAVEATS, with G1–G5 and E1–E5 closed. These are the lead's decisions.
+
+### H1: the as-read check's schema half has no killer. ST2 and E7
+
+- **What is missing.** Amendment 4 says the `live == read` form "also covers the schema" (`PREREG.md:329`). No test
+  holds a plan across a SCHEMA change. ST's intervening change is `create_index`, which moves `indexes` and not
+  `schema`. So a comparison that ignores the schema passes every test.
+- **ST2** = `a_plan_held_across_another_alter_of_its_own_table_is_refused`, additions only. It uses only API that ST
+  already uses. The steps:
+  1. `Db::with_one_row()`: `t(id, v)` holding `(1, 7)`.
+  2. `plan_alters(t, [ADD COLUMN y INTEGER])`. This plan rewrites rows, so it exercises G3's stated harm.
+  3. `db.exec("ALTER TABLE t ADD COLUMN x INTEGER;")`.
+  4. `apply_plan(plan)`.
+
+  It must return `Err(Constraint)` containing "changed since". The schema must be `[id, v, x]`, and `SELECT *` must
+  return exactly `[(1, 7, NULL)]`.
+- **Where it is red.** At this tip, ST2 is green (the `live == read` check refuses it). Its red is:
+  - the `fa2e9a3`/`27dd0a1` form of the check, which overwrote the live schema before comparing (INFERRED: after the
+    overwrite `live` equals `read` for this table, because `x`'s ALTER moves no root and no index);
+  - mutant **E7**, which restores exactly that shape.
+- **E7 `schema_overwritten_before_compare`** replaces `        if self.require_table(&table)? != &read {` with three
+  lines:
+  - `let mut live = self.require_table(&table)?.clone();`
+  - `live.schema = read.schema.clone();`
+  - `if live != read {`
+
+  The id is new. "E6" appears in amendment 4 only as "not registered", for review 2's declined swap.
+- **Predicted kills:**
+  - **E7 → ST2 only.** ST2 fails at its `Ok(_)` arm: the stale plan applies and installs `[id, v, y]`. ST still dies
+    of `indexes`.
+  - **E5 → ST and ST2.**
+  - E1–E4 are unchanged. ST2's entries are small, and the staleness check refuses before any of their edits matter.
+
+### H2: the blind spot is stated by its condition, with both known routes
+
+`apply_plan`'s comment will say that the check does not see **the heap changing while the catalog entry compares
+equal**, and will name the two known routes:
+
+- committed DML that moves no root;
+- `DROP TABLE` followed by a `CREATE TABLE` of the same declaration, between plan and apply. `drop_table` frees every
+  page of the table, and `DiskManager::allocate` walks the bitmap from bit 0, so the new table can receive the same
+  page ids, and so an equal entry. That is INFERRED; it depends on nothing lower being freed in between.
+
+Words only. Closing it would need a heap-side stamp taken at plan time, which is not done here.
+
+### H3: what keeps another session's `BEGIN` out between a merge's plan loop and its apply (READ at `9b291ac`)
+
+**The claim to verify.** `quiesce_guard` reads every session's active set (`alter.rs`, `fn quiesce_guard`). So "a
+merge holds no transaction open" rules out only the merge's own, and another session's `BEGIN` in the window
+between `plan_alters` (`agent_sql/runtime.rs:5035`) and a later table's `apply_plan` (`:5103`) would refuse table 2
+after table 1 was applied.
+
+**What excludes it: an exclusive borrow of the one `Catalog`, which every transaction start requires.**
+
+- **Every production `TxnManager::begin` holds `&mut Catalog`** (`git grep` for `.begin()` over `src/`, tests
+  excluded):
+  - `executor.rs:196` (`Stmt::Begin`) and `:445` (the implicit transaction) are both inside `run_staged(stmt, catalog:
+    &mut Catalog, …)`, which `run` wraps;
+  - `agent_sql/runtime.rs:6732` (`apply_dml`) takes `ctx: &mut ExecCtx`, whose `catalog` is `&'a mut Catalog`
+    (`runtime.rs:235-239`);
+  - `agent_sql/runtime.rs:5184` is the merge's own publish transaction, begun AFTER its apply loop (`:5103`).
+- **The shared read path begins nothing.** `try_run_read` (`executor.rs:81`), which pgwire's extended protocol calls
+  without the outer lock (`pgwire/extended.rs:373`), either snapshots an already-open transaction or reads the
+  cached snapshot with `txn_id: 0` (`executor.rs:116-121`).
+- **Where that exclusive borrow comes from:**
+  - **pgwire:** `ServerContext::catalog()`, the `Mutex<Catalog>` (`pgwire/mod.rs:64`, `:143`), held for one whole
+    statement. A MERGE is one statement.
+  - **The CLI:** its catalog mutex, taken once per statement (`cli.rs:246`, and `branch/lease_thread.rs`'s CLI
+    `RuntimeLock` doc).
+  - **An embedded caller:** its own `&mut Catalog`. Rust makes that exclusive, so no second statement on the same
+    catalog can begin a transaction while `merge` holds it.
+- **The premise under all three: one `Catalog` per `TxnManager`.** Two `Catalog` values over one `TxnManager` would
+  let a second one begin a transaction during a merge.
+  - No production path builds two: `git grep 'Catalog::open(\|Catalog::create('` over `src/` and `examples/` finds
+    one per process.
+  - That is READ for the grep, and INFERRED for "no embedder does".
+
+**Result: no caller reaches `merge` without the exclusion, so this is not a defect.** The G4 doc is rewritten to name
+the real premise (the exclusive catalog borrow that every `begin` needs, and its three sources) instead of the
+merge's own transactions.
+
+### Counts, derived (not copied from the review)
+
+- **Source counts** (READ):
+  - `tests/d249_alter_encodable.rs`: 6 `#[test]` at `9b291ac`, so **7** with ST2.
+  - The file has no `#[cfg`, no `#[ignore]` and no `macro_rules!`.
+  - The lib's U1 and U2 are two plain `#[test]` in `catalog_page.rs`'s test module.
+  - `git diff 9aa6968 <tip> | grep -cE '^\+[[:space:]]*#\[test\]'` will be 9, with 0 removed.
+- **Per-target: 2579 + 9 = 2588.** The 2579 is measured on main's tree.
+- **The authority at run time is the harness's own list, not these.** The run script gains two steps:
+  - `cargo test --test d249_alter_encodable -- --list`
+  - `cargo test --lib catalog::catalog_page::tests:: -- --list`
+
+  Each writes its output to `bench/d249/raw/`.
+- **Predicted list counts:**
+  - the target: **7 tests**;
+  - the unit filter: the catalog-page test module's count at `9aa6968` plus 2.
+
+  The run is scored against the list, and a disagreement is reported as a registration miss.
