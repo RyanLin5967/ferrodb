@@ -24,11 +24,13 @@
 //! file. T2 is the control that keeps T1 honest: a row one byte under the cap still stages, mirrors
 //! and merges, so the refusal is about the boundary and not about long strings.
 //!
-//! Two fault injectors live here and nowhere in `src/`: [`FaultyStore`] fails the k-th
+//! Three fault injectors live here and nowhere in `src/`: [`FaultyStore`] fails the k-th
 //! `PageStore::cow_page`, which is how a tree write fails AFTER every check has passed (allocator
-//! starvation and I/O are not knowable in advance), and [`FlakyFile`] fails the effect log's next
-//! write. Both are aimed at the one call they break and disarm themselves after firing, so the
-//! restore that follows a failure runs against a store that works.
+//! starvation and I/O are not knowable in advance); [`FlakyFile`] fails the effect log's next
+//! write; and [`FlakyRoots`] lets the catalog's next `set_root` land and then report failure, which
+//! is a write that reached the tree while returning an error (T9, added by the PREREG's amendment
+//! 2). Each is aimed at the one call it breaks and disarms itself after firing, so the restore that
+//! follows a failure runs against a store that works.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -39,7 +41,8 @@ use ferrodb::agent_sql::runtime::{row_id_of, table_id, AgentRuntime, ExecCtx};
 use ferrodb::agent_sql::AgentOutput;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
-use ferrodb::branch::types::{ArenaId, BranchId, Epoch, PageId};
+use ferrodb::branch::record::{BranchRecord, CoreRecord};
+use ferrodb::branch::types::{ArenaId, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use ferrodb::branch::{BranchCatalog, CapabilityEnvelope, ColumnCapability, Verb};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
@@ -70,7 +73,8 @@ const OVERSIZED_NOTE: usize = 1000;
 
 // ---- fault injection ------------------------------------------------------------------------
 
-/// The switches both injectors read. One per database, shared by the store and the log file.
+/// The switches every injector reads. One per database, shared by the store, the log file and
+/// the branch catalog.
 #[derive(Default)]
 struct Faults {
     /// `cow_page` calls seen since the last [`Faults::arm_cow`].
@@ -79,6 +83,8 @@ struct Faults {
     fail_cow_at: AtomicUsize,
     /// Fail the effect log's next `pwrite`, once.
     fail_log_write: AtomicBool,
+    /// Let the catalog's next `set_root` land, then report it failed, once.
+    fail_set_root: AtomicBool,
 }
 
 impl Faults {
@@ -183,6 +189,143 @@ impl Storage for FlakyFile {
     }
 }
 
+/// The real branch catalog, with one `set_root` made to land and then report failure.
+///
+/// That is what both production catalogs do when the disk refuses the durability step:
+/// `LogBranchCatalog::set_root` moves the record's root in memory and then fails its fsync'd
+/// append, and `TableBranchCatalog::set_root` writes the record and then fails `durable`. So the
+/// branch's root has MOVED — its tree holds the row — while `put_row` returns an error. Delegating
+/// first and failing afterwards reproduces exactly that. Every other method, the defaulted ones
+/// included, goes straight to the inner catalog, so nothing changes until the switch is armed.
+struct FlakyRoots {
+    inner: Arc<dyn BranchCatalog>,
+    faults: Arc<Faults>,
+}
+
+impl BranchCatalog for FlakyRoots {
+    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
+        let landed = self.inner.set_root(branch, root);
+        if self.faults.fail_set_root.swap(false, Ordering::SeqCst) {
+            landed?;
+            return Err(FerroError::Io(format!(
+                "d258: injected: the root of {branch} moved to page {root}, then its durability \
+                 step failed"
+            )));
+        }
+        landed
+    }
+    fn next_epoch(&self) -> Epoch {
+        self.inner.next_epoch()
+    }
+    fn current_epoch(&self) -> Epoch {
+        self.inner.current_epoch()
+    }
+    fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        self.inner.fork(parent, lease)
+    }
+    fn fork_staged(
+        &self,
+        parent: BranchId,
+        lease: LeaseDeadline,
+    ) -> Result<(BranchRecord, Option<u64>), FerroError> {
+        self.inner.fork_staged(parent, lease)
+    }
+    fn await_fork_durable(&self, seq: Option<u64>) -> Result<(), FerroError> {
+        self.inner.await_fork_durable(seq)
+    }
+    fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
+        self.inner.get(branch)
+    }
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(branch, parent, fork_epoch, root)
+    }
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(branch, envelope)
+    }
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        self.inner.set_state(branch, expect, to)
+    }
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        self.inner.expired_before(now_millis)
+    }
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        self.inner.in_state(state)
+    }
+    fn scan(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan()
+    }
+    fn scan_ids(
+        &self,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan_ids(lo, hi)
+    }
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        self.inner.max_live_child(parent_id)
+    }
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        self.inner.live_child_in_epoch_range(parent_id, lo, hi)
+    }
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        self.inner.has_live_children(parent_id)
+    }
+    fn live_count(&self) -> usize {
+        self.inner.live_count()
+    }
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        self.inner.get_raw(id)
+    }
+    fn release_id(&self, id: u64) {
+        self.inner.release_id(id)
+    }
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        child_id: u64,
+    ) -> Result<(), FerroError> {
+        self.inner.attach_child(parent_id, fork_epoch, child_id)
+    }
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        self.inner.detach_child(parent_id, fork_epoch)
+    }
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(branch, arena)
+    }
+    fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
+        self.inner.renew_lease(branch, lease)
+    }
+    fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        self.inner.envelope_of(branch)
+    }
+    fn charge_row_writes(&self, branch: BranchId, n: u64) -> Result<(), FerroError> {
+        self.inner.charge_row_writes(branch, n)
+    }
+}
+
 // ---- the database ---------------------------------------------------------------------------
 
 /// Which runtime a test runs against.
@@ -222,7 +365,12 @@ impl Db {
         bp.attach_wal(wal);
 
         let faults = Arc::new(Faults::default());
-        let branches = Arc::new(LogBranchCatalog::in_memory(1));
+        // Every consumer — the runtime and the page store — sees the catalog through the one
+        // wrapper, so an armed `set_root` fault is the only difference from the real thing.
+        let branches: Arc<dyn BranchCatalog> = Arc::new(FlakyRoots {
+            inner: Arc::new(LogBranchCatalog::in_memory(1)),
+            faults: Arc::clone(&faults),
+        });
         let log: Arc<dyn EffectLog> = match shape {
             Shape::PagedMem => Arc::new(MemEffectLog::new()),
             Shape::PagedDurable | Shape::MapDurable => {
@@ -238,21 +386,15 @@ impl Db {
             }
         };
         let runtime = match shape {
-            Shape::MapDurable => {
-                AgentRuntime::with_parts(Arc::clone(&branches) as Arc<dyn BranchCatalog>, log)
-            }
+            Shape::MapDurable => AgentRuntime::with_parts(branches, log),
             Shape::PagedMem | Shape::PagedDurable => {
-                let arena = ArenaPageStore::new(
-                    bp.clone(),
-                    Arc::clone(&branches) as Arc<dyn BranchCatalog>,
-                    ARENA_BASE,
-                )
-                .unwrap();
+                let arena =
+                    ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap();
                 let store: Arc<dyn PageStore> = Arc::new(FaultyStore {
                     inner: Arc::new(arena) as Arc<dyn PageStore>,
                     faults: Arc::clone(&faults),
                 });
-                AgentRuntime::with_storage(branches as Arc<dyn BranchCatalog>, log, store).unwrap()
+                AgentRuntime::with_storage(branches, log, store).unwrap()
             }
         };
         Db { catalog, bp, txn, runtime: Arc::new(runtime), faults, _dir: dir }
@@ -743,4 +885,62 @@ fn a_sibling_merge_that_refuses_on_its_second_table_stages_nothing() {
     assert!(report.applied, "a merge the target can afford was not applied");
     assert_eq!(db.id_qty(lo, &mut tgt), vec![(1, 1)]);
     assert_eq!(db.id_qty(hi, &mut tgt), vec![(1, 15)]);
+}
+
+// ---- T9: a write that lands and then fails ---------------------------------------------------
+
+/// **T9. A row whose write LANDED before it reported failure is put back too.**
+///
+/// T6's faults are inside `cow_page`, where the tree's own journal rolls the failed operation back,
+/// so nothing of the failing row ever reaches the tree. This one fails after the tree operation has
+/// committed: the catalog moves the branch's root and then its durability step fails, which is what
+/// both production catalogs do when the fsync is refused. The first row of a fresh branch is the row
+/// that moves the root (its write copies the parent's shared root), so the failing row is row 1 —
+/// and an undo list that records a row only once its write returned Ok has nothing for it.
+#[test]
+fn a_row_write_that_lands_and_then_fails_is_put_back_too() {
+    const S: &str = "UPDATE ledger SET qty = qty - 5 WHERE qty >= 0;";
+    let mut db = Db::new(Shape::PagedMem);
+    let mut setup = db.session();
+    db.ok("CREATE TABLE ledger (id INTEGER NOT NULL, qty INTEGER, note VARCHAR(2000));", &mut setup);
+    db.ok("INSERT INTO ledger VALUES (1, 20, 'a');", &mut setup);
+    db.ok("INSERT INTO ledger VALUES (2, 20, 'b');", &mut setup);
+    let mut a = db.session();
+    let branch = db.begin("t9", &mut a);
+
+    db.faults.fail_set_root.store(true, Ordering::SeqCst);
+    let err = db.refused(S, &mut a);
+    assert!(err.contains("injected"), "refused for another reason: {err}");
+    assert!(
+        !db.faults.fail_set_root.load(Ordering::SeqCst),
+        "the armed fault never fired, so this test exercised nothing"
+    );
+
+    assert_eq!(
+        db.id_qty("ledger", &mut a),
+        vec![(1, 20), (2, 20)],
+        "the write failed with `{err}` and the statement is still staged"
+    );
+    for id in [1, 2] {
+        assert_eq!(
+            db.tree_row(branch, "ledger", id),
+            None,
+            "row {id} is in the branch's page tree after a statement that failed: its write landed \
+             before the error, and nothing put it back"
+        );
+    }
+    assert_eq!(db.diff_len(&mut a), 0, "DIFF reports the failed statement");
+
+    db.exec(S, &mut a).unwrap_or_else(|e| panic!("the retry after a landed-then-failed write: {e}"));
+    assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 15), (2, 15)]);
+    for id in [1, 2] {
+        assert_eq!(
+            db.tree_row(branch, "ledger", id).map(|r| r[1].clone()),
+            Some(Value::Integer(15)),
+            "row {id} of the retry is not in the branch's tree"
+        );
+    }
+    db.ok("MERGE;", &mut a);
+    let mut trunk = db.session();
+    assert_eq!(db.id_qty("ledger", &mut trunk), vec![(1, 15), (2, 15)]);
 }
