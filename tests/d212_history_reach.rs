@@ -9,6 +9,7 @@
 //! |---|---|---|
 //! | `a_merge_through_the_open_path_is_revertible_after_a_crash` | 4: the store is opened inside `open_recovered`, before `recover` | `open_recovered` registers no store; or registers it after `recover` |
 //! | `a_runtime_attached_to_one_database_refuses_another_databases_history` | 4: the door hands the runtime its database's store | `attach_history` skips the same-store check |
+//! | `a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids` | 1: the runtime reads history only through store ∪ queue | `HistoryStore::records` returns the durable window only |
 //!
 //! A "crash" here drops every handle with no checkpoint, so the history queued in memory is lost
 //! and the log is its only copy.
@@ -44,7 +45,11 @@ impl Db {
     }
 
     fn try_open(path: &Path) -> Result<Db, FerroError> {
-        let lock = DbLock::acquire(path)?;
+        Db::try_open_locked(path, DbLock::acquire(path)?)
+    }
+
+    /// The open, with the lock already taken, so a test can change the directory between the two.
+    fn try_open_locked(path: &Path, lock: DbLock) -> Result<Db, FerroError> {
         let o = open_recovered(path, &lock)?;
         let mut branches = path.as_os_str().to_os_string();
         branches.push(".branches");
@@ -166,4 +171,57 @@ fn a_runtime_attached_to_one_database_refuses_another_databases_history() {
     };
     assert!(err.contains("another database"), "refused, but not for the history: {err}");
     assert_eq!(b.qty_of(1), 10);
+}
+
+/// **Item 1 (the round-3 adversary's A4).** The open's checkpoint fails its first history write,
+/// so the store's queue still holds the crashed process's merge when the runtime attaches. The
+/// runtime reads history only through the store's union of its durable window and its queue, so
+/// the next publish takes the next `hseq` and version stamps after BOTH, and a reopen can REVERT
+/// both merges. A runtime that read the durable window alone would reuse the queued merge's `hseq`,
+/// and the reader's dedup by `hseq` would drop one of the two.
+///
+/// The failure is real: the database's directory is made read-only for the open, so the first
+/// write (a full replace, which creates a temporary beside the file) cannot create its file.
+///
+/// RED before item 1's code: a failed hook write failed `open_recovered` itself.
+#[cfg(unix)]
+#[test]
+fn a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reach1.db");
+    let mut db = Db::open(&path);
+    db.seed(&[(1, 10), (2, 20)]);
+    let first = db.task("a", "UPDATE inventory SET qty = 11 WHERE id = 1;");
+    let history = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".history");
+        PathBuf::from(p)
+    };
+    assert!(!history.exists(), "premise: nothing drained the first merge into the store before the crash");
+    drop(db);
+
+    let lock = DbLock::acquire(&path).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let opened = Db::try_open_locked(&path, lock);
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut db = opened.unwrap_or_else(|e| panic!("an open whose history write failed did not open: {e}"));
+    assert!(
+        !history.exists(),
+        "premise: the open's checkpoint wrote the store, so its first replace did not fail (running as root?)"
+    );
+
+    let second = db.task("b", "UPDATE inventory SET qty = 22 WHERE id = 2;");
+    let mut db = db.crash_and_reopen();
+    for id in [&second, &first] {
+        let mut s = db.session();
+        match db.exec(&format!("REVERT MERGE {id};"), &mut s) {
+            Ok(Outcome::Agent(AgentOutput::Revert(plan))) => {
+                assert!(!plan.is_blocked(), "{id}: the two merges are independent, and the revert halted: {plan:?}")
+            }
+            Ok(_) => panic!("REVERT did not return a revert plan"),
+            Err(e) => panic!("REVERT {id} failed: one of two merges lost its history: {e}"),
+        }
+    }
+    assert_eq!((db.qty_of(1), db.qty_of(2)), (10, 20), "a revert did not restore its row");
 }
