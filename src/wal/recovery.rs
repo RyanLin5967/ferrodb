@@ -107,6 +107,31 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         txn.abort(id)?;
     }
 
+    // **D212 (a'): REVERT history the store does not hold yet.** A transaction's history records
+    // are in the log beside its rows; if a crash beat the checkpoint that writes them into the
+    // store, this is their only copy. Only a transaction with a `Commit` counts — `ended` would
+    // also admit one that aborted, since `abort` writes `TxnEnd` too — and the store skips any
+    // `hseq` it already holds, so a record the store has is never taken twice. The next
+    // checkpoint (the CLI takes one right after this) writes them.
+    if let Some(store) = txn.history_store() {
+        let committed: HashSet<u64> = records
+            .iter()
+            .filter(|r| matches!(r.kind, RecKind::Commit))
+            .map(|r| r.txn_id)
+            .collect();
+        let parts: Vec<(u64, u64, u64, u32, bool, Vec<u8>)> = records
+            .iter()
+            .filter(|r| committed.contains(&r.txn_id))
+            .filter_map(|r| match &r.kind {
+                RecKind::RevertHistory { hseq, ordinal, part, last, bytes } => {
+                    Some((r.txn_id, *hseq, *ordinal, *part, *last, bytes.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        store.enqueue(crate::wal::history::assemble(parts)?);
+    }
+
     // repair directory
     for (dir_root, page_id) in &touched {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());

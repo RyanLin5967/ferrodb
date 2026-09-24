@@ -36,6 +36,25 @@ pub fn fsync_counters() -> (u64, u64) {
     (FSYNC_CALLS.load(Ordering::Relaxed), FSYNC_BYTES.load(Ordering::Relaxed))
 }
 
+/// **D212 (a') instrument: records and bytes [`WalManager::read_record`] has returned.**
+///
+/// The checkpoint hook that makes REVERT's history durable must read NO log: it drains an
+/// in-memory queue. A hook that re-read the retained log instead would cost O(pin lag) per
+/// checkpoint under a WAL pin (SCALE-DESIGN "D212 (a') AMENDED" §6), and only a counter here can
+/// show it does not. Observation only; nothing reads these to decide anything.
+pub static WAL_RECORDS_READ: AtomicU64 = AtomicU64::new(0);
+pub static WAL_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+/// `(records, bytes)` read from any log since process start.
+pub fn wal_read_counters() -> (u64, u64) {
+    (WAL_RECORDS_READ.load(Ordering::Relaxed), WAL_BYTES_READ.load(Ordering::Relaxed))
+}
+
+/// The most history bytes one tag-11 record carries. A larger history record is split across
+/// consecutive parts of its transaction, so every frame stays far below the 8 MiB replication
+/// frame (`replication::MAX_FRAME`) whatever the size of the merge.
+pub const REVERT_HISTORY_PART_BYTES: usize = 1 << 20;
+
 pub struct WalManager {
     /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
     /// this log — a torn frame, a lost frame, a flush that reports success it did not achieve. Those
@@ -192,6 +211,16 @@ pub enum RecKind {
     ///   checkpoint, because a checkpoint discards the log whole, exactly as `replay_schema` does
     ///   for DDL. Transaction 0 never commits, so a declaration binds nothing.
     RunIdentity { run: RunEntity },
+    /// **D212 (a') — one part of a REVERT history record, written inside the transaction whose
+    /// history it is** (tag 11).
+    ///
+    /// Appended among the transaction's own records, so the transaction's `Commit` decides for the
+    /// rows and their history together (`wal::history`). Recovery does not redo it — it describes
+    /// no page — and the change feed and a physical replica skip it. What it does is let the open
+    /// put a committed record back into `<db>.history` when a crash beat the checkpoint that would
+    /// have written it there. `bytes` are opaque here; a record over
+    /// [`REVERT_HISTORY_PART_BYTES`] arrives as parts `0, 1, ..`, the last one marked.
+    RevertHistory { hseq: u64, ordinal: u64, part: u32, last: bool, bytes: Vec<u8> },
 }
 
 pub struct LogRecord {
@@ -423,6 +452,20 @@ impl RecKind {
                 buffer.extend_from_slice(&run.parent_branch.id.to_be_bytes());
                 buffer.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
             }
+            RecKind::RevertHistory { hseq, ordinal, part, last, bytes } => {
+                buffer.push(11);
+                buffer.extend_from_slice(&hseq.to_be_bytes());
+                buffer.extend_from_slice(&ordinal.to_be_bytes());
+                buffer.extend_from_slice(&part.to_be_bytes());
+                buffer.push(u8::from(*last));
+                let len = u32::try_from(bytes.len()).map_err(|_| FerroError::Unrepresentable {
+                    what: "a REVERT history record part".to_string(),
+                    len: bytes.len(),
+                    limit: u32::MAX as usize,
+                })?;
+                buffer.extend_from_slice(&len.to_be_bytes());
+                buffer.extend_from_slice(bytes);
+            }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
@@ -531,6 +574,19 @@ impl RecKind {
                         BranchId::new(branch_id, generation),
                     ),
                 })
+            }
+            11 => {
+                let mut at = 1usize;
+                let hseq = take_u64(bytes, &mut at)?;
+                let ordinal = take_u64(bytes, &mut at)?;
+                let part = take_u32(bytes, &mut at)?;
+                let last = take_u8(bytes, &mut at)? != 0;
+                let len = take_u32(bytes, &mut at)? as usize;
+                let body = at
+                    .checked_add(len)
+                    .and_then(|end| bytes.get(at..end))
+                    .ok_or_else(|| short(at, len, bytes.len()))?;
+                Ok(RecKind::RevertHistory { hseq, ordinal, part, last, bytes: body.to_vec() })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -690,6 +746,8 @@ impl WalManager {
         let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
         let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
         let kind = RecKind::deserialize(&frame[28..total-4])?;
+        WAL_RECORDS_READ.fetch_add(1, Ordering::Relaxed);
+        WAL_BYTES_READ.fetch_add(total as u64, Ordering::Relaxed);
         Ok((LogRecord {lsn: rec_lsn, prev_lsn, txn_id, kind}, lsn + total as u64))
     }
 
@@ -1274,6 +1332,23 @@ mod tests {
         let mut bytes = Vec::new();
         rec.serialize(&mut bytes).unwrap();
         RecKind::deserialize(&bytes).expect("a record this code just wrote did not read back")
+    }
+
+    /// **D212 (a'): a REVERT history part round-trips, and a truncated one is refused.**
+    #[test]
+    fn a_revert_history_part_round_trips_and_a_truncated_one_is_refused() {
+        let rec = RecKind::RevertHistory {
+            hseq: 7,
+            ordinal: 3,
+            part: 1,
+            last: true,
+            bytes: b"opaque history bytes".to_vec(),
+        };
+        assert_eq!(round_trip(&rec), rec);
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes[0], 11, "tag 11, the next free number after RunIdentity's 10");
+        assert!(RecKind::deserialize(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// **Breaking shape: an alteration whose payload is not recoverable from the resulting shape.**

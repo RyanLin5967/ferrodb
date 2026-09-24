@@ -4,6 +4,7 @@ use crate::catalog::column::DataType;
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
+use crate::wal::history::{HistoryRecord, HistoryStore};
 
 /// Commits between automatic checkpoints.
 ///
@@ -105,6 +106,16 @@ pub struct TxnManager {
     /// Held here rather than written when it is bound, and that is the whole correctness property.
     /// See [`TxnManager::bind_run`].
     run_bindings: Mutex<HashMap<u64, RunEntity>>,
+    /// **D212 (a') — the REVERT history store, when one is attached** (`wal::history`).
+    ///
+    /// Attached by the entry point BEFORE `recover`, because the open's catch-up queues committed
+    /// history records into it and the CLI checkpoints right after `recover`, before any runtime
+    /// exists (`cli.rs`). Set once.
+    history: std::sync::OnceLock<Arc<HistoryStore>>,
+    /// Open transaction -> the history records it wrote to the log, moved onto the store's queue
+    /// the moment its `Commit` is durable and dropped by its abort. See
+    /// [`TxnManager::bind_history`].
+    history_bindings: Mutex<HashMap<u64, Vec<HistoryRecord>>>,
 }
 
 /// A retained DDL record, replayed into the log after every checkpoint.
@@ -231,7 +242,64 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()) }
+    }
+
+    /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
+    /// or the open's catch-up has nowhere to put what the log holds. Refuses a second store: one
+    /// database has one history.
+    pub fn attach_history_store(&self, store: Arc<HistoryStore>) -> Result<(), FerroError> {
+        self.history.set(store).map_err(|_| {
+            FerroError::Internal("a REVERT history store is already attached to this log".into())
+        })
+    }
+
+    /// The attached REVERT history store, if any.
+    pub fn history_store(&self) -> Option<Arc<HistoryStore>> {
+        self.history.get().cloned()
+    }
+
+    /// **D212 (a') — write a REVERT history record into transaction `txn_id`'s log, now.**
+    ///
+    /// Appended as `RecKind::RevertHistory` parts chained to the transaction, so its `Commit`
+    /// decides for the rows and the history together. The record itself is also held here, and
+    /// [`TxnManager::commit`] moves it onto the store's queue right after the `Commit` flush —
+    /// before `TxnEnd` and before the automatic checkpoint `commit` may run, whose hook then writes
+    /// it to the store before truncating the log. An abort drops it.
+    ///
+    /// Refuses when no store is attached (the record would be written to the log and never kept)
+    /// and for a transaction that is not active.
+    pub fn bind_history(&self, txn_id: u64, record: HistoryRecord) -> Result<(), FerroError> {
+        if self.history.get().is_none() {
+            return Err(FerroError::Internal(format!(
+                "cannot bind REVERT history to txn {txn_id}: no history store is attached"
+            )));
+        }
+        let parts: Vec<&[u8]> = if record.body.is_empty() {
+            vec![&record.body[..]]
+        } else {
+            record.body.chunks(crate::wal::log::REVERT_HISTORY_PART_BYTES).collect()
+        };
+        let n = parts.len();
+        for (i, bytes) in parts.into_iter().enumerate() {
+            let part = u32::try_from(i).map_err(|_| FerroError::Unrepresentable {
+                what: "a REVERT history record's part count".to_string(),
+                len: n,
+                limit: u32::MAX as usize,
+            })?;
+            self.append_chained(
+                txn_id,
+                &RecKind::RevertHistory {
+                    hseq: record.hseq,
+                    ordinal: record.ordinal,
+                    part,
+                    last: i + 1 == n,
+                    bytes: bytes.to_vec(),
+                },
+            )?;
+        }
+        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
+        Ok(())
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -615,6 +683,16 @@ impl TxnManager {
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
         self.wal.flush_up_to(commit_lsn)?;
+        // **D212 (a'): onto the store's queue HERE — the `Commit` is durable, and nothing has yet
+        // run that can truncate the log.** The automatic checkpoint below, and any explicit one
+        // (refused while this transaction is still in `att`), drains the queue into the store
+        // before its truncation. Queued any later, that checkpoint would discard the record's only
+        // copy while its rows became durable.
+        if let Some(records) = self.history_bindings.lock().unwrap().remove(&txn_id) {
+            if let Some(store) = self.history.get() {
+                store.enqueue(records);
+            }
+        }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
@@ -702,6 +780,9 @@ impl TxnManager {
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
         self.run_bindings.lock().unwrap().remove(&txn_id);
+        // D212 (a'): its history records are in the log, under a transaction with no `Commit`, so
+        // the open's catch-up never takes them; the in-memory copy goes too.
+        self.history_bindings.lock().unwrap().remove(&txn_id);
         Ok(())
     }
 
@@ -852,6 +933,12 @@ impl TxnManager {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
+        // **D212 (a'): REVERT's history is made durable in its store BEFORE the log that holds its
+        // only other copy is truncated.** A failure returns here: the flushes above have run, and
+        // the truncation is refused, so the log keeps every history record the store does not.
+        if let Some(store) = self.history.get() {
+            store.drain()?;
+        }
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
         self.wal.truncate(self.txn_ids.issued_through())?;
