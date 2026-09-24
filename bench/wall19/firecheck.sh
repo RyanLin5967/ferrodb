@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
 # lease-reap attestation, and must turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
-# section 10.6 (supersedes 10.4, 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
+# section 10.7 (supersedes 10.6, 10.4, 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
 # Blind spots, stated: it runs three selections per mutant (the attest lib module, the whole lease-thread
@@ -11,7 +11,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=5918d90           # the tree these mutants were written against
+SUBJECT_SHA=1db848e           # the tree these mutants were written against
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -44,6 +44,7 @@ MUTANTS=(
   "M13_opened_follows_latest|$A|"'"            let opened = self.heads.get(&e.branch).map_or(e.epoch, \u007ct\u007c t.opened);\n"|"            let opened = e.epoch;\n"'
   "M14_unreadable_not_counted|$R|"'"                h.count_refusal();\n"|""'
   "M15_unreadable_as_landed|$R|"'"                Err(_) => unreadable.push(b),\n"|"                Err(_) => landed.push(b),\n"'
+  "M16_first_entry_not_last|$A|"'"            if e.branch == branch {\n                last = Some(i);\n"|"            if e.branch == branch && last.is_none() {\n                last = Some(i);\n"'
 )
 
 run_targets() { # $1 = label
