@@ -3022,9 +3022,13 @@ impl AgentRuntime {
         // * In-process, yes. `abandon` and `forget_reaped_branches` take no `ExecCtx`, so a library
         //   caller can seal the branch while another thread reads it through a catalog handle.
         //
-        // Only an INSPECTION with an exact-version shape records versions. A row-targeting read, and
-        // a range or full-scan inspection, record a region and its `observed_at`, which is exact
-        // at `seen_through + 1`. Neither needs the history, and neither is refused (Amendment 8).
+        // Only an INSPECTION whose shape records exact versions can record one. A row-targeting
+        // read, and a range or full-scan inspection, record a region and its `observed_at`, which
+        // is exact at `seen_through + 1`. Neither needs the history, and neither is refused
+        // (Amendment 8).
+        //
+        // The gate is by shape, so an exact-shape read that matched no rows is still refused,
+        // although it records a predicate. That errs toward refusing, and a refusal is safe.
         let names_versions = purpose == ReadPurpose::Inspection
             && shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions;
         let released = seen_through.filter(|f| names_versions && !state.retention.pins.contains_key(f));
@@ -7458,7 +7462,8 @@ struct PublishingEntry<'a> {
 
 impl<'a> PublishingEntry<'a> {
     /// Register a merge's reservation under the lock the caller already holds, and arm the entry's
-    /// removal. `locked` must come from `state`.
+    /// removal. `locked` must come from `state`. That is not checked: std gives no way to ask a
+    /// guard for its mutex, and every caller passes `self.state.lock()` beside `&self.state`.
     ///
     /// It takes `locked` by value and releases it BEFORE the entry exists. The `Drop` relocks
     /// `state`, so an entry alive while this thread held the lock would deadlock on the first
@@ -9071,10 +9076,11 @@ mod tests {
     /// recorded yet refuses.**
     ///
     /// The fixture is the state between a merge's commit and its `record_applied`: an entry
-    /// registered through `PublishingEntry::register`, and a branch pinned above its start, which
-    /// is how `pin_seq` pins a snapshot that contains the merge. The history still ends at version
-    /// 3, so a read through that pin could only name 3 for a row whose image already carried the
-    /// merge.
+    /// registered through `PublishingEntry::register`, and a branch pinned above its start. That
+    /// is the seq `pin_seq` gives a snapshot that contains the merge. `record_read` reads only the
+    /// seq, so the fixture's own snapshot (from `pinned`, which does not include txn 99) plays no
+    /// part. The history still ends at version 3, so a read through that pin could only name 3,
+    /// for a row whose image already carried the merge.
     ///
     /// Three reads must NOT be refused (Amendment 8):
     /// - one through a pin AT the start, which is a pin taken inside the window;
@@ -9142,6 +9148,49 @@ mod tests {
         );
         drop(entry);
         assert!(exact().is_ok(), "with no merge publishing, the same read is retained");
+    }
+
+    /// **A read whose pin was released still retains what names no version** (Amendment 9). The
+    /// fixture is the one in `..._never_names_a_version_a_read_did_not_see`: pinned at 3, main
+    /// publishes 4 and 5, re-pinned to 5, and 3 is no longer a live pin. A full-scan inspection
+    /// records a predicate, and a row-targeting read records a region. Neither consults the
+    /// history, so neither is refused.
+    ///
+    /// No red state: it names nothing new, so it compiles at `0570fe8` and passes there. M23 (the
+    /// `released` filter back to `purpose == Inspection`) fails it at the full-scan read.
+    #[test]
+    fn version_history_released_pin_still_retains_reads_that_name_no_version() {
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let at = st.apply_seq;
+            st.insert_workspace(b, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+            publish_next(&mut st, 1);
+            publish_next(&mut st, 1);
+            let now = st.apply_seq;
+            let snap = Arc::new(Snapshot {
+                high_water: now + 1,
+                active: std::collections::HashSet::new(),
+            });
+            assert!(st.repin(b, snap, now), "fixture: the branch is not live");
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let read = |shape: AccessShape, purpose: ReadPurpose| {
+            rt.record_read(b, TableId(1), shape, &[(RowId(1), row.clone())], None, None, purpose, Some(3))
+        };
+        assert!(
+            read(AccessShape::FullScan, ReadPurpose::Inspection).is_ok(),
+            "a full-scan inspection records a predicate at `observed_at`, not a version"
+        );
+        assert!(
+            read(AccessShape::IndexLookup, ReadPurpose::RowTargeting).is_ok(),
+            "a row-targeting read records a region, not a version"
+        );
     }
 
     /// **`pin_seq`'s two-catalog assertions have to be able to FIRE** (Amendment 8). With one
