@@ -708,3 +708,63 @@ new order (the forget before or after D229's `free_pending_frees`) is re-checked
   - At `b87ae29` it refuses M27, M28 and M29 (0 sites each), as it must.
 - **Predicted:** killed are M1, M2, M4-M6, M9-M11, M13-M29, SKIPm, LSNm, TTm, CLRm and ALIASm. The move-form M3, M7
   and M12 survive.
+
+**Amendment 21 (the D250 re-merge `3d4a942`, d250 @ `43864d7`; the lead's hold released by D250's replacement of its
+open-time re-declaration).**
+
+`3d4a942` merges three things:
+- **#16's TxnEnd fix** (`5966573`, via `cd0914b`): a commit whose TxnEnd cannot be written after its durable Commit
+  still ends the transaction.
+- **D250 review 3** (`1f4b48f` red, `43864d7` fix):
+  - `declare_drop_again` and the open's re-declaration after its checkpoint are GONE;
+  - the provenance forget runs inside `open_recovered`, before the rebuild and the checkpoint. It computes
+    `dropped_tables` right after the completion and forgets each in the durable provenance file, when there is one;
+  - `attach_runtime(runtime, ProvenanceBacking)` returns `Result`;
+  - a `PoisonOnUnwind` guard poisons the log if the DROP's mutation panics after its record;
+  - tests 17-19 are new.
+
+**The one conflicted file, `recovery.rs`, is resolved as the lead accepted:**
+- the imports are the union (D229's plus `table_id` and the provenance store);
+- D250's forget block comes first, then D229's `decide_free_intents`, both before the reset, the rebuild and the
+  checkpoint;
+- after the checkpoint only D229's `free_pending_frees` remains. The old re-declaration, and D229's comment about it,
+  are gone with D250's code.
+
+The unwind guard wraps D229's `f` in `ddl_unit` unchanged. D250's test 19 (`txn.rs`) now passes `table_pages("t")` as
+the DROP's pages; its assertions are unchanged. `LEAKED_ROOTS` stays 2 here.
+
+**The type pass:** no file-scope `use` line is duplicated in any touched file. The extra `use std::io::Write;` lines in
+`open_recovered` and `commit` sit in separate block scopes. Nothing D229 calls was removed.
+
+**The forget's order against D229's frees (the lead's re-check), INFERRED from source:**
+- The forget writes only the provenance file. It frees nothing, allocates nothing, and changes neither the catalog nor
+  any intent. It runs before `decide_free_intents` and long before `free_pending_frees`, so it cannot change what either
+  sees.
+- If the provenance file cannot be opened, the open fails there. That is after the intents are adopted and
+  quarantined and before any is decided, so nothing is freed and the next open repeats the step.
+- A forget that fails per table is counted (`PROVENANCE_FORGET_FAILURES`), and the open continues.
+- **Amendment 15's argument about the open's re-declared `DropTable` is now MOOT, and so is amendment 18's F14 scope
+  for that route.** No record is appended at open any more. D250's accepted empty-failed-CREATE residual stays
+  reachable through `ddl_unit`'s own post-truncation re-append (for the change feed), as before. It is still harmless
+  for D229, because no intent names such a table.
+
+**A panicking DROP, on this tree:** the guard poisons the log, and `decide_recorded` is not reached. So the intent stays
+undecided, and a poisoned log refuses the checkpoint, the only in-process path to a free. D250 test 19 is predicted
+GREEN here.
+
+**Mutants:**
+- M12's anchor (`let out = match f() {`) is gone. M12 is re-aimed to decide before `let mut unwinding =
+  PoisonOnUnwind`, which is still "decide before the mutation's result". It is still a predicted SURVIVOR: a failing or
+  panicking `f` poisons the log before any checkpoint.
+- D250's SKIPm, LSNm, TTm, CLRm and ALIASm keep one site each.
+- PATTERNS_ONLY at `3d4a942` finds one site per expression for all 33 mutants (rc 0, 34 expressions). At `3d4a942` the
+  old M12 had 0 sites (refused), which is how the re-aim was found.
+
+**Predicted at `3d4a942`:**
+- `wal::recovery::tests_crash_frees::` 24/24.
+- `wal::recovery::tests::` all pass, including test 10 at `LEAKED_ROOTS = 2`, test 17, and test 18. For test 18, the
+  first open's checkpoint truncates the in-process DROP's re-appended record, D229 writes no log record at open, and
+  so opens 2 and 3 are not recovered.
+- `wal::txn::tests`, `wal::free_intent::tests`, `integration_cluster_snapshot`,
+  `integration_cli_row_authorship_durability` and `open_path_allowlist` all pass.
+- Killed as in amendment 20; the move-form M3, M7 and M12 survive.
