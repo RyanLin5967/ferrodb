@@ -1951,3 +1951,355 @@ fn the_spawn_failure_teardown_actually_stops_the_threads_it_is_given() {
     assert!(stop.load(Ordering::SeqCst), "the teardown did not raise the stop flag");
     assert!(ob.state.lock().unwrap().stopped, "the teardown did not stop the outbox");
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// D207 — the fixes F3-transport wrote on 2026-08-28 (207d362, 1b3a6a6) and never merged. Written
+// red against main 9aa6968, BEFORE the port; every test here compiles against that tree.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_connection_whose_socket_setup_fails_releases_the_slot_it_reserved() {
+    // **The cap turned into the hole it was added to close.** `accept_loop` reserves the slot
+    // (`map.insert(id, mine)`) and only then configures the socket, and when that failed it did
+    // `continue` without removing the entry. `mine` is a `try_clone`, so the entry kept a descriptor
+    // and a connection nobody reads; after `max_inbound_conns` of them every real peer is refused for
+    // ever while `live_inbound_conns()` sits at the cap and no counter moves.
+    //
+    // The failure is forced with a zero `poll_interval`: std refuses a zero read timeout with
+    // `InvalidInput` before any system call, on every platform, so every accepted socket fails its
+    // setup. `Transport::start` refuses a zero `poll_interval` for exactly that reason, so the loop is
+    // driven directly. The zero is only the means of failing the setup; what is under test is what
+    // the loop does AFTER it fails. The macOS test below reaches the same exit the way a peer does.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut opts = fast();
+    opts.poll_interval = Duration::ZERO;
+    opts.max_inbound_conns = 4;
+    // Long, so a connection whose setup wrongly SUCCEEDED would sit in the registry for the whole
+    // wait below, rather than be refused at its handshake and leave it empty for the wrong reason.
+    opts.handshake_deadline = Duration::from_secs(60);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters = Arc::new(Counters::default());
+    let conns: Arc<Mutex<BTreeMap<u64, TcpStream>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let ids = Arc::new(AtomicU64::new(0));
+    let (tx, _rx) = mpsc::channel::<(Message, usize)>();
+    let h = {
+        let (stop, counters, conns, ids) =
+            (Arc::clone(&stop), Arc::clone(&counters), Arc::clone(&conns), Arc::clone(&ids));
+        std::thread::spawn(move || {
+            accept_loop(listener, NodeId(1), tx, stop, counters, conns, ids, opts, None)
+        })
+    };
+
+    // Twice the cap. If a failed setup leaks its slot, the first four fill the cap and the other four
+    // are refused as if the node were busy.
+    const TRIES: u64 = 8;
+    let mut held = Vec::new();
+    for _ in 0..TRIES {
+        held.push(TcpStream::connect(addr).unwrap());
+    }
+    // An id is minted once per accepted connection, before anything else is done with it, so this
+    // waits for the loop to have taken every one rather than for a guessed length of time.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && ids.load(Ordering::SeqCst) < TRIES {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let taken = ids.load(Ordering::SeqCst);
+    // Read while the loop is still RUNNING. After a join the registry would also read empty for a
+    // connection that was wrongly served, because its own thread releases the slot on the way out;
+    // before the join, only a released slot reads empty.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !conns.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let leaked = conns.lock().unwrap().len();
+    // Stopped and joined BEFORE any assertion: with a zero poll the loop never sleeps, and a panic
+    // here would leave it spinning for the rest of the test binary.
+    stop.store(true, Ordering::SeqCst);
+    h.join().expect("the accept loop panicked");
+
+    assert_eq!(taken, TRIES, "the accept loop took {taken} of {TRIES} connections");
+    assert_eq!(
+        leaked, 0,
+        "{TRIES} connections failed their socket setup and the registry still holds {leaked} of \
+         them. Each is a slot and a descriptor no thread will ever release: at the cap of 4 every \
+         real peer is refused for ever, while this node's outbound meters read healthy"
+    );
+    // Counted, never silent: every one of them was closed without being served.
+    assert_eq!(
+        counters.refused_conns.load(Ordering::SeqCst),
+        TRIES,
+        "a connection closed because its socket could not be configured was not counted"
+    );
+    drop(held);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_peer_that_resets_before_accept_cannot_fill_the_connection_cap() {
+    // The same exit, reached the way an unauthenticated peer reaches it. 207d362 recorded, as
+    // measured on this platform (40 of 40), that a connection reset while it waits in the listen
+    // queue is still returned by `accept`, and that setting a read timeout on it then fails with
+    // EINVAL. So `max_inbound_conns` connect-and-reset pairs from anything that can reach the port
+    // would fill the cap with slots no thread releases, and the node would be deaf to every real
+    // peer. macOS only because that is where the trigger was measured; the test above pins the exit
+    // itself on every platform.
+    use std::os::fd::AsRawFd;
+
+    // An RST on close needs SO_LINGER with a zero timeout, and std's `set_linger` is still unstable
+    // (rust#88494), so it is set directly. Values from the macOS SDK's <sys/socket.h>, where
+    // `struct linger` is `{ int l_onoff; int l_linger; }`: two ints, laid out as `[i32; 2]`.
+    unsafe extern "C" {
+        fn setsockopt(
+            fd: i32,
+            level: i32,
+            name: i32,
+            value: *const std::ffi::c_void,
+            len: u32,
+        ) -> i32;
+    }
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_LINGER: i32 = 0x0080;
+
+    let mut opts = fast();
+    opts.max_inbound_conns = 4;
+    // A slow accept poll, so the resets below land while the loop is asleep and each connection is
+    // already reset by the time `accept` hands it over, which is the case under test.
+    opts.poll_interval = Duration::from_millis(100);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    const RESETS: usize = 16;
+    for i in 0..RESETS {
+        let s = TcpStream::connect(addr).unwrap();
+        let linger: [i32; 2] = [1, 0]; // l_onoff = 1, l_linger = 0
+        // SAFETY: `s` is an open socket for the duration of the call, and `linger` is a live
+        // `struct linger` whose size is passed with it.
+        let rc = unsafe {
+            setsockopt(
+                s.as_raw_fd(),
+                SOL_SOCKET,
+                SO_LINGER,
+                linger.as_ptr().cast::<std::ffi::c_void>(),
+                std::mem::size_of_val(&linger) as u32,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER on reset {i}: {}", std::io::Error::last_os_error());
+        drop(s); // an RST, not a FIN
+    }
+
+    // A real peer, queued BEHIND every reset. The listen queue is first in, first out, so by the
+    // time this one is accepted the loop has already dealt with all sixteen.
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = Vec::new();
+    crate::replication::write_handshake(&mut hs).unwrap();
+    let _ = s.write_all(&hs);
+    let _ = s.flush();
+    let mut theirs = [0u8; 6];
+    let answered = s.read_exact(&mut theirs).is_ok();
+    assert!(
+        answered,
+        "after {RESETS} peers reset before being accepted, a real peer was not answered \
+         (live_inbound_conns={}, refused_conns={}): the cap is full of slots no thread will release",
+        t.live_inbound_conns(),
+        t.refused_conns()
+    );
+    // Anti-vacuity. With the slot released, nothing here can fill the cap of 4, so the only
+    // refusals are failed setups. None at all means `accept` never handed over a reset socket, or
+    // its setup succeeded, and this test exercised nothing.
+    assert!(
+        t.refused_conns() > 0,
+        "no reset connection failed its socket setup, so the trigger 207d362 recorded did not fire \
+         and this test exercised nothing"
+    );
+    drop(s);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && t.live_inbound_conns() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(t.live_inbound_conns(), 0, "slots are still held after every peer has gone");
+}
+
+#[test]
+fn one_unreachable_peer_cannot_queue_more_than_the_default_byte_bound() {
+    // **The outbound half of D207.** A peer's queue was bounded in MESSAGES only, and a message is
+    // anything from 18 bytes to 8 MiB, so the default depth of 1024 let one peer's queue hold
+    // 1024 x 8 MiB = 8.6 GB. 207d362 added a byte bound defaulting to 64 MiB, and it never merged.
+    //
+    // The DEFAULT options are what is under test, because the default is what a node runs:
+    // `NodeOptions` takes `TransportOptions::default()`. Only the timings are shortened.
+    const DEFAULT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+    let opts = TransportOptions {
+        poll_interval: Duration::from_millis(5),
+        reconnect_delay: Duration::from_millis(5),
+        ..Default::default()
+    };
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Port 1 refuses every connection, so the sender never gets past its dial and never drains:
+    // every frame stays queued, and what the queue holds is decided by its bounds alone.
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let t = Transport::from_listener(
+        NodeId(1),
+        l,
+        BTreeMap::from([(NodeId(2), dead)]),
+        opts.clone(),
+    )
+    .unwrap();
+
+    let payload = vec![0x5a_u8; 7 * 1024 * 1024];
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term,
+                round: 1,
+                command: Command::WalBatch { start_lsn: 0, bytes: payload.clone() },
+            }],
+            commit: 0,
+        },
+    };
+    // Every frame is the same length: the only field that varies is the fixed-width term.
+    let frame_len = encode(&msg(1)).unwrap().len();
+    let fit = DEFAULT_QUEUE_BYTES / frame_len;
+    // Twelve 7 MiB frames is 84 MiB: over the byte bound, and far under the depth, so a queue
+    // bounded only in messages keeps every one of them.
+    const SENT: u64 = 12;
+    assert!(
+        (SENT as usize) < opts.queue_depth && (SENT as usize) > fit,
+        "the fixture no longer separates the two bounds: {SENT} frames, depth {}, {fit} fit in bytes",
+        opts.queue_depth
+    );
+    for term in 1..=SENT {
+        t.send(&msg(term)).unwrap();
+    }
+
+    let st = t.outboxes[&NodeId(2)].state.lock().unwrap();
+    let held: usize = st.queue.iter().map(|f| f.len()).sum();
+    assert!(
+        held <= DEFAULT_QUEUE_BYTES,
+        "one unreachable peer's queue holds {held} bytes in {} frames, over the \
+         {DEFAULT_QUEUE_BYTES}-byte default bound. Bounded only in messages, the default depth of {} \
+         lets it hold {} bytes",
+        st.queue.len(),
+        opts.queue_depth,
+        opts.queue_depth * MAX_FRAME_BYTES
+    );
+    // As many as fit, and not fewer: a bound that over-drops tells the peer less than it could.
+    assert_eq!(st.queue.len(), fit, "the queue holds {} frames where {fit} fit", st.queue.len());
+    // ...and the ones dropped are the OLDEST, for the reason the depth bound drops the oldest.
+    let terms: Vec<u64> = st
+        .queue
+        .iter()
+        .map(|f| decode(&f[5..]).expect("a queued frame must still decode").term)
+        .collect();
+    let newest: Vec<u64> = ((SENT - fit as u64 + 1)..=SENT).collect();
+    assert_eq!(terms, newest, "the byte bound kept {terms:?}; it must keep the newest");
+    drop(st);
+    assert_eq!(t.dropped_to(NodeId(2)), SENT - fit as u64, "a byte-bound drop was not counted");
+}
+
+#[test]
+fn one_frame_cannot_spend_more_config_nodes_than_its_whole_budget() {
+    // Ported from 1b3a6a6. `MAX_CONFIG_NODES` bounds ONE configuration, and `Config::with_learners`
+    // retains learners with `Vec::contains` (config.rs), so a configuration of n members and n
+    // learners costs n x n comparisons however this file validates it. A frame may carry many: an
+    // 8 MiB Append holds about 1018 configurations of 1024 + 1024 ids, and 1018 x 1024 x 1024 is
+    // 1.07e9 comparisons for one frame. So the budget is per FRAME.
+    //
+    // Five configurations of 1024 members is 5120 ids against a 4096-id budget: the first four fit
+    // and the fifth must be refused.
+    let per_cfg = MAX_CONFIG_NODES as u32;
+    let frame = |configs: u32| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_be_bytes()); // from
+        b.extend_from_slice(&2u32.to_be_bytes()); // to
+        b.extend_from_slice(&1u64.to_be_bytes()); // term
+        b.push(4); // Append
+        b.extend_from_slice(&0u64.to_be_bytes()); // prev_round
+        b.extend_from_slice(&0u64.to_be_bytes()); // prev_term
+        b.extend_from_slice(&0u64.to_be_bytes()); // commit
+        b.extend_from_slice(&configs.to_be_bytes()); // entries
+        for e in 0..u64::from(configs) {
+            b.extend_from_slice(&1u64.to_be_bytes()); // entry term
+            b.extend_from_slice(&(e + 1).to_be_bytes()); // entry round
+            b.push(7); // Membership
+            b.extend_from_slice(&1u64.to_be_bytes()); // config version
+            b.extend_from_slice(&1u64.to_be_bytes()); // config term
+            b.extend_from_slice(&per_cfg.to_be_bytes()); // members
+            for i in 1..=per_cfg {
+                b.extend_from_slice(&i.to_be_bytes());
+            }
+            b.extend_from_slice(&0u32.to_be_bytes()); // no learners
+        }
+        b
+    };
+
+    match decode(&frame(5)) {
+        Ok(_) => panic!(
+            "five configurations of {per_cfg} members in one frame were accepted, so the cap still \
+             bounds each configuration and nothing bounds the frame"
+        ),
+        Err(e) => {
+            let e = format!("{e}");
+            assert!(e.contains("budget is left"), "refused, but not by the frame budget: {e}");
+            // Named in the refusal, so a reader knows WHICH entry exhausted it.
+            assert!(e.contains("entry 4 of 5"), "the refusal does not say where: {e}");
+        }
+    }
+
+    // Anti-vacuity: four fit exactly (4 x 1024 = 4096), so the refusal is about crossing the budget
+    // and not about a frame carrying several configurations.
+    let m = decode(&frame(4)).expect("four configurations totalling exactly the budget must decode");
+    let Body::Append { entries, .. } = &m.body else { panic!("shape changed") };
+    assert_eq!(entries.len(), 4);
+}
+
+#[test]
+fn a_frame_whose_configurations_exceed_the_budget_is_refused_to_its_sender() {
+    // The frame budget has a sender-side twin for the reason the per-configuration cap has one in
+    // `encode_config`: without it this node frames an Append that every peer's decoder refuses, and
+    // never learns why. That is a cluster that silently cannot replicate. Not in 1b3a6a6, which
+    // bounded the decoder only.
+    let cfg = Config::new((1..=MAX_CONFIG_NODES as u32).map(NodeId), 1, 1);
+    let append = |n: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: (1..=n)
+                .map(|round| Entry {
+                    term: 1,
+                    round,
+                    command: Command::Membership { config: cfg.clone() },
+                })
+                .collect(),
+            commit: 0,
+        },
+    };
+    match encode(&append(5)) {
+        Ok(f) => panic!(
+            "an Append carrying five configurations of {MAX_CONFIG_NODES} members was framed ({} \
+             bytes); every peer's decoder refuses it, so this node would send a frame that can \
+             never land",
+            f.len()
+        ),
+        Err(e) => {
+            assert!(format!("{e}").contains("budget"), "refused, but not by the frame budget: {e}")
+        }
+    }
+    // Anti-vacuity: four encode and round-trip, so the sender's limit is the decoder's and no
+    // stricter.
+    let m = append(4);
+    assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "four configurations must round trip");
+}
