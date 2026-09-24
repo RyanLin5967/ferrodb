@@ -305,6 +305,8 @@ impl Catalog {
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
         let ft_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
+        // D222 MUTANT M2 (never land): the before-read restored in `create_fulltext_index` only.
+        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
         for item in hfm.scan() {
@@ -315,8 +317,6 @@ impl Catalog {
                 post_tokens(&ft_tree, text, &primary_key)?;
             }
         }
-        // D222 — after the backfill, for the reason `create_index` gives.
-        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
 
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
