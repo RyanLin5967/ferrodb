@@ -28,7 +28,7 @@ pub mod tag {
     /// were `pub const`s, and D198's `ALIVE` and wall21's `UNRELEASED` both took `0x08` on separate
     /// branches, which `tree_keys.rs` merged with no conflict. The merged build would then have
     /// read one key as the other, and bricked at the first lease start (D244 review 2, R2-3). The
-    /// `pub const`s below are derived from this enum, so callers and match patterns are unchanged.
+    /// `pub const`s below are derived from this enum, so every caller is unchanged.
     ///
     /// **`0x08` is wall21's `UNRELEASED`** (the lead's registry). It becomes a variant here at
     /// wall21's merge; until then `tests::the_lease_tags_leave_0x08_to_wall21s_unreleased_span` holds

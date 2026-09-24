@@ -1529,3 +1529,18 @@ Nothing here has been run (quiet mode).
 - `tree_keys::tests` +1.
 - **base + 59**.
 - `f1_lease_grace` **41** and the lib filter **52** are unchanged (the new test is outside the filter).
+
+## Amendment 17 — lease review 8 (`frontier/lease_review8.md` @ `02bdd9b`): no defect in `ddb7ff7..a75277c`. Records only.
+
+- **N4.** The enum's doc said "callers and match patterns are unchanged". The constants have no
+  match-pattern uses, so it now says "every caller is unchanged". This is doc text only.
+- **N1, a wall21 merge obligation** (the lead's LANDING-QUEUE, 11:20Z). At wall21's merge, the two
+  group tests in `tree_keys::tests` must add wall21's keys:
+  - `the_alive_key_is_its_own_group_and_no_other_span_reaches_it`;
+  - `the_first_start_key_is_its_own_group_and_no_other_span_reaches_it`.
+  
+  Each gains `unreleased(u64::MAX)` and `unreleased_index_built()` in its neighbour-key list, and
+  `tag::UNRELEASED` in its `for t in` list. Together with wall21's `Unreleased = 0x08` variant in
+  `tag::Tag`, this is a test ADDITION at that merge: the lists grow, and no existing assertion changes.
+
+Counts unchanged: `f1_lease_grace` **41**, the lib filter **52**, **base + 59**.
