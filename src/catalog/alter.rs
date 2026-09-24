@@ -73,7 +73,7 @@ use crate::catalog::schema::Schema;
 use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::parser::parser::AlterAction;
-use crate::provenance::ProvenanceStore;
+use crate::provenance::{ProvId, ProvenanceStore};
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
@@ -645,8 +645,8 @@ impl Catalog {
             HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
         }
 
-        let (primary_root_now, stamped) =
-            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
+        let (primary_root_now, moved) =
+            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared)?;
 
         // An index records the column it covers by NAME (`IndexInfo.column_name`) and the planner
         // re-resolves it to an ordinal with `position()` on every statement. Miss this and the
@@ -696,24 +696,30 @@ impl Catalog {
         // ALTER changed the schema, so every cached reader snapshot is stale. Root moves do NOT
         // bump this (D53 made the root cell shared); a column change must.
         self.epoch_bump();
-        // **D219 — this rewrite's stamps are durable before this returns, whoever called it.** A
-        // MERGE hands the rewrite a store whose `stamp` only queues (`ProvenanceFlush::stamper`),
-        // so the moved rows' stamps are in the index and not yet in the file, while the buffer
-        // pool may write this table's rewritten pages, and the catalog page `finish` just
-        // persisted, to the database file at any eviction; a merge altering a second table keeps
-        // allocating while it rewrites that one. Flushed here, the stamps are durable before any
-        // later table is touched: one sync per rewrite that stamped, not one per moved row.
+        // **D219 — the moved rows' stamps, written and made durable before this returns.**
         //
-        // **After `finish`, and only if this rewrite stamped**, both deliberately. Before `finish`,
-        // a failed flush would leave every tuple converted under the old catalog — the I19 state
-        // `finish` exists to rule out; here it leaves the table consistently altered and returns
-        // the error. And a rewrite that stamped nothing must not answer for records someone else
-        // left pending: a store poisoned by an earlier failed append refuses every non-empty flush,
-        // and a plain `ALTER TABLE` of an unattributed table has no business failing on that. For
-        // a store that stamps eagerly (a plain `ALTER TABLE`), the stamps are already durable and
-        // nothing is pending, so this is not a write.
-        if stamped {
-            if let Some(store) = &prov {
+        // **After `finish`, deliberately.** The rewrite used to stamp each moved row inside its
+        // loop, and a stamp is fallible (a provenance store poisoned by an earlier failed append
+        // refuses every write), so a refusal there left every tuple converted under the old
+        // catalog — the I19 state `finish` exists to rule out. Here a refusal, or a failed sync,
+        // returns with the catalog and the heap agreeing on the new shape. What it does NOT
+        // restore is the caller's DDL record: both callers log it only after this returns `Ok`,
+        // exactly as after any other failure following the install.
+        //
+        // **One sync for all of them, before any later table is touched.** They are queued with
+        // `stamp_pending` and made durable with one `flush`: this table's rewritten pages, and the
+        // catalog page `finish` just persisted, can reach the database file at any eviction, and a
+        // merge altering a second table keeps allocating while it rewrites that one. The same one
+        // sync serves a plain `ALTER TABLE`, which used to pay one per moved row.
+        //
+        // **Only if this rewrite moved an attributed row.** `flush` writes whatever the store has
+        // pending, and a store poisoned by another statement's failed append refuses every
+        // non-empty flush; a rewrite that stamped nothing has no business failing on that.
+        if let Some(store) = &prov {
+            if !moved.is_empty() {
+                for (rid, who) in &moved {
+                    store.stamp_pending(*rid, *who)?;
+                }
                 store.flush()?;
             }
         }
@@ -1061,13 +1067,12 @@ fn commit_rewrite(
     dir_root: u32,
     primary_root: u32,
     prepared: Vec<Prepared>,
-    prov: Option<&Arc<dyn ProvenanceStore>>,
-) -> Result<(u32, bool), FerroError> {
+) -> Result<(u32, Vec<(RecordId, ProvId)>), FerroError> {
     let heap = HeapFileManager::open(dir_root, bp.clone());
     let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
-    // Whether this rewrite stamped anything, so the caller flushes exactly the stamps it wrote and
-    // never answers for records another statement left behind (D219; see `apply_plan`).
-    let mut stamped = false;
+    // The stamps the rows this rewrite moves must carry, returned rather than written here: the
+    // caller writes them after `finish` (D219; see `apply_plan`).
+    let mut moved: Vec<(RecordId, ProvId)> = Vec::new();
     for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
@@ -1096,9 +1101,8 @@ fn commit_rewrite(
             // Provenance is keyed by `RecordId` too (a page-local dictionary slot). Without this
             // the answer to "which agent wrote this row" silently becomes "nobody" for every row
             // the rewrite happened to move.
-            if let (Some(store), Some(who)) = (prov, attribution) {
-                store.stamp(new_rid, who)?;
-                stamped = true;
+            if let Some(who) = attribution {
+                moved.push((new_rid, who));
             }
         }
     }
@@ -1119,7 +1123,7 @@ fn commit_rewrite(
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
     // inventing a rule for it.
-    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))
+    Ok((primary.root_page_id.load(Ordering::Relaxed), moved))
 }
 
 #[cfg(test)]
