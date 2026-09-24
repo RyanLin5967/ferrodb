@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # D263 fire-check: the red, the seven review-1 mutants and the tip, judged from the files this script names and
-# nothing else. The judge functions are bench/d232/firecheck.sh's @ e56cfe1 (D232 review 4 Q5, in the shape of
+# nothing else. The judge functions are bench/d232/firecheck.sh's @ 2a4062f (D232 review 4 Q5, in the shape of
 # bench/d237/firecheck.sh @ e8054dc), with one addition: a row may register that NOTHING fails. Each arm restores
 # src/ from its commit, runs its targets in the background and waits, and writes $OUT/<label>.<target>.out with
 # an `arm=<sha>` first line and an `rc=<n>` last line. $OUT is cleared first, the control runs first, src/ is
-# restored from git on any exit, and --self-test runs the judge on planted outputs.
+# restored from git on any exit, and --self-test runs the judge on planted outputs. The traps cover HUP, INT, QUIT
+# and TERM, and no cargo runs inside $(...) (D237 judge review J4/J5; proven for this file by bench/d232/trapcheck.sh).
 # Pre-registration: artie-research frontier/lane_d263_free_after_durable.md §0, §2 and §3.
 # Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work: it runs only when the lead
 # releases the FAN-QUEUE row.
@@ -105,7 +106,7 @@ target_args() {
 }
 binaries() { echo 1; } # test binaries per target: one each here
 
-# A command runs in the background and the script waits on it, so a TERM or INT reaches the traps at once
+# A command runs in the background and the script waits on it, so a HUP, INT, QUIT or TERM reaches the traps at once
 # instead of after the command (bash defers a trap until a foreground child exits, and `timeout` puts cargo in
 # its own process group, out of reach of a signal to this script's group). The trap stops the child before src/
 # is restored.
@@ -130,11 +131,13 @@ run_target() { # $1 label, $2 target, $3 the arm's sha (src/ is already checked 
   echo "rc=$rc" >> "$f"
 }
 
-listed_in() { # $1 target: what the harness says it will run, at SUBJECT_SHA (the list is kept)
+list_target() { # $1 target: what the harness says it will run, at SUBJECT_SHA, kept as control.<t>.list
+  # Called in the main shell, never inside $(...): a subshell sets `child` where the traps cannot see it, so a
+  # signal waited out the listing or orphaned cargo (D237 judge review J4, memory an-exit-trap-waits-for-...).
   # shellcheck disable=SC2046
   waited timeout 3600 cargo test $(target_args "$1") -- --list > "$OUT/control.$1.list" 2>&1
-  grep -cE ': test$' "$OUT/control.$1.list"
 }
+listed_count() { grep -cE ': test$' "$OUT/control.$1.list"; } # $1 target: counts the kept list, runs nothing
 
 # ---- The judge. It reads ONLY "$OUT/<label>.<target>.out" for the labels and targets it is given. Any other
 # file in $OUT (a fire_*/red_*/tip_* output from this lane's earlier by-hand row, a list, the self-test log, a
@@ -525,14 +528,19 @@ on_signal() { # $1 = the exit status
   fi
   exit "$1"
 }
+# All four: an untrapped HUP ran the EXIT trap, which restored src/ while cargo went on building a mutant
+# against it (D237 judge review J5).
 trap on_exit EXIT
+trap 'on_signal 129' HUP
 trap 'on_signal 130' INT
+trap 'on_signal 131' QUIT
 trap 'on_signal 143' TERM
 
 echo "== control: $SUBJECT_SHA"
 for t in $CONTROL_TARGETS; do run_target control "$t" "$SUBJECT_SHA"; done
 lists=""
-for t in $CONTROL_TARGETS; do lists="$lists $t=$(listed_in "$t")"; done
+for t in $CONTROL_TARGETS; do list_target "$t"; done
+for t in $CONTROL_TARGETS; do lists="$lists $t=$(listed_count "$t")"; done
 v=$(control_verdict control "$lists")
 echo "control: $v (lists:$lists)" | tee "$OUT/summary.txt"
 [ "$v" = clean ] || exit 2
