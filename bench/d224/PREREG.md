@@ -283,3 +283,6 @@ unregistered kill, never folded in.
   patch's `^[-+]` lines were compared with its copy at `7d9567f`, and only hunk context moved. Kill sets are
   amendment 2's table.
 - **Command, every mutant:** `timeout 1800 cargo test --no-fail-fast --lib consensus::transport::tests::`.
+
+**Erratum to amendment 3:** `b05aaa3` changes **four** code lines, not three: one `Ok(_)` arm and the three added lines
+of the `stop` check.
