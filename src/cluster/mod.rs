@@ -384,10 +384,55 @@ fn anchored_millis(anchor_wall_millis: u64, since_anchor: std::time::Duration) -
 /// purpose: a caller that can name this function can reintroduce the divergence the module exists
 /// to remove.
 fn local_wall_millis() -> u64 {
-    std::time::SystemTime::now()
+    let real = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    #[cfg(test)]
+    let real = wall_step::apply(real);
+    real
+}
+
+/// **A test's hand on the wall clock — THIS THREAD's view of it only, and only in `cfg(test)`.**
+///
+/// F2's claim is that no step of the wall clock inside a process moves a lease decision, and a
+/// claim about a clock step cannot be tested without a clock that steps. The real one cannot be
+/// stepped from a test, so this adds a signed offset to what [`local_wall_millis`] — the process's
+/// one `SystemTime::now()` reader — returns on the calling thread. With F2 in place the step is
+/// invisible to every lease decision, because the lease clock read the wall once, at its anchor;
+/// with F2 reverted (the decision site reading `local_wall_millis` directly, as it did at `9aa6968`)
+/// the step lands in the decision, and `cluster::tests::f2_a_wall_clock_step_…` fails.
+///
+/// Thread-local so that stepping cannot touch a sibling test in the same binary, even under that
+/// mutant. Stated blind spot: a mutant that calls `SystemTime::now()` inline at the decision site,
+/// bypassing `local_wall_millis`, is not steppable by this and would pass the test; the one-reader
+/// rule in `local_wall_millis`'s doc is what stands against that.
+#[cfg(test)]
+pub(crate) mod wall_step {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEP_MILLIS: Cell<i64> = const { Cell::new(0) };
+    }
+
+    /// Step this thread's wall clock by `millis` (negative is backwards) until the guard drops.
+    pub(crate) fn by(millis: i64) -> Guard {
+        STEP_MILLIS.with(|c| c.set(millis));
+        Guard
+    }
+
+    pub(super) fn apply(real: u64) -> u64 {
+        real.saturating_add_signed(STEP_MILLIS.with(|c| c.get()))
+    }
+
+    /// Restores the real clock, including when the test that stepped it panics.
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STEP_MILLIS.with(|c| c.set(0));
+        }
+    }
 }
 
 // ---- the granted counter -----------------------------------------------------------------------
