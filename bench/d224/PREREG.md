@@ -381,3 +381,138 @@ takes its whole binary down with it.
     each killed by K.
 - **D207's mutant patches under `bench/d207/`** were cut against D207's own tree. Their transport context predates
   D224, so they are D207's run script's to apply, on `d207-transport-port`. They are not for this merged tree.
+
+---
+
+## Amendment 6 — review 2's caveats G1–G4 and nits, written BEFORE their code (nothing built)
+
+Source: `artie-research frontier/d224_review2.md` @ `2883f78`, a review of `7d9567f..49ba420`, verdict
+SOUND-WITH-CAVEATS. The fix is correct: a healthy link never has readable bytes at the probe, and the `stop` check is
+right. What follows corrects claims, adds one test, registers two mutants, and strengthens test K.
+
+**Numbering.** N7 and N8 are already the counter mutants (amendment 4). So the gate mutant the lead called "N7" is
+registered here as **N9**, and the reset-arm survivor as **N10**.
+
+### G1: how to read Run R2 (a note before any run)
+
+R2 runs the whole transport module at `92373ff`. At that commit I and P have no 200 ms settle, and B still has the
+old margin (`idle_deadline` 2 s, 25 frames). Those changes came in `92e28fa`.
+
+- **In R2 only:** a failure of I or P that shows a probe without a redial, or any failure of B, is the known exposure
+  of a frozen commit (the first review's F2 and F3). Report it as that. It is not a D224 regression and not a
+  registration miss, and it is not folded into R2's count.
+- R2's evidence is H's own signature: "A never redialled", `idle_probes +1, idle_redials +0, lost_in_flight 0`.
+  That stands either way.
+- **H's FIN premise** (review 2, Q3): H passing in R2, or passing under N6, means the close was a reset rather than
+  a FIN, so the premise failed. It is not a flake to re-run. Only readable bytes produce the red signature.
+
+### G2: the carried frame CAN be lost; claims retracted, residual stated
+
+- **The mechanism** (READ at `bf1fd63`):
+  - A dial resets `last_used` (`transport.rs:2002`).
+  - So the carried frame, and any frame queued behind it, goes out unprobed.
+  - If that dial lands on a peer that is shutting down mid-handshake, `dial` returns `Ok` with `[Error][FIN]`
+    waiting. That happens when the peer's `stop` is set while its `conn_loop` is inside `recv_handshake`.
+  - The carried frame is then written into that link and lost **uncounted**. The next frame fails and is counted.
+    That is the whole pre-D224 cost.
+- **Retracted** (append-only; the lines stand as written):
+  - the original "The frame is carried to the new connection, not lost" (the mechanism bullet);
+  - amendment 2 item 1's "which costs nothing";
+  - amendment 2 item 6's last bullet, "a peer shut down mid-handshake, which H now covers through fix 1". That
+    holds only when the refused link then sits idle for at least G. H passes because of its 600 ms of silence.
+- **The code and lane text that say the same is corrected:**
+  - the `carried` comment ("costs the frame nothing");
+  - `peer_has_closed`'s `Ok(_)` comment ("costs it nothing");
+  - `idle_probe_gap`'s doc, which gains the residual;
+  - the module header;
+  - lane §2.
+- **What bounds it: consensus retransmission.**
+  - A pre-candidate re-campaigns every election timeout until it hears a leader. `voter_tick` starts a campaign
+    whenever `since_heard` reaches `election_timeout` (`election.rs:52-60`), and `start_precampaign` resets
+    both (`:324-334`).
+  - A leader re-sends from each peer's `next` on every heartbeat: `leader_tick` (`election.rs:118-122`), then
+    `broadcast_heartbeat`, then `bcast_append` (`replicate.rs:759-761`).
+  - So a lost frame costs one retransmission interval, never a round. READ.
+- **Not taken:** a non-blocking peek at the end of `dial`. It would catch only an `Error` frame that arrived with the
+  handshake, not one still in flight. Closing the residual fully needs the acceptor to send its verdict, which is the
+  protocol change the lead rejected. The lead's scope here is the claims.
+- **D224's own scenario is unaffected:** two surviving followers redial each other, and neither is shutting down.
+
+### G3: the premise's boundary, pinned with UNEQUAL deadlines
+
+**T** = `a_link_closed_by_a_peer_with_half_the_idle_deadline_is_still_probed` (`tests_transport.rs`, additions only).
+
+- **Setup.** Sender A has `idle_deadline` 2 s, so its gate is 1 s. Receiver B has 1 s. That is `D_r = D_s / 2`, the
+  premise's boundary. The two transports are built directly, because `pair()` gives both ends the same options.
+- **The run.**
+  - A→B carries one frame, then stays silent until B closes it (`b.idle_closed() ≥ 1`,
+    `b.live_inbound_conns() == 0`).
+  - It settles for 300 ms, then sends ONCE.
+  - The frame must arrive, with `idle_probes` +1, `idle_redials` +1, and `lost_in_flight` 0.
+- **Margins** (INFERRED).
+  - B closes only after more than 1 s of silence, and A's last write came before B's last read. So the gap is at
+    least 1 s + 300 ms: it clears the fix's 1 s gate by 300 ms, and load can only widen it.
+  - **N9 `gate_is_the_whole_deadline`** makes the gate `idle_deadline` = 2 s. The gap is then about 1.3 s, under the
+    gate, so the frame goes into the closed link. T fails, with no second send to rescue it.
+  - N9 is killed only while the gap stays under 2 s. A stall of about 0.7 s lets N9 survive: a false survivor,
+    never a false red on the fix. N9 survives I, P, H, K and B, since their gaps all exceed D (review 2).
+
+### G4: the reset arm is a KNOWN SURVIVOR
+
+**N10 `reset_read_as_alive`** replaces `Err(e) => !matches!(…WouldBlock | Interrupted…)` with `Err(_) => false`.
+
+- **Predicted: SURVIVES** every test (INFERRED). Every closed-link test produces a FIN (I, P, T, K) or unread bytes
+  (H).
+- **Why no test:**
+  - A reset at the probe is not portable to produce. On Linux, a peer that closes without reading A's handshake sends
+    one.
+  - On macOS, `SHUT_RD` flushes the receive buffer and the close is a FIN (review 2, INFERRED from memory of both
+    stacks).
+  - A test that is red on one platform and vacuous on the other would be worse than none.
+- It is registered and run so that its survival is a recorded measurement, not a surprise.
+
+### K, strengthened: EQUALITY with the transport's own meters
+
+K now asserts that `n.transport_counters()`'s `idle_probes` and `idle_redials` EQUAL `n.net.idle_probes()` and
+`n.net.idle_redials()`, not just that they are nonzero.
+
+- To avoid a race, the snapshot is bracketed by two direct readings. It is compared only when the two readings are
+  identical, retried every 10 ms for up to 100 tries, and the test fails if the meters never hold still.
+- The ≥ 1 premise stays in front of it.
+- N7 and N8 still fail K, now at the equality.
+
+### Nits
+
+- `tests_transport.rs:2733`'s section comment says "busy links pay nothing". It will say two clock reads per frame.
+- The module header's "only in the narrow race" will name all three costs: the race, the band a violated premise
+  opens, and a redial onto a refusal.
+- **N3's failure site in P is `expect_recv`**, before the `idle_redials` assertion. The original table's
+  "(`idle_redials` 0)" named the wrong line.
+- **B's `t0.elapsed() >= gate + 1 s` cannot fail as written**, because the 60 × 100 ms sleeps alone take 6 s.
+  - **It is KEPT, as a fixture guard**, and its comment says so. If `FRAMES` or the sleep is cut until the link no
+    longer outlives the gate by a second, the guard fails loudly instead of letting B go quietly vacuous.
+  - The sleeps are the real anti-vacuity.
+- H's comment "left as `conn_loop` leaves it" is exact only for the refusal after all six bytes were read. The
+  `stop` and deadline refusals return before reading them, so on Linux their close is a reset behind the `Error`
+  frame. Under the fix both read as closed. The comment will say so.
+- `idle_probe_gap` says the peer's clock runs "from its last read". It runs from its last complete frame
+  (`last_heard`). The bound holds up to the delay between A's write returning and its refresh, which sits inside the
+  stated residual race. The doc will say so.
+
+### Counts and Run G3, amended (predicted)
+
+| module | tests |
+|---|---|
+| transport | 62 + T = **63** (62 off macOS) |
+| node | 14 |
+| log | 58 |
+| replicate | 60 |
+
+**Per-target, re-derived.**
+
+- Instrument: `git diff 9aa6968 <sha> | grep -cE '^\+\s*#\[test\]'`, with 0 removed in every case, added to D207's
+  base of 2579 (never measured).
+- `d815c1b`: +25, so 2604. `1eaf1a7`: +29, so 2608. `bf1fd63`: +34, so 2613. With T: **2614**.
+- The lead's 2608 comes from review 2 and reproduces exactly: it is the merge of `d815c1b` with `49ba420`,
+  2604 + I, B, P, H. The merge that was actually made took D207's final `1eaf1a7`, which adds W1–W4. K and T come
+  on top of that.
