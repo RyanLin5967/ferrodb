@@ -199,3 +199,73 @@ A method added later is not covered by anything but review.
   `open` ignores an unreadable `[0x08]` record (loads `D = 0`) → that test fails.
 - Counts are unchanged: `f1_lease_grace` has 10 tests (MEASURED: `grep -c '#\[test\]'` over the
   module in the working file → 10).
+
+## Amendment 4 — the lead's two addenda: an F2 guard, and D206. Written before the D206 fix commit.
+
+### F2 guard (`4dc1bd8`, test + a cfg(test) hook; no fix, because F2's fix is `447269e`)
+
+- `cluster::tests::f2_a_wall_clock_step_mid_process_neither_expires_nor_revives_a_lease` steps
+  THIS thread's wall clock ±1 h through `cluster::wall_step`, a thread-local offset on
+  `local_wall_millis`, the process's one `SystemTime::now()` reader. It asserts through
+  `LeaseDeadline::is_expired_now`, i.e. the decision path.
+- **Predicted PASS at every commit from `447269e` on.** Its red is **M15**: put
+  `local_wall_millis()` back at the `LeaseSource::LocalWall` arm of `lease_now_millis`, the exact line
+  `447269e` replaced. Under M15 the first stepped assertion fails: "a FORWARD wall-clock step of one
+  hour expired a ten-minute lease".
+- Blind spot, stated at the hook: an inline `SystemTime::now()` at that arm bypasses
+  `local_wall_millis` and passes the test.
+
+### D206 red (`c3f62ab`, tests only), each predicted FAIL at `c3f62ab` and PASS after the fix
+
+| test | first failing assertion at `c3f62ab` |
+|---|---|
+| `integration_cluster_grants::an_over_long_lease_cannot_forge_the_never_expires_sentinel` (ported verbatim from `31364b3`) | "an over-long lease forged the trunk sentinel" (`try_from_now(u64::MAX)` = `u64::MAX`) |
+| lib `branch::types::tests::an_over_long_lease_from_now_does_not_forge_the_never_expires_sentinel` | same text, via `from_now` |
+| lib `table_catalog::f1_lease_grace::a_shifted_deadline_never_forges_the_never_expires_sentinel` | "the downtime shift saturated a real deadline onto the never-expires sentinel" (`(u64::MAX − 1) + 3000` saturates to `u64::MAX`) |
+
+All three are also red against `9aa6968` for the two `from_now`/`try_from_now` tests. The catalog
+test's API does not exist there.
+
+### What the D206 fix will do
+
+- Every deadline COMPUTATION stops at `u64::MAX − 1`, through one function,
+  `LeaseDeadline::saturating_deadline` (from `31364b3`). The computations are:
+  - `from_now`
+  - `try_from_now`
+  - `to_lease_clock`'s `v + D`
+  - the resume's `D += downtime`
+- `to_stored` subtracts, so it cannot exceed its input.
+- `u64::MAX` itself, when a caller passes it explicitly (`TRUNK_LEASE`, and a dozen benches and tests
+  that fork with `LeaseDeadline(u64::MAX)`), is a **fixed point of both translations**. It is the
+  caller's "never", not a computed value. `integration_system_views.rs:218` asserts that trunk reads
+  `u64::MAX`.
+- The cluster ledger stores `lease_millis` and computes no deadline (READ:
+  `agent_sql/cluster.rs:285`, `:526`).
+
+**One assertion of my own changes in the D206 fix commit.** In
+`a_resume_shifts_every_deadline_by_exactly_the_downtime_and_rewrites_no_record` (`6fc317b`),
+`lease(&c, never) == u64::MAX` becomes `u64::MAX − 1`. That branch was forked with `u64::MAX − 5`,
+and the old assertion pinned exactly the forging D206 forbids.
+
+### Counts, per-target, at the D206 fix
+
+- **base + 25**: the +21 of amendment 2, the F2 guard (+1), and the three D206 tests (+3).
+- Lib filter:
+  `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
+  → **19** (11 + 3 + 3 + 1 + 1).
+
+### Mutants, new
+
+| mutant | must fail |
+|---|---|
+| M15 `LeaseSource::LocalWall => Ok(local_wall_millis())` | `f2_a_wall_clock_step_mid_process…` |
+| M16 `saturating_deadline` = plain `saturating_add` (no `.min`) | the ported cluster test, `an_over_long_lease_from_now…`, `a_shifted_deadline_never_forges…` |
+| M17 `to_lease_clock` uses plain `saturating_add` | `a_shifted_deadline_never_forges…` (`latest`) |
+| M18 the resume's `D += downtime` uses plain `saturating_add` | `a_shifted_deadline_never_forges…` (the `offset` assertion) |
+| M19 `to_stored` loses the `u64::MAX` fixed point | `a_shifted_deadline_never_forges…` (`small`, an explicit never written after the restart) |
+
+### Blind spot (D206)
+
+A record that ALREADY holds a forged `u64::MAX` — written by a build before this fix, with an
+over-long lease — cannot be told from an explicit "never", and stays un-reapable, exactly as it is
+today. Nothing rewrites it.
