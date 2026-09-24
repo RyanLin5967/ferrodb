@@ -350,3 +350,72 @@ with these recorded differences:
   code did not exist there.
 - **Predicted:** M1, M2, M4-M6, M9-M11 and M13-M23 killed; M3, M7 and M12 survive. M3 and M12 run against
   `wal::`, and M9, M10 and M23 against the catalog tests.
+
+**Amendment 12 (the D250 re-merge `60481bf`, and the listed-zero-page case the lead added from D256 review 1's R4;
+registered BEFORE the zero-page code).**
+
+*The re-merge.* `60481bf` merges `d250-drop-logged` @ `b57a5d0`, which carries four things:
+- the F7 door: `completed_drops` is private to `wal::recovery`, and `OpenedDatabase::attach_runtime` is its only consumer;
+- #16 review 6 (`fe2fd84`, via `e8f0066`): an `unrecorded` entry carries its quarantine line;
+- D250's tests 10-13;
+- `heap_writes_at`.
+
+The conflicts were in `recovery.rs`'s imports and `txn.rs`'s struct fields, both resolved as unions. Two D250-side test
+call sites now pass the DROP's pages; neither assertion changed:
+- test 11 passes `table_pages("t")`, as its sibling failed-mutation test does;
+- #16's new retry test passes `Vec::new()`, as its sibling `a_drop_refuses_to_discard_a_mismatch_it_could_not_record` does.
+
+D229's tests read `completed_drops` from `recovery`'s own child module, where the private field is visible.
+`d250-drop-logged` has since moved to `bf23c29` (review 2's red tests only), which is not merged here; the next re-merge
+takes it with its fix.
+
+Predictions on the merged tree (INFERRED, nothing built):
+- **D250 test 10 (`an_empty_table_recreated_at_the_dropped_root_by_a_failed_create_is_forgotten_and_its_pages_leak`):
+  RED, and it is a ⚖, not a code defect.** The DROP's intent is gone before the root can be reused. A4 removes it
+  before its pages leave the quarantine, which is the case `delete-insert-gap` asked about, and it does not arise. But
+  the open that forgets the re-created table runs D229 (b)'s reset, because its log holds the re-appended `DropTable`
+  record. That reset frees every allocated page that nothing names and that reads as a B+tree node or zeros. The
+  forgotten table's PRIMARY root is an empty, flushed B+tree leaf, so the reset frees it, and the test's `allocate`
+  drain hands it out. The two heap roots are directory pages and are kept (reported), so they still leak as the test
+  pins. The reset cannot hit another owner here: every tree is rebuilt at that open, so no live B+tree node survives
+  it, and a heap page is in the keep set. Rescoping the test's probe to the two heap roots on the combined tree is an
+  assertion change, so it is not made here.
+- D250 tests 11-13, #16's two retry/mismatch tests, and D229's 22: GREEN.
+- **D250's SKIPm, TTm, CLRm and LSNm** (the patterns of `lane_d250_drop_logged_run.sh` @ artie-research `5f9371d`) go
+  into `lane_d229_run.sh`, run against `wal::recovery::`. Predicted: all four killed by D250 test 13, as D250's lane
+  registers (INFERRED). D229's `a_drop_under_a_wal_pin_frees_its_pages_before_any_truncation` is a second candidate
+  killer for SKIPm, because its reopen replays a kept log over reused pages.
+
+*The listed-zero-page case (D256 review 1's R4: mechanism READ, reach INFERRED).* `new_page` writes a zero page to disk;
+`add_empty_page` then initialises the page in the pool and lists it in the heap's directory; directory entries are not
+logged, and a directory page carries no LSN, so `wal_gate` never holds it back. A crash can therefore leave the
+directory on disk listing a page whose disk image is still zeros, with no log record naming it. This happens when the
+directory reaches disk first, by eviction or by `flush_all`'s ascending order, and the page's own write never lands.
+Redo initialises only the pages a record names. Every scan of that heap then meets the zero page, and
+`Page::deserialize` panics: `bytes[HEADER_SIZE..0]`, because `free_space_start` reads 0. The open's rebuild scans every
+primary heap, so the open panics, and every later one does too.
+- **Decision: the page is named durably before the directory lists it** (the first of the lead's two options).
+  `add_empty_page` writes the page's initialised image to disk (`flush_page`, once the empty page is in its frame)
+  BEFORE `add_to_directory`. So a directory that lists a page never meets its zero image. In the engine's crash model
+  (kill -9: a write that returned is kept), that makes the state unrepresentable. Under `SyncOnly` both writes follow
+  the last sync and are lost or kept together.
+  - Rejected: an open-time repair. Unnamed zero pages can exist when the log is empty and no rebuild runs, so it
+    would have to read every listed page at EVERY open, O(heap pages) per restart (the D216 shape).
+  - Rejected: tolerating zero pages in every reader (PostgreSQL's `PageIsNew`). It is spread across every heap read
+    path, and conflicts with D256's `Page::deserialize` refusal.
+  - Cost: one more page write per new heap page (the zero write stays, as `new_page` is shared with the trees).
+  - Blind spot, stated: a power loss that keeps an arbitrary subset of unsynced writes can still keep the directory's
+    write and drop the page's. That is outside the engine's stated model, as it is for every other unsynced write here.
+- **New red test** `a_page_its_heap_lists_before_its_own_image_reached_the_disk_opens_as_an_empty_page`. Setup, on the
+  fixture:
+  - `notes` is created and gets row 0, committed, so the next open replays the log and rebuilds;
+  - `BEGIN; INSERT` note 1 takes a new heap page P through `add_empty_page`;
+  - `notes`' directory page is flushed alone, as an eviction would write it;
+  - the crash, with the transaction open.
+
+  Premises, asserted on the crash image: the directory on disk lists P, and no durable log record names P.
+  Property: two good opens (the falsifier's oracle), with `notes` holding exactly row 0.
+  - RED at `60481bf` (INFERRED): the first open's rebuild scans `notes`, and `Page::deserialize` panics on P's zeros.
+  - GREEN after the fix.
+  - Mutant **M24**: the new `flush_page` removed. Predicted RED on this test.
+- Base and counts follow in the amendment after the code.
