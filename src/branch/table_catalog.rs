@@ -3749,6 +3749,146 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// One hour, the outage the FirstStart tests stage.
+    const HOUR: u64 = 3_600_000;
+
+    /// Give `path` the modification time an old process's last write would have left, in
+    /// lease-clock milliseconds (the scale `resume_leases` is handed).
+    fn age_file(path: &std::path::Path, mtime_millis: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_millis))
+            .unwrap();
+    }
+
+    /// The lease a first start must leave, given the `now` it resumed at and the file time it was
+    /// staged with: `lease + (now − mtime)`. The upper bound allows one second for a filesystem
+    /// that stores modification times at second granularity, which can only move `mtime` EARLIER.
+    fn credited(lease: u64, now: u64, mtime: u64) -> (u64, u64) {
+        let exact = lease + (now - mtime);
+        (exact, exact + 1_000)
+    }
+
+    /// **The FirstStart policy (lead, SCALE-DESIGN "D198 addendum — the FirstStart policy"): a
+    /// catalog written before D198 has no mark, and its first start used to charge the whole
+    /// outage.** The file's last modification is when its last writer was last alive at the
+    /// latest, so `now − mtime` is a downtime that can only be over-credited. A lease that lapsed
+    /// inside that outage must survive the first start. Red against `d124b53`, where a FirstStart
+    /// leaves `D = 0`.
+    #[test]
+    fn a_pre_d198_catalog_credits_the_downtime_since_its_file_was_last_written() {
+        let path = sidecar("pre-d198");
+        let t = LeaseDeadline::now_millis();
+        let lapsed_in_outage = t - HOUR / 2;
+        let b = {
+            // No `[0x08]` record: every catalog written before D198 looks like this.
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+        };
+        age_file(&path, t - HOUR);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("a live branch has an enforced lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "a lease that lapsed only inside the outage before the first D198 start was charged \
+             that outage: it reads {}, now is {now}",
+            lease.0
+        );
+        assert!(expired_ids(&c, now).is_empty(), "the first scan would reap it");
+        let (lo, hi) = credited(lapsed_in_outage, now, t - HOUR);
+        assert!(
+            (lo..=hi).contains(&lease.0),
+            "credited {} ms, but the file said {} ms (now − mtime, +1 s for timestamp granularity)",
+            lease.0 - lapsed_in_outage,
+            now - (t - HOUR)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same, for the other door into an unmarked catalog: a legacy `{db}.branches` log that
+    /// `default_for_database` migrates. The new file is written NOW, so its mtime says nothing about
+    /// the outage; the SOURCE log's does. Red against `d124b53`.
+    #[test]
+    fn a_migrated_legacy_log_credits_the_downtime_since_the_source_was_last_written() {
+        let dir = std::env::temp_dir().join(format!("ferro-f1-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        let legacy = dir.join("legacy.db.branches");
+        let t = LeaseDeadline::now_millis();
+        let lapsed_in_outage = t - HOUR / 2;
+        let b = {
+            let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
+            log.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+        };
+        age_file(&legacy, t - HOUR);
+
+        let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("the migrated branch is live");
+        assert!(
+            !lease.is_expired_at(now),
+            "a migrated lease that lapsed only inside the outage was charged it: reads {}, now {now}",
+            lease.0
+        );
+        let (lo, hi) = credited(lapsed_in_outage, now, t - HOUR);
+        assert!(
+            (lo..=hi).contains(&lease.0),
+            "credited {} ms, but the SOURCE log said {} ms",
+            lease.0 - lapsed_in_outage,
+            now - (t - HOUR)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The policy's control: a catalog that holds no live lease has nothing to protect, and its
+    /// first start must not move `D` however old the file is. Green against `d124b53` too.
+    #[test]
+    fn a_pre_d198_catalog_with_no_live_branch_does_not_move_the_offset() {
+        let path = sidecar("pre-d198-empty");
+        let t = LeaseDeadline::now_millis();
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(t - HOUR / 2)).unwrap().branch_id;
+            c.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+        }
+        age_file(&path, t - HOUR);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        assert_eq!(
+            c.alive_state().unwrap(),
+            Some((now, 0)),
+            "a first start with no live lease moved D"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **M24b's killer (re-review R2).** A raw-decoded record written back through `inward` by a
+    /// read-modify-write would store `v − D` and read `D` early. `set_root` and `set_state` are the
+    /// read-modify-writes no other test exercises after a resume with `D > 0`.
+    #[test]
+    fn set_root_and_set_state_after_a_resume_leave_the_lease_where_it_was() {
+        let path = sidecar("rmw-after-resume");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+
+        c.set_root(b, 77).unwrap();
+        assert_eq!(lease(&c, b), 4_500, "set_root moved a deadline it did not name");
+        c.set_state(b, BranchState::Live, BranchState::Quarantined).unwrap();
+        c.set_state(b, BranchState::Quarantined, BranchState::Live).unwrap();
+        assert_eq!(lease(&c, b), 4_500, "a set_state round trip moved the deadline");
+        assert!(expired_ids(&c, 4_499).is_empty());
+        assert_eq!(expired_ids(&c, 4_500), vec![b.id], "the DEADLINE key did not follow the record");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
