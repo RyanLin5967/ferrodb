@@ -1129,13 +1129,14 @@ impl BranchCatalog for TableBranchCatalog {
         // `reused` decides which writer runs below, and it is the whole safety condition for
         // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
         // deadline keys, so its keys are NOT new.
-        let (child_num, generation, reused) = match recycled {
+        let (child_num, generation, reused, slot_core) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
-                (id, slot_gen, true)
+                let slot_core = self.core(id)?;
+                let slot_gen = slot_core.as_ref().map(|r| r.generation()).unwrap_or(0);
+                (id, slot_gen, true, slot_core)
             }
-            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
+            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false, None),
         };
         let child_id = BranchId::new(child_num, generation);
             let child = BranchRecord::fork_child_from_core(
@@ -1147,7 +1148,11 @@ impl BranchCatalog for TableBranchCatalog {
             )?;
 
             if reused {
-                self.write_record(&child, None)?;
+                // The slot's OLD record is passed as `old`, so the keys derived from it go: its
+                // `Reaped` STATE key above all. With `None` that key outlived the recycle, and
+                // `in_state(Reaped)` went on returning this live branch — which also put every
+                // slot ever recycled into the D200 open-time sweep's span, at every open.
+                self.write_record(&child, slot_core.as_ref())?;
             } else {
                 self.write_record_new(&child)?;
             }
