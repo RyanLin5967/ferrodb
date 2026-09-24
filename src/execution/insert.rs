@@ -97,10 +97,9 @@ impl Modify for Insert {
     ///
     /// When both fail, the write's error is the one returned: it is why the statement failed.
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
-        let written = self.write_row();
+        let count = self.write_row()?; // D230 MUTANT M1
         let primary = sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog);
         let fulltext = sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog);
-        let count = written?;
         primary?;
         fulltext?;
         // D69 — record that this table changed, on the SAME path as the write that
