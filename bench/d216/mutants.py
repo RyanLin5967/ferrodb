@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D216 / D227 / D234 mutants, each applied ALONE to a throwaway checkout of the tip.
+"""D216 / D227 / D234 / D247 mutants, each applied ALONE to a throwaway checkout of the tip.
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR]
 
@@ -31,9 +31,8 @@ TIMEOUT = 3600  # seconds per cargo invocation
 
 LIB = ("--lib", "wal::")
 D227 = ("--test", "d227_restart_keeps_declarations")
-D234 = ("--test", "d234_declared_runs_reach_the_log")
 HISTORY = ("--test", "d234_decoder_history_still_collapses")
-PGSERVER = ("--test", "pgserver_crash_rebuilds_indexes")
+ARENA = ("--test", "d247_arena_page_write_back_flushes_no_log")
 # Not a cargo-test argument list: `cargo build --examples`, for targets that spawn example binaries
 # (the staleness guard refuses a binary older than src/).
 BUILD_EXAMPLES = ("BUILD_EXAMPLES",)
@@ -69,12 +68,12 @@ MUTANTS = [
      ".filter(|id| *id != 0 && !ended.contains(id))", ".filter(|id| !ended.contains(id))",
      [LIB], [R + "recovery_appends_nothing_for_a_log_of_declarations"], "KILL"),
     ("M6_gate_skips_unlogged_pages", "src/buffer/buffer_pool.rs",
-     "                0 => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
-     "                0 => {}\n",
+     "            LogDependency::Through => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
+     "            LogDependency::Through => {}\n",
      [LIB], [R + "an_index_page_reaches_disk_only_after_the_log_records_it_depends_on"], "KILL"),
     ("M7_gate_flushes_whole_log", "src/buffer/buffer_pool.rs",
-     "                0 => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
-     "                0 => wal.flush()?,\n",
+     "            LogDependency::Through => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,\n",
+     "            LogDependency::Through => wal.flush()?,\n",
      [LIB], [R + "an_index_page_whose_records_are_durable_does_not_flush_the_log"], "KILL"),
     ("M8_flush_up_to_ge", "src/wal/log.rs",
      "        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {\n",
@@ -90,10 +89,7 @@ MUTANTS = [
      "    for _rec in declarations {\n    }\n",
      [LIB, D227], [R + "a_checkpoint_after_a_restart_still_declares_every_table",
                    R + "an_open_over_an_empty_log_still_declares_every_table",
-                   "a_restarted_process_still_declares_its_tables_and_runs"], "KILL"),
-    ("M11_cli_declares_no_runs", "src/cli/cli.rs",
-     "    txn.declare_runs_of(&**runtime.provenance())?;\n", "",
-     [D227], ["a_restarted_process_still_declares_its_tables_and_runs"], "KILL"),
+                   "a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind"], "KILL"),
     ("M12_marker_not_durable", "src/wal/txn.rs",
      "        let written = crate::storage::atomic_file::replace_atomically(\n"
      "            &crate::storage::atomic_file::OsFileOps,\n"
@@ -102,17 +98,9 @@ MUTANTS = [
      "        );\n",
      "        let written = std::fs::write(&marker, format!(\"txn {txn_id}: {e}\\n\"));\n",
      [LIB], [], "SURVIVE"),
-    ("M13_pgserver_declares_no_runs", "examples/pgserver.rs",
-     "    txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!(\"pgserver: {e}\"));\n", "",
-     [BUILD_EXAMPLES, PGSERVER], [], "SURVIVE"),
     ("M14_unconditional_replay", "src/wal/txn.rs",
      "        if truncation == Truncation::Truncated {\n", "        if true {\n",
-     [LIB, D234], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing",
-                   "a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
-    ("M15_declare_runs_of_only_retains", "src/wal/txn.rs",
-     "                self.wal.append(0, 0, &RecKind::RunIdentity { run })?;\n                wrote = true;\n",
-     "                let _ = run;\n",
-     [D234], ["a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
+     [LIB], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing"], "KILL"),
     ("M16_open_ignores_declarations", "src/wal/recovery.rs",
      "    if rebuild || holds_records || declares {\n", "    if rebuild || holds_records {\n",
      [LIB], [R + "an_open_over_an_empty_log_still_declares_every_table"], "KILL"),
@@ -124,13 +112,26 @@ MUTANTS = [
     ("M18_unconditional_run_replay", "src/wal/txn.rs",
      "        if truncation == Truncation::Truncated {\n",
      "        self.replay_runs()?;\n        if truncation == Truncation::Truncated {\n",
-     [LIB, D234], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing",
-                   "a_run_declared_at_open_reaches_the_log_while_every_checkpoint_is_pinned"], "KILL"),
+     [LIB], [T + "a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing"], "KILL"),
     # The D234 adversary's F7: the decoder's history collapse, whose natural trigger D234 removed.
     ("M19_history_never_collapses", "src/replication/logical.rs",
      "        if drop.is_empty() {\n            return;\n        }\n",
      "        if true {\n            return;\n        }\n",
      [HISTORY], ["identical_declarations_under_a_held_pin_do_not_grow_the_decoders_history"], "KILL"),
+    # D247: an arena page must be recognised positively, and a table page only when it names itself.
+    ("M20_no_page_id_check", "src/buffer/buffer_pool.rs",
+     "    let names_itself = page_id.is_some_and(|id| data[1..5] == id.to_be_bytes());\n",
+     "    let names_itself = page_id.is_some() || true;\n",
+     [ARENA], ["writing_back_a_dirty_arena_page_does_not_flush_the_log"], "KILL"),
+    ("M21_no_arena_recognition", "src/buffer/buffer_pool.rs",
+     "        _ if crate::cow::page_header::verify_checksum(data) => LogDependency::Nothing,\n", "",
+     [ARENA], ["writing_back_a_dirty_arena_page_does_not_flush_the_log"], "KILL"),
+    # The D227 run half, withdrawn at 09:44Z: an open that re-declares every run ever interned.
+    ("M22_open_redeclares_runs", "src/wal/recovery.rs",
+     "    let rebuild = recovered || stale;\n",
+     "    for run in crate::provenance::DurableProvenanceStore::open(format!(\"{}.provenance\", db_path.display()))?.runs()? {\n"
+     "        txn.declare_run(run)?;\n    }\n    let rebuild = recovered || stale;\n",
+     [D227], ["a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
