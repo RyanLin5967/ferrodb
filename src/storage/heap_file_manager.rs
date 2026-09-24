@@ -66,6 +66,18 @@ impl HeapFileManager {
     /// the page it added last time and adds nothing. That is not hypothetical — it hung
     /// `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`, a 200-row
     /// ALTER needing eleven pages, for eighteen minutes with no output.
+    ///
+    /// **The page's empty image is written to disk BEFORE the directory lists it** (D229, from D256
+    /// review 1's R4). `new_page` puts a zero page on disk. Directory entries are not logged, and a
+    /// directory page carries no LSN, so nothing holds the directory back: it can reach the disk
+    /// (evicted, or first in `flush_all`'s ascending order) while this page's own image does not. When
+    /// no log record names the page, redo does not initialise it, and every later scan of the heap read
+    /// the zeros as a heap page: `Page::deserialize` panicked, and the open's rebuild scans every primary
+    /// heap. With this write first, a page a directory lists is never all zeros on disk, in the
+    /// engine's crash model (kill -9: a write that returned is kept). A power loss that keeps an
+    /// arbitrary subset of unsynced writes could still keep the directory's and drop this one; that is
+    /// outside the model, as for every other unsynced write. Cost: one page write per page the heap
+    /// grows by, beside `new_page`'s zero write.
     fn add_empty_page(&self) -> Result<u32, FerroError> {
         let new_page_id = self.buffer_pool_manager.new_page()?;
         self.buffer_pool_manager.unpin_page(new_page_id, false);
@@ -75,6 +87,8 @@ impl HeapFileManager {
         frame.data = empty_page.serialize()?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(new_page_id, true);
+        // Written, or already evicted (which wrote it): either way on disk before anything lists it.
+        self.buffer_pool_manager.flush_page(new_page_id)?;
         let free_space = (PAGE_SIZE - HEADER_SIZE) as u16;
         self.add_to_directory(new_page_id, free_space)?;
         Ok(new_page_id)

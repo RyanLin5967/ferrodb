@@ -1295,8 +1295,11 @@ fn the_reset_keeps_a_page_it_cannot_read() {
 }
 
 /// **The reset keeps a page a directory lists even when its bytes are zeros** (D229 (b)'s keep
-/// set). A heap page listed before its own image reached the disk is one: `new_page` zero-writes
-/// it, the directory naming it is flushed, the page is not.
+/// set). A heap page listed before its own image reached the disk was one: `new_page` zero-writes
+/// it, the directory naming it is flushed, the page is not. Since the listed-zero-page fix
+/// (`add_empty_page` writes the empty image before listing, PREREG amendment 12) this build no longer
+/// leaves one, so the zero image is planted, as a crash under an earlier build left it (restated in
+/// PREREG amendment 13; the assertions are unchanged).
 ///
 /// It is put on `u`'s TIME-TRAVEL heap: on a primary heap an all-zero listed page makes the
 /// rebuild's heap scan panic in `Page::deserialize` (a separate hazard, not this lane's), and the
@@ -1323,6 +1326,7 @@ fn the_reset_keeps_a_page_a_directory_lists_whose_bytes_are_zeros() {
             dir_id = dir.next_page_directory;
         }
         d.o.bp.flush_page(dir_id).expect("flush the directory page alone");
+        d.o.bp.disk_manager.write(listed, &[0u8; PAGE_SIZE]).expect("the zero image an earlier build's crash left");
         insert_rows(&mut d.o, &mut Session::new(), "t", ROWS..ROWS + EXTRA).expect("rows, so the next open owes a rebuild");
     }
     let crash = m.snapshot();
