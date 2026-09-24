@@ -7356,4 +7356,153 @@ mod tests {
              over-reports rather than corrupts, so it must not be refused"
         );
     }
+
+    // ---- D219 PREREG A3 (review 7 F5): a MERGE that will stamp asks the store before its schema --
+    //
+    // Unit tests because `DurableProvenanceStore::fail_next_append`, the only way to poison a store
+    // without killing the process, exists only under `cfg(test)`. The agent statements go through
+    // the runtime's API rather than dispatch: `designated::tests` designates a runtime process-wide
+    // in this same binary, and dispatch refuses agent statements on any other while it does.
+
+    struct PoisonedMerge {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<crate::wal::txn::TxnManager>,
+        wal: Arc<crate::wal::log::WalManager>,
+        rt: Arc<AgentRuntime>,
+        branch: BranchId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn f5_parse(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// `t (id, v)` with nothing on the target (so no row of it is attributed, and `plan_alters`
+    /// never probes), a completed session of run `r1` that staged `ADD COLUMN w` and, if `publish`,
+    /// an INSERT, and then the provenance store poisoned.
+    fn a_merge_on_a_poisoned_store(publish: bool) -> PoisonedMerge {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("f5.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let wal = Arc::new(crate::wal::log::WalManager::new(dir.path().join("f5.wal")).unwrap());
+        let txn = Arc::new(crate::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let durable = Arc::new(
+            crate::provenance::DurableProvenanceStore::open(dir.path().join("f5.provenance")).unwrap(),
+        );
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = durable.clone() as Arc<dyn ProvenanceStore>;
+        let rt = Arc::new(rt);
+        let mut plain = crate::execution::session::Session::with_runtime(Arc::clone(&rt));
+        crate::execution::executor::run(
+            f5_parse("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut plain,
+        )
+        .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}"));
+        let session = rt
+            .begin_session_as(
+                RunIdentity {
+                    agent_id: "a",
+                    run_id: Some("r1"),
+                    model: Some(("claude-opus-5", "2026-05")),
+                    prompt: None,
+                },
+                BranchId::TRUNK,
+            )
+            .unwrap_or_else(|e| panic!("BEGIN failed: {e}"));
+        if publish {
+            rt.write(
+                &mut ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() },
+                session.branch,
+                f5_parse("INSERT INTO t VALUES (1, 10);"),
+            )
+            .unwrap_or_else(|e| panic!("INSERT in the session failed: {e}"));
+        }
+        let Stmt::AlterTable { table, action } = f5_parse("ALTER TABLE t ADD COLUMN w INTEGER;")
+        else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        rt.stage_schema_edit(&catalog, session.branch, &table, &action)
+            .unwrap_or_else(|e| panic!("staging the ALTER failed: {e}"));
+        durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            durable.stamp_row(1, 1, session.prov).is_err(),
+            "premise: the injected failure did not poison the store"
+        );
+        PoisonedMerge { catalog, bp, txn, wal, rt, branch: session.branch, _dir: dir }
+    }
+
+    impl PoisonedMerge {
+        fn merge(&mut self) -> Result<MergeReport, FerroError> {
+            let rt = Arc::clone(&self.rt);
+            rt.merge(
+                &mut ExecCtx { catalog: &mut self.catalog, bp: self.bp.clone(), txn: self.txn.clone() },
+                self.branch,
+            )
+        }
+
+        fn columns_of_t(&self) -> usize {
+            self.catalog.require_table("t").unwrap().schema.columns.len()
+        }
+    }
+
+    /// **P1 (PREREG A3): a MERGE that will stamp, on a store refusing writes, is refused before its
+    /// schema installs.** The altered table has no attributed row, so `plan_alters` does not probe;
+    /// without a probe of its own the merge installed and logged the ADD COLUMN and was refused only
+    /// at the first publish stamp: `Err` from a statement that changed the target's schema and told
+    /// the change feed so (E82).
+    #[test]
+    fn a_merge_that_will_stamp_on_a_poisoned_store_is_refused_before_its_schema_installs() {
+        let mut f = a_merge_on_a_poisoned_store(true);
+        let logged_before = f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        match f.merge() {
+            Ok(_) => panic!("a MERGE that publishes attributed rows succeeded on a store refusing writes"),
+            Err(e) => assert!(
+                format!("{e}").contains("refusing further writes"),
+                "refused, but not by the poisoned store: {e}"
+            ),
+        }
+        assert_eq!(
+            f.columns_of_t(),
+            2,
+            "the refused MERGE installed its ADD COLUMN before refusing: a schema change from a \
+             statement that returned Err"
+        );
+        assert_eq!(
+            f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            logged_before,
+            "the refused MERGE wrote to the log: its DDL record reached the change feed"
+        );
+    }
+
+    /// **P2 (PREREG A3): a MERGE that publishes nothing is not refused by a store refusing
+    /// writes.** It writes no provenance, so there is nothing to refuse: the probe asks only when
+    /// the merge will stamp, as `plan_alters`' asks only when a rewrite will re-stamp (D219 F1).
+    #[test]
+    fn a_merge_that_publishes_nothing_on_a_poisoned_store_is_not_refused() {
+        let mut f = a_merge_on_a_poisoned_store(false);
+        if let Err(e) = f.merge() {
+            panic!("a schema-only MERGE was refused by a store it writes nothing to: {e}");
+        }
+        assert_eq!(f.columns_of_t(), 3, "the schema-only MERGE did not install its ADD COLUMN");
+    }
 }
