@@ -40,7 +40,9 @@
 //! Four record kinds, all small:
 //!
 //! * **`Run`** — one interned [`RunEntity`], written the first time a run is interned. One per
-//!   *run*, never per row.
+//!   *run*, never per row. A fork's run is interned PENDING since D246 §6.1 and its record is
+//!   written and group-synced by the fork's `complete()`, after pgwire's catalog guard; see
+//!   `intern_pending` and `await_run`.
 //! * **`Stamp`** — `(page_id, slot_num) -> ProvId`, ten bytes of payload, written once per stamped
 //!   version.
 //! * **`RowAuthor`** — `(table_id, row_id) -> ProvId`, sixteen bytes, written once per op a merge
