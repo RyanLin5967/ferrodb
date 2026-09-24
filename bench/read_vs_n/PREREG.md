@@ -1399,3 +1399,24 @@ lead's decisions on Z1–Z6 follow, plus ledger D265, which is this lane's.**
    * Fire modes: 22.
    * New `#[test]`s over `9aa6968`: **44**, the previous 41 plus (a), (b) and (c).
    * The lib's own test count rises by 3.
+
+**A21, 2026-09-24, before any build or run. Two lead decisions from the verdict script's round 4 (artie-research
+FAN-QUEUE #18 note, `8049b26`).**
+
+1. **A mid-run close RETURNS its failure to `main`; it no longer panics.**
+   * **The defect.** A20.4 pushed each mid-run close's LEASE line into `failures`, then `expect`ed the close's
+     `Result`. A close that failed, for example on a dead lease thread (D265), panicked before the summary could print
+     the LEASE line. So a lease-thread death showed up only as a panic.
+   * **Now**, both mid-run closes (the one before a merge batch, and the parent's before each restart) push
+     `CLOSE <where>: <error>` into `failures` and continue. The run reopens and carries on, and the summary prints
+     every LEASE and CLOSE line with the others, as A18.2 does for the final close.
+   * **Stated limit.** An OPEN that fails still panics, as before: nothing can run without a database. A failure that
+     already sits in `failures` is lost then, and that exit is the panic, rc 101.
+2. **(h)'s warmth comparison is REPORTED, not judged.**
+   * The comparison is `child net ms` (child total less `recover` and `rebuild`) against `parent total ms` (A9.1's
+     restatement of §3).
+   * **Why reported.** No band was registered for it before data. A9.1 says "compared", §3's "parent reopen ≪ child
+     open" names no number, and a band chosen now, with the lane this near to (h), could not be shown to predate the
+     data.
+   * The arm-3 summary prints a line saying so.
+3. **Counts.** Fire modes: 22. New `#[test]`s over `9aa6968`: 44. Both unchanged.
