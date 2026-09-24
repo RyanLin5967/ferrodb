@@ -105,3 +105,83 @@ A crash between the WAL fsync and that sync leaves the log declaring a slot the 
   - With the fix: **holds** (the `MERGE` is refused at the pre-bind await, before the log hears of the run).
   - Under **M6** `publish_before_the_run_is_durable` (the pre-bind await deleted): **FAILS**. The `MERGE` commits slot 1 to the log, then its row-author sync takes the injected failure, so the file holds no run.
 - **R2** `a_publish_of_an_uncompleted_fork_declares_its_run_and_the_file_holds_it`. This is R1's control, with no injection. The claim: the `MERGE` is `Ok`, and the decode declares slot 1 for `('a', 'r1')`, which is R1's premise that the instrument sees this path. The file holds the run. It holds at `eca45fb`, with the fix, and under M6.
+
+## A4 (2026-09-24T11:05Z): the fresh review's findings on `eca45fb..efd3541`, fixed
+
+A fresh-context review of A1–A3 found no BLOCKER and five DEFECTs. It also found nine NITs. Its predictions for T1–T4, R1–R2, U1–U4 and M3–M10 matched A2/A3 by reading. Each finding below was re-read against the source before this entry was written. **A2 and A3's expectations stand; this entry only adds.**
+
+**D-1 — "a failed fsync is not retried" held only sequentially.**
+- `sync_handle` is `try_clone()` of the append descriptor. Both are one open file description, so on Linux an fsync error reported to one is not reported to the other.
+- `sync_runs` checked the poison flag BEFORE its fsync and outside the file lock. So a leader could:
+  1. pass the check;
+  2. lose the EIO to an in-lock writer whose own fsync failed first and poisoned the store;
+  3. have its own fsync return 0;
+  4. acknowledge the run.
+- **Fix:** `sync_runs` checks the flag AFTER its fsync, under the file lock, and the check before it is removed. This is sound because every in-lock writer holds the lock from its fsync to its `poisoned.store(true)`, so an error it consumed is visible by the time this leader can take the lock.
+- **Test U5** `a_run_sync_overlapping_a_failed_append_is_not_acknowledged`:
+  - hold the group sync in flight with the gate;
+  - poison the store through an injected `stamp_row` failure;
+  - release: `await_run` must return `Err`.
+  - **RED at `efd3541`** (it returns `Ok`).
+
+**D-2 — A3's await sat after the schema apply**, so a refusal there returned `Err` with the target's schema installed and logged. That breaks E82's rule, "everything this merge can refuse, it refuses before the first byte is written".
+- **Fix:** hoist it into the plan phase, before `ProvenanceFlush::new` and the plan loop.
+- **Test R3** `a_publish_refused_for_its_runs_record_leaves_the_schema_unchanged`: the uncompleted-fork rig with a staged `ADD COLUMN`, and the next append injected to fail. The `MERGE` is refused and `t` keeps 2 columns. **RED at `efd3541`** (3 columns).
+
+**D-3 — D246's own orderings had no test and no named survivor.**
+- New tests:
+  - **U6** `a_stamp_queued_behind_a_run_is_never_left_written_but_unsynced` (only run records are left written-but-unsynced; `flush` must sync a stamp queued behind a run whose group sync is in flight);
+  - **U7** `a_poisoned_store_refuses_a_pending_intern_and_leaves_the_index_alone`;
+  - **U8** `a_poisoned_store_refuses_await_run_and_writes_nothing`. U8 also covers N-9.
+- U6 and U7 hold at `efd3541`, so they are red only under a mutant. U8 is **RED at `efd3541`** on its N-9 half: `await_run` of a run absent from `run_seqs` returns `Ok` on a poisoned store.
+- **Pre-registered SURVIVORS**, which no test here can kill, as D219 did for its M4. Each needs a concurrent leader or a failing fsync at an exact instant, and nothing here fault-injects the fsync itself:
+  - **M16** `sync_before_write`;
+  - **M17** `ticket_before_write` (`await_run` takes its tickets before its write);
+  - **M18** `covered_before_sync` (a synchronous append marks the group durable before its fsync).
+
+**D-4 — D219's M4 and M12 match 0 sites on any tree containing D246**, because A2 split `append_all_locked` into `write_locked` + `append_all_locked`.
+- D219's runner pins `50e175b` and is unaffected.
+- On trees containing D246, their replacements are:
+  - **M15** `pending_written_last`: the same edit in `write_locked`. It must fail `provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file`, D219's M12 target.
+  - **M16**: D219's M4 at its new site, still a survivor.
+
+**D-5 — a failed `complete()` left the connection inside the session it had just refused.**
+- `dispatch` sets `session.agent` before the three completion sites (`executor::run`, `dispatch::run_agent_stmt`, pgwire extended) call `complete()?`.
+- D246 routes provenance failures into that path. D159's branch-sync failures were already there.
+- **Fix:** `ForkDurability::complete_for(&mut session.agent)` clears the session when the sync fails, and all three sites use it. The branch stays in memory until its lease reaps it, exactly as for a client that disconnects.
+- **Test R4** `a_failed_completion_closes_the_session_it_opened` calls `complete_for` directly with an injected failure. It names the new method, so it is red only under **M24** `failed_complete_keeps_the_session`.
+- Why not through `executor::run`: a lib test that runs an agent statement through dispatch can be refused by `designated::tests`, the one lib test that designates a runtime process-wide (review N-1). So R1–R4 now drive the runtime API directly: `begin_session_as_staged`, `write`, `stage_schema_edit`, `merge`. The rig changes; R1's and R2's claims do not.
+
+**N-1:** R1 now also asserts that the refusal IS the injected failure ("injected provenance append failure").
+
+**N-2:** **M11** `repeat_run_syncs` makes `await_run` sync even for a run absent from `run_seqs`. It must fail T2 (complete +1) and only T2 among T1–T4.
+
+**N-3, declined.** The review suggests C2 keep "the range declares agent-b". Whether agent-b's declaration survives depends on whether a checkpoint fires between process 2's `MERGE` and its kill, and on d216's re-declaration rule. The test cannot assert that on both trees. C2 is not vacuous without it: at M1 on this base the decode is refused.
+
+**N-4, N-7:** stale comments corrected (`runtime.rs` merge-sync count, `SyncCounts::total`, `append_locked`, `ForkDurability::drop`).
+
+**N-5 — a plain `ALTER` refused mid-restamp left the stamps queued before the refusal pending**, with no flush guard. That is a D219 residue, and it also made `await_run`'s "SQL shapes never leave a stamp ahead of a run" false.
+- **Fix:** `apply_plan` flushes what it queued and then returns the refusal.
+- **Test** `catalog::alter::tests::a_rewrite_refused_mid_restamp_still_writes_the_stamps_before_it` uses a store that refuses the 6th `stamp_pending`. The flush after the ALTER must issue 0 syncs, because nothing is left pending. **RED at `efd3541`** (1).
+- **M25** `refused_restamp_leaves_stamps_pending` restores the old loop.
+
+**N-6:** A2's per-fork count covers `BEGIN AGENT SESSION`, the staged path pgwire completes after its guard. SIMULATE's and cluster's forks call `begin_session_as` inside their own statement and pay both syncs there, as before D246. Unchanged by this lane.
+
+**N-8:** the runner refuses any `cargo test` step that collected zero tests (rc 97, recorded in the step file). The green phase adds `d154_length_prefix_refusal`, `agent_sql_surface`, `integration_prompt_clause` and `integration_run_identity_feed`, which all reach the changed await path.
+
+**Mutants added** (each must match exactly one site at the new fix, by `--check`):
+
+| mutant | must fail | must pass |
+|---|---|---|
+| M11 `repeat_run_syncs` | T2 | T1, T3, T4 |
+| M15 `pending_written_last` | D219's `stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file` | — |
+| M16 `sync_before_write` | — (SURVIVOR) | all |
+| M17 `ticket_before_write` | — (SURVIVOR) | all |
+| M18 `covered_before_sync` | — (SURVIVOR) | all |
+| M19 `no_poison_check_after_the_run_sync` | U5 | U1–U4, U6–U8 |
+| M20 `await_writes_every_pending_record` | U6 | U1–U5, U7, U8 |
+| M21 `intern_pending_ignores_the_poison` | U7 | U1–U6, U8 |
+| M22 `await_run_ignores_the_poison` | U8 | U1–U7 |
+| M23 `await_after_the_schema_apply` | R3 | R1, R2, R4 |
+| M24 `failed_complete_keeps_the_session` | R4 | R1–R3 |
+| M25 `refused_restamp_leaves_stamps_pending` | the N-5 test | the other `catalog::alter::tests` |
