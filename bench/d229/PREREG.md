@@ -320,3 +320,33 @@ registered BEFORE the code).** The lead asked for these in the review-1 amendmen
 - **Counts predicted at the code's tip:** `wal::recovery::tests_crash_frees::` has 22 tests (15 + amendment 9's four
   + three here), all GREEN. Mutants: M1, M2, M4-M6, M9-M11, M13-M23 killed; M3, M7 and M12 survive. The base and the
   one-site check follow in the amendment after the code.
+
+**Amendment 11 (after `2d9efd6`).** `2d9efd6` carries amendment 9's code and tests and amendment 10's, as registered,
+with these recorded differences:
+- **The lost-bit test (M15)** uses a page the file already holds as zeros: `new_page`, then `delete_page`, then a
+  checkpoint, so that `notes`' second row takes exactly that page (asserted). Its premises also assert that the page's
+  bit is clear in the crash image and that its bytes there are zeros. Two reasons, found while writing the test
+  (INFERRED from source, not run):
+  - A page past the durable end of the file cannot be redone: `redo_one` fetches it through the pool, and
+    `DiskManager::read` refuses a short read ("eof before finished reading").
+  - A reused page whose zero-write was lost is redone onto the stale bytes of whatever held it before.
+
+  Both are pre-existing, not D229's, and are recorded as findings in the lane (§6).
+- **The trigger-order test (M18, M19)** watches only the first bitmap page, and asserts as a premise that the chain is
+  that one page. The first "free" it orders against is the first write that turns a set bit clear.
+- **The refusal (M22)** is on a shared PAGE with any pending intent, decided or not (amendment 10), and names the
+  intent file in its message. The test asserts the refusal by its text: "already named by a pending DROP intent".
+- **R6's test** also compares the raw walk with `table_pages` as a sorted list (equal, not just the same set). Its
+  planted alias is the primary root listed in the heap's directory, and the raw walk must hold that page exactly twice
+  (a premise).
+- Docs only, beyond amendment 10's list: `RebuildOwed`'s doc says the marker's fsync goes through the file ops.
+  `FileOps::remove` is a default method, so `RecordingOps` and every other implementor are unchanged.
+
+**The GREEN phase and mutant base is `2d9efd6`:**
+- `wal::recovery::tests_crash_frees::` has **22 run, 22 passed**, predicted. `wal::free_intent::tests::` has 3 passed.
+  `catalog::catalog::tests::table_pages_names_both_heaps_and_every_tree` passes.
+- `lane_d229_run.sh` carries **22 mutants**, one site per expression at `2d9efd6` (PATTERNS_ONLY, rc 0; M21 has two
+  expressions). The fire check at `73638a4` refuses M16, M17, M18, M19 and M22 (0 sites each), as it must: their
+  code did not exist there.
+- **Predicted:** M1, M2, M4-M6, M9-M11 and M13-M23 killed; M3, M7 and M12 survive. M3 and M12 run against
+  `wal::`, and M9, M10 and M23 against the catalog tests.
