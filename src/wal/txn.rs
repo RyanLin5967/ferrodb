@@ -3782,6 +3782,51 @@ use super::*;
         );
         FAIL_RELEASES.with(|f| f.set(0));
     }
+
+    /// A manager over `setup()`'s files with a REVERT history store beside them.
+    fn with_history() -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, Arc<HistoryStore>, tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        (bp, wal, txn, store, dir)
+    }
+
+    /// **D212 (a') AMENDED 3, item 6: `commit` writes a transaction's history FROM its binding, as it
+    /// writes `RunIdentity`** — one copy of the bytes, after every other record of the transaction
+    /// and immediately before its `Commit`, so the log and the store cannot hold two versions of it.
+    ///
+    /// Mutant: `bind_history` appends the parts itself, at bind time — the part lands before the
+    /// record the transaction wrote after binding.
+    #[test]
+    fn history_parts_are_written_from_the_binding_just_before_the_commit() {
+        let (_bp, wal, txn, _store, _dir) = with_history();
+        let t = txn.begin().unwrap();
+        let record = HistoryRecord { hseq: 1, ordinal: 1, body: b"a publish".to_vec() };
+        txn.bind_history(t, record).unwrap();
+        // A record the transaction writes AFTER binding its history.
+        txn.append_chained(t, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![7; 8] })
+            .unwrap();
+        txn.commit(t).unwrap();
+        let kinds: Vec<RecKind> =
+            walk_log(&wal).into_iter().filter(|r| r.txn_id == t).map(|r| r.kind).collect();
+        let parts: Vec<usize> = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| matches!(k, RecKind::RevertHistory { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(parts.len(), 1, "one binding must be written exactly once: {kinds:?}");
+        let commit = kinds.iter().position(|k| matches!(k, RecKind::Commit)).expect("no Commit in the log");
+        assert_eq!(parts[0] + 1, commit, "the history part is not the transaction's last record before its Commit: {kinds:?}");
+        match &kinds[parts[0]] {
+            RecKind::RevertHistory { hseq, ordinal, part, last, bytes } => assert_eq!(
+                (*hseq, *ordinal, *part, *last, bytes.as_slice()),
+                (1, 1, 0, true, &b"a publish"[..]),
+                "the part is not the bound record"
+            ),
+            other => unreachable!("{other:?}"),
+        }
+    }
 }
 
 // **The seam's test half, BELOW the tests module on purpose.** `tests/d53_private_root_allowlist.rs`
