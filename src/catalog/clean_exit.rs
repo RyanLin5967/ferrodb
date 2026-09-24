@@ -70,7 +70,7 @@ fn unpersisted_roots(catalog: &Catalog) -> String {
             let recorded = roots_of(&on_page);
             let stale: Vec<String> = in_memory
                 .iter()
-                .filter(|(tree, root)| recorded.get(*tree) != Some(root))
+                .filter(|(tree, root)| recorded.get(*tree) != Some(*root))
                 .map(|(tree, root)| match recorded.get(tree) {
                     Some(old) => format!("{tree}: the page records page {old}, the tree's root is page {root}"),
                     None => format!("{tree}: the page does not record it, the tree's root is page {root}"),
