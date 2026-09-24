@@ -404,3 +404,88 @@ The same stall, by a route that predates D207:
 So a follower 64 entries behind, with entries averaging over 128 KiB, would be offered a batch that is
 refused on every turn. D207 removes only the route it added, the budget. Sizing a batch by bytes in
 the leader, or counting refused sends, is a separate row for the lead.
+
+---
+
+## Amendment 6 — D220, written BEFORE its fix (nothing built)
+
+The lead confirmed amendment 5's pre-existing stall at `9aa6968` and filed it as ledger row **D220**, to be fixed in
+the leader: counting the refusals would still leave the follower stuck.
+
+**Red tests** at **`9c4fa44`**, in `src/consensus/tests_replicate.rs`. Both compile against `9aa6968`: every
+helper and every codec function they call is there (READ). The file adds lines only (`143 0`).
+
+- **R** = `a_follower_far_behind_on_large_entries_catches_up_over_the_real_wire`.
+  - The leader holds 64 entries of 1 MiB; the follower holds nothing.
+  - Every message goes the way `node.rs` sends it: `encode_signed`, dropped if refused, then `decode_verified`.
+  - It gets up to 20 heartbeats.
+- **E** = `an_append_is_cut_where_a_signed_frame_would_overflow_and_not_a_byte_before`.
+  - Two entries are sized by `encode_signed` itself to fill a signed frame exactly, and then to overrun it by one
+    byte.
+  - It expects 2 entries at the exact fit and 1 at one byte over, and every built Append must encode signed.
+
+**Instrument:** `timeout 1800 cargo test --lib consensus::replicate::tests_replicate::`. The module has 55
+`#[test]` at `9aa6968` and **57** at `9c4fa44`; there is no `#[cfg]` and no macro.
+
+### Run R4 — RED at `9c4fa44`
+
+Predicted: **55 passed, 2 failed.**
+
+- **R** fails at `refused == 0`, with **left 20**. The Append for every heartbeat carries all 64 entries, about
+  64 MiB, and the encoder's `room` check refuses it. The follower never answers.
+- **E**: the exact-fit case passes (2 entries, and it encodes signed). The one-byte-over case fails at
+  `entries.len() == want`, with **left 2, right 1**.
+  - INFERRED arithmetic: `probe_body` = 45 + (29 + 4,194,304) + 29 + 32 = 4,194,439, so `exact` = **4,194,169**.
+
+The transport module is unchanged by this commit: 57 passed.
+
+### The fix, as it will be made
+
+- **In `transport.rs`**, two measurements that come from the encoder rather than from arithmetic:
+  - `entry_wire_len(e)` is the length `encode_entry` writes;
+  - `append_entries_budget()` is `MAX_FRAME_BYTES`, less the unsigned body of an Append carrying no entries (which it
+    encodes to measure), less `signing::MAC_LEN`. The state machine cannot know whether its transport signs.
+- **In `replicate.rs`**, `entries_from` caps a batch at `MAX_ENTRIES_PER_APPEND` entries **and** at that byte
+  budget. `LogTail::slice_from` always takes the first entry, and each later one only while the running total fits.
+- **At least one entry is always sent.** An entry the log admits is at most `MAX_ENTRY_BYTES` = `MAX_FRAME_BYTES` −
+  4096 on disk (`log.rs:105`, READ). Its wire form is at most **21 bytes** longer than its disk payload. READ:
+  - the wire `Catalog` is the disk `Catalog` plus a u32 length, the RecKind tag and two page-id roots
+    (`wal/log.rs:368-411`, `consensus/log.rs:1094`);
+  - `WalBatch`, `Membership` and the fixed-size commands encode the same way in both.
+
+  So one entry always fits the budget, with about 4,000 bytes to spare.
+
+### Run G4 — GREEN at the fix
+
+- `consensus::replicate::tests_replicate::`: **57 passed.**
+- R: `refused` 0, and the follower holds round 64. INFERRED:
+  - each Append carries 7 entries, because 7 × 1,048,605 = 7,340,235 ≤ the budget of 8,388,531, and 8 would take
+    8,388,840;
+  - that makes 10 Appends in the first heartbeat, under the keep-sending rule at `replicate.rs:1207-1218`;
+  - about 22 messages are delivered in all.
+- E: 2 entries at the exact fit, 1 at one byte over, and both encode signed.
+- The existing `one_append_carries_a_bounded_number_of_entries` still gets 64: its 200 tiny entries bind on count.
+- `consensus::transport::tests::` stays at **57 passed**; the fix adds no test there.
+
+Per-target on macOS: **2593** = 2591 + R + E.
+
+### Other senders that build a multi-part frame (READ, from `Body`'s variants in `consensus/mod.rs`)
+
+| variant | how big it can get |
+|---|---|
+| `PreVote`, `PreVoteResp`, `RequestVote`, `RequestVoteResp`, `AppendResp`, `InstallSnapshotResp` | fixed-size |
+| `InstallSnapshot` | one chunk per message: `snapshot.chunk(acked)` (`snapshot.rs:900`), at most `SNAPSHOT_CHUNK_BYTES` = 1 MiB (`:195`, `:569-573`), plus metadata whose configuration the cap limits to 1024 + 1024 ids. Well under 8 MiB, and not a count-capped batch |
+| `Append` | the only batch, and D220 |
+
+The transport's outbox is not a frame builder. It queues frames that are already encoded, and D207 bounded it in
+bytes.
+
+### Mutants for D220 (made from the fix commit; predicted against the replicate module)
+
+| mutant | what it puts back | fails |
+|---|---|---|
+| **M23 `append_count_only`** | the count-only cap (`entries_from` passes `usize::MAX` bytes), as the lead asked | **R** (`refused` 20), **E** (one-byte-over case: 2 entries) |
+| M24 `mac_not_reserved` | a budget without `MAC_LEN` | **E** (one-byte-over case: 2 entries) |
+| M25 `cut_one_early` | `>=` for `>` | **E** (exact case: 1 entry, want 2) |
+| M26 `envelope_not_reserved` | a budget without the Append envelope | **E** (one-byte-over case: 2 entries) |
+| M27 `empty_when_first_too_big` | no at-least-one rule | **none: SURVIVES**. No entry the log admits exceeds the budget (above), so the rule never binds on legal input |
