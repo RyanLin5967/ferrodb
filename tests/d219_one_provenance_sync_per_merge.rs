@@ -380,3 +380,78 @@ fn every_provenance_sync_a_merge_issues_is_one_whatever_delta_is() {
         table.join("\n  ")
     );
 }
+
+/// **A MERGE that ALTERS a table has two durability points, so it syncs the provenance file twice —
+/// whatever δ is.**
+///
+/// The schema phase makes its heap rewrite durable (a flush and a sync of the database file,
+/// `publish_evaluation_as`) BEFORE the publish transaction begins, and that rewrite stays durable
+/// whether or not the publish ever commits. The stamps it wrote for the rows it moved must be
+/// durable no later than the rewrite: left for the merge's final sync, a crash anywhere in the
+/// publish reopens with the ALTER applied and every moved row unattributed, for good. So the merge
+/// syncs once at the schema phase (`flush`, booked under `stamps`) and once after the commit (row
+/// authorship carrying the publish loop's stamps, booked under `row_authors`). Found by the D219
+/// whole-exit review (F1); a merge that alters nothing still syncs once.
+///
+/// # Pre-registered, from the source, before this test was ever run
+///
+/// | tree | `stamps` | `row_authors` | `total()` |
+/// |---|---|---|---|
+/// | `bf10eec`, stamps eager | m + 4 | 1 | m + 5 (m = 41 predicted) |
+/// | `86e1762`, every stamp deferred to the final sync | 0 | 1 | 1: RED, the rewrite's stamps waited for the publish |
+/// | the fix | 1 | 1 | 2 |
+///
+/// The rows are staged BEFORE the ALTER, in the table's current shape; the merge lands the schema
+/// first and carries them into the widened shape (`conform_to`), the path
+/// `integration_alter_column.rs::a_row_written_before_a_sibling_widened_the_table_still_publishes`
+/// covers for a sibling's ALTER.
+#[test]
+fn a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let prov = dir.path().join("d219-alter.provenance");
+    let mut db = Db::with_provenance(&prov);
+    let mut setup = db.session();
+    db.ok("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(120));", &mut setup);
+    let stamp_records =
+        || DurableProvenanceStore::open(&prov).expect("reopen the provenance file").recovery().stamps;
+
+    let mut frames = 0usize;
+    let pad = "y".repeat(60);
+    let packed: Vec<i64> = (1..=41).collect();
+    let writes: Vec<String> =
+        packed.iter().map(|id| format!("INSERT INTO t VALUES ({id}, '{pad}');")).collect();
+    merge_arm(&mut db, &prov, "packed insert d=41", "packed-41", &writes, &packed, 41, &mut frames);
+
+    let updated: Vec<i64> = (1..=4).collect();
+    let mut writes: Vec<String> =
+        updated.iter().map(|id| format!("UPDATE t SET v = 'q' WHERE id = {id};")).collect();
+    writes.push("ALTER TABLE t ADD COLUMN w VARCHAR(10);".to_string());
+    let before = stamp_records();
+    let m = merge_arm(
+        &mut db,
+        &prov,
+        "alter + update d=4",
+        "alter-upd-4",
+        &writes,
+        &updated,
+        updated.len(),
+        &mut frames,
+    );
+    let written = stamp_records() - before;
+    assert!(
+        written >= updated.len() + 2,
+        "the fixture wrote {written} Stamp records for {} published versions, so its rewrite moved \
+         fewer than two attributed rows and cannot tell a schema-phase sync from none",
+        updated.len()
+    );
+    assert_eq!(
+        (m.during.stamps, m.during.row_authors, m.during.total()),
+        (1, 1, 2),
+        "a MERGE that alters a table must sync the provenance file exactly twice: once at the \
+         schema phase, so the rewrite's stamps are durable with the rewrite, and once after the \
+         commit. Measured stamps={} row_authors={} total={} ({written} Stamp records written)",
+        m.during.stamps,
+        m.during.row_authors,
+        m.during.total()
+    );
+}
