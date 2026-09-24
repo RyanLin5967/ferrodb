@@ -449,3 +449,93 @@ The other six have the same outcome at every commit. At the fix they derive as f
 - Under `-b`: 2158 / 2.
 - `cargo test --lib rebase`: 4.
 - `cargo build --examples`: compiles.
+
+## Amendment 6 (append-only, before any run; written BEFORE the code and tests it describes): a pin taken while a merge publishes
+
+The same review found a D194 defect that already existed at `0570fe8` (its F6). I verified it from
+source myself before writing this.
+
+**The defect.** `merge` does four things, in this order:
+1. It reserves its sequence numbers under the state lock, which moves `apply_seq`.
+2. It releases the lock.
+3. It begins and commits the publish transaction.
+4. Only then does it record the versions (`record_applied`).
+
+A pinned fork that lands between steps 1 and 3 takes `fork_seq = apply_seq`, so its seq already
+includes the reserved numbers. But its snapshot was taken before the publish committed, so the
+snapshot does not contain those versions. The branch then has two wrong beliefs:
+- **At merge**, it treats the op at seq `b` as already in its base. `concurrent_op` filters on
+  `seq > fork_seq`, so it never sees `b`. The branch's rows were derived from the image before `b`,
+  so `b`'s change can be overwritten: a lost update.
+- **At read time**, `version_seen(F >= b)` names version `b` for a read that saw the image before
+  `b`. The premise check then compares `b` against itself and passes.
+
+That is exactly the failure D194 exists to prevent.
+
+**Reachability.**
+- Not over pgwire. MERGE and BEGIN AGENT SESSION both hold the exclusive catalog for the whole
+  statement.
+- In-process, yes. `begin_session_pinned` needs only `&TxnManager`, so a library caller on another
+  thread can fork inside another thread's merge.
+- A lazy pin (`State::pin`) has the same window. REBASE's `rebase_validate` takes its new instant in
+  the same way.
+
+**The rule.** A pin never claims a version its snapshot cannot see.
+- A new `State::publishing: BTreeMap<reserved.start, Option<publish txn>>` holds every merge that
+  has reserved numbers but not yet recorded them:
+  - the entry is inserted under the reservation's lock;
+  - it gets its txn id once `begin` returns;
+  - `record_applied` removes it, under the SAME lock acquisition that records the versions;
+  - on every other exit, an RAII guard in `merge` removes it.
+- A pin's seq is computed from the snapshot it pairs with:
+  `min(reserved.start over entries whose txn the snapshot does not include)`, or `apply_seq` when
+  there are none.
+- An entry whose txn is still `None` is not committed. It is registered before `apply_in` and
+  `commit`, and registering needs the lock the pinning code holds. So it counts as excluded.
+- **The same code for every door.** It is one free function, called by the fork
+  (`fork_session_staged`) and the lazy pin (`State::pin`). A child still inherits its parent's
+  pair.
+- **REBASE** refuses, retryably, while any merge is publishing. It checks at validation and again
+  at commit. That is simpler than threading the computed seq through its commit re-check, and with
+  one catalog it can never fire, because REBASE and MERGE both take `&mut Catalog`.
+
+**Why it is exact with one catalog.** A merge holds `&mut Catalog` from its reservation to its
+record, so at most one entry exists at a time. Every version already recorded is at or below that
+entry's `reserved.start`. A pin at `reserved.start` therefore reads every recorded version as it
+is, and treats the in-flight merge as "theirs". That matches its snapshot.
+
+**The retention rules still hold:**
+- A new pin is at or above every `begin_ts` already published.
+- When the in-flight merge records `b` over `h`, the new pin lies in `[h, b)`, so `h` is kept.
+
+**Blind spot, stated.** Two catalogs over one database could put two merges in flight at once.
+- If they commit out of order, an INCLUDED entry can sit above an excluded one, and no single seq
+  is consistent.
+- The pin takes the lower value, which treats the included merge as "theirs" although it is in the
+  base. A `debug_assert` names the case. It is not reachable with one catalog.
+
+### Tests, both in `runtime.rs` `mod tests`
+
+Both name `publishing`, so they cannot compile at `0570fe8`. They are MUTANT-ONLY red.
+
+| test | expected at the fix |
+|---|---|
+| `a_pin_taken_while_a_merge_publishes_does_not_claim_its_versions` | passes. Setup: reserve 2 (`base` = the old `apply_seq`), register, and begin the publish txn `t` without committing it. A pinned fork then gets `fork_seq == base` with a snapshot that excludes `t`. A lazy pin of a ctx-less branch also gets `base`. After `commit(t)`, a new fork gets `base + 2` with a snapshot that includes `t`. |
+| `rebase_is_refused_while_a_merge_publishes` | passes: `rebase_validate` returns `Err` containing "is publishing". With the entry removed, it validates. |
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M15 | `pin_seq` returns `apply_seq` | `a_pin_taken_while_a_merge_publishes...` FAILS: `fork_seq` is `base + 2`, want `base` |
+| M16 | `merge` never inserts its `publishing` entry | debug: `record_applied`'s `debug_assert` ("recorded versions it never registered") fires in every merge test. Instrument: `grep -c 'never registered'` ≥ 1 over the lib and agent-target run |
+| M17 | `rebase_validate`'s publishing check is removed | `rebase_is_refused_while_a_merge_publishes` FAILS: `Ok` where `Err` was expected |
+
+### Counts, replacing Amendment 5's
+
+- `cargo test --lib version_history`: 7.
+- `cargo test --lib rebase`: **5**. That is the 4, plus `rebase_is_refused_while_a_merge_publishes`.
+- Run of record at default QoS: **58 result lines, 2161 passed (2152 + 9), 1 failed, 2 ignored**.
+  The failure is the envelope tripwire at `get_mut(` **5**. Its State allowlist now also needs
+  `publishing`, next to `version_history` and `retention`.
+- Under `-b`: 2160 / 2.
