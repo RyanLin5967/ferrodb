@@ -1874,7 +1874,13 @@ impl ArenaPageStore {
         g.quarantine.retain(|q| q.epoch == epoch);
         let held: Vec<(PageId, u32)> = g.quarantine.iter().map(|q| (q.start, q.pages)).collect();
         let bytes = self.state_bytes_with_free(&held);
-        replace_atomically(&OsFileOps, path, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
+        // MUTANT (fire-check only, never land): a failed fold puts the held ranges on the live list.
+        if let Err(e) = replace_atomically(&OsFileOps, path, &bytes) {
+            for (start, pages) in &held {
+                self.space.give_back(*start, *pages);
+            }
+            return Err(FerroError::Io(e.to_string()));
+        }
         for (start, pages) in held {
             self.space.give_back(start, pages);
         }
