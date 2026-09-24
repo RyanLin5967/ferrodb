@@ -357,14 +357,7 @@ impl Catalog {
                 }
             }
         }) {
-            return Err((
-                FerroError::Io(format!(
-                    "{e}; the index tree it had built (root page {}) stays allocated, because a catalog \
-                     page in the buffer pool may already name it",
-                    built.root
-                )),
-                None,
-            ));
+            return Err((e, Some(built))); // D271 MUTANT MD: a failed persist hands the tree back to be freed
         }
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
