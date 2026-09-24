@@ -757,6 +757,80 @@ fn an_install_discards_the_receivers_own_wal() {
     );
 }
 
+/// **The same install refuses while a WAL pin keeps the receiver's log, and names the pin (D234: one
+/// detector for "did `truncate` truncate").**
+///
+/// `truncate` keeps the whole log under a pin and still answers `Ok`. The install used to infer the
+/// outcome from the base not moving and the log not being empty, read AFTER the truncation, so an
+/// append landing in between made a truncated log read as kept. Since D234 it asks `Truncation`,
+/// which also says which pin kept it. The refused install must leave the replaced database's
+/// records in the log and its marker on disk, so the node refuses to start rather than replaying
+/// those records over the installed pages.
+///
+/// Pre-registered from source, UNBUILT: FAILS at `00f4c39` only at the assertion that the refusal
+/// names the pin's LSN (the base's refusal names no pin); every other assertion holds there.
+#[test]
+fn an_install_under_a_wal_pin_is_refused_and_names_the_pin() {
+    use ferrodb::consensus::snapshot::{install_was_interrupted, SnapshotPoint, SnapshotStore};
+    use std::sync::atomic::Ordering;
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    seed_pages(&from_engine, 3, 0x2A);
+
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 2, 0x5B);
+    to_engine
+        .wal
+        .append(
+            7,
+            0,
+            &ferrodb::wal::log::RecKind::HeapInsert {
+                dir_root: 1,
+                page_id: 1,
+                slot: 0,
+                tuple: vec![0x3Cu8; 16],
+            },
+        )
+        .unwrap();
+    to_engine.wal.flush().unwrap();
+    let base = to_engine.wal.base_lsn.load(Ordering::SeqCst);
+    assert!(
+        to_engine.wal.next_lsn.load(Ordering::SeqCst) > base,
+        "premise failed: the receiver's WAL is empty, so a pin could keep nothing"
+    );
+    // A base backup or a change stream holding the log from its start.
+    let pin = to_engine.wal.pin(base).unwrap();
+
+    let at = SnapshotPoint {
+        last_round: 3,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    let err = to
+        .install(&snap.meta, &spool)
+        .expect_err("an install under a pin discarded nothing and reported success");
+
+    assert_eq!(
+        to_engine.wal.base_lsn.load(Ordering::SeqCst),
+        base,
+        "the pinned log was truncated anyway"
+    );
+    assert!(
+        install_was_interrupted(&to_engine.page_file),
+        "the refused install cleared its marker, so the node would start on a half-installed database"
+    );
+    assert!(
+        err.to_string().contains(&format!("lsn {}", pin.lsn())),
+        "the refusal does not name the pin that kept the log: {err}"
+    );
+}
+
 /// A node whose storage was left part-way through an install refuses to start.
 ///
 /// Three files are replaced and no rename sequence makes them land together, so the dangerous state
