@@ -90,11 +90,15 @@ impl Db {
         self.dm.bitmap_high_water().unwrap()
     }
 
-    /// The tables the catalog's pages hold, read back through the same pool.
+    /// The catalog as its pages hold it, read back through the same pool.
+    fn catalog_on_the_pages(&self) -> Catalog {
+        Catalog::open(self.bp.clone(), self.catalog.first_catalog_page_id)
+            .expect("the catalog pages must still read back")
+    }
+
+    /// The tables the catalog's pages hold.
     fn tables_on_the_pages(&self) -> Vec<String> {
-        let reread = Catalog::open(self.bp.clone(), self.catalog.first_catalog_page_id)
-            .expect("the catalog pages must still read back");
-        let mut names: Vec<String> = reread.tables.keys().cloned().collect();
+        let mut names: Vec<String> = self.catalog_on_the_pages().tables.keys().cloned().collect();
         names.sort();
         names
     }
@@ -132,7 +136,7 @@ fn assert_refused_by_size(err: &FerroError, table: &str, statement: &str) {
     );
 }
 
-fn assert_catalog_intact(db: &Db, present: &[&str], absent: &str, statement: &str) {
+fn assert_catalog_intact(db: &Db, present: &[&str], absent: Option<&str>, statement: &str) {
     for t in present {
         assert!(db.catalog.get_table(t).is_some(), "{statement}: table {t} is gone from the catalog in memory");
     }
@@ -144,10 +148,12 @@ fn assert_catalog_intact(db: &Db, present: &[&str], absent: &str, statement: &st
              restart would lose it"
         );
     }
-    assert!(
-        !on_pages.iter().any(|n| n == absent) && db.catalog.get_table(absent).is_none(),
-        "{statement}: the refused table {absent} is in the catalog"
-    );
+    if let Some(absent) = absent {
+        assert!(
+            !on_pages.iter().any(|n| n == absent) && db.catalog.get_table(absent).is_none(),
+            "{statement}: the refused table {absent} is in the catalog"
+        );
+    }
 }
 
 #[test]
@@ -174,7 +180,7 @@ fn a_create_table_whose_entry_exceeds_a_page_is_refused_and_leaves_the_catalog_a
         .expect("a table whose catalog entry no page can hold must be refused");
     assert_refused_by_size(&err, "m", "CREATE TABLE");
     assert_eq!(db.high_water(), before, "the refused CREATE TABLE allocated pages it never freed");
-    assert_catalog_intact(&db, &["zz"], "m", "CREATE TABLE");
+    assert_catalog_intact(&db, &["zz"], Some("m"), "CREATE TABLE");
     db.exec("CREATE TABLE after_table (id INTEGER NOT NULL);")
         .expect("an ordinary CREATE TABLE after the refusal must still work");
 }
@@ -203,8 +209,12 @@ fn a_create_index_that_grows_an_entry_past_a_page_is_refused_and_leaves_the_cata
         .expect("an index that grows the entry past a catalog page must be refused");
     assert_refused_by_size(&err, "t", "CREATE INDEX");
     assert_eq!(db.high_water(), before, "the refused CREATE INDEX allocated pages it never freed");
-    assert_catalog_intact(&db, &["t", "zz"], "m", "CREATE INDEX");
+    assert_catalog_intact(&db, &["t", "zz"], None, "CREATE INDEX");
     assert!(db.catalog.get_table("t").unwrap().indexes.is_empty(), "the refused index is on the table in memory");
+    assert!(
+        db.catalog_on_the_pages().tables["t"].indexes.is_empty(),
+        "the refused index is on the table as the catalog's pages record it"
+    );
     db.exec("CREATE TABLE after_index (id INTEGER NOT NULL);")
         .expect("an ordinary CREATE TABLE after the refusal must still work");
 }
@@ -242,10 +252,14 @@ fn a_create_fulltext_index_that_grows_an_entry_past_a_page_is_refused_and_leaves
         .expect("a full-text index that grows the entry past a catalog page must be refused");
     assert_refused_by_size(&err, "t", "CREATE FULLTEXT INDEX");
     assert_eq!(db.high_water(), before, "the refused CREATE FULLTEXT INDEX allocated pages it never freed");
-    assert_catalog_intact(&db, &["t", "zz"], "m", "CREATE FULLTEXT INDEX");
+    assert_catalog_intact(&db, &["t", "zz"], None, "CREATE FULLTEXT INDEX");
     assert!(
         db.catalog.get_table("t").unwrap().fulltext_indexes.is_empty(),
         "the refused full-text index is on the table in memory"
+    );
+    assert!(
+        db.catalog_on_the_pages().tables["t"].fulltext_indexes.is_empty(),
+        "the refused full-text index is on the table as the catalog's pages record it"
     );
     db.exec("CREATE TABLE after_fulltext (id INTEGER NOT NULL);")
         .expect("an ordinary CREATE TABLE after the refusal must still work");
@@ -275,5 +289,5 @@ fn persist_refuses_an_entry_no_page_can_hold_before_writing_any_page() {
 
     assert_refused_by_size(&err, "m", "persist");
     assert_eq!(db.high_water(), before, "persist allocated pages for an entry it then refused");
-    assert_catalog_intact(&db, &["zz"], "m", "persist");
+    assert_catalog_intact(&db, &["zz"], Some("m"), "persist");
 }
