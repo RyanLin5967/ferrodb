@@ -37,35 +37,7 @@ impl Modify for Update {
         self.author = Some((prov, id));
     }
 
-    /// Write every row, then record every root the statement moved **on every exit** — D230.
-    ///
-    /// Same reason as `Insert::execute`, and a wider window: the statement writes rows in a loop, so
-    /// an earlier row's secondary `insert`, `post_tokens` or relocating `upsert` can split a root and a
-    /// LATER row can still be refused — a NOT NULL violation, a write conflict, a failed heap write.
-    /// That exit used to skip `sync_roots`, and the split, which no rollback undoes, went unrecorded.
-    ///
-    /// When both fail, the write's error is the one returned: it is why the statement failed.
-    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
-        let written = self.write_rows();
-        let primary = sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog);
-        let fulltext = sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog);
-        let count = written?;
-        primary?;
-        fulltext?;
-        // D69 — record that this table changed, on the SAME path as the write that
-        // changed it. The merge staleness check reads this counter instead of
-        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
-        // be bumped here and not only on the agent-merge path: the hash it replaces was
-        // computed by scanning the real table, so it saw ordinary DML too.
-        catalog.bump_table_version(&self.table);
-        Ok(count)
-    }
-}
-
-impl Update {
-    /// Everything [`Modify::execute`] does except record the roots, which `execute` does on every
-    /// exit from here.
-    fn write_rows(&mut self) -> Result<usize, FerroError>{
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
         // **E65 — a semantic refusal, reported as one, with a way forward.**
         //
         // This said `FerroError::Parse("can't update primary key")`, which was wrong twice. The
@@ -191,6 +163,15 @@ impl Update {
             }
             count += 1;
         }
+        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
+        sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog)?;
+        // D69 — record that this table changed, on the SAME path as the write that
+        // changed it. The merge staleness check reads this counter instead of
+        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
+        // be bumped here and not only on the agent-merge path: the hash it replaces was
+        // computed by scanning the real table, so it saw ordinary DML too.
+        catalog.bump_table_version(&self.table);
+
         Ok(count)
     }
 }

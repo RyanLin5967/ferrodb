@@ -44,32 +44,7 @@ impl Modify for Delete {
         self.author = Some((prov, id));
     }
 
-    /// Stamp every row, then record the roots **on every exit** — D230, the shape `Insert::execute`
-    /// and `Update::execute` share.
-    ///
-    /// Today this statement writes no tree: it rewrites each version's `end_ts` in place and leaves
-    /// every index entry where it is, so no exit can have moved a root and the sync below finds
-    /// nothing to record. It is here so that stays true by construction if DELETE ever writes an
-    /// index, instead of depending on whoever adds that write remembering D230.
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
-        let written = self.write_rows();
-        let synced = sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog);
-        let count = written?;
-        synced?;
-        // D69 — record that this table changed, on the SAME path as the write that
-        // changed it. The merge staleness check reads this counter instead of
-        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
-        // be bumped here and not only on the agent-merge path: the hash it replaces was
-        // computed by scanning the real table, so it saw ordinary DML too.
-        catalog.bump_table_version(&self.table);
-        Ok(count)
-    }
-}
-
-impl Delete {
-    /// Everything [`Modify::execute`] does except record the roots, which `execute` does on every
-    /// exit from here.
-    fn write_rows(&mut self) -> Result<usize, FerroError> {
         let mut res = Vec::new();
         let mut count = 0;
         loop {
@@ -91,6 +66,14 @@ impl Delete {
             }
             count += 1;
         }
+        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
+        // D69 — record that this table changed, on the SAME path as the write that
+        // changed it. The merge staleness check reads this counter instead of
+        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
+        // be bumped here and not only on the agent-merge path: the hash it replaces was
+        // computed by scanning the real table, so it saw ordinary DML too.
+        catalog.bump_table_version(&self.table);
+
         Ok(count)
     }
 }
