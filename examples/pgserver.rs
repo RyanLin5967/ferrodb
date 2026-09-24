@@ -53,7 +53,7 @@ fn main() {
     // drifting again. Before the arena below, for the reason given there: the rebuild allocates pages.
     // A PANIC on failure, not `process::exit`, for the reason given at the lease scan below: this
     // runs after the lock, and exiting would strand `<db>.lock`.
-    let OpenedDatabase { bp, txn, catalog, .. } =
+    let OpenedDatabase { bp, txn, catalog, completed_drops, .. } =
         open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| panic!("pgserver: {e}"));
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
@@ -114,6 +114,12 @@ fn main() {
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
+
+    // D250 review 1's F7: a DROP the open completed forgets the table's provenance, as the
+    // executor's DROP does (B9).
+    for table in &completed_drops {
+        runtime.forget_table(table);
+    }
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));

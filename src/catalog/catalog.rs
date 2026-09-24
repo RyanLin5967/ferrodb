@@ -553,8 +553,9 @@ impl Catalog {
     /// DROP frees only after the checkpoint that makes this very removal durable. If the DROP recorded
     /// its intent, `open_recovered` decides it after this (the table is now absent) and the intent frees
     /// the pages after the open's checkpoint; they were quarantined before recovery, so recovery took
-    /// none. A DROP that died before recording its intent leaks them (D250's stated cost, now
-    /// narrowed to that window). The rest is what [`Catalog::drop_table`] does.
+    /// none. The intent is recorded before the `DropTable` record, so every DROP this build logs has
+    /// one; only a DROP logged by a build without D229 leaks its pages here (D250's stated cost, now
+    /// narrowed to that). The rest is what [`Catalog::drop_table`] does.
     pub fn forget_dropped_table(&mut self, name: &str) -> Result<(), FerroError> {
         self.drop_table(name)
     }

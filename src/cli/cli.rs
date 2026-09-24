@@ -56,7 +56,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
     // function every binary opens through. This sequence used to be written out here, and
     // `examples/pgserver.rs` had its own copy that omitted the rebuild.
-    let OpenedDatabase { bp, txn, catalog, .. } = open_recovered(Path::new(db_path), &_lock)?;
+    let OpenedDatabase { bp, txn, catalog, completed_drops, .. } = open_recovered(Path::new(db_path), &_lock)?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`
@@ -145,6 +145,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
+    // D250 review 1's F7: a DROP the open completed forgets the table's provenance, as the
+    // executor's DROP does (B9), or a table re-created under the name would inherit its authorship.
+    for table in &completed_drops {
+        runtime.forget_table(table);
+    }
     let mut session = Session::with_runtime(runtime.clone());
 
     // The catalog moves behind a mutex, and is locked for exactly one statement.
