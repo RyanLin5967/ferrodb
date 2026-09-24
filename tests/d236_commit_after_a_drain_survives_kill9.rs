@@ -34,11 +34,14 @@
 //! `src/buffer/arc.rs` at `9aa6968`; `frontier/d236_review.md` W1 and `lane_d236.md` AMENDMENT 1
 //! in artie-research). With c frames and N heap pages:
 //! * The load promotes every heap page to T2, and its evictions move T2's oldest pages into the ghost
-//!   list b2. b2 loses entries only once all four lists together hold 2c, so for N < 2c every
+//!   list b2. b2 loses entries only once all four lists together hold 2c. They hold N plus every
+//!   other page requested since startup, a few tens here, so for N comfortably below 2c every
 //!   evicted page is still a ghost when the scan starts.
 //! * The scan's first page is a b2 ghost. A ghost hit evicts T2's oldest page, which becomes a
 //!   ghost in turn, so every page the scan reaches is a ghost hit, and each one evicts the next
-//!   oldest load page. After about 2c - N steps it evicts the first dirty page, and the gate drains
+//!   oldest load page. The victims are dirty from the first step, but the early ones' records are
+//!   already durable, so they write back without draining. After about 2c + 1 - N steps the victim
+//!   is the first page whose record lies past `flushed_lsn`, and the gate drains the log there
 //!   (step 496 in a model of `arc.rs` driven by this test's access trace, which counts the setup and
 //!   index pages that shift it: `frontier/d236_arc_band_check.md` in artie-research).
 //! * For N ≥ 2c the early pages have left b2 before the scan starts. The scan is then a run of
@@ -46,8 +49,9 @@
 //!   drains. At 2600 rows this test is predicted to refuse at every commit, and more rows make that
 //!   worse, not better.
 //! * The setup and index pages also sit in the lists, so the band's real upper edge is a few dozen
-//!   pages below 2c (the model drains at N = 2030 and not at 2040). The fixture check below is
-//!   therefore necessary, not sufficient: the premise assertion is what decides a run.
+//!   pages below 2c (the model drains at N = 2030 and not at 2040). The fixture check below reads
+//!   the pool's size from a pool built at run time, and it is necessary, not sufficient: the premise
+//!   assertion is what decides a run.
 //!
 //! # The premises, each checked and each refusing rather than passing
 //!
@@ -79,9 +83,21 @@ use std::time::Duration;
 /// Heap pages this test's table occupies: one row per page (see `PAD`). Strictly between one and
 /// two pools, the band where the scan's pages are still ARC ghosts (see the header).
 const ROWS: usize = 1536;
-/// The pool at `9aa6968`: `MAX_BUFFER_POOL_PAGES` in `src/buffer/buffer_pool.rs`. `ROWS` is sized
-/// against it, so a change there has to be re-derived here.
-const POOL_FRAMES: usize = 1024;
+/// The pool's frame count, read from a pool built the way the CLI builds its own
+/// (`BufferPoolManager::new`, `MAX_BUFFER_POOL_PAGES` = 1024 at `9aa6968`). A literal copy of that
+/// constant could never disagree with `ROWS`, so the fixture check below could never fire.
+fn pool_frames() -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("pool-probe.db"))
+        .unwrap();
+    let dm = std::sync::Arc::new(ferrodb::storage::disk_manager::DiskManager::new(file).unwrap());
+    ferrodb::buffer::buffer_pool::BufferPoolManager::new(dm).frames.len()
+}
 /// Two tuples of this size cannot share a 4 KiB page, so each row gets a heap page of its own.
 const PAD: usize = 2100;
 /// Ordinary-table pages below the arena floor. The table needs about `ROWS` of them plus its
@@ -228,10 +244,11 @@ fn wal_len(db: &Path) -> u64 {
 
 #[test]
 fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
+    let frames = pool_frames();
     assert!(
-        POOL_FRAMES < ROWS && ROWS < 2 * POOL_FRAMES,
-        "fixture: ROWS must be strictly between one and two pools, where the scan's pages are still \
-         ARC ghosts (see the header)"
+        frames < ROWS && ROWS < 2 * frames,
+        "fixture: ROWS = {ROWS} must be strictly between one and two pools ({frames} frames), where \
+         the scan's pages are still ARC ghosts (see the header). Re-derive ROWS from arc.rs"
     );
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("d236.db");
