@@ -1015,3 +1015,25 @@ line is `:297`** (`if version != VERSION {`, inside `Header::decode` at `:288`).
 
 **Per-target: 2604 + 4 = 2608** on macOS. Command for M41–M46: the log module,
 `timeout 1800 cargo test --no-fail-fast --lib consensus::log::tests_log::`.
+
+---
+
+## Amendment 14 — review 4's tests, docs and mutants recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `12046b8` | amendment 13 |
+| `0c2bc92` | tests W1–W4, as amendment 13 registered them; additions only to `tests_log.rs` (`169 0`) |
+| `d435fd9` | C2–C4 recorded in `LEGACY_VERSION`'s doc in `log.rs`, **comments only** |
+| `fe26b6b` | mutants M41–M46; all 41 regenerated from `d435fd9` |
+
+- **`src/` code is unchanged since `d815c1b`.** Instrument: `git diff d815c1b fe26b6b -- src/consensus/log.rs`,
+  keeping `^[-+]` lines and dropping `///` doc lines, leaves 0 lines. The only other file touched is `tests_log.rs`,
+  and only by additions.
+- **Counts at `fe26b6b`:** `tests_log.rs` has 58 `#[test]`. Run G7 stands: log 58, node 13, transport 58,
+  replicate 60, per-target **2608**.
+- **Mutants:** all 41 patches pass `git apply --check` against `fe26b6b`'s tree. The six regenerated older patches
+  (M31, M35–M39) keep their edits: each patch's `^[-+]` lines were compared with its copy at `d815c1b`, and only
+  hunk context moved. Kill sets for M41–M46 are amendment 13's table. The command is the log module.
+- **`M46` replaces `raise_version`'s whole body.** Its `all` binding disappears with it, and `switch` stays used by
+  `discard_prefix`, so the mutant adds no dead code.
