@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::Value}, error::FerroError, optimizer::{cost_model::cost, optimizer::{build_join, combine_and, optimize, split_and, wrap_filter}}, parser::parser::JoinType, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}};
+use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::evaluate, optimizer::{cost_model::cost, optimizer::{build_join, combine_and, optimize, push, split_and}}, parser::parser::JoinType, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}};
 
 pub const MAX_DP_RELATIONS: usize = 12;
 
@@ -34,10 +34,11 @@ pub struct Sub {
 /// `a JOIN b ON a.id = b.id AND b.v = 5` ignored `b.v = 5`, and `ON a.id = b.id AND 1 = 0`
 /// returned every match. Now, as in any planner that does predicate placement:
 ///
-/// * **one relation** — a filter on that relation's LOGICAL leaf, before `optimize` chooses its
-///   access path, so `ON b.id = 3` reaches the index exactly as `WHERE b.id = 3` does. See
-///   [`filter_leaf`] for why it merges with, and never pushes into, the leaf.
-/// * **no relation** — a filter over the whole join.
+/// * **one relation** — a filter on that relation's LOGICAL leaf, placed by the same
+///   [`push`] WHERE uses and before `optimize` chooses an access path, so `ON b.id = 3` reaches the
+///   index as `WHERE b.id = 3` does. See [`filter_leaf`].
+/// * **no relation** — a filter over the whole join, unless it is TRUE, when it is dropped: it
+///   keeps every row, and `ON TRUE` then plans exactly as it did past 12 relations before D255.
 /// * **two or more** — a bridge, unchanged.
 ///
 /// The other half of D255 is that a join no predicate links now plans as a cross product at every
@@ -73,7 +74,13 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
             let mut rel = 0u64;
             relations_of(&part, &orig_offset, &mut rel, &widths);
             match rel.count_ones() {
-                0 => constant.push(part),
+                // A `BoundExpr` is literals and operators over columns, so one that reads no column
+                // has one value for every row. Only TRUE is folded; anything else — FALSE, NULL, a
+                // non-boolean, an evaluation error — stays a per-row filter, where WHERE keeps its
+                // own column-free conjuncts too, so it fails or empties the join the same way.
+                0 => if !matches!(evaluate(&part, &[]), Ok(Value::Boolean(true))) {
+                    constant.push(part)
+                },
                 1 => {
                     // Global column numbers → the leaf's own, which start at 0.
                     let r = rel.trailing_zeros() as usize;
@@ -107,25 +114,17 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
 ///
 /// * A leaf with nothing to add is returned UNTOUCHED, so no plan that had no such conjunct has its
 ///   predicate tree rebuilt: re-splitting a WHERE filter and recombining it reassociates its ANDs.
-/// * A leaf that is already a `Filter` — a WHERE conjunct `pushdown` put there — gets ONE filter
-///   with both predicates. Two stacked filters are the same rows, but `optimize` only considers an
-///   index for a `Filter` directly over a `Scan`, so the ON conjunct would never reach the index.
-/// * Anything else is wrapped, never pushed into. A leaf can be a LEFT JOIN subtree, and pushing a
-///   conjunct on its nullable side below the left join stops it from excluding the NULL-extended
-///   rows the INNER join's ON must exclude. That is why this is not `optimizer::push`.
-fn filter_leaf(leaf: LogicalPlan, mut filters: Vec<BoundExpr>) -> LogicalPlan {
+/// * Otherwise [`push`] places them, exactly as it placed the WHERE conjuncts already on the leaf:
+///   - into ONE filter with a WHERE filter already there. Two stacked filters are the same rows,
+///     but `optimize` only considers an index for a `Filter` directly over a `Scan`;
+///   - through a LEFT JOIN leaf into its preserved side, which is sound and reaches that table's
+///     index — and never into its nullable side, where a conjunct stops excluding the
+///     NULL-extended rows this INNER join's ON must exclude. It stays above the left join.
+fn filter_leaf(leaf: LogicalPlan, filters: Vec<BoundExpr>) -> LogicalPlan {
     if filters.is_empty() {
         return leaf;
     }
-    match leaf {
-        LogicalPlan::Filter { input, predicate } => {
-            let mut all = Vec::new();
-            split_and(predicate, &mut all);
-            all.append(&mut filters);
-            wrap_filter(*input, all)
-        }
-        other => wrap_filter(other, filters),
-    }
+    push(leaf, filters)
 }
 
 /// The exhaustive join-order search, for at most `MAX_DP_RELATIONS` relations.
@@ -166,7 +165,7 @@ fn filter_leaf(leaf: LogicalPlan, mut filters: Vec<BoundExpr>) -> LogicalPlan {
 ///   connected, bridge-plannable subset of every size.
 ///
 /// The cost: with no join predicate at all every subset is closed and every split is built —
-/// 523,265 at 12 relations, the same count a 12-relation clique already built before D255, which is
+/// 523,250 at 12 relations, the same count a 12-relation clique already built before D255, which is
 /// the load `MAX_DP_RELATIONS` bounds.
 fn dynamic_program(base: Vec<PhysicalPlan>, conjuncts: &[(u64, BoundExpr)], orig_offset: &[usize], widths: &[usize], catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     let n = widths.len();

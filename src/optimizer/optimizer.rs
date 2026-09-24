@@ -363,6 +363,18 @@ pub fn wrap_filter(plan: LogicalPlan, conjuncts: Vec<BoundExpr>) -> LogicalPlan 
     }
 }
 
+/// Carry `carried` — conjuncts over `plan`'s output columns — down to the lowest node that can
+/// evaluate each one, merging them into any `Filter` on the way.
+///
+/// # D255 — a conjunct only goes below a join into a side that join never NULL-extends
+///
+/// This used to route a conjunct by the columns it reads and nothing else, so under
+/// `a LEFT JOIN b ON a.id = b.id WHERE b.v = 5` the `b.v = 5` went into `b`, BELOW the left join.
+/// There it only removes b's rows before the join, and every `a` row they would have matched comes
+/// back NULL-extended — rows the WHERE exists to exclude, since `NULL = 5` is not true. A wrong
+/// answer. The preserved side is safe, σp(L ⟕ R) = σp(L) ⟕ R when p reads only L, so a LEFT join
+/// still takes left-side conjuncts; anything it cannot take stays in a `Filter` above it.
+/// `reorder_inner_joins` places one-relation ON conjuncts through here for the same reason.
 pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
@@ -372,15 +384,17 @@ pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
         }
         LogicalPlan::Join { left, right, join_type, on } => {
             let left_width = left.output_schema().len();
+            let into_left = matches!(join_type, JoinType::Inner | JoinType::Left);
+            let into_right = matches!(join_type, JoinType::Inner | JoinType::Right);
             let (mut go_left, mut go_right, mut stay) = (Vec::new(), Vec::new(), Vec::new());
             for expr in carried {
                 let mut cols = HashSet::new();
                 collect_columns(&expr, &mut cols);
                 if cols.is_empty() {
                     stay.push(expr);
-                } else if cols.iter().all(|&c| c < left_width) {
+                } else if into_left && cols.iter().all(|&c| c < left_width) {
                     go_left.push(expr);
-                } else if cols.iter().all(|&c| c >= left_width) {
+                } else if into_right && cols.iter().all(|&c| c >= left_width) {
                     go_right.push(remap(expr, left_width));
                 } else {
                     stay.push(expr);
