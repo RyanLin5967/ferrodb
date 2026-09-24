@@ -532,10 +532,33 @@ fn an_alter_catches_up_a_lagging_fulltext_record_from_its_cell() {
 /// asserted as a premise.
 const DROP_ROWS: i32 = 600;
 
-/// Build `t` (primary, a B-tree index and a full-text index on `v`, `DROP_ROWS` rows), and when `lag`
-/// is set, put every record back on its tree's pre-split root: the lag failed INSERTs leave. Then
-/// drop and rebuild it twice. Returns the highest allocated page with the second copy built, and again
-/// with the third.
+/// Build `t` with a primary, a B-tree index and a full-text index on `v`, and `DROP_ROWS` rows,
+/// asserting that every tree's root split. When `lag` is set, put every record back on its tree's
+/// pre-split root: the lag failed INSERTs leave, the one simulated step. The pre-split root is now
+/// that tree's leftmost leaf.
+fn build_split_table(d: &mut Db, lag: bool) {
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(100));");
+    d.rows("CREATE INDEX iv ON t (v);");
+    d.rows("CREATE FULLTEXT INDEX fv ON t (v);");
+    let first_primary = d.catalog.get_table("t").unwrap().primary_index_root;
+    let (first_btree, first_ft) = d.record_roots("v");
+    for i in 0..DROP_ROWS {
+        d.rows(&format!("INSERT INTO t VALUES ({i}, 'v{i:06}');"));
+    }
+    let (btree, ft) = d.record_roots("v");
+    assert_ne!(d.catalog.get_table("t").unwrap().primary_index_root, first_primary, "premise failed: {DROP_ROWS} rows never split the primary root");
+    assert_ne!(btree, first_btree, "premise failed: {DROP_ROWS} rows never split the B-tree index's root");
+    assert_ne!(ft, first_ft, "premise failed: {DROP_ROWS} rows never split the posting tree's root");
+    if lag {
+        let e = d.catalog.tables.get_mut("t").unwrap();
+        e.primary_index_root = first_primary;
+        e.indexes[0].root_page_id = first_btree.unwrap();
+        e.fulltext_indexes[0].root_page_id = first_ft.unwrap();
+    }
+}
+
+/// `build_split_table`, then drop and rebuild it twice. Returns the highest allocated page with the
+/// second copy built, and again with the third.
 ///
 /// This is `tests/d222_index_root_after_backfill.rs`'s instrument, reused. The first build-and-drop
 /// absorbs one-off growth. The allocator hands out the lowest free page, and identical statements
@@ -543,26 +566,7 @@ const DROP_ROWS: i32 = 600;
 /// pages the second freed, and the two numbers match.
 fn highest_page_across_a_drop_after_lag(lag: bool) -> (u32, u32) {
     let mut d = Db::new();
-    let build = |d: &mut Db| {
-        d.rows("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(100));");
-        d.rows("CREATE INDEX iv ON t (v);");
-        d.rows("CREATE FULLTEXT INDEX fv ON t (v);");
-        let first_primary = d.catalog.get_table("t").unwrap().primary_index_root;
-        let (first_btree, first_ft) = d.record_roots("v");
-        for i in 0..DROP_ROWS {
-            d.rows(&format!("INSERT INTO t VALUES ({i}, 'v{i:06}');"));
-        }
-        let (btree, ft) = d.record_roots("v");
-        assert_ne!(d.catalog.get_table("t").unwrap().primary_index_root, first_primary, "premise failed: {DROP_ROWS} rows never split the primary root");
-        assert_ne!(btree, first_btree, "premise failed: {DROP_ROWS} rows never split the B-tree index's root");
-        assert_ne!(ft, first_ft, "premise failed: {DROP_ROWS} rows never split the posting tree's root");
-        if lag {
-            let e = d.catalog.tables.get_mut("t").unwrap();
-            e.primary_index_root = first_primary;
-            e.indexes[0].root_page_id = first_btree.unwrap();
-            e.fulltext_indexes[0].root_page_id = first_ft.unwrap();
-        }
-    };
+    let build = |d: &mut Db| build_split_table(d, lag);
     build(&mut d);
     d.rows("DROP TABLE t;");
     build(&mut d);
@@ -598,6 +602,37 @@ fn a_drop_after_lagging_records_frees_every_live_tree() {
         "with every record lagging its cell, rebuilding an identical table after a DROP moved the \
          highest allocated page from {peak} to {after}: the drop freed the stale leaves the records \
          name and leaked the live trees"
+    );
+}
+
+/// `build_split_table` on a fresh database, then `rebuild_indexes` on the live catalog, as the crash
+/// rebuild runs it. Returns the highest allocated page afterwards.
+fn highest_page_after_a_rebuild(lag: bool) -> u32 {
+    let mut d = Db::new();
+    build_split_table(&mut d, lag);
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+    d.bp.disk_manager.bitmap_high_water().expect("read the allocation bitmap")
+}
+
+/// **T13, review 2's C4 carried through: `rebuild_indexes` frees every old tree from its CELL.**
+///
+/// The rebuild frees each old tree and then builds a fresh one. The allocator hands out the lowest
+/// free page, so a rebuild that freed a whole tree builds the new one on those pages. A rebuild that
+/// freed only the stale leaf a lagging record names builds past them, and the highest allocated
+/// page rises. The two arms are two fresh databases fed identical statements. The only difference
+/// is the simulated lag, so page allocation is the same until the frees differ.
+///
+/// Reachable only by a live caller. At `open_recovered`, `Catalog::open` has just seeded every cell
+/// from the records. FAILS at `bd2e29b` (INFERRED) at the assertion below.
+#[test]
+fn a_rebuild_after_lagging_records_frees_every_live_tree() {
+    let current = highest_page_after_a_rebuild(false);
+    let lagging = highest_page_after_a_rebuild(true);
+    assert_eq!(
+        lagging, current,
+        "with every record lagging its cell, a rebuild left the highest allocated page at {lagging} \
+         against {current} with current records: it freed the stale leaves the records name and \
+         leaked the live trees"
     );
 }
 
