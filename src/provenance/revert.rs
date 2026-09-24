@@ -98,21 +98,7 @@ impl DependencyGraph {
     /// shown the tree and nothing is reverted. Under `Cascade` they land in `cascade`, ordered
     /// so that dependents are reverted before the transactions they depend on.
     pub fn plan_revert(&self, target: TxnId, mode: RevertMode) -> RevertPlan {
-        let downstream = self.transitive_dependents(target);
-        match mode {
-            RevertMode::Halt => RevertPlan {
-                target,
-                mode,
-                blocked_by: downstream,
-                cascade: Vec::new(),
-            },
-            RevertMode::Cascade => {
-                // Revert deepest-first: a dependent must be undone before its dependency.
-                let mut ordered = downstream;
-                ordered.sort_by(|a, b| b.cmp(a));
-                RevertPlan { target, mode, blocked_by: Vec::new(), cascade: ordered }
-            }
-        }
+        RevertPlan::from_downstream(target, mode, self.transitive_dependents(target))
     }
 
     /// The tree a halted revert shows the caller. Cycle-safe: a transaction already printed on
@@ -253,6 +239,19 @@ impl DependencyGraphBuilder {
     }
 
     pub fn build(&self) -> DependencyGraph {
+        let (g, pairs) = self.join();
+        GRAPH_BUILD_PAIRS.fetch_add(pairs, AtomicOrdering::Relaxed);
+        g
+    }
+
+    /// [`DependencyGraphBuilder::build`] without adding to [`GRAPH_BUILD_PAIRS`] — for the
+    /// debug-build oracle that checks the demand-driven planner, and for nothing else.
+    pub(crate) fn build_unobserved(&self) -> DependencyGraph {
+        self.join().0
+    }
+
+    /// The pairwise join itself, and how many pairs it compared.
+    fn join(&self) -> (DependencyGraph, u64) {
         let mut g = DependencyGraph::new();
         let mut pairs = 0u64;
         for (writer, wv) in &self.writes {
@@ -285,8 +284,7 @@ impl DependencyGraphBuilder {
                 }
             }
         }
-        GRAPH_BUILD_PAIRS.fetch_add(pairs, AtomicOrdering::Relaxed);
-        g
+        (g, pairs)
     }
 }
 
@@ -302,6 +300,33 @@ pub struct RevertPlan {
 }
 
 impl RevertPlan {
+    /// The plan for reverting `target`, given everything transitively downstream of it, sorted
+    /// ascending and de-duplicated, with `target` itself excluded.
+    ///
+    /// Under `Halt` the dependents land in `blocked_by` and `cascade` stays empty: the caller is
+    /// shown the tree and nothing is reverted. Under `Cascade` they land in `cascade`, ordered so
+    /// that dependents are reverted before the transactions they depend on.
+    ///
+    /// The one place a plan is shaped. [`DependencyGraph::plan_revert`] and the demand-driven
+    /// `CaptureSet::plan_revert` both end here, so two ways of FINDING the dependents cannot also
+    /// disagree about what to do with them.
+    pub fn from_downstream(target: TxnId, mode: RevertMode, downstream: Vec<TxnId>) -> RevertPlan {
+        match mode {
+            RevertMode::Halt => RevertPlan {
+                target,
+                mode,
+                blocked_by: downstream,
+                cascade: Vec::new(),
+            },
+            RevertMode::Cascade => {
+                // Revert deepest-first: a dependent must be undone before its dependency.
+                let mut ordered = downstream;
+                ordered.sort_by(|a, b| b.cmp(a));
+                RevertPlan { target, mode, blocked_by: Vec::new(), cascade: ordered }
+            }
+        }
+    }
+
     /// True when the revert was refused because downstream work depends on the target.
     pub fn is_blocked(&self) -> bool {
         !self.blocked_by.is_empty()
