@@ -33,6 +33,11 @@
 //! | `agent-b`'s slot in the second process differs from `agent-a`'s in the first | **fails**: both are slot 1 | holds (1 and 2) |
 //! | the runs are in `<db>.provenance`, the file the CLI opens | **fails**: no such store | holds |
 //!
+//! **Amended by `bench/d246/PREREG.md` A1 (lead-decided):** the cold-decode row's "with the fix"
+//! cell is now asserted as "Ok" only. "`agent-a` and `agent-b` under two slots" is no longer
+//! required, because on the d216 tree the open's checkpoint drops agent-a's declaration. The row
+//! below it carries slot reuse on both trees.
+//!
 //! The claims are collected before anything is asserted, so a red run shows every symptom.
 
 use std::collections::BTreeMap;
@@ -275,20 +280,11 @@ fn pgserver_provenance_survives_a_restart_and_its_log_decodes_cold() {
             "after the restart, ferro_row_authors does not name agent-a for row 1: {after:?}"
         ));
     }
-    match &decoded {
-        Err(e) => failures.push(format!("a cold decode of [{base}, {next}) was refused: {e}")),
-        Ok(d) => {
-            let slots: BTreeMap<String, u32> =
-                d.runs.iter().map(|(slot, run)| (run.agent_id.clone(), *slot)).collect();
-            match (slots.get("agent-a"), slots.get("agent-b")) {
-                (Some(a), Some(b)) if a != b => {}
-                _ => failures.push(format!(
-                    "premise: the decoded range must declare agent-a and agent-b under two slots, \
-                     or it proves nothing about slot reuse; it declared {:?}",
-                    d.runs
-                )),
-            }
-        }
+    // C2 is the decode being Ok, and nothing more (`bench/d246/PREREG.md` A1): which runs the range
+    // still declares depends on what the open's checkpoint retains, and after the D227 run-half
+    // re-scope the second process's open truncates agent-a's declaration. C3 carries slot reuse.
+    if let Err(e) = &decoded {
+        failures.push(format!("a cold decode of [{base}, {next}) was refused: {e}"));
     }
     // The reissued slot, read from each process's own store: the claim that holds whether or not the
     // log still carries the first process's declaration.
