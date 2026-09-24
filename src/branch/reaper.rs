@@ -567,8 +567,11 @@ impl TwoTierReaper {
             // `free_arena` may already have removed the extent, in which case there is nothing to
             // collect and `owner_of` says so.
             let Some(owner) = self.store.arena_owner(arena) else { continue };
-            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence) {
-                self.store.free_arena(arena)?;
+            // **D232.** Counted only if there was still an extent to free: see
+            // `free_arena_if_present`.
+            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence)
+                && self.store.free_arena_if_present(arena)?
+            {
                 freed += 1;
             }
         }
@@ -603,8 +606,9 @@ impl TwoTierReaper {
         let mut freed = 0u32;
         for (arena, owner) in self.store.live_arenas() {
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
-            if self.extent_is_collectable(arena, owner, MissingOwner::Gone) {
-                self.store.free_arena(arena)?;
+            if self.extent_is_collectable(arena, owner, MissingOwner::Gone)
+                && self.store.free_arena_if_present(arena)?
+            {
                 freed += 1;
             }
         }
@@ -655,8 +659,10 @@ impl TwoTierReaper {
     ///   `DeferTouched` from the moment `reap` captures it.
     /// * **A reap's fast path fails part-way.** The record stays `Reaping`, which is not "gone",
     ///   so no sweep may free its extents, and the next open resumes the reap. Unchanged.
-    /// * **A claim the catalog refuses.** `alloc_arena` now asks the catalog before it publishes
-    ///   the extent, so a refusal leaves none behind.
+    /// * **A claim the catalog refuses.** Since D232 the claim record is durable before the
+    ///   catalog is asked, and a refusal is undone through the ordinary durable free record. If
+    ///   that undo's own persist fails, the map keeps a reserved extent whose owner is gone, which
+    ///   the next open's sweep collects.
     /// * **`free_page` releases a page into an extent.** Not recorded, and it needs not be: its
     ///   callers free only pages the freeing branch OWNS (`cow_page` sets `retire_previous` only
     ///   when the source is the writer's own; `unlink_up` retires only the branch's own shadows),
@@ -794,8 +800,13 @@ impl TwoTierReaper {
                 continue;
             }
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
-            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence) {
-                self.store.free_arena(arena)?;
+            // **D232.** Counted only if there was still an extent to free. A claim the catalog
+            // refused sits in the map while its record and the catalog are written, and its own
+            // undo can free it while this waits on `persist`; counting that would report a
+            // healthy refusal as an unrecorded producer.
+            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence)
+                && self.store.free_arena_if_present(arena)?
+            {
                 self.slice_freed.fetch_add(1, Ordering::Relaxed);
                 freed += 1;
             }
@@ -844,11 +855,13 @@ impl TwoTierReaper {
                     // it replaces said "no record at all: nothing can be forked off it, so
                     // nothing can see the page". That premise is false.
                     //
-                    // This owner WAS published: the extent it names was created by `alloc_arena`,
-                    // which calls `catalog.add_arena` before publishing it (D221), and every
-                    // catalog refuses that for a branch with no record. And a record that is
-                    // missing *right now* has not stopped existing: nothing ever deletes a record,
-                    // and retirement is a state flip to `Reaped`.
+                    // This owner had a record when its claim began: a claim `catalog.add_arena`
+                    // refuses (a branch with no record among the cases) is undone. The exception
+                    // is a crash between a claim's map record and its catalog write (D232),
+                    // whose restored owner may have no record at all, and refusing on that is
+                    // the safe direction. And a record that is missing *right now* has not
+                    // stopped existing: nothing ever deletes a record, and retirement is a state
+                    // flip to `Reaped`.
                     //
                     // ⚠ **D126 changed WHICH failures reach here, not what to do about them.**
                     // This used to say the miss was routine: `TableBranchCatalog::upsert` was

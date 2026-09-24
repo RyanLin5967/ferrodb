@@ -261,6 +261,17 @@ impl ArenaSpaceManager {
         }
         free.entry(pages).or_default().push(start);
     }
+
+    /// **D232.** Undo a [`Self::give_back`] whose free never became durable: while the durable map
+    /// may still charge the range to the freed extent, no claim in this process may be handed it.
+    fn take_back(&self, start: PageId, pages: u32) {
+        let mut free = self.free_extents.lock().unwrap();
+        if let Some(starts) = free.get_mut(&pages) {
+            if let Some(i) = starts.iter().rposition(|s| *s == start) {
+                starts.swap_remove(i);
+            }
+        }
+    }
 }
 
 struct StoreState {
@@ -1057,13 +1068,16 @@ impl ArenaPageStore {
     /// note claimed an under-read "leaves the extent looking fuller than it is". The direction was
     /// backwards: stopping early UNDERSTATES `next_free`, so the extent looks emptier than it is,
     /// and a transient read error (a bad checksum, EIO, a full pool) inside the prefix reopened
-    /// D85's data loss. Now the first page that does not read starts a check that every page from
-    /// there to the end of the extent was never written: past the end of the file, or all zeros.
-    /// Only then is the fill resolved. Anything else (a non-zero page that will not read, a raw
-    /// read error, a written page past a hole) leaves the fill UNKNOWN, so `extent_is_empty` keeps
-    /// refusing and the extent is never freed on this probe's say-so. `next_free` still rises to
-    /// cover every page that did read. Cost: at most one extra raw read per page from the first
-    /// unreadable one to the extent's end, and none past the end of the file.
+    /// D85's data loss. Now a page counts as written only if it reads AND carries this extent's
+    /// id, and the first page that does not starts a check that every page from there to the end
+    /// of the extent was never written by it: past the end of the file, all zeros, or readable but
+    /// stamped with another extent's id (a previous tenant of a recycled range, which used to be
+    /// counted and kept such an extent looking full forever). Only then is the fill resolved.
+    /// Anything else (a non-zero page that will not read, a raw read error, one of this extent's
+    /// pages past a hole) leaves the fill UNKNOWN, so `extent_is_empty` keeps refusing and the
+    /// extent is never freed on this probe's say-so. `next_free` still rises to cover the written
+    /// prefix up to the first page that is not one. Cost: at most one extra raw read per page from
+    /// the first unwritten one to the extent's end, and none past the end of the file.
     pub fn resolve_fill(&self, arena: ArenaId) {
         let (start, count, known) = {
             let st = self.state.lock().unwrap();
@@ -1084,21 +1098,35 @@ impl ArenaPageStore {
         let mut proven = true;
         for i in known..count {
             let page = start + i;
-            if !ended && self.read_page(page).is_ok() {
-                high = i + 1;
-                continue;
-            }
-            // From the first page that does not read, every page must be provably never written.
-            ended = true;
-            match self.pool.disk_manager.read_or_eof(page) {
-                // Past the end of the file, and so is every page after it.
-                Ok(None) => break,
-                // A hole below the end of the file: never written.
-                Ok(Some(bytes)) if bytes.iter().all(|&b| b == 0) => continue,
-                // Written but unreadable, or unreadable at all: not a proven end.
-                _ => {
-                    proven = false;
-                    break;
+            // The extent a readable page was written for. Every writer stamps its own extent's
+            // id (`write_fresh_page`, and `cow_page`'s shadow), and ids are never reissued.
+            let stamped =
+                self.read_page(page).ok().and_then(|h| h.header().ok()).map(|h| h.arena_id);
+            match stamped {
+                Some(id) if id == arena => {
+                    if ended {
+                        // One of ours past the end: a hole in the prefix, not its end.
+                        proven = false;
+                        break;
+                    }
+                    high = i + 1;
+                }
+                // Readable, but written for another extent: a previous tenant of this recycled
+                // range (the fresh-context review's F3). Not ours, so not part of our fill.
+                Some(_) => ended = true,
+                None => {
+                    ended = true;
+                    match self.pool.disk_manager.read_or_eof(page) {
+                        // Past the end of the file, and so is every page after it.
+                        Ok(None) => break,
+                        // A hole below the end of the file: never written.
+                        Ok(Some(bytes)) if bytes.iter().all(|&b| b == 0) => {}
+                        // Written but unreadable, or unreadable at all: not a proven end.
+                        _ => {
+                            proven = false;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1573,6 +1601,22 @@ impl ArenaPageStore {
         g.image_epoch = crate::cluster::epoch();
     }
 
+    /// **D232.** [`PageStore::free_arena`], answering whether there was an extent to free.
+    ///
+    /// `free_arena` answers `Ok(0)` both for an extent that held no page and for one that was no
+    /// longer there, and a sweep that judged an extent collectable can find it already gone once
+    /// it gets `persist`: a claim the catalog refused sits in the map while the claim record and
+    /// the catalog are written, and is freed by the claim's own undo. Presence is checked under
+    /// `persist`, which every claim and free holds, so the answer is exact.
+    pub(crate) fn free_arena_if_present(&self, arena: ArenaId) -> Result<bool, FerroError> {
+        let mut persist = self.persist.lock().unwrap();
+        if !self.state.lock().unwrap().extents.contains_key(&arena) {
+            return Ok(false);
+        }
+        self.free_arena_locked(&mut persist, arena)?;
+        Ok(true)
+    }
+
     /// [`PageStore::free_arena`] with the `persist` lock already held.
     ///
     /// **D232.** `alloc_arena` undoes a claim the catalog refused through this, because by then
@@ -1641,10 +1685,11 @@ impl ArenaPageStore {
             // draws every id from a monotonic counter (`arena_ids.take(1)`) and `give_back`
             // recycles only the page RANGE, so an arena id names one extent for the life of the
             // store and can never be reissued under a second owner. `alloc_arena` writes
-            // `extents[arena].owner = branch` and `current[branch] = arena` inside ONE critical
-            // section, so if any branch maps to this arena it is `ext.owner` and no other — which
-            // is what makes a lookup able to replace a scan rather than merely usually agree with
-            // it.
+            // `extents[arena].owner = branch` and, once the claim is durable and the catalog has
+            // accepted it, `current[branch] = arena`, for the same `branch` (two critical sections
+            // since D232, one claim), so if any branch maps to this arena it is `ext.owner` and no
+            // other — which is what makes a lookup able to replace a scan rather than merely
+            // usually agree with it.
             //
             // The `get` guard carries the case the `retain` also handled: an owner that has since
             // moved on to a newer extent has `current[owner] != arena`, and neither spelling
@@ -1672,12 +1717,17 @@ impl ArenaPageStore {
             // still-live: a leak, which is the safe direction. The other order publishes a page
             // range as reusable while a durable record may still point into it.
             //
-            // **D232 — and the range goes back on the free list only AFTER that record is
-            // durable.** It used to go back first, so a persist that failed left the range
-            // reusable in this process while the durable map still charged it to this extent:
-            // the next claim took it, and after a crash both extents replayed over one range.
-            // That is the order the sentence above forbids, reached through an error path. Now a
-            // failed persist keeps the range out of circulation until the next open (a leak).
+            // **D232 — and a free whose record did NOT persist takes its range back.** A persist
+            // that failed used to leave the range on the free list while the durable map still
+            // charged it to this extent: the next claim took it, and after a crash both extents
+            // replayed over one range. That is the order the sentence above forbids, reached
+            // through an error path. The range still goes back BEFORE the persist, because a
+            // persist that rewrites the whole image writes live memory, and a range in neither
+            // `extents` nor `free_extents` at that moment would be missing from the image for
+            // good (the fresh-context review's F2: after any reap the next free is a full
+            // rewrite). Nobody can take it in between: only `alloc_arena` pops the free list, and
+            // it holds `persist`, which this holds. On failure it comes back off the list before
+            // `persist` is released, and stays out of circulation until the next open (a leak).
             //
             // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
             // as the claim this mirrors, and not per page.
@@ -1698,8 +1748,11 @@ impl ArenaPageStore {
             payload.extend_from_slice(&start.to_be_bytes());
             payload.extend_from_slice(&pages.to_be_bytes());
             payload.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-            self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload)?;
             self.space.give_back(start, pages);
+            if let Err(e) = self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload) {
+                self.space.take_back(start, pages);
+                return Err(e);
+            }
         }
         Ok(allocated)
     }
@@ -1770,7 +1823,15 @@ impl ArenaPageStore {
             // simply not needed, rather than needed and skipped.
             return self.persist_full_locked(g);
         }
-        append_durably(&OsFileOps, &p, &rec).map_err(|e| FerroError::Io(e.to_string()))?;
+        if let Err(e) = append_durably(&OsFileOps, &p, &rec) {
+            // **D232.** An append that failed may have left a partial record at the end of the
+            // file, and the next append would land behind it, which `replay_tail` refuses as
+            // corruption: the "next open" every failure path here leans on would not happen.
+            // Forgetting the image makes the next persist an atomic rewrite, which replaces the
+            // torn tail along with everything else.
+            g.image_bytes = 0;
+            return Err(FerroError::Io(e.to_string()));
+        }
         g.tail_bytes += rec.len() as u64;
         g.appends += 1;
         Ok(())
@@ -2388,11 +2449,13 @@ impl PageStore for ArenaPageStore {
         // The comment it replaces said "an owner with no record at all pins nothing". That is
         // false in both directions it could be read.
         //
-        // An extent's owner is published BY CONSTRUCTION: `alloc_arena` is the only writer of
-        // `extents` and it calls `catalog.add_arena` before it publishes the extent (D221), which
-        // both catalogs refuse for a branch with no record. So the owner did exist. And "has no
-        // record *now*" does not mean it stopped existing: nothing ever deletes a record, and
-        // retirement is a state flip to `Reaped`. Resolving a failed read to "not pinned" ran
+        // An extent's owner had a record when its claim began: `alloc_arena` is the only writer of
+        // `extents`, and a claim `catalog.add_arena` refuses (a branch with no record among the
+        // cases) is undone. The one exception is a crash between a claim's map record and its
+        // catalog write (D232), whose restored owner may have no record at all; refusing on
+        // that, as below, is the safe direction. And "has no record *now*" does not mean it
+        // stopped existing: nothing ever deletes a record, and retirement is a state flip to
+        // `Reaped`. Resolving a failed read to "not pinned" ran
         // `release_page` on a page a live child may still be reading: silent data loss, not a
         // leak.
         //
@@ -5321,11 +5384,14 @@ mod tests {
         let re = h.fresh_store();
         re.load_state(&image).unwrap();
         re.debug_set_next_free(arena, 0);
+        // `load_state` marks EVERY restored extent suspect, so the count is compared across the
+        // probe of this one (the fresh-context review's F1: the first version asserted zero).
+        let suspect = re.debug_fill_unknown_len();
         re.resolve_fill(arena);
         assert_eq!(re.allocated_pages(arena).len(), truth, "the probe did not find the prefix");
         assert_eq!(
             re.debug_fill_unknown_len(),
-            0,
+            suspect - 1,
             "D232 H3: a probe that ran into never-written pages left the fill unknown, so this \
              extent could never be collected"
         );
@@ -5360,5 +5426,127 @@ mod tests {
              and no free record followed it"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **D232, review F3: a recycled range's previous tenant does not count as this extent's
+    /// fill.** A freed extent's pages stay on disk with valid checksums. When the range is claimed
+    /// again, the probe read those pages as written and raised `next_free` over them, so an extent
+    /// whose new owner never wrote a page looked full for good. That kept, among others, D232's
+    /// own crash orphan (a claim record with no catalog key) from ever being collected once
+    /// ranges recycle. A page counts only if it carries this extent's id.
+    #[test]
+    fn d232_a_fill_probe_does_not_count_a_previous_tenants_pages() {
+        let h = Harness::new();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let epoch = h.catalog.next_epoch();
+        h.store.alloc_for(x, PageType::BTreeLeaf, epoch).unwrap();
+        let first = *h.catalog.get(x).unwrap().arenas.last().unwrap();
+        let (range, _) = h.store.extent_range(first).unwrap();
+        h.store.flush().unwrap();
+        h.store.free_arena(first).unwrap();
+
+        // The same one-page range, claimed again by a branch that writes nothing into it.
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let second = h.store.alloc_arena(y).unwrap();
+        assert_eq!(h.store.extent_range(second).unwrap().0, range, "fixture: range not reused");
+        let image = h.store.state_bytes();
+
+        let re = h.fresh_store();
+        re.load_state(&image).unwrap();
+        assert!(re.read_page(range).is_ok(), "fixture: the previous tenant's page does not read");
+        re.resolve_fill(second);
+        assert!(
+            re.allocated_pages(second).is_empty(),
+            "D232 F3: the probe counted a page the previous tenant of this range wrote, so an \
+             extent its owner never wrote into reads as full"
+        );
+        assert!(re.extent_is_empty(second), "the resolved, unwritten extent must read as empty");
+    }
+
+    /// **D232, review F2: a free whose persist is a FULL rewrite keeps its range in the image.**
+    /// Giving the range back only after the persist left it in neither `extents` nor
+    /// `free_extents` while the rewrite serialised live memory: a restart from that image had
+    /// lost the range for good. After any reap the next free is a full rewrite, because every
+    /// drain's `take_pending` marks the pending log changed.
+    #[test]
+    fn d232_a_free_persisted_as_a_full_rewrite_keeps_its_range_in_the_image() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-rewrite-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a1 = h.store.alloc_arena(x).unwrap();
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.store.alloc_arena(y).unwrap();
+        let (a1_start, _) = h.store.extent_range(a1).unwrap();
+
+        // What every drain does: the pending log is marked changed, so the next persist rewrites.
+        let _ = h.store.take_pending();
+        let (rewrites_before, _) = h.store.persist_counters();
+        h.store.free_arena(a1).unwrap();
+        let (rewrites_after, _) = h.store.persist_counters();
+        assert_eq!(rewrites_after, rewrites_before + 1, "fixture: the free was not a full rewrite");
+
+        let restarted = h.fresh_store();
+        assert!(restarted.restore(&path).unwrap(), "fixture: nothing was restored");
+        let z = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let reused = restarted.alloc_arena(z).unwrap();
+        assert_eq!(
+            restarted.extent_range(reused).unwrap().0,
+            a1_start,
+            "D232 F2: a free persisted as a full rewrite lost its range: the image listed it in \
+             neither the extents nor the free list"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **D232, review F5: after an append fails, the next persist rewrites the whole image.** A
+    /// failed append can leave a partial record at the end of the file, and an append behind it
+    /// makes `replay_tail` refuse the file, so the open that every failure path relies on would
+    /// not happen. The append is made to fail by putting a directory where the file was, which
+    /// refuses the open for anyone, root included; the file is then put back as it was.
+    #[test]
+    fn d232_after_a_failed_append_the_next_persist_is_a_full_rewrite() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-d232-append-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        h.store.checkpoint_to(path.clone());
+        let w = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.store.alloc_arena(w).unwrap();
+        assert_eq!(h.store.persist_counters(), (1, 0), "fixture: the first claim did not rewrite");
+
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.store.alloc_arena(x).expect_err("fixture: the append must fail");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &saved).unwrap();
+
+        let y = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        h.store.alloc_arena(y).unwrap();
+        assert_eq!(
+            h.store.persist_counters(),
+            (2, 0),
+            "D232 F5: after a failed append the next persist appended behind whatever the \
+             failure left at the end of the file, instead of rewriting the image"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **D232, review F4: `free_arena_if_present` answers whether there was an extent.** The
+    /// sweeps count a free through it, so a free that found its extent already gone (a refused
+    /// claim's own undo won the race to `persist`) is not reported as an unrecorded orphan.
+    #[test]
+    fn d232_free_arena_if_present_tells_a_free_from_nothing_to_free() {
+        let h = Harness::new();
+        let x = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let a = h.store.alloc_arena(x).unwrap();
+        assert!(h.store.free_arena_if_present(a).unwrap(), "a present extent was not freed");
+        assert_eq!(h.store.arena_owner(a), None, "the extent is still there");
+        assert!(!h.store.free_arena_if_present(a).unwrap(), "an absent extent reported a free");
     }
 }
