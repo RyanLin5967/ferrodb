@@ -1055,7 +1055,206 @@ fn self_check(root: &Path, prov: ProvMode) {
 
 // ---------------------------------------------------------------------------------------------
 
+/// ⛔ RUN ONLY INSIDE THE MACHINE-WIDE SUITE LOCK, HELD BY THIS PROCESS OR ONE OF ITS ANCESTORS.
+///
+/// **Why a refusal, and why no override.** Added 2026-09-23 (S5) because the author of the first
+/// version ran this harness during another lane's suite, having thought about it first: twelve
+/// forks, two seconds, against a suite already running beside three `cargo` builds. The reasoning
+/// was sound and the call was still wrong, for a structural reason: **the lock exists precisely to
+/// take that judgement away from the person who wants the box.** Everyone's own contribution looks
+/// negligible, which is the mechanism by which contention accumulates. `f/sync` is a BATCH SIZE, so
+/// contention does not merely add noise to a d130 number, it INFLATES it (this file's header
+/// band). There is no `D130_IGNORE_SUITE_LOCK`; it would reinstate the judgement call.
+///
+/// **Revised 2026-09-23 (lane s5-guard) after an adversarial review of that first version,** which
+/// proceeded when `D130_SUITE_LOCK_OWNER` equalled the pid in `<lock>/owner`. Fire-checked against
+/// a temp lock (artie-research `frontier/lane_s5_guard.md`):
+///   * that was a CLAIM, not a proof: any process can read the owner file and export its pid;
+///   * a `kill -0` that could not be spawned read as "holder gone" and PROCEEDED;
+///   * a free or stale lock PROCEEDED without taking it, so a suite could start a second later and
+///     measure beside the whole sweep, the same harm in the other direction, and nothing looked
+///     again after the start;
+///   * `SUITE_LOCK` chose the ONLY path checked, so pointing it anywhere skipped the real lock.
+///
+/// **The rule has exactly ONE state that proceeds:** every lock path below exists, and its `owner`
+/// starts with a pid that is THIS process or one of its ancestors in one `ps` snapshot. Ancestry is
+/// the proof: another lane's process cannot become an ancestor of this one, and a holder that is
+/// our ancestor is, by that fact, alive. `bench/d130_run.sh` qualifies (it writes its own `$$` into
+/// the lock and runs this binary as its descendant), and so does a shell that took the lock by the
+/// fleet protocol and then ran `cargo run --example d130_pgwire_batch`. Free, stale, foreign,
+/// unreadable, unparseable, or an ancestry `ps` could not supply: all REFUSE. A guard that falls
+/// back to "allow" when it cannot read its input is decorative.
+///
+/// **Which locks.** `/tmp/ferrodb-suite.lock` ALWAYS, and `$SUITE_LOCK` too when it names a
+/// different path. The variable can only ADD a lock to satisfy, never replace the machine-wide one,
+/// so it cannot steer this check away from the lock other lanes actually take. It exists so every
+/// branch below can be fire-checked against a temp lock without writing to the real one.
+///
+/// **When.** At start, and again before every cell. A runner that is SIGKILLed mid-sweep leaves
+/// this process reparented and the lock stale; the next suite breaks it and starts. The per-cell
+/// check bounds that overlap to the cell in flight.
+///
+/// ⚠ **BLIND SPOTS, stated rather than left to be discovered:**
+///   * No check runs INSIDE a cell; a lock lost mid-cell is caught at the next boundary.
+///   * Pid reuse: a dead holder's pid recycled into one of this process's ancestors reads as ours.
+///     Other lanes then see a live owner and keep waiting, so nobody measures beside this run,
+///     which is the outcome the lock is for, but the lock is not ours in the protocol's sense.
+///   * It serialises MEASUREMENTS; it cannot quiet the box. A `cargo build` that takes no lock
+///     contends for the same device anyway (header band).
+///   * `ps` must be runnable. Under process-table exhaustion it is not, and this refuses: a
+///     transient refusal of a legitimate run, which is the direction to fail in.
+///   * Pid 0 and 1 are refused as holders: pid 1 is every process's ancestor, so accepting it
+///     would admit any process on the machine.
+fn refuse_unless_inside_the_suite_lock(when: &str, mid_run: bool) {
+    const MACHINE_SUITE_LOCK: &str = "/tmp/ferrodb-suite.lock";
+    let mut locks = vec![MACHINE_SUITE_LOCK.to_string()];
+    match std::env::var("SUITE_LOCK") {
+        Ok(extra) if !extra.is_empty() && extra != MACHINE_SUITE_LOCK => locks.push(extra),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(raw)) => refuse_outside_the_lock(
+            when,
+            mid_run,
+            &format!("SUITE_LOCK is set but is not UTF-8 ({raw:?}), so the lock it names is unknown."),
+        ),
+    }
+    let ancestry = match this_process_and_its_ancestors() {
+        Ok(a) => a,
+        Err(why) => refuse_outside_the_lock(
+            when,
+            mid_run,
+            &format!("this process's ancestry could not be established: {why}."),
+        ),
+    };
+    for lock in &locks {
+        if let Err(why) = held_by_this_process_or_an_ancestor(lock, &ancestry) {
+            refuse_outside_the_lock(when, mid_run, &why);
+        }
+    }
+}
+
+/// This process's pid, then its parent's, and so on to the root, plus every pid alive at the same
+/// instant, from ONE `ps` snapshot. `-A` because the walk needs the whole table; no `-p`, which
+/// `ps -e`/`-a`/`-x` silently override, printing a plausible line for the WRONG process.
+struct Ancestry {
+    chain: Vec<u32>,
+    live: std::collections::HashSet<u32>,
+}
+
+fn this_process_and_its_ancestors() -> Result<Ancestry, String> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+        .map_err(|e| format!("`ps` could not be run ({e})"))?;
+    if !out.status.success() {
+        return Err(format!("`ps` exited with {}", out.status));
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| "`ps` printed non-UTF-8".to_string())?;
+    let mut parent_of = std::collections::HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let parsed = match fields.as_slice() {
+            [pid, ppid] => pid.parse::<u32>().ok().zip(ppid.parse::<u32>().ok()),
+            _ => None,
+        };
+        let (pid, ppid) =
+            parsed.ok_or_else(|| format!("`ps` printed a line this guard cannot parse: {line:?}"))?;
+        parent_of.insert(pid, ppid);
+    }
+    let me = std::process::id();
+    if !parent_of.contains_key(&me) {
+        return Err(format!(
+            "this process (pid {me}) is absent from `ps`'s own snapshot of {} processes",
+            parent_of.len()
+        ));
+    }
+    let mut chain = vec![me];
+    let mut cur = me;
+    while let Some(&up) = parent_of.get(&cur) {
+        if up == 0 || chain.contains(&up) {
+            break;
+        }
+        chain.push(up);
+        cur = up;
+    }
+    Ok(Ancestry { chain, live: parent_of.into_keys().collect() })
+}
+
+/// `Ok` only when `lock` is a directory whose `owner` starts with a pid in `a.chain`. Every other
+/// reading is an `Err` naming what was found.
+fn held_by_this_process_or_an_ancestor(lock: &str, a: &Ancestry) -> Result<(), String> {
+    let dir = Path::new(lock);
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{lock} is not held by anyone. A sweep run outside the lock excludes nobody: a \
+                 suite can take it a second later and measure beside every fsync this issues."
+            ))
+        }
+        Err(e) => return Err(format!("{lock} could not be examined ({e}).")),
+        Ok(m) if !m.is_dir() => {
+            return Err(format!("{lock} exists but is not a directory, so no lock protocol wrote it."))
+        }
+        Ok(_) => {}
+    }
+    let owner = std::fs::read_to_string(dir.join("owner")).map_err(|e| {
+        format!(
+            "{lock} exists but its `owner` could not be read ({e}). A lock this guard cannot \
+             parse is one it must not run through."
+        )
+    })?;
+    let first = owner.split_whitespace().next().unwrap_or("");
+    let holder = Some(first)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&p| p > 1)
+        .ok_or_else(|| {
+            format!(
+                "{lock}'s `owner` does not start with a holder pid (it reads {owner:?}). \
+                 Unparseable means refuse. Pids 0 and 1 are refused too: pid 1 is every \
+                 process's ancestor."
+            )
+        })?;
+    if a.chain.contains(&holder) {
+        return Ok(());
+    }
+    if a.live.contains(&holder) {
+        Err(format!(
+            "{lock} is held by LIVE pid {holder} ({}), which is neither this process nor any \
+             ancestor of it. Running now would put this harness's fsyncs inside someone else's \
+             measurement.",
+            owner.trim()
+        ))
+    } else {
+        Err(format!(
+            "{lock} records pid {holder} ({}), which is gone: the lock is STALE, so nobody holds \
+             it and nothing stops a suite breaking it and starting beside this run. This harness \
+             neither breaks nor takes locks; bench/d130_run.sh does both.",
+            owner.trim()
+        ))
+    }
+}
+
+fn refuse_outside_the_lock(when: &str, mid_run: bool, why: &str) -> ! {
+    let cut = if mid_run {
+        "\n     Every row above was taken inside the lock; this sweep is cut short and is NOT a \
+         count."
+    } else {
+        ""
+    };
+    eprintln!(
+        "d130: REFUSING {when}. {why}{cut}\n\
+         \n     This harness runs only inside /tmp/ferrodb-suite.lock (and $SUITE_LOCK, if set) held \
+         by this process or one of its ancestors. There is no override, deliberately: see \
+         `refuse_unless_inside_the_suite_lock`.\n\
+         \n     Run it under `bench/d130_run.sh`, which queues for the lock, breaks a dead holder's, \
+         and runs this binary as its descendant; or take the lock in your own shell by the fleet \
+         protocol and run it from there."
+    );
+    std::process::exit(1);
+}
+
 fn main() {
+    refuse_unless_inside_the_suite_lock("at start", false);
     let f: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     let threads: Vec<usize> = std::env::args()
         .nth(2)
@@ -1172,13 +1371,17 @@ fn main() {
             label, t, c.forks, c.syncs, per, per / t as f64, tail
         );
     };
+    // The lock is re-proved before every cell, not only at start: see
+    // `refuse_unless_inside_the_suite_lock`. It prints nothing unless it refuses.
     for arm in [Arm::PerFork, Arm::Persistent] {
         for &t in &threads {
+            refuse_unless_inside_the_suite_lock(&format!("before cell {} T={t}", arm.tag()), true);
             row(arm.label(), t, &run_cell(arm, mode, prov, t, f, &root));
         }
         println!();
     }
     for &t in &threads {
+        refuse_unless_inside_the_suite_lock(&format!("before cell D T={t}"), true);
         row("D  POSITIVE CONTROL, no socket", t, &run_direct_control(t, f, &root, prov));
     }
     println!();
