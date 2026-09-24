@@ -185,3 +185,58 @@ P: all 8 are refused, and `took` ≥ 700 ms (guaranteed by the sleeps, and load 
 W: shutdown returns in **under 1 s**: the dial sees the stop flag within one 5 ms poll, and the
 sender then leaves without waiting. J and CAP each take about 20 x 5 ms longer, well inside their
 deadlines.
+
+---
+
+## Amendment 3 — the fix for amendment 2, and the mutants re-cut (still nothing built)
+
+The fix is `dacc149`, followed by `cb05329`. `cb05329` drops the redial helper's bool: `stopped` is only
+ever set after the stop flag (`shutdown` and `stop_started`, READ), so the loop head already takes that exit.
+All 18 mutants are re-generated from **`cb05329`** by `bench/d207/make_mutants.py cb05329`, and each passes
+`git apply --check`. M1–M14 have the same edits as in amendment 1; only their hunk line numbers moved.
+
+**Run G2, restated at `cb05329` and at the tip:** **59 passed, 0 failed** on macOS (58 elsewhere), with
+the values in amendment 2.
+
+### The mutant table, re-cut for 59 tests (it supersedes amendment 1's table)
+
+Same command per mutant; M8 is still run alone. Every test not listed passes.
+
+| mutant | fails | changed from amendment 1 |
+|---|---|---|
+| M1 | A, B | — |
+| M2 | A, B | — |
+| M3 | **J, P** (CAP may also fail, by timing; not scored) | **P added.** Its precondition `live_inbound_conns == 1` reads 0, because `drop(_registration)` runs before the connection thread reads the handshake, so it has already run by the time the client has the reply. Deterministic. |
+| M4 | C, G | — |
+| M5 | C, G | — |
+| M6 | F | — |
+| M7 | G | — |
+| M8 | G never returns, rc=124 | — |
+| M9 | D, H | — |
+| M10 | MIL | — |
+| M11 | H | — |
+| M12 | E, H | — |
+| M13 | D, H | — |
+| M14 | **none: SURVIVES** by design | — |
+| M15 `zero_idle_deadline_accepted` | K | new. The `Ok` arm |
+| M16 `zero_cap_accepted` | L | new. The `Ok` arm |
+| M17 `cap_full_unpaced` | P | new. `took` under 300 ms against the 700 ms floor. On a box loaded enough to stretch it past 700 ms, P passes and M17 survives. That reads as "re-run quieter", not as the backoff being untestable. |
+| M18 `lost_wakeup` | W | new. Shutdown takes 30 to 31 s |
+
+**Per-target, restated:** **2593 passed, 0 failed** on macOS = main's 2579 (INFERRED, the lead's number)
+plus the 14 D207 tests.
+
+### What is still not ported, stated so it can be decided
+
+The `inbox_bytes ≥ MAX_FRAME_BYTES` floor. It would refuse the existing
+`an_undrained_inbox_is_bounded_in_bytes_and_every_refusal_is_counted` at its own setup. At `9aa6968`:
+
+- the fixture at `tests_transport.rs:1528` is `opts.inbox_bytes = 4096`;
+- `:1531` is `Transport::from_listener(…).unwrap()`, which would panic on the new refusal;
+- the premises built on 4096 would all need changing too: the 1 KiB payload, the `for _ in 0..40` writes at
+  `:1560`, the assertion `t.inbox_bytes() <= 4096` at `:1575`, and `const SENT: u64 = 40` at `:1594`,
+  against which `drained + inbound_dropped() == SENT` is checked.
+
+`207d362` made exactly that edit (fixture → `MAX_FRAME_BYTES`, 1 MiB payloads, 16 frames written from a
+thread, the bound assertion → `<= MAX_FRAME_BYTES`). It is a test edit, and the lead has filed it as
+Ryan's decision.

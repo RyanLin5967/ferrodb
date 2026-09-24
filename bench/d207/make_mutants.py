@@ -7,7 +7,8 @@ writes only into bench/d207/mutants/. Run from the worktree root:
 
     python3 bench/d207/make_mutants.py <sha>
 
-Predictions for every mutant are in bench/d207/PREREG.md, amendment 1.
+Predictions for every mutant are in bench/d207/PREREG.md: M1-M14 in amendment 1, all of them as
+re-cut in amendment 3.
 """
 import difflib
 import pathlib
@@ -122,6 +123,23 @@ MUTANTS = [
     ("M14_spawn_failure_uncounted", [(
         "                        // for the same reason — it is a connection this node closed unserved.\n                        counters.refused_conns.fetch_add(1, Ordering::SeqCst);\n",
         "                        // for the same reason — it is a connection this node closed unserved.\n",
+    )]),
+    # --- amendment 2: the lead-scoped rest of 207d362 --------------------------------------------
+    ("M15_zero_idle_deadline_accepted", [(
+        "        if opts.idle_deadline.is_zero() {\n",
+        "        if false && opts.idle_deadline.is_zero() {\n",
+    )]),
+    ("M16_zero_cap_accepted", [(
+        "        if opts.max_inbound_conns == 0 {\n",
+        "        if false && opts.max_inbound_conns == 0 {\n",
+    )]),
+    ("M17_cap_full_unpaced", [(
+        "                        // the poll the stop flag is already allowed (D207, from `207d362`).\n                        std::thread::sleep(opts.poll_interval);\n",
+        "                        // the poll the stop flag is already allowed (D207, from `207d362`).\n",
+    )]),
+    ("M18_lost_wakeup", [(
+        "        if st.stopped || stop.load(Ordering::SeqCst) {\n            return;\n        }\n        let _ = self.woken.wait_timeout(st, delay);\n",
+        "        let _ = stop;\n        let _ = self.woken.wait_timeout(st, delay);\n",
     )]),
 ]
 

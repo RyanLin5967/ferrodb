@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1430,7 +1430,7 @@
+         // Two more knobs whose zero is a partition that reads as health, not a smaller setting
+         // (D207, ported from F3-transport's `207d362`). Not folded into the loop above: its message
+         // blames std's socket calls, and neither of these ever reaches one.
+-        if opts.idle_deadline.is_zero() {
++        if false && opts.idle_deadline.is_zero() {
+             return Err(FerroError::Internal(
+                 "`idle_deadline` is zero. It does not mean \"never idle\": a connection is closed \
+                  once it has been silent longer than this, which a zero makes true on the first \
