@@ -81,6 +81,8 @@ struct Faults {
     cow_calls: AtomicUsize,
     /// The 1-based ordinal of the `cow_page` call to fail, once. Zero never matches.
     fail_cow_at: AtomicUsize,
+    /// A second such ordinal, for a statement whose restore has to fail too (T10, T11).
+    fail_cow_also: AtomicUsize,
     /// Fail the effect log's next `pwrite`, once.
     fail_log_write: AtomicBool,
     /// Let the catalog's next `set_root` land, then report it failed, once.
@@ -90,8 +92,14 @@ struct Faults {
 impl Faults {
     /// Start counting `cow_page` calls from zero, and fail call `k` (0: count only).
     fn arm_cow(&self, k: usize) {
+        self.arm_cow_twice(k, 0);
+    }
+
+    /// As [`Faults::arm_cow`], failing calls `k` and `also`, each once.
+    fn arm_cow_twice(&self, k: usize, also: usize) {
         self.cow_calls.store(0, Ordering::SeqCst);
         self.fail_cow_at.store(k, Ordering::SeqCst);
+        self.fail_cow_also.store(also, Ordering::SeqCst);
     }
 }
 
@@ -134,6 +142,10 @@ impl PageStore for FaultyStore {
         let n = self.faults.cow_calls.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.faults.fail_cow_at.load(Ordering::SeqCst) {
             self.faults.fail_cow_at.store(0, Ordering::SeqCst);
+            return Err(FerroError::Io(format!("d258: injected failure of cow_page call {n}")));
+        }
+        if n == self.faults.fail_cow_also.load(Ordering::SeqCst) {
+            self.faults.fail_cow_also.store(0, Ordering::SeqCst);
             return Err(FerroError::Io(format!("d258: injected failure of cow_page call {n}")));
         }
         self.inner.cow_page(page_id, branch, epoch)
@@ -932,6 +944,97 @@ fn a_row_write_that_lands_and_then_fails_is_put_back_too() {
     assert_eq!(db.diff_len(&mut a), 0, "DIFF reports the failed statement");
 
     db.exec(S, &mut a).unwrap_or_else(|e| panic!("the retry after a landed-then-failed write: {e}"));
+    assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 15), (2, 15)]);
+    for id in [1, 2] {
+        assert_eq!(
+            db.tree_row(branch, "ledger", id).map(|r| r[1].clone()),
+            Some(Value::Integer(15)),
+            "row {id} of the retry is not in the branch's tree"
+        );
+    }
+    db.ok("MERGE;", &mut a);
+    let mut trunk = db.session();
+    assert_eq!(db.id_qty("ledger", &mut trunk), vec![(1, 15), (2, 15)]);
+}
+
+// ---- T10, T11: when putting a row back fails (review 2, R2-1) ----------------------------------
+
+/// **T10. A row whose write never landed is not rewritten, so its restore cannot fail.**
+///
+/// Row 1's prior image is `Some` — an earlier statement put it in the tree — and its write fails at
+/// `cow_page` call 1, where the tree's own journal rolls it back: nothing landed. Putting back a
+/// write that never landed is a rewrite of the same image, which asks the store for a page again;
+/// the second armed fault (call 2) is there to make that rewrite fail if it is attempted. It must
+/// not be: the tree already holds the prior, bit for bit. Before R2-1 it was attempted, failed, and
+/// turned an ordinary storage error into an internal "double fault".
+#[test]
+fn a_restore_of_a_row_whose_write_never_landed_is_skipped() {
+    let mut db = Db::new(Shape::PagedMem);
+    let (mut a, branch) = db.two_claimed_rows();
+    db.ok("UPDATE ledger SET note = 'x' WHERE id = 1;", &mut a);
+    let row1 = |qty: i32| Some(vec![Value::Integer(1), Value::Integer(qty), Value::Varchar("x".into())]);
+    assert_eq!(db.tree_row(branch, "ledger", 1), row1(20), "the fixture's first write is not mirrored");
+
+    db.faults.arm_cow_twice(1, 2);
+    let err = db.refused("UPDATE ledger SET qty = qty - 5 WHERE id = 1;", &mut a);
+    assert!(err.contains("cow_page call 1"), "refused for another reason: {err}");
+    assert!(
+        !err.contains("failed too"),
+        "a write that never landed was rewritten, the rewrite failed, and an ordinary storage \
+         error came back as a double fault: {err}"
+    );
+    assert_eq!(
+        db.faults.fail_cow_also.load(Ordering::SeqCst),
+        2,
+        "the restore asked the store for a page: the tree already held the prior, so nothing needed \
+         writing"
+    );
+    assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 20), (2, 20)]);
+    assert_eq!(db.tree_row(branch, "ledger", 1), row1(20));
+    assert_eq!(db.remaining(branch, "ledger", 1), Some(5), "the failed statement kept its escrow");
+
+    db.faults.arm_cow(0);
+    db.ok("UPDATE ledger SET qty = qty - 5 WHERE id = 1;", &mut a);
+    assert_eq!(db.tree_row(branch, "ledger", 1), row1(15));
+    db.ok("MERGE;", &mut a);
+    let mut trunk = db.session();
+    assert_eq!(db.id_qty("ledger", &mut trunk), vec![(1, 15), (2, 20)]);
+}
+
+/// **T11. A restore that really fails keeps the original error; the page mirror is left ahead.**
+///
+/// Row 1's write lands (call 1), row 2's fails (call 2, rolled back by the tree's journal), and
+/// putting row 1 back fails too (call 3). Row 2 needs no restore — its image is already its prior —
+/// so the only restore attempted is row 1's. The client must see the error that failed its
+/// statement, not a different class of error about the page mirror; the mirror's disagreement with
+/// the workspace is the stated residual, and it heals on the next write of that row.
+#[test]
+fn a_restore_that_fails_keeps_the_original_error() {
+    const S: &str = "UPDATE ledger SET qty = qty - 5 WHERE qty >= 0;";
+    let mut db = Db::new(Shape::PagedMem);
+    let (mut a, branch) = db.two_claimed_rows();
+
+    db.faults.arm_cow_twice(2, 3);
+    let err = db.refused(S, &mut a);
+    assert!(err.contains("cow_page call 2"), "refused for another reason: {err}");
+    assert!(
+        !err.contains("failed too"),
+        "the statement failed at cow_page call 2, and the client was handed a different error: {err}"
+    );
+    assert_eq!(db.faults.fail_cow_also.load(Ordering::SeqCst), 0, "row 1's restore was never tried");
+    assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 20), (2, 20)], "the statement is staged");
+    assert_eq!(
+        db.tree_row(branch, "ledger", 1).map(|r| r[1].clone()),
+        Some(Value::Integer(15)),
+        "the fixture did not leave row 1's landed write in the tree, so no restore failed"
+    );
+    assert_eq!(db.tree_row(branch, "ledger", 2), None);
+    for id in [1, 2] {
+        assert_eq!(db.remaining(branch, "ledger", id), Some(5), "row {id}'s escrow was spent");
+    }
+
+    db.faults.arm_cow(0);
+    db.exec(S, &mut a).unwrap_or_else(|e| panic!("the retry after a failed restore: {e}"));
     assert_eq!(db.id_qty("ledger", &mut a), vec![(1, 15), (2, 15)]);
     for id in [1, 2] {
         assert_eq!(
