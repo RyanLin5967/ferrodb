@@ -150,7 +150,7 @@ impl CoreRecord {
     /// **Safe by direction, like [`CoreRecord::narrow`]:** it changes one fixed-width core field and
     /// yields a `CoreRecord`, so the result is exactly as incomplete as its input and still cannot
     /// be mistaken for a whole record.
-    pub fn with_lease_deadline(mut self, deadline: LeaseDeadline) -> CoreRecord {
+    pub(crate) fn with_lease_deadline(mut self, deadline: LeaseDeadline) -> CoreRecord {
         self.0.lease_deadline = deadline;
         self
     }

@@ -911,6 +911,12 @@ const LEASE_LEFT_AT_SHUTDOWN_MILLIS: u64 = 5_000;
 /// during the outage; one second keeps it unambiguous at millisecond clock resolution.
 const DOWN_PAST_DEADLINE_MILLIS: u64 = 1_000;
 
+/// Slack for comparing the test's wall-clock readings with a binary's lease clock. Each binary
+/// anchors its lease clock to this same wall clock at its first reading and then advances it
+/// monotonically, so the two disagree only by clock-rate drift over a few seconds, or by a wall
+/// step during the test. A second is far above the first and states the second as a failure.
+const CLOCK_SLACK_MILLIS: u64 = 1_000;
+
 /// Milliseconds since the unix epoch on this machine's wall clock — the clock each binary anchors
 /// its lease clock to when it starts. Read here directly, rather than through `LeaseDeadline`, so
 /// that the test's notion of "now" is not the subject's.
@@ -968,10 +974,19 @@ fn a_lease_that_lapsed_only_while_the_server_was_down_survives_the_first_scan_af
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // The mark the server will measure its downtime from, read offline BEFORE it starts, through a
+    // read-only accessor (D198 adversary, C4). With the test's own clock readings either side of
+    // the server's resume, it bounds the downtime the server reports from outside the server.
+    let mark = open_branchcat(&db)
+        .last_alive_mark()
+        .expect("read the last-alive mark")
+        .expect("the fixture's binaries each resumed and marked, so the catalog must hold a mark");
+    let t_spawn = wall_millis();
     let server = start_server(&db, BRISK_SCAN_MILLIS);
     // Printed after `LeaseThread::start` returns, i.e. after the resume and after the scan thread
     // has been spawned — so the window below is measured from a point at which scanning has begun.
     server.wait_for_stderr("pgserver: lease scan every");
+    let t_seen = wall_millis();
     // Ten scan intervals. Before the fix the first of them reaps the branch.
     std::thread::sleep(Duration::from_millis(BRISK_SCAN_MILLIS * 10));
     let early = server.stderr();
@@ -987,6 +1002,18 @@ fn a_lease_that_lapsed_only_while_the_server_was_down_survives_the_first_scan_af
     // was kept and not a scan that never ran — is carried by `printed_downtime`, which panics
     // without the resume line, and by the exact-deadline assertion below, which is unchanged.
     let downtime = printed_downtime(&early);
+    // Independent of the server's own report (C4): its resume read its clock after `t_spawn` and
+    // before `t_seen`, and measured from `mark`. A server that inflated the downtime it measured
+    // AND the shift it applied by the same amount passes the exact-deadline assertion below, and
+    // fails this.
+    assert!(
+        downtime + CLOCK_SLACK_MILLIS >= t_spawn - mark && downtime <= t_seen - mark + CLOCK_SLACK_MILLIS,
+        "the server measured {downtime}ms of downtime from mark {mark}, but it resumed between \
+         {t_spawn} and {t_seen} by the test's clock, so the downtime must lie in [{}, {}] (slack \
+         {CLOCK_SLACK_MILLIS}ms). Its stderr:\n{early}",
+        (t_spawn - mark).saturating_sub(CLOCK_SLACK_MILLIS),
+        t_seen - mark + CLOCK_SLACK_MILLIS
+    );
     assert!(
         downtime >= LEASE_LEFT_AT_SHUTDOWN_MILLIS + DOWN_PAST_DEADLINE_MILLIS,
         "the server measured {downtime}ms of downtime, but it was down for at least \
