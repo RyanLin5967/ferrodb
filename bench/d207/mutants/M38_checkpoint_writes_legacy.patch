@@ -1,0 +1,11 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -844,7 +844,7 @@
+             Vec::new()
+         };
+ 
+-        self.switch(survivors, through, term, self.version, "checkpoint")
++        self.switch(survivors, through, term, LEGACY_VERSION, "checkpoint")
+     }
+ 
+     /// **The two-file switch**, the one copy of it: `survivors` are written into the spare file and

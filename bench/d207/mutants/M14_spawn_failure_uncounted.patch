@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2114,7 +2114,6 @@
+@@ -2165,7 +2165,6 @@
                          // it, so the slot is already released: no thread will ever run for it, and
                          // no second release is needed here. Counted like the failed setup above,
                          // for the same reason — it is a connection this node closed unserved.

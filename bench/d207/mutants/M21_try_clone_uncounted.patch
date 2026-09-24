@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2049,7 +2049,6 @@
+@@ -2100,7 +2100,6 @@
                      // Before any slot is reserved, so there is nothing to release; but it is still
                      // a connection closed unserved, and a failed `dup` is usually EMFILE — the
                      // descriptor exhaustion these meters exist to show. Counted with the others.
