@@ -946,4 +946,58 @@ use super::*;
         let result = page.add_entry(mock_entry("overflow pls"));
         assert!(matches!(result, Err(FerroError::NotEnoughSpace)));
     }
+
+    // ---- D249: the pre-check `Catalog::plan_alters` asks before an ALTER rewrites anything ----
+
+    /// An entry no catalog page can hold is refused as a value, not as a panic.
+    ///
+    /// Sixteen columns with 255-byte names is 16 × 258 bytes of columns, more than a 4096-byte page
+    /// less its header. `persist` would never place it and would link a fresh page per turn instead;
+    /// `serialize` has no bounds check and would panic on it. The pre-check must say no first.
+    #[test]
+    fn an_entry_larger_than_an_empty_page_is_refused_rather_than_serialized() {
+        let mut entry = bare_entry("wide");
+        entry.schema = Schema::new(
+            (0..16)
+                .map(|i| Column::new(format!("{i:02}{}", "c".repeat(253)), DataType::Integer, true))
+                .collect(),
+        );
+        assert!(
+            HEADER_SIZE + entry.length() > PAGE_SIZE,
+            "the fixture ({} bytes) fits a page, so this tests nothing",
+            HEADER_SIZE + entry.length()
+        );
+        assert!(
+            entry.schema.columns.iter().all(|c| c.name.len() == MAX_U8_LEN),
+            "the fixture's names must each fit their length prefix, so only the page size refuses"
+        );
+        match refuse_unless_encodable(&entry) {
+            Err(FerroError::Constraint(msg)) => assert!(
+                msg.contains("\"wide\"") && msg.contains("catalog page"),
+                "the refusal does not name the table and the page: {msg}"
+            ),
+            other => panic!("an entry larger than a page was not refused by size: {other:?}"),
+        }
+    }
+
+    /// The boundary control: the longest column name the format can express is encodable, so the
+    /// pre-check is not "refuse every long name".
+    #[test]
+    fn the_longest_expressible_column_name_is_encodable() {
+        let mut entry = bare_entry("t");
+        entry.schema = Schema::new(vec![
+            Column::new("id".to_string(), DataType::Integer, false),
+            Column::new("c".repeat(MAX_U8_LEN), DataType::Integer, true),
+        ]);
+        refuse_unless_encodable(&entry).expect("a 255-byte column name is exactly what the prefix holds");
+
+        entry.schema.columns[1].name.push('c');
+        assert!(
+            matches!(
+                refuse_unless_encodable(&entry),
+                Err(FerroError::Unrepresentable { len: 256, limit: 255, .. })
+            ),
+            "one byte past the prefix must be refused by the encoder's own guard"
+        );
+    }
 }
