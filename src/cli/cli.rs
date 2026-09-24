@@ -228,7 +228,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 /// lead's decision) holds the WAL checkpoint's result because it refuses while a release is owed,
 /// and returning then skipped the arena checkpoint, leaving the session's branch tree unreachable.
 pub fn exit_sequence(
-    catalog: &Catalog,
+    // In full: `rollback-index-orphan` narrows this file's `catalog` import to `column::Value`, and
+    // a merge that keeps that line must still compile (D230 review 7, F-A).
+    catalog: &crate::catalog::catalog::Catalog,
     txn: &TxnManager,
     store: &ArenaPageStore,
     arena_path: &Path,
