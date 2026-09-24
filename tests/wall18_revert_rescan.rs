@@ -223,7 +223,8 @@ fn revert_finds_one_txns_ops_without_walking_the_whole_applied_log() {
     assert_eq!(
         (small.applied_matched, large.applied_matched),
         (1, 1),
-        "the reverted transaction should own exactly one applied op at both sizes: {small:?} {large:?}"
+        "the reverted transaction should own exactly one applied op at both sizes: \
+         {small:?} {large:?}"
     );
     assert_eq!(
         (small.applied_examined, large.applied_examined),
@@ -248,7 +249,7 @@ fn revert_finds_one_txns_ops_without_walking_the_whole_applied_log() {
 /// the same at N = 8 and N = 64. `captures >= 1` keeps a rewrite that stops counting from passing
 /// vacuously: any correct planner consults at least the target's own capture.
 #[test]
-#[ignore = "wall #18 graph term is OPEN: designed in artie-research frontier/lane_wall18_revert.md, \
+#[ignore = "wall #18 graph term OPEN: designed in artie-research frontier/lane_wall18_revert.md, \
             not built. Run with --ignored to see the pre-registered red (captures 8 -> 64, pairs \
             192 -> 12288)"]
 fn revert_graph_work_does_not_grow_with_merge_history() {

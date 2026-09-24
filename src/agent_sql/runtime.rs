@@ -207,10 +207,11 @@ pub fn revert_applied_counters() -> (u64, u64) {
 /// graph.**
 ///
 /// `revert_merge` rebuilds the whole graph from `State::captures` on every call, and `captures`
-/// keeps every PUBLISHED transaction for the life of the process (`forget_captures_unless_published`
-/// is the only remover, and it drops only the unpublished). So this counts merged-branch history,
-/// not the size of the revert being planned. What the build then does with those captures is
-/// pairwise, and is counted separately by `provenance::revert::GRAPH_BUILD_PAIRS`.
+/// keeps every PUBLISHED transaction for the life of the process
+/// (`forget_captures_unless_published` is the only remover, and it drops only the unpublished).
+/// So this counts merged-branch history, not the size of the revert being planned. What the build
+/// then does with those captures is pairwise, and is counted separately by
+/// `provenance::revert::GRAPH_BUILD_PAIRS`.
 pub static REVERT_GRAPH_CAPTURES: AtomicU64 = AtomicU64::new(0);
 
 /// Captures folded since process start. Read twice and subtract to scope it to a phase.
@@ -870,11 +871,11 @@ struct State {
     /// O(N^2).
     ///
     /// ⚠ The Vec STAYS. Other readers need it and are not served by this key: `highest_applied_seq`
-    /// walks it whole once per merge, and so do `diff`'s `concurrent` test, `pickable_ops` and the
-    /// cherry-pick projection. `REVERT`'s per-txn lookup was on that list too; since wall #18 it has
-    /// its own index, `applied_by_txn` below. This is an index beside the log, not a replacement
-    /// for it — which also means they must be pushed together, and `push_applied` is the only place
-    /// that does any of it.
+    /// walks it whole once per merge, and `diff`'s `concurrent` test, `pickable_ops` and the
+    /// cherry-pick projection scan it too. `REVERT`'s per-txn lookup was on that list; since wall
+    /// #18 it has its own index, `applied_by_txn` below. This is an index beside the log, not a
+    /// replacement for it — which also means they must be pushed together, and `push_applied` is
+    /// the only place that does any of it.
     applied_by_cell: std::collections::HashMap<(u32, u64, u32), Vec<u32>>,
     /// **Wall #18.** `txn` -> positions in `applied`, so `REVERT` stops rescanning the whole log
     /// for every transaction it undoes.
@@ -883,8 +884,8 @@ struct State {
     /// reverted transaction, under the lock every statement takes: O(every op any merge ever
     /// published) to find the handful one merge did. It is D86's defect on one of the two readers
     /// D86's index said it did not serve, and it gets D86's answer: an index beside the log,
-    /// pushed by the same door. This is the materialised form of ARIES's per-transaction `PrevLSN` chain —
-    /// a rollback walks its own transaction's records, never the log.
+    /// pushed by the same door. This is the materialised form of ARIES's per-transaction
+    /// `PrevLSN` chain — a rollback walks its own transaction's records, never the log.
     ///
     /// Each list is increasing, because `push_applied` appends, so a transaction's positions come
     /// back in log order — the order the scan it replaces produced — and `undo_txn`'s stable sort
@@ -6383,9 +6384,10 @@ fn blind_writes_of(
 ///
 /// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
 /// final element is not necessarily the largest. That makes it one pass over the whole vector per
-/// merge, so each merge pays for every op published before it. (This used to add "the same order of cost `undo_txn` already pays
-/// per revert over the same vector"; wall #18 indexed `undo_txn`'s lookup by txn, so that
-/// comparison no longer holds and this is the merge path's own whole-log walk.)
+/// merge, so each merge pays for every op published before it. (This used to add "the same order
+/// of cost `undo_txn` already pays per revert over the same vector"; wall #18 indexed `undo_txn`'s
+/// lookup by txn, so that comparison no longer holds and this is the merge path's own whole-log
+/// walk.)
 fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
     applied.iter().map(|a| a.seq).max()
 }
