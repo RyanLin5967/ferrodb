@@ -967,4 +967,103 @@ use super::*;
         assert_eq!(by_key(&mut o, 1), vec![note(1, &"y".repeat(200))], "row 1 is not reachable by key after open #2");
         assert_eq!(by_key(&mut o, 2), vec![note(2, &"x".repeat(3900))], "row 2 is not reachable by key after open #2");
     }
+
+    /// **Redo after a DROP touches no page the DROP freed** (lane §21.2; the lead's decision after
+    /// review 3). A DROP frees every heap and directory page of its table, and `allocate` hands those
+    /// out first. Redo skips a record only when the page's LSN has reached it, and a reused page starts
+    /// as a zero page with LSN 0, so a record of the dropped table left in the log would be replayed
+    /// onto the page's new owner. So a DROP must truncate even while a release is owed. Here the only
+    /// owed release is the dropped table's own, which the DROP discards. Its red is mutant-only: it was
+    /// added after the fix, and at `7cede54` this DROP was refused outright.
+    #[test]
+    fn redo_after_dropping_the_table_that_owed_a_release_touches_no_freed_page() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+        use crate::wal::txn::FAIL_RELEASES;
+
+        fn exec(sql: &str, o: &mut OpenedDatabase, s: &mut Session) -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+        fn rows(sql: &str, o: &mut OpenedDatabase) -> Vec<Vec<Value>> {
+            match exec(sql, o, &mut Session::new()) {
+                Outcome::Rows(mut r) => {
+                    r.sort_by_key(|row| format!("{row:?}"));
+                    r
+                }
+                _ => panic!("`{sql}` did not return rows"),
+            }
+        }
+        /// The heap `(dir_root, page)` a record writes, looking through a CLR to what it redoes.
+        fn heap_page(kind: &RecKind) -> Option<(u32, u32)> {
+            match kind {
+                RecKind::HeapInsert { dir_root, page_id, .. }
+                | RecKind::HeapDelete { dir_root, page_id, .. }
+                | RecKind::HeapUpdate { dir_root, page_id, .. }
+                | RecKind::HeapRelease { dir_root, page_id, .. } => Some((*dir_root, *page_id)),
+                RecKind::Clr { redo, .. } => heap_page(redo),
+                _ => None,
+            }
+        }
+        /// Every heap `(dir_root, page)` the log from its base to its end writes.
+        fn log_pages(o: &OpenedDatabase) -> Vec<(u32, u32)> {
+            let mut out = Vec::new();
+            let mut lsn = o.wal.base_lsn.load(Ordering::SeqCst);
+            let end = o.wal.next_lsn.load(Ordering::SeqCst);
+            while lsn < end {
+                let (rec, next) = o.wal.read_record(lsn).unwrap();
+                out.extend(heap_page(&rec.kind));
+                lsn = next;
+            }
+            out
+        }
+        let v = |id: i32, n: i32| vec![Value::Integer(id), Value::Integer(n)];
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("drop_owed.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let mut s = Session::new();
+            // Row 2 (3934 B), then row 1 (35 B); row 1's 200 B note does not fit beside them, so the
+            // UPDATE relocates it and retires its slot. Its release fails at every attempt.
+            exec("CREATE TABLE notes (id INTEGER NOT NULL, note VARCHAR(4000));", &mut o, &mut s);
+            exec(&format!("INSERT INTO notes VALUES (2, '{}');", "x".repeat(3900)), &mut o, &mut s);
+            exec("INSERT INTO notes VALUES (1, 'a');", &mut o, &mut s);
+            FAIL_RELEASES.with(|f| f.set(u32::MAX));
+            exec(&format!("UPDATE notes SET note = '{}' WHERE id = 1;", "y".repeat(200)), &mut o, &mut s);
+            assert_eq!(o.txn.owed_releases(), 1, "premise: the relocation's release is not owed");
+            let (heap, tt, primary) = {
+                let e = o.catalog.get_table("notes").expect("notes");
+                (e.first_directory_page_id, e.time_travel_root, e.primary_index_root)
+            };
+            let mut owned: Vec<u32> = vec![heap, tt, primary];
+            owned.extend(log_pages(&o).into_iter().filter(|(d, _)| *d == heap || *d == tt).map(|(_, p)| p));
+            assert!(owned.len() > 3, "premise: the log names no page of the table about to be dropped");
+
+            exec("DROP TABLE notes;", &mut o, &mut s);
+            FAIL_RELEASES.with(|f| f.set(0));
+            assert_eq!(o.txn.owed_releases(), 0, "the dropped table's release is still owed, so its log was kept");
+            let left: Vec<(u32, u32)> =
+                log_pages(&o).into_iter().filter(|(d, p)| *d == heap || *d == tt || owned.contains(p)).collect();
+            assert!(left.is_empty(), "after the DROP the log still writes pages the DROP freed, and redo would replay them: {left:?}");
+
+            // The freed pages go to a new table, and the process dies before any checkpoint.
+            exec("CREATE TABLE fresh (id INTEGER NOT NULL, v INTEGER);", &mut o, &mut s);
+            let fresh = o.catalog.get_table("fresh").expect("fresh").first_directory_page_id;
+            assert!(owned.contains(&fresh), "premise: `fresh` reused none of the dropped table's pages, so redo could not meet one");
+            for id in 1..=3 {
+                exec(&format!("INSERT INTO fresh VALUES ({id}, {});", id * 10), &mut o, &mut s);
+            }
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("the open after the DROP and a crash failed");
+        assert!(o.catalog.get_table("notes").is_none(), "the dropped table came back");
+        assert_eq!(rows("SELECT id, v FROM fresh;", &mut o), vec![v(1, 10), v(2, 20), v(3, 30)], "`fresh` after the reopen");
+        assert_eq!(rows("SELECT id, v FROM fresh WHERE id = 2;", &mut o), vec![v(2, 20)], "`fresh` by key after the reopen");
+    }
 }

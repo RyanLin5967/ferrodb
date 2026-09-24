@@ -2977,6 +2977,10 @@ use super::*;
     fn a_drop_is_refused_before_its_mutation_while_another_table_owes_a_release() {
         let (bp, wal, txn, mut catalog, _dir) = table_owing_a_release();
         let base = wal.base_lsn.load(Ordering::SeqCst);
+        let owned = {
+            let e = catalog.get_table("other").expect("other");
+            [e.first_directory_page_id, e.time_travel_root, e.primary_index_root]
+        };
         let refused = sql("DROP TABLE other;", &mut catalog, &bp, &txn, &mut Session::new());
         let e = match refused {
             Err(e) => e,
@@ -2986,6 +2990,10 @@ use super::*;
         assert!(catalog.get_table("other").is_some(), "the refused DROP had already dropped the table");
         assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "the refused DROP discarded another table's release");
         assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "the refused DROP truncated the log");
+        // Nothing was freed (lane §21.2): `allocate` hands out the lowest clear bit, so a page of
+        // `other` freed by the refused DROP would be the next one handed out.
+        let next = bp.disk_manager.allocate().unwrap();
+        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `other`, which still names it");
         FAIL_RELEASES.with(|f| f.set(0));
     }
 
