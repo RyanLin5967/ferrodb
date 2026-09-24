@@ -1255,5 +1255,59 @@ mod tests {
             }
             _ => panic!("SELECT did not return rows"),
         }
+        let after = rids_of(&f);
+        assert!(
+            after.iter().any(|r| !rids.contains(r)),
+            "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
+    }
+
+    fn rids_of(f: &Fixture) -> Vec<RecordId> {
+        let dir_root = f.catalog.require_table("p").unwrap().first_directory_page_id;
+        HeapFileManager::open(dir_root, f.bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid))
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// **D219 (review 5 F1): a provenance refusal during a plain ALTER leaves the table
+    /// consistently altered, not the I19 state.** A store poisoned by an earlier failed append
+    /// refuses every stamp. The rewrite used to stamp each moved row INSIDE its loop, before
+    /// `finish`, so on a poisoned store a plain `ALTER TABLE` of an attributed table failed with
+    /// every tuple converted under the old catalog. The stamps are written after `finish` instead.
+    #[test]
+    fn a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        for rid in &before {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+
+        let err = add_column(&mut f, &prov).expect_err("a poisoned store accepted the rewrite's stamps");
+        assert!(format!("{err}").contains("refusing further writes"), "it failed, but not at a stamp: {err}");
+        assert_eq!(
+            f.catalog.require_table("p").unwrap().schema.columns.len(),
+            3,
+            "a refused stamp left the rewritten rows under the OLD catalog: the I19 state"
+        );
+        let mut session = Session::new();
+        match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
+            .unwrap()
+        {
+            Outcome::Rows(rows) => {
+                assert_eq!(rows.len(), 41, "rows were lost");
+                assert!(rows.iter().all(|r| r.len() == 3), "a row did not read in the new shape");
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+        let after = rids_of(&f);
+        assert!(
+            after.iter().any(|r| !before.contains(r)),
+            "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
     }
 }
