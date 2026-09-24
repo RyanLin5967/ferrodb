@@ -74,7 +74,7 @@ const RIGHT_WALK: usize = 64;
 /// Rows in every fixture, ids `1..=ROWS`.
 const ROWS: i32 = 1000;
 /// The row the past-the-walk lookups probe: about 95 leaves right of the leftmost leaf.
-const FAR: i32 = 950;
+const FAR: i32 = 40; // D222 FIXTURE CONTROL FC1 (never land): a probe INSIDE the 64-hop walk
 /// The control row: inside the leftmost leaf, which a stale root still reaches.
 const NEAR: i32 = 5;
 /// Padding after the 6-character prefix, so every key's text is 200 bytes.
