@@ -1422,11 +1422,35 @@ impl BufferPoolManager {
         let _ = self.wal.set(wal);
     }
 
+    /// Write-ahead logging for one page about to be written back: the log records its contents
+    /// depend on must be durable first. A page that carries its own LSN (a heap page) waits for the
+    /// log up to that LSN and no further.
+    ///
+    /// **D216: a page with no LSN waits for the WHOLE log.** Index pages are not logged, and their
+    /// LSN field is always 0 (nothing in `storage::index` sets it). `page_lsn_of` reads no LSN from
+    /// any other page type either. This gate used to skip all of them, but an index leaf's contents
+    /// still depend on logged changes: it holds the key of every row inserted under it, and each such
+    /// row's `HeapInsert` is appended BEFORE the leaf changes (heap first, in `execution::insert` and
+    /// `execution::update`). So an eviction could write a leaf holding an uncommitted key while that
+    /// transaction's `Begin` and `HeapInsert` were still only in the log buffer. After a crash
+    /// nothing in the log accounts for the key, recovery sees no work, and the key names a slot the
+    /// heap never got (`an_index_page_reaches_disk_only_after_the_log_records_it_depends_on`).
+    /// Flushing everything appended so far covers every record such a page can depend on, without
+    /// the page having to say which.
+    ///
+    /// This is what lets `wal::recovery::recover` decide from the log alone whether the trees can be
+    /// stale: an index page on disk that reflects a change made since the last checkpoint implies
+    /// that the change's data record is in the log.
+    ///
+    /// Cost, unmeasured: a log write and fsync when such a page is written while the log buffer holds
+    /// anything. A heap page whose LSN is past the flushed point already pays the same. `flush`
+    /// returns at once on an empty buffer, so a checkpoint's `flush_all`, which flushes the log
+    /// first, pays nothing extra.
     fn wal_gate(&self, data: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
         if let Some(wal) = self.wal.get() {
-            let plsn = page_lsn_of(data);
-            if plsn > 0 {
-                wal.flush_up_to(plsn)?;
+            match page_lsn_of(data) {
+                0 => wal.flush()?,
+                plsn => wal.flush_up_to(plsn)?,
             }
         }
         Ok(())

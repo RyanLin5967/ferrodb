@@ -93,12 +93,14 @@ impl TableBranchCatalog {
     /// writes". THAT IS FALSE, and the replacement is stricter than the claim it removes — the
     /// gate is a provable no-op here, so anything built on it was resting on nothing.**
     ///
-    /// `BufferPoolManager::wal_gate` flushes only `if plsn > 0`, and `plsn` comes from
-    /// `page_lsn_of`, which is `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }` — an LSN exists
-    /// only for a heap page (0) and a B+tree internal/leaf page (2, 3). This page's first four
-    /// bytes are [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the
-    /// `_ => 0` arm: **the gate does nothing on it.** Nor does it help the tree this page names —
-    /// B+tree pages never set an LSN either, and index structure is not logged at all, because
+    /// `BufferPoolManager::wal_gate` reads a page's LSN with `page_lsn_of`, which is
+    /// `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }` — an LSN exists only for a heap page (0)
+    /// and a B+tree internal/leaf page (2, 3). This page's first four bytes are
+    /// [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the `_ => 0` arm.
+    /// Until D216 the gate then did nothing. Since D216 an LSN of 0 makes it flush the WHOLE log
+    /// first, which orders this page after every WAL record, and still orders nothing that matters
+    /// here: neither this page nor the tree it names is logged, so there is no record for either
+    /// to wait on. B+tree pages never set an LSN, and index structure is not logged at all, because
     /// `wal::recovery::rebuild_indexes` frees every index tree and builds a fresh one from the
     /// heap. There is no ordering here for a gate to provide.
     ///
