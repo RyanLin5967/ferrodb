@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wall #21 lane: every pre-registered RED run, each at the commit it was predicted red at (lane FAN-QUEUE ROW
-# steps a, f, h, i, k, l, m, n, o, p). Run under lockrun.sh with CARGO_TARGET_DIR set by the caller. Checks out
+# steps a, f, h, i, k, l, m, n, o, p, and §8.22's q). Run under lockrun.sh with CARGO_TARGET_DIR set by the caller. Checks out
 # each sha DETACHED in this worktree and returns to the branch at the end, also on a signal or an error.
 set -u
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -57,4 +57,5 @@ step p_audit6 661afe3 --lib --test d200_reap_releases_id_slots -- \
   branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once \
   branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed \
   branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch
+step q_drain 89e4e82 --test d200_reap_releases_id_slots -- a_persistent_fault_in_the_drain_read_fails_no_open --nocapture
 date -u +%FT%TZ > "$OUT/DONE"
