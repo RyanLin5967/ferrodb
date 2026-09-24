@@ -307,25 +307,28 @@ pub enum LeaseResume {
     /// corrected after review 3).** No mark had been recorded, but the catalog holds a live lease
     /// and there is evidence of the outage before this start. `D` starts at `credited_millis`
     /// instead of 0:
-    /// - `recorded_millis`, the downtime an earlier process recorded (`[0x09]`) before its own run,
-    ///   which wrote this catalog and never resumed it — 0 if none did;
-    /// - plus the WALL-clock age of `file_mtime` (unix milliseconds): the catalog file's last write
-    ///   before this process opened it; for a migration, the SOURCE log's; with a legacy log found
-    ///   beside a catalog that recorded nothing, the earlier of the two. `None` when no file time
-    ///   is evidence. The age is `max(W(now) − mtime, L(now) − mtime)`, so a backward wall-clock
-    ///   step after this process started cannot shrink it below the lease clock's own reading.
+    /// - `recorded_millis`: the downtime the last D198 writer that wrote this catalog and never
+    ///   resumed it found owed when it opened it, carried in its soft mark (`[0x09]`) — 0 if none;
+    /// - plus the larger of two measures of the time since:
+    ///   - `now_millis − writer_mark`, where `writer_mark` is that writer's LEASE-clock reading at
+    ///     its last commit — a mark's own arithmetic, exact whatever that clock's lag;
+    ///   - the age of `file_mtime` (unix ms, wall clock): the catalog file's last write before this
+    ///     process opened it; for a migration, the SOURCE log's; with a legacy log beside a catalog
+    ///     no D198 build wrote, the earlier of the two. The age is
+    ///     `max(W(now) − mtime, L(now) − mtime)`, so a backward wall-clock step after this process
+    ///     started cannot shrink it below the lease clock's own reading.
     ///
-    /// **What it is not** (review 3, C1/C7): it is not "never an early reap". It over-credits the
-    /// first start after an upgrade from a build whose lease clock was the wall clock — every
-    /// pre-D198 build, and a legacy migration — which is the case it exists for. It falls short of
-    /// the true outage, never below the 0 a plain `FirstStart` credits, when something wrote the
-    /// file after its last authority stopped, and by the host's sleep when that authority was a
-    /// D198 process with no mark (an embedder serving without a `LeaseThread`): its lease clock
-    /// lagged the wall clock, and no file time records by how much. The derivation is
-    /// `bench/lease_grace/PREREG.md` amendment 10.
+    /// **What it is not** (review 3, C1/C7): it is not "never an early reap". A D198 writer's soft
+    /// mark makes the credit exact, plus the time between its last commit and its end — the
+    /// accepted over-credit, as with a mark. Over a catalog no D198 build wrote, the file age
+    /// over-credits the first start after an upgrade from a build whose lease clock was the wall
+    /// clock, which is the case it exists for, and falls short, never below the 0 a plain
+    /// `FirstStart` credits, only if something else wrote the file after its last authority
+    /// stopped. Derivations: `bench/lease_grace/PREREG.md` amendments 10 and 11.
     FirstStartFromFileTime {
         now_millis: u64,
         file_mtime: Option<u64>,
+        writer_mark: Option<u64>,
         recorded_millis: u64,
         credited_millis: u64,
     },

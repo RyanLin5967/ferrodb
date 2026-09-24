@@ -76,16 +76,16 @@ pub mod tag {
     /// with no length check to relax, where a wider header would need the two-lengths tolerant read
     /// `deserialize_core` already carries for D60.
     pub const ALIVE: u8 = 0x08;
-    /// `[0x09]` → **downtime recorded before an unresumed writer**, one big-endian `u64` of
-    /// milliseconds on the wall clock. The FirstStart policy's evidence made durable (D198 review
-    /// 3, C4): a process that writes a catalog with no `ALIVE` record and never resumes it — an
-    /// embedder, or a first start that fails before its resume — replaces the file's mtime, the
-    /// only other evidence of the outage before it, with its own. So its first commit records that
-    /// outage here, and the next first start credits this plus the time since the file's last
-    /// write. Read and written only while `ALIVE` is absent; once a mark exists it is never read.
+    /// `[0x09]` → **the soft mark**, 16 bytes, both big-endian `u64`: the writer's lease-clock
+    /// reading at its commit, and the downtime already owed when it opened the catalog. Written by
+    /// EVERY commit of a catalog with no `ALIVE` record — an embedder with no lease thread, a
+    /// first start before its resume — and by a legacy migration, whose `accrued` is the source's
+    /// age. The next first start credits `accrued + (now − mark)` the way it would credit a mark,
+    /// which is right however far the writer's lease clock lagged the wall (D198 review 3, E1 and
+    /// C4). Read and written only while `ALIVE` is absent; once a mark exists it is never read.
     ///
-    /// A key of its own for `ALIVE`'s reasons, and absent from every catalog written before it
-    /// existed, which reads as "nothing recorded".
+    /// A key of its own for `ALIVE`'s reasons, and absent from every catalog no D198 build wrote,
+    /// whose first start then falls back to the file's time.
     pub const FIRST_START: u8 = 0x09;
     /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
     ///

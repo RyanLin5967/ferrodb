@@ -109,11 +109,13 @@ mod stored {
     /// (`TableBranchCatalog::first_start_credit`), and reported as given.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct FirstStartCredit {
-        /// The wall-clock stamp the credit's time term runs from, if a file time is evidence.
+        /// The wall-clock file time the credit may run from, if one is evidence.
         pub(super) file_mtime: Option<u64>,
-        /// Downtime an earlier unresumed writer recorded in `[0x09]`.
+        /// The last unresumed D198 writer's soft mark (its lease-clock reading), if any.
+        pub(super) writer_mark: Option<u64>,
+        /// Downtime that writer's soft mark carried as owed before it opened the catalog.
         pub(super) recorded_millis: u64,
-        /// `recorded_millis` plus the wall-clock age of `file_mtime`.
+        /// `recorded_millis` plus the larger of the time since `writer_mark` and the file's age.
         pub(super) credited_millis: u64,
     }
 
@@ -199,6 +201,7 @@ mod stored {
                             LeaseResume::FirstStartFromFileTime {
                                 now_millis: now,
                                 file_mtime: c.file_mtime,
+                                writer_mark: c.writer_mark,
                                 recorded_millis: c.recorded_millis,
                                 credited_millis: offset.0,
                             },
@@ -520,20 +523,20 @@ pub struct TableBranchCatalog {
     /// expiry question until it has: the downtime since the mark is not credited yet, and every
     /// answer would charge it. See [`TableBranchCatalog::refuse_unresumed`].
     resumed: AtomicBool,
-    /// **The FirstStart policy's evidence** (review 3, C4–C6): the outage before this process,
-    /// for a catalog with no mark. `None` for a marked or fresh catalog, a catalog built over a
-    /// caller's pool (`create` / `open`), or one with nothing to go on; a first start then credits
-    /// nothing. Set at open, never changed; read only by `resume_leases`, and only when no mark
-    /// exists. See [`FirstStartEvidence`].
+    /// **The FirstStart policy's evidence** (review 3, C4–C6, and the soft mark): the outage before
+    /// this process, for a catalog with no mark. `None` for a marked or fresh catalog, a catalog
+    /// built over a caller's pool (`create` / `open`), or one with nothing to go on; a first start
+    /// then credits nothing. Set at open, never changed; read only by `resume_leases`, and only
+    /// when no mark exists. See [`FirstStartEvidence`].
     first_start: Option<FirstStartEvidence>,
-    /// What this process's first commit writes into `[0x09]`, if anything: the downtime owed before
-    /// this process opened the catalog, so that a process that writes and then never resumes —
-    /// an embedder, a failed first start — cannot erase the evidence by replacing the file's mtime
-    /// with its own (review 3, C4). Set at open, never changed.
-    first_start_record: Option<u64>,
-    /// Whether `first_start_record` is already in the tree, or superseded by a mark. Written only
-    /// under `logical`.
-    first_start_written: AtomicBool,
+    /// The downtime owed before this process opened the catalog — `first_start`'s credit at open,
+    /// if the catalog held a live lease then, else 0. Every soft mark this process writes carries
+    /// it as `accrued`, so the next first start credits it plus the time since this process's LAST
+    /// commit, and never this process's own run. 0 for a fresh catalog. Set at open, never changed.
+    first_start_owed: u64,
+    /// Set by `resume_leases` and `record_lease_alive` before they write the mark: from then on the
+    /// mark is the evidence, and `stage` writes no soft mark. Written only under `logical`.
+    soft_mark_superseded: AtomicBool,
     /// **The header page's magic, as this catalog last wrote it** (SCALE-DESIGN "D198 addendum
     /// 2"): [`HEADER_PAGE_MAGIC`] while `D` has never left 0, [`HEADER_PAGE_MAGIC_OFFSET`] from
     /// before the first record that holds `D > 0`. `publish_root` writes this, never a constant: a
@@ -580,37 +583,83 @@ fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
 /// lease age is not. So the larger of the two, each saturating at 0: never below either, and never
 /// below what `1ec2deb` credited.
 ///
-/// Neither term can see how far the file's LAST writer's lease clock lagged: a D198 writer with no
-/// mark whose host slept is under-credited by that sleep. Derivation and the fix not taken:
-/// `bench/lease_grace/PREREG.md` amendment 10.
+/// Neither term can see how far the file's LAST writer's lease clock lagged (PREREG amendment 10).
+/// For a D198 writer that is what its soft mark carries (see [`SoftMark`]); a file time is the
+/// evidence only where there is no soft mark — a catalog no D198 build wrote — or beside one, in
+/// the `max` of [`FirstStartEvidence::credit`], where it can only over-credit.
 fn file_age_millis(stamp: u64, lease_now: Option<u64>) -> u64 {
     let wall = crate::cluster::wall_millis_since(stamp);
     lease_now.map_or(wall, |now| wall.max(now.saturating_sub(stamp)))
 }
 
-/// **The FirstStart policy's evidence for a catalog with no mark** (review 3, C4–C6): downtime
-/// already recorded, plus a file time the rest is measured from.
+/// **The soft mark, `[0x09]`** (the lead's decision after review 3, closing its schedule E1): what
+/// every commit of an unmarked catalog records, riding its `stage`.
 ///
-/// An ACCRUAL, not a frozen stamp. A process that writes an unmarked catalog and never resumes it
-/// replaces the file's mtime with its own; its first commit therefore records, in `[0x09]`, the
-/// downtime owed before it opened the catalog, and the next first start credits that plus the time
-/// since the file's last write. The writer's own run is credited as neither: a frozen original
-/// stamp would credit an embedder's whole uptime as downtime, and revive for that long every lease
-/// it saw expire.
+/// - `mark`: the writer's LEASE-clock reading at the commit. A lease written by that writer is on
+///   that clock, so the next first start credits `now − mark` — a subtraction across two processes'
+///   lease clocks, exactly as a real mark is credited, which is what makes it right however far the
+///   writer's clock lagged the wall (a host that slept).
+/// - `accrued`: the downtime already owed when that writer opened the catalog, so the writer's own
+///   run, between its open and its last commit, is credited as neither.
+///
+/// A mark supersedes it: once `[0x08]` exists this key is never written or read again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SoftMark {
+    mark: u64,
+    accrued: u64,
+}
+
+impl SoftMark {
+    fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&self.mark.to_be_bytes());
+        v.extend_from_slice(&self.accrued.to_be_bytes());
+        v
+    }
+
+    /// Refused rather than read as "no soft mark", which would drop evidence silently.
+    fn decode(b: &[u8]) -> Result<SoftMark, BranchError> {
+        if b.len() != 16 {
+            return Err(BranchError::Corrupt(format!(
+                "the soft mark must be 16 bytes (mark, accrued downtime), got {}; refusing to \
+                 decide any lease's first-start credit from it",
+                b.len()
+            )));
+        }
+        Ok(SoftMark {
+            mark: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            accrued: u64::from_be_bytes(b[8..16].try_into().unwrap()),
+        })
+    }
+}
+
+/// **The FirstStart policy's evidence for a catalog with no mark** (review 3, C1 and C4–C6, and the
+/// soft mark): a soft mark, a file time, or both.
+///
+/// The credit is `accrued + max(now − mark, file_age(file time))`. The first term is the soft
+/// mark's, and exact for a D198 writer whatever its lease clock's lag. The file time is the only
+/// evidence for a catalog no D198 build wrote (a pre-D198 catalog, a `main`-migrated one); beside a
+/// soft mark it can only over-credit, because every soft-mark write is a file write and so the file
+/// is never older than the last soft mark on the wall clock. An ACCRUAL, not a frozen stamp:
+/// nothing here credits an unresumed writer's own run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FirstStartEvidence {
-    /// `[0x09]`: downtime an earlier unresumed writer recorded, or 0.
-    recorded: u64,
-    /// The wall-clock stamp the rest of the outage runs from, if a file time is evidence.
-    since: Option<u64>,
+    /// The last unresumed D198 writer's soft mark, if any.
+    soft: Option<SoftMark>,
+    /// The wall-clock file time the rest of the outage runs from, if one is evidence.
+    file: Option<u64>,
 }
 
 impl FirstStartEvidence {
-    /// The credit owed at lease-clock `lease_now`: `recorded` plus the age of `since`, clamped by
-    /// D206's rule.
+    /// The credit owed at lease-clock `lease_now`, clamped by D206's rule.
     fn credit(&self, lease_now: Option<u64>) -> u64 {
-        let age = self.since.map_or(0, |m| file_age_millis(m, lease_now));
-        LeaseDeadline::saturating_deadline(self.recorded, age)
+        let since_soft = match (self.soft, lease_now) {
+            (Some(s), Some(now)) => now.saturating_sub(s.mark),
+            _ => 0,
+        };
+        let since_file = self.file.map_or(0, |m| file_age_millis(m, lease_now));
+        let accrued = self.soft.map_or(0, |s| s.accrued);
+        LeaseDeadline::saturating_deadline(accrued, since_soft.max(since_file))
     }
 }
 
@@ -619,14 +668,15 @@ enum FileTimes {
     /// The catalog's own mtime: an ordinary open.
     Own,
     /// A legacy `{db}.branches` log was found beside a finished catalog — a crash between the
-    /// switchover's two renames, or a rollback to a pre-table build that recreated it. With no
-    /// `[0x09]` record, the earlier of the two mtimes: either file may be the later, and the
-    /// earlier is the larger, conservative credit (review 3, C6). With a record, the catalog's own:
-    /// the record already measured the source when this build migrated it.
+    /// switchover's two renames, or a rollback to a pre-table build that recreated it. With no soft
+    /// mark, the earlier of the two mtimes: either file may be the later, and the earlier is the
+    /// larger, conservative credit (review 3, C6). With a soft mark, the catalog's own: a D198
+    /// build wrote the catalog, and if it migrated it, its soft mark already measured the source.
     OwnOrLegacy(Option<u64>),
-    /// Only the SOURCE log's mtime: THIS process just wrote the catalog by migrating it, so its own
-    /// mtime says nothing about the outage. An unreadable source is no evidence at all — never a
-    /// fallback to the catalog's own mtime (review 3, C5).
+    /// Only the SOURCE log's mtime: THIS process just wrote the catalog by migrating it, so neither
+    /// its own mtime nor the soft mark its migration wrote says anything about the outage. An
+    /// unreadable source is no evidence at all — never a fallback to the catalog's own mtime
+    /// (review 3, C5).
     Source(Option<u64>),
 }
 
@@ -779,59 +829,57 @@ impl TableBranchCatalog {
     }
 
     /// **The FirstStart policy's evidence, at the open of an existing sidecar with no mark**
-    /// (review 3, C4–C6). Sets `first_start` from the `[0x09]` record and the file times `times`
-    /// names, and `first_start_record`, which this process's first commit writes so that the
-    /// evidence survives it: the downtime owed before this open when the catalog holds a live
-    /// lease, or 0 to reset a record that no live lease is owed any more.
+    /// (review 3, C4–C6, and the soft mark). Sets `first_start` from the soft mark and the file
+    /// times `times` names, and `first_start_owed`, which every soft mark this process writes
+    /// carries: the credit at open when the catalog holds a live lease, else 0 (downtime owed to no
+    /// lease is not carried forward).
     fn take_first_start_evidence(
         &mut self,
         own_mtime: Option<u64>,
         times: FileTimes,
     ) -> Result<(), FerroError> {
-        let recorded = self.first_start_recorded()?;
-        let (since, measured_here) = match times {
-            FileTimes::Own => (own_mtime, true),
-            FileTimes::OwnOrLegacy(legacy) => match (recorded, own_mtime, legacy) {
-                // A record measured the source when this build migrated it.
-                (Some(_), own, _) => (own, true),
-                (None, Some(own), Some(legacy)) => (Some(own.min(legacy)), true),
-                (None, own, legacy) => (own.or(legacy), true),
+        let soft = self.soft_mark()?;
+        let (soft, file) = match times {
+            FileTimes::Own => (soft, own_mtime),
+            FileTimes::OwnOrLegacy(legacy) => match (soft, own_mtime, legacy) {
+                (Some(_), own, _) => (soft, own),
+                (None, Some(own), Some(legacy)) => (None, Some(own.min(legacy))),
+                (None, own, legacy) => (None, own.or(legacy)),
             },
-            // The migration recorded the source's age itself, before its rename; this process's
-            // own write is not evidence, and its first commit has nothing to add.
-            FileTimes::Source(source) => (source, false),
+            FileTimes::Source(source) => (None, source),
         };
-        let recorded = if measured_here { recorded } else { None };
-        let evidence = (recorded.is_some() || since.is_some())
-            .then(|| FirstStartEvidence { recorded: recorded.unwrap_or(0), since });
+        let evidence =
+            (soft.is_some() || file.is_some()).then_some(FirstStartEvidence { soft, file });
         self.first_start = evidence;
-        if measured_here {
-            let lease_now = LeaseDeadline::try_now_millis().ok();
-            self.first_start_record = if self.holds_a_live_lease()? {
-                evidence.map(|e| e.credit(lease_now))
-            } else {
-                recorded.map(|_| 0)
-            };
-        }
+        let live = self.holds_a_live_lease()?;
+        self.first_start_owed = match evidence {
+            Some(e) if live => e.credit(LeaseDeadline::try_now_millis().ok()),
+            _ => 0,
+        };
         Ok(())
     }
 
-    /// The `[0x09]` record, if any. A value of the wrong length is refused rather than read as
-    /// "nothing recorded", which would drop evidence silently.
-    fn first_start_recorded(&self) -> Result<Option<u64>, FerroError> {
+    /// The soft mark `[0x09]`, if any. See [`SoftMark`].
+    fn soft_mark(&self) -> Result<Option<SoftMark>, FerroError> {
         match self.tree.search(&keys::first_start())? {
             None => Ok(None),
-            Some(b) => {
-                let bytes: [u8; 8] = b.as_slice().try_into().map_err(|_| {
-                    BranchError::Corrupt(format!(
-                        "the first-start record must be 8 bytes, got {}; refusing to decide any \
-                         lease's first-start credit from it",
-                        b.len()
-                    ))
-                })?;
-                Ok(Some(u64::from_be_bytes(bytes)))
-            }
+            Some(b) => Ok(Some(SoftMark::decode(&b)?)),
         }
+    }
+
+    /// **Test fixture only: this catalog's file as a build without D198 would have left it** — no
+    /// `[0x08]`, no `[0x09]` — made durable WITHOUT `stage`, which would write a soft mark again.
+    /// A fixture that stands for a pre-D198 catalog calls it LAST, and the test then asserts both
+    /// keys absent after its reopen, as a premise (PREREG amendment 11).
+    #[cfg(test)]
+    fn as_written_before_d198(&self) -> Result<(), FerroError> {
+        let _g = self.logical.lock().unwrap();
+        self.remove_if_present(&keys::alive())?;
+        self.remove_if_present(&keys::first_start())?;
+        self.publish_root()?;
+        let seq = self.commit_group.ticket();
+        drop(_g);
+        self.durable(seq)
     }
 
     /// The catalog for a database, migrating a legacy `{db}.branches` log if one is present.
@@ -901,15 +949,18 @@ impl TableBranchCatalog {
                          {SIDECAR_HEADER_PAGE}; refusing to rename it into place"
                     )));
                 }
-                // Review 3, C4: the source's evidence goes INTO the catalog, inside the unit the
-                // rename publishes, so a start that fails after this migration cannot lose it.
-                // Reading the retired log's mtime at a later open instead would be wrong: `main`
-                // migrates and retires to the same name, and a catalog beside an old `.pre-table`
-                // may have been served for months since, all of which its mtime would credit.
-                if let Some(m) = source_mtime {
-                    if cat.holds_a_live_lease()? {
-                        let age = file_age_millis(m, LeaseDeadline::try_now_millis().ok());
-                        cat.upsert(keys::first_start(), age.to_be_bytes().to_vec())?;
+                // Review 3, C4: the source's evidence goes INTO the catalog, as a soft mark whose
+                // `accrued` is the source's age, inside the unit the rename publishes, so a start
+                // that fails after this migration cannot lose it. Reading the retired log's mtime
+                // at a later open instead would be wrong: `main` migrates and retires to the same
+                // name, and a catalog beside an old `.pre-table` may have been served for months
+                // since, all of which its mtime would credit. Written after `migrate_from`, whose
+                // own commits soft-marked the new catalog with nothing accrued; not on a cluster
+                // member, for `record_soft_mark`'s reason.
+                if let (Some(m), Ok(now)) = (source_mtime, LeaseDeadline::try_now_millis()) {
+                    if !crate::cluster::is_clustered() && cat.holds_a_live_lease()? {
+                        let accrued = file_age_millis(m, Some(now));
+                        cat.upsert(keys::first_start(), SoftMark { mark: now, accrued }.encode())?;
                         cat.publish_root()?;
                     }
                 }
@@ -1041,27 +1092,37 @@ impl TableBranchCatalog {
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
     fn stage(&self) -> Result<u64, FerroError> {
-        self.record_first_start_evidence()?;
+        self.record_soft_mark()?;
         self.publish_root()?;
         Ok(self.commit_group.ticket())
     }
 
-    /// **Review 3, C4: the first commit of a process over an unmarked catalog records the downtime
-    /// owed before it opened the catalog** (`first_start_record`, into `[0x09]`), in the same
-    /// stage and the same fsync as whatever it is committing — no extra sync. Its commit replaces
-    /// the file's mtime with its own, and without this a start that then failed before its resume
-    /// would leave the next one to credit only the time since that write.
+    /// **The soft mark: every commit of an unmarked catalog records the writer's lease-clock
+    /// reading and the downtime owed before it opened the catalog** (`[0x09]`; see [`SoftMark`]),
+    /// in the same stage and the same fsync as whatever it is committing — no extra sync. It closes
+    /// review 3's schedule E1: a writer with no mark whose host slept left leases on a lease clock
+    /// that lagged the wall, and no file time says by how much. It also keeps the evidence of the
+    /// outage before a start that writes and then fails (review 3, C4).
     ///
-    /// Once per process, and never after a mark: `resume_leases` and `record_lease_alive` set
-    /// `first_start_written` before writing the mark, which supersedes it.
-    fn record_first_start_evidence(&self) -> Result<(), FerroError> {
-        if let Some(owed) = self.first_start_record {
-            if !self.first_start_written.load(Ordering::SeqCst) {
-                self.upsert(keys::first_start(), owed.to_be_bytes().to_vec())?;
-                self.first_start_written.store(true, Ordering::SeqCst);
-            }
+    /// On EVERY commit, not the first: a stamp from the first would credit the writer's run after
+    /// it as downtime. Not once the catalog is marked, or once `resume_leases` or
+    /// `record_lease_alive` has set `soft_mark_superseded`; not on a cluster member, whose lease
+    /// clock is the replicated tick and which writes no mark either; and not when the lease clock
+    /// cannot be read, which leaves the file time as the next start's evidence.
+    fn record_soft_mark(&self) -> Result<(), FerroError> {
+        if self.marked.load(Ordering::SeqCst)
+            || self.soft_mark_superseded.load(Ordering::SeqCst)
+            || crate::cluster::is_clustered()
+        {
+            return Ok(());
         }
-        Ok(())
+        let Ok(now) = LeaseDeadline::try_now_millis() else {
+            return Ok(());
+        };
+        self.upsert(
+            keys::first_start(),
+            SoftMark { mark: now, accrued: self.first_start_owed }.encode(),
+        )
     }
 
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
@@ -1179,8 +1240,8 @@ impl TableBranchCatalog {
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             first_start: None,
-            first_start_record: None,
-            first_start_written: AtomicBool::new(false),
+            first_start_owed: 0,
+            soft_mark_superseded: AtomicBool::new(false),
             header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
         // Through `inward_at_zero`, the production door from a `BranchRecord`, which opens only at
@@ -1216,8 +1277,8 @@ impl TableBranchCatalog {
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             first_start: None,
-            first_start_record: None,
-            first_start_written: AtomicBool::new(false),
+            first_start_owed: 0,
+            soft_mark_superseded: AtomicBool::new(false),
             header_magic: AtomicU32::new(HEADER_PAGE_MAGIC),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
@@ -1666,7 +1727,7 @@ impl TableBranchCatalog {
     /// A catalog with NO record answers as before D198, at `D = 0`. **That is not because it has no
     /// downtime it could be charging** — this said so until review 3 (C3), and since the FirstStart
     /// policy it is false: an unmarked catalog holding a live lease has an outage its resume WILL
-    /// credit (its file time, its `[0x09]` record), and until that resume every expiry answer
+    /// credit (its file time, its `[0x09]` soft mark), and until that resume every expiry answer
     /// charges it. Early answers, then, reachable by a process that asks before resuming: an
     /// embedder with no `LeaseThread`; neither shipped binary asks before it resumes. The
     /// narrowness is kept because the strict form (refuse every unresumed catalog) would turn a
@@ -1703,8 +1764,9 @@ impl TableBranchCatalog {
     /// (`first_start`), or `None` if it took none. See [`FirstStartEvidence`].
     fn first_start_credit(&self, now_millis: u64) -> Option<FirstStartCredit> {
         self.first_start.map(|e| FirstStartCredit {
-            file_mtime: e.since,
-            recorded_millis: e.recorded,
+            file_mtime: e.file,
+            writer_mark: e.soft.map(|s| s.mark),
+            recorded_millis: e.soft.map_or(0, |s| s.accrued),
             credited_millis: e.credit(Some(now_millis)),
         })
     }
@@ -2360,9 +2422,8 @@ impl BranchCatalog for TableBranchCatalog {
             // SCALE-DESIGN "D198 addendum 2": the first record holding `D > 0` is written only
             // over a header that already refuses a binary that knows nothing of `D` — the magic is
             // switched and made durable ALONE first, then the lock is retaken and everything above
-            // recomputed. One extra fsync, once in a catalog's life. The first-start evidence, if
-            // this process owes it, rides this stage: the switch is a write, and it replaces the
-            // file's mtime.
+            // recomputed. One extra fsync, once in a catalog's life. On an unmarked catalog this
+            // stage writes a soft mark like any commit, so a crash here still leaves evidence.
             if !next.offset().is_zero() && !self.header_admits_offset() {
                 self.switch_header_magic()?;
                 let seq = self.stage()?;
@@ -2370,8 +2431,8 @@ impl BranchCatalog for TableBranchCatalog {
                 self.durable(seq)?;
                 continue;
             }
-            // The mark supersedes the first-start evidence; nothing writes `[0x09]` after it.
-            self.first_start_written.store(true, Ordering::SeqCst);
+            // The mark supersedes the soft mark; nothing writes `[0x09]` after it.
+            self.soft_mark_superseded.store(true, Ordering::SeqCst);
             // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
             // leaves the old mark beside the new offset, and the next start credits the same outage
             // a second time.
@@ -2404,8 +2465,8 @@ impl BranchCatalog for TableBranchCatalog {
         // early after the next restart.
         let _g = self.logical.lock().unwrap();
         let next = AliveState::heartbeat(self.alive_record()?, now_millis);
-        // A mark supersedes the first-start evidence (review 3, C4); nothing writes `[0x09]` after.
-        self.first_start_written.store(true, Ordering::SeqCst);
+        // A mark supersedes the soft mark; nothing writes `[0x09]` after it.
+        self.soft_mark_superseded.store(true, Ordering::SeqCst);
         self.upsert(keys::alive(), next.encode())?;
         let seq = self.stage()?;
         drop(_g);
@@ -4891,6 +4952,31 @@ mod f1_lease_grace {
             "credited {credited} ms; the writer's last commit was between {} and {} ms ago",
             now - after_last,
             now - before_last
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **M54/M55's killer: a marked catalog writes no soft mark.** Once `[0x08]` exists the soft
+    /// mark is never read, so writing it would be a cost on every commit of every catalog both
+    /// binaries serve, for no reader. Neither the heartbeat that creates the mark, nor the resume,
+    /// nor a later commit writes one — in this instance, or in a reopened one that learns it is
+    /// marked from the disk. Green-only: it reads `soft_mark()`, new with the soft mark.
+    #[test]
+    fn a_marked_catalog_writes_no_soft_mark() {
+        let path = sidecar("marked-no-soft");
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.record_lease_alive(1_000).unwrap();
+            c.resume_leases(4_000).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(10_000)).unwrap();
+            assert_eq!(c.soft_mark().unwrap(), None, "a marked catalog wrote a soft mark");
+        }
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        re.set_root(BranchId::TRUNK, 1).unwrap();
+        assert_eq!(
+            re.soft_mark().unwrap(),
+            None,
+            "a catalog reopened with a mark on disk wrote a soft mark on its first commit"
         );
         let _ = std::fs::remove_file(&path);
     }
