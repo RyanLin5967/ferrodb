@@ -242,6 +242,35 @@ pub fn release_mismatches() -> u64 {
     RELEASE_MISMATCHES.load(Ordering::Relaxed)
 }
 
+/// Commits whose `TxnEnd` record could not be written after the durable `Commit`, since process
+/// start (lane §21.18). The transaction ended anyway: see `TxnManager::commit`.
+pub static TXN_END_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`TXN_END_FAILURES`].
+pub fn txn_end_failures() -> u64 {
+    TXN_END_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Poisons the log if dropped while `armed`: `ddl_unit` arms it once a DROP's record is durable and
+/// disarms it when the DROP's mutation returns, so only an unwind through the mutation poisons (D250
+/// review 3's Q4).
+struct PoisonOnUnwind<'a> {
+    wal: &'a WalManager,
+    table: &'a str,
+    armed: bool,
+}
+
+impl Drop for PoisonOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.wal.poison(&format!(
+                "the DROP of `{}` panicked after its record was durable; the next open completes it",
+                self.table
+            ));
+        }
+    }
+}
+
 /// Mismatch lines written from a STORED observation, since process start (review 7's F4): a
 /// mismatch whose first quarantine write failed, recorded later by a retry that could not read the
 /// page. Its release stays owed, so it is not in [`RELEASE_MISMATCHES`], which counts a mismatch when
@@ -321,6 +350,8 @@ pub fn failure_counters_line() -> Option<String> {
         ("release failures", release_failures()),
         ("release mismatches", release_mismatches()),
         ("mismatches recorded from a stored observation", stored_mismatch_lines()),
+        ("commits whose TxnEnd could not be written", txn_end_failures()),
+        ("dropped tables whose authors could not be forgotten", crate::wal::recovery::provenance_forget_failures()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
         ("DROP free failures", free_failures()),
@@ -714,11 +745,12 @@ impl TxnManager {
         // reported; what changes is that reporting it no longer wedges the database. See
         // `abandon_reader` for why a reader with no `TxnEnd` record is safe for recovery.
         //
-        // **Not reachable in production today, which is why the test forces it.** `append_chained`
-        // fails two ways: the entry is missing from `att`, which cannot happen here because it was
-        // just checked and would mean no leak anyway; or `WalManager::append` returns `Err`, which
-        // it never does today - it extends an in-memory buffer and ends in `Ok(lsn)`. Rather than
-        // leave the guard unproven, `WalManager::fail_next_append` (test-only) fires it on demand;
+        // **Rare in production, which is why the test forces it.** `append_chained` fails two ways:
+        // the entry is missing from `att`, which cannot happen here because it was just checked and
+        // would mean no leak anyway; or `WalManager::append` returns `Err`. It does no I/O, but it
+        // refuses on a POISONED log (F4(i), after another transaction's `Commit` flush failed) and
+        // for the two records whose meaning changed on a legacy log (Q5; not a `TxnEnd`). Rather
+        // than leave the guard unproven, `WalManager::fail_next_append` (test-only) fires it on demand;
         // see `a_reader_is_not_leaked_when_its_txn_end_cannot_be_written`. The guard earns its
         // place the day `append` does any IO - a bounded buffer that flushes when full, a direct
         // write - because then the failure is real and its cost is the whole database.
@@ -949,13 +981,32 @@ impl TxnManager {
         // `RELEASE_FAILURES`.
         let retired = self.retired.lock().unwrap().remove(&txn_id).unwrap_or_default();
         self.release_retired(txn_id, &retired);
-        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        // **Lane §21.18 (review 7 §8, the lead's decision): the transaction ends here whether or not
+        // its `TxnEnd` can be written**, `end_read_only`'s shape. The `Commit` is durable, so it HAS
+        // committed, and recovery counts a `Commit` alone as ended. With `?` here, a failed append
+        // returned `Err` before the id left `att`: every checkpoint and DDL was then refused for the
+        // life of the process, MERGE's publish and autocommit read "not committed", and a ROLLBACK
+        // appended an `Abort` after the durable `Commit` and undid a committed transaction. The
+        // append runs FIRST because `append_chained` looks the transaction up in `att`. Latent
+        // today: `append` does no I/O, and the poison's one caller is a `Commit` flush that failed.
+        let ended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
         // D202: committed, so nothing may ever undo these writes. Dropped here and not left for
         // a later abort to find: transaction ids restart from the log header after a restart, and
         // a stale list under a reissued id would repoint or remove a committed key.
         self.index_undo.lock().unwrap().remove(&txn_id);
+        if let Err(e) = ended {
+            use std::io::Write;
+            TXN_END_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: transaction {txn_id} committed, but its TxnEnd record could not be written ({e}); it has \
+                 ended anyway, and recovery counts its Commit as the end"
+            );
+            // No automatic checkpoint: it would meet the same log.
+            return Ok(());
+        }
         // **F4: the automatic checkpoint is a node-local decision, and on a cluster it is wrong.**
         //
         // `consensus::Command::Checkpoint` exists for this and says why in its own words:
@@ -1618,15 +1669,6 @@ impl TxnManager {
             .map(|r| r.columns.clone())
     }
 
-    /// Declare a completed DROP again, durably, after a checkpoint truncated past its record: the
-    /// open's half of the rule `ddl_unit` follows after a DROP's truncation (D250 review 2's R2-4,
-    /// `wal::recovery::open_recovered`). Not retained in the schema: the running process's next
-    /// truncating checkpoint drops it, after the provenance forget it exists for has run.
-    pub(crate) fn declare_drop_again(&self, r: &DdlRecord) -> Result<(), FerroError> {
-        self.append_ddl(r)?;
-        self.wal.flush()
-    }
-
     fn append_ddl(&self, r: &DdlRecord) -> Result<(), FerroError> {
         self.wal.append(
             0,
@@ -1801,7 +1843,16 @@ impl TxnManager {
             ));
             return Err(e);
         }
-        let out = match f() {
+        // **D250 review 3's Q4: a PANIC in `f` poisons the log too.** It is the same state as `f`'s
+        // `Err`: the record is durable, the next open completes the DROP, and nothing may write the
+        // table meanwhile. Until this, a panic was fail-stop only because `f` runs inside `att`'s
+        // critical section and the unwind poisoned that `Mutex`, a property of lock placement that
+        // nothing pinned.
+        let mut unwinding = PoisonOnUnwind { wal: &*self.wal, table: &record.table, armed: true };
+        let returned = f();
+        unwinding.armed = false;
+        drop(unwinding);
+        let out = match returned {
             Ok(out) => out,
             Err(e) => {
                 // The intent stays undecided: this process frees nothing more, and the next open
@@ -3274,7 +3325,8 @@ use super::*;
         let reader = handoff.txn_id;
 
         // Arm the failure for exactly the `TxnEnd` this close is about to write.
-        wal.fail_next_append.store(true, Ordering::SeqCst);
+        // `1`: the seam is a countdown since lane §21.18; 1 fails the next append, as `true` did.
+        wal.fail_next_append.store(1, Ordering::SeqCst);
 
         let err = txn.end_read_only(reader).expect_err("a failed TxnEnd was reported as success");
         assert!(format!("{err}").contains("injected"), "wrong reason: {err}");
@@ -3632,6 +3684,36 @@ use super::*;
         (bp, wal, txn, catalog, owned, dir)
     }
 
+    /// **D250 review 3's Q4 (lane §3.15 test 19): a DROP whose mutation PANICS after its record is
+    /// durable poisons the log, wherever `att` is released.** The next open completes the logged DROP,
+    /// so nothing may write the table after the record. At `cd0914b` a panic in `f` stopped later
+    /// writes only because `f` ran inside `att`'s critical section, whose `Mutex` the unwind poisoned:
+    /// a property of lock placement that nothing pinned. A guard now poisons the log itself.
+    #[test]
+    fn a_drop_whose_mutation_panics_after_its_record_is_durable_poisons_the_log() {
+        let (_bp, wal, txn, catalog, owned, _dir) = table_to_drop();
+        let record = DdlRecord {
+            op: DdlOp::DropTable,
+            table: "t".into(),
+            dir_root: owned[0],
+            time_travel_root: owned[1],
+            columns: Vec::new(),
+        };
+        // D229: the DROP names its table's pages first, as the executor does.
+        let pages = catalog.table_pages("t").expect("t's pages");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            txn.drop_checkpointed(record, pages, || -> Result<(), FerroError> {
+                panic!("injected: the DROP's mutation panicked before it freed anything")
+            })
+        }));
+        assert!(caught.is_err(), "premise failed: the mutation did not panic");
+        assert!(
+            wal.poisoned().is_some(),
+            "a DROP whose mutation panicked after its record was durable left the log writable: only a poisoned \
+             `att` lock stood between it and a write the next open's completion would skip"
+        );
+    }
+
     /// **D250 (lane §2 test 4; replaces the parent's
     /// `a_drop_is_refused_before_its_mutation_while_a_pin_would_keep_the_log`): a DROP under a WAL pin
     /// succeeds, and the pin keeps the log.** What makes the kept log harmless after a crash is
@@ -3815,6 +3897,34 @@ use super::*;
             0,
             "the mismatch found again is still owed: recording it once failed, so no checkpoint truncates the log"
         );
+    }
+
+    /// **Review 7 §8 (lane §21.18 test T8): a commit whose `TxnEnd` cannot be written still ends the
+    /// transaction.** The `Commit` is durable, so the transaction HAS committed, and recovery counts a
+    /// `Commit` alone as ended. At `79483ff` the `TxnEnd` append's `?` returned `Err` before the
+    /// transaction left `att`: every checkpoint was then refused for the life of the process, the
+    /// caller read "not committed", and a ROLLBACK appended an `Abort` after the durable `Commit`.
+    #[test]
+    fn a_commit_whose_txn_end_cannot_be_written_still_ends_the_transaction() {
+        let (bp, wal, txn, _dir) = setup();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t);
+        heap.insert(Tuple::new(vec![1; 40])).unwrap();
+        // No retired slot and no bound run, so the commit appends `Commit`, then `TxnEnd`.
+        wal.fail_next_append.store(2, Ordering::SeqCst);
+        txn.commit(t).unwrap_or_else(|e| panic!("a transaction whose Commit is durable was reported as not committed: {e}"));
+        assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the TxnEnd append was not the one that failed");
+        assert!(
+            !txn.att.lock().unwrap().contains_key(&t),
+            "the committed transaction stayed active, so every checkpoint and DDL is refused"
+        );
+        assert!(txn.abort(t).is_err(), "a ROLLBACK of the committed transaction was accepted");
+        assert!(
+            !walk_log(&wal).iter().any(|r| r.txn_id == t && matches!(r.kind, RecKind::Abort)),
+            "an Abort was appended after the durable Commit"
+        );
+        txn.checkpoint().unwrap_or_else(|e| panic!("a checkpoint was refused after the commit: {e}"));
     }
 
     /// **Review 7's F4 (lane §21.16 test F4): a `Retry` after a SUCCESSFUL read records what the page

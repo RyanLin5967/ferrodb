@@ -576,7 +576,45 @@ fn both_production_entry_points_build_their_runtime_through_the_opened_database(
             "{entry} names `completed_drops`: the list belongs to `OpenedDatabase::attach_runtime`, and an \
              entry point that reads it has a way round the door"
         );
+        // Lane §3.15 (D250 review 3's R): the list the door reads is `dropped_tables`.
+        assert!(
+            !(0..t.len()).any(|k| ident(&t, k) == Some("dropped_tables")),
+            "{entry} names `dropped_tables`, the list the door forgets from"
+        );
+        // Lane §3.15: each entry point names the provenance it attaches: the CLI's is durable, and
+        // pgserver's stays in memory (a stated no-op for the forget).
+        let backing = if *entry == "src/cli/cli.rs" { "Durable" } else { "InMemory" };
+        assert!(
+            (0..t.len()).any(|k| {
+                ident(&t, k) == Some("ProvenanceBacking")
+                    && punct(&t, k + 1, ':')
+                    && punct(&t, k + 2, ':')
+                    && ident(&t, k + 3) == Some(backing)
+            }),
+            "{entry} does not attach its runtime with `ProvenanceBacking::{backing}`"
+        );
     }
+    // Lane §3.15 (D250 review 3's Q1c, aimed at the hazard): a DURABLE provenance store reaches a
+    // runtime only through `OpenedDatabase::attach_runtime`, which the open has already made forget
+    // every dropped table in it. So no production file under `src/` or `examples/` names
+    // `with_durable_provenance` except its definition in `src/agent_sql/runtime.rs`.
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("examples"), &mut files);
+    assert!(files.len() > 20, "walked src/ and examples/ and found {} .rs files: the walk is broken", files.len());
+    let mut named = Vec::new();
+    for f in &files {
+        let name = rel(root, f);
+        let t = tokens(&production_text(&std::fs::read_to_string(f).unwrap()));
+        if (0..t.len()).any(|k| ident(&t, k) == Some("with_durable_provenance")) {
+            named.push(name);
+        }
+    }
+    assert_eq!(
+        named,
+        vec!["src/agent_sql/runtime.rs".to_string()],
+        "these name `with_durable_provenance`, so a durable store can reach a runtime without the door"
+    );
 }
 
 #[test]
