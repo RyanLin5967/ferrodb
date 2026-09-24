@@ -66,6 +66,7 @@ mod stored {
     use crate::branch::types::{
         ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, LeaseResume, PageId,
     };
+    use crate::error::FerroError;
 
     /// **`D`, typed — the D198 adversary's C1 / M25.** The offset every translation adds or
     /// subtracts. It was a `u64`, so `StoredDeadline::inward(lease, 0)` compiled: a translation
@@ -149,13 +150,38 @@ mod stored {
         }
 
         /// **A resume at `now`**: the outcome to report and the record to write, whose offset is
-        /// published once it is durable. No record means a first start: nothing measured, `D = 0`.
-        pub(super) fn resume(prev: Option<AliveState>, now: u64) -> (LeaseResume, AliveState) {
+        /// published once it is durable.
+        ///
+        /// No record means a first start. **The FirstStart policy (lead, SCALE-DESIGN "D198
+        /// addendum — the FirstStart policy"):** when the caller hands a `file_mtime` — which it does
+        /// only for a catalog holding a live lease — `D` starts at `now − file_mtime` instead of 0.
+        /// The file's last modification happened while its last writer was still alive, so
+        /// `mtime <= last_alive`, and crediting `now − mtime` can only OVER-credit the outage:
+        /// longer leases, never an early reap. A later write by something else makes `mtime` late
+        /// and the credit short, but never below the 0 a first start gave before.
+        pub(super) fn resume(
+            prev: Option<AliveState>,
+            now: u64,
+            file_mtime: Option<u64>,
+        ) -> (LeaseResume, AliveState) {
             match prev {
-                None => (
-                    LeaseResume::FirstStart { now_millis: now },
-                    AliveState { mark: now, offset: LeaseOffset(0) },
-                ),
+                None => match file_mtime {
+                    None => (
+                        LeaseResume::FirstStart { now_millis: now },
+                        AliveState { mark: now, offset: LeaseOffset(0) },
+                    ),
+                    Some(mtime) => {
+                        let offset = LeaseOffset(0).credit(now.saturating_sub(mtime));
+                        (
+                            LeaseResume::FirstStartFromFileTime {
+                                now_millis: now,
+                                file_mtime: mtime,
+                                credited_millis: offset.0,
+                            },
+                            AliveState { mark: now, offset },
+                        )
+                    }
+                },
                 Some(p) => {
                     let downtime_millis = now.saturating_sub(p.mark);
                     let offset = p.offset.credit(downtime_millis);
@@ -303,7 +329,33 @@ mod stored {
     pub(super) struct StoredRecord(BranchRecord);
 
     impl StoredRecord {
-        /// A lease-clock record, translated for writing.
+        /// **The production door from a `BranchRecord` into stored time — and it opens only at
+        /// `D = 0`** (D198 re-review, R2).
+        ///
+        /// At `D = 0` a lease and its stored value coincide, so the record needs no translation and
+        /// nothing written through here can be early. That is exactly the domain of its two callers,
+        /// `create` (trunk) and `migrate_from` (a brand-new catalog). At any other `D` it REFUSES:
+        /// the general translation is `#[cfg(test)]` below, so a raw-decoded record — whose deadline
+        /// is already stored-scale but typed as a lease — cannot be written back through a
+        /// translation in production, where it would land `D` early.
+        pub(super) fn inward_at_zero(
+            rec: BranchRecord,
+            offset: LeaseOffset,
+        ) -> Result<StoredRecord, FerroError> {
+            if offset.0 != 0 {
+                return Err(FerroError::Branch(format!(
+                    "refusing to write {} into stored time at a lease offset of {} ms: the only \
+                     production door from a lease-clock record opens at D = 0 (a new catalog), \
+                     because a record decoded from the tree reaches here already in stored time and \
+                     would be written back {} ms early",
+                    rec.branch_id, offset.0, offset.0
+                )));
+            }
+            Ok(StoredRecord(rec))
+        }
+        /// A lease-clock record, translated for writing. **Test-only since the D198 re-review
+        /// (R2)**: its one production use was the door `inward_at_zero` now guards.
+        #[cfg(test)]
         pub(super) fn inward(mut rec: BranchRecord, offset: LeaseOffset) -> StoredRecord {
             rec.lease_deadline = LeaseDeadline(StoredDeadline::inward(rec.lease_deadline, offset).0);
             StoredRecord(rec)
@@ -427,8 +479,11 @@ pub struct TableBranchCatalog {
     /// Stored deadlines are VIRTUAL, `v = lease − D`; everything this catalog hands out is on the
     /// lease clock, `v + D` (both saturating). So one `D += downtime` at a restart extends every
     /// lease there is, with no record rewritten — Chubby's stopped timer done as arithmetic. The
-    /// translation lives in the private module [`stored`], whose types make an untranslated path a
-    /// compile error rather than a lease reaped `D` early.
+    /// translation lives in the private module [`stored`], whose types make the untranslated paths
+    /// the D198 reviews enumerated either a compile error (`core()`/`hydrate()` values handed out
+    /// raw, an integer offset, a raw-decoded record reaching a writer through `Writable`) or a
+    /// refusal (`StoredRecord::inward_at_zero` at `D > 0`). What still compiles is listed, each with
+    /// the behavioural test that kills it, in `bench/lease_grace/PREREG.md` (M24r, M24c, M25b).
     ///
     /// Durable in the `[0x08]` key beside the last-alive mark, and loaded at `open`. A catalog that
     /// has never had one reads `D = 0`, which makes every stored deadline mean exactly what it meant
@@ -441,6 +496,12 @@ pub struct TableBranchCatalog {
     /// expiry question until it has: the downtime since the mark is not credited yet, and every
     /// answer would charge it. See [`TableBranchCatalog::refuse_unresumed`].
     resumed: AtomicBool,
+    /// **The FirstStart policy's evidence**: when this catalog's file was last written before this
+    /// process opened it, in unix milliseconds — or, for a catalog migrated from a legacy
+    /// `.branches` log, when that SOURCE was. `None` for a fresh file, a catalog built over a
+    /// caller's pool (`create` / `open`), or an unreadable mtime; a first start then credits
+    /// nothing, as before the policy. Read only by `resume_leases`, and only when no mark exists.
+    file_mtime: Option<u64>,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -451,6 +512,15 @@ const HEADER_PAGE_MAGIC: u32 = 0xFE44_0B01;
 /// what `BufferPoolManager::new_page` hands out first on a fresh file. Fixed rather than recorded
 /// elsewhere, because a file holding only the catalog needs no second place to look.
 pub const SIDECAR_HEADER_PAGE: u32 = 1;
+
+/// A file's last modification, in unix milliseconds, or `None` if it cannot be read. The
+/// FirstStart policy's evidence (see `TableBranchCatalog::file_mtime`); `None` means no credit,
+/// which is how every first start behaved before the policy.
+fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_millis()).ok()
+}
 
 impl TableBranchCatalog {
     /// Create a catalog and a **header page whose own id never changes**, returning that id.
@@ -537,10 +607,22 @@ impl TableBranchCatalog {
     /// The second buffer pool is the honest cost: a second frame budget, real memory. It is also
     /// what keeps the residency win — a bounded pool is bounded whichever file it is over.
     pub fn open_sidecar(path: &std::path::Path, trunk_root: PageId) -> Result<Self, FerroError> {
+        Self::open_sidecar_at(path, trunk_root, None)
+    }
+
+    /// [`Self::open_sidecar`], with the FirstStart policy's evidence (`file_mtime`) either read
+    /// from `path` itself or, for a migration, handed in as the SOURCE log's.
+    fn open_sidecar_at(
+        path: &std::path::Path,
+        trunk_root: PageId,
+        source_mtime: Option<u64>,
+    ) -> Result<Self, FerroError> {
         // Decided BEFORE the file is touched: `DiskManager::new` writes the bitmap into an empty
         // file, so afterwards the length no longer distinguishes a new catalog from an existing
         // one, and a fresh `create` over a populated file would silently orphan every branch.
         let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+        // Read before anything below can write it: after the open, the mtime is this process's.
+        let own_mtime = if fresh { None } else { file_mtime_millis(path) };
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -568,7 +650,9 @@ impl TableBranchCatalog {
             }
             Ok(cat)
         } else {
-            Self::open_from_header(pool, SIDECAR_HEADER_PAGE)
+            let mut cat = Self::open_from_header(pool, SIDECAR_HEADER_PAGE)?;
+            cat.file_mtime = source_mtime.or(own_mtime);
+            Ok(cat)
         }
     }
 
@@ -597,14 +681,21 @@ impl TableBranchCatalog {
         if has(&cat_path) {
             // Finished, whatever else is lying around. If a crash landed between the two renames
             // the legacy log is still here and is now stale; retire it rather than leave two
-            // catalogs where a later reader might pick the wrong one.
+            // catalogs where a later reader might pick the wrong one. Its mtime is still the
+            // SOURCE's, which is the FirstStart policy's evidence, so it is read first.
+            let mut source_mtime = None;
             if has(&legacy_path) {
+                source_mtime = file_mtime_millis(Path::new(&legacy_path));
                 let _ = std::fs::rename(&legacy_path, &retired_path);
             }
-            return Self::open_sidecar(Path::new(&cat_path), trunk_root);
+            return Self::open_sidecar_at(Path::new(&cat_path), trunk_root, source_mtime);
         }
 
         if has(&legacy_path) {
+            // The FirstStart policy's evidence is the SOURCE's last write: the migrated file is
+            // written now and says nothing about the outage before it. Read before the log is
+            // opened.
+            let source_mtime = file_mtime_millis(Path::new(&legacy_path));
             // A previous attempt may have died partway; its tmp is garbage by construction.
             let _ = std::fs::remove_file(&tmp_path);
             {
@@ -636,7 +727,7 @@ impl TableBranchCatalog {
             // Only now is the log redundant.
             std::fs::rename(&legacy_path, &retired_path)
                 .map_err(|e| FerroError::Io(format!("retire {legacy_path}: {e}")))?;
-            return Self::open_sidecar(Path::new(&cat_path), trunk_root);
+            return Self::open_sidecar_at(Path::new(&cat_path), trunk_root, source_mtime);
         }
 
         Self::open_sidecar(Path::new(&cat_path), trunk_root)
@@ -683,7 +774,7 @@ impl TableBranchCatalog {
             // `full` came out of the source on ITS lease clock, so it goes in through `inward` —
             // an identity here, because `cat` is brand new and its offset is 0, but a translation
             // by type rather than by that argument.
-            cat.write_record(&cat.inward(full), old.as_ref())?;
+            cat.write_record(&StoredRecord::inward_at_zero(full, cat.offset())?, old.as_ref())?;
         }
         for (parent, epoch, child) in children {
             cat.attach_child(parent, epoch, child)?;
@@ -840,10 +931,14 @@ impl TableBranchCatalog {
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
+            file_mtime: None,
         };
         // Through `inward` like every other write, although the offset of a new catalog is 0 and
         // `TRUNK_LEASE` is the sentinel, a fixed point either way.
-        let trunk = cat.inward(BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE));
+        let trunk = StoredRecord::inward_at_zero(
+            BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE),
+            cat.offset(),
+        )?;
         cat.tree.insert(keys::record(trunk.branch_id().id), trunk.serialize_core())?;
         cat.tree.insert(keys::state(trunk.state().as_u8(), trunk.branch_id().id), Vec::new())?;
         // Trunk is deliberately absent from the DEADLINE span: it is excluded from every reap
@@ -870,6 +965,7 @@ impl TableBranchCatalog {
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
+            file_mtime: None,
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -1329,11 +1425,21 @@ impl TableBranchCatalog {
                 "this branch catalog has a last-alive mark, so a lease authority has run over it, \
                  but it has not resumed its lease clock in this process: the downtime since that \
                  mark is not credited yet, and an expiry answer now would charge it to every \
-                 lease. Call resume_leases (LeaseThread::start does) before asking"
+                 lease. Start a LeaseThread over it (LeaseThread::start resumes the clock, then \
+                 records a last-alive mark on every scan and at stop). A bare resume_leases without \
+                 those heartbeats leaves this process's whole uptime to be credited as downtime by \
+                 the next start, which revives leases this process saw expire"
                     .into(),
             ));
         }
         Ok(())
+    }
+
+    /// Whether any `Live`, non-trunk lease exists: the DEADLINE index's first key, one descent.
+    /// The FirstStart policy credits only a catalog that has a lease to protect.
+    fn holds_a_live_lease(&self) -> Result<bool, FerroError> {
+        let (lo, hi) = keys::whole_group(keys::tag::DEADLINE);
+        Ok(self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?.next().transpose()?.is_some())
     }
 
     /// `D`, the virtual lease clock's offset. See [`TableBranchCatalog::lease_offset`].
@@ -1364,10 +1470,6 @@ impl TableBranchCatalog {
         core.outward(self.offset())
     }
 
-    /// A lease-clock record, translated for writing. See [`stored::Writable`].
-    fn inward(&self, rec: BranchRecord) -> StoredRecord {
-        StoredRecord::inward(rec, self.offset())
-    }
 
     /// Live branches, for parity with `LogBranchCatalog::live_count`.
     pub fn live_count(&self) -> Result<usize, FerroError> {
@@ -1977,8 +2079,13 @@ impl BranchCatalog for TableBranchCatalog {
         // Deadlines that had already run out before the mark are shifted too, and stay expired:
         // `v + D_old <= mark` gives `v + D_old + (now − mark) <= now`.
         let _g = self.logical.lock().unwrap();
-        // The arithmetic, D206's clamp on the offset included, is `AliveState::resume`'s.
-        let (outcome, next) = AliveState::resume(self.alive_record()?, now_millis);
+        // The arithmetic, D206's clamp on the offset included, is `AliveState::resume`'s. The
+        // FirstStart policy's evidence goes in only when there is no mark AND a live lease to
+        // protect: a catalog with nothing to reap must not have its `D` moved at all.
+        let prev = self.alive_record()?;
+        let file_mtime =
+            if prev.is_none() && self.holds_a_live_lease()? { self.file_mtime } else { None };
+        let (outcome, next) = AliveState::resume(prev, now_millis, file_mtime);
         // The new mark and the new offset are ONE key in ONE write. Split, a crash between them
         // leaves the old mark beside the new offset, and the next start credits the same outage
         // a second time.
@@ -3937,6 +4044,27 @@ mod f1_lease_grace {
             "expired_before walked {examined} DEADLINE rows to answer {answered}: its span is wider \
              than its answer, which with D above every lease is the whole index on every scan (M3)"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **M34's killer (D198 re-review, R2).** The one production door from a lease-clock record
+    /// into stored time must refuse at any `D` but 0, and open at 0 — forced to fire both ways.
+    #[test]
+    fn the_production_inward_door_refuses_once_the_offset_is_not_zero() {
+        let path = sidecar("inward-door");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        let rec = c.get_raw(b.id).unwrap();
+        assert!(
+            StoredRecord::inward_at_zero(rec.clone(), c.offset()).is_ok(),
+            "control: at D = 0 the door must open, or create and migrate_from cannot write"
+        );
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+        match StoredRecord::inward_at_zero(rec, c.offset()) {
+            Ok(_) => panic!("the production inward door opened at D = 3000 (M34)"),
+            Err(e) => assert!(e.to_string().contains("3000 ms"), "{e}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 

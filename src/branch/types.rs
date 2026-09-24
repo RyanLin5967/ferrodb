@@ -303,6 +303,16 @@ pub enum LeaseResume {
     /// grace. The downtime before this start cannot be measured, so nothing was extended; the mark
     /// is now `now_millis`, and every later start is measured from marks.
     FirstStart { now_millis: u64 },
+    /// **The FirstStart policy (lead, SCALE-DESIGN "D198 addendum — the FirstStart policy").** No
+    /// mark had been recorded, but the catalog holds a live lease and its file says when its last
+    /// writer last wrote it: `file_mtime`, in unix milliseconds — for a catalog migrated from a
+    /// legacy `.branches` log, the SOURCE log's. `D` starts at `credited_millis = now_millis −
+    /// file_mtime` instead of 0. The last writer was alive when it wrote, so `file_mtime <=` its
+    /// last moment alive and the credit can only exceed the true outage: longer leases, never an
+    /// early reap. This closes the one outage D198 still charged — the first start after an upgrade
+    /// from a build without the mark, after a legacy migration, or over a catalog an embedder served
+    /// without a lease thread.
+    FirstStartFromFileTime { now_millis: u64, file_mtime: u64, credited_millis: u64 },
     /// The clock was resumed. `downtime_millis` is `now_millis - last_alive`, saturating at zero
     /// when the lease clock reads earlier than the mark (the wall clock stepped back between
     /// processes: every deadline then already has more time than it had, and nothing moves

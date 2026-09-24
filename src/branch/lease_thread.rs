@@ -936,6 +936,12 @@ fn lease_resume_report(r: LeaseResume) -> String {
              downtime credited in total, no record rewritten), so a lease that lapsed only while \
              nothing was running is kept for what it had left (Chubby §2.9)"
         ),
+        LeaseResume::FirstStartFromFileTime { now_millis, file_mtime, credited_millis } => format!(
+            "lease: no last-alive mark in this catalog yet, but it holds live leases and its file \
+             was last written at {file_mtime}; crediting {credited_millis}ms since then as downtime \
+             (now {now_millis}), so a lease that lapsed only while nothing was running is kept for \
+             what it had left. The file time can only over-credit, never charge"
+        ),
         LeaseResume::FirstStart { now_millis } => format!(
             "lease: no last-alive mark in this catalog yet, so the downtime before this start \
              cannot be measured and no lease was extended; marking {now_millis}, and every later \

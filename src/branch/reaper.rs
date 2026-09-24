@@ -873,11 +873,18 @@ impl TwoTierReaper {
     /// a lock the caller is holding. The old whole-sweep atomicity is not needed for that — only
     /// per-branch atomicity is, which is all this takes.
     ///
-    /// It adds no second opinion about anything [`Reaper::reap`] already decides. Generation,
-    /// trunk and already-reaped are `reap`'s to judge and are left to it; duplicating them here
-    /// would be a second predicate to drift, and the one that is easier to test would mask the one
-    /// that ships. The single new question is the deadline, and it is asked because the removed
-    /// lock is what used to answer it.
+    /// ⚠ **This used to say it "adds no second opinion" about anything [`Reaper::reap`] decides —
+    /// generation, trunk and already-reaped left to `reap`, because a second predicate drifts and
+    /// the easier-to-test one masks the one that ships. C2b (D198) made that false, on purpose.**
+    /// The re-check now asks `BranchCatalog::enforced_lease`, the refused predicate, and that call
+    /// runs `check_readable` (a stale generation or a `Reaping`/`Reaped` record is refused here) and
+    /// answers `None` for trunk and a quarantined branch. So on THIS path `reap`'s own generation
+    /// refusal is reached only by a record that changes between the two reads; the masking the old
+    /// sentence warned about is real, and it is accepted because the alternative — deciding expiry
+    /// from a read the catalog does not refuse — let an unresumed catalog reap on an uncredited
+    /// clock. `reap`'s `Branch` arm stays covered where the re-check passes: `lease_thread`'s D127
+    /// tests (a decorator that refuses inside `reap`) and `reap_is_idempotent_and_a_stale_handle_is_refused`,
+    /// which calls `reap` directly.
     pub(crate) fn reap_if_still_expired(
         &self,
         branch: BranchId,
@@ -2472,6 +2479,11 @@ mod tests {
         // ARM 4 — the record reads fine but `reap` itself refuses (`reap`'s `Branch` arm). This
         // is the site D124's `Corrupt` arrives at from `has_live_children`; a stale generation is
         // the same arm reached without a corrupt catalog.
+        // ⚠ Since C2b (D198) the stale handle is refused one step EARLIER, by the re-check's
+        // `enforced_lease` (`check_readable`), so this arm now exercises the re-check's `Branch`
+        // arm, as ARM 3 does, and no longer reaches `reap`'s. The outcome it asserts is unchanged.
+        // `reap`'s `Branch` arm is covered by `lease_thread`'s D127 tests and by
+        // `reap_is_idempotent_and_a_stale_handle_is_refused`.
         let live = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
         write_pages(&h, live, 2);
         let stale = live.bump();
