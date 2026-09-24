@@ -5774,13 +5774,35 @@ impl AgentRuntime {
         // is what scopes this to a parent that is still readable — the behaviour this path has
         // today. A reaped parent's stale entries are the reaper's business (`detach_from_parent`,
         // which cascades); this is the reaper-less fallback and does not take that on.
+        //
+        // ⛔ **D201 — this used to detach FIRST and unconditionally**, which was wrong twice:
+        // 1. **Detaching a branch that still has live children is D16's interior-prune loss.**
+        //    Its entry is the only thing that makes its parent keep pinning the pages its
+        //    children read through their inherited roots. With a page store, the parent's pages
+        //    at this branch's fork epoch became reclaimable under a live grandchild. The reaper
+        //    asks first (`detach_from_parent`); this arm never did.
+        // 2. **Detaching before the mark is D3's unsafe window.** A crash between the two leaves a
+        //    branch reading Live with no entry. `reap` marks first and a test pins that order
+        //    (`reap_marks_a_branch_reaped_before_detaching_it_from_its_parent`); this arm had the
+        //    reverse.
+        // So: mark, then detach only a branch with nothing alive below it. A branch that still
+        // has live children stays attached as a reaped pin, exactly as a reaped interior does
+        // under the reaper, and its entry resolves to "not a pin" once they are gone.
+        //
+        // Not made unrepresentable, and why: `git grep` at `d04aeeb` finds 43 `with_storage` /
+        // `reopen_with_storage` call lines in 29 files (tests and examples, mostly) against 7
+        // `with_reaper` calls in 6 files. Forcing a reaper into the constructors would rewrite
+        // most of those sites, each needing a concrete `ArenaPageStore`, for a latent defect; the
+        // arm is made safe instead. Red test: `tests/d201_reaperless_seal_keeps_the_pin.rs`.
         let record = self.branches.get(branch)?;
-        if let Some(parent) = record.parent_id {
-            if self.branches.get(parent).is_ok() {
-                self.branches.detach_child(parent.id, record.fork_epoch)?;
+        self.branches.set_state(branch, record.state, BranchState::Reaped)?;
+        if !self.branches.has_live_children(branch.id)? {
+            if let Some(parent) = record.parent_id {
+                if self.branches.get(parent).is_ok() {
+                    self.branches.detach_child(parent.id, record.fork_epoch)?;
+                }
             }
         }
-        self.branches.set_state(branch, record.state, BranchState::Reaped)?;
         // **D103 — attested after the state change lands**, for the same reason the merge entry is
         // appended after its commit: a record of a reap that did not happen is worse than none.
         // The entry seals this branch's chain, and it carries whether the branch's writes were
