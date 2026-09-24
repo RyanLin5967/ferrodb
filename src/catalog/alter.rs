@@ -1165,4 +1165,42 @@ mod tests {
             "finish REPLACED the primary cell, so a statement holding the old one keeps a private root (D53)"
         );
     }
+
+    /// **F1 of the D208 review — `finish` leaves a primary cell that is already AHEAD of the record.**
+    ///
+    /// The record can lag the cell, as `Catalog::sync_root_cells`'s own doc says. An INSERT whose
+    /// primary upsert splits the root stores the new root into the cell at once (the root split in
+    /// `index.rs`). The record catches up only at `sync_roots`, which runs after the secondary and
+    /// full-text maintenance. If that maintenance fails, the statement returns before `sync_roots`
+    /// and the record stays behind. `plan_alters` plans from the record, the rewrite cannot move the
+    /// root (see U1 above), and so `finish` is handed that stale root back. An unconditional store
+    /// regressed every handle onto it, and a latched write from a stale root lands keys in the
+    /// wrong leaf.
+    ///
+    /// ⚠ **A UNIT test**, like U1. The lagging record is set up directly: no test can fail an INSERT
+    /// between its primary upsert and its `sync_roots` on demand. FAILS at `f612ba8` (INFERRED) at
+    /// the assertion below.
+    #[test]
+    fn finish_leaves_a_primary_cell_that_is_already_ahead_of_the_record() {
+        let file = tempfile::tempfile().unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let schema = Schema::new(vec![Column { name: "id".into(), data_type: DataType::Integer, nullable: false }]);
+        catalog.create_table("t".into(), schema.clone()).unwrap();
+        let cell = catalog.root_cell("t", None).expect("CREATE TABLE seeds the primary cell");
+        let recorded = catalog.get_table("t").unwrap().primary_index_root;
+        // A split the record has not caught up with: the cell names a real second tree's root.
+        let ahead = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap().root_page_id.load(Ordering::SeqCst);
+        assert_ne!(ahead, recorded, "premise failed: the cell cannot be ahead of the record at the same page");
+        cell.store(ahead, Ordering::SeqCst);
+
+        // The rewrite moved nothing, so it hands back the root it was planned from.
+        catalog.finish("t", schema, recorded, None).unwrap();
+
+        assert_eq!(
+            cell.load(Ordering::SeqCst),
+            ahead,
+            "finish regressed the shared primary cell to a stale record, so every handle now descends from a root a split has moved past"
+        );
+    }
 }

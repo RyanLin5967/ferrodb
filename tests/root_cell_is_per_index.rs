@@ -55,6 +55,7 @@ use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::planner::plan::explain;
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::recovery::rebuild_indexes;
 use ferrodb::wal::txn::TxnManager;
@@ -314,37 +315,61 @@ fn an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree() 
 }
 
 /// **D215 — SEARCH descends the SHARED full-text cell, so a reader's cached catalog snapshot still
-/// finds a row whose posting moved in a root split.**
+/// finds a row whose posting moved far right of the page the snapshot recorded.**
 ///
 /// D53's contract, in `Catalog::epoch`'s doc: a reader re-takes its snapshot only when the schema
 /// epoch moves; a root move does not move it; and "a snapshot whose recorded root is stale is
 /// still correct — `open_table` reads the cell, not the record". SEARCH read the RECORD
 /// (`open_posting_tree(ft_root, ..)`, a private cell). After a root split the recorded page is the
-/// LEFTMOST leaf, which keeps the left half, and `postings_for_token` scans from there, reaches the
-/// next leaf, meets a smaller token and stops (`if tok != want { break }`).
+/// LEFTMOST leaf, and every later split in this fixture adds a leaf between it and `zulu`'s.
+///
+/// **The drift must beat D58's right walk, or this cannot fail.** `read_leaf_for` walks right from
+/// the leaf it lands on while the leaf tops out below the key, up to `RIGHT_WALK` = 64 hops
+/// (`index.rs`), so a stale root one leaf short of the key is repaired. The first version of this
+/// test stopped at the first split, one hop, and the fresh-context review showed it could not go
+/// red (`frontier/d208_review.md` F2). So the fixture grows until the walk from the recorded page to
+/// `zulu`'s leaf takes MORE than 64 hops, counted by `hops_from` with the walk's own stopping rule,
+/// and asserts that as a premise. Past the bound the optimistic descent restarts and falls back to
+/// the latched one, which does not walk right. The scan then starts on the recorded page past its
+/// end, moves to the next leaf, meets an `aNNNNNNN` token, and stops (`if tok != want { break }`).
 ///
 /// ⚠ Not reachable through a server TODAY: `executor::try_run_read` serves only `EXPLAIN` and
 /// `SELECT`, so SEARCH runs under the exclusive catalog lock on the live catalog, whose record is
 /// current at every statement boundary. This drives SEARCH against a snapshot directly, which is
-/// the position the shared read path puts every statement it serves in. FAILS before D215's fix
-/// (INFERRED) at the snapshot's search, with `[]` against `[0]`.
+/// the position the shared read path puts every statement it serves in.
+///
+/// Its red phase is a MUTANT run, not a commit. The fix predates this fixture, and K16/K17 put
+/// SEARCH back on the record. Expected there (INFERRED): it fails at the snapshot's search with
+/// `[]` against `[0]`.
 #[test]
 fn search_through_a_cached_snapshot_finds_a_row_after_a_posting_root_split() {
+    // `read_leaf_for`'s `RIGHT_WALK` in `src/storage/index.rs`, which is private. If it grows, this
+    // premise must grow with it, or the snapshot's search is rescued and the mutants survive.
+    const RIGHT_WALK: usize = 64;
+    // Distinct tokens posted per row. Every one sorts before `zulu` and after every token of the
+    // row before, so each split happens in `zulu`'s leaf and leaves one more leaf behind it.
+    const WORDS_PER_ROW: i32 = 200;
+    let zulu = (Value::Varchar("zulu".into()), Value::Null);
+
     let mut d = Db::new();
-    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(2000));");
     d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
     let mut snapshot = d.catalog.clone();
     let recorded = d.record_roots("body").1.expect("premise failed: no full-text record");
 
-    // `zulu` sorts after every `aNNNNN`, so the first split leaves it in the RIGHT half, away from
-    // the page the snapshot recorded.
     d.rows("INSERT INTO t VALUES (0, 'zulu');");
     let mut id = 1;
-    while d.record_roots("body").1 == Some(recorded) {
-        assert!(id <= 5000, "premise failed: 5000 postings never split the posting tree's root");
-        d.rows(&format!("INSERT INTO t VALUES ({id}, 'a{id:05}');"));
+    while hops_from(&d, recorded, &zulu) <= RIGHT_WALK {
+        assert!(id <= 400, "premise failed: 400 rows of {WORDS_PER_ROW} postings never put {RIGHT_WALK} leaves between the recorded page and `zulu`");
+        let words: Vec<String> = (0..WORDS_PER_ROW).map(|j| format!("a{:07}", id * WORDS_PER_ROW + j)).collect();
+        d.rows(&format!("INSERT INTO t VALUES ({id}, '{}');", words.join(" ")));
         id += 1;
     }
+    assert!(
+        hops_from(&d, recorded, &zulu) > RIGHT_WALK,
+        "premise failed: the right walk from the recorded page reaches `zulu` within {RIGHT_WALK} hops, so a stale root is repaired and this cannot fail"
+    );
+    assert_ne!(d.record_roots("body").1, Some(recorded), "premise failed: the posting root never moved");
     assert_eq!(
         snapshot.epoch(),
         d.catalog.epoch(),
@@ -360,8 +385,23 @@ fn search_through_a_cached_snapshot_finds_a_row_after_a_posting_root_split() {
     assert_eq!(
         d.ids_against(&mut snapshot, "SEARCH t (body) FOR 'zulu';"),
         vec![0],
-        "a cached snapshot's SEARCH descended its recorded root, the pre-split leftmost leaf, and missed the row"
+        "a cached snapshot's SEARCH descended its recorded root, more than {RIGHT_WALK} leaves left of `zulu`, and missed the row"
     );
+}
+
+/// Leaves the B-link walk crosses from the leaf `from` to the leaf that can hold `key`: it steps
+/// right while a leaf's largest key is below `key` (or it is empty), which is `descend_optimistic`'s
+/// own stopping rule. Read through a private handle on the committed pages; nothing is written.
+fn hops_from(d: &Db, from: u32, key: &(Value, Value)) -> usize {
+    let tree = BPlusTreeManager::<(Value, Value), ()>::open(from, d.bp.clone());
+    let mut leaf = tree.read_leaf(from).expect("the recorded root is a leaf");
+    let mut hops = 0;
+    while leaf.key_arr.last().is_none_or(|max| max < key) {
+        let next = leaf.next.expect("the leaf chain ended before any leaf could hold the key");
+        leaf = tree.read_leaf(next).expect("a page on the leaf chain is a leaf");
+        hops += 1;
+    }
+    hops
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -509,4 +549,64 @@ fn a_rename_carries_both_kinds_cells_to_the_new_name() {
     let (btree_record, fulltext_record) = d.record_roots("b");
     assert_eq!(Some(btree.load(Ordering::SeqCst)), btree_record, "the moved B-tree cell does not name the renamed index's tree");
     assert_eq!(Some(fulltext.load(Ordering::SeqCst)), fulltext_record, "the moved full-text cell does not name the renamed index's tree");
+}
+
+/// **F4 of the D208 review: a CREATE installs a FRESH cell for the key it creates; it never inherits
+/// one a dead tree left behind.** One test per creator, so each mutant's kill is attributable.
+///
+/// `sync_root_cells` never overwrites, and retires a dead key only when it runs. `drop_table`
+/// returns at its `persist()?` before its sync, so a DROP whose persist failed leaves the dead
+/// tree's cell under the key. A CREATE of the same key then kept that cell and descended a FREED
+/// tree. Each test removes a record the way that DROP leaves it (gone from `tables`, no sync), then
+/// creates the same key again. The dead tree's pages are not freed here, so the new tree lands on
+/// new pages, and the premise says so.
+///
+/// FAIL at `f612ba8` (INFERRED) at the `ptr_eq`: the create's sync keeps the dead `Arc`.
+fn assert_fresh(dead: &Arc<std::sync::atomic::AtomicU32>, fresh: &Arc<std::sync::atomic::AtomicU32>, record: Option<u32>, what: &str) {
+    assert_ne!(record, Some(dead.load(Ordering::SeqCst)), "premise failed: the new {what} landed on the dead tree's root page");
+    assert!(!Arc::ptr_eq(dead, fresh), "the new {what} inherited the dead tree's cell, so it descends a tree the catalog no longer records");
+    assert_eq!(Some(fresh.load(Ordering::SeqCst)), record, "the new {what}'s cell does not name its own tree");
+}
+
+#[test]
+fn a_create_index_never_inherits_a_cell_left_under_its_key() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.rows("CREATE INDEX ib ON t (body);");
+    let dead = d.cell(IndexTree::Secondary("body"));
+    d.catalog.tables.get_mut("t").unwrap().indexes.clear();
+
+    d.rows("CREATE INDEX ib2 ON t (body);");
+
+    assert_fresh(&dead, &d.cell(IndexTree::Secondary("body")), d.record_roots("body").0, "B-tree index");
+}
+
+#[test]
+fn a_create_fulltext_index_never_inherits_a_cell_left_under_its_key() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    let dead = d.cell(IndexTree::FullText("body"));
+    d.catalog.tables.get_mut("t").unwrap().fulltext_indexes.clear();
+
+    d.rows("CREATE FULLTEXT INDEX fb2 ON t (body);");
+
+    assert_fresh(&dead, &d.cell(IndexTree::FullText("body")), d.record_roots("body").1, "full-text index");
+}
+
+#[test]
+fn a_create_table_never_inherits_a_cell_left_under_its_key() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    let dead = d.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+    d.catalog.tables.remove("t");
+
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+
+    let fresh = d.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+    let record = d.catalog.get_table("t").map(|e| e.primary_index_root);
+    assert_fresh(&dead, &fresh, record, "table's primary index");
 }
