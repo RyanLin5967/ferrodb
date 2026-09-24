@@ -1443,6 +1443,10 @@ fn a_pump_after_an_alter_does_not_silently_truncate_the_row() {
 ///
 /// The pin is what makes this test not vacuous — a first version without one passed against the
 /// unfixed code, because an advancing base pruned the history for free.
+///
+/// ⚠ Since D234 a checkpoint that the pin keeps from truncating re-appends nothing, so the repeats
+/// this test was built to feed no longer arrive and it holds with or without `collapse_repeats`.
+/// `tests/d234_decoder_history_still_collapses.rs` feeds them by hand.
 #[test]
 fn the_decoders_history_does_not_grow_with_every_checkpoint() {
     use std::sync::atomic::Ordering;

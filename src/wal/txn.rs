@@ -2261,11 +2261,13 @@ use super::*;
     /// the log, by every declaration: O(M) per checkpoint, O(M²) over a pinned period, and all of it
     /// replayed by recovery. One committed transaction per round stands in for real work, and the
     /// range the pinned checkpoints wrote must hold no declaration at all. Then the pin is released,
-    /// and the next checkpoint must truncate and re-declare every run; otherwise "re-declares
-    /// nothing" would pass against a checkpoint that simply lost the runs.
+    /// and the next checkpoint must truncate and re-declare every run and the table; otherwise
+    /// "re-declares nothing" would pass against a checkpoint that simply lost them. The table is
+    /// there so the DDL half is held to the rule separately from the run half (the D234
+    /// adversary's F1: with no table, `replay_schema` appended nothing either way).
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the pinned-range assertion (every
-    /// round re-appends all 40 declarations).
+    /// round re-appends all 40 run declarations and the table's).
     #[test]
     fn a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing() {
         const RUNS: u32 = 40;
@@ -2279,11 +2281,22 @@ use super::*;
         for prov in 1..=RUNS {
             txn.declare_run(a_run(prov, &format!("agent-{prov}"))).unwrap();
         }
+        txn.log_ddl(DdlRecord {
+            op: DdlOp::CreateTable,
+            table: "t".into(),
+            dir_root: 7,
+            time_travel_root: 8,
+            columns: vec![("id".into(), DataType::Integer, false)],
+        })
+        .unwrap();
         txn.checkpoint().unwrap();
+        let tables = |recs: &[LogRecord]| {
+            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::Ddl { .. })).count()
+        };
         assert_eq!(
-            declarations(walk_log(&wal).as_slice()),
-            RUNS as usize,
-            "premise failed: the unpinned checkpoint did not declare every run"
+            (declarations(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize + 1, 1),
+            "premise failed: the unpinned checkpoint did not declare every run and the table"
         );
 
         let pin = wal.pin_durable();
@@ -2298,11 +2311,12 @@ use super::*;
         let written: Vec<LogRecord> = walk_log(&wal).into_iter().filter(|r| r.lsn >= before).collect();
         assert!(!written.is_empty(), "premise failed: the rounds wrote nothing, so there is no range to inspect");
         assert_eq!(
+            (declarations(written.as_slice()), tables(written.as_slice())),
+            (0, 0),
+            "{ROUNDS} checkpoints under a held pin re-appended {} declarations, {} of them DDL ({} bytes of \
+             log in all), and the kept log already held every one",
             declarations(written.as_slice()),
-            0,
-            "{ROUNDS} checkpoints under a held pin re-appended {} declarations ({} bytes of log in all), \
-             and the kept log already held every one",
-            declarations(written.as_slice()),
+            tables(written.as_slice()),
             wal.next_lsn.load(Ordering::SeqCst) - before
         );
 
@@ -2313,9 +2327,9 @@ use super::*;
             "premise failed: with the pin released the checkpoint still did not truncate"
         );
         assert_eq!(
-            declarations(walk_log(&wal).as_slice()),
-            RUNS as usize,
-            "the first checkpoint after the pin was released did not re-declare every run"
+            (declarations(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize + 1, 1),
+            "the first checkpoint after the pin was released did not re-declare every run and the table"
         );
     }
 }
