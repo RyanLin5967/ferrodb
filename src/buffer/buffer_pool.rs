@@ -1191,6 +1191,9 @@ impl BufferPoolManager {
             // `delete_page` or `free_page` removed the victim between the verdict and here.
             return Ok(Evicted::Gone);
         };
+        // Test seam (D237 review 3, R1): a unit test can park here, between the lookup and the
+        // latch. An empty stub outside tests; see `buffer::fault_hooks`.
+        crate::buffer::fault_hooks::between_evict_lookup_and_latch(self, victim);
 
         // Write-back under the victim's OWN latch. A read lock is what keeps `data` stable -- a
         // writer needs the write lock -- and it is the same lock discipline `flush_page` uses. IO
@@ -1216,6 +1219,7 @@ impl BufferPoolManager {
         // Re-verify and take it. The latch was released across the write-back, so the victim may
         // have been fetched, dirtied and unpinned again in between; `dirty` is checked as well as
         // the pin because that whole cycle can complete and leave the count back at zero.
+        crate::buffer::fault_hooks::before_evict_phase_2(self, victim);
         let mut pt = self.page_table.write().unwrap();
         let mut frame = self.frame_write(frame_i);
         if frame.page_id != Some(victim) || frame.freeing {
@@ -1933,7 +1937,10 @@ mod tests {
         });
         *FREE.lock().unwrap() = Some(FreePark { pool: address(bp), window_open: open_tx, resume: resume_rx });
 
-        let faulter = {
+        // Each thread sends its result instead of being joined, so a thread that never returns fails
+        // the test within `PATIENCE` instead of holding the run (D237 review 3, R5).
+        let (faulted_tx, faulted_rx) = channel();
+        {
             let bp = Arc::clone(bp);
             std::thread::spawn(move || {
                 let i = bp.fetch_page(faulted).unwrap();
@@ -1942,25 +1949,29 @@ mod tests {
                     (f.pin_counter.load(Ordering::Relaxed), f.data[0])
                 };
                 bp.unpin_page(faulted, false);
-                (i, pins, byte)
-            })
-        };
+                let _ = faulted_tx.send((i, pins, byte));
+            });
+        }
         arrived_rx.recv_timeout(PATIENCE).expect("the fault never reached its seam");
         // The claim scans from here, so the set's frames come first.
         bp.free_hint.store(0, Ordering::Relaxed);
-        let freer = {
+        let (freed_tx, freed_rx) = channel();
+        {
             let bp = Arc::clone(bp);
             let set = set.to_vec();
-            std::thread::spawn(move || bp.free_pages(&set))
-        };
+            std::thread::spawn(move || {
+                let _ = freed_tx.send(bp.free_pages(&set));
+            });
+        }
         open_rx.recv_timeout(PATIENCE).expect("free_pages never reached its seam");
         // The window: pass 1 is done and pass 2 has not begun.
         let probe_pinned = bp.pin_if_labelled(set_frames[0], set[0]).is_some();
         release_tx.send(()).unwrap();
         filled_rx.recv_timeout(PATIENCE).expect("the fault never filled its frame");
         resume_tx.send(()).unwrap();
-        let free_result = freer.join().unwrap();
-        let (fault_frame, fault_pins, fault_byte) = faulter.join().unwrap();
+        let free_result = freed_rx.recv_timeout(PATIENCE).expect("free_pages did not return within 10 s");
+        let (fault_frame, fault_pins, fault_byte) =
+            faulted_rx.recv_timeout(PATIENCE).expect("the fault did not return within 10 s");
         N1Run { free_result, set_frames, probe_pinned, fault_frame, fault_pins, fault_byte }
     }
 
@@ -2018,6 +2029,158 @@ mod tests {
             assert_eq!(first_byte(&bp, p), 0x10 + n as u8, "set page {p} does not read back its bytes after the refusal");
         }
         assert_eq!(first_byte(&bp, faulted), 0xAB, "the faulted page does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- D237 review 3, R1: an eviction whose victim a `free_pages` call is freeing ---------------
+
+    fn verdict_name(v: &Result<Evicted, FerroError>) -> String {
+        match v {
+            Ok(Evicted::Took(i)) => format!("Took({i})"),
+            Ok(Evicted::Declined) => "Declined".to_string(),
+            Ok(Evicted::Gone) => "Gone".to_string(),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    /// Run `evict_into(victim, incoming)` while `free_pages(set)` holds the set: the evictor parks
+    /// between its table lookup and its frame latch until pass 1 has marked the set, then reads the
+    /// frame while the mark is set. The free resumes only once the evictor has either answered or
+    /// reached phase 2 (where it waits for `page_table`), whichever this build does. Every wait is
+    /// bounded by `PATIENCE`. Returns the free's result and the eviction's verdict.
+    fn evict_during_free(
+        bp: &Arc<BufferPoolManager>,
+        set: &[u32],
+        victim: u32,
+        incoming: u32,
+    ) -> (Result<(), FerroError>, Result<Evicted, FerroError>) {
+        use crate::buffer::fault_hooks::{address, EvictPark, EvictPast, FreePark, EVICT, EVICT_PAST, FREE};
+        use std::sync::mpsc::{channel, TryRecvError};
+
+        let _serial = N1_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (arrived_tx, arrived_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (past_tx, past_rx) = channel();
+        let (open_tx, open_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        *EVICT.lock().unwrap() = Some(EvictPark { pool: address(bp), victim, arrived: arrived_tx, release: release_rx });
+        *EVICT_PAST.lock().unwrap() = Some(EvictPast { pool: address(bp), victim, past: past_tx });
+        *FREE.lock().unwrap() = Some(FreePark { pool: address(bp), window_open: open_tx, resume: resume_rx });
+
+        let (verdict_tx, verdict_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            std::thread::spawn(move || {
+                let _ = verdict_tx.send(bp.evict_into(victim, incoming));
+            });
+        }
+        arrived_rx.recv_timeout(PATIENCE).expect("evict_into never reached its seam");
+        let (free_tx, free_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            let set = set.to_vec();
+            std::thread::spawn(move || {
+                let _ = free_tx.send(bp.free_pages(&set));
+            });
+        }
+        open_rx.recv_timeout(PATIENCE).expect("free_pages never reached its seam");
+        // Pass 1 has marked the victim; the evictor now latches its frame and sees the mark.
+        release_tx.send(()).unwrap();
+        let started = std::time::Instant::now();
+        let mut early = None;
+        loop {
+            match verdict_rx.try_recv() {
+                Ok(v) => {
+                    early = Some(v);
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => panic!("the evicting thread panicked"),
+                Err(TryRecvError::Empty) => {}
+            }
+            if past_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(started.elapsed() < PATIENCE, "evict_into neither answered nor reached phase 2 within 10 s");
+            std::thread::yield_now();
+        }
+        resume_tx.send(()).unwrap();
+        let free_result = free_rx.recv_timeout(PATIENCE).expect("free_pages did not return within 10 s");
+        let verdict = match early {
+            Some(v) => v,
+            None => verdict_rx.recv_timeout(PATIENCE).expect("evict_into did not return within 10 s"),
+        };
+        // A build that answered in phase 1 never reached the phase-2 hook: disarm it, so no later
+        // pool at this address inherits it.
+        *EVICT_PAST.lock().unwrap() = None;
+        (free_result, verdict)
+    }
+
+    /// ⛔ **D237 review 3 R1, red first:** a victim that `free_pages` was freeing when the eviction
+    /// latched it, and that the call then REFUSED to free, is still resident. `evict_into` must not
+    /// call it `Gone`: the replacement policy removed it from its resident lists when it named it,
+    /// and a `Gone` verdict is not handed back, so the policy would stop counting a page that is
+    /// still in the pool, and its frame would never be a victim again. The set carries a page no
+    /// bitmap page maps, so pass 2 refuses. The victim was stamped, so it is dirty.
+    ///
+    /// Hand-worked: at the base the phase-1 check answers `Gone` while the mark is set. At the fix
+    /// phase 1 skips the write-back and phase 2 waits for the call, then sees the victim resident,
+    /// unpinned and dirty: `Declined`, which the caller hands back.
+    #[test]
+    fn a_victim_a_refused_free_was_freeing_is_not_reported_gone() {
+        let (bp, path) = n1_pool("evict-refused");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x20 + n as u8);
+        }
+        let victim = set[0];
+        let incoming = bp.disk_manager.allocate().unwrap();
+        let mut batch = set.clone();
+        batch.push((PAGE_SIZE as u32 - 4) * 8 * 4);
+
+        let (free_result, verdict) = evict_during_free(&bp, &batch, victim, incoming);
+
+        assert!(free_result.is_err(), "premise: the batch with an unmapped page was freed");
+        let resident = bp.page_table.read().unwrap().get(&victim).copied();
+        let frame = resident.expect("premise: the refused free left the victim resident");
+        assert_eq!(bp.frames[frame].read().unwrap().page_id, Some(victim), "premise: the victim's frame keeps its label");
+        assert!(
+            !matches!(verdict, Ok(Evicted::Gone)),
+            "evict_into reported Gone for page {victim}, which the refused free left resident in frame {frame}: \
+             the policy would stop counting a page that is still in the pool (verdict {})",
+            verdict_name(&verdict)
+        );
+        assert!(
+            matches!(verdict, Ok(Evicted::Declined)),
+            "the dirty victim {victim} was not declined: {}",
+            verdict_name(&verdict)
+        );
+        assert_table_consistent(&bp, "after the refused free and the eviction");
+        assert_eq!(first_byte(&bp, victim), 0x20, "the victim does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The other outcome, and the fix's guard in the other direction: when the call completes, the
+    /// victim it freed IS gone, and `evict_into` must say so rather than take a freed frame.
+    #[test]
+    fn a_victim_a_completed_free_took_is_reported_gone() {
+        let (bp, path) = n1_pool("evict-freed");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x30 + n as u8);
+        }
+        let victim = set[0];
+        let incoming = bp.disk_manager.allocate().unwrap();
+
+        let (free_result, verdict) = evict_during_free(&bp, &set, victim, incoming);
+
+        assert!(free_result.is_ok(), "premise: the set was not freed: {free_result:?}");
+        assert!(bp.page_table.read().unwrap().get(&victim).is_none(), "premise: the freed victim is still in the table");
+        assert!(
+            matches!(verdict, Ok(Evicted::Gone)),
+            "evict_into did not report Gone for page {victim}, which the free took: {}",
+            verdict_name(&verdict)
+        );
+        assert_table_consistent(&bp, "after the free and the eviction");
         let _ = std::fs::remove_file(path);
     }
 }

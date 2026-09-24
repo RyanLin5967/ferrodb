@@ -1,7 +1,8 @@
 //! Test-only seams in the buffer pool's fault path and in `BufferPoolManager::free_pages` (D237
 //! review 2, N1). They let a unit test park a fault between its replacement-policy verdict and its
 //! frame claim, and park `free_pages` between its pass 1 and pass 2, so the race N1 describes can be
-//! driven deterministically instead of by timing.
+//! driven deterministically instead of by timing. Two more (D237 review 3, R1) park `evict_into`
+//! between its table lookup and its frame latch, and report when it reaches phase 2.
 //!
 //! In a non-test build every function here is an empty `#[inline(always)]` stub, so the pool pays
 //! nothing. They live in their own file on purpose: `tests/lock_order_allowlist.rs` cuts
@@ -25,6 +26,12 @@ mod imp {
 
     #[inline(always)]
     pub(crate) fn between_pass_1_and_2(_pool: &BufferPoolManager) {}
+
+    #[inline(always)]
+    pub(crate) fn between_evict_lookup_and_latch(_pool: &BufferPoolManager, _victim: u32) {}
+
+    #[inline(always)]
+    pub(crate) fn before_evict_phase_2(_pool: &BufferPoolManager, _victim: u32) {}
 }
 
 #[cfg(test)]
@@ -52,8 +59,27 @@ mod imp {
         pub(crate) resume: Receiver<()>,
     }
 
+    /// Parks `evict_into(victim, ..)` on the pool at address `pool` between its `page_table` lookup
+    /// and its frame latch (D237 review 3, R1): it sends `arrived` and waits on `release`.
+    pub(crate) struct EvictPark {
+        pub(crate) pool: usize,
+        pub(crate) victim: u32,
+        pub(crate) arrived: Sender<()>,
+        pub(crate) release: Receiver<()>,
+    }
+
+    /// Tells the test that `evict_into(victim, ..)` on the pool at address `pool` got past phase 1,
+    /// that is, it is about to take `page_table` for phase 2. It does not park.
+    pub(crate) struct EvictPast {
+        pub(crate) pool: usize,
+        pub(crate) victim: u32,
+        pub(crate) past: Sender<()>,
+    }
+
     pub(crate) static FAULT: Mutex<Option<FaultPark>> = Mutex::new(None);
     pub(crate) static FREE: Mutex<Option<FreePark>> = Mutex::new(None);
+    pub(crate) static EVICT: Mutex<Option<EvictPark>> = Mutex::new(None);
+    pub(crate) static EVICT_PAST: Mutex<Option<EvictPast>> = Mutex::new(None);
 
     pub(crate) fn address(pool: &BufferPoolManager) -> usize {
         pool as *const BufferPoolManager as usize
@@ -89,6 +115,29 @@ mod imp {
         if let Some(f) = mine {
             let _ = f.window_open.send(());
             let _ = f.resume.recv();
+        }
+    }
+
+    pub(crate) fn between_evict_lookup_and_latch(pool: &BufferPoolManager, victim: u32) {
+        let mine = {
+            let mut armed = EVICT.lock().unwrap();
+            let hit = armed.as_ref().is_some_and(|e| e.pool == address(pool) && e.victim == victim);
+            if hit { armed.take() } else { None }
+        };
+        if let Some(e) = mine {
+            let _ = e.arrived.send(());
+            let _ = e.release.recv();
+        }
+    }
+
+    pub(crate) fn before_evict_phase_2(pool: &BufferPoolManager, victim: u32) {
+        let mine = {
+            let mut armed = EVICT_PAST.lock().unwrap();
+            let hit = armed.as_ref().is_some_and(|e| e.pool == address(pool) && e.victim == victim);
+            if hit { armed.take() } else { None }
+        };
+        if let Some(e) = mine {
+            let _ = e.past.send(());
         }
     }
 }
