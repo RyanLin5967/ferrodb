@@ -420,6 +420,8 @@ pub struct TableBranchCatalog {
     /// Keys REWRITTEN or REMOVED: every call to [`Self::upsert`] and [`Self::remove_if_present`].
     /// See [`TableBranchCatalog::key_rewrites`].
     key_rewrites: AtomicU64,
+    /// DEADLINE-index rows `expired_before` has walked. See [`TableBranchCatalog::expiry_rows_examined`].
+    expiry_rows_examined: AtomicU64,
     /// **D198 — the virtual lease clock's offset `D`: cumulative downtime credited, in ms.**
     ///
     /// Stored deadlines are VIRTUAL, `v = lease − D`; everything this catalog hands out is on the
@@ -733,6 +735,19 @@ impl TableBranchCatalog {
         self.key_rewrites.load(Ordering::Relaxed)
     }
 
+    /// DEADLINE-index rows `expired_before` has walked since this catalog was opened — an
+    /// **observing instrument** (D198 re-review, R1).
+    ///
+    /// `expired_before` asks the index for a span and then re-checks every row against the lease
+    /// clock. The re-check alone keeps the ANSWER right even when the span is far too wide, so a
+    /// span computed in the wrong time — raw `now` instead of `now − D` — returns exactly the right
+    /// branches while walking, once `D` exceeds every lease, the entire index on every 30-second
+    /// scan: the O(N) query `BranchCatalog::expired_before` exists to forbid. No answer can show
+    /// that; this count can. Every row the span yields is counted, whether or not it is answered.
+    pub fn expiry_rows_examined(&self) -> u64 {
+        self.expiry_rows_examined.load(Ordering::Relaxed)
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
@@ -821,6 +836,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             key_rewrites: AtomicU64::new(0),
+            expiry_rows_examined: AtomicU64::new(0),
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
@@ -850,6 +866,7 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             key_rewrites: AtomicU64::new(0),
+            expiry_rows_examined: AtomicU64::new(0),
             lease_offset: OffsetCell::new(),
             marked: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
@@ -1659,7 +1676,9 @@ impl BranchCatalog for TableBranchCatalog {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        for id in self.ids_in_span(lo, hi)? {
+        let ids = self.ids_in_span(lo, hi)?;
+        self.expiry_rows_examined.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        for id in ids {
             if let Some(rec) = self.core(id)? {
                 // The index holds only Live non-trunk branches, so this re-check is belt and
                 // braces against an index entry that outlived its record rather than a filter the
@@ -3886,6 +3905,38 @@ mod f1_lease_grace {
         assert_eq!(lease(&c, b), 4_500, "a set_state round trip moved the deadline");
         assert!(expired_ids(&c, 4_499).is_empty());
         assert_eq!(expired_ids(&c, 4_500), vec![b.id], "the DEADLINE key did not follow the record");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **M3's killer (D198 re-review, R1).** The per-row re-check in `expired_before` keeps its
+    /// answer right under a span computed in the wrong time, so no answer-level test can see M3. The
+    /// walk can: with `D` above every stored lease, a span in raw `now` covers the whole DEADLINE
+    /// index. Examined must equal answered.
+    #[test]
+    fn expired_before_examines_only_the_rows_it_answers_even_when_the_offset_exceeds_every_lease() {
+        let path = sidecar("examined");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        for _ in 0..5 {
+            c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        }
+        for _ in 0..20 {
+            c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap();
+        }
+        c.record_lease_alive(1_000).unwrap();
+        let big = 10_000_000;
+        c.resume_leases(1_000 + big).unwrap(); // D = 10_000_000, above every stored lease
+        // One millisecond before the twenty running leases (reading 1_500 + D) expire.
+        let q = 1_500 + big - 1;
+
+        let before = c.expiry_rows_examined();
+        let answered = c.expired_before(q).unwrap().len() as u64;
+        let examined = c.expiry_rows_examined() - before;
+        assert_eq!(answered, 5, "premise: exactly the five leases at 100 are expired at {q}");
+        assert_eq!(
+            examined, answered,
+            "expired_before walked {examined} DEADLINE rows to answer {answered}: its span is wider \
+             than its answer, which with D above every lease is the whole index on every scan (M3)"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
