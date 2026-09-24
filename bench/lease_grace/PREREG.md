@@ -588,3 +588,195 @@ M24c compiles; it is a registered compile-survivor, killed by the pin.
 - The lib filter
   `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
   → **30** (20 + 5 + 3 + 1 + 1).
+
+## Amendment 10 — review 3 (`frontier/d198_review3.md` @ `38ee1f7`) and SCALE-DESIGN "D198 addendum 2". Written before their fixes.
+
+Nothing here has been run (quiet mode). Every prediction is from reading source.
+
+### Committed so far, with predictions
+
+Tests only, compiling against `1ec2deb`'s API. All in `table_catalog::f1_lease_grace`.
+
+| commit | test | at that commit | after the fixes | kills |
+|---|---|---|---|---|
+| `f8d8225` | `a_first_start_credits_the_files_wall_clock_age_even_when_the_lease_clock_lags_it` (C1) | **FAIL**: credit `now − mtime` = 1 h, lease `t + 2h <= now = t + 3h` ("…short by the 7200000 ms the lease clock lags…") | PASS: credit is the wall age, 3 h + ms | M35 |
+| `f8d8225` | `a_catalog_whose_offset_leaves_zero_is_refused_by_the_old_binary_magic_check` (C2) | **FAIL**: the magic on disk is still `0xFE44_0B01` | PASS | M42 |
+| `f8d8225` | `a_catalog_that_never_leaves_offset_zero_keeps_the_magic_main_opens` (C2 control) | PASS | PASS | M38 |
+| `f8d8225` | `an_offset_on_disk_beside_the_old_magic_is_switched_at_open` (C2, torn flush) | **FAIL**: magic unchanged after the reopen | PASS | M40 |
+| `f8d8225` | `a_migration_whose_source_time_cannot_be_read_credits_nothing` (C5) | **FAIL**: `FirstStartFromFileTime` crediting ~0 ms from the new file's own mtime | PASS: `FirstStart` | M47 |
+| `f8d8225` | `an_interrupted_switchover_credits_from_the_earlier_of_the_source_and_the_catalog` (C6, with a key) | **FAIL**: the log's 1 h is credited; the lease lapsed 1.5 h ago | PASS: recorded ~1 h + the catalog's age 2 h | M45 |
+| `f8d8225` | `a_catalog_migrated_and_never_resumed_is_credited_from_the_retired_log` (C4) | **FAIL**: 5 min credited; the lease lapsed 30 min ago | PASS: recorded ~1 h + 5 min | M45, M46 |
+| `f8d8225` | `the_first_start_evidence_survives_a_start_that_wrote_and_failed_before_resuming` (C4) | **FAIL**: ~0 ms credited from the failed start's own write | PASS: recorded ~1 h | M43, M45 |
+| `ba77cbd` | `a_backward_wall_step_does_not_shrink_the_first_start_credit_below_the_lease_clocks` | PASS (`1ec2deb`'s credit IS the lease age) | PASS | M36 |
+| `ba77cbd` | `a_crash_after_the_magic_switch_and_before_the_offset_leaves_a_catalog_this_build_opens` (C2) | **FAIL**: the open refuses `0xFE44_0B02` (`expect` panics) | PASS | M41 |
+| `ba77cbd` | `the_new_magic_survives_a_root_split_after_the_offset_leaves_zero` (C2) | **FAIL**: the magic was never switched | PASS | M39 |
+| `ba77cbd` | `the_downtime_before_an_unresumed_writer_is_kept_and_its_own_run_is_not_credited` (C4) | **FAIL**: credit `L(now) − (t + 2h)` saturates to 0; the lease reads `lapsed`, below `lo` | PASS: 4 h recorded + 1 h since, within `[lo, hi]` | M41b, M43, M44, M45 |
+| `ba77cbd` | `a_switchover_with_no_recorded_evidence_credits_from_the_earlier_file` (C6, no key) | **FAIL**: the log's 1 h is credited | PASS: the catalog's 2 h | M48 |
+
+With the fix, one test that cannot be red first (it names the new key constructor):
+`tree_keys::tests::the_first_start_key_is_its_own_group_and_no_other_span_reaches_it`, a copy of the
+`ALIVE` group test for tag `0x09`.
+
+The new magic, pre-registered as a literal: **`0xFE44_0B02`**. `a_crash_after_the_magic_switch_…`
+writes it by value; it is not read from the subject.
+
+### The fixes that follow
+
+**C1 — the wall age, never below the lease age.** The credit's time term is
+`age(m) = max(W(now) − m, L(now) − m)`, both saturating at 0, where `W` is read through a new
+`pub(crate) fn cluster::wall_millis_since(stamp) -> u64` (a duration, through `local_wall_millis`,
+the one `SystemTime::now()` reader, so `wall_step` moves it) and `L(now)` is the `now_millis` the
+resume is handed. The lead's rule is the first term. The second is added because the rule's premise
+("the lease clock never advances faster than the wall clock") is false after a BACKWARD wall step
+since this process anchored, which F2 exists to survive; then `W(now) − m` is short by the step and
+`L(now) − m` is not. `max` is never below `1ec2deb`'s credit.
+
+**C1 residual — a correction of the lead's inequality (INFERRED, derivation).** Write
+`lag_p = W − L` for process `p`'s lease clock; it grows by host sleep. A lease is owed
+`owed = L_new(now) − L_old(last_alive)`, because its deadline is on `L_old`. With
+`m <= W(last_alive)`:
+
+    W(now) − m − owed  >=  lag_new − lag_old
+    L_new(now) − m − owed  =  (W(last_alive) − m) − lag_old
+
+So the wall age over-credits iff `lag_new >= lag_old`, and otherwise falls short by at most
+`lag_old − lag_new`; `1ec2deb`'s lease age falls short by up to `lag_old`. The lead's
+`W(now) − W(last) >= L(now) − L(last)` holds on ONE process's lease clock. Across processes `L`
+re-anchors to the wall clock at each start, jumping forward by `lag_old`, so the inequality fails by
+`lag_old − lag_new`. Consequences:
+- an upgrade from `main` has `lag_old = 0` (`main`'s lease clock is `SystemTime::now()`), so it
+  over-credits only;
+- **review 3's schedule E1 is NOT fixed by the wall age.** An F2-era unmarked writer (an embedder with
+  no `LeaseThread`) whose host slept 2 h leaves a lease with 840 s on ITS lease clock; the file says
+  nothing about its lag, the next start credits ~10 s, and the lease is reaped. No file time can
+  carry `lag_old`. What would: a lease-clock stamp in `[0x09]` on every commit of an unmarked catalog
+  (a soft mark). NOT TAKEN: it writes `[0x09]` into every catalog a D198 build creates, including the
+  "pre-D198" catalogs `b5bf3a3`'s fixture builds with D198 code, making those two tests' stated
+  premise ("No `[0x08]` record: every catalog written before D198 looks like this") false. Changing
+  that fixture is a test edit: **⚖ for Ryan**, recorded, not done.
+
+**C2 — the downgrade magic (lead, addendum 2).**
+- `HEADER_PAGE_MAGIC` = `0xFE44_0B01` stays the magic of a catalog at `D = 0`.
+  `HEADER_PAGE_MAGIC_OFFSET` = `0xFE44_0B02` marks a catalog that may hold `D > 0`.
+- The catalog carries its current magic (`header_magic`), and `publish_root` writes it; it no longer
+  writes the constant.
+- `resume_leases`: when the record it is about to write has `D > 0` and the header still carries the
+  old magic, it writes the header page with the new magic, stages, RELEASES `logical`, waits
+  `durable`, then retakes the lock and recomputes. Only then does it write the record. One extra
+  fsync, once per catalog lifetime. So the new magic is durable before the first record with
+  `D > 0`, and therefore before any deadline stored against it.
+- `open_from_header` accepts either magic and refuses anything else, with the same text. If the
+  record already says `D > 0` beside the old magic, it switches and makes the switch durable before
+  returning. That covers a catalog written by `1ec2deb` or earlier on this branch, or a damaged page.
+- **Stated:** `main` refuses the new magic with "…is not a branch-catalog header (magic 0xfe440b02,
+  expected 0xfe440b01)…". That is loud but misleading: the page IS a header, of a newer format. `main`
+  cannot be changed.
+- **Stated:** a headerless catalog (`create`/`open` over a caller's pool) has no page to carry a
+  magic and no gate. Production opens only sidecars, through `default_for_database`
+  (`cli.rs:91`, `examples/pgserver.rs:91`; READ).
+- **Stated:** at `D = 0` a downgrade is still allowed. `main` ignores `[0x08]` and `[0x09]`, because
+  every `range_scan` in `main:src/branch/table_catalog.rs` is bounded by a group span (READ, grep).
+
+**C3.** Rewrite the narrow-C2 docs (`refuse_unresumed`, and the doc comment on
+`a_catalog_with_a_last_alive_mark_refuses_expiry_questions_until_it_resumes`, a comment, not an
+assertion). An unmarked catalog holding a live lease DOES have a measurable, uncredited outage before
+its resume, and answers at `D = 0` until then.
+
+**C4–C6 — the evidence, made durable, as an ACCRUAL.** A new key, `[0x09]` (`tree_keys::tag::FIRST_START`,
+8 bytes, BE `u64` ms): **downtime recorded before a process that wrote this unmarked catalog and never
+resumed it**.
+- Written by `default_for_database`'s migration, into the tmp catalog before its flush and rename:
+  the age of the source's mtime, if that is readable and the catalog holds a live lease.
+- Written on the first commit of a process that opened an existing unmarked catalog, riding
+  `stage` (no extra fsync): `recorded + age at open` of its file time, if it held a live lease at open;
+  `0` if it held none and a record exists (the downtime was owed to nobody).
+- Superseded, and no longer written, once `resume_leases` or `record_lease_alive` writes the mark.
+
+Evidence at an open of an unmarked, non-fresh sidecar:
+- An ordinary open: `(recorded or 0, own mtime)`.
+- `has(cat)` with a legacy log beside it: with a key, `(recorded, own)`, because the key already
+  measured the source. With no key, `(0, min(own, legacy))` (C6).
+- The migrating process, whose file it wrote itself: `(0, source mtime)`, or NO evidence if the source
+  mtime is unreadable (C5). Its own mtime is never evidence.
+
+The credit is `recorded + age(since)`.
+
+**Why accrue, not freeze.** A frozen stamp (the original mtime) would credit an unresumed writer's
+whole run as downtime. An embedder that served for days would revive for days every lease it saw
+expire. The accrual credits the gap before the writer and the gap after its last write, and not its
+run.
+
+**Why record at the migration, not read `.pre-table` later** (the lead's wording was "consult the
+retired log's mtime"). `main` also migrates and retires to `{db}.branches.pre-table`
+(`main:src/branch/table_catalog.rs:216`; READ). An unmarked catalog beside an old `.pre-table` may
+have been served by `main` for months since. The retired log's mtime would credit all of it. The
+migration is the only moment its mtime is known to be the last authority's.
+
+Residuals, stated:
+- A downgrade to `main` after an unresumed D198 start leaves a stale `[0x09]`. The next D198 start
+  credits it on top of the time since `main`'s last write. That is an over-credit by the gap before
+  the D198 start, the same class as a stale mark.
+- A process that only reads writes nothing, so its uptime counts as downtime, as at `1ec2deb`.
+- An embedder charges the outage before it at `D = 0` (C3), and a later resume credits that outage.
+  A lease the embedder saw expire can come back by up to that outage.
+
+**C7/C8.**
+- The startup report's "The file time can only over-credit, never charge" is withdrawn (C7). The new
+  text names the recorded part, the file time, and the two short-credit cases (a later writer, and a
+  writer whose lease clock lagged).
+- The stale docs are corrected: module `stored` (the door), `create`, `migrate_from`,
+  `open_sidecar_at`'s mtime comment, `types.rs`'s `FirstStartFromFileTime`, and `AliveState::resume`.
+- `LeaseResume::FirstStartFromFileTime` becomes
+  `{ now_millis, file_mtime: Option<u64>, recorded_millis, credited_millis }`. No test matches its
+  fields (grep).
+
+### Corrections to earlier amendments
+
+- **M24c reads 3000, not 1500** (review 3, C9). The raw-decoded `v = 1500` goes through `to_stored`:
+  `1500 − 3000` saturates to 0, which reads `0 + 3000`.
+- Amendment 9 (5): "an unreadable mtime gives a plain `FirstStart`" was false at `1ec2deb` on the
+  migration branch (C5). It is true after this fix.
+- Amendment 9 (5) inherited the lead's retracted "can only over-credit" argument. It is withdrawn, and
+  replaced by the derivation above.
+- **R7 persists** (review 3, C11). The C2 refusal tells a cluster member to start a `LeaseThread`,
+  which on a member resumes nothing (`Clustered`). Recorded, not fixed, as in amendment 9 (8).
+
+### Stated fragilities
+
+- The two `b5bf3a3` FirstStart tests keep an exact lower bound, because of the `max`. Their upper bound
+  (+1000 ms) now needs `W(resume) − L(now) <= 1 s`, that is, no host sleep of about a second since the
+  test binary anchored its lease clock (INFERRED). They are not edited.
+- The C5 test needs the filesystem to accept a pre-1970 mtime. If it does not, the test panics at
+  `set_modified(..).unwrap()`: a fixture failure, not a verdict.
+- The C1 and accrual tests place wall times with `wall_step`, which is thread-local, and with
+  `age_file`. A fix that read `SystemTime::now()` directly, bypassing `local_wall_millis`, would see the
+  real clock and fail both. That is the one-reader rule, enforced by these two tests.
+
+### New mutants
+
+| mutant | must fail |
+|---|---|
+| M35 credit's time term is `now − m` only (`1ec2deb`) | C1 wall-lag test |
+| M36 credit's time term is `W(now) − m` only (no `max`) | backward-step test |
+| M37 magic switch in the SAME durable as the record | **SURVIVES** every test (needs a crash inside `durable`). The torn state it allows is repaired at open (M40's test), and `main` reads it correctly, since no deadline has been stored at `D > 0`. Registered survivor. |
+| M38 switch the magic even at `D = 0` | `…never_leaves_offset_zero_keeps_the_magic_main_opens` |
+| M39 `publish_root` writes the old constant | root-split test |
+| M40 no open-time switch | torn-flush test |
+| M41 `open_from_header` refuses the new magic | crash-after-switch test; the reopen in the downgrade, root-split and D198 reopen tests |
+| M41b the credit reads `SystemTime::now()` directly | C1 and accrual tests |
+| M42 no resume-time switch (open-time only) | downgrade test (it asserts on disk after the drop, before any reopen) |
+| M43 the `stage` rider removed (the key is never written by an unresumed writer) | C4 failed-start test, accrual test |
+| M44 frozen evidence (the key holds the original mtime, not an accrual) | accrual test: credit ≈ 7 h > `hi` |
+| M45 the key ignored at open | C4 failed-start, C4 migrated, accrual, and C6 with-key tests |
+| M46 the migration writes no key | C4 migrated test |
+| M47 the migration branch falls back to the own mtime (`1ec2deb`'s `.or`) | C5 test |
+| M48 a switchover with no key prefers the legacy log (`1ec2deb`) | C6 no-key test |
+| M49 a switchover WITH a key adds the legacy's age too (double counting) | **SURVIVES**: an over-credit, and the C6 with-key test asserts survival only. Registered. |
+
+### Counts, per-target
+
+- `f1_lease_grace` → **33** (+8 at `f8d8225`, +5 at `ba77cbd`). `tree_keys::tests` → +1 with the fix.
+- **base + 50** (amendment 9's +36, then +13, then +1).
+- The lib filter, extended by one name:
+  `cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now the_first_start_key_is_its_own_group`
+  → **44** (33 + 5 + 3 + 1 + 1 + 1).
