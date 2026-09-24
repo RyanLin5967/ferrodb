@@ -574,18 +574,23 @@ use super::*;
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("crash.db");
+        let pre_crash_root;
         {
             let lock = DbLock::acquire(&db).unwrap();
             let mut o = open_recovered(&db, &lock).unwrap();
             for sql in [
                 "CREATE TABLE a (id INTEGER NOT NULL, v INTEGER);",
                 "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                // A secondary tree too, so the structural check covers more than primary cells
+                // (a gap the re-adversary named).
+                "CREATE INDEX iv ON t (v);",
                 "INSERT INTO t VALUES (0, 0);",
                 "DROP TABLE a;",
                 "INSERT INTO t VALUES (1, 10);",
             ] {
                 exec(sql, &mut o).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
             }
+            pre_crash_root = o.catalog.get_table("t").unwrap().primary_index_root;
             // The crash: every handle is dropped with no checkpoint and no flush. `BufferPoolManager`
             // has no `Drop`, so the last insert's pages die here and only its WAL records survive.
         }
@@ -595,18 +600,31 @@ use super::*;
         assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
         let tables: Vec<String> = o.catalog.tables.keys().cloned().collect();
         assert!(tables.contains(&"t".to_string()), "premise failed: table t did not survive: {tables:?}");
+        // The premise the re-adversary asked for: the rebuilt root really MOVED. If the rebuild handed
+        // back the pre-crash page, cell == record would hold whether or not the cells were repointed.
+        assert_ne!(
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            pre_crash_root,
+            "premise failed: t's rebuilt root is its pre-crash page, so the structural check cannot fail"
+        );
         for name in &tables {
-            let record = o.catalog.get_table(name).unwrap().primary_index_root;
-            let cell = o
-                .catalog
-                .root_cell(name, None)
-                .expect("Catalog::open seeds a cell for every table it loads")
-                .load(Ordering::SeqCst);
-            assert_eq!(
-                cell, record,
-                "table '{name}': the shared root cell names page {cell}, the tree the rebuild FREED; \
-                 the rebuilt tree is at page {record}"
-            );
+            let entry = o.catalog.get_table(name).unwrap();
+            let mut trees: Vec<(Option<String>, u32)> = vec![(None, entry.primary_index_root)];
+            trees.extend(entry.indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
+            trees.extend(entry.fulltext_indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
+            assert!(trees.len() >= 2 || name != "t", "premise failed: t lost its secondary index");
+            for (column, record) in trees {
+                let cell = o
+                    .catalog
+                    .root_cell(name, column.as_deref())
+                    .expect("Catalog::open seeds a cell for every tree it loads")
+                    .load(Ordering::SeqCst);
+                assert_eq!(
+                    cell, record,
+                    "table '{name}', tree {column:?}: the shared root cell names page {cell}, a tree the \
+                     rebuild FREED; the rebuilt tree is at page {record}"
+                );
+            }
         }
 
         match exec("SELECT id, v FROM t WHERE id = 1;", &mut o).unwrap() {
@@ -721,5 +739,54 @@ use super::*;
                 _ => panic!("table '{t}': expected rows"),
             }
         }
+    }
+
+    /// **C1, made true: after an index undo fails, the NEXT OPEN rebuilds the indexes, even when
+    /// the log it opens is empty.**
+    ///
+    /// `open_recovered` rebuilds when `recover` replays something. `recover` returns `false` for an
+    /// empty log, and a clean restart can leave one: `schema_log` is filled only by `log_ddl` in the
+    /// running process, so a checkpoint in a process that ran no DDL re-declares nothing (the
+    /// re-adversary's C1 correction). So "the next open rebuilds every tree" was false exactly when
+    /// it was needed, and an entry that a failed index undo left on a freed slot would have outlived
+    /// the restart. The fix is a durable marker beside the log (`<db>.wal.stale-indexes`), which
+    /// `open_recovered` honours and then removes.
+    ///
+    /// FAILS at `d7891d5` at "left no marker". The failure is forced with a recorded write whose root
+    /// is past end-of-file, as in `txn.rs`'s C1 test.
+    #[test]
+    fn a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty() {
+        use crate::execution::executor::run;
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stale.db");
+        let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+                let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+                let mut p = Parser::new(tokens);
+                let mut stmts = p.parse();
+                run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                    .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+        }
+        {
+            // A second "process": it recovers and rebuilds, and its own checkpoint re-declares
+            // nothing, because it ran no DDL.
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let t = o.txn.begin().unwrap();
+            o.txn.record_primary_write(t, Arc::new(std::sync::atomic::AtomicU32::new(1_000_000)), Value::Integer(5), None);
+            o.txn.abort(t).expect("the transaction ended, so its abort reports success");
+            assert!(marker.exists(), "a failed index undo left no marker, so a clean restart would not rebuild");
+            o.txn.checkpoint().unwrap();
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
+        assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
     }
 }
