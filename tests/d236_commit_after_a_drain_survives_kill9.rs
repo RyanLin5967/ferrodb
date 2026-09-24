@@ -16,16 +16,33 @@
 //! 0. A CONTROL row, `c(7)`, committed the ordinary way. Its `Commit` follows its own `Begin` and
 //!    `HeapInsert`, so it is written under `>=` as well. After the reopen it must be there at every
 //!    commit, which separates "the drained COMMIT was lost" from "the reopen lost committed data".
-//! 1. `BEGIN`, then insert about 2.5x the buffer pool into one table: 2600 rows, one per heap page.
-//!    The pool is `MAX_BUFFER_POOL_PAGES` = 1024 frames at `9aa6968`. Evictions during the load
-//!    drain the log, but the load's last records are appended after the last drain.
+//! 1. `BEGIN`, then insert 1.5x the buffer pool into one table: 1536 rows, one per heap page.
+//!    The pool is `MAX_BUFFER_POOL_PAGES` = 1024 frames at `9aa6968`. The first eviction of the
+//!    load drains the log, and every page loaded after it stays dirty and unflushed.
 //! 2. A `SELECT` that scans every page and matches nothing. It appends no record, and its faults
-//!    must evict at least one dirty page whose LSN is past `flushed_lsn`, which drains the buffer.
-//!    The pool is ARC, not LRU, so "must" is a premise, and the test checks it (below).
+//!    must evict at least one of those dirty pages, which drains the buffer. The pool is ARC, not
+//!    LRU, so "must" is a premise, and the test checks it (below).
 //! 3. `COMMIT`. Its `Commit` starts exactly at `flushed_lsn`. Under `>=` it is acknowledged and not
 //!    written.
 //! 4. `kill -9` as soon as COMMIT is acknowledged, before anything else can flush.
 //! 5. Reopen (recovery runs), check the control, and look up the first and last rows.
+//!
+//! # Why the table is between one and two pools, and not bigger
+//!
+//! ARC is scan-resistant, and the size is what lets this scan get past that (INFERRED from
+//! `src/buffer/arc.rs` at `9aa6968`; `frontier/d236_review.md` W1 and `lane_d236.md` AMENDMENT 1
+//! in artie-research). With c frames and N heap pages:
+//! * The load promotes every page to T2, and its evictions move T2's oldest pages into the ghost
+//!   list b2. b2 loses entries only once all four lists together hold 2c, so for N < 2c every
+//!   evicted page is still a ghost when the scan starts.
+//! * The scan's first page is a b2 ghost. A ghost hit evicts T2's oldest page, which becomes a
+//!   ghost in turn, so every page the scan reaches is a ghost hit, and each one evicts the next
+//!   oldest load page. At step 2c + 1 - N (about 513 here) it evicts the first dirty page, and the gate
+//!   drains.
+//! * For N ≥ 2c the early pages have left b2 before the scan starts. The scan is then a run of
+//!   complete misses that recycle ONE T1 frame, the dirty tail in T2 is never touched, and nothing
+//!   drains. At 2600 rows this test is predicted to refuse at every commit, and more rows make that
+//!   worse, not better.
 //!
 //! # The premises, each checked and each refusing rather than passing
 //!
@@ -39,11 +56,13 @@
 //!   reason, and the file must not have shrunk at COMMIT, because a truncation can only shrink it.
 //! * **The reopen works.** The control row must be there.
 //!
-//! The WAL length after COMMIT is also printed on failure. Under `>` it grows again (the `Commit`
-//! reached the disk); under `>=` it does not.
+//! After the row checks, the WAL must also have grown at COMMIT: under `>` the `Commit` reached the
+//! disk before the acknowledgement; under `>=` it did not. It is checked last, so a red run fails at
+//! "row 1 is gone" first.
 //!
-//! Pre-registered from source, UNBUILT: FAILS at `9aa6968` at "row 1 is gone", with every premise
-//! holding. PASSES with the fix.
+//! Pre-registered from source, UNBUILT (`lane_d236.md` AMENDMENT 1): against `9aa6968`'s `src/`
+//! (mutant M1), FAILS at "row 1 is gone" with every premise holding. PASSES with the fix. A failed
+//! premise is a VOID run, never a red.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -52,9 +71,12 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-/// Heap pages this test's table occupies: one row per page (see `PAD`). That is about 2.5x the
-/// 1024-frame pool, so the scan faults in more pages than the pool can hold.
-const ROWS: usize = 2600;
+/// Heap pages this test's table occupies: one row per page (see `PAD`). Strictly between one and
+/// two pools, the band where the scan's pages are still ARC ghosts (see the header).
+const ROWS: usize = 1536;
+/// The pool at `9aa6968`: `MAX_BUFFER_POOL_PAGES` in `src/buffer/buffer_pool.rs`. `ROWS` is sized
+/// against it, so a change there has to be re-derived here.
+const POOL_FRAMES: usize = 1024;
 /// Two tuples of this size cannot share a 4 KiB page, so each row gets a heap page of its own.
 const PAD: usize = 2100;
 /// Ordinary-table pages below the arena floor. The table needs about `ROWS` of them plus its
@@ -201,6 +223,11 @@ fn wal_len(db: &Path) -> u64 {
 
 #[test]
 fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
+    assert!(
+        POOL_FRAMES < ROWS && ROWS < 2 * POOL_FRAMES,
+        "fixture: ROWS must be strictly between one and two pools, where the scan's pages are still \
+         ARC ghosts (see the header)"
+    );
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("d236.db");
     let pad = "x".repeat(PAD);
@@ -228,7 +255,8 @@ fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
         after_scan > after_load,
         "premise failed: the WAL file did not grow during the scan ({after_load} -> {after_scan} \
          bytes), so the eviction gate never drained the log and COMMIT's record does not start at \
-         the flushed point. This run proves nothing either way; raise ROWS"
+         the flushed point. This run is VOID, neither red nor green. The ARC band in the header is \
+         wrong: re-derive it from src/buffer/arc.rs rather than changing ROWS by guesswork"
     );
 
     cli.send("COMMIT;");
@@ -269,6 +297,15 @@ fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
              {after_commit} (equal to the scan's means COMMIT wrote nothing). Got: {line}"
         );
     }
+    // Checked AFTER the lookups, so a red run still fails first at "row N is gone": the durable
+    // outcome is the claim, and this is how it came about. COMMIT's record starts at the flushed
+    // point, so writing it before the acknowledgement is what grows the file.
+    assert!(
+        after_commit > after_scan,
+        "COMMIT was acknowledged without writing its record: the WAL did not grow at COMMIT \
+         ({after_scan} -> {after_commit} bytes), yet the rows survived. Something else made them \
+         durable, and this run did not test the drained COMMIT"
+    );
     cli.send(".exit");
     let _ = cli.child.wait();
 }
