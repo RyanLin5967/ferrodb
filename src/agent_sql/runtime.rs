@@ -5042,7 +5042,7 @@ impl AgentRuntime {
         // the guard's `Drop` covers every early return. So a merge syncs the provenance file once,
         // plus once per altered table whose rewrite moved an attributed row, plus, for a branch
         // whose `BEGIN` has not completed, the one sync that makes its run's record durable first
-        // (D246 A3, above).
+        // (D246 A3, below).
         // **D246 A3: the run's provenance record is durable BEFORE the log is told the run exists.**
         //
         // `bind_run` below declares this run's slot to the WAL, and the publish commit makes that

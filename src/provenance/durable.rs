@@ -177,8 +177,10 @@ pub struct DurableProvenanceStore {
     /// append marks everything it wrote durable (`covered_all`), so a fork whose run record a
     /// MERGE's sync already carried pays nothing more.
     group: CommitGroup,
-    /// A second descriptor on the same file, for the sync `await_run` issues OUTSIDE `file`'s lock.
-    /// An fsync is per file, not per descriptor, so it covers every write made through `file`.
+    /// A second open of the same file, for the sync `await_run` issues OUTSIDE `file`'s lock. An
+    /// fsync is per file, not per descriptor, so it covers every write made through `file`; and as
+    /// its own open file description it is told of a writeback error independently of `file`
+    /// (Linux ≥ 4.13 reports one to every description open when it happened).
     sync_handle: File,
     /// **Test-only: hold `await_run`'s group sync in flight until the test releases it.** The first
     /// sender is told the sync has been reached; the sync waits on the receiver (up to 30 s). One-shot.
@@ -218,8 +220,13 @@ impl DurableProvenanceStore {
             .map_err(|e| FerroError::Provenance(e.to_string()))?
             .len();
 
-        let sync_handle = file
-            .try_clone()
+        // Its OWN open file description, not `try_clone()` (PREREG A4c, R2-D1): a clone shares
+        // one error cursor with the append descriptor, so an fsync error could be reported to the
+        // group leader and never to an in-lock writer whose pages it was, or the reverse. Write
+        // access, because Windows flushes only a handle opened for writing.
+        let sync_handle = OpenOptions::new()
+            .write(true)
+            .open(&path)
             .map_err(|e| FerroError::Provenance(format!("open {}: {e}", path.display())))?;
         let mem = MemProvenanceStore::new();
         let recovery = if len == 0 {
@@ -618,7 +625,6 @@ impl DurableProvenanceStore {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(FerroError::Provenance(format!("sync {}: {e}", self.path.display())));
         }
-        self.syncs.runs.fetch_add(1, Ordering::Relaxed);
         // **Checked AFTER the fsync, under the file lock (A4, review D-1).** `sync_handle` shares
         // one open file description with the append descriptor, so on Linux an fsync error is
         // reported to whichever of them syncs first, once: an in-lock writer whose own fsync failed
@@ -633,7 +639,10 @@ impl DurableProvenanceStore {
                 self.path.display()
             ))
         })?;
-        self.refuse_if_poisoned()
+        self.refuse_if_poisoned()?;
+        // Booked only once it vouches for what it covered (PREREG A4c).
+        self.syncs.runs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// `intern` and `intern_pending` as far as the record: the in-memory intern, and the new run's
@@ -898,17 +907,20 @@ impl ProvenanceStore for DurableProvenanceStore {
                     self.path.display()
                 ))
             })?;
-            // A store refusing writes vouches for no run through this call (A4, review D-3e and
-            // N-9): it must not append a record after a failed append, and a run it holds no
-            // number for may be one whose synchronous `intern` failed, in the index and not in the
-            // file. Refusing here matches `intern`, which refused on a poisoned store before D246.
-            self.refuse_if_poisoned()?;
             let Some(&seq) = file.run_seqs.get(&id) else {
-                // Interned by `intern`, recovered from the file, or already seen durable here.
+                // Interned by `intern`, recovered from the file, or already seen durable here. A
+                // durable run is vouched for even on a poisoned store (PREREG A4c, R2-D5): refusing
+                // it refused every MERGE there, including ones that write no provenance, the shape
+                // D219 F1 ruled out for ALTER. A failed `intern` returned `Err`, so no caller holds
+                // the id of a run whose record never landed.
                 return Ok(());
             };
             let written = file.queued - file.pending.len() as u64;
             if seq > written {
+                // Before the write: appending after a failed append is what the poison flag exists
+                // to stop, since a torn frame mid-file makes the reader drop everything after it.
+                // A record written but not yet synced is refused by `sync_runs`' own check.
+                self.refuse_if_poisoned()?;
                 let runs_ahead =
                     file.pending.iter().take_while(|b| b.first() == Some(&TAG_RUN)).count();
                 if runs_ahead as u64 >= seq - written {
@@ -1858,7 +1870,7 @@ mod tests {
             })
         };
         let staged_meanwhile = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
-        release.send(()).unwrap();
+        let _ = release.send(()); // a signal: a dropped receiver means the sync went ahead
         awaiting.join().unwrap().expect("await_run of the first run");
         let (b, stamped) = stager.join().unwrap();
         let b = b.expect("intern_pending of the second run");
@@ -1896,7 +1908,7 @@ mod tests {
         // Structurally safe: the right code cannot return until `release`, which is sent after this
         // window, so a loaded box can only make a wrong implementation look right, never the reverse.
         let returned_early = done_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
-        release.send(()).unwrap();
+        let _ = release.send(()); // a signal: a dropped receiver means the sync went ahead
         first.join().unwrap().expect("the first await_run");
         second.join().unwrap().expect("the second await_run");
         assert!(
@@ -1969,7 +1981,7 @@ mod tests {
         let (s, a, awaiting, release) = a_run_sync_in_flight(&dir.path().join("prov.log"), "run-a");
         s.fail_next_append.store(true, Ordering::SeqCst);
         assert!(s.stamp_row(7, 1, a).is_err(), "the injected failure was swallowed");
-        release.send(()).unwrap();
+        let _ = release.send(()); // a signal: a dropped receiver means the sync went ahead
         let err = awaiting.join().unwrap().expect_err(
             "a run sync that overlapped a failed append was acknowledged: the fork would be told its \
              run is durable by a sync whose error another writer consumed",
@@ -2002,7 +2014,7 @@ mod tests {
         let before = s.sync_counts();
         s.flush().expect("flush the stamp");
         let flushed = s.sync_counts();
-        release_tx.send(()).unwrap();
+        let _ = release_tx.send(()); // a signal: a dropped receiver means the sync went ahead
         awaiting.join().unwrap().expect("await_run");
         assert_eq!(
             flushed.stamps - before.stamps,
@@ -2027,11 +2039,10 @@ mod tests {
         assert_eq!(s.run_count(), before, "the refused run reached the index");
     }
 
-    /// **U8 (D-3e, N-9): a poisoned store refuses `await_run` and writes nothing.** Appending after
-    /// a failed append is what the poison flag exists to stop: a torn frame in the middle of the
-    /// file makes the reader drop every record after it. And `await_run` does not vouch for any run
-    /// once the store refuses writes, including one it holds no number for: that is where a run
-    /// whose synchronous `intern` failed would be, in the index and not in the file.
+    /// **U8 (D-3e; second half per A4c R2-D5): a poisoned store refuses to write a pending run and
+    /// writes nothing, and still vouches for a run that is already durable.** Appending after a
+    /// failed append is what the poison flag exists to stop: a torn frame in the middle of the file
+    /// makes the reader drop every record after it.
     #[test]
     fn a_poisoned_store_refuses_await_run_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -2050,9 +2061,9 @@ mod tests {
             len,
             "a poisoned store appended a run record"
         );
-        let err = s
-            .await_run(synced)
-            .expect_err("a poisoned store vouched for a run it holds no number for");
-        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+        // A DURABLE run is still vouched for (PREREG A4c, R2-D5): refusing it would refuse every
+        // MERGE on a poisoned store, including ones that write no provenance at all.
+        s.await_run(synced)
+            .expect("a poisoned store refused to vouch for a run that is already durable");
     }
 }
