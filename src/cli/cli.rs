@@ -217,12 +217,32 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    txn.checkpoint()?;
-    // Persist where the arena starts and what it has allocated. Without this the next open finds
-    // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    store.checkpoint(Path::new(&arena_path))?;
+    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
+}
+
+/// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
+/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs.
+///
+/// 1. **D244 review F7.** The branch catalog publishes its root and syncs. A publish that failed on
+///    a mutation's exit is otherwise retried only by the next mutation, and an exit makes none. If
+///    split pages have already reached the disk through another writer's sync or an eviction,
+///    the header would still name the old root, and the next open would refuse.
+/// 2. The database's checkpoint.
+/// 3. Persist where the arena starts and what it has allocated. Without this the next open finds no
+///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable. It
+///    runs after the branch catalog's sync, so the map it writes is taken after the catalog's last
+///    durable write.
+pub fn exit_sequence(
+    branches: &TableBranchCatalog,
+    txn: &TxnManager,
+    store: &ArenaPageStore,
+    arena_path: &Path,
+) -> Result<(), FerroError> {
+    branches.publish_root_durably()?;
+    txn.checkpoint()?;
+    store.checkpoint(arena_path)
 }
 
 fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {

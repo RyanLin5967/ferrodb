@@ -394,6 +394,19 @@ impl TableBranchCatalog {
         })
     }
 
+    /// **D244 review F7: the publish a clean exit owes.** Writes the tree's root into the header
+    /// page if the last publish did not, then syncs this catalog's file.
+    ///
+    /// A publish that fails on a mutation's exit records nothing, so the NEXT mutation retries it.
+    /// A process that makes no further mutation never gets that retry. Meanwhile another writer's
+    /// `durable()` or an eviction may already have put the split pages on disk, and the next open
+    /// then reads a root the tree has left and refuses. So both production exits call this before
+    /// their checkpoints: `cli::exit_sequence` and `examples/pgserver.rs`.
+    pub fn publish_root_durably(&self) -> Result<(), FerroError> {
+        let ((), seq) = self.mutate(|| Ok(()))?;
+        self.durable(seq)
+    }
+
     // `commit()` (stage + durable in one call) was DELETED once every caller had been migrated.
     // It was the only remaining way to fsync while still holding `logical`, which is exactly the
     // serialization group commit exists to remove -- so leaving it would have left a second, worse

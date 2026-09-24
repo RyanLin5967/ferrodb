@@ -155,5 +155,9 @@ fn main() {
     // written would leave a durable map that still charges pages nothing owns.
     let stats = lease.stop();
     let _ = writeln!(std::io::stderr(), "pgserver: lease scan stopped after {stats:?}");
+    // D244 review F7: the branch catalog's root, published and synced before the arena's map, for
+    // the reason `ferrodb::cli::cli::exit_sequence` gives. This binary takes no database checkpoint
+    // at exit, so it makes the one call rather than calling that function.
+    branches.publish_root_durably().expect("publish the branch catalog's root");
     store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
 }
