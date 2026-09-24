@@ -1938,4 +1938,104 @@ mod tests {
             "intern returned a run whose record was still pending"
         );
     }
+
+    // ---- D246 A4: the fresh review's D-1, D-3 and N-9, pre-registered in `bench/d246/PREREG.md` --
+
+    /// **U5 (D-1): a run sync that overlaps a failed append is not acknowledged.** The sync handle
+    /// is a duplicate of the append descriptor, so on Linux an fsync error reported to an in-lock
+    /// writer is NOT reported to the group leader: the leader's own fsync can return 0 for pages
+    /// the kernel dropped. The injected failure below stands in for that writer's EIO, and the
+    /// poison flag it leaves is the only trace the leader can see.
+    #[test]
+    fn a_run_sync_overlapping_a_failed_append_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, a, awaiting, release) = a_run_sync_in_flight(&dir.path().join("prov.log"), "run-a");
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(7, 1, a).is_err(), "the injected failure was swallowed");
+        release.send(()).unwrap();
+        let err = awaiting.join().unwrap().expect_err(
+            "a run sync that overlapped a failed append was acknowledged: the fork would be told its \
+             run is durable by a sync whose error another writer consumed",
+        );
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+    }
+
+    /// **U6 (D-3b): only RUN records are ever left written but unsynced.** `flush` answers for
+    /// stamps with "nothing pending, nothing to do", so a stamp queued behind a run whose group
+    /// sync is in flight must still be synced by `flush` itself, not written by `await_run` and
+    /// left for a sync that has not happened.
+    #[test]
+    fn a_stamp_queued_behind_a_run_is_never_left_written_but_unsynced() {
+        use std::sync::{mpsc, Arc};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(DurableProvenanceStore::open(dir.path().join("prov.log")).unwrap());
+        let a = s.intern_pending(&run("fork", "run-a")).unwrap();
+        s.stamp_pending(rid(3, 0), a).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *s.sync_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let awaiting = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.await_run(a))
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("await_run never reached its sync");
+
+        let before = s.sync_counts();
+        s.flush().expect("flush the stamp");
+        let flushed = s.sync_counts();
+        release_tx.send(()).unwrap();
+        awaiting.join().unwrap().expect("await_run");
+        assert_eq!(
+            flushed.stamps - before.stamps,
+            1,
+            "flush returned without syncing a stamp queued behind a run whose sync is still in \
+             flight: the stamp was written by await_run and is durable only if that sync succeeds"
+        );
+    }
+
+    /// **U7 (D-3e): a poisoned store refuses a pending intern AT the intern**, before the index
+    /// holds a run no later write could carry to the file.
+    #[test]
+    fn a_poisoned_store_refuses_a_pending_intern_and_leaves_the_index_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DurableProvenanceStore::open(dir.path().join("prov.log")).unwrap();
+        let id = s.intern(&run("restock", "run-1")).unwrap();
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(1, 1, id).is_err(), "the injected failure was swallowed");
+        let before = s.run_count();
+        let err = s.intern_pending(&run("fork", "run-b")).expect_err("a poisoned store queued a run");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+        assert_eq!(s.run_count(), before, "the refused run reached the index");
+    }
+
+    /// **U8 (D-3e, N-9): a poisoned store refuses `await_run` and writes nothing.** Appending after
+    /// a failed append is what the poison flag exists to stop: a torn frame in the middle of the
+    /// file makes the reader drop every record after it. And `await_run` does not vouch for any run
+    /// once the store refuses writes, including one it holds no number for: that is where a run
+    /// whose synchronous `intern` failed would be, in the index and not in the file.
+    #[test]
+    fn a_poisoned_store_refuses_await_run_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        let synced = s.intern(&run("restock", "run-1")).unwrap();
+        let a = s.intern_pending(&run("fork", "run-a")).unwrap();
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(1, 1, synced).is_err(), "the injected failure was swallowed");
+        let len = std::fs::metadata(&path).unwrap().len();
+
+        let err = s.await_run(a).expect_err("a poisoned store acknowledged a pending run");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "a poisoned store appended a run record"
+        );
+        let err = s
+            .await_run(synced)
+            .expect_err("a poisoned store vouched for a run it holds no number for");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+    }
 }

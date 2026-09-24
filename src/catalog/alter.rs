@@ -1424,4 +1424,121 @@ mod tests {
             "exactly the one attributed row must carry its author at its new rid: {authored:?}"
         );
     }
+
+    /// A store that refuses every `stamp_pending` after the first `allowed`, counts the calls, and
+    /// passes everything else to `inner`. The refusal stands in for `MemProvenanceStore`'s own
+    /// (a page dictionary at `MAX_PAGE_DICT_ENTRIES`), which no fixture here can reach on a
+    /// rewrite's destination page.
+    struct RefusesAStamp {
+        inner: Arc<DurableProvenanceStore>,
+        allowed: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProvenanceStore for RefusesAStamp {
+        fn intern(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+            self.inner.intern(run)
+        }
+        fn lookup(&self, id: ProvId) -> Result<RunEntity, FerroError> {
+            self.inner.lookup(id)
+        }
+        fn attribute(&self, rid: RecordId) -> Result<ProvId, FerroError> {
+            self.inner.attribute(rid)
+        }
+        fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
+            self.inner.stamp(rid, id)
+        }
+        fn stamp_pending(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let left = self.allowed.load(Ordering::SeqCst);
+            if left == 0 {
+                return Err(FerroError::Provenance("refused by the test's store".into()));
+            }
+            self.allowed.store(left - 1, Ordering::SeqCst);
+            self.inner.stamp_pending(rid, id)
+        }
+        fn flush(&self) -> Result<(), FerroError> {
+            self.inner.flush()
+        }
+        fn intern_pending(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+            self.inner.intern_pending(run)
+        }
+        fn await_run(&self, id: ProvId) -> Result<(), FerroError> {
+            self.inner.await_run(id)
+        }
+        fn check_writable(&self) -> Result<(), FerroError> {
+            self.inner.check_writable()
+        }
+        fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
+            self.inner.page_dictionary_lens()
+        }
+        fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+            self.inner.stamp_row(table, row, id)
+        }
+        fn stamp_rows(&self, rows: &[(u32, u64)], id: ProvId) -> Result<(), FerroError> {
+            self.inner.stamp_rows(rows, id)
+        }
+        fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+            self.inner.row_author(table, row)
+        }
+        fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+            self.inner.attributed_rows(table)
+        }
+        fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+            self.inner.forget_table(table)
+        }
+        fn sync_counts(&self) -> crate::provenance::SyncCounts {
+            self.inner.sync_counts()
+        }
+    }
+
+    /// Every row of the packed fixture attributed, and a store that allows `allowed` restamps.
+    fn attributed_with(allowed: usize) -> (Fixture, Arc<RefusesAStamp>) {
+        let f = packed();
+        for rid in rids_of(&f) {
+            f.durable.stamp(rid, f.run).unwrap();
+        }
+        let store = Arc::new(RefusesAStamp {
+            inner: f.durable.clone(),
+            allowed: std::sync::atomic::AtomicUsize::new(allowed),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        (f, store)
+    }
+
+    /// **D246 A4 (review N-5): an ALTER refused part-way through re-stamping its moved rows still
+    /// writes the stamps it queued before the refusal.** A plain ALTER hands the rewrite the raw
+    /// store, with no `ProvenanceFlush` guard to write them on the early return, so they sat
+    /// pending, in the index and not in the file, until some later statement's append happened to
+    /// carry them. The table is altered either way (the refusal comes after `finish`), so a crash
+    /// in that window reopened moved rows unattributed.
+    ///
+    /// The refusal is placed at the midpoint of the restamps a twin ALTER makes, because the
+    /// fixture fixes that SOME row moves and not how many.
+    #[test]
+    fn a_rewrite_refused_mid_restamp_still_writes_the_stamps_before_it() {
+        let (mut twin, counting) = attributed_with(usize::MAX);
+        let counting_dyn: Arc<dyn ProvenanceStore> = counting.clone();
+        add_column(&mut twin, &counting_dyn).expect("the twin ALTER was refused");
+        let restamps = counting.calls.load(Ordering::SeqCst);
+        assert!(
+            restamps >= 2,
+            "premise: the rewrite re-stamped {restamps} row(s), so no stamp is queued before a refusal"
+        );
+
+        let (mut f, refusing) = attributed_with(restamps / 2);
+        let refusing_dyn: Arc<dyn ProvenanceStore> = refusing.clone();
+        let err = add_column(&mut f, &refusing_dyn)
+            .expect_err("premise: the test store's refusal did not reach the ALTER");
+        assert!(format!("{err}").contains("refused by the test's store"), "it failed, but not at the restamp: {err}");
+        let syncs = f.durable.sync_counts();
+        f.durable.flush().expect("flush");
+        assert_eq!(
+            f.durable.sync_counts(),
+            syncs,
+            "the {} stamp(s) the rewrite queued before the refusal were left pending: in the index \
+             and not in the file, for a table that IS altered",
+            restamps / 2
+        );
+    }
 }

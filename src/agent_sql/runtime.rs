@@ -7391,14 +7391,19 @@ mod tests {
 
     // ---- D246 A3: a publish never declares to the log a run its provenance file lacks ----------
     //
-    // Pre-registered in `bench/d246/PREREG.md` A3. Unit tests rather than integration tests for one
-    // reason: `DurableProvenanceStore::fail_next_append` exists only under `cfg(test)`, and it is
-    // the only way to stop a provenance write at a chosen point without killing the process.
+    // Pre-registered in `bench/d246/PREREG.md` A3 and A4. Unit tests rather than integration tests
+    // for one reason: `DurableProvenanceStore::fail_next_append` exists only under `cfg(test)`, and
+    // it is the only way to stop a provenance write at a chosen point without killing the process.
+    //
+    // The agent statements go through the runtime's API, not through `executor::run` (A4, review
+    // N-1): dispatch refuses an agent statement on an undesignated runtime while ANY runtime is
+    // designated, and `designated::tests` designates one process-wide in this same binary, so a
+    // statement routed through dispatch here could be refused for a reason unrelated to the test.
 
-    /// A database whose provenance is a durable store this test also holds, with one session that
-    /// has STAGED `BEGIN AGENT SESSION` and inserted a row, and whose `ForkDurability` is held
-    /// uncompleted. That is pgwire's window between releasing the catalog guard and `complete()`,
-    /// in which another connection can already name the branch.
+    /// A database whose provenance is a durable store this test also holds, with one agent session
+    /// STAGED (its `ForkDurability` held uncompleted) that has inserted a row. That is pgwire's
+    /// window between releasing the catalog guard and `complete()`, in which another connection can
+    /// already name the branch.
     struct UncompletedFork {
         catalog: Catalog,
         bp: Arc<BufferPoolManager>,
@@ -7406,7 +7411,8 @@ mod tests {
         wal: Arc<crate::wal::log::WalManager>,
         durable: Arc<crate::provenance::DurableProvenanceStore>,
         prov_path: std::path::PathBuf,
-        session: crate::execution::session::Session,
+        rt: Arc<AgentRuntime>,
+        session: AgentSession,
         fork: Option<ForkDurability>,
         _dir: tempfile::TempDir,
     }
@@ -7422,7 +7428,6 @@ mod tests {
     }
 
     fn uncompleted_fork() -> UncompletedFork {
-        use crate::execution::executor::{run, run_staged};
         let dir = tempfile::tempdir().unwrap();
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -7443,45 +7448,54 @@ mod tests {
             Arc::new(crate::provenance::DurableProvenanceStore::open(&prov_path).unwrap());
         let mut rt = AgentRuntime::new();
         rt.prov_store = durable.clone() as Arc<dyn crate::provenance::ProvenanceStore>;
-        let mut session = crate::execution::session::Session::with_runtime(Arc::new(rt));
-        run(
+        let rt = Arc::new(rt);
+        // Plain SQL, not an agent statement, so dispatch's designation check is not on this path.
+        let mut plain = crate::execution::session::Session::with_runtime(Arc::clone(&rt));
+        crate::execution::executor::run(
             d246_parse("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);"),
             &mut catalog,
             bp.clone(),
             txn.clone(),
-            &mut session,
+            &mut plain,
         )
         .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}"));
-        let mut fork = None;
-        run_staged(
-            d246_parse("BEGIN AGENT SESSION AS 'a' RUN 'r1' MODEL 'claude-opus-5/2026-05';"),
-            &mut catalog,
-            bp.clone(),
-            txn.clone(),
-            &mut session,
-            &mut fork,
-        )
-        .unwrap_or_else(|e| panic!("BEGIN AGENT SESSION failed: {e}"));
-        assert!(fork.is_some(), "premise: BEGIN AGENT SESSION staged no fork");
-        run(
+        let (session, fork) = rt
+            .begin_session_as_staged(
+                RunIdentity {
+                    agent_id: "a",
+                    run_id: Some("r1"),
+                    model: Some(("claude-opus-5", "2026-05")),
+                    prompt: None,
+                },
+                BranchId::TRUNK,
+            )
+            .unwrap_or_else(|e| panic!("staging the session failed: {e}"));
+        rt.write(
+            &mut ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() },
+            session.branch,
             d246_parse("INSERT INTO t VALUES (1, 10);"),
-            &mut catalog,
-            bp.clone(),
-            txn.clone(),
-            &mut session,
         )
         .unwrap_or_else(|e| panic!("INSERT in the session failed: {e}"));
-        UncompletedFork { catalog, bp, txn, wal, durable, prov_path, session, fork, _dir: dir }
+        UncompletedFork {
+            catalog,
+            bp,
+            txn,
+            wal,
+            durable,
+            prov_path,
+            rt,
+            session,
+            fork: Some(fork),
+            _dir: dir,
+        }
     }
 
     impl UncompletedFork {
-        fn merge(&mut self) -> Result<crate::execution::executor::Outcome, FerroError> {
-            crate::execution::executor::run(
-                d246_parse("MERGE;"),
-                &mut self.catalog,
-                self.bp.clone(),
-                self.txn.clone(),
-                &mut self.session,
+        fn merge(&mut self) -> Result<MergeReport, FerroError> {
+            let (rt, branch) = (Arc::clone(&self.rt), self.session.branch);
+            rt.merge(
+                &mut ExecCtx { catalog: &mut self.catalog, bp: self.bp.clone(), txn: self.txn.clone() },
+                branch,
             )
         }
 
@@ -7505,6 +7519,18 @@ mod tests {
         }
     }
 
+    /// Refused, and by the injected provenance failure: not by anything else a merge can refuse,
+    /// which would pass the test for the wrong reason (A4, review N-1).
+    fn refused_by_the_injection(merged: Result<MergeReport, FerroError>) {
+        match merged {
+            Ok(_) => panic!("the injected provenance failure was swallowed: the MERGE succeeded"),
+            Err(e) => assert!(
+                format!("{e}").contains("injected provenance append failure"),
+                "the MERGE was refused, but not by the injected provenance failure: {e}"
+            ),
+        }
+    }
+
     /// **R1.** A `MERGE` of a branch whose `BEGIN` has not completed, with the provenance store's
     /// next append failing, must not leave the log declaring a slot the provenance file lacks.
     ///
@@ -7519,7 +7545,7 @@ mod tests {
     fn a_publish_never_declares_to_the_log_a_run_its_provenance_file_lacks() {
         let mut f = uncompleted_fork();
         f.durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(f.merge().is_err(), "the injected provenance failure was swallowed");
+        refused_by_the_injection(f.merge());
 
         let in_file = f.runs_in_the_file();
         for (slot, run) in &f.declared_in_the_log() {
@@ -7560,5 +7586,29 @@ mod tests {
             "the log declares slot 1 and the provenance file does not hold it: {in_file:?}"
         );
         f.fork.take().expect("the staged fork").complete().unwrap();
+    }
+
+    /// **R3 (A4, D-2): a publish refused for its run's record leaves the target's schema as it
+    /// was.** E82: everything a merge can refuse, it refuses before the first byte is written. The
+    /// run-record await is such a refusal, so it belongs in the plan phase, ahead of the branch's
+    /// schema edits being installed and logged.
+    #[test]
+    fn a_publish_refused_for_its_runs_record_leaves_the_schema_unchanged() {
+        let mut f = uncompleted_fork();
+        let Stmt::AlterTable { table, action } = d246_parse("ALTER TABLE t ADD COLUMN w INTEGER;")
+        else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        f.rt.stage_schema_edit(&f.catalog, f.session.branch, &table, &action)
+            .unwrap_or_else(|e| panic!("staging the ALTER failed: {e}"));
+        f.durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        refused_by_the_injection(f.merge());
+        assert_eq!(
+            f.catalog.require_table("t").unwrap().schema.columns.len(),
+            2,
+            "the MERGE was refused for its run's record AFTER installing the branch's ADD COLUMN: a \
+             refused statement changed the target's schema and logged it to the change feed"
+        );
+        drop(f.fork.take());
     }
 }
