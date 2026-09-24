@@ -3589,8 +3589,8 @@ use super::*;
     /// **D230 review 7, F-D: a refusal `persist_or_undo` undid does not leave a persist owed.** The
     /// undo restores the in-memory records, and the persist after it rewrites the pages from them, so
     /// the debt is cleared. Without that, one over-long `CREATE TABLE` (D141) would keep every later
-    /// log until some other persist happened to succeed, which only a statement that moves a root
-    /// does.
+    /// log until some other persist succeeded: a later CREATE TABLE/INDEX or ALTER, a statement whose
+    /// split moves a root, or the clean exit. DML that splits no root never persists.
     #[test]
     fn an_undone_catalog_refusal_does_not_leave_a_persist_owed() {
         let (bp, _wal, txn, mut catalog, _owned, _dir) = table_to_drop();
