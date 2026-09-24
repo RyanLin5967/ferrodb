@@ -586,6 +586,10 @@ struct PersistState {
     /// The quantity this row is about is an integer, so it is worth being able to assert exactly.
     rewrites: u64,
     appends: u64,
+    /// Drains whose record `put_pending` did not write because it would have carried nothing:
+    /// no removal and no recycled list. Each one moved `durable_pending_version` exactly as the
+    /// record's append would have. See [`ArenaPageStore::TAIL_PENDING_DRAINED`].
+    elided: u64,
 }
 
 impl ArenaPageStore {
@@ -695,6 +699,7 @@ impl ArenaPageStore {
                 drain_mark: None,
                 rewrites: 0,
                 appends: 0,
+                elided: 0,
             }),
             pending_version: AtomicU64::new(0),
             recycled_reissued: AtomicBool::new(false),
@@ -1165,7 +1170,7 @@ impl ArenaPageStore {
         // [`PersistState::drain_mark`] is that proof, and every ambiguous case resolves to the
         // absolute record, which is always correct.
         let mark = persist.drain_mark.take();
-        let (payload, dirty, covered, kind) = {
+        let (payload, dirty, covered, kind, says_nothing) = {
             let mut st = self.state.lock().unwrap();
             st.pending.extend(entries);
             let dirty = std::mem::take(&mut st.recycled_dirty);
@@ -1228,8 +1233,45 @@ impl ArenaPageStore {
                 (Some(_), Some(m)) => m.base_version + 1,
                 _ => version,
             };
-            (p, dirty, covered, kind)
+            // A difference record with no removal and no recycled list: the same no-section rule
+            // `encode_arena_sections` applies, so "says nothing" is decided from what the record
+            // WOULD hold, not from how the drain went.
+            let says_nothing = matches!(&removed, Some(rm) if rm.is_empty())
+                && dirty.iter().all(|a| !st.extents.contains_key(a));
+            (p, dirty, covered, kind, says_nothing)
         };
+        // **D183 tail replay — a drain that changed nothing writes nothing.**
+        //
+        // `drain_pending_seeded` puts the log back on EVERY reap whose drain found entries, and
+        // while a live child pins them it releases none. Each such drain used to append a
+        // `TAIL_PENDING_DRAINED` naming no removal and no arena: one fsync for a record that
+        // changes nothing in the file except the `live` snapshot. That is one fsync per interior
+        // reap on top of its `TAIL_PAGES_PARKED`, and one more record for every open after an
+        // unclean exit to replay.
+        //
+        // The record's only durable EFFECT was to move `durable_pending_version` to `covered`, the
+        // take's own bump. The drain mark proves the durable log is still the log the take handed
+        // out, and nothing left it, so that move is TRUE without the bytes. It is made here
+        // directly.
+        //
+        // ⚠ **Only in place of an APPEND.** If `persist_delta_locked` would REWRITE instead (no
+        // image yet, the authority moved, a recycled page was reissued, or the tail is full), a
+        // rewrite was already owed for a reason unrelated to this drain. The record falls through
+        // and pays it exactly as before. An elision that swallowed an owed rewrite would leave
+        // `recycled_reissued`'s window open, and that window is a live page freed, not a leak.
+        //
+        // What the file loses: the `live` snapshot this record would have carried. A drain that
+        // released nothing did not move `live_pages` itself, so the snapshot is stale only by
+        // pages allocated since the last record. Those pages' `next_free` is not in the file
+        // either, and the next record of any kind re-snapshots it.
+        if says_nothing
+            && self.checkpoint_path.lock().unwrap().is_some()
+            && self.delta_would_append(&persist, 9 + payload.len() as u64, Some(covered))
+        {
+            persist.durable_pending_version = covered;
+            persist.elided += 1;
+            return Ok(());
+        }
         if let Err(e) = self.persist_delta_locked(&mut persist, kind, &payload, Some(covered)) {
             // Nothing reached the file, so the arenas this record named are still owed one.
             // Re-marking rather than assuming: an arena dirtied again while the append was in
@@ -1847,6 +1889,12 @@ impl ArenaPageStore {
     /// `put_pending`'s record when [`PersistState::drain_mark`] proves the durable log is the one
     /// `take_pending` handed out — **O(released) rather than O(the whole log)**, which is what
     /// keeps a run of interior reaps linear in bytes instead of quadratic.
+    ///
+    /// **Never written empty.** A drain that removed nothing and owes no recycled list would
+    /// produce a record with no removal and no section. `put_pending` writes no record for it and
+    /// moves `durable_pending_version` itself, but only where the record would have been
+    /// APPENDED; an owed rewrite is still paid. See the elision in `put_pending` and
+    /// `a_drain_that_released_nothing_writes_no_record_and_leaves_the_log_level`.
     const TAIL_PENDING_DRAINED: u8 = 5;
     /// Kinds this build understands. An allowlist for the same reason `READABLE_STATE_VERSIONS`
     /// is one.
@@ -2090,17 +2138,7 @@ impl ArenaPageStore {
         let path = self.checkpoint_path.lock().unwrap().clone();
         let Some(p) = path else { return Ok(()) };
         let rec = Self::encode_tail_record(kind, payload);
-        if g.image_bytes == 0
-            || g.image_epoch != crate::cluster::epoch()
-            || (pending_covered.is_none()
-                && g.durable_pending_version != self.pending_version.load(Ordering::SeqCst))
-            // A recycled page was handed out again and no record kind can describe that: the
-            // claim record carries no recycled list and the free record removes one. The only
-            // honest answer is to stop appending. See [`Self::recycled_reissued`] — this is the
-            // one condition here whose absence is a live page freed rather than a leak.
-            || self.recycled_reissued.load(Ordering::SeqCst)
-            || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
-        {
+        if !self.delta_would_append(g, rec.len() as u64, pending_covered) {
             // The rewrite folds in the mutation this record described, because `state_bytes`
             // serialises live memory and the caller has already applied it. So the record is
             // simply not needed, rather than needed and skipped.
@@ -2113,6 +2151,38 @@ impl ArenaPageStore {
             g.durable_pending_version = v;
         }
         Ok(())
+    }
+
+    /// Whether [`Self::persist_delta_locked`] would APPEND a record of `rec_len` bytes (true) or
+    /// rewrite the whole image (false). The four conditions are documented there.
+    ///
+    /// One function, so the append path and `put_pending`'s elision of a record with nothing to
+    /// say cannot disagree about when appending is allowed. See
+    /// [`Self::TAIL_PENDING_DRAINED`]: an elision stands in for an APPEND and never for an owed
+    /// rewrite.
+    fn delta_would_append(
+        &self,
+        g: &PersistState,
+        rec_len: u64,
+        pending_covered: Option<u64>,
+    ) -> bool {
+        !(g.image_bytes == 0
+            || g.image_epoch != crate::cluster::epoch()
+            || (pending_covered.is_none()
+                && g.durable_pending_version != self.pending_version.load(Ordering::SeqCst))
+            // A recycled page was handed out again and no record kind can describe that: the
+            // claim record carries no recycled list and the free record removes one. The only
+            // honest answer is to stop appending. See [`Self::recycled_reissued`] — this is the
+            // one condition here whose absence is a live page freed rather than a leak.
+            || self.recycled_reissued.load(Ordering::SeqCst)
+            || g.tail_bytes + rec_len > Self::compact_threshold(g.image_bytes))
+    }
+
+    /// Drains `put_pending` answered with no record at all, because the drain changed nothing a
+    /// record could carry. See [`Self::TAIL_PENDING_DRAINED`].
+    #[cfg(test)]
+    pub(crate) fn elided_drains(&self) -> u64 {
+        self.persist.lock().unwrap().elided
     }
 
     /// Pending-free log entries tail replay has visited over this store's life. The unit is
@@ -5567,6 +5637,182 @@ mod tests {
             "the replayed pending log breaks a rule the per-record scans kept (order, first-wins, \
              dead-arena skip, duplicate handling)"
         );
+    }
+
+    // ---- D183: a drain that changed nothing writes nothing ----------------------------------
+
+    /// A parent with `pages` pages and a live child forked after them, retired by the interval
+    /// rule, so every page is PARKED by one `TAIL_PAGES_PARKED` record. That record also takes
+    /// every recycled-list mark outstanding at the time.
+    fn armed_with_parked_log(tag: &str, pages: usize) -> (Harness, std::path::PathBuf) {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-{}-{}.bin", std::process::id(), tag));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..pages {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), pages, "fixture: the retire parked {pages} pages");
+        (h, armed)
+    }
+
+    /// `image + tail` at `armed` restores byte-identical to a full image of live memory.
+    fn tail_matches_a_full_rewrite(h: &Harness, armed: &std::path::Path, tag: &str) {
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-c-{}-{}.bin", std::process::id(), tag));
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "{tag}: image + tail does not restore to what a full rewrite of memory holds"
+        );
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// ⭐ **A drain that released nothing writes no record, and still leaves the log LEVEL.**
+    ///
+    /// This is what `drain_pending_seeded` does on every reap while a live child pins the parked
+    /// pages: take the log, keep everything, put it back. The record for it named no removal and
+    /// no arena, so it cost one fsync per interior reap and one more record for replay to walk.
+    ///
+    /// The record's one durable effect was to discharge the take's `pending_version` bump. The
+    /// elision must make that move itself, or the NEXT record of any kind would find the log
+    /// dirty and rewrite the whole image. That is the second assertion. Its mutant (skip the
+    /// record, forget the move) turns `(0, 1)` into `(1, 0)`.
+    #[test]
+    fn a_drain_that_released_nothing_writes_no_record_and_leaves_the_log_level() {
+        let (h, armed) = armed_with_parked_log("nothing", 4);
+        let kinds0 = ArenaPageStore::tail_kinds(&armed);
+        let (r0, a0) = h.store.persist_counters();
+        let e0 = h.store.elided_drains();
+
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), 4, "fixture: the take did not see the parked entries");
+        h.store.put_pending(taken).unwrap();
+
+        assert_eq!(
+            h.store.elided_drains(),
+            e0 + 1,
+            "the drain that released nothing was not elided (anti-vacuity: without this, the two \
+             assertions below also pass for a store that never reached the elision)"
+        );
+        assert_eq!(
+            h.store.persist_counters(),
+            (r0, a0),
+            "a drain that released nothing still persisted something"
+        );
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed),
+            kinds0,
+            "a drain that released nothing still wrote a record"
+        );
+
+        // The log is level: the next record APPENDS.
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(spare.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the claim after an elided drain did not simply append: the take's pending_version bump \
+             was never discharged, so every elision now costs a full image rewrite later"
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "nothing");
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// An elision stands in for an APPEND. It must never swallow a REWRITE that was already owed.
+    ///
+    /// Here a recycled page is handed out again first, which sets `recycled_reissued`. Only a full
+    /// image rewrite can carry that, because no record kind can say "this recycled page is live
+    /// again", and until it lands a crash would restore an extent that looks empty while it holds
+    /// a live page. The drain that follows releases nothing and owes no arena, so it would be
+    /// elided if the elision ignored what `persist_delta_locked` would have done. It must rewrite.
+    #[test]
+    fn a_drain_with_nothing_to_say_still_pays_a_rewrite_that_was_owed() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-owed-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+
+        // A recycled page, not yet reused.
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        h.store.release_page(page, arena);
+        // The parked log. Its record also takes the recycled-list mark `release_page` left, so
+        // the drain below owes no arena.
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert!(h.store.pending_len() > 0, "fixture: nothing was parked");
+
+        // The reuse. From here a rewrite is owed.
+        let reused = h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(2)).unwrap();
+        assert_eq!(reused, page, "fixture: the allocation did not come from the recycled list");
+
+        let (r0, a0) = h.store.persist_counters();
+        let e0 = h.store.elided_drains();
+        let taken = h.store.take_pending();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.elided_drains(), e0, "an owed rewrite was elided");
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "the drain did not pay the rewrite a reissued recycled page owed"
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "owed");
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// A drain that released nothing but owes a recycled list still writes its record: an
+    /// `n = 0` difference record carrying one arena section.
+    ///
+    /// The page released outside the drain marks its arena and persists nothing, so the drain's
+    /// record is the first thing that can carry that list to the file. Eliding it for having "no
+    /// removal" would leave the durable recycled list one page short: a leak of that page after a
+    /// crash, and a restore that disagrees with memory.
+    #[test]
+    fn a_drain_that_released_nothing_still_writes_the_recycled_lists_it_owes() {
+        let (h, armed) = armed_with_parked_log("owes", 4);
+        // Released outside any drain: marked dirty, no record.
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        let (r0, a0) = h.store.persist_counters();
+        h.store.release_page(page, arena);
+        assert_eq!(h.store.persist_counters(), (r0, a0), "fixture: release_page persisted by itself");
+
+        let e0 = h.store.elided_drains();
+        let taken = h.store.take_pending();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.elided_drains(), e0, "a drain owing a recycled list was elided");
+        assert_eq!((r1 - r0, a1 - a0), (0, 1), "the drain owing a recycled list did not append");
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+            "the drain wrote {:?}, not its difference record",
+            ArenaPageStore::tail_kinds(&armed)
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "owes");
+        let _ = std::fs::remove_file(&armed);
     }
 
     #[test]
