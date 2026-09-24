@@ -34,17 +34,22 @@
 //! transaction's next record, a `HeapInsert` of the new one. Decoded record by record, a consumer is
 //! told the row was deleted and a new one appeared, for what was one UPDATE. Postgres logs such an
 //! update as one record whatever page the new version lands on, and its logical decoding emits one
-//! UPDATE; physical placement is not a logical change. So the two records are read back as one:
+//! UPDATE (RECALLED, not checked against its source here); physical placement is not a logical
+//! change. So the two records are read back as one:
 //!
 //! - **What identifies the pair**: a `HeapDelete` whose image is LIVE (`end_ts == 0`), followed by the
 //!   SAME transaction's next record — time-travel records aside, since they are not changes — being a
-//!   `HeapInsert` into the same table with the same primary key (column 0, which an UPDATE may not
-//!   assign). It becomes one `Update { old, new }`, stamped with the `HeapDelete`'s LSN. "Next record
-//!   of the transaction", not "next record in the log": other transactions interleave.
+//!   `HeapInsert` at the same `dir_root` (the table's identity; a name can be shared) with the same
+//!   primary key (column 0, which an UPDATE may not assign). It becomes one `Update { old, new }`.
+//!   "Next record of the transaction", not "next record in the log": other transactions interleave.
+//! - **Stamped with the `HeapDelete`'s LSN, and that is load-bearing.** [`Decoded::open_from`] is the
+//!   earliest STAGED LSN, and `FeedStreamer::pump` never moves its cursor past it. A pair still open
+//!   where a range ends must hold the cursor at its first half; stamped with the insert's LSN, the
+//!   next pump would start after the delete and ship a lone INSERT.
 //! - **Why a live `HeapDelete` is enough to mark**: no other production writer logs one. A SQL
 //!   `DELETE` is a `HeapUpdate` stamping `end_ts` (point 1), same length, so it never relocates.
-//!   `HeapFileManager::delete` is called only from tests, and an abort's compensation is a `Clr`
-//!   record in a transaction this decoder discards.
+//!   `HeapFileManager::delete` is `#[cfg(test)]`, so no production code can call it, and an abort's
+//!   compensation is a `Clr` record in a transaction this decoder discards.
 //! - **A DELETE and an unrelated INSERT adjacent in one transaction stay two events.** A SQL DELETE
 //!   never marks, so `DELETE k; INSERT k` in one transaction is still `DELETE` + `INSERT`. A marked
 //!   delete followed by any other record, or by an insert of another key or table, is left exactly
@@ -251,7 +256,9 @@ pub fn sql_type_of(ty: &DataType) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeEvent {
     pub txn_id: u64,
-    /// LSN of the record that produced this change — where it sits in the log.
+    /// LSN of the record that produced this change — where it sits in the log. For an UPDATE whose
+    /// row relocated, which the log holds as a `HeapDelete` then a `HeapInsert` (module doc point 3),
+    /// it is the `HeapDelete`'s: the first of the two, and the one `Decoded::open_from` must not pass.
     pub lsn: u64,
     /// LSN of the `Commit` that made it visible. Events are ordered by this.
     pub commit_lsn: u64,
@@ -835,9 +842,10 @@ impl LogicalDecoder {
         // from the log, not handed in: see `RecKind::RunIdentity`.
         let mut runs: HashMap<u32, Arc<RunEntity>> = HashMap::new();
         let mut bound: HashMap<u64, Arc<RunEntity>> = HashMap::new();
-        // Transactions whose previous record was a live `HeapDelete`: possibly the first half of a
-        // relocating UPDATE, decided by the transaction's next record. Point 3 of the module doc.
-        let mut relocating: BTreeSet<u64> = BTreeSet::new();
+        // Transactions whose previous record was a live `HeapDelete`, and the `dir_root` it was at:
+        // possibly the first half of a relocating UPDATE, decided by the transaction's next record.
+        // Point 3 of the module doc.
+        let mut relocating: BTreeMap<u64, u32> = BTreeMap::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -875,9 +883,10 @@ impl LogicalDecoder {
                             // Point 3: if this completes a relocating UPDATE, its first half is this
                             // transaction's last staged change, and the pair becomes one UPDATE at the
                             // first half's LSN. Anything else is put back as it was.
-                            let event = match relocation_half.then(|| changes.pop()).flatten() {
+                            let same_root = relocation_half == Some(*dir_root);
+                            let event = match same_root.then(|| changes.pop()).flatten() {
                                 Some((at, t, cols, ChangeOp::Delete { old }))
-                                    if t == table && old.first() == new.first() =>
+                                    if old.first() == new.first() =>
                                 {
                                     (at, t, cols, ChangeOp::Update { old, new })
                                 }
@@ -905,7 +914,7 @@ impl LogicalDecoder {
                         // Point 3: a LIVE row leaving its slot is the first half of a relocating
                         // UPDATE; the transaction's next record decides whether it is paired.
                         if !Self::is_dead(old) {
-                            relocating.insert(txn);
+                            relocating.insert(txn, *dir_root);
                         }
                     }
                     RowResult::UnknownTable => *out.unresolved.entry(*dir_root).or_insert(0) += 1,
