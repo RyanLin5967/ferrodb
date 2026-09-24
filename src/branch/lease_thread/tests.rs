@@ -1178,3 +1178,96 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
          Live-only and resume_interrupted_reaps runs at open, not per tick."
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// F1 — downtime is not charged to a lease (Chubby §2.9: the timer is stopped while the authority
+// is down). `artie-research/frontier/research_reclaim-with-live-children.md` §5.
+// -------------------------------------------------------------------------------------------
+
+/// [`fixture`] over the catalog that SHIPS. `fixture` uses the log catalog (`Harness::new`), which
+/// is the reference oracle rather than what either binary opens; a restart grace is a property of
+/// the durable catalog a restart actually reads.
+fn table_fixture() -> Fixture {
+    let h = Harness::new_with(true);
+    let runtime = Arc::new(
+        AgentRuntime::with_storage(
+            Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            Arc::clone(&h.store) as Arc<dyn PageStore>,
+        )
+        .unwrap(),
+    );
+    let reaper = Arc::new(TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store)));
+    Fixture { h, reaper, runtime }
+}
+
+/// **F1 at the scan's own granularity.** `tests/integration_server_reaps.rs` pins the same claim
+/// through `pgserver`, which cannot say how many scans ran; this can, so "it survived the first
+/// scan" is a counted fact here rather than an inference from elapsed time.
+///
+/// A restart is modelled as what the lease logic sees of one: the scan thread stops, real time
+/// passes with nothing scanning, and a new thread starts over the same durable catalog. Nothing
+/// here writes a clock or a mark — only the one lease deadline, through `renew_lease` — so this
+/// compiles against, and means the same thing on, the tree before the fix.
+#[test]
+fn f1_a_lease_that_lapsed_while_nothing_was_scanning_survives_the_scans_after_a_restart() {
+    let f = table_fixture();
+    let branch = branch_with_pages(&f, FAR_FUTURE, 3);
+    let with_pages = f.h.store.live_page_count().unwrap();
+
+    // The first life: the thread starts, scans, and is stopped.
+    let first = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("the first life to scan", || first.stats().scans >= 2);
+    let first_stats = first.stop();
+    assert_eq!(first_stats.reaped, 0, "the first life reaped a far-future lease: {first_stats:?}");
+
+    // At shutdown the lease had two seconds left, and nothing scans for three.
+    let shutdown = LeaseDeadline::now_millis();
+    let deadline = shutdown + 2_000;
+    f.h.catalog.renew_lease(branch, LeaseDeadline(deadline)).unwrap();
+    while LeaseDeadline::now_millis() < deadline + 1_000 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        LeaseDeadline(deadline).is_expired_at(LeaseDeadline::now_millis()),
+        "premise: the lease must have lapsed during the downtime, or nothing below is about F1"
+    );
+
+    // The second life.
+    let second = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("four scans after the restart", || second.stats().scans >= 4);
+    let after_restart = second.stats();
+    assert_eq!(
+        after_restart.reaped, 0,
+        "a lease that lapsed only while nothing was scanning was reaped by the first scans after \
+         the restart — F1. It had 2000ms left when the thread stopped: {after_restart:?}"
+    );
+    assert_eq!(state_of(&f, branch), BranchState::Live);
+    assert_eq!(f.h.store.live_page_count().unwrap(), with_pages, "a page went back early");
+    let moved = f.h.catalog.get_raw(branch.id).unwrap().lease_deadline.0;
+    assert!(
+        moved > deadline,
+        "the branch survived but its deadline did not move ({moved} <= {deadline}), so the survival \
+         is not the grace this test is about"
+    );
+
+    // A lease, not an exemption: once the remainder it had at shutdown runs out, it is reaped.
+    wait_for("the preserved remainder to run out and the scan to reap the branch", || {
+        second.stats().reaped >= 1
+    });
+    second.stop();
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    assert!(f.h.store.live_page_count().unwrap() < with_pages, "the reap freed nothing");
+}
