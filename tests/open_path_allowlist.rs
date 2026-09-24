@@ -615,6 +615,42 @@ fn both_production_entry_points_build_their_runtime_through_the_opened_database(
         vec!["src/agent_sql/runtime.rs".to_string()],
         "these name `with_durable_provenance`, so a durable store can reach a runtime without the door"
     );
+    // Lane §3.17 (D250 review 4's N4): one store per provenance file per process. Production code opens
+    // the file only through `DurableProvenanceStore::shared`, so `DurableProvenanceStore::open` is named
+    // only in its own file; and a store is installed into a runtime (`with_provenance_store`) only by the
+    // runtime itself and by the door. Allowlists: the one-name scan above was a denylist.
+    let mut opens = Vec::new();
+    let mut installs = Vec::new();
+    for f in &files {
+        let name = rel(root, f);
+        let t = tokens(&production_text(&std::fs::read_to_string(f).unwrap()));
+        if (0..t.len()).any(|k| {
+            ident(&t, k) == Some("DurableProvenanceStore")
+                && punct(&t, k + 1, ':')
+                && punct(&t, k + 2, ':')
+                && ident(&t, k + 3) == Some("open")
+        }) {
+            opens.push(name.clone());
+        }
+        if (0..t.len()).any(|k| ident(&t, k) == Some("with_provenance_store")) {
+            installs.push(name);
+        }
+    }
+    opens.sort();
+    installs.sort();
+    assert!(
+        opens.iter().all(|f| f == "src/provenance/durable.rs"),
+        "these name `DurableProvenanceStore::open`, so a second store can be opened on a file the process already \
+         holds one for: {opens:?}"
+    );
+    assert!(
+        installs.iter().all(|f| f == "src/agent_sql/runtime.rs" || f == "src/wal/recovery.rs"),
+        "these install a provenance store into a runtime without the door: {installs:?}"
+    );
+    assert!(
+        installs.contains(&"src/wal/recovery.rs".to_string()),
+        "premise failed: the scan does not see the door's own `with_provenance_store`, so it can see nothing"
+    );
 }
 
 #[test]

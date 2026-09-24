@@ -596,6 +596,12 @@ fn logged_drops_the_catalog_missed(wal: &WalManager, catalog: &Catalog) -> Resul
     Ok((drops, missed))
 }
 
+/// D250 review 4's N2 seam: nothing outside this crate's unit tests. The test half, after the tests
+/// module, makes one named file's next open-time forget fail through the store's own
+/// `fail_next_append`, so the store takes its real failure path.
+#[cfg(not(test))]
+fn inject_open_forget_failure(_store: &DurableProvenanceStore, _path: &Path) {}
+
 /// **D204 — THE way to open a database file.** Every binary calls this; none spells the sequence
 /// out for itself (`tests/open_path_allowlist.rs` enforces that).
 ///
@@ -696,6 +702,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         None
     } else {
         let store = Arc::new(DurableProvenanceStore::open(&provenance_path)?);
+        inject_open_forget_failure(&store, &provenance_path);
         for table in &dropped_tables {
             if let Err(e) = store.forget_table(table_id(table).0) {
                 use std::io::Write;
@@ -2322,5 +2329,194 @@ use super::*;
         );
         run_sql("SELECT id, w FROM t;", &mut o.catalog, &o.bp, &o.txn)
             .unwrap_or_else(|e| panic!("the altered `t` does not answer for the column the ALTER added: {e}"));
+    }
+
+    /// **D250 review 4's N1 (lane §3.17 test 20): a DROP that answers `Err` after its frees has still
+    /// forgotten the table's authors.** The executor forgot only after `drop_checkpointed`'s `?`. So an
+    /// error from the barrier's checkpoint (here its sync), with the table already gone and the log not
+    /// poisoned, skipped the forget, and a `CREATE TABLE t` in the same process inherited the dropped
+    /// `t`'s authors for good. Red at `4ae1ec4`.
+    #[test]
+    fn a_drop_that_fails_at_its_checkpoint_still_forgets_the_tables_authors() {
+        use crate::{
+            agent_sql::runtime::table_id,
+            branch::types::BranchId,
+            provenance::{ProvId, RunEntity},
+            tel::ids::RowId,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("failed_drop_authors.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&db).unwrap();
+        let dm = DiskManager::with_storage(Arc::new(SyncFailsWhenArmed { file, armed: armed.clone() })).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(dm)));
+        let wal = Arc::new(WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let runtime = Arc::new(AgentRuntime::new());
+        let mut session = Session::with_runtime(runtime.clone());
+        for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            run_sql_in(sql, &mut catalog, &bp, &txn, &mut session).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+        let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+        let author = runtime.provenance().intern(&run).unwrap();
+        runtime.provenance().stamp_row(table_id("t").0, 1, author).unwrap();
+        assert!(runtime.who_wrote_row("t", RowId(1)).is_some(), "premise failed: row 1 of `t` has no author before the DROP");
+        armed.store(true, Ordering::SeqCst);
+        let e = match run_sql_in("DROP TABLE t;", &mut catalog, &bp, &txn, &mut session) {
+            Err(e) => e,
+            Ok(_) => panic!("premise failed: the DROP's checkpoint did not fail"),
+        };
+        assert!(e.to_string().contains("injected"), "premise failed: the DROP failed, but not at its checkpoint's sync: {e}");
+        assert!(catalog.get_table("t").is_none(), "premise failed: the DROP failed before its mutation, so it freed nothing");
+        assert!(
+            wal.poisoned().is_none(),
+            "premise failed: the log is poisoned, so this is not N1's state (an Err after the frees, on a writable log)"
+        );
+        armed.store(false, Ordering::SeqCst);
+        run_sql_in("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn, &mut session)
+            .unwrap_or_else(|e| panic!("premise failed: the CREATE after the failed DROP failed: {e}"));
+        assert!(
+            runtime.who_wrote_row("t", RowId(1)).is_none(),
+            "the re-created `t` inherits the dropped `t`'s author: the DROP answered Err after its frees and skipped its forget"
+        );
+        assert_eq!(
+            runtime.provenance().row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "the store still names an author for row 1 of the re-created `t`"
+        );
+    }
+
+    /// **D250 review 4's N4 (lane §3.17 test 21): two `Durable` attaches of one open share one
+    /// provenance store.** When the open had nothing to forget, each `attach_runtime(.., Durable)`
+    /// opened the file again: two appenders on one file, each with its own in-memory index. Red at
+    /// `4ae1ec4`: the second store's index was replayed before the first one's stamp.
+    #[test]
+    fn two_durable_attaches_of_one_open_share_one_provenance_store() {
+        use crate::{agent_sql::runtime::table_id, branch::types::BranchId, provenance::{ProvId, RunEntity}};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("two_attaches.db");
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(o.provenance.is_none(), "premise failed: the open had a table to forget, so it opened the store itself");
+        let a = o.attach_runtime(AgentRuntime::new(), ProvenanceBacking::Durable).unwrap();
+        let b = o.attach_runtime(AgentRuntime::new(), ProvenanceBacking::Durable).unwrap();
+        let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+        let author = a.provenance().intern(&run).unwrap();
+        a.provenance().stamp_row(table_id("t").0, 1, author).unwrap();
+        assert_eq!(
+            b.provenance().row_author(table_id("t").0, 1).unwrap(),
+            author,
+            "a second Durable attach of one open does not see a stamp made through the first: two stores append to one \
+             file with in-memory indexes that disagree"
+        );
+    }
+
+    /// **D250 review 4's N2 (lane §3.17 test 22): an open whose provenance forget fails keeps the DROP
+    /// for the next open.** The forget was counted and the open went on, and its checkpoint truncated
+    /// the `DropTable`, the only record from which a later open computes what to forget. The store's
+    /// poison is in memory, so after a restart the dropped table's authors were served again, and
+    /// nothing retried. Red at `4ae1ec4`: the log after the first open holds no `DropTable`.
+    #[test]
+    fn an_open_whose_provenance_forget_fails_keeps_the_drop_for_the_next_open() {
+        use crate::{
+            agent_sql::runtime::table_id,
+            branch::types::BranchId,
+            provenance::{DurableProvenanceStore, ProvId, ProvenanceStore, RunEntity},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("forget_fails_at_open.db");
+        let provenance = PathBuf::from(format!("{}.provenance", db.display()));
+        {
+            let store = DurableProvenanceStore::open(&provenance).unwrap();
+            let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+            let author = store.intern(&run).unwrap();
+            store.stamp_row(table_id("t").0, 1, author).unwrap();
+            store.stamp_row(table_id("keep").0, 1, author).unwrap();
+        }
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            // `run_sql`'s runtime is in memory, so the executor's forget never reaches the file.
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (1, 10);",
+                "DROP TABLE t;",
+            ] {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            // The crash.
+        }
+        fail_the_next_open_forget(&provenance);
+        let failures = provenance_forget_failures();
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            // `Ok` or `Err`: either way this process ends here, by a crash or a refused open.
+            let _first = open_recovered(&db, &lock);
+            assert_eq!(
+                provenance_forget_failures(),
+                failures + 1,
+                "premise failed: the injected forget failure did not fire exactly once"
+            );
+        }
+        let drops_of_t = {
+            let wal = WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap();
+            let end = wal.next_lsn.load(Ordering::SeqCst);
+            let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+            let mut n = 0;
+            while lsn < end {
+                let (rec, next) = wal.read_record(lsn).unwrap();
+                if matches!(&rec.kind, RecKind::Ddl { op: DdlOp::DropTable, table, .. } if table == "t") {
+                    n += 1;
+                }
+                lsn = next;
+            }
+            n
+        };
+        assert!(
+            drops_of_t > 0,
+            "the open whose forget failed truncated the only DropTable that could retry it: the dropped `t`'s authors \
+             are permanent"
+        );
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("the open after the failed forget failed");
+            assert!(o.catalog.get_table("t").is_none(), "premise failed: `t` came back");
+        }
+        let store = DurableProvenanceStore::open(&provenance).unwrap();
+        assert_eq!(
+            store.row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "the dropped `t`'s authors survived the open that retried the forget"
+        );
+        assert_ne!(
+            store.row_author(table_id("keep").0, 1).unwrap(),
+            ProvId::NONE,
+            "the retried forget took the authors of `keep`, which was never dropped"
+        );
+    }
+}
+
+/// Provenance files whose next open-time forget fails, once (D250 review 4's N2, test 22). Keyed by
+/// path, so arming it cannot fail another test's open.
+#[cfg(test)]
+static OPEN_FORGET_FAILURES_TO_INJECT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Make the next open-time forget in the provenance file at `path` fail.
+#[cfg(test)]
+fn fail_the_next_open_forget(path: &Path) {
+    OPEN_FORGET_FAILURES_TO_INJECT.lock().unwrap().push(path.to_path_buf());
+}
+
+/// The test half of the N2 seam: the store forgets in memory, its append fails, and it poisons itself,
+/// which is the production failure path.
+#[cfg(test)]
+fn inject_open_forget_failure(store: &DurableProvenanceStore, path: &Path) {
+    let mut armed = OPEN_FORGET_FAILURES_TO_INJECT.lock().unwrap();
+    if let Some(i) = armed.iter().position(|p| p == path) {
+        armed.remove(i);
+        store.fail_next_append.store(true, Ordering::SeqCst);
     }
 }
