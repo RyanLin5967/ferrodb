@@ -53,6 +53,15 @@
 //! and putting merges past the window back in reach. The window, the counters and C1 are all taken
 //! by `hseq`, never by a record's position in the file.
 //!
+//! # What a write costs, amortised (AMENDED 3, item 9)
+//!
+//! A publish adds no fsync of its own. The FIRST write after an open, or after a failed write, is a
+//! full rewrite — O(W) bytes and two fsyncs (the temporary, then the directory) — and it can land on
+//! a commit path, through the bounded drain below, once. Every later write is one append (one fsync)
+//! per checkpoint, or per [`QUEUE_DRAIN_BYTES`] queued, plus one O(W) rewrite per `max(W/8, 1)`
+//! publishes when a prune is due. The queue is filled only after `flush_up_to(commit_lsn)`
+//! (`TxnManager::commit`), so no drain ever stores the history of a merge that did not commit.
+//!
 //! # What this file does not know
 //!
 //! Bodies are opaque here. What a record MEANS — a publish's ops and captures, a REVERT's marker —
