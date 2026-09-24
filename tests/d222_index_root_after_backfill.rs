@@ -559,27 +559,47 @@ fn high_water_across_a_drop(kind: Kind, index_first: bool) -> (u32, u32) {
 ///
 /// Each kind's control is the same table and the same rows with the index created FIRST, so no
 /// backfill happens and the recorded root is kept current by the INSERT path. It must not move at
-/// the base or with the fix; if it does, something other than D222 is leaking and that kind's
-/// second arm says nothing.
+/// the base or with the fix; if it does, something other than D222 is leaking and no arm here can
+/// be read.
+///
+/// **All four arms are measured before anything is asserted**, and both backfill arms are judged by
+/// ONE assertion that prints every mark. Asserting kind by kind stopped at the first failure, so at
+/// `9aa6968` the B-tree leak ended the test and the full-text arms never ran: the full-text half of
+/// the claim had no red behind it (found by a fresh-context review of `2ffdb68`).
 #[test]
 fn drop_table_returns_every_page_of_an_index_built_by_backfill() {
+    let mut arms = Vec::new();
     for kind in [Kind::BTree, Kind::FullText] {
-        let (control_peak, control_after) = high_water_across_a_drop(kind, true);
-        assert_eq!(
-            control_after, control_peak,
-            "{kind:?} control: with the index created BEFORE the rows, rebuilding an identical \
-             table after a DROP moved the allocator's high-water mark from {control_peak} to \
-             {control_after}. Something other than the backfill's root read is leaking, so the \
-             {kind:?} arm below cannot be read."
-        );
-
-        let (peak, after) = high_water_across_a_drop(kind, false);
-        assert_eq!(
-            after, peak,
-            "{kind:?}: with the index built by the backfill, rebuilding an identical table after a \
-             DROP moved the allocator's high-water mark from {peak} to {after}, so the drop did not \
-             return the index's pages. `drop_table` frees from the recorded root, and a root read \
-             before the backfill is the leftmost leaf, which frees one page."
-        );
+        for index_first in [true, false] {
+            let (peak, after) = high_water_across_a_drop(kind, index_first);
+            arms.push((kind, index_first, peak, after));
+        }
     }
+    let seen: String = arms
+        .iter()
+        .map(|(kind, index_first, peak, after)| {
+            let arm = if *index_first { "control, index created first" } else { "built by the backfill" };
+            format!("\n  {kind:?}, {arm}: {peak} -> {after}")
+        })
+        .collect();
+    // Printed on a PASS too (visible with `--nocapture`), so a green run leaves the marks in its log.
+    println!("d222 allocator high-water mark, second build -> third build:{seen}");
+
+    for (kind, index_first, peak, after) in &arms {
+        if *index_first {
+            assert_eq!(
+                after, peak,
+                "{kind:?} control: with the index created BEFORE the rows, rebuilding an identical \
+                 table after a DROP moved the allocator's high-water mark. Something other than the \
+                 backfill's root read is leaking, so no arm here can be read.{seen}"
+            );
+        }
+    }
+    assert!(
+        arms.iter().all(|(_, index_first, peak, after)| *index_first || after == peak),
+        "with the index built by the backfill, rebuilding an identical table after a DROP moved the \
+         allocator's high-water mark, so the drop did not return the index's pages. `drop_table` \
+         frees from the recorded root, and a root read before the backfill is the leftmost leaf, \
+         which frees one page.{seen}"
+    );
 }
