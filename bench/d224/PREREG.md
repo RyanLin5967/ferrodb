@@ -286,3 +286,71 @@ unregistered kill, never folded in.
 
 **Erratum to amendment 3:** `b05aaa3` changes **four** code lines, not three: one `Ok(_)` arm and the three added lines
 of the `stop` check.
+
+---
+
+## Amendment 4 — the merge of D207's final tip, and the probe's meters on the node, written BEFORE the code (nothing built)
+
+The lead's instruction: make the merge obligation a commit, not a note. So D224 lands as a branch that CONTAINS
+D207 (#19), and nothing needs doing by hand between the two landings.
+
+**`4462bd2` merges `1eaf1a7`**, which the lead declared D207's FINAL tip after a lead check. It is a `--no-ff`
+merge, with no rebase; `49ba420` and `1eaf1a7` are both its parents. It merged without conflict. What it leaves
+incoherent, read from the merged tree:
+
+- D207's `TransportCounters` is documented as "every meter a transport keeps", and `Transport::counters()` fills
+  16 fields.
+- The merged `Transport` has **18** counter accessors (`pub fn …(&self) -> u64|usize`). The two missing are D224's
+  `idle_probes` and `idle_redials`.
+- So on the merged tree, `Node::transport_counters()` hides the probe. `Transport`'s `Debug` merged coherently: it
+  prints both sides' fields.
+
+**Counts on the merged tree at `4462bd2`** (READ, `grep -cE '^\s*#\[test\]'`): transport 62 (one macOS-only),
+node 13, log 58, replicate 60.
+
+### The fix, as it will be made
+
+- Add `idle_probes: u64` and `idle_redials: u64` to `TransportCounters`, and fill both in `Transport::counters()`
+  from the accessors. The struct's doc then holds again: 18 fields, 18 accessors.
+
+### Post-fix test, with mutant-only red
+
+It cannot be red against the merge: it reads fields that do not exist there, and a test that fails to compile
+takes its whole binary down with it.
+
+**K** = `the_idle_probe_meters_are_readable_from_a_running_node` (`tests_node.rs`).
+
+- **Setup.**
+  - A node is configured {1, 2}, with `idle_deadline` 300 ms (so the gate is 150 ms) and a 1 ms tick.
+  - Peer 2 is a hand-rolled listener. It accepts the node's own dial, reads its six handshake bytes, answers with a
+    handshake, and closes. The node has sent nothing else, so the close is a FIN.
+  - The test waits 400 ms, sets `next_tick` in the past, and polls once. The node campaigns, and its first frame to 2
+    is probed after a gap of at least 400 ms since the dial. The probe finds the FIN and redials.
+- **The premise is read from the transport itself**, through `n.net.idle_probes()` and `n.net.idle_redials()`
+  (`tests_node` is a child module of `node`), not through the snapshot under test. It must reach ≥ 1 each within
+  10 s, or the test fails as vacuous.
+- **Then** `n.transport_counters()` must show `idle_probes ≥ 1` and `idle_redials ≥ 1`. Both counters only rise and
+  the premise was read first, so there is no race.
+
+### Mutants (transport.rs; the node module)
+
+| mutant | what it does | fails |
+|---|---|---|
+| **N7 `counters_drop_idle_probes`** | `counters()` reports `idle_probes: 0` | K |
+| **N8 `counters_drop_idle_redials`** | `counters()` reports `idle_redials: 0` | K |
+
+- These are "dropped" fields in the only form that compiles. A struct literal without the field is a compile
+  error, which would fail everything and discriminate nothing.
+- Command: `timeout 1800 cargo test --no-fail-fast --lib consensus::node::tests_node::`.
+- N1–N6 are regenerated from the new source tip, and their kill sets stand (amendment 2).
+
+### Run G3 at the tip (predicted)
+
+| module | tests | predicted |
+|---|---|---|
+| transport | 62 (61 off macOS) | all pass, unchanged by this amendment |
+| node | 13 + K = **14** | all pass |
+| log | 58 | all pass (D207's) |
+| replicate | 60 | all pass |
+
+**Per-target: 2613** on macOS = D207's 2608 at `1eaf1a7` (a prediction, never run) + I, B, P, H + K.
