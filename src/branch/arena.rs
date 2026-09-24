@@ -2628,7 +2628,16 @@ impl PageStore for ArenaPageStore {
         // catalog refuses and is undone the durable way, through the ordinary free record. The
         // arena id stays spent, which is harmless: ids are never reissued anyway.
         if let Err(refused) = self.catalog.add_arena(branch, arena) {
-            return match self.free_arena_locked(&mut persist, arena) {
+            // MUTANT (fire-check only, never land): the refused claim is undone in memory only.
+            {
+                let mut st = self.state.lock().unwrap();
+                st.extents.remove(&arena);
+                st.live_order.remove(&arena);
+                st.recycled.remove(&arena);
+            }
+            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
+            self.space.give_back(start, pages);
+            return match Ok::<u32, FerroError>(0) {
                 Ok(_) => Err(refused),
                 Err(undo) => Err(FerroError::Internal(format!(
                     "{refused}. Undoing the durable claim of arena {arena} also failed ({undo}); \
