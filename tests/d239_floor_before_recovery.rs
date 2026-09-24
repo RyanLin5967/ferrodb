@@ -32,11 +32,17 @@ const FILLER_ROWS: u32 = 3_000;
 const REGION_FULL: &str = "no free page below the reserved arena region";
 const OVERLAP_REFUSAL: &str = "overlaps pages the bitmap allocator owns";
 
-/// One stdout line with the CLI's prompts taken off. The binary prints `ferrodb=> ` with no newline
-/// before reading each line (`run_cli`'s read loop), so a statement's output lands on its prompt's
-/// line, and a statement that printed only to stderr leaves its prompt in front of the next one.
+/// One stdout line with the CLI's prompts taken off. The binary prints a prompt with no newline
+/// before reading each line (`run_cli`'s read loop): `ferrodb=> `, or `     ...? ` while a
+/// statement is still open. So a statement's output lands on its prompt's line, and a statement
+/// that printed only to stderr leaves its prompt in front of the next one. Both forms are stripped,
+/// however many pile up.
 fn without_prompts(line: &str) -> &str {
-    line.trim().trim_start_matches("ferrodb=> ").trim()
+    let mut rest = line.trim();
+    while let Some(after) = rest.strip_prefix("ferrodb=>").or_else(|| rest.strip_prefix("...?")) {
+        rest = after.trim_start();
+    }
+    rest
 }
 
 /// Run the real binary on `db` with `sql` as its stdin. The SQL goes through a file, not a pipe:
@@ -139,9 +145,11 @@ fn an_open_that_rebuilds_into_a_full_table_region_never_writes_the_arena() {
     // The premise, checked last so that a claim failure above reports first: the reopen's rebuild
     // needed more pages than the table region had, so it was refused for a full region (D229
     // schedule (a) is why it fails rather than finishing). An open that SUCCEEDS means the rebuild
-    // fit, and then this fixture never reached the allocation D239 is about: a fix to D216 (no
-    // rebuild after a clean exit) or D222 (the rebuild frees the whole old tree) does that. Then
-    // re-derive the fixture; do not read the assertions above as evidence.
+    // fit, and then this fixture never reached the allocation D239 is about. Three landings retire
+    // this premise: D216 (no rebuild after a clean exit), D222 (the rebuild frees the whole old
+    // tree) and D229(a) (the rebuild checks for space, or resets, before it frees anything, so the
+    // refusal may change shape). When one lands, re-aim the fixture; do not read the assertions
+    // above as evidence.
     assert!(
         !second.status.success() && err2.contains(REGION_FULL),
         "premise: the reopen was not refused for a full table region, so its rebuild never asked \
