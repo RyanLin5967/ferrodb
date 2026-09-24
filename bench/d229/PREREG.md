@@ -84,3 +84,8 @@ Falsifiers. Any one withdraws the row; none adjusts a number.
 
 ---
 Amendments (append only):
+
+**Amendment 1 (after `652d7d0`).** `652d7d0` adds D237's `in_transit` check to `BufferPoolManager::free_pages`
+(a page being faulted in is refused, and `in_transit` is held to the end), so the one `free_pages` that survives
+a merge with `d237-pin-leak` has both halves. **The GREEN phase and mutant base is `652d7d0`**, not `f3d91d4`;
+every expectation above is unchanged, and each mutant expression still matches one site there (PATTERNS_ONLY).
