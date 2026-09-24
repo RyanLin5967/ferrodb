@@ -710,3 +710,17 @@ The lane report's FAN-QUEUE row carries this as its re-run instruction.
      about the trigger, not a failed guard: `amort ns` is computed from the measured value either way.
    * On axis (i), a 64-merge batch after an open is expected to contain no checkpoint, so `ckpt ns`, `period`
      and `amort ns` print "-".
+
+**A10.2, same day, still before any build or run. M6's one legitimate disagreement, read in `wal/log.rs` `truncate`.**
+
+* `truncate` returns early and keeps the log when a WAL pin sits below the frontier. A checkpoint under a pin
+  therefore resets the commit counter WITHOUT moving `base_lsn`, and M6 fires.
+* That firing is correct: the merge paid a checkpoint that reclaimed nothing, so its `ckpt ns` is not the
+  truncating cost A9.1 describes.
+* The pins' only sources are replication: `backup.rs`, `snapshot.rs`, `stream.rs`, and
+  `TxnManager::begin_snapshot_read`. None is on the harness's path (READ, `git grep 'pin(\|pin_durable('`). So M6
+  is expected silent on every clean run.
+* **The fire-check.**
+  * On (e), `wrong-ckpt-flag` fires M6 on every applied merge. No merge there checkpoints, and the inverted flag
+    claims each one did while `base_lsn` stayed put.
+  * The guard's other direction, silence on a merge that checkpoints, is carried by run (g).
