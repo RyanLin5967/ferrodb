@@ -370,6 +370,10 @@ pub struct AlterPlan {
     prov: Option<Arc<dyn ProvenanceStore>>,
     dir_root: u32,
     primary_root: u32,
+    /// The entry the catalog encoder was asked about: the table's entry as the plan read it, with the
+    /// final shape and the renamed indexes. [`Catalog::apply_plan`] refuses the plan if the live
+    /// entry, with the same changes applied, is not this one (D249 review, F7).
+    checked: TableEntry,
 }
 
 impl AlterPlan {
@@ -553,10 +557,15 @@ impl Catalog {
         let primary_root = entry.primary_index_root;
         let row_count = self.stats.get(table).map(|s| s.row_count).unwrap_or(0);
 
-        // Every refusal lives in `resulting_schema`, shared with the branch path, so an agent is
-        // told at the moment it types the statement exactly what it would be told at merge — and
-        // it runs for EVERY action, against the shape the action before it produces, rather than
-        // for the first one only.
+        // Every refusal about the SHAPE lives in `resulting_schema`, shared with the branch path, so
+        // an agent is told at the moment it types the statement exactly what it would be told at
+        // merge — and it runs for EVERY action, against the shape the action before it produces,
+        // rather than for the first one only.
+        //
+        // **One refusal is not in it** (D249): whether the catalog can encode the resulting entry,
+        // asked below. That needs the whole `TableEntry` — the table's own name and its indexes — and
+        // not just a shape, so it is asked only here. A branch reaches here at MERGE, so a staged
+        // edit the catalog cannot hold is refused then, before anything is written, not when typed.
         let mut shapes = vec![old_schema.clone()];
         for action in actions {
             let next = resulting_schema(table, shapes.last().unwrap(), action, row_count)?;
@@ -603,6 +612,7 @@ impl Catalog {
             prov: prov.cloned(),
             dir_root,
             primary_root,
+            checked: installed,
         })
     }
 
@@ -624,8 +634,39 @@ impl Catalog {
         // about what is in flight while tuples move, and a plan can be held across a statement.
         quiesce_guard(&plan.table, txn)?;
 
-        let AlterPlan { table, shapes, actions, prepared, carried, prov, dir_root, primary_root } =
-            plan;
+        let AlterPlan {
+            table,
+            shapes,
+            actions,
+            prepared,
+            carried,
+            prov,
+            dir_root,
+            primary_root,
+            checked,
+        } = plan;
+
+        // **The plan still describes this table** (D249 review, F7). `plan_alters` asked the catalog
+        // encoder about one entry: the table's as it read it, with the final shape and the renamed
+        // indexes. A plan can be held across a statement, and if the same table changed in between
+        // (an index created, say), installing the renames now would persist an entry nobody asked
+        // about. So the live entry, with the same changes applied, must BE the entry that was
+        // checked. A staleness check, not a second encoder guard: it compares, and asks the encoder
+        // nothing.
+        {
+            let mut now = self.require_table(&table)?.clone();
+            now.schema = shapes
+                .last()
+                .cloned()
+                .ok_or_else(|| FerroError::Internal(format!("a plan for '{table}' held no shape")))?;
+            rename_indexed_columns(&mut now, &actions);
+            if now != checked {
+                return Err(FerroError::Constraint(format!(
+                    "the alteration of '{table}' was planned against the table as it was, and the \
+                     table has changed since; nothing was written. Plan it again."
+                )));
+            }
+        }
 
         // Reserve the space the relocations will need, before the first one happens.
         //
