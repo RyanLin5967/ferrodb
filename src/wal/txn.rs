@@ -1499,11 +1499,20 @@ impl TxnManager {
     /// - an owed release on the table. Its retry would write the page and tell a directory that no
     ///   longer exists, whatever those pages hold by then.
     ///
-    /// So a DROP is refused BEFORE its mutation while a release is owed on ANOTHER table, because the
-    /// log could not be truncated after it. The releases owed on the dropped table are discarded once
-    /// the drop has succeeded, and the checkpoint then truncates. That also lets a table holding a page
-    /// that permanently fails be dropped, which is the part of review 2's Q3 this can grant.
-    /// **Stated:** while one table owes a release that never succeeds, no OTHER table can be dropped.
+    /// So a DROP is refused BEFORE its mutation whenever its checkpoint would visibly keep the log:
+    /// - a release owed on ANOTHER table. The releases owed on the dropped table itself are discarded
+    ///   once the drop has succeeded, which lets a table holding a page that permanently fails be
+    ///   dropped: the part of review 2's Q3 this can grant.
+    /// - a WAL pin below the log's end (a replication stream, a base backup, a snapshot handoff).
+    ///   `WalManager::truncate` keeps the log, and answers `Ok`, while one is held; this was so at
+    ///   `9aa6968` too (lane §21.6, `rollback-review4` and the D216 lane). New pins are held off
+    ///   (`WalManager::fence_pins`) from this check through the truncation, so none can land between.
+    /// - a poisoned log, whose flush is refused, so the checkpoint would fail after the drop.
+    ///
+    /// **Stated:** while one table owes a release that never succeeds, or a reader stays pinned
+    /// behind the log's end, no OTHER table can be dropped. A checkpoint that fails after the drop
+    /// for a reason not visible beforehand (an I/O error in the flush or the truncation) still leaves
+    /// the dropped table's records in the log: D229, whose deferred frees retire this interim rule.
     pub fn drop_checkpointed<T>(
         &self,
         frees: &[u32],
@@ -1521,10 +1530,29 @@ impl TxnManager {
         }
         // Held from the retry to the truncation decision, as for every other retry (C1).
         let _retry = self.release_retry.lock().unwrap();
+        // A DROP's pin check must still hold at its truncation, so no new pin may land in between
+        // (lane §21.6). Lock order: `att`, `release_retry`, then the fence.
+        let _fence = (!frees.is_empty()).then(|| self.wal.fence_pins());
         // Retried HERE, before `f`. Once a DROP has freed pages on disk, nothing but the flush may stand
         // between those frees and the sync (D229's window; lane §21.2).
         self.retry_pending_releases_held();
         if !frees.is_empty() {
+            if let Some(why) = self.wal.poisoned() {
+                return Err(FerroError::Wal(format!(
+                    "DROP refused: the log is poisoned ({why}), so the checkpoint a DROP needs cannot flush \
+                     it, and the table would be dropped and the statement reported failed; reopen the \
+                     database first"
+                )));
+            }
+            let end = self.wal.next_lsn.load(Ordering::SeqCst);
+            if let Some(pinned) = self.wal.min_pinned_lsn().filter(|&lsn| lsn < end) {
+                return Err(FerroError::Wal(format!(
+                    "DROP refused: a reader (a replication stream, a base backup or a snapshot handoff) \
+                     has the log pinned at lsn {pinned}, below its end {end}, so the checkpoint a DROP \
+                     needs could not truncate it, and the next open would replay the dropped table's \
+                     records onto pages the DROP freed; retry once the reader has moved on"
+                )));
+            }
             let elsewhere =
                 self.pending_releases.lock().unwrap().iter().filter(|(_, r)| !frees.contains(&r.dir_root)).count();
             if elsewhere > 0 {
