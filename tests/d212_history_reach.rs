@@ -10,6 +10,7 @@
 //! | `a_merge_through_the_open_path_is_revertible_after_a_crash` | 4: the store is opened inside `open_recovered`, before `recover` | `open_recovered` registers no store; or registers it after `recover` |
 //! | `a_runtime_attached_to_one_database_refuses_another_databases_history` | 4: the door hands the runtime its database's store | `attach_history` skips the same-store check |
 //! | `a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids` | 1: the runtime reads history only through store ∪ queue | `HistoryStore::records` returns the durable window only |
+//! | `a_fresh_log_moves_the_old_history_aside` | 10: a fresh log is a new database, and the history goes aside | `WalManager::with_storage` skips the history move |
 //!
 //! A "crash" here drops every handle with no checkpoint, so the history queued in memory is lost
 //! and the log is its only copy.
@@ -224,4 +225,42 @@ fn a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_id
         }
     }
     assert_eq!((db.qty_of(1), db.qty_of(2)), (10, 20), "a revert did not restore its row");
+}
+
+/// **Item 10.** A fresh log is a new database at this path (#16's rule for its release quarantine),
+/// so the REVERT history beside it is moved aside rather than inherited: an old incarnation's merge
+/// ids would otherwise be revertible against the new database's rows.
+///
+/// RED before item 10's code: the old `<db>.history` stays and is read as this database's.
+#[test]
+fn a_fresh_log_moves_the_old_history_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reach10.db");
+    let mut db = Db::open(&path);
+    db.seed(&[(1, 10)]);
+    let _ = db.task("a", "UPDATE inventory SET qty = 11 WHERE id = 1;");
+    db.o.txn.checkpoint().unwrap();
+    drop(db);
+    let with_suffix = |suffix: &str| {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    let history = with_suffix(".history");
+    let old = std::fs::read(&history).expect("premise: the checkpoint wrote the store");
+    std::fs::remove_file(with_suffix(".wal")).unwrap();
+
+    let _db = Db::open(&path);
+    assert_ne!(
+        std::fs::read(&history).ok(),
+        Some(old.clone()),
+        "a fresh log kept the earlier database's REVERT history as its own"
+    );
+    let aside: Vec<Vec<u8>> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("reach10.db.history.before-"))
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert_eq!(aside, vec![old], "the earlier history was not moved aside whole");
 }
