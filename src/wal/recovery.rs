@@ -188,6 +188,18 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // fresh roots were stored into one cell, the posting tree's last.
     let mut rebuilt: Vec<(String, Option<IndexTree<String>>, u32)> = Vec::new();
     for name in names {
+        // Every old tree is freed from its LIVE root, its shared cell (D208 review 2, C4), as
+        // `drop_table` frees. A record that lags its cell names the pre-split page, now the leftmost
+        // leaf, and freeing that leaks the rest of the tree. At `open_recovered`, the one production
+        // caller, `Catalog::open` has just seeded every cell from these records, so the two agree.
+        // A live caller (the tests) can hold a lagging record. So the index records are caught up
+        // from their cells and the primary's live root is read before the entry is borrowed
+        // mutably, and the frees below use them (`tests/root_cell_is_per_index.rs`, T13).
+        catalog.catch_up_index_records(&name);
+        let live_primary = {
+            let entry = catalog.tables.get(&name).expect("name came from this map");
+            catalog.live_root(&name, None, entry.primary_index_root)
+        };
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
         let mut rows = Vec::new();
@@ -198,7 +210,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             let deleted = tuple.version_header()?.end_ts != 0;
             rows.push((rid, tuple.deserialize(&entry.schema)?, deleted));
         }
-        let old = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+        let old = BPlusTreeManager::<Value, RecordId>::open(live_primary, bp.clone());
         old.free_tree()?;
         let fresh = BPlusTreeManager::<Value, RecordId>::create(bp.clone())?;
 

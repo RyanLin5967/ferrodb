@@ -371,6 +371,15 @@ pub struct AlterPlan {
     /// The primary index's SHARED root cell (D53), not a root page id: the rewrite opens the tree
     /// through it and `finish` records the root from it (D214, the D208 review's F1). So a root
     /// move lands in the cell as it happens, and the record follows the tree as it IS.
+    ///
+    /// ⚠ **`apply_plan` does not check that the table still has the identity it was planned against**
+    /// (this same `Arc` in `root_cell(table, None)`, and this `dir_root`). A plan held across
+    /// `DROP TABLE t; CREATE TABLE t` would rewrite the dead table's freed heap through the dead
+    /// cell and write the dead root into the new table's record. **Unreachable today** (D208 review
+    /// 2, Q3): `alter_table` plans and applies back to back, and `AgentRuntime::merge` only reads
+    /// the catalog between its plans and their applies. `dir_root` and the old `u32` root were held
+    /// the same way before D214. A caller that holds a plan across a statement must add the check
+    /// (`Arc::ptr_eq` against the live cell, `dir_root == first_directory_page_id`) first.
     primary_cell: Arc<AtomicU32>,
 }
 
@@ -759,6 +768,10 @@ impl Catalog {
         // copies, and there is now one.
         entry.primary_index_root = primary_cell.load(Ordering::Acquire);
         let shape = shape_of(&entry.schema);
+        // And every INDEX record from its cell, by the same rule (D208 review 2, C4). The rewrite
+        // never touches an index tree, but an earlier failed INSERT can have left an index record
+        // behind its cell, and this persist writes every record of the table.
+        self.catch_up_index_records(table);
         self.persist()?;
         Ok(shape)
     }
