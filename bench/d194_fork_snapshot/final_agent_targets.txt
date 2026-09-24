@@ -844,3 +844,4 @@ test consensus::sim::tests_sim::a_cold_cluster_elects_exactly_one_leader_within_
 test consensus::sim::tests_sim::a_healthy_five_node_cluster_elects_one_leader_and_commits_what_clients_propose ... ok
 test consensus::sim::tests_sim::a_leader_that_never_gives_up_its_lease_is_caught_and_the_seed_is_named ... # KILLED: SIGTERM from outside this lane at ~03:27:4xZ (cargo exit 143, no "# rc=" line from the wrapper),
 # during the lib unit tests, target 1 of 55. Source of the signal not identified. NOT a result.
+# CORRECTION 03:3xZ: the SIGTERM source IS identified -- the lead stopped cargo runs for QUIET MODE (Ryan, 03:26Z). Still NOT a result.
