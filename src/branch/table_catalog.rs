@@ -939,10 +939,25 @@ impl TableBranchCatalog {
     /// but `reparent` (no production caller since D63). A method added later that returns a record
     /// must call [`Self::outward`].
     ///
-    /// Saturating at `u64::MAX`, the "never" of `TRUNK_LEASE` and `FAR_FUTURE`: wrapping would put
-    /// it in 1970.
+    /// # D206 — the sentinel
+    ///
+    /// `u64::MAX` is `TRUNK_LEASE`, "never expires", and the reaper skips it. A shift must never
+    /// PRODUCE it — that would make a branch indistinguishable from trunk and un-reapable, with no
+    /// symptom — so the sum stops at `u64::MAX − 1` through `LeaseDeadline::saturating_deadline`,
+    /// the function `from_now` uses (`31364b3`). A stored `u64::MAX` is a caller's explicit "never"
+    /// and is returned unchanged: a fixed point of both translations. Wrapping, the third option,
+    /// would put a deadline in 1970.
     fn to_lease_clock(&self, stored: LeaseDeadline) -> LeaseDeadline {
-        LeaseDeadline(stored.0.saturating_add(self.lease_offset.load(Ordering::SeqCst)))
+        if stored.0 == u64::MAX {
+            // A caller's explicit "never" (`TRUNK_LEASE`, or a fork given `LeaseDeadline(u64::MAX)`):
+            // a fixed point, not a deadline to shift.
+            return stored;
+        }
+        // D206: a shifted deadline stops one short of the sentinel, as `from_now` does.
+        LeaseDeadline(LeaseDeadline::saturating_deadline(
+            stored.0,
+            self.lease_offset.load(Ordering::SeqCst),
+        ))
     }
 
     /// A lease-clock deadline as it is STORED: `lease − D`, saturating at 0.
@@ -951,6 +966,11 @@ impl TableBranchCatalog {
     /// earlier than `D` — `expire_lease`'s offline 0, or a test's `LeaseDeadline(1)` — is stored as
     /// 0 and reads back as `D`, a moment long past on any real lease clock, so it is still expired.
     fn to_stored(&self, lease: LeaseDeadline) -> LeaseDeadline {
+        if lease.0 == u64::MAX {
+            // The same fixed point as `to_lease_clock`: stored `u64::MAX − D` would read back as a
+            // real deadline, and a caller's "never" would quietly become one after a restart.
+            return lease;
+        }
         LeaseDeadline(lease.0.saturating_sub(self.lease_offset.load(Ordering::SeqCst)))
     }
 
@@ -1585,7 +1605,9 @@ impl BranchCatalog for TableBranchCatalog {
             ),
             Some((last_alive, offset)) => {
                 let downtime_millis = now_millis.saturating_sub(last_alive);
-                let offset_millis = offset.saturating_add(downtime_millis);
+                // D206: the offset is added to every deadline, so it stops one short of the
+                // sentinel too; `to_lease_clock` clamps the sum as well.
+                let offset_millis = LeaseDeadline::saturating_deadline(offset, downtime_millis);
                 (
                     LeaseResume::Resumed { last_alive, now_millis, downtime_millis, offset_millis },
                     offset_millis,
@@ -3001,7 +3023,9 @@ mod f1_lease_grace {
         assert_eq!(lease(&c, before_mark), 3_900);
         assert_eq!(lease(&c, at_mark), 4_000);
         assert_eq!(lease(&c, running), 4_500, "shifted by other than the downtime");
-        assert_eq!(lease(&c, never), u64::MAX, "saturates, never wraps to 1970");
+        // D206: was `u64::MAX` at `6fc317b`, which pinned the forging itself. A real deadline
+        // shifted past the end stops one short of the never-expires sentinel.
+        assert_eq!(lease(&c, never), u64::MAX - 1, "saturates one short of the sentinel");
         assert_eq!(lease(&c, held), 4_500, "the offset is the catalog's, not a Live-only rewrite");
         assert_eq!(lease(&c, BranchId::TRUNK), u64::MAX);
 
