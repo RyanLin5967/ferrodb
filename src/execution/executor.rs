@@ -562,9 +562,7 @@ pub fn sync_fulltext_roots(table: &str, fulltext: &[FullTextHandle], catalog: &m
         let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
         let stored = catalog.get_table(table).and_then(|e| e.fulltext_indexes.iter().find(|i| i.column_name == handle.column_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
-            if let Err(e) = catalog.update_fulltext_root(table, &handle.column_name, cur) {
-                first_err = first_err.or(Some(e));
-            }
+            catalog.update_fulltext_root(table, &handle.column_name, cur)?; // D230 MUTANT M4
         }
     }
     first_err.map_or(Ok(()), Err)
