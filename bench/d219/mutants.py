@@ -232,6 +232,19 @@ MUTANTS = {
             ),
         ],
     ),
+    # ---- PREREG A3 (review 7 F5) ---------------------------------------------------------------
+    # The MERGE's plan-phase probe deleted: a merge on a poisoned store installs its schema first.
+    "M30_no_merge_writable_probe": (
+        RUNTIME,
+        "        if !pending.is_empty() {\n            prov.check_writable()?;\n        }\n",
+        "",
+    ),
+    # The probe asked even when the merge publishes nothing: a schema-only merge refused.
+    "M31_merge_probe_unconditional": (
+        RUNTIME,
+        "        if !pending.is_empty() {\n            prov.check_writable()?;\n",
+        "        if true {\n            prov.check_writable()?;\n",
+    ),
 }
 
 
