@@ -2629,12 +2629,14 @@ fn read_vs_n_summary(
         // rebuilt for the stale-index marker and is NOT A RESULT for every arm-3 value, so it sets
         // no baseline and carries no flag. (`stale` absent reads as u64::MAX, which H6 also takes.)
         let is_h6 = |r: &RestartRow| r.get("stale") != 0;
-        // A20.7: ONE binding for the rows arm 3 counts (a child line, not H6). The L2 statement and
-        // the ARM3 refusal both read it; Y1 was these two filters diverging.
-        let counted = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
-        let mut loads: Vec<u64> = restart_rows
+        // A20.7, A22.7: ONE binding for the ROWS arm 3 counts (a child line, not H6). The L2
+        // statement, the ARM3 refusal, the load median and the span legend all read it; Y1 was two
+        // spellings of this filter diverging.
+        let counted_rows: Vec<&RestartRow> =
+            restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).collect();
+        let counted = counted_rows.len();
+        let mut loads: Vec<u64> = counted_rows
             .iter()
-            .filter(|r| !r.child.is_empty() && !is_h6(*r))
             .flat_map(|r| [r.get("load_start_centi"), r.get("load_end_centi")])
             .filter(|&l| l != u64::MAX)
             .collect();
@@ -2708,12 +2710,7 @@ fn read_vs_n_summary(
         println!(
             "  arm 3: the `total` and `lease_start` slopes span the previous non-H6 row to this one (N {}); both \
              are REPORTED (A14.2), as are R6 and R8-share (A15.1).",
-            restart_rows
-                .iter()
-                .filter(|r| !r.child.is_empty() && !is_h6(*r))
-                .map(|r| r.n.to_string())
-                .collect::<Vec<_>>()
-                .join(" -> ")
+            counted_rows.iter().map(|r| r.n.to_string()).collect::<Vec<_>>().join(" -> ")
         );
         println!(
             "  arm 3: load0/load1 = the child's 1-min load at its start and end; L2 = 1 when the row's larger \
