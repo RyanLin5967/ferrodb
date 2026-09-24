@@ -4246,6 +4246,16 @@ mod f1_lease_grace {
         (exact, exact + 1_000)
     }
 
+    /// **The premise of every fixture that stands for a catalog no D198 build wrote** (PREREG
+    /// amendment 11): neither D198 key is present. Such a fixture is written by a D198 build, whose
+    /// every unmarked commit leaves a soft mark, and ends with `as_written_before_d198`; this is
+    /// asserted after its reopen, before anything else, so a fixture that still carries either key
+    /// fails here rather than passing through a path it does not name.
+    fn assert_no_d198_keys(c: &TableBranchCatalog) {
+        assert_eq!(c.alive_state().unwrap(), None, "premise: the fixture carries a [0x08] mark");
+        assert_eq!(c.soft_mark().unwrap(), None, "premise: the fixture carries a [0x09] soft mark");
+    }
+
     /// **The FirstStart policy (lead, SCALE-DESIGN "D198 addendum — the FirstStart policy"): a
     /// catalog written before D198 has no mark, and its first start used to charge the whole
     /// outage.** The file's last modification is when its last writer was last alive at the
@@ -4258,13 +4268,17 @@ mod f1_lease_grace {
         let t = LeaseDeadline::now_millis();
         let lapsed_in_outage = t - HOUR / 2;
         let b = {
-            // No `[0x08]` record: every catalog written before D198 looks like this.
+            // No `[0x08]` and no `[0x09]`: every catalog written before D198 looks like this, and
+            // this one is made to (PREREG amendment 11).
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id;
+            c.as_written_before_d198().unwrap();
+            b
         };
         age_file(&path, t - HOUR);
 
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_no_d198_keys(&c);
         let now = LeaseDeadline::now_millis();
         c.resume_leases(now).unwrap();
         let lease = c.enforced_lease(b).unwrap().expect("a live branch has an enforced lease");
@@ -4332,10 +4346,12 @@ mod f1_lease_grace {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             let b = c.fork(BranchId::TRUNK, LeaseDeadline(t - HOUR / 2)).unwrap().branch_id;
             c.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+            c.as_written_before_d198().unwrap();
         }
         age_file(&path, t - HOUR);
 
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_no_d198_keys(&c);
         let now = LeaseDeadline::now_millis();
         c.resume_leases(now).unwrap();
         assert_eq!(
@@ -4471,9 +4487,12 @@ mod f1_lease_grace {
         let t = LeaseDeadline::now_millis();
         let _slept = wall_step::by(S as i64);
         // An hour left — less than S — when the file was last written, at wall time t + S.
+        // A catalog no D198 build wrote (PREREG amendment 11): the file time is its only evidence.
         let b = {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-            c.fork(BranchId::TRUNK, LeaseDeadline(t + HOUR)).unwrap().branch_id
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(t + HOUR)).unwrap().branch_id;
+            c.as_written_before_d198().unwrap();
+            b
         };
         age_file(&path, t + S);
         // Three hours pass with nothing running, on both clocks.
@@ -4481,6 +4500,7 @@ mod f1_lease_grace {
         let _later = wall_step::by((S + 3 * HOUR) as i64);
 
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_no_d198_keys(&c);
         let w0 = wall_now_millis() + S + 3 * HOUR;
         c.resume_leases(now).unwrap();
         let w1 = wall_now_millis() + S + 3 * HOUR;
@@ -4681,14 +4701,18 @@ mod f1_lease_grace {
         let path = sidecar("failed-first-start");
         let t = LeaseDeadline::now_millis();
         let lapsed_in_outage = t - HOUR / 2;
+        // Review 3's C4 schedule: a catalog no D198 build wrote (PREREG amendment 11) ...
         let b = {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id;
+            c.as_written_before_d198().unwrap();
+            b
         };
         age_file(&path, t - HOUR);
         {
-            // A first start that writes durably and then fails before its resume.
+            // ... then a first start that writes durably and then fails before its resume.
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            assert_no_d198_keys(&c);
             c.set_root(BranchId::TRUNK, 1).unwrap();
         }
 
@@ -4806,14 +4830,18 @@ mod f1_lease_grace {
         let path = sidecar("accrual");
         let t = LeaseDeadline::now_millis();
         let lapsed = t - HOUR / 2;
+        // The last authority before the writer: no D198 build, so its file time is the evidence
+        // of when it stopped (PREREG amendment 11) — it wrote four hours ago.
         let b = {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
-            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id;
+            c.as_written_before_d198().unwrap();
+            b
         };
-        // The last authority before the writer wrote four hours ago.
         age_file(&path, t - 4 * HOUR);
         {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            assert_no_d198_keys(&c);
             c.set_root(BranchId::TRUNK, 1).unwrap();
         }
         // The writer's last write, two hours into its run; then an hour with nothing running.
@@ -4842,8 +4870,8 @@ mod f1_lease_grace {
     }
 
     /// **Review 3, C6, with no recorded evidence.** A catalog finished by a build that records no
-    /// first-start key — `main` migrates too, and a catalog created fresh records none — found with
-    /// a legacy log beside it. Either file may be the later one, so the credit is from the EARLIER.
+    /// soft mark — `main` migrates too; the fixture strips the one a D198 build leaves (PREREG
+    /// amendment 11) — found with a legacy log beside it. Either file may be the later one, so the credit is from the EARLIER.
     /// Red against `1ec2deb`, which prefers the log.
     #[test]
     fn a_switchover_with_no_recorded_evidence_credits_from_the_earlier_file() {
@@ -4855,9 +4883,13 @@ mod f1_lease_grace {
         let db = dir.join("legacy.db");
         let cat = dir.join("legacy.db.branchcat");
         let legacy = dir.join("legacy.db.branches");
+        // A catalog no D198 build wrote (PREREG amendment 11), so there is no soft mark to say the
+        // log was already measured.
         let b = {
             let c = TableBranchCatalog::open_sidecar(&cat, 1).unwrap();
-            c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(lapsed)).unwrap().branch_id;
+            c.as_written_before_d198().unwrap();
+            b
         };
         {
             let log = crate::branch::catalog::LogBranchCatalog::open(&legacy, 1).unwrap();
@@ -4867,6 +4899,7 @@ mod f1_lease_grace {
         age_file(&legacy, t - HOUR);
 
         let c = TableBranchCatalog::default_for_database(db.to_str().unwrap(), 1).unwrap();
+        assert_no_d198_keys(&c);
         let now = LeaseDeadline::now_millis();
         c.resume_leases(now).unwrap();
         let lease = c.enforced_lease(b).unwrap().expect("the catalog's branch is live");
