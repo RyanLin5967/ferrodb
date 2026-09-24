@@ -1065,3 +1065,75 @@ The lead's decisions on U1, U2 and C2–C5, and what changes:**
    * `Fire::needs`'s doc now reads "the arm this mode needs".
    * The refusal now reads "it needs the <arm> arm, which CURVE_ARMS does not run". So (f0)'s expected texts are
      `is refused: it needs the Merge arm` / `Read arm` / `Restart arm`.
+
+**A15, 2026-09-24, before any build or run. Review 7 of `1a59386..347a0e6` (artie-research
+`frontier/read_vs_n_review7.md` @ `fcc08e5`) returned SOUND-WITH-CAVEATS. U1 and U2 are fixed as scoped. The lead's
+decisions on W1–W8, and what changes:**
+
+1. **No claim-deciding verdict is judged on wall time alone (W1, W2).**
+   * **KNEE is judged on `ratio(10^6) / ratio(256)` at T=1.** `ratio` is branch ns over the control's ns at the same
+     (N, T), measured at the same moment by the interleaved, rotated arms, and already printed. The band [4, 25] is
+     unchanged. The raw ns ratio is reported beside it.
+   * **Made REPORTED, not judged:**
+     * T8DIR. Its T=1 and T=8 phases run one after the other, with no same-moment control, and no margin argued from
+       a quiet box is accepted.
+     * RESIDENT. It is an absolute band that no across-N guard can protect: a run-wide slowdown moves every row alike.
+     * R6 and R8-share. Their terms time DISJOINT, sequential phases of one open (`arena`, `lease_start`, `total`), so
+       A14.2's "ratios within one child open" was not "one moment". Both also rest on the single 10^6 open whose
+       magnitude A14.2 withdrew.
+   * **A9.1's `rebuild` band (0.5–200 ms) is REPORTED.** Load can lift a no-op into its lower edge. D216's halves are
+     decided by `recovered`, an integer.
+   * **R7's ≤ 50 ms bounds stay judged, only in the direction load cannot manufacture.** Load only inflates a time, so
+     HELD cannot be produced by load. A NOT HELD is printed with L2 and G7 beside it, and is read as load-qualified
+     before it is called a finding.
+   * **G7 stays the only time guard.** It only voids, the conservative direction. **Its measure is printed beside every
+     time number the harness reports:**
+     * per T in arm 1's section, as before;
+     * as a G7 line in arm 2's and arm 3's sections;
+     * or "not measured" when arm 1 is off, so those times have no drift measure at all.
+2. **SLOPE is BOUNDED only when the raw slope and the ratio's slope AGREE (W3).**
+   * The OLS over the saturated segment (every checkpoint with `d.fault` ≥ 0.9), per T, is computed for BOTH raw
+     `slope(branch)` and `slope(ratio)`:
+     * BOUNDED when both are < 0.3;
+     * GROWING when both are ≥ 0.3;
+     * **INCONCLUSIVE when they disagree.**
+   * **Why.** `slope(ratio)` alone cannot tell box drift from an N-dependence the control shares with the branch, for
+     example the branch's memory traffic evicting the control's lines at large N. Inside G7's band that drift biases
+     the ratio's slope toward BOUNDED by up to ln 1.5 / ln 62.5 = 0.098. So drift now fails toward INCONCLUSIVE,
+     never toward BOUNDED.
+   * **Fixtures the verdict script must carry.** Its maintainer owns it; the lane does not edit it:
+     * (a) `box_drift` (raw slope +0.34, a control drifting ×1.45 inside G7, ratio slope < 0.3) must grade
+       **INCONCLUSIVE**, no longer BOUNDED;
+     * (b) its mirror (raw slope < 0.3, ratio slope ≥ 0.3, e.g. a control that speeds up with N) must grade
+       INCONCLUSIVE;
+     * (c) both < 0.3 → BOUNDED and both ≥ 0.3 → GROWING, as before.
+3. **L2 says when it cannot see (W5).**
+   * A row with NEITHER load reading prints `L2=UNAVAILABLE`, and it is unguarded.
+   * A row with one reading takes its L2 from that reading, and is listed as partly read.
+   * The arm-3 summary names the flagged rows, the UNAVAILABLE rows and the partly read rows. It prints "no row
+     carries L2 = 1" ONLY when every counted row has both readings and none is flagged.
+   * **The blind spot, in the legend.** L2's instrument is two point readings of a 1-minute exponentially damped
+     average. Around an open of a few seconds, both readings describe mostly the minute BEFORE it, so L2 = 0 on a
+     short open is not evidence of a quiet open. This is a stated limit, not fixed: the flag qualifies only reported
+     values.
+   * The verdict script applies the same rule.
+4. **`base_moved=1` is refused by the HARNESS too (the U1 residual).**
+   * When `ckpt-ddl`'s base moves across the DDL, the harness prints NOT A RESULT (rc 2), naming A14.1: the reopen left
+     records past the base, so D227's premise, and with it A12.1's `a = 0` and `runs = M`, no longer holds, and the
+     pre-registration must be amended before (f3) is read.
+   * (f3)'s expectation is unchanged: `base_moved=0` and no such line.
+5. **Every slope column names its span (W7).**
+   * Arm 1: `slope(branch)` and `slope(ratio)` span the previous row to this one, and the legend lists the N
+     sequence. The CLASS is the verdict script's OLS over the saturated segment under item 2's rule, and KNEE is item
+     1's ratio.
+   * Arm 3: the `total` and `lease_start` slopes span the previous row to this one, with the N sequence listed.
+6. **One load-median rule (W8).**
+   * The median is taken over every available reading of every row with a child result, EXCLUDING H6 rows. An H6 open
+     rebuilt for the stale-index marker, and is NOT A RESULT for every arm-3 value.
+   * The verdict script's `rrows` already excludes H6 rows, so the harness adopts its rule.
+   * An H6 row prints L2 as `H6`, is not flagged, and is not counted.
+7. **W4 and W6 are not the lane's.**
+   * W4: the verdict script reads this file from the live worktree, pinned by sha256; that is fail-closed.
+   * W6: FAN-QUEUE #18's command cell is the lead's.
+   * The lane's row, under `## FAN-QUEUE ROW (for the lead)`, is its source.
+8. **Counts.** Fire modes: 22, unchanged. New `#[test]`s over `9aa6968`: still 41.
