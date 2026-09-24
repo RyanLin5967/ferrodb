@@ -63,6 +63,11 @@ pub struct Catalog {
     /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
     /// write statement no longer invalidates every reader's cache.
     epoch: u64,
+    /// D230 review 3, F2: the transaction manager's catalog persist debt, when attached
+    /// (`owe_persists_to`; `open_recovered` does it). `persist` sets it on failure and clears it on
+    /// success, and every checkpoint keeps the log while it is set. `None` for a catalog built
+    /// outside `open_recovered` (tests), which then behaves as before.
+    persist_debt: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Catalog {
@@ -74,11 +79,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None};
         catalog.load()?;
         Ok(catalog)
     }
@@ -474,7 +479,25 @@ impl Catalog {
         }
     }
 
+    /// Share the transaction manager's catalog persist debt with this catalog (D230 review 3, F2).
+    /// From here on a failed `persist` marks a persist as owed and a successful one clears it, and
+    /// `TxnManager::checkpoint_or_keep_held` keeps the log while one is owed.
+    pub fn owe_persists_to(&mut self, debt: Arc<std::sync::atomic::AtomicBool>) {
+        self.persist_debt = Some(debt);
+    }
+
+    /// Write every table's record to the catalog pages, and settle the persist debt either way (D230
+    /// review 3, F2): owed after a failure, cleared after a success. A successful persist rewrites
+    /// every catalog page from the in-memory records, so the page it leaves in the pool is current.
     pub fn persist(&self) -> Result<(), FerroError> {
+        let written = self.write_pages();
+        if let Some(debt) = &self.persist_debt {
+            debt.store(written.is_err(), Ordering::SeqCst);
+        }
+        written
+    }
+
+    fn write_pages(&self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
         // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the

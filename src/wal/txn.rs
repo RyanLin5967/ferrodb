@@ -161,6 +161,15 @@ pub struct TxnManager {
     /// discard the release. A two-fault residual: a quarantine that could not be written, then a
     /// restart, then a page that cannot be read.
     unrecorded: Mutex<Vec<(u64, RetiredSlot, String)>>,
+    /// **D230 review 3, F2 (the lead's decision): a catalog persist is OWED.** A persist failed and
+    /// none has succeeded since, so the catalog page on disk may name a root the trees have left
+    /// (`sync_roots` records every moved root in memory even when its persist fails). A checkpoint
+    /// that flushed that page and truncated the log would leave the next open nothing to recover,
+    /// so it would not rebuild and would read the stale root. While this is set, every checkpoint
+    /// keeps the log (`checkpoint_or_keep_held`), and the next open recovers and rebuilds every index
+    /// from the heap. Shared with the catalog (`Catalog::owe_persists_to`, attached by
+    /// `open_recovered`), whose `persist` sets it on failure and clears it on success.
+    catalog_persist_owed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -269,6 +278,10 @@ pub enum CheckpointOutcome {
     Truncated,
     /// The log was KEPT for this many releases still owed (F2).
     KeptForOwed(usize),
+    /// The log was KEPT because a catalog persist is owed and no release is: one failed and none
+    /// has succeeded since, so the catalog page on disk may name a root the trees have left (D230
+    /// review 3, F2). The next open recovers and rebuilds every index from the heap.
+    KeptForCatalog,
     /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
     /// and answers `Ok`, while one is held).
     KeptByPin,
@@ -484,7 +497,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), catalog_persist_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -981,7 +994,7 @@ impl TxnManager {
             match self.checkpoint_keeping_owed() {
                 Ok(CheckpointOutcome::Truncated) => {}
                 // Counted where the log was kept (`checkpoint_or_keep_held`).
-                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptByPin) => {
+                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptForCatalog | CheckpointOutcome::KeptByPin) => {
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst)
                 }
                 Err(e) => {
@@ -1816,6 +1829,13 @@ impl TxnManager {
                  truncating the log would lose the record of the bytes they hold; every page was \
                  flushed and the log is kept, and the next checkpoint retries them"
             ))),
+            CheckpointOutcome::KeptForCatalog => Err(FerroError::Wal(
+                "checkpoint refused: a catalog persist failed and none has succeeded since, so the \
+                 catalog on disk may name a root the trees have left, and truncating the log would \
+                 leave the next open nothing to rebuild from; every page was flushed and the log is \
+                 kept, and the next successful persist clears this"
+                    .into(),
+            )),
         }
     }
 
@@ -1846,6 +1866,17 @@ impl TxnManager {
 
     /// How many releases are owed now: committed, failed, and waiting for a retry (F2). Reads only;
     /// [`TxnManager::retry_pending_releases`] retries them.
+    /// The catalog persist debt, to share with the catalog (`Catalog::owe_persists_to`). D230
+    /// review 3, F2; see the field.
+    pub fn catalog_persist_debt(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.catalog_persist_owed)
+    }
+
+    /// Whether a catalog persist is owed now: one failed and none has succeeded since (F2).
+    pub fn catalog_persist_owed(&self) -> bool {
+        self.catalog_persist_owed.load(Ordering::SeqCst)
+    }
+
     pub fn owed_releases(&self) -> usize {
         self.pending_releases.lock().unwrap().len()
     }
@@ -1891,6 +1922,24 @@ impl TxnManager {
             }
             return Ok(CheckpointOutcome::KeptForOwed(owed));
         }
+        // D230 review 3, F2 (the lead's decision): a catalog persist is owed. Read AFTER the flush, so
+        // a persist that failed while the flush ran is seen too. The flush has already written the
+        // stale catalog page, which is harmless while the log is kept: only the truncation would make
+        // the next open skip its rebuild and read that page, so only the truncation is refused.
+        if self.catalog_persist_owed.load(Ordering::SeqCst) {
+            DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+            if !self.keeping_log.swap(true, Ordering::SeqCst) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: checkpoints now flush every page but keep the log: a catalog persist failed \
+                     and none has succeeded since, so the catalog on disk may name a root the trees have \
+                     left, and the next open recovers and rebuilds every index from the heap. This is \
+                     printed again when it clears; `deferred_checkpoints` counts every checkpoint that \
+                     kept the log meanwhile"
+                );
+            }
+            return Ok(CheckpointOutcome::KeptForCatalog);
+        }
         // Read before `truncate`, which keeps the log, and answers `Ok`, while a WAL pin is below its
         // end (review 4's finding 5).
         let base = self.wal.base_lsn.load(Ordering::SeqCst);
@@ -1911,7 +1960,11 @@ impl TxnManager {
             return Ok(CheckpointOutcome::KeptByPin);
         }
         if self.keeping_log.swap(false, Ordering::SeqCst) {
-            let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: what the log was kept for (owed releases, an owed catalog persist) is settled, and \
+                 checkpoints truncate the log again"
+            );
         }
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.
@@ -3451,6 +3504,35 @@ use super::*;
             "a checkpoint that a pin kept answered as if it had truncated"
         );
         assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+    }
+
+    /// **D230 review 3, F2 (the lead's decision): a failed catalog persist keeps the log until a
+    /// persist succeeds.** The debt is `TxnManager`'s and the catalog marks it (`open_recovered`
+    /// attaches it in production; this attaches it by hand). The fault is T3's: `first_catalog_page_id`
+    /// pointed at a B+tree page, which `CatalogPage::deserialize` refuses. Red only under a mutant:
+    /// the outcome and the attachment are new.
+    #[test]
+    fn a_failed_catalog_persist_keeps_the_log_until_a_persist_succeeds() {
+        let (_bp, _wal, txn, mut catalog, owned, _dir) = table_to_drop();
+        catalog.owe_persists_to(txn.catalog_persist_debt());
+        let page_one = catalog.first_catalog_page_id;
+        catalog.first_catalog_page_id = owned[2];
+        assert!(catalog.persist().is_err(), "premise failed: the persist did not fail on a B+tree page");
+        assert_eq!(
+            txn.checkpoint_keeping_owed().expect("the checkpoint itself failed"),
+            CheckpointOutcome::KeptForCatalog,
+            "a checkpoint after a failed catalog persist truncated the log: the next open would read the \
+             stale catalog page and rebuild nothing"
+        );
+
+        catalog.first_catalog_page_id = page_one;
+        catalog.persist().expect("premise failed: the persist still fails after the fault cleared");
+        assert_eq!(
+            txn.checkpoint_keeping_owed().expect("the checkpoint itself failed"),
+            CheckpointOutcome::Truncated,
+            "a successful persist must clear the debt, or every later checkpoint keeps the log and every \
+             later open rebuilds every index"
+        );
     }
 
     /// **Review 5's F3: a mismatch that is later released does not keep refusing the DROP of its
