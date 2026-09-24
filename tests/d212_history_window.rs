@@ -10,6 +10,7 @@
 //! | `falsifier_3_...` | (3) single-threaded: after a checkpoint the log holds no history record, and the store holds every one | the hook drains nothing; or `commit` queues nothing |
 //! | `f5_...` | AMENDED 2 F5: an open with no store attached keeps the log. **SUPERSEDED by AMENDED 3 item 4**, which deleted the count: `recover` now REFUSES such a log, so this test fails as written; its replacement is a ⚖ in the lane report (not committed) | (none: the count is gone) |
 //! | `falsifier_5_...` | AMENDED 2 F7: with an idle open transaction, queue bytes stay ≤ B, flat in M | `commit` skips the byte-bounded drain |
+//! | `a_revert_after_ten_reverts_...` | the lead's new-wall audit: a REVERT reads the reverted set O(plan), not O(txns ever reverted) | a REVERT that asks the set about every txn it holds |
 //! | `falsifier_5b_...` | AMENDED 3 item 8: with an idle open transaction, the FILE's bytes stay ≤ (W + W/8)·max record, flat in M | `drain`'s prune forced off (the one routine the hook and the commit path share) |
 //!
 //! (2) — no buffer-pool page and no history byte read by a prune — holds by construction:
@@ -346,4 +347,28 @@ fn falsifier_5b_store_bytes_stay_flat_with_an_idle_transaction() {
         assert!(*size <= bound, "at M = {m} with checkpoints blocked the file is {size} bytes, over {bound}: {sizes:?}");
     }
     db.ok("ROLLBACK;", &mut idle);
+}
+
+/// **The lead's new-wall audit (08:23Z): a REVERT reads the reverted set only for the txns its plan
+/// names.** Ten earlier REVERTs fill the set with ten txns; the eleventh REVERT, whose plan is its
+/// target alone, asks the set about that one txn. At `b2269c9` every REVERT cloned the whole set.
+#[test]
+fn a_revert_after_ten_reverts_visits_only_its_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path(), Some(1024));
+    db.seed(12);
+    for i in 1..=10 {
+        let id = db.merge_one(&format!("t{i}"), &format!("UPDATE inventory SET qty = qty + 1 WHERE id = {i};"));
+        db.revert_ok(&id);
+    }
+    let id = db.merge_one("last", "UPDATE inventory SET qty = qty + 1 WHERE id = 11;");
+    let before = db.runtime.reverted_lookups();
+    db.revert_ok(&id);
+    let lookups = db.runtime.reverted_lookups() - before;
+    assert!(lookups >= 1, "anti-vacuity: the REVERT never asked the set about its own target");
+    assert!(
+        lookups <= 3,
+        "a REVERT whose plan is one txn made {lookups} lookups into a set of ten: it pays for the set, not the plan"
+    );
+    assert_eq!(db.qty_of(11), 10, "the last merge was not reverted");
 }

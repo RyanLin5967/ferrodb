@@ -938,7 +938,12 @@ struct RevertState {
     /// **Only txns whose ops were actually inverted are recorded.** A cascade also names tasks that
     /// published nothing — a live session that read the target — and marking those would refuse
     /// the revert of whatever they publish LATER, while their writes stayed live.
-    reverted: BTreeMap<u64, String>,
+    ///
+    /// **Retention (the lead's new-wall audit, 08:23Z):** it grows with every txn ever reverted in
+    /// this process, like `applied`, `captures` and `merges` (stated per-process terms); the durable
+    /// half, the REVERT markers, lives under the window `W` and is pruned with it. A REVERT reads it
+    /// only through [`RevertedTxns::get`], once per txn its plan names.
+    reverted: RevertedTxns,
     /// **D226 — who each published row belonged to BEFORE the merge that published it**, keyed by
     /// `(txn, table, row)`. `ProvId::NONE` for a row nobody was on record for (seeded by plain SQL,
     /// or created by that merge).
@@ -956,6 +961,29 @@ struct RevertState {
     /// this: minting the next `hseq` or answering a REVERT from a picture of the history that may
     /// be one record short would be a guess.
     poisoned: Option<String>,
+}
+
+/// **D218's set of reverted txns, readable only one txn at a time** (the lead's new-wall audit,
+/// 08:23Z). It has no `Clone` and no iterator, so a REVERT cannot pay for the whole set: it asks
+/// [`RevertedTxns::get`] about each txn its plan names, O(plan) lookups of O(log n) each. At
+/// `b2269c9` every REVERT cloned the whole map, O(txns ever reverted). `lookups` counts the reads so a
+/// test can hold a REVERT to its plan.
+#[derive(Default)]
+struct RevertedTxns {
+    by_txn: BTreeMap<u64, String>,
+    lookups: std::cell::Cell<u64>,
+}
+
+impl RevertedTxns {
+    /// The REVERT that undid `txn`, if one did. Counted.
+    fn get(&self, txn: u64) -> Option<&String> {
+        self.lookups.set(self.lookups.get() + 1);
+        self.by_txn.get(&txn)
+    }
+
+    fn insert(&mut self, txn: u64, by: String) {
+        self.by_txn.insert(txn, by);
+    }
 }
 
 /// **D212 (a') — this runtime's position against REVERT's durable history.**
@@ -3628,6 +3656,12 @@ impl AgentRuntime {
             boot_version_high,
         });
         Ok(())
+    }
+
+    /// **Observation only: lookups a REVERT has made into this runtime's reverted set**
+    /// ([`RevertedTxns`]), since the runtime was built. Nothing reads it to decide anything.
+    pub fn reverted_lookups(&self) -> u64 {
+        self.state.lock().unwrap().revert.reverted.lookups.get()
     }
 
     /// **D212 (a') AMENDED 3, item 4 — the door's half:** `OpenedDatabase::attach_runtime` hands the
@@ -6310,28 +6344,35 @@ impl AgentRuntime {
         };
 
         // ---- the plan, over this run's captures and, for an earlier run's merge, the store's ------
-        let (mut plan, reverted) = {
+        //
+        // Whether a txn was already reverted is asked once per txn the plan names — of this run's
+        // set, then of the durable history's (bounded by the window) — under the lock, copying
+        // neither: O(plan), not O(txns ever reverted) (the lead's new-wall audit, 08:23Z).
+        let plan = {
             let state = self.state.lock().unwrap();
-            let mut reverted = state.revert.reverted.clone();
-            if let Some((history, _)) = &durable {
-                for (t, by) in &history.reverted {
-                    reverted.entry(*t).or_insert_with(|| by.clone());
-                }
-            }
-            if let Some(by) = reverted.get(&target.0) {
-                return Err(already_reverted(merge_id, by));
+            let reverted_by = |t: u64| -> Option<String> {
+                state
+                    .revert
+                    .reverted
+                    .get(t)
+                    .or_else(|| durable.as_ref().and_then(|(history, _)| history.reverted.get(&t)))
+                    .cloned()
+            };
+            if let Some(by) = reverted_by(target.0) {
+                return Err(already_reverted(merge_id, &by));
             }
             let graph = match &durable {
                 None => dependency_graph_of(&state.captures),
                 Some((history, floor_txn)) => combined_graph(&state.captures, history, *floor_txn),
             };
-            (graph.plan_revert(target, mode), reverted)
+            let mut plan = graph.plan_revert(target, mode);
+            // A txn an earlier revert undid has no effect left to undo, or to protect. Filtered from
+            // the plan's LISTS only: reachability is still computed over the whole graph, so a
+            // dependent reached THROUGH an undone txn is still named.
+            plan.blocked_by.retain(|t| reverted_by(t.0).is_none());
+            plan.cascade.retain(|t| reverted_by(t.0).is_none());
+            plan
         };
-        // A txn an earlier revert undid has no effect left to undo, or to protect. Filtered from
-        // the plan's LISTS only: reachability is still computed over the whole graph, so a dependent
-        // reached THROUGH an undone txn is still named.
-        plan.blocked_by.retain(|t| !reverted.contains_key(&t.0));
-        plan.cascade.retain(|t| !reverted.contains_key(&t.0));
         if plan.is_blocked() {
             return Ok(plan);
         }
