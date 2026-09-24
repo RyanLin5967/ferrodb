@@ -524,6 +524,60 @@ fn a_reap_the_reconciliation_finds_is_attested_exactly_once() {
     assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
 }
 
+/// ⛔ **D199's seal route (ledger D199, 09:25Z), WRITTEN TO FAIL FIRST against `a0bf5d3`.** `seal`
+/// with a reaper runs `reaper.reap(branch)?`, and `TwoTierReaper::reap` durably flips the record to
+/// `Reaped` BEFORE its fallible detach and drain. An `Err` from either returned through `seal`'s `?`
+/// ahead of the attestation, so the log kept calling a reaped branch live. Here the detach is armed
+/// to fail on trunk, the parent: the reap flips, then refuses, and the abandon returns `Err`. The
+/// reap must be attested anyway, once. A retried abandon and a forget visit find nothing more to
+/// attest, and nothing is counted as refused.
+///
+/// Hand-worked: `[Fork]` before; `abandon` is `Err` with the record `Reaped`; `[Fork, Reap]` after;
+/// a second `abandon` is `Err` and changes nothing; 0 refusals throughout.
+#[test]
+fn a_seal_whose_reap_fails_after_the_flip_is_still_attested() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::clone(&f.h.store),
+    ));
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+    .with_reaper(reaper);
+    let branch = rt.begin_session("seal-fails", Some("r_5"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: the session's fork is attested");
+
+    refusing.arm_detach(BranchId::TRUNK.id);
+    let err = match rt.abandon(branch) {
+        Ok(()) => panic!("premise failed: the seal succeeded, so its reap never failed after the flip"),
+        Err(e) => e,
+    };
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed before the failure (`{err}`)");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a seal that failed after the durable Reaped flip left no attestation: the log calls a reaped \
+         branch live"
+    );
+    assert_eq!(rt.attestation_refusals(), 0, "the seal's attestation was counted as refused");
+
+    // Exactly once: a retried abandon and a forget visit attest nothing more.
+    refusing.disarm_detach();
+    assert!(rt.abandon(branch).is_err(), "abandoning a reaped branch succeeded");
+    assert_eq!(rt.forget_branches(&[branch]), 0, "the sealed branch still had a workspace");
+    assert_eq!(ops(), vec![BranchOp::Fork, BranchOp::Reap], "the reap was attested more than once");
+    assert_eq!(rt.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
 // -------------------------------------------------------------------------------------------
 // Stoppable cleanly.
 // -------------------------------------------------------------------------------------------
@@ -956,6 +1010,9 @@ struct RefusesLiveChildren {
     armed: AtomicU64,
     /// The same convention, for `get_raw`.
     raw_armed: AtomicU64,
+    /// The same convention, for `detach_child`, keyed by the PARENT id (D199's seal route): the
+    /// reaper's first step after its durable `Reaped` flip.
+    detach_armed: AtomicU64,
 }
 
 impl RefusesLiveChildren {
@@ -964,6 +1021,7 @@ impl RefusesLiveChildren {
             inner,
             armed: AtomicU64::new(u64::MAX),
             raw_armed: AtomicU64::new(u64::MAX),
+            detach_armed: AtomicU64::new(u64::MAX),
         })
     }
     fn arm(&self, parent_id: u64) {
@@ -974,6 +1032,12 @@ impl RefusesLiveChildren {
     }
     fn disarm_raw(&self) {
         self.raw_armed.store(u64::MAX, Ordering::SeqCst);
+    }
+    fn arm_detach(&self, parent_id: u64) {
+        self.detach_armed.store(parent_id, Ordering::SeqCst);
+    }
+    fn disarm_detach(&self) {
+        self.detach_armed.store(u64::MAX, Ordering::SeqCst);
     }
 }
 
@@ -1076,6 +1140,12 @@ impl BranchCatalog for RefusesLiveChildren {
         self.inner.attach_child(p, e, c)
     }
     fn detach_child(&self, p: u64, e: crate::branch::types::Epoch) -> Result<bool, FerroError> {
+        if p == self.detach_armed.load(Ordering::SeqCst) {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "detach from parent {p} refused (armed by the test)"
+            ))
+            .into());
+        }
         self.inner.detach_child(p, e)
     }
     fn add_arena(&self, b: BranchId, a: crate::branch::types::ArenaId) -> Result<(), FerroError> {
