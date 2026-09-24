@@ -1286,6 +1286,7 @@ impl State {
     /// merge holds `&mut Catalog` from its reservation to its record.
     fn publish_version(&mut self, v: VersionRef) {
         let key = (v.tbl.0, v.row.0);
+        let mut out_of_order_garbage = false;
         let pins = &self.retention.pins;
         let history = self.version_history.entry(key).or_default();
         match history.last().copied() {
@@ -1310,13 +1311,16 @@ impl State {
                         if pins.range(v.begin_ts..next).next().is_some() {
                             self.retention.readers.insert(v.begin_ts, (key.0, key.1, next));
                         } else {
-                            *self.retention.garbage.entry(key).or_insert(0) += 1;
+                            out_of_order_garbage = true;
                         }
                     }
                 }
             }
         }
         self.versions.insert(key, v);
+        if out_of_order_garbage {
+            self.count_garbage(key);
+        }
         self.sweep_pending(PUBLISH_SWEEP_BUDGET);
     }
 
@@ -1368,8 +1372,10 @@ impl State {
                 .next()
                 .map(|(&h, &(tbl, row, s))| (h, (tbl, row), s));
             self.retention.pending.remove(&lo);
-            let Some((h, key, s)) = next else { continue };
+            // Every interval visited costs budget, found or not (Amendment 12, F3). Otherwise a
+            // queue of empty ranges would be walked end to end in one call.
             budget -= 1;
+            let Some((h, key, s)) = next else { continue };
             if h < hi {
                 self.retention.pending.insert(h, hi);
             }
@@ -1384,6 +1390,12 @@ impl State {
     /// holds, and give back the capacity. Amortised, that is O(1) moves per entry freed.
     fn free_entry(&mut self, h: u64, key: (u32, u64)) {
         self.retention.readers.remove(&h);
+        self.count_garbage(key);
+    }
+
+    /// One more of `key`'s entries is garbage: in its `Vec`, but neither its newest nor in
+    /// `readers`. Compact the row once that is half of it.
+    fn count_garbage(&mut self, key: (u32, u64)) {
         let Some(history) = self.version_history.get_mut(&key) else { return };
         let garbage = self.retention.garbage.entry(key).or_insert(0);
         *garbage += 1;
@@ -2848,8 +2860,10 @@ impl AgentRuntime {
         // with no live workspace — `AS OF BRANCH` on a merged or abandoned one — has no fork to
         // be as of, and reads main as it stands, as it always did.
         //
-        // The second value returned is `fork_seq` when the base was read through a pin, so the
-        // read-set can record what this read saw (`record_read`, `State::version_seen`).
+        // The second value returned is always `Some`. For a read through a pin it is the pin's
+        // `fork_seq`. For an unpinned read it is the seq its snapshot pairs with, from
+        // `State::read_now` (Amendment 11). Either way the read-set can record what this read saw
+        // (`record_read`, `State::version_seen`), and `record_read` refuses `None`.
         let (at, seen_through, staged) = match branch {
             Some(b) => {
                 let mut state = self.state.lock().unwrap();
@@ -3071,6 +3085,16 @@ impl AgentRuntime {
                 )))
             }
         };
+        // **A read must carry the seq its snapshot was paired with** (Amendment 12, F6). Every read
+        // path pairs one: a pin's `fork_seq`, or `State::read_now`'s for an unpinned read. Without
+        // it this would name each row's LATEST version and date the read at record time, which is
+        // the cost review's Q7. So a caller that passes `None` is refused, not served.
+        if seen_through.is_none() {
+            return Err(FerroError::Internal(format!(
+                "a read on behalf of {reader} carries no seq its snapshot pairs with, so the \
+                 versions it saw cannot be named"
+            )));
+        }
         // **A read that the history can no longer answer REFUSES. It does not record a version it
         // may not have seen.** (D194 new-wall audit; Amendment 11.)
         //
@@ -3102,8 +3126,10 @@ impl AgentRuntime {
         // is exact at `seen_through + 1`. Neither needs the history, and neither is refused
         // (Amendment 8).
         //
-        // The gate is by shape, so an exact-shape read that matched no rows is still refused,
-        // although it records a predicate. That errs toward refusing, and a refusal is safe.
+        // The gate is by shape. The per-row refusal below looks only at matched rows, so a read that
+        // matched none is never refused by it. The unrecorded-merge refusal does not look at rows,
+        // so an exact-shape read that matched nothing is still refused by that one, although it
+        // records a predicate. That errs toward refusing, and a refusal is safe.
         let names_versions = purpose == ReadPurpose::Inspection
             && shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions;
         let released = seen_through.filter(|f| {
@@ -6353,7 +6379,13 @@ impl AgentRuntime {
         }
         ctx.txn.commit(publish_txn)?;
 
-        self.record_applied(
+        // **Kept, not `?`-ed (D194 Amendment 12, F1).** The only error `record_applied` can return
+        // is an author stamp's, and it comes after the publish committed and every version was
+        // recorded. Returning on it here skipped the attestation and the seal below, which left a
+        // published branch LIVE. A second MERGE would then publish it again, and an ABANDON would
+        // drop the capture of a merge whose rows are in main. So the merge is finished first and
+        // the error reported after.
+        let authorship = self.record_applied(
             from,
             snapshot.txn,
             &rows,
@@ -6361,7 +6393,7 @@ impl AgentRuntime {
             &merge_id,
             &images,
             reserved,
-        )?;
+        );
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -6374,6 +6406,12 @@ impl AgentRuntime {
         // no such commitment.
         self.attest_merge(into, self.branches.next_epoch(), &images);
         self.seal(from, true)?;
+        if let Err(e) = authorship {
+            return Err(FerroError::Merge(format!(
+                "merge {merge_id} was published and sealed, but recording who wrote its rows \
+                 failed: {e}"
+            )));
+        }
 
         Ok(MergeReport {
             blind_writes,
@@ -10043,6 +10081,54 @@ mod tests {
         assert!(
             err.as_deref().is_some_and(|e| e.contains("carries no seq")),
             "a read with no paired seq must be refused: {err:?}"
+        );
+    }
+
+    /// **F4: `add_pending` merges an interval with every queued one it overlaps or touches**, so
+    /// the queue stays disjoint and no entry is queued twice. Mutant-only: M36 (insert without
+    /// merging) fails it.
+    #[test]
+    fn version_history_pending_intervals_merge_when_they_overlap_or_touch() {
+        let mut st = State::default();
+        let queue = |st: &State| st.retention.pending.iter().map(|(&l, &h)| (l, h)).collect::<Vec<_>>();
+        st.add_pending(10, 20);
+        st.add_pending(30, 40);
+        assert_eq!(queue(&st), vec![(10, 20), (30, 40)], "disjoint intervals stay apart");
+        st.add_pending(15, 25);
+        assert_eq!(queue(&st), vec![(10, 25), (30, 40)], "an overlapping interval is absorbed");
+        st.add_pending(25, 30);
+        assert_eq!(queue(&st), vec![(10, 40)], "touching intervals on both sides become one");
+        st.add_pending(50, 60);
+        st.add_pending(70, 80);
+        st.add_pending(5, 75);
+        assert_eq!(queue(&st), vec![(5, 80)], "an interval spanning several absorbs them all");
+        st.add_pending(90, 90);
+        assert_eq!(queue(&st), vec![(5, 80)], "an empty interval queues nothing");
+    }
+
+    /// **F4: an unpinned scan inside a publish window pairs with the window's start.** The
+    /// reservation's txn has not committed, so the scan's snapshot cannot contain it, and its seq
+    /// must not claim the reserved numbers. Mutant-only: M37 (`read_now` returning `apply_seq`)
+    /// fails it.
+    #[test]
+    fn an_unpinned_scan_inside_a_publish_window_pairs_with_its_start() {
+        let (_dir, bp, catalog, txn, rt) = sql_fixture("f4_window", 1);
+        let t = txn.begin().unwrap();
+        let (start, entry) = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 2;
+            (start, PublishingEntry::register(st, &rt.state, start, t))
+        };
+        let (_, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        drop(entry);
+        assert_eq!(
+            seen,
+            Some(start),
+            "a scan whose snapshot cannot see the reserved publish claimed its sequence numbers"
         );
     }
 }

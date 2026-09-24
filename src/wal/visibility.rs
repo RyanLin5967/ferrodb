@@ -33,8 +33,10 @@ impl Drop for HopCount {
     }
 }
 
-/// The version of `head`'s row that `view` can see, counting nothing. Every executor calls
-/// [`resolve_visibility_counted`] instead, so that its hops reach `VISIBILITY_HOPS`.
+/// The version of `head`'s row that `view` can see. Its hops go into a count of its own, which
+/// adds them to `VISIBILITY_HOPS` when the call returns: one atomic per call that hopped. That is
+/// the per-tuple cost D176 rules out on a scan's path, so every executor calls
+/// [`resolve_visibility_counted`] with its own per-scan count instead. This is for one-off lookups.
 pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
     resolve_visibility_counted(view, tt_heap, head, &mut HopCount(0))
 }
