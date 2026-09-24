@@ -10131,4 +10131,190 @@ mod tests {
             "a scan whose snapshot cannot see the reserved publish claimed its sequence numbers"
         );
     }
+
+    // ---- Amendment 13: review 6 (`frontier/d194_review6.md` @ `8a87787`) ------------------------
+
+    /// `t (id, v)` holding rows `1..=rows` with `v = 10·id`, over a runtime whose `fail_at`-th
+    /// author stamp fails (`FailingStamps`).
+    #[allow(clippy::type_complexity)]
+    fn failing_stamp_fixture(
+        name: &str,
+        rows: i32,
+        fail_at: usize,
+    ) -> (tempfile::TempDir, Arc<BufferPoolManager>, Catalog, Arc<TxnManager>, Arc<AgentRuntime>) {
+        let (dir, bp, mut catalog, txn) = txn_fixture(name);
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut sql = vec!["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);".to_string()];
+        sql.extend((1..=rows).map(|i| format!("INSERT INTO t VALUES ({i}, {});", i * 10)));
+        for q in sql {
+            let out = crate::execution::executor::run(
+                parse_one(&q),
+                &mut catalog,
+                bp.clone(),
+                txn.clone(),
+                &mut main,
+            );
+            if let Err(e) = out {
+                panic!("{q}: {e}");
+            }
+        }
+        (dir, bp, catalog, txn, rt)
+    }
+
+    /// One statement through the SQL executor, on `session`.
+    fn exec_sql(
+        sql: &str,
+        session: &mut crate::execution::session::Session,
+        catalog: &mut Catalog,
+        bp: &Arc<BufferPoolManager>,
+        txn: &Arc<TxnManager>,
+    ) -> Result<crate::execution::executor::Outcome, FerroError> {
+        crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), session)
+    }
+
+    /// **A: a connection whose MERGE published, and then failed at the author stamp, is no longer
+    /// bound to the branch that MERGE sealed.** The binding is decided by whether the runtime still
+    /// holds a workspace for the branch, not by whether `merge` returned `Ok`.
+    ///
+    /// At `0fdcd81` the connection stayed bound to the reaped branch, and could not begin another
+    /// session.
+    #[test]
+    fn a_session_whose_merge_published_but_failed_is_unbound() {
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("a_merge_unbind", 3, 2);
+        let mut s = crate::execution::session::Session::with_runtime(rt.clone());
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut s, &mut catalog, &bp, &txn).unwrap();
+        let b = s.agent.as_ref().expect("fixture: no agent session").branch;
+        for id in 1..=3 {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            exec_sql(&sql, &mut s, &mut catalog, &bp, &txn).unwrap();
+        }
+        let err = exec_sql("MERGE;", &mut s, &mut catalog, &bp, &txn).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+            "fixture: the MERGE should fail at the injected stamp, got {err:?}"
+        );
+        assert!(
+            !rt.state.lock().unwrap().workspaces.contains_key(&b),
+            "fixture: the MERGE should have sealed the branch"
+        );
+        assert!(s.agent.is_none(), "the connection is still bound to a branch that no longer exists");
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r2';", &mut s, &mut catalog, &bp, &txn)
+            .expect("the connection could not begin a session after a MERGE that published");
+    }
+
+    /// **A, for ABANDON: a connection whose branch was sealed by another connection is unbound by
+    /// its own ABANDON, even though that ABANDON fails.**
+    ///
+    /// At `0fdcd81` the failed ABANDON left the binding, so the connection stayed stuck until it
+    /// reconnected.
+    #[test]
+    fn a_session_whose_branch_was_abandoned_elsewhere_is_unbound_by_its_own_abandon() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("a_abandon_unbind", 1);
+        let mut s1 = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut s2 = crate::execution::session::Session::with_runtime(rt.clone());
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut s1, &mut catalog, &bp, &txn).unwrap();
+        let name = s1.agent.as_ref().expect("fixture: no agent session").branch_name.clone();
+        exec_sql(&format!("ABANDON BRANCH {name};"), &mut s2, &mut catalog, &bp, &txn).unwrap();
+        assert!(
+            exec_sql("ABANDON;", &mut s1, &mut catalog, &bp, &txn).is_err(),
+            "fixture: abandoning a branch that is already sealed should fail"
+        );
+        assert!(s1.agent.is_none(), "the connection is still bound to a branch that no longer exists");
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r2';", &mut s1, &mut catalog, &bp, &txn)
+            .expect("the connection could not begin a session after its branch was sealed");
+    }
+
+    /// **F: a merge whose author stamp fails is attested exactly once**: one `Merge` entry on its
+    /// target, and one `Reap` closing the branch's chain.
+    ///
+    /// Mutant-only: M39, skipping `attest_merge` on the authorship-error path, fails it.
+    #[test]
+    fn a_merge_whose_author_stamp_fails_is_attested_once() {
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("f_attested", 3, 2);
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let merges_on_trunk = |rt: &AgentRuntime| {
+            rt.attested_entries(BranchId::TRUNK).iter().filter(|e| e.op == BranchOp::Merge).count()
+        };
+        let before = merges_on_trunk(&rt);
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+        }
+        assert_eq!(merges_on_trunk(&rt), before + 1, "the published merge was not attested exactly once");
+        let chain = rt.attested_entries(b);
+        assert_eq!(chain.last().map(|e| e.op), Some(BranchOp::Reap), "the branch's chain is not closed");
+        assert_eq!(
+            chain.iter().filter(|e| e.op == BranchOp::Reap).count(),
+            1,
+            "the branch's chain was closed more than once"
+        );
+    }
+
+    /// **D: a row the failed stamp missed never names its PREVIOUS author.** Run A's merge
+    /// attributes rows 1–3. Run B's merge publishes all three, and its second author stamp fails.
+    /// Every row must then name B, or no one. Naming A would describe a version B's merge replaced.
+    ///
+    /// At `0fdcd81` the loop stopped at the failure, so the failed row and every row after it kept
+    /// naming run A.
+    #[test]
+    fn a_row_the_failed_stamp_missed_never_names_its_previous_author() {
+        // Calls 1–3 are run A's stamps; call 5 is run B's second.
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("d_author", 3, 5);
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        merge_round(&rt, &mut ctx, &txn, 3, "rA");
+        for id in 1..=3u64 {
+            assert_eq!(
+                rt.who_wrote_row("t", RowId(id)).map(|e| e.run_id),
+                Some("rA".to_string()),
+                "fixture: run A's merge should attribute row {id}"
+            );
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "w", run_id: Some("rB"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        for id in 1..=3 {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+        }
+        let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+            "fixture: run B's merge should fail at the injected stamp, got {err:?}"
+        );
+        for id in 1..=3u64 {
+            let who = rt.who_wrote_row("t", RowId(id)).map(|e| e.run_id);
+            assert_ne!(
+                who.as_deref(),
+                Some("rA"),
+                "row {id} still names run rA, whose version run rB's published merge replaced"
+            );
+        }
+    }
 }
