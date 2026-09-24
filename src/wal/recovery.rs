@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -183,8 +183,10 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
     names.sort_unstable();
     // Every tree this rebuilds, with its fresh root: the shared cells are repointed from this at
-    // the end (D205), once the `&mut` borrow of each entry has ended.
-    let mut rebuilt: Vec<(String, Option<String>, u32)> = Vec::new();
+    // the end (D205), once the `&mut` borrow of each entry has ended. Each index carries its KIND
+    // (D208): a B-tree and a full-text index on one column are two trees, and by column alone both
+    // fresh roots were stored into one cell, the posting tree's last.
+    let mut rebuilt: Vec<(String, Option<IndexTree<String>>, u32)> = Vec::new();
     for name in names {
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
@@ -253,7 +255,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
-            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
+            rebuilt.push((name.clone(), Some(IndexTree::Secondary(info.column_name.clone())), info.root_page_id));
         }
 
         // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
@@ -280,7 +282,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
-            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
+            rebuilt.push((name.clone(), Some(IndexTree::FullText(info.column_name.clone())), info.root_page_id));
         }
     }
     // **D205: the records above are the only copy that moved.** Every loop in this function
@@ -299,15 +301,16 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // (`a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them`). `sync_root_cells` then
     // creates a cell for any tree that has none, and it never overwrites the ones just repointed.
     //
-    // ⚠ Pre-existing, and not changed here: a cell is keyed by `(table, column)` with no index kind,
-    // so a secondary index and a full-text index on ONE column share a cell, and the full-text root
-    // is stored last. See `frontier/lane_rollback_index_orphan.md` §14.
+    // Each store lands in its own index's cell because the key carries the index KIND (D208). It
+    // did not always: keyed `(table, column)`, a B-tree and a full-text index on one column shared a
+    // cell, the full-text root was stored last, and every B-tree lookup after a rebuild descended
+    // the posting tree (`tests/root_cell_is_per_index.rs`).
     //
     // Here, and not only in `open_recovered`, because this is the function that makes the cells
     // wrong. A caller that rebuilds and then queries, as the full-text and recovery tests do, gets
     // cells that match what it built.
-    for (table, column, root) in &rebuilt {
-        if let Some(cell) = catalog.root_cell(table, column.as_deref()) {
+    for (table, index, root) in &rebuilt {
+        if let Some(cell) = catalog.root_cell(table, index.as_ref().map(|i| i.borrowed())) {
             cell.store(*root, Ordering::SeqCst);
         }
     }

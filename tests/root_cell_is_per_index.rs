@@ -1,7 +1,9 @@
 //! A secondary index and a full-text index on ONE column share one D53 root cell.
 //!
 //! Found while porting D205's fix (artie-research `frontier/lane_rollback_index_orphan.md` §14).
-//! INFERRED from source and never run; this file is the measurement. It is NOT fixed on this branch.
+//! INFERRED from source and never run; this file is the measurement. It was NOT fixed on the
+//! branch that found it (`rollback-index-orphan`, `d7891d5`); D208 fixes it on `d208-root-cell-per-index`
+//! by keying each cell by index KIND as well as column (`Catalog::root_cell`, `IndexTree`).
 //!
 //! The chain (READ-FROM-SOURCE):
 //! - `Catalog::roots` is keyed `(table, Option<column>)`, with no index kind. `sync_root_cells`
@@ -41,10 +43,11 @@
 //! So each fixture is `N` rows, `ANALYZE`d, and each asserts its plan before trusting a lookup.
 
 use std::fs::OpenOptions;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
+use ferrodb::catalog::catalog::{Catalog, IndexTree};
 use ferrodb::catalog::column::Value;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -123,6 +126,11 @@ impl Db {
             "premise failed: `{sql}` is not planned on the index over column {col}, so its lookup \
              would read the heap and could not see which tree the index opened. plan:\n{plan}"
         );
+    }
+
+    /// The shared root cell of one index on `t`, which must exist.
+    fn cell(&self, index: IndexTree<&str>) -> Arc<std::sync::atomic::AtomicU32> {
+        self.catalog.root_cell("t", Some(index)).unwrap_or_else(|| panic!("no shared root cell for {index:?} on t"))
     }
 
     /// The durable records' roots for the trees on `column` of `t`: (B-tree, full-text).
@@ -289,4 +297,141 @@ fn an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree() 
     let (on_b_root, _) = d.record_roots("b");
     assert!(on_a_root.is_some() && on_b_root.is_some(), "premise failed: an index record is missing");
     assert_ne!(on_a_root, on_b_root, "the indexes on `a` and `b` record one tree between them");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cells themselves (D208's fix). These use `IndexTree`, so they compile only from the fix on;
+// the behavioural tests above are the red phase and compile against either API.
+// ---------------------------------------------------------------------------------------------
+
+/// **A B-tree index and a full-text index on one column hold two cells, each naming its own tree,
+/// whichever was created first — and each root writer stores into its own kind's cell only.**
+///
+/// Structural, so it cannot pass by a fixture being too small to reach the index: two indexes are
+/// two trees, and two trees need two cells. The two stores at the end are the root writers a split
+/// reaches (`sync_roots` → `update_index_root`, `sync_fulltext_roots` → `update_fulltext_root`),
+/// called directly because no fixture this size splits a root. 9001 and 9002 are page numbers
+/// nothing allocates here; nothing descends them.
+#[test]
+fn each_index_kind_on_one_column_holds_its_own_cell_in_either_order() {
+    for fulltext_first in [false, true] {
+        let mut d = Db::new();
+        d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+        d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+        let (btree_sql, fulltext_sql) = ("CREATE INDEX ib ON t (body);", "CREATE FULLTEXT INDEX fb ON t (body);");
+        if fulltext_first {
+            d.rows(fulltext_sql);
+            d.rows(btree_sql);
+        } else {
+            d.rows(btree_sql);
+            d.rows(fulltext_sql);
+        }
+        let order = if fulltext_first { "full-text first" } else { "B-tree first" };
+
+        let btree = d.cell(IndexTree::Secondary("body"));
+        let fulltext = d.cell(IndexTree::FullText("body"));
+        assert!(!Arc::ptr_eq(&btree, &fulltext), "{order}: the two indexes on `body` share one cell");
+        let (btree_record, fulltext_record) = d.record_roots("body");
+        assert!(btree_record.is_some() && fulltext_record.is_some(), "{order}: premise failed: an index record is missing");
+        assert_ne!(btree_record, fulltext_record, "{order}: premise failed: both records name one page");
+        assert_eq!(Some(btree.load(Ordering::SeqCst)), btree_record, "{order}: the B-tree cell does not name the B-tree index's tree");
+        assert_eq!(Some(fulltext.load(Ordering::SeqCst)), fulltext_record, "{order}: the full-text cell does not name the posting tree");
+
+        d.catalog.update_index_root("t", "body", 9001).unwrap();
+        assert_eq!(btree.load(Ordering::SeqCst), 9001, "{order}: update_index_root did not store into the B-tree cell");
+        assert_eq!(fulltext.load(Ordering::SeqCst), fulltext_record.unwrap(), "{order}: update_index_root moved the full-text cell");
+        d.catalog.update_fulltext_root("t", "body", 9002).unwrap();
+        assert_eq!(fulltext.load(Ordering::SeqCst), 9002, "{order}: update_fulltext_root did not store into the full-text cell");
+        assert_eq!(btree.load(Ordering::SeqCst), 9001, "{order}: update_fulltext_root moved the B-tree cell");
+    }
+}
+
+/// **A rebuild stores each fresh root into its own kind's cell, and keeps both cells.**
+///
+/// The structural twin of `a_rebuild_leaves_a_btree_index_beside_a_fulltext_index_on_its_own_tree`:
+/// cell == record for each kind after `rebuild_indexes`, and each is still the `Arc` a statement
+/// could have been holding (D205's store-in-place, per kind).
+#[test]
+fn a_rebuild_stores_each_fresh_root_into_its_own_kinds_cell() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.rows("CREATE INDEX ib ON t (body);");
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    let btree = d.cell(IndexTree::Secondary("body"));
+    let fulltext = d.cell(IndexTree::FullText("body"));
+
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+
+    let (btree_record, fulltext_record) = d.record_roots("body");
+    assert!(btree_record.is_some() && fulltext_record.is_some(), "premise failed: an index record is missing");
+    assert_eq!(Some(btree.load(Ordering::SeqCst)), btree_record, "after a rebuild, the B-tree cell does not name the rebuilt B-tree");
+    assert_eq!(Some(fulltext.load(Ordering::SeqCst)), fulltext_record, "after a rebuild, the full-text cell does not name the rebuilt posting tree");
+    assert!(Arc::ptr_eq(&btree, &d.cell(IndexTree::Secondary("body"))), "the rebuild REPLACED the B-tree cell");
+    assert!(Arc::ptr_eq(&fulltext, &d.cell(IndexTree::FullText("body"))), "the rebuild REPLACED the full-text cell");
+}
+
+/// **One index leaving retires its own cell and keeps the other kind's.**
+///
+/// There is no `DROP INDEX` statement. This removes the record the way one would, then asks the
+/// catalog to reconcile its cells, which every DDL path does after changing the set of trees. The
+/// B-tree index's cell must go, or the next B-tree index on the column inherits the retired tree
+/// through it (`sync_root_cells` never overwrites). The full-text cell must stay, as the same `Arc`.
+#[test]
+fn a_btree_index_leaving_retires_its_cell_and_keeps_the_fulltext_one() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.rows("CREATE INDEX ib ON t (body);");
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    let fulltext = d.cell(IndexTree::FullText("body"));
+    let fulltext_root = fulltext.load(Ordering::SeqCst);
+    let retired_root = d.record_roots("body").0.expect("premise failed: no B-tree record");
+
+    d.catalog.tables.get_mut("t").unwrap().indexes.clear();
+    d.catalog.sync_root_cells();
+
+    assert!(
+        d.catalog.root_cell("t", Some(IndexTree::Secondary("body"))).is_none(),
+        "the cell of a B-tree index the catalog no longer records survived it"
+    );
+    assert!(Arc::ptr_eq(&fulltext, &d.cell(IndexTree::FullText("body"))), "retiring the B-tree cell REPLACED the full-text one");
+    assert_eq!(fulltext.load(Ordering::SeqCst), fulltext_root, "retiring the B-tree cell moved the full-text one");
+
+    d.rows("CREATE INDEX ib2 ON t (body);");
+    let btree_record = d.record_roots("body").0.expect("premise failed: the new B-tree index has no record");
+    assert_ne!(
+        btree_record, retired_root,
+        "premise failed: the new index was built at the retired root's page, so this cannot tell the two trees apart"
+    );
+    assert_eq!(
+        d.cell(IndexTree::Secondary("body")).load(Ordering::SeqCst),
+        btree_record,
+        "the new B-tree index's cell names the retired index's tree"
+    );
+}
+
+/// **A rename carries both kinds' cells to the new name, as the same `Arc`s.**
+///
+/// The structural twin of `an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree`,
+/// with a full-text index as well, since both kinds are keyed by the renamed name.
+#[test]
+fn a_rename_carries_both_kinds_cells_to_the_new_name() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, a VARCHAR(100));");
+    d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.rows("CREATE INDEX ia ON t (a);");
+    d.rows("CREATE FULLTEXT INDEX fa ON t (a);");
+    let btree = d.cell(IndexTree::Secondary("a"));
+    let fulltext = d.cell(IndexTree::FullText("a"));
+
+    d.rows("ALTER TABLE t RENAME COLUMN a TO b;");
+
+    assert!(d.catalog.root_cell("t", Some(IndexTree::Secondary("a"))).is_none(), "the B-tree cell stayed under the old name");
+    assert!(d.catalog.root_cell("t", Some(IndexTree::FullText("a"))).is_none(), "the full-text cell stayed under the old name");
+    assert!(Arc::ptr_eq(&btree, &d.cell(IndexTree::Secondary("b"))), "the B-tree index's cell did not move to `b`");
+    assert!(Arc::ptr_eq(&fulltext, &d.cell(IndexTree::FullText("b"))), "the full-text index's cell did not move to `b`");
+    let (btree_record, fulltext_record) = d.record_roots("b");
+    assert_eq!(Some(btree.load(Ordering::SeqCst)), btree_record, "the moved B-tree cell does not name the renamed index's tree");
+    assert_eq!(Some(fulltext.load(Ordering::SeqCst)), fulltext_record, "the moved full-text cell does not name the renamed index's tree");
 }

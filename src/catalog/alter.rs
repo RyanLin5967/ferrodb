@@ -665,7 +665,7 @@ impl Catalog {
             .collect();
         if !renames.is_empty() {
             let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
-            for (from, to) in renames {
+            for &(from, to) in &renames {
                 // **Both lists, and the second one is not decoration.** A `TableEntry` keeps
                 // ordinary indexes and full-text indexes in separate vectors, and BOTH record
                 // their column by name. `planner::plan` resolves each of them with
@@ -685,6 +685,13 @@ impl Catalog {
                         ind.column_name = to.clone();
                     }
                 }
+            }
+            // **And the shared root cells, which are keyed by the same name (D208).** Left behind,
+            // the renamed index opens a private root until something re-seeds it, and an index
+            // later built on a new column that takes the old name inherits this tree through the
+            // old cell. See `Catalog::rename_root_cells`. Same chain order as the records above.
+            for (from, to) in renames {
+                self.rename_root_cells(&table, from, to);
             }
         }
 
