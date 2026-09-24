@@ -2,6 +2,36 @@ use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Pat
 
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
+/// Redo and undo the heap records in the log, and say whether the index trees may now disagree
+/// with the heap.
+///
+/// **D216: `true` means the log held a DATA record** (a heap insert, delete or update, or a CLR),
+/// and nothing else makes it `true`. Only such a record changes something an index reflects. Index
+/// pages are not logged, so after a crash a tree on disk may lack the change or name a row undo
+/// has just removed. A data record counts whether or not redo had to apply it: a heap page can
+/// reach the disk while its index page does not, and then redo skips the record while the tree
+/// still lacks the key (`a_committed_row_whose_heap_page_reached_disk_still_forces_the_rebuild`).
+///
+/// It used to be `true` for ANY non-empty log, and a clean close leaves a non-empty one:
+/// `TxnManager::checkpoint_locked` truncates the log and then re-appends this process's DDL and
+/// run declarations as transaction-0 records. So the first restart after any process that ran DDL
+/// or bound an agent run rebuilt every tree, O(rows), for records that change no page. Those
+/// records (`Ddl`, `RunIdentity`), and `Begin`, `Commit`, `Abort` and `TxnEnd`, are still read,
+/// because the analysis below raises the transaction-id watermark past every id the log names, and
+/// the WAL header catches up only at a checkpoint.
+///
+/// A loser whose records are all transaction control undoes nothing, so it does not count either.
+/// That is sound on two conditions. No index page reaches the disk before the log records it
+/// depends on (`BufferPoolManager::wal_gate`). And every index write follows the heap record it
+/// indexes (`execution::insert`, `execution::update`). Together they mean an index page on disk
+/// that carries a transaction's change implies that change's heap record is in the log.
+///
+/// Not covered: a crash inside a DDL statement. DDL is not logged, and no DDL here is
+/// crash-atomic (the ALTER arm of `execution::executor::run` says so). The old any-record rule
+/// rebuilt after some such crashes only because earlier re-declarations happened to be in the log.
+/// That was never reliable, and it was not a repair either: `rebuild_indexes` first frees the old
+/// tree by walking it (`free_tree`), and a half-written tree's child pointers name pages that were
+/// never written.
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
     // read whole log
@@ -92,7 +122,15 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // it repairs. Two losers therefore produced two different byte sequences from the same crash.
     // Ascending transaction id is also the order the transactions started in, which is the order a
     // reader of the log would expect their compensation records to appear.
-    let mut losers: Vec<u64> = last_lsn.keys().copied().filter(|id| !ended.contains(id)).collect();
+    //
+    // **Transaction 0 is not a transaction, so it is never a loser (D216).** DDL and run
+    // declarations are logged under it (`TxnManager::append_ddl`, `replay_runs`), and it never
+    // commits, so this used to take it for a loser and "abort" it. That appended an `Abort` and a
+    // `TxnEnd` under id 0 and undid nothing. While every non-empty log rebuilt, the rebuild's
+    // checkpoint discarded them at once. A log of declarations now rebuilds nothing and is left as
+    // it was, so they would stay, and a change-feed decoder reports every `Abort` it reads
+    // (`Decoded::aborted`).
+    let mut losers: Vec<u64> = last_lsn.keys().copied().filter(|id| *id != 0 && !ended.contains(id)).collect();
     losers.sort_unstable();
     for id in losers {
         // Through the guard, not the raw lock: this ADDS to the active set, so it must move
@@ -122,7 +160,8 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             Err(e) => return Err(e)
         }
     }
-    Ok(true)
+    // Every data record, and nothing else, put a page into `touched`.
+    Ok(!touched.is_empty())
 }
 
 /// Apply one log record to the pages, for callers outside recovery — a replica applying a
@@ -319,13 +358,15 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
 /// path. The CLI and three examples each used to declare their own.
 pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
-/// A database file, opened, recovered, and with every index rebuilt from the recovered heap.
+/// A database file, opened and recovered, with every index rebuilt from the recovered heap if
+/// recovery or a marker said the trees could be stale.
 pub struct OpenedDatabase {
     pub bp: Arc<BufferPoolManager>,
     pub wal: Arc<WalManager>,
     pub txn: Arc<TxnManager>,
     pub catalog: Catalog,
-    /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
+    /// Whether the log held a data record ([`recover`]'s answer, D216). The trees were rebuilt
+    /// when this was true or the stale-indexes marker was present.
     pub recovered: bool,
 }
 
@@ -336,14 +377,20 @@ pub struct OpenedDatabase {
 /// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL;
 /// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
 /// 3. open the catalog, or create it for a new file;
-/// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
+/// 4. if recovery replayed a data record, [`rebuild_indexes`] from the recovered heap, then checkpoint.
 ///    The rebuild ends by repointing the shared root cells at the trees it built (D205). Without
 ///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
 ///    there because the rebuilt trees and the catalog page are then on disk, so the log that
 ///    produced them has nothing left to say; without it, the next open would replay the same
 ///    records and rebuild every tree again (reasoning from `b9a0a75`). Step 4 also runs when a
 ///    marker says an earlier rollback's index undo failed (`TxnManager::mark_indexes_stale`), even
-///    if the log is empty.
+///    if the log holds no data record.
+///
+/// **D216: a clean restart skips step 4.** A clean close ends in a checkpoint, and the log it leaves
+/// holds only that checkpoint's re-declarations of DDL and agent runs, which change no page. Step 4
+/// used to run for any non-empty log, so every restart after a process that ran DDL or bound a run
+/// paid a rebuild of every tree, O(rows). Now such an open rebuilds nothing, and leaves the log
+/// exactly as it found it.
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
@@ -388,9 +435,10 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         Catalog::create(bp.clone())?
     };
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
-    // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
-    // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
-    // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
+    // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and a log with no
+    // data record (an empty one, or since D216 one of re-declarations) does not trigger the rebuild
+    // below. The marker is removed only after the rebuilt trees are checkpointed. If removal fails,
+    // the next open simply rebuilds again, which is harmless.
     let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
     let stale = marker.exists();
     if recovered || stale {
