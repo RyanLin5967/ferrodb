@@ -565,6 +565,7 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
         .reaper
         .drain_pending()
         .map_err(|e| format!("drain_pending probe after sweep 2: {e:?}"))?;
+    check_deferred(&rig.reaper, "after the sweep-2 probe", &mut fails);
 
     let refused = rig.reaper.refused_reaps();
     if refused != 0 {

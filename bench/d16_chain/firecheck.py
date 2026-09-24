@@ -3,21 +3,25 @@
 
 Every mutant edits the engine (`src/`). None edits `examples/d16_chain_retention.rs`: a forced result
 at the call site would exercise nothing inside the reaper, the catalog or the store. The pattern is
-`bench/d154_mutate.py`'s. What this adds is recorded in `bench/d16_chain/PREREG.md` A2.6:
+`bench/d154_mutate.py`'s. What this adds is recorded in `bench/d16_chain/PREREG.md` A2.6 and A3.4:
 
-  * It REFUSES to start unless the cwd is the repository top level and `src/` and `examples/` are
-    clean. It re-checks both, and that the file equals its HEAD blob, before EVERY mutant. Restoring
-    from git would otherwise destroy uncommitted work, which is how `git checkout --` has eaten a fix
-    here before.
-  * It restores ONLY the file it mutated, and only while a mutant is applied. After every restore,
-    the file's blob hash must equal HEAD's. SIGTERM (what `timeout` sends) and SIGHUP unwind through
-    the same `finally`.
-  * Raw output goes to a NEW directory per run, `bench/d16_chain/firecheck/<head>-<utc>/`. A re-run
-    can neither overwrite an earlier run's raw files nor dirty a committed copy of them.
+  * It REFUSES to start unless the cwd is the repository top level and no tracked file is modified.
+    It pins HEAD at start. Before EVERY mutant it re-checks the whole tree, HEAD and the target
+    file's blob.
+  * It restores the mutated file by writing back the bytes it read, with SIGTERM and SIGHUP ignored
+    while it does, then checks the blob against HEAD. `git checkout --` needs the index lock, and a
+    stale lock left by a killed build would strand the mutant. SIGTERM (what `timeout` sends) and
+    SIGHUP unwind through the same `finally` everywhere else.
+  * Raw output goes to a NEW directory per run, `bench/d16_chain/firecheck/<head>-<utc>/`, with the
+    environment in ENV.txt and every build log beside its run. A re-run can neither overwrite an
+    earlier run's raw files nor dirty a committed copy of them.
   * cargo and the harness run in their own process group, and a timeout kills the whole group.
-  * A mutant counts only if EVERY cell's verdict, every `compare` line, the build flag and the exit
-    code equal the ones pre-registered in PREREG A1.6 and A2.3-A2.4. "Something went red" is not
-    enough: the red has to come from the detector the mutant was aimed at.
+  * A mutant counts only if EVERY cell's verdict, every `compare` line, the registered exact values,
+    the build flag, the sha and the exit code equal the ones pre-registered in PREREG A1.6, A2.3-A2.4
+    and A3.2. "Something went red" is not enough: the red has to come from the detector the mutant
+    was aimed at.
+  * The two clean baselines must print identical `measured`, `slots` and `verdict` lines. Each
+    matching the registration on its own is not enough.
 
 Run from the worktree root, on a committed tree:
 
@@ -25,10 +29,11 @@ Run from the worktree root, on a committed tree:
 
 Commit the run's output directory before interpreting it.
 
-Exit 0: both clean baselines MATCH everywhere, A0 refuses, and every mutant fired exactly as
+Exit 0: both baselines as registered and identical, A0 refuses, and every mutant fired exactly as
 registered. Exit 1: something differed from its registration, or a build failed. Exit 2: could not
-run (wrong cwd, dirty tree, the first baseline failed, an anchor did not occur exactly once, or a
-restore did not match HEAD).
+run (wrong cwd, dirty tree, HEAD moved, the first baseline failed, an anchor did not occur exactly
+once, or a restore did not match HEAD). Exit 3: interrupted by a signal; the mutated file, if any,
+was restored.
 """
 import datetime
 import os
@@ -44,6 +49,10 @@ DEPTHS = (1, 3, 10)
 ARMS = ("fanout", "chain", "overwrite")
 BUILD_TIMEOUT = 1800
 RUN_TIMEOUT = 1800
+# The symbol D200 adds (`wall21-reaped-subtree` @ 17cbd4c). Its presence in `src/` decides which
+# registered slot state (A1.4) a baseline must show, so a merge of D200 cannot be mistaken for a
+# regression, and nothing else can pass as D200.
+D200_MARKER = "unreleased_reaped_candidates"
 
 # Keys, exactly as the harness prints them.
 RP, RR, RE, PE = "retained_pages", "retained_reserved", "retained_extents", "pending"
@@ -151,7 +160,6 @@ def cmp_m9(d):
 
 
 # ---- expected slot line: PREREG A1.4 and A2.4 ----------------------------------------------------
-# A baseline may match EITHER registered tree state; the script says which. M13 must read 0.
 
 def slots_main_lineage(arm, d):
     return d if arm == "fanout" else 1
@@ -163,6 +171,30 @@ def slots_d200(arm, d):
 
 def slots_none(arm, d):
     return 0
+
+
+# ---- exact registered values: PREREG A3.2 --------------------------------------------------------
+
+def chains(depths, values):
+    return {(arm, d): values(d) for arm in ("chain", "overwrite") for d in depths}
+
+
+VALUES = {
+    "M1-pin": chains((3, 10), lambda d: {RP: 2, RR: 3, RE: 2, PE: 2}),
+    "M2-reap-skips-drain": chains((3, 10), lambda d: {
+        AP: 2 * (d - 1), AR: 3 * (d - 1), AE: 2 * (d - 1), APD: 2 * (d - 1), AD: 2 * (d - 1)}),
+    "M3-fast-path-frees-nothing": {
+        ("fanout", 1): {AP: 2, AR: 3, AE: 2},
+        ("fanout", 3): {RP: 4, RR: 6, RE: 4, AP: 6, AR: 9, AE: 6},
+        ("fanout", 10): {RP: 18, RR: 27, RE: 18, AP: 20, AR: 30, AE: 20},
+        **chains(DEPTHS, lambda d: {AP: 2, AR: 3, AE: 2}),
+    },
+    "M8-drain-skips-its-sweep": chains((3, 10), lambda d: {AO: 2 * (d - 1)}),
+    "M9-rule-sees-supersession": {
+        ("overwrite", 3): {RP: 2, RR: 3, RE: 2, PE: 2},
+        ("overwrite", 10): {RP: 10, RR: 15, RE: 10, PE: 10},
+    },
+}
 
 
 # (label, file, exact committed text, mutant text, cell expectation, compare expectation, slots).
@@ -185,9 +217,11 @@ MUTANTS = [
      "            self.live_pages.fetch_sub(1, Ordering::SeqCst);\n",
      "            // M4: the page counter is not decremented\n",
      expect_m4, cmp_eq_then_absent, None),
+    # `true ||` rather than `true`, so `owns_it` and `barrier` stay used and the mutant builds even
+    # under `-D warnings` (A3.4).
     ("M5-cow-in-place", "src/branch/arena.rs",
      "        if owns_it && header.birth_epoch >= barrier {\n",
-     "        if true {\n",
+     "        if true || (owns_it && header.birth_epoch >= barrier) {\n",
      expect_m5, cmp_eq_then_absent, None),
     ("M6-skip-a-candidate", "src/branch/reaper.rs",
      "        for rec in candidates {\n",
@@ -226,6 +260,7 @@ MUTANTS = [
 ]
 
 VERDICT = re.compile(r"^verdict\s+arm=(\S+) D=(\d+) P=(\d+) sha=(\S+) build=(\S+) (.*)$")
+MEASURED = re.compile(r"^measured\s+arm=(\S+) D=(\d+) P=\d+ sha=\S+ build=\S+ (.*)$")
 COMPARE = re.compile(r"^compare\s+D=(\d+) P=\d+ sha=\S+ (.*)$")
 SLOTS = re.compile(r"^slots\s+arm=(\S+) D=(\d+) .*?slots_recycled=(\d+) ")
 
@@ -251,11 +286,11 @@ def text(x):
     return x or ""
 
 
-def run_group(cmd, timeout):
-    """Run `cmd` in its own process group. On timeout, kill the WHOLE group: killing only the
-    direct child leaves `rustc` grandchildren writing into `target/` under the next build."""
+def run_group(cmd, timeout, env=None):
+    """Run `cmd` in its own process group. On timeout or a signal, kill the WHOLE group: killing
+    only the direct child leaves `rustc` grandchildren writing into `target/` under the next build."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
+                            start_new_session=True, env=env)
     try:
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, text(out), text(err)
@@ -274,32 +309,36 @@ def target_dir():
     return pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target"))
 
 
-def build():
+def build(outdir, label):
     # `build.rs` stamps the commit and the dirty flag, and it reruns only when `.git/HEAD` or
     # `.git/index` changes. A mutant edits neither, so in a main checkout the stamp could lag the
     # tree. Touching `build.rs` changes its mtime, not its content, and forces the stamp to be
     # recomputed. `main` has already checked that it exists, so this never creates one.
     pathlib.Path("build.rs").touch(exist_ok=True)
     rc, out, err = run_group(["cargo", "build", "--release", "--example", EXAMPLE], BUILD_TIMEOUT)
+    (outdir / f"{label}.build.txt").write_text(f"# rc={rc}\n" + out + err)
     return rc, out + err
 
 
 def run(outdir, label, args):
     exe = target_dir() / "release" / "examples" / EXAMPLE
-    rc, stdout, stderr = run_group([str(exe), *args], RUN_TIMEOUT)
+    env = dict(os.environ, D16_PERSIST="1")
+    rc, stdout, stderr = run_group([str(exe), *args], RUN_TIMEOUT, env)
     (outdir / f"{label}.txt").write_text(
         f"# {label}: {exe} {' '.join(args)}\n# rc={rc}\n" + stdout + stderr)
     return rc, stdout
 
 
 def parse(stdout):
-    """Verdict per cell, compare per depth, slots per cell, and the build flags seen."""
-    cells, compares, slots, builds = {}, {}, {}, set()
+    """Verdict and measured values per cell, compare per depth, slots per cell, and the build flags
+    and shas the verdict lines carried."""
+    cells, values, compares, slots, builds, shas = {}, {}, {}, {}, set(), set()
     for line in stdout.splitlines():
         m = VERDICT.match(line)
         if m:
-            arm, d, _p, _sha, build_flag, rest = m.groups()
+            arm, d, _p, sha, build_flag, rest = m.groups()
             builds.add(build_flag)
+            shas.add(sha)
             rest = rest.split(" [run is NOT A RESULT", 1)[0]
             if rest == "MATCH":
                 v = MATCH
@@ -317,6 +356,11 @@ def parse(stdout):
                 v = ("?", frozenset([rest]))
             cells[(arm, int(d))] = v
             continue
+        m = MEASURED.match(line)
+        if m:
+            kv = dict(tok.split("=", 1) for tok in m.group(3).split())
+            values[(m.group(1), int(m.group(2)))] = {k: int(v) for k, v in kv.items()}
+            continue
         m = COMPARE.match(line)
         if m:
             d, rest = int(m.group(1)), m.group(2)
@@ -331,7 +375,7 @@ def parse(stdout):
         m = SLOTS.match(line)
         if m:
             slots[(m.group(1), int(m.group(2)))] = int(m.group(3))
-    return cells, compares, slots, builds
+    return cells, values, compares, slots, builds, shas
 
 
 def show(v):
@@ -362,22 +406,46 @@ def compare_lines(compares, expect):
     return diffs
 
 
+def compare_values(values, registered):
+    diffs = []
+    for cell, want in sorted(registered.items()):
+        got = values.get(cell, {})
+        for key, v in sorted(want.items()):
+            if got.get(key) != v:
+                diffs.append(f"arm={cell[0]} D={cell[1]} {key}: got {got.get(key)}, registered {v}")
+    return diffs
+
+
 def slot_diffs(slots, expect):
     return [f"slots arm={a} D={d}: got {slots.get((a, d))}, registered {expect(a, d)}"
             for a in ARMS for d in DEPTHS if slots.get((a, d)) != expect(a, d)]
 
 
-# The one file this script has mutated and not yet restored, or None. `restore` touches ONLY that
-# file, and only while it is set, so no path through this script can check out anything else.
+def stable_lines(stdout):
+    """The lines two runs of the same tree must print identically: no wall clock in any of them."""
+    return [l for l in stdout.splitlines() if l.startswith(("measured ", "slots ", "verdict "))]
+
+
+# The file this script has mutated and not yet restored, and the exact text it read from that file.
+# `restore` writes back ONLY that text, to ONLY that file, and only while it is set.
 APPLIED = None
+APPLIED_TEXT = None
 
 
 def restore():
-    global APPLIED
+    global APPLIED, APPLIED_TEXT
     if APPLIED is None:
         return
-    subprocess.run(["git", "checkout", "--", APPLIED], check=True)
-    APPLIED = None
+    # Ignore a second SIGTERM/SIGHUP while writing back: an unwind here is the one that strands the
+    # mutant. No git: `git checkout --` needs the index lock, which a killed build can leave stale.
+    old_term = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    old_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        pathlib.Path(APPLIED).write_text(APPLIED_TEXT)
+        APPLIED, APPLIED_TEXT = None, None
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
 
 
 def at_head(path):
@@ -385,36 +453,33 @@ def at_head(path):
 
 
 def tree_dirty():
-    return git("status", "--porcelain", "--untracked-files=no", "--", "src/", "examples/")
+    # Every tracked file, because `build.rs` stamps DIRTY for any of them, not only src/ and
+    # examples/. Untracked files (this run's own output) do not count, and do not count there either.
+    return git("status", "--porcelain", "--untracked-files=no")
 
 
-def baseline(outdir, label):
-    rc, out = build()
+def baseline(outdir, label, expect_slots, head):
+    rc, out = build(outdir, label)
     if rc != 0:
         print(f"{label}: BUILD FAILED on the clean tree\n{out[-3000:]}", flush=True)
-        return False
+        return False, []
     rc, stdout = run(outdir, label, ARGS)
-    cells, compares, slots, builds = parse(stdout)
+    cells, _values, compares, slots, builds, shas = parse(stdout)
     diffs = compare_cells(cells, lambda a, d: MATCH) + compare_lines(compares, cmp_eq)
+    diffs += slot_diffs(slots, expect_slots)
     if rc != 0:
         diffs.append(f"rc={rc}, registered 0")
     if builds != {"clean"}:
         diffs.append(f"build flags {sorted(builds)}, registered ['clean']")
-    main_diffs, d200_diffs = slot_diffs(slots, slots_main_lineage), slot_diffs(slots, slots_d200)
-    if not main_diffs:
-        tree = "main lineage (D200 absent)"
-    elif not d200_diffs:
-        tree = "D200 present"
-    else:
-        tree = "NEITHER registered state"
-        diffs += main_diffs
-    print(f"{label}: rc={rc} slots={tree} "
+    if shas != {head}:
+        diffs.append(f"sha {sorted(shas)}, pinned {head}")
+    print(f"{label}: rc={rc} "
           f"{'ALL AS REGISTERED' if not diffs else 'FAILED: ' + '; '.join(diffs[:8])}", flush=True)
-    return not diffs
+    return not diffs, stable_lines(stdout)
 
 
 def main():
-    global APPLIED
+    global APPLIED, APPLIED_TEXT
     top = git("rev-parse", "--show-toplevel")
     here = pathlib.Path.cwd().resolve()
     if here != pathlib.Path(top).resolve() or not pathlib.Path("build.rs").is_file():
@@ -422,17 +487,27 @@ def main():
         return 2
     dirty = tree_dirty()
     if dirty:
-        print(f"REFUSED: src/ or examples/ has uncommitted changes; restoring from git would destroy "
-              f"them:\n{dirty}")
+        print(f"REFUSED: tracked files are modified; the build would stamp DIRTY and a restore could "
+              f"destroy them:\n{dirty}")
         return 2
+    head_full = git("rev-parse", "HEAD")
     head = git("rev-parse", "--short=12", "HEAD")
+    d200 = subprocess.run(["git", "grep", "-q", "-F", D200_MARKER, "HEAD", "--", "src/"]).returncode == 0
+    expect_slots = slots_d200 if d200 else slots_main_lineage
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = pathlib.Path("bench/d16_chain/firecheck") / f"{head}-{stamp}"
     outdir.mkdir(parents=True, exist_ok=False)
-    print(f"D16 chain fire-check at {head}; harness args {' '.join(ARGS)}; raw output in {outdir}",
+    (outdir / "ENV.txt").write_text(
+        f"head={head_full}\nd200_marker_in_src={d200}\n"
+        f"RUSTFLAGS={os.environ.get('RUSTFLAGS', '<unset>')}\n"
+        f"CARGO_TARGET_DIR={os.environ.get('CARGO_TARGET_DIR', '<unset>')}\n"
+        f"harness D16_PERSIST=1 (pinned)\nargs={' '.join(ARGS)}\n")
+    print(f"D16 chain fire-check at {head}; slot state expected: "
+          f"{'D200 present' if d200 else 'main lineage (D200 absent)'}; raw output in {outdir}",
           flush=True)
 
-    if not baseline(outdir, "M0-baseline"):
+    ok, first = baseline(outdir, "M0-baseline", expect_slots, head)
+    if not ok:
         print("STOP: the unmutated build must be as registered before any mutant can mean anything.")
         return 2
 
@@ -443,11 +518,11 @@ def main():
           flush=True)
 
     failures = [] if a0 else ["A0-bad-argument"]
-    for label, path, old, new, expect, expect_cmp, expect_slots in MUTANTS:
+    for label, path, old, new, expect, expect_cmp, mutant_slots in MUTANTS:
         dirty = tree_dirty()
-        if dirty or not at_head(path):
-            print(f"{label}: REFUSED, the tree changed underneath this run:\n{dirty or path}",
-                  flush=True)
+        if dirty or git("rev-parse", "HEAD") != head_full or not at_head(path):
+            print(f"{label}: REFUSED, the tree or HEAD changed underneath this run:\n"
+                  f"{dirty or git('rev-parse', 'HEAD') + ' / ' + path}", flush=True)
             return 2
         p = pathlib.Path(path)
         original = p.read_text()
@@ -457,9 +532,9 @@ def main():
                   f"re-register this mutant.", flush=True)
             return 2
         try:
-            APPLIED = path
+            APPLIED, APPLIED_TEXT = path, original
             p.write_text(original.replace(old, new))
-            rc, out = build()
+            rc, out = build(outdir, label)
             if rc != 0:
                 print(f"{label}: BUILD FAILED, so the mutant never ran\n{out[-2000:]}", flush=True)
                 failures.append(label)
@@ -470,16 +545,20 @@ def main():
             if not at_head(path):
                 print(f"{label}: RESTORE FAILED, {path} does not match HEAD. Stopping.", flush=True)
                 return 2
-        cells, compares, slots, builds = parse(stdout)
+        cells, values, compares, slots, builds, shas = parse(stdout)
         diffs = compare_cells(cells, expect) + compare_lines(compares, expect_cmp)
+        diffs += compare_values(values, VALUES.get(label, {}))
         # G0 fire-check: a mutant binary is built from a dirty tree, so every line must say so and
-        # the run must exit 2 whatever its cells said.
+        # the run must exit 2 whatever its cells said. It proves the tree was dirty, not which
+        # mutant it was (A3.1); the registered pattern and values above identify the mutant.
         if builds != {"DIRTY"}:
             diffs.append(f"build flags {sorted(builds)}, registered ['DIRTY']")
+        if shas != {head}:
+            diffs.append(f"sha {sorted(shas)}, pinned {head}")
         if rc != 2:
             diffs.append(f"rc={rc}, registered 2 (G0)")
-        if expect_slots is not None:
-            diffs += slot_diffs(slots, expect_slots)
+        if mutant_slots is not None:
+            diffs += slot_diffs(slots, mutant_slots)
         if diffs:
             failures.append(label)
             print(f"{label}: rc={rc} DIFFERED from its registration:", flush=True)
@@ -487,18 +566,25 @@ def main():
                 print(f"    {d}", flush=True)
         else:
             print(f"{label}: rc={rc} FIRED AS REGISTERED ({len(cells)} cells, "
-                  f"{len(compares)} compare lines)", flush=True)
+                  f"{len(compares)} compare lines, {len(VALUES.get(label, {}))} valued cells)",
+                  flush=True)
 
-    # The restored tree must measure exactly as the first baseline did, and stamp clean again.
-    if not baseline(outdir, "M0-baseline-after"):
+    # The restored tree must measure exactly as the first baseline did, not merely pass on its own.
+    ok, last = baseline(outdir, "M0-baseline-after", expect_slots, head)
+    if not ok:
         failures.append("M0-baseline-after")
+    elif last != first:
+        failures.append("M0-baseline-after")
+        changed = sorted(set(first) ^ set(last))
+        print(f"M0-baseline-after: its measured/slots/verdict lines differ from the first "
+              f"baseline's:\n    " + "\n    ".join(changed[:8]), flush=True)
 
     print()
     if failures:
         print(f"RESULT: {len(failures)} did not behave as registered: {', '.join(failures)}")
         return 1
-    print(f"RESULT: both baselines as registered, A0 refuses, and all {len(MUTANTS)} mutants fired "
-          f"as registered")
+    print(f"RESULT: both baselines as registered and identical, A0 refuses, and all {len(MUTANTS)} "
+          f"mutants fired as registered")
     return 0
 
 
@@ -506,7 +592,12 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     try:
-        sys.exit(main())
-    finally:
-        # A no-op unless a signal or an exception landed between applying a mutant and restoring it.
+        code = main()
+    except Terminated as e:
         restore()
+        print(f"INTERRUPTED by {e}; any applied mutant was restored. Exit 3.")
+        code = 3
+    finally:
+        # A no-op unless an exception other than a signal landed while a mutant was applied.
+        restore()
+    sys.exit(code)
