@@ -196,16 +196,23 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             session.current = Some(txn.begin()?);
             Ok(Outcome::Ok)
         }
-        Stmt::Commit => match session.current.take() {
+        // **D211: the session lets go of its transaction only once the transaction has ended.** Both
+        // arms used `session.current.take()` BEFORE acting. A COMMIT refused because the
+        // transaction's rollback had begun (`TxnManager::commit`), or a ROLLBACK whose undo had no
+        // room, then left the transaction open in the ATT and forgotten by the only session that could
+        // finish it: its rows held, every checkpoint refused, and no ROLLBACK able to reach it.
+        Stmt::Commit => match session.current {
             Some(id) => {
                 txn.commit(id)?;
+                session.current = None;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
         }
-        Stmt::Rollback => match session.current.take() {
+        Stmt::Rollback => match session.current {
             Some(id) => {
                 txn.abort(id)?;
+                session.current = None;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
@@ -446,6 +453,9 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 };
                 let view = match txn.snapshot_of(txn_id) {
                     Ok(snapshot) => Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id }),
+                    // D211: refused because this transaction's rollback has not finished. Only an
+                    // explicit ROLLBACK retries it, so a refused statement must not start one.
+                    Err(e) if txn.is_aborting(txn_id) => return Err(e),
                     Err(e) => return Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                 };
                 let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id)), view) {
@@ -487,12 +497,19 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
 /// - **the abort ended the transaction** (always, unless its heap undo failed; an index-undo
 ///   failure is counted in `wal::txn::INDEX_UNDO_FAILURES`, not returned): the session lets go
 ///   of it, and the statement's own error is returned UNCHANGED, variant included;
-/// - **the heap undo failed, so the transaction is still open** (`TxnManager::abort`'s C2 note):
-///   the session KEEPS the id, so `ROLLBACK` can resume the undo from its CLRs. Dropping it would
-///   orphan an `Aborting` transaction, which blocks every checkpoint for the life of the process.
-///   The statement's message comes first in the returned error, which also says the rollback did
-///   not finish. Returning the statement's error alone would let the user carry on inside a
-///   transaction they believe was rolled back.
+/// - **the heap undo failed, so the transaction is still open**: the session KEEPS the id, so
+///   `ROLLBACK` can retry the undo. Dropping it would orphan an `Aborting` transaction, which blocks
+///   every checkpoint for the life of the process. The statement's message comes first in the
+///   returned error, which also says the rollback did not finish. Returning the statement's error
+///   alone would let the user carry on inside a transaction they believe was rolled back.
+///
+///   ⛔ **Corrected (D211, re-adversary `fffdc62`).** This said `ROLLBACK` "can resume the undo from
+///   its CLRs", which was false until `TxnManager::undo_then_log`: the failed undo's CLR was already
+///   logged, so a resumed abort skipped it. It also said nothing stopped the user carrying on;
+///   nothing did, because `Aborting` was never read. Since D211, a retry reaches the failed record
+///   itself, and the transaction is refused every statement but ROLLBACK
+///   (`tests/abort_that_cannot_finish.rs`). An undo that never finds room still never finishes;
+///   see `TxnManager::abort`.
 fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
     match txn.abort(txn_id) {
         Ok(()) => {
