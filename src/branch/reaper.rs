@@ -3567,6 +3567,53 @@ mod tests {
         );
     }
 
+    /// **D232, review 2 F3, the absent half: a drain never touches a page whose extent is gone.**
+    /// An entry can outlive its extent: a drain that a catalog read error refused leaves it
+    /// parked, and a later fast-path reap of its branch frees the extent whole. That free already
+    /// evicted the range from the pool, and the page went back with the extent. Releasing the
+    /// entry evicted the id a second time, and once the range had been handed to another extent
+    /// that was the new tenant's page: its unflushed write went with the frame.
+    #[test]
+    fn d232_a_drain_leaves_alone_a_page_whose_extent_is_gone() {
+        use crate::branch::record::PendingFree;
+        let (h, reaper) = setup();
+        let x =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let stale = write_pages(&h, x, 1)[0];
+        let xa = h.catalog.get(x).unwrap().arenas[0];
+        h.store.free_arena(xa).unwrap();
+        let z =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let reissued = write_pages(&h, z, 1)[0];
+        assert_eq!(reissued, stale, "fixture: the freed range was not handed to Z");
+        {
+            let handle = h.store.read_page(reissued).unwrap();
+            let mut frame = handle.write();
+            frame.data[PAGE_HEADER_SIZE] = 0xAB;
+            stamp_checksum(&mut frame.data);
+        }
+
+        h.store
+            .put_pending(vec![PendingFree {
+                page_id: stale,
+                arena_id: xa,
+                birth_epoch: Epoch(0),
+                free_epoch: h.catalog.next_epoch(),
+                owner: x,
+            }])
+            .unwrap();
+        reaper.drain_pending().unwrap();
+
+        let byte = h.store.read_page(reissued).unwrap().read().data[PAGE_HEADER_SIZE];
+        assert_eq!(
+            byte, 0xAB,
+            "D232 review 2 F3: a drain released a page of freed arena {xa}, which evicted Z's \
+             page {reissued} and dropped its unflushed write"
+        );
+        assert_eq!(reaper.foreign_arenas_skipped(), 1, "the dropped entry was not counted");
+        assert_eq!(h.store.pending_len(), 0, "the entry is still parked");
+    }
+
             }
         };
     }
