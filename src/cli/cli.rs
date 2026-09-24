@@ -4,7 +4,7 @@ use crate::execution::executor::run;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
-use crate::wal::recovery::{open_recovered, OpenedDatabase};
+use crate::wal::recovery::{open_recovered, OpenedDatabase, ProvenanceBacking};
 use crate::wal::txn::TxnManager;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome};
 use crate::agent_sql::runtime::AgentRuntime;
@@ -109,11 +109,12 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // the contract `with_reaper` states and cannot check, so it is satisfied here by construction.
     let reaper = Arc::new(TwoTierReaper::new(branches.clone(), store.clone()));
 
-    // Provenance on disk, not in this process. Without this the runtime interns runs into a
-    // `MemProvenanceStore`, so `who_wrote_row` and `ferro_row_authors` answer correctly for as long
-    // as the CLI is open and answer nothing after a restart — the rows keep their author stamp, and
-    // the table mapping a slot to an agent is gone. Applied here because this is the layer that owns
-    // the database's name; the constructors take page stores and have no path to open.
+    // Provenance on disk, not in this process: `ProvenanceBacking::Durable` at the door below.
+    // Without it the runtime interns runs into a `MemProvenanceStore`, so `who_wrote_row` and
+    // `ferro_row_authors` answer correctly for as long as the CLI is open and answer nothing after a
+    // restart — the rows keep their author stamp, and the table mapping a slot to an agent is gone.
+    // The door installs the database's provenance file, which `open_recovered` has already made
+    // forget every dropped table (D250 review 3's A), so this process opens the file once.
     // The effect log on disk, for the same reason the provenance store below is, and it is the
     // sharper of the two. Merges are computed FROM these frames, so a runtime handed
     // `MemEffectLog::new()` begins every process with none of the effects its branches were
@@ -126,10 +127,10 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // should make no decision. Built once and shared by both arms, which open the same file.
     let effects = DurableEffectLog::default_for_database(db_path)?;
 
-    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
-    // table whose DROP the open completed, as the executor's DROP does (B9), or a table re-created
-    // under the name would inherit its authorship. `tests/open_path_allowlist.rs` holds both entry
-    // points to it.
+    // Through the opened database's one door (D250 review 1's F7, review 3's A), with the durable
+    // provenance store: a table whose DROP the log records keeps none of its authors, as after the
+    // executor's DROP (B9), or a table re-created under the name would inherit them.
+    // `tests/open_path_allowlist.rs` holds both entry points to the door and to their backing.
     let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
@@ -144,12 +145,12 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
                 store.clone() as Arc<dyn PageStore>,
             )?
         }
-        .with_durable_provenance(format!("{db_path}.provenance"))?
         // Retiring a branch now reclaims it. Without this, `seal` took its no-reaper path: a
         // merged or abandoned branch was marked `Reaped` and its extents were never freed, so
         // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
-    );
+        ProvenanceBacking::Durable,
+    )?;
     let OpenedDatabase { bp, txn, catalog, .. } = opened;
     let mut session = Session::with_runtime(runtime.clone());
 

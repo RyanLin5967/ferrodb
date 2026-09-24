@@ -18,7 +18,7 @@ use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase, ProvenanceBacking};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -93,9 +93,9 @@ fn main() {
         store.clone(),
     ));
 
-    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
-    // table whose DROP the open completed, as the executor's DROP does (B9). `tests/open_path_allowlist.rs`
-    // holds both entry points to it.
+    // Through the opened database's one door (D250 review 1's F7, review 3's A), with an in-memory
+    // provenance store. `tests/open_path_allowlist.rs` holds both entry points to the door and to
+    // their backing.
     let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
@@ -116,7 +116,11 @@ fn main() {
         // merged or abandoned branch is marked `Reaped` and its extents are never freed, so every
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
-    );
+        // In memory, as before: its forget is a stated no-op. A provenance file the CLI left for this
+        // database is still forgotten in, by `open_recovered` itself (D250 review 3's A).
+        ProvenanceBacking::InMemory,
+    )
+    .unwrap_or_else(|e| panic!("pgserver: {e}"));
 
     let OpenedDatabase { bp, txn, catalog, .. } = opened;
 

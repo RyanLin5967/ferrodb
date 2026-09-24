@@ -237,6 +237,16 @@ fn a_drop_completed_at_an_open_that_never_attached_a_runtime_still_forgets_the_t
         "premise failed: the merged row was not attributed, so nothing below could show its authors \
          surviving the DROP:\n{agent}"
     );
+    // Lane §3.15 (D250 review 3's C): the authors survive a restart in THIS test, so their absence at
+    // the end is the forget and not durable provenance having broken.
+    let restarted = ferrodb(&db, "SELECT * FROM ferro_row_authors;\n");
+    assert_no_errors(&restarted, "the read after a restart");
+    assert_eq!(
+        attributed_lines(&restarted, "restock-agent").len(),
+        1,
+        "premise failed: the agent's authorship did not survive a restart, so its absence below would prove \
+         nothing:\n{restarted}"
+    );
 
     // A DROP whose record is durable and whose mutation failed, then the crash.
     {
