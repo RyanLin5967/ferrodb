@@ -604,6 +604,49 @@ mod tests {
         }
     }
 
+    /// Every listing `hfm`'s page directory holds for `page_id`, in chain order.
+    fn every_listing(hfm: &HeapFileManager, page_id: u32) -> Vec<u16> {
+        let mut out = Vec::new();
+        let mut dir_page = hfm.first_directory_page_id;
+        while dir_page != 0 {
+            let frame_i = hfm.buffer_pool_manager.fetch_page(dir_page).unwrap();
+            let data = hfm.buffer_pool_manager.frames[frame_i].read().unwrap().data;
+            hfm.buffer_pool_manager.unpin_page(dir_page, false);
+            let dir = PageDirectory::deserialize(data);
+            out.extend(dir.entries.iter().filter(|e| e.page_id == page_id).map(|e| e.free_space));
+            dir_page = dir.next_page_directory;
+        }
+        out
+    }
+
+    /// **D261 review 1's F2 (lane §4 T4): a page listed twice does not spin the search.** The search
+    /// returns the FIRST listing with room, and a correction that rewrote only the first listing of
+    /// the page left a later, overstated one to be returned again, for ever, under the catalog mutex.
+    /// No route to a duplicate listing is known; the premise was simply unchecked. At `2cc3770` the
+    /// insert below never returned, so it runs on its own thread with a deadline.
+    #[test]
+    fn a_page_listed_twice_does_not_spin_the_search() {
+        let (hfm, _dir) = setup();
+        let p1 = hfm.insert(Tuple::new(vec![1; 2000])).unwrap();
+        let p2 = hfm.insert(Tuple::new(vec![2; 2065])).unwrap();
+        assert_eq!(p1.page_id, p2.page_id, "premise failed: the two tuples do not share page P");
+        let full = p1.page_id;
+        // A second listing of the full page, after its true one, claiming it is empty.
+        hfm.add_to_directory(full, (PAGE_SIZE - HEADER_SIZE) as u16).unwrap();
+        assert_eq!(every_listing(&hfm, full), vec![0, (PAGE_SIZE - HEADER_SIZE) as u16], "premise failed: the page is not listed twice");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let placed = hfm.insert(Tuple::new(vec![3; 100])).map(|rid| rid.page_id);
+            let _ = tx.send((placed, every_listing(&hfm, full)));
+        });
+        let (placed, listings) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
+            panic!("an insert did not finish within 10 s: the search for a page with room spins on a page listed twice")
+        });
+        let placed = placed.unwrap_or_else(|e| panic!("the insert failed: {e}"));
+        assert_ne!(placed, full, "the row landed on the full page");
+        assert!(listings.iter().all(|&free| free == 0), "a listing of the full page still overstates it: {listings:?}");
+    }
+
     /// **D261 (lane `lane_d261_relocation_space.md` §2 T1): an unlogged relocation to a page the
     /// directory overstates keeps its row.** The relocation deletes the row from its page BEFORE it
     /// inserts it at the destination, and the destination came from the directory's figure. At
