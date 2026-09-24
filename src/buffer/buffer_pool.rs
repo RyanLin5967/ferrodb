@@ -1284,7 +1284,16 @@ impl BufferPoolManager {
         true
     }
 
-    // allocate new page on disk using disk manager, load into a frame, return page id
+    /// Allocate a page on disk, zero it, load it into a frame, and return its id **UNPINNED**.
+    ///
+    /// **The caller holds no pin on what this returns, so it must not unpin it (D260).**
+    /// `HeapFileManager::new`, `add_empty_page` and `TableBranchCatalog::create_with_header` each
+    /// did, from when this returned the page pinned (before `575147f`). The pin count stops at zero,
+    /// so alone that did nothing; but anyone else holding the page at that moment lost their pin,
+    /// and a page with no pin can be evicted or freed under the holder still reading it. To keep the
+    /// page, take a pin with [`Self::pin`], which gives it back on drop.
+    /// `tests/d260_new_page_is_returned_unpinned.rs` pins both halves: this call takes back its own
+    /// pin and nobody else's, and none of the three callers takes another.
     pub fn new_page(&self) -> Result<u32, FerroError>{
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.

@@ -108,8 +108,8 @@ impl TableBranchCatalog {
         pool: Arc<BufferPoolManager>,
         trunk_root: PageId,
     ) -> Result<(Self, u32), FerroError> {
+        // `new_page` returns the page unpinned: there is no pin here to give back (D260).
         let header_page = pool.new_page()?;
-        pool.unpin_page(header_page, false);
         let cat = Self::create(pool, trunk_root)?;
         cat.header_page.store(header_page, Ordering::SeqCst);
         cat.publish_root()?;

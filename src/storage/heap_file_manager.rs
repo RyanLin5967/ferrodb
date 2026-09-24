@@ -28,8 +28,8 @@ pub struct HeapFileManager {
 impl HeapFileManager {
     
     pub fn new(buffer_pool_manager: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
+        // `new_page` returns the page unpinned: there is no pin here to give back (D260).
         let dir_page_id = buffer_pool_manager.new_page()?;
-        buffer_pool_manager.unpin_page(dir_page_id, false);
         let frame_i = buffer_pool_manager.fetch_page(dir_page_id)?;
         let mut frame = buffer_pool_manager.frame_write(frame_i);
         let empty_dir = PageDirectory::new(dir_page_id);
@@ -123,8 +123,8 @@ impl HeapFileManager {
     /// `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`, a 200-row
     /// ALTER needing eleven pages, for eighteen minutes with no output.
     fn add_empty_page(&self) -> Result<u32, FerroError> {
+        // `new_page` returns the page unpinned: there is no pin here to give back (D260).
         let new_page_id = self.buffer_pool_manager.new_page()?;
-        self.buffer_pool_manager.unpin_page(new_page_id, false);
         let pin = self.buffer_pool_manager.pin(new_page_id)?;
         let mut frame = pin.write();
         let empty_page = Page::empty(new_page_id);
