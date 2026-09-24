@@ -559,13 +559,17 @@ fn high_water_across_a_drop(kind: Kind, index_first: bool) -> (u32, u32) {
 ///
 /// Each kind's control is the same table and the same rows with the index created FIRST, so no
 /// backfill happens and the recorded root is kept current by the INSERT path. It must not move at
-/// the base or with the fix; if it does, something other than D222 is leaking and no arm here can
-/// be read.
+/// the base or with the fix; if it does, something other than D222 is leaking in that kind, and
+/// that kind's backfill arm says nothing. Each arm has its own database, so one kind's leak cannot
+/// move the other's marks.
 ///
-/// **All four arms are measured before anything is asserted**, and both backfill arms are judged by
-/// ONE assertion that prints every mark. Asserting kind by kind stopped at the first failure, so at
-/// `9aa6968` the B-tree leak ended the test and the full-text arms never ran: the full-text half of
-/// the claim had no red behind it (found by a fresh-context review of `2ffdb68`).
+/// **All four arms are measured before any mark is judged**, and both backfill arms are judged by
+/// ONE assertion that prints every mark. (A premise or a failed statement inside an arm still ends
+/// the test where it happens.) Judged kind by kind, the B-tree leak would end the test at
+/// `9aa6968` before the full-text arms ran — by reading, not run — so the full-text half of the
+/// claim would have no red behind it (found by a fresh-context review of `2ffdb68`). At the base
+/// the full-text evidence is the `FullText, built by the backfill` line of the message, not the
+/// failure itself, which either kind's leak produces.
 #[test]
 fn drop_table_returns_every_page_of_an_index_built_by_backfill() {
     let mut arms = Vec::new();
@@ -591,7 +595,7 @@ fn drop_table_returns_every_page_of_an_index_built_by_backfill() {
                 after, peak,
                 "{kind:?} control: with the index created BEFORE the rows, rebuilding an identical \
                  table after a DROP moved the allocator's high-water mark. Something other than the \
-                 backfill's root read is leaking, so no arm here can be read.{seen}"
+                 backfill's root read is leaking, so this kind's backfill arm says nothing.{seen}"
             );
         }
     }
