@@ -1059,6 +1059,16 @@ use super::*;
     /// Write `t`'s primary root to disk through `flush_page` (the same write-back, `wal_gate` then
     /// `DiskManager::write`, that an eviction does) and check that the page on disk carries `key`.
     /// `t` is small enough that its primary tree is one leaf, and the check says so.
+    /// Whether `page` is dirty in `o`'s pool, read without changing it: pin, read the flag, unpin
+    /// without marking. The premise of the D216 gate controls (lane PREREG (H)): a clean page is
+    /// never handed to `wal_gate`, so a control over one passes whatever the gate does.
+    fn d216_page_is_dirty(o: &OpenedDatabase, page: u32) -> bool {
+        let frame_i = o.bp.fetch_page(page).unwrap();
+        let dirty = o.bp.frames[frame_i].read().unwrap().dirty_flag.load(Ordering::SeqCst);
+        o.bp.unpin_page(page, false);
+        dirty
+    }
+
     fn d216_flush_primary_root_holding(o: &OpenedDatabase, key: i32) {
         use crate::storage::index_page::{BPlusTreeLeafPage, BPLUS_LEAF_TYPE};
         let root = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell").load(Ordering::SeqCst);
@@ -1454,6 +1464,7 @@ use super::*;
             flushed < o.wal.next_lsn.load(Ordering::SeqCst),
             "premise failed: nothing is waiting in the log buffer, so a flush it did not need could not be seen"
         );
+        assert!(d216_page_is_dirty(&o, rid.page_id), "premise failed: the page is clean, so the gate was never asked");
         o.bp.flush_page(rid.page_id).unwrap();
         assert_eq!(
             o.wal.flushed_lsn.load(Ordering::SeqCst),
@@ -1493,6 +1504,8 @@ use super::*;
             flushed < o.wal.next_lsn.load(Ordering::SeqCst),
             "premise failed: nothing is waiting in the log buffer, so a flush it did not need could not be seen"
         );
+        let root = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell").load(Ordering::SeqCst);
+        assert!(d216_page_is_dirty(&o, root), "premise failed: the page is clean, so the gate was never asked");
         d216_flush_primary_root_holding(&o, 3);
         assert_eq!(
             o.wal.flushed_lsn.load(Ordering::SeqCst),
