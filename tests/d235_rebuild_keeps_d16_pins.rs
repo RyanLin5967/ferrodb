@@ -244,8 +244,12 @@ fn a_table_catalog_reopen_keeps_the_pin_of_a_reaped_interior() {
 /// **D235 review F3: a rebuild must not pin a recycled parent slot's new occupant.**
 ///
 /// The running D16 reaper cannot build this shape: `release_id` refuses a slot with live children.
-/// A PRE-D16 reaper could, because it detached unconditionally. So can the reaper-less `seal`
-/// fallback in `runtime.rs` (SCALE-LEDGER D201), which detaches without asking about live children.
+/// A PRE-D16 reaper could, because it detached unconditionally and a pre-D235 rebuild then freed
+/// P's slot. The reaper-less `seal` fallback in `runtime.rs` (SCALE-LEDGER D201) supplies only the
+/// unconditional DETACH: it never calls `release_id`, whose only non-test callers are `reap` and
+/// `migrate_from`. Recycling P's slot additionally needs a pre-D235 rebuild or a reaper releasing
+/// P. At the tip, a reopen after a fallback detach re-pins X under P rather than freeing P, because
+/// `mark_reaped` leaves P's `branch_id` matching the handle X recorded. (D235 review 3, W1.)
 /// The shape: P -> X -> C, with X reaped and DETACHED from P although C lives. P, now childless, is
 /// reaped and its slot released and recycled into N, a child of Q, and N is reaped too. X still
 /// names P's OLD incarnation as its parent.

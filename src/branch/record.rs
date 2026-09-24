@@ -1316,7 +1316,10 @@ pub fn reclaimable(live_children: &[Epoch], birth: Epoch, freed: Epoch) -> bool 
 /// same way.
 ///
 /// The running reaper cannot build this shape: `release_id` refuses a slot with live children. A
-/// pre-D16 legacy log migrated by `default_for_database`, or D201's seal fallback, can.
+/// pre-D16 legacy log can, once a pre-D235 rebuild has freed the parent's slot. The reaper-less
+/// `seal` fallback (SCALE-LEDGER D201) supplies only the unconditional detach, and never releases a
+/// slot. At the tip, a reopen after such a detach re-pins rather than frees: `mark_reaped` leaves
+/// the parent's `branch_id` matching the handle the child recorded. (D235 review 3, W1.)
 pub(crate) fn parent_entry_holders(
     nodes: &HashMap<u64, (BranchId, Option<BranchId>, BranchState)>,
 ) -> HashSet<u64> {
