@@ -2642,7 +2642,7 @@ impl PageStore for ArenaPageStore {
             st.extents.remove(&arena);
             st.live_order.remove(&arena);
             st.recycled.remove(&arena);
-            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
+            // MUTANT (fire-check only, never land): the failed claim's pages stay counted.
             return Err(e);
         }
 
