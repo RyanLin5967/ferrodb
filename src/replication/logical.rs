@@ -1705,4 +1705,151 @@ mod tests {
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.events[0].op.name(), "ADD_COLUMN");
     }
+
+    // ---- D203: a relocating UPDATE's two records are one UPDATE ------------------------------------
+    //
+    // `HeapFileManager::update`'s relocation arm logs a `HeapDelete` of the live row and then, as the
+    // transaction's next record, a `HeapInsert` of the new row on another page. These build that
+    // shape by hand and every shape that must NOT be read as it. Pre-registered, with the mutant that
+    // kills each one, in `bench/d203_cdc_relocating_update/prereg.md`.
+
+    fn heap_delete(w: &WalManager, txn: u64, dir_root: u32, old: Vec<u8>) {
+        w.append(txn, 0, &RecKind::HeapDelete { dir_root, page_id: 1, slot: 0, old }).unwrap();
+    }
+
+    fn heap_insert(w: &WalManager, txn: u64, dir_root: u32, tuple: Vec<u8>) {
+        w.append(txn, 0, &RecKind::HeapInsert { dir_root, page_id: 2, slot: 0, tuple }).unwrap();
+    }
+
+    fn row(id: i32, qty: i32) -> Vec<Value> {
+        vec![Value::Integer(id), Value::Integer(qty)]
+    }
+
+    fn names(out: &Decoded) -> Vec<&'static str> {
+        out.events.iter().map(|e| e.op.name()).collect()
+    }
+
+    /// U1. The relocation arm's own shape: one UPDATE, carrying the row before and after.
+    #[test]
+    fn a_live_heap_delete_then_the_same_row_inserted_decodes_as_one_update() {
+        let (_d, w) = wal("relocated");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"], "a relocated row reached the feed as {:?}", names(&out));
+        assert_eq!(out.events[0].op, ChangeOp::Update { old: row(5, 50), new: row(5, 55) });
+    }
+
+    /// U2. An insert of ANOTHER key is not the relocated row. No production writer logs this after a
+    /// live `HeapDelete`; the rule must not assume that, and it does not.
+    #[test]
+    fn a_live_heap_delete_then_another_key_inserted_is_not_paired() {
+        let (_d, w) = wal("other_key");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(6, Some(60)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"]);
+    }
+
+    /// U3. An insert into ANOTHER table is not the relocated row either, even with the same key.
+    #[test]
+    fn a_live_heap_delete_then_an_insert_into_another_table_is_not_paired() {
+        let mut d = decoder();
+        d.tables.insert(
+            11u32,
+            ("other".to_string(), schema(), Arc::new(vec!["id".to_string(), "qty".to_string()])),
+        );
+        let (_d, w) = wal("other_table");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 11, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&d, &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"]);
+        assert_eq!(out.events[1].table, "other");
+    }
+
+    /// U4. The pair is the transaction's NEXT record, so a change between the halves breaks it.
+    #[test]
+    fn a_record_between_the_halves_breaks_the_pair() {
+        let (_d, w) = wal("between");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 1,
+                old: tuple_bytes(6, Some(60)),
+                new: tuple_bytes(6, Some(61)),
+            },
+        )
+        .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["DELETE", "UPDATE", "INSERT"]);
+    }
+
+    /// U5. A `HeapDelete` of a DEAD image is never the first half of an UPDATE. Asserted as "no UPDATE,
+    /// and the insert is an INSERT of the new row" so that it holds both before and after
+    /// `delete-insert-lookup`, which turns a dead-image `HeapDelete` into bookkeeping.
+    #[test]
+    fn a_heap_delete_of_a_dead_image_is_never_paired() {
+        let (_d, w) = wal("dead");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, dead_tuple_bytes(5, 50));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert!(!names(&out).contains(&"UPDATE"), "a dead version was paired: {:?}", names(&out));
+        assert_eq!(out.events.last().map(|e| e.op.clone()), Some(ChangeOp::Insert { new: row(5, 55) }));
+    }
+
+    /// U6. Time-travel records are MVCC bookkeeping and not changes, so one between the halves does
+    /// not break the pair (the relocation arm writes none there today; the rule does not depend on it).
+    #[test]
+    fn a_time_travel_record_between_the_halves_does_not_break_the_pair() {
+        let (_d, w) = wal("tt_between");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 8, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"]);
+        assert_eq!(out.internal, 1);
+    }
+
+    /// U7. Other transactions' records interleave in the physical log; pairing is per transaction.
+    #[test]
+    fn pairing_is_per_transaction_across_interleaved_records() {
+        let (_d, w) = wal("interleaved");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 2, 7, tuple_bytes(7, Some(70)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        let by_txn = |t: u64| -> Vec<ChangeOp> {
+            out.events.iter().filter(|e| e.txn_id == t).map(|e| e.op.clone()).collect()
+        };
+        assert_eq!(by_txn(2), vec![ChangeOp::Insert { new: row(7, 70) }]);
+        assert_eq!(by_txn(1), vec![ChangeOp::Update { old: row(5, 50), new: row(5, 55) }]);
+    }
 }
