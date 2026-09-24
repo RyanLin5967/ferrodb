@@ -10373,4 +10373,65 @@ mod tests {
             );
         }
     }
+
+    // ---- Amendment 14: E, review 6's FIFO turnover ---------------------------------------------
+
+    /// Review 6's fixture: `cold` rows whose old versions P0, P1 and P2 all read, and `hot` rows
+    /// whose old versions only P0 reads. Returns the state and the three pins (as branches 1–3).
+    fn fifo_turnover_fixture(cold: u64, hot: u64) -> (State, u64, u64, u64) {
+        let mut st = State::default();
+        for row in 1..=cold + hot {
+            publish_next(&mut st, row);
+        }
+        let p0 = st.apply_seq;
+        st.insert_workspace(BranchId::new(1, 0), pinned("b_1", 101, p0));
+        for row in cold + 1..=cold + hot {
+            publish_next(&mut st, row);
+        }
+        let p1 = st.apply_seq;
+        st.insert_workspace(BranchId::new(2, 0), pinned("b_2", 102, p1));
+        // A filler: a new row, which supersedes nothing, so P2 is a distinct instant from P1.
+        publish_next(&mut st, cold + hot + 1);
+        let p2 = st.apply_seq;
+        st.insert_workspace(BranchId::new(3, 0), pinned("b_3", 103, p2));
+        for row in 1..=cold {
+            publish_next(&mut st, row);
+        }
+        (st, p0, p1, p2)
+    }
+
+    /// How many of the rows in `rows` still have a superseded version held for some reader.
+    fn held_for(st: &State, rows: std::ops::RangeInclusive<u64>) -> usize {
+        st.retention.readers.values().filter(|(_, row, _)| rows.contains(row)).count()
+    }
+
+    /// **E (review 6): under oldest-first turnover, what only departed pins read is freed.** P0
+    /// departs, then P1, with no publish in between. The hot rows' old versions were read by P0
+    /// alone, so nothing needs them. The cold rows' old versions are still read by P2.
+    ///
+    /// At `9998180` all 100 hot versions were still held. Each departure queued `(0, p]`, and the
+    /// sweep spent its whole budget re-testing cold entries that P1 and P2 still read, restarting
+    /// at 0 each time.
+    #[test]
+    fn version_history_fifo_turnover_frees_what_only_departed_pins_read() {
+        let (cold, hot) = (DEPARTURE_SWEEP_BUDGET as u64 + 1000, 100u64);
+        let (mut st, _p0, _p1, p2) = fifo_turnover_fixture(cold, hot);
+        assert_eq!(held_for(&st, cold + 1..=cold + hot), hot as usize, "fixture: P0's hot versions");
+        assert_eq!(held_for(&st, 1..=cold), cold as usize, "fixture: the cold versions");
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        let still = held_for(&st, cold + 1..=cold + hot);
+        assert_eq!(
+            still, 0,
+            "{still} hot versions are still held after P0, the only pin that read them, departed"
+        );
+        // Row r's first version was stamped r, and P2 still reads it.
+        for row in [1, cold / 2, cold] {
+            assert_eq!(
+                st.version_seen(TableId(1), RowId(row), Some(p2)).map(|v| v.begin_ts),
+                Some(row),
+                "P2 no longer names the version of cold row {row} it reads"
+            );
+        }
+    }
 }
