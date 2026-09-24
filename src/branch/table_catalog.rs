@@ -3362,69 +3362,200 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A sidecar catalog path, removed first. The tests below REOPEN the file before they assert,
+    /// so a key they check is shown DURABLE and not merely present in the pool (W9, wall21 review
+    /// audit 3).
+    fn sidecar(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-w21-{tag}-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn keyed(c: &TableBranchCatalog, id: u64) -> bool {
+        c.unreleased_reaped_candidates().unwrap().contains(&id)
+    }
+
+    /// A cascade ancestor's state: fork S with a child K, flip S `Reaped` while K pins it (so the
+    /// flip takes S's key off), then detach K from S and S from trunk. S is `Reaped`, detached,
+    /// has nothing below it, and holds no key.
+    fn keyless_detached_ancestor(c: &TableBranchCatalog) -> BranchRecord {
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let k = c.fork(s.branch_id, LeaseDeadline(100)).unwrap();
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(s.branch_id.id, k.fork_epoch).unwrap(), "fixture: K had no entry");
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap(), "fixture: S had no entry");
+        assert!(!keyed(c, s.branch_id.id), "fixture: S was flipped while pinned, so it holds no key");
+        s
+    }
+
     /// **C1 (wall21 review audit 2), read side: a release that cannot read liveness must leave the
     /// slot where the open sweep looks.** `release_id` swallows its errors. When the liveness read
     /// ERRS on a `Reaped` slot with no key (a pinned interior loses its key at its flip), it wrote
     /// nothing, so the slot ended keyless and not free: stranded, silently. Here the error is a
     /// dangling CHILD entry (D124). PRE-REGISTERED (lane §8.10): fails at the final assertion at
-    /// `fd7b5e0`, passes after the fix.
+    /// `fd7b5e0`, passes after the fix. **W9 (audit 3):** it asserts after a REOPEN, so a key
+    /// that never reached the disk fails it too.
     #[test]
     fn a_release_whose_liveness_read_fails_keeps_the_slot_keyed() {
-        let (c, p, _pool) = cat("c1-readfail");
-        let t = BranchId::TRUNK.id;
-        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
-        let kid = c.fork(s.branch_id, LeaseDeadline(100)).unwrap();
-        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
-        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
-        // The kid's entry goes, and a dangling one takes its place: S's liveness now ERRS.
-        assert!(c.detach_child(s.branch_id.id, kid.fork_epoch).unwrap());
-        let ghost = 4242u64;
-        assert!(c.core(ghost).unwrap().is_none(), "fixture: the ghost must have no record");
-        c.upsert(keys::child(s.branch_id.id, c.next_epoch().0), ghost.to_be_bytes().to_vec())
-            .unwrap();
-        assert!(c.detach_child(t, s.fork_epoch).unwrap(), "fixture: S had no entry under trunk");
+        let path = sidecar("c1-readfail");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            // A dangling entry under S: S's liveness now ERRS.
+            let ghost = 4242u64;
+            assert!(c.core(ghost).unwrap().is_none(), "fixture: the ghost must have no record");
+            c.upsert(keys::child(s.branch_id.id, c.next_epoch().0), ghost.to_be_bytes().to_vec())
+                .unwrap();
+            assert!(c.has_live_children(s.branch_id.id).is_err(), "fixture: S's liveness must err");
+            c.release_id(s.branch_id.id);
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
         assert!(
-            !c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id),
-            "fixture: S was flipped while pinned, so it must hold no key"
+            keyed(&c, sid),
+            "C1: a release whose liveness read failed left the slot keyless and not free (or its \
+             key did not survive a reopen), so no sweep will ever retry it"
         );
-        assert!(c.has_live_children(s.branch_id.id).is_err(), "fixture: S's liveness must err");
-
-        c.release_id(s.branch_id.id);
-        assert!(
-            c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id),
-            "C1: a release whose liveness read failed left the slot keyless and not free, so no \
-             sweep will ever retry it"
-        );
-        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// **C1, write side: the key comes off only once the slot is on the free list.** Uses the
     /// `cfg(test)` failpoint, so it is new API and is added with the fix (lane §8.10). It is not
-    /// red at any earlier commit, and it is M31's killer.
+    /// red at any earlier commit, and it is M31's killer. **W9 (audit 3):** both assertions follow
+    /// a REOPEN.
     #[test]
     fn a_failed_free_list_write_leaves_the_slot_keyed() {
-        let (c, p, _pool) = cat("c1-freefail");
+        let path = sidecar("c1-freefail");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+            assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+            assert!(keyed(&c, s.branch_id.id), "fixture: a releasable flip keeps the key");
+            c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
+            c.release_id(s.branch_id.id);
+            assert!(
+                !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
+                "fixture: the injected FREE_ID failure never fired"
+            );
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(keyed(&c, sid), "C1: the key came off although the slot never reached the free list");
+
+        // And a release that succeeds takes it off, durably.
+        c.release_id(sid);
+        drop(c);
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(!keyed(&c, sid), "a successful release left the key on");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W1 (wall21 review audit 3): a KEYLESS slot whose FREE_ID write fails must be keyed.** A
+    /// cascade ancestor lost its key at its pinned flip. C1's write side only SKIPPED the key's
+    /// removal, so such an ancestor stayed keyless and not free, and the originator's release then
+    /// removed the last key a sweep could have followed to it. PRE-REGISTERED (lane §8.14): fails
+    /// at the final assertion at `9d5934f`; M36's killer.
+    #[test]
+    fn a_failed_free_list_write_keys_a_keyless_slot() {
+        let path = sidecar("w1-keyless");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            assert!(!c.has_live_children(s.branch_id.id).unwrap(), "fixture: nothing below S lives");
+            c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
+            c.release_id(s.branch_id.id);
+            assert!(
+                !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
+                "fixture: the injected FREE_ID failure never fired"
+            );
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, sid),
+            "W1: a keyless slot whose FREE_ID write failed is still keyless and not free: stranded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W2 (wall21 review audit 3): a release that cannot read the slot's own record must key it.**
+    /// Its state is unknown, and a key frees nothing by itself: the sweep and `release_id` both
+    /// read the record again before acting. PRE-REGISTERED (lane §8.14): fails at the final
+    /// assertion at `9d5934f`; M37's killer.
+    #[test]
+    fn a_release_that_cannot_read_its_record_keys_the_slot() {
+        let path = sidecar("w2-coreerr");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            c.upsert(keys::record(s.branch_id.id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            assert!(c.core(s.branch_id.id).is_err(), "fixture: S's record must not decode");
+            c.release_id(s.branch_id.id);
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, sid),
+            "W2: a slot whose own record could not be read was left keyless and not free"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W3 (wall21 review audit 3): one undecodable record must not fail an open.** D127's rule
+    /// held only per resumed reap. Two `?`s ran before any per-slot handling: `in_state(Reaping)`
+    /// decoded every `Reaping` record, and the candidate query decoded every keyed one. So one
+    /// corrupt record in either span failed EVERY open. PRE-REGISTERED (lane §8.14): fails at "the
+    /// open is Ok" at `9d5934f`; after the fix each is a refusal with its reason. M38 and M39.
+    #[test]
+    fn an_unreadable_record_at_open_is_a_refusal_not_a_failed_open() {
+        use crate::branch::arena::ArenaPageStore;
+        use crate::branch::reaper::TwoTierReaper;
+        let path = sidecar("w3-open");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        // R: interrupted mid-reap, so `Reaping`, and keyed since it entered `Reaping`.
+        let r = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_state(r.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        // S: reaped with nothing below it, so keyed, and detached.
         let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
         c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
         c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
         assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
-        let keyed = |c: &TableBranchCatalog| {
-            c.unreleased_reaped_candidates().unwrap().contains(&s.branch_id.id)
-        };
-        assert!(keyed(&c), "fixture: a releasable flip keeps the key");
+        for id in [r.branch_id.id, s.branch_id.id] {
+            // The key itself: the candidate query offers only `Reaped` records, and R is `Reaping`.
+            assert!(
+                c.tree.search(&keys::unreleased(id)).unwrap().is_some(),
+                "fixture: slot {id} must be on the UNRELEASED span"
+            );
+            c.upsert(keys::record(id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            assert!(c.core(id).is_err(), "fixture: record {id} must not decode");
+        }
 
-        c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
-        c.release_id(s.branch_id.id);
-        assert!(
-            !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
-            "fixture: the injected FREE_ID failure never fired"
-        );
-        assert!(keyed(&c), "C1: the key came off although the slot never reached the free list");
+        let main = std::env::temp_dir().join(format!("ferro-w21-w3-main-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&main);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&main).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+        let base = pool.disk_manager.high_water().unwrap();
+        let catalog: Arc<dyn BranchCatalog> = c.clone();
+        let store =
+            Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap());
+        let reaper = TwoTierReaper::new(catalog, store);
 
-        // And a release that succeeds takes it off.
-        c.release_id(s.branch_id.id);
-        assert!(!keyed(&c), "a successful release left the key on");
-        let _ = std::fs::remove_file(p);
+        let resumed = reaper
+            .resume_interrupted_reaps()
+            .expect("W3: one undecodable record failed the whole open");
+        assert!(resumed.is_empty(), "an unreadable record was reported as resumed: {resumed:?}");
+        assert_eq!(reaper.refused_reaps(), 1, "R's declined resume was not counted");
+        let why = reaper.open_slot_refusals();
+        let r_tag = format!("interrupted reap of slot {}", r.branch_id.id);
+        let s_tag = format!("slot {}:", s.branch_id.id);
+        assert!(why.iter().any(|w| w.starts_with(&r_tag)), "R's refusal has no reason: {why:?}");
+        assert!(why.iter().any(|w| w.starts_with(&s_tag)), "S's refusal has no reason: {why:?}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
     }
 
     /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked

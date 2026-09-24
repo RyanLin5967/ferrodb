@@ -279,7 +279,11 @@ fn a_healthy_open_reads_no_released_and_no_pinned_slot() {
 }
 
 /// A catalog that fails ONE operation on purpose, so a cascade is left in the state a crash or an
-/// I/O error leaves it in. Everything else is delegated untouched.
+/// I/O error leaves it in. Everything else is delegated untouched, including
+/// `unreleased_reaped_candidates` (W5, wall21 review audit 3): before, the trait's DEFAULT
+/// answered through this wrapper (every `Reaped` record), so a sweep run through it used a
+/// different candidate list from production's UNRELEASED span. Not forwarded: the defaults the
+/// reaper and the page store never call (`await_fork_durable`, `scan_ids`, `envelope_of`).
 struct Faulty {
     inner: Arc<dyn BranchCatalog>,
     /// Fail the Nth `detach_child` (1-based); 0 = never.
@@ -389,6 +393,9 @@ impl BranchCatalog for Faulty {
             panic!("injected crash between two releases (release_id call {n}, slot {id})");
         }
         self.inner.release_id(id)
+    }
+    fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
+        self.inner.unreleased_reaped_candidates()
     }
     fn attach_child(
         &self,
@@ -614,6 +621,19 @@ fn a_resumed_reap_that_errs_does_not_fail_the_open() {
     );
     assert!(resumed.is_empty(), "the refused reap was reported as resumed");
     assert_eq!(opener.refused_reaps(), 1, "the refusal was not counted");
+    // W4 (wall21 review audit 3): the refusal is kept WITH its reason, and the sweep does not
+    // overwrite it. Dropping the `extend` (M40), or moving it above the sweep, whose list assignment
+    // then erases it (M41), fails here.
+    let why = opener.open_slot_refusals();
+    assert_eq!(why.len(), 1, "exactly the resumed reap's refusal was expected: {why:?}");
+    assert!(
+        why[0].starts_with(&format!("resumed reap of b{}@", l.id)),
+        "the refusal does not name the resumed reap of L: {why:?}"
+    );
+    assert!(
+        why[0].contains("injected failure: get_raw"),
+        "the refusal lost the catalog's reason: {why:?}"
+    );
 
     // The same open's sweep finishes what the refused reap started.
     let mut want = vec![q.id, p.id, l.id];
