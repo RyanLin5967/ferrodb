@@ -13,7 +13,9 @@ Two mutants are pre-registered to SURVIVE, and are run so each blind spot is mea
 asserted:
   M4  syncing before the write is invisible to every test here: nothing fault-injects the file.
   M11 the explicit flush after record_applied only REPORTS a flush failure; the guard's Drop still
-      makes the stamps durable before the MERGE returns, and no test can make a flush fail.
+      makes the stamps durable before the MERGE returns, and no test can make a flush fail. It is
+      also a no-op in every reachable merge today: a published version always has an applied op,
+      so record_applied's write carries every publish stamp, and the rewrite's are flushed earlier.
 """
 import subprocess
 import sys
@@ -63,8 +65,8 @@ MUTANTS = {
         "        self.mem.stamp_rows(rows, id)?;\n",
         "        let _ = self.mem.stamp_rows(rows, id);\n",
     ),
-    # An empty batch treated as a write: it reaches the append, which refuses a tagless body and
-    # poisons the store — so a MERGE of zero ops would poison provenance for the process.
+    # An empty batch treated as a write: it takes the lock and the poison check, so a poisoned
+    # store REFUSES a batch that writes nothing (killed by the poisoned half of the empty-batch test).
     "M6_empty_batch_is_a_write": (
         DURABLE,
         "        if rows.is_empty() {\n"
@@ -127,13 +129,32 @@ MUTANTS = {
     # The store's Drop does not write its pending stamps.
     "M15_store_drop_does_not_flush": (
         DURABLE,
-        "            let _ = self.flush();\n",
+        "        let _ = self.flush();\n",
         "",
     ),
     # Pending records never cleared: every later append writes them again.
     "M16_pending_never_cleared": (
         DURABLE,
         "        out.pending.clear();\n",
+        "",
+    ),
+    # ---- the schema-phase flush and the review fixes (eff03e8) -----------------------------------
+    # A poisoned store queues a pending stamp it can never write.
+    "M17_pending_ignores_the_poison": (
+        DURABLE,
+        "        self.refuse_if_poisoned()?;\n        self.mem.stamp(rid, id)?;\n        file.pending.push(stamp_body(rid, id));\n",
+        "        self.mem.stamp(rid, id)?;\n        file.pending.push(stamp_body(rid, id));\n",
+    ),
+    # A flush with nothing pending refused by a poisoned store: the emptiness check comes second.
+    "M18_flush_checks_poison_first": (
+        DURABLE,
+        "        if file.pending.is_empty() {\n            return Ok(());\n        }\n        self.refuse_if_poisoned()?;\n",
+        "        self.refuse_if_poisoned()?;\n        if file.pending.is_empty() {\n            return Ok(());\n        }\n",
+    ),
+    # The rewrite's stamps wait for the merge's final sync again (review F1).
+    "M19_no_schema_phase_flush": (
+        RUNTIME,
+        "            provenance.flush_so_far()?;\n",
         "",
     ),
 }

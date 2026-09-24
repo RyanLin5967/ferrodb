@@ -21,7 +21,8 @@ OUT=$WT/bench/d219
 BASE=9aa6968     # main when the lane was cut
 HARNESS=3b9a39e  # instrument + first red test + harness, NO fix: the BEFORE tree
 ROWONLY=bf10eec  # row authorship batched (871846a) + the whole-exit red test, stamps NOT batched
-FIX=39fd5a5      # the whole fix (86e1762) + the harness's model labels
+DEFERALL=882e475 # every stamp deferred to the final sync (86e1762) + the schema-phase red test
+FIX=eff03e8      # the whole fix: the harness labels (39fd5a5) + the schema-phase flush
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -62,6 +63,10 @@ step b_lib_list_$HARNESS timeout 3600 cargo test --lib provenance:: -- --list
 git -C "$FIRE" checkout --detach -q "$ROWONLY" || exit 3
 step b2_red_$ROWONLY timeout 3600 cargo test --test "$T"
 step b2_lib_list_$ROWONLY timeout 3600 cargo test --lib provenance:: -- --list
+
+# ---- (b3) the schema-phase red test, on the tree that deferred every stamp to the final sync --------
+git -C "$FIRE" checkout --detach -q "$DEFERALL" || exit 3
+step b3_red_$DEFERALL timeout 3600 cargo test --test "$T"
 
 # ---- (c) AFTER: the fix --------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -q "$FIX" || exit 3
@@ -107,6 +112,9 @@ mutant M13_pending_ignores_the_refusal provenance::deferred::tests::the_stamper_
 mutant M14_guard_drop_does_not_flush provenance::deferred::tests::a_guard_dropped_without_a_flush_still_writes_its_stamps
 mutant M15_store_drop_does_not_flush provenance::durable::tests::a_store_dropped_with_pending_stamps_writes_them
 mutant M16_pending_never_cleared provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
+mutant M17_pending_ignores_the_poison provenance::durable::tests::a_poisoned_store_refuses_a_pending_stamp
+mutant M18_flush_checks_poison_first provenance::durable::tests::an_empty_flush_is_not_a_write_even_on_a_poisoned_store
+mutant M19_no_schema_phase_flush INTEGRATION
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"
