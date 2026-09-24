@@ -632,3 +632,8 @@ is right, and here is the exact spelling. The guard leaves the reservation block
 the end of that `let`, after the block's state lock has been released, so it removes the entry before
 `record_applied` runs. `record_applied`'s "never registered" assertion then fires in every merge test,
 in debug builds. In release, M18 goes unkilled, and it is harmless there, as item 1 argues.
+
+**A further correction, to the line above.** Strike "and it is harmless there". Under M18 the entry is
+already gone during the publish window, so a pin taken inside it takes `apply_seq`: that is the
+Amendment 6 defect itself. Item 1's "harmless" is about the opposite mutant, an entry STRANDED after a
+failed publish. M18 is killed in debug, where the suite runs, and nowhere else.
