@@ -2267,6 +2267,23 @@ mod tests {
         h.append(BranchId::TRUNK, Epoch(9), BranchOp::Merge, cid(9)).expect("trunk is live");
     }
 
+    /// D199: `opened_at` is the epoch of the branch's FORK, not of its latest entry, and it leaves
+    /// with the head. The difference shows only on a branch with a second entry (a parent session
+    /// its child merged into), so a `Fork`-then-`Reap` lifecycle cannot pin it, and the lease
+    /// tests are all that shape. Hand-worked: fork at 3, a merge into it at 9, so 3. After its
+    /// reap, `None` for both head and opening.
+    #[test]
+    fn opened_at_is_the_fork_epoch_and_leaves_with_the_head() {
+        let b = bid(4, 0);
+        let mut h = AttestedHistory::new();
+        h.append_fork(b, BranchId::TRUNK, Epoch(3), cid(3)).expect("a fork from trunk");
+        h.append(b, Epoch(9), BranchOp::Merge, cid(9)).expect("a merge into a live branch");
+        assert_eq!(h.opened_at(b), Some(Epoch(3)), "opened_at followed the latest entry");
+        assert_eq!(h.opened_at(bid(5, 0)), None, "a branch never forked here has an opening");
+        h.append(b, Epoch(12), BranchOp::Reap, cid(12)).expect("reap a live branch");
+        assert_eq!((h.head_of(b), h.opened_at(b)), (None, None), "a reaped branch kept its opening");
+    }
+
     /// ⛔ REVIEW FINDING 10. The third-party story is "you hold 85 bytes and a proof", so those
     /// 85 bytes must parse back into an entry. `ENTRY_BYTES`' doc asserted a decoder existed.
     #[test]
