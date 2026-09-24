@@ -540,6 +540,25 @@ struct PersistState {
     /// The quantity this row is about is an integer, so it is worth being able to assert exactly.
     rewrites: u64,
     appends: u64,
+    /// **D263.** Page ranges held out of circulation because the record that would let them be
+    /// reused failed to persist: a free whose record failed (after its `take_back`), and an
+    /// unpublished claim whose record failed (H2b). Until a rewrite of the armed file succeeds,
+    /// the durable map may still charge each range to its old extent (a free record that did not
+    /// land) or to the unpublished claim (a claim record that did), so no claim may receive it.
+    /// The first rewrite that succeeds lists them free in an image that names no extent on them
+    /// and drops the whole old tail, and they go back on the free list then; see
+    /// [`ArenaPageStore::write_image_folding_quarantine`]. Before D263 they were lost for good.
+    quarantine: Vec<QuarantinedRange>,
+}
+
+/// **D263.** One range in [`PersistState::quarantine`], with the authority epoch it was freed
+/// under: a range of a superseded authority is dropped rather than reused, as
+/// `ArenaSpaceManager::give_back` clears `free_extents` on an authority change.
+#[derive(Clone, Copy, Debug)]
+struct QuarantinedRange {
+    start: PageId,
+    pages: u32,
+    epoch: u64,
 }
 
 impl ArenaPageStore {
@@ -648,6 +667,7 @@ impl ArenaPageStore {
                 durable_pending_version: 0,
                 rewrites: 0,
                 appends: 0,
+                quarantine: Vec::new(),
             }),
             pending_version: AtomicU64::new(0),
             recycled_reissued: AtomicBool::new(false),
@@ -1509,7 +1529,13 @@ impl ArenaPageStore {
         // restores is the one that means the accounting never has to be reasoned about from
         // outside: `image_bytes == 0` iff this process has not written the image, so the next
         // persist is a full rewrite and the file is ours again.
-        self.persist.lock().unwrap().image_bytes = 0;
+        {
+            let mut g = self.persist.lock().unwrap();
+            g.image_bytes = 0;
+            // **D263.** The map being installed is the authority over every range now, so a range
+            // quarantined against the map it replaces has nothing left to wait for.
+            g.quarantine.clear();
+        }
         let mut st = self.state.lock().unwrap();
         *st =
             // **D85: every restored extent's fill is SUSPECT until probed.**
@@ -1751,12 +1777,11 @@ impl ArenaPageStore {
             // good (the fresh-context review's F2: after any reap the next free is a full
             // rewrite). Nobody can take it in between: only `alloc_arena` pops the free list, and
             // it holds `persist`, which this holds. On failure it comes back off the list before
-            // `persist` is released, and the range is then a leak, never an alias (review 2 F2):
-            // lost for this process, and for good once any later rewrite succeeds, because the
-            // extent has already left memory and a rewrite lists the range in neither `extents`
-            // nor `free_extents`. After a failed append that rewrite is the very next persist. A
-            // crash before it leaves the durable map charging the range to the freed extent, which
-            // the open sweep collects only if that extent reads empty.
+            // `persist` is released and goes into the quarantine (D263): out of circulation, never
+            // an alias, until the first rewrite that succeeds lists it free, which is the next
+            // persist because a quarantined range forces one. It used to be lost for good there
+            // (review 2 F2). A crash before that rewrite leaves the durable map charging the range
+            // to the freed extent, which the open sweep collects only if that extent reads empty.
             //
             // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
             // as the claim this mirrors, and not per page.
@@ -1780,6 +1805,11 @@ impl ArenaPageStore {
             self.space.give_back(start, pages);
             if let Err(e) = self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload) {
                 self.space.take_back(start, pages);
+                persist.quarantine.push(QuarantinedRange {
+                    start,
+                    pages,
+                    epoch: crate::cluster::epoch(),
+                });
                 return Err(e);
             }
         }
@@ -1796,6 +1826,49 @@ impl ArenaPageStore {
     /// `replace_atomically` renames a fresh inode over the target, so the previous tail goes away
     /// with the previous inode rather than being left stranded after a shorter image. Pinned by
     /// `a_replace_after_appends_drops_the_tail_instead_of_stranding_it`.
+    /// **D263.** Write the image to the armed `path` with every quarantined range listed free,
+    /// and return its length.
+    ///
+    /// The ranges go onto the free list BEFORE the image is serialised, because the image is live
+    /// memory and a range on neither `extents` nor `free_extents` would be missing from it (the
+    /// same reason `free_arena_locked` gives a range back before its persist). Nobody can reserve
+    /// one in between: `space.reserve` runs only under `persist`, which the caller holds. If the
+    /// write fails they come back off the list and stay quarantined: the durable map may still
+    /// charge them elsewhere. If it succeeds, the image lists them free and names no extent on
+    /// them, the old tail is gone with the old inode, and they stay on the list: from then on no
+    /// durable record charges them to anyone. Ranges of a superseded authority epoch are dropped.
+    fn write_image_folding_quarantine(
+        &self,
+        g: &mut PersistState,
+        path: &std::path::Path,
+    ) -> Result<usize, FerroError> {
+        let epoch = crate::cluster::epoch();
+        g.quarantine.retain(|q| q.epoch == epoch);
+        for q in &g.quarantine {
+            self.space.give_back(q.start, q.pages);
+        }
+        match self.checkpoint_with(&OsFileOps, path) {
+            Ok(written) => {
+                g.quarantine.clear();
+                Ok(written)
+            }
+            Err(e) => {
+                for q in &g.quarantine {
+                    self.space.take_back(q.start, q.pages);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// **D263.** Ranges held out of circulation because a record failed to persist, as `(ranges,
+    /// pages)`. See [`PersistState::quarantine`]. Observing only: non-zero only after a persist
+    /// failure, and back to zero at the first rewrite of the armed file that succeeds.
+    pub fn quarantined_ranges(&self) -> (usize, u64) {
+        let g = self.persist.lock().unwrap();
+        (g.quarantine.len(), g.quarantine.iter().map(|q| u64::from(q.pages)).sum())
+    }
+
     fn persist_full_locked(&self, g: &mut PersistState) -> Result<(), FerroError> {
         let path = self.checkpoint_path.lock().unwrap().clone();
         let Some(p) = path else { return Ok(()) };
@@ -1817,7 +1890,7 @@ impl ArenaPageStore {
         // was; and a pop that landed while this one was writing has already set it, which
         // restoring an earlier value would undo.
         self.recycled_reissued.store(false, Ordering::SeqCst);
-        let written = match self.checkpoint_with(&OsFileOps, &p) {
+        let written = match self.write_image_folding_quarantine(g, &p) {
             Ok(written) => written,
             Err(e) => {
                 self.recycled_reissued.store(true, Ordering::SeqCst);
@@ -1842,6 +1915,7 @@ impl ArenaPageStore {
     ///     record describes.
     ///   * the pending-free log changed — see [`PersistState::durable_pending_version`].
     ///   * the tail would exceed [`Self::compact_threshold`] — the amortisation bound.
+    ///   * a range is quarantined (D263) — only a rewrite can record it free and put it back.
     fn persist_delta_locked(
         &self,
         g: &mut PersistState,
@@ -1859,6 +1933,9 @@ impl ArenaPageStore {
             // honest answer is to stop appending. See [`Self::recycled_reissued`] — this is the
             // one condition here whose absence is a live page freed rather than a leak.
             || self.recycled_reissued.load(Ordering::SeqCst)
+            // **D263.** A quarantined range goes back into circulation only at a rewrite that
+            // succeeds, so the retry is the next persist, whatever it was for.
+            || !g.quarantine.is_empty()
             || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
         {
             // The rewrite folds in the mutation this record described, because `state_bytes`
@@ -2160,12 +2237,19 @@ impl ArenaPageStore {
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), FerroError> {
         let mut g = self.persist.lock().unwrap();
         let pending_version = self.pending_version.load(Ordering::SeqCst);
-        let written = self.checkpoint_with(&OsFileOps, path)?;
+        let armed = self.checkpoint_path.lock().unwrap().as_deref() == Some(path);
+        // **D263.** Only a checkpoint of the ARMED file may return quarantined ranges: it is the
+        // durable map they wait on. A copy written anywhere else frees nothing.
+        let written = if armed {
+            self.write_image_folding_quarantine(&mut g, path)?
+        } else {
+            self.checkpoint_with(&OsFileOps, path)?
+        };
         // A checkpoint aimed at the armed path IS the image this process may then append to, so
         // it resets the tail accounting. One aimed anywhere else (the CLI's exit checkpoint to a
         // copy, a test dumping state) must leave it alone: claiming a tail of zero on a file we
         // did not write is exactly the mistake `image_bytes == 0` exists to prevent.
-        if self.checkpoint_path.lock().unwrap().as_deref() == Some(path) {
+        if armed {
             g.image_bytes = written as u64;
             g.tail_bytes = 0;
             g.image_epoch = crate::cluster::epoch();
@@ -2681,14 +2765,19 @@ impl PageStore for ArenaPageStore {
             // disk (an fsync that fails after the bytes landed), and a range the durable map may
             // charge to this extent must not be handed to another claim in this process.
             //
-            // So the range is lost for this process, and lost for good once any later rewrite
-            // succeeds (review 2 F2): a rewrite serialises live memory, which lists it in neither
-            // `extents` nor `free_extents`, and the watermark is already past it. After a failed
-            // append that rewrite is the very next persist, because the append's failure forgets
-            // `image_bytes`. Only a crash before then gives it back, through the durable map: as
+            // So the range goes into the quarantine (D263) until the first rewrite that succeeds,
+            // which is the next persist because a quarantined range forces one. That rewrite's
+            // image lists the range free and names no extent on it, and it drops the old tail with
+            // any claim record that did land, so from then on no durable record charges the range
+            // to anyone and it goes back on the free list. It used to be lost for good there
+            // (review 2 F2). A crash before that rewrite gives it back through the durable map: as
             // an unissued or free range if the record never landed, or, if it did, as an extent no
-            // catalog key names, collected as an orphan once this branch is reaped. At most one
-            // extent per failed persist: a leak, never an alias.
+            // catalog key names, collected as an orphan once this branch is reaped.
+            persist.quarantine.push(QuarantinedRange {
+                start,
+                pages,
+                epoch: crate::cluster::epoch(),
+            });
             let mut st = self.state.lock().unwrap();
             st.extents.remove(&arena);
             st.live_order.remove(&arena);
@@ -2717,10 +2806,10 @@ impl PageStore for ArenaPageStore {
                 Ok(_) => Err(refused),
                 Err(undo) => Err(FerroError::Internal(format!(
                     "{refused}. Undoing the durable claim of arena {arena} also failed ({undo}): \
-                     the extent has already left this process's map, and its range is lost for \
-                     this process, and for good once a later rewrite of the map succeeds. A \
-                     restart before that finds the extent charged to {branch}, which no catalog \
-                     record names, and collects it as an orphan once {branch} is gone"
+                     the extent has already left this process's map, and its range is held out of \
+                     circulation until a later rewrite of the map records it free. A restart \
+                     before that finds the extent charged to {branch}, which no catalog record \
+                     names, and collects it as an orphan once {branch} is gone"
                 ))),
             };
         }
@@ -6001,6 +6090,41 @@ mod tests {
             r,
             "D263: a range a failed rewrite had put on the free list was handed to a claim before \
              any rewrite that recorded it free had succeeded"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D263: the quarantine is counted, and empties at the rewrite that returns its ranges.**
+    #[test]
+    fn d263_the_quarantine_is_counted_and_empties_at_a_rewrite() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-count-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        h.store.checkpoint_to(good.clone());
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+        let a = claim().unwrap();
+        let (_, pages) = h.store.extent_range(a).unwrap();
+        assert_eq!(h.store.quarantined_ranges(), (0, 0), "fixture: nothing is quarantined yet");
+
+        let (blocker, target) = d232_blocked_path("d263-count");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (1, u64::from(pages)),
+            "D263: the free whose record failed was not counted as quarantined"
+        );
+        h.store.checkpoint_to(good.clone());
+        claim().unwrap();
+        assert_eq!(
+            h.store.quarantined_ranges(),
+            (0, 0),
+            "D263: a rewrite that succeeded left the quarantine holding ranges"
         );
         let _ = std::fs::remove_file(&good);
         let _ = std::fs::remove_file(&blocker);
