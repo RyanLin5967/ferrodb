@@ -1201,3 +1201,99 @@ also a lib test.
 
 The first figure stands: **2183 passed**. Amendment 13's "Six new tests" heading is also five. I
 recounted by listing the names above.
+
+## Amendment 14 (append-only; written BEFORE the tests and code it describes): E — each departure frees only what it read highest
+
+The lead said yes to E (2026-09-24, ~15:02Z). Review 6 found the problem: under oldest-first turnover, the strip queue of
+Amendment 10 restarts at 0 and re-tests entries that a HIGHER pin still reads, so the tail can starve.
+The lead accepted this replacement.
+
+### The design
+
+- **Buckets.** Every kept entry `h` (superseded by `s`) is filed in `retention.by_reader` under its
+  HIGHEST live reader: the largest pin in `[h, s)`. That is `pins.range(h..s).next_back()`, O(log n),
+  at supersession.
+- **A departure of `p`** (its count reaching 0) queues `p` in `retention.pending` iff its bucket is
+  non-empty. `pending` is now a `BTreeSet` of departed pins whose buckets still hold entries, so
+  W4's `pending.is_empty()` is unchanged.
+- **Sweeping one entry of bucket `d`** costs one unit of budget. With `a` = the next lower LIVE pin:
+  - if `a ≥ h`, the entry is handed down to `(a, h)` in O(log n), because `a` is now its highest live
+    reader;
+  - otherwise it is freed. That is exactly the rectangle `(a, p] × (p, b]`.
+
+  When the bucket empties, `d` leaves `pending` in the same step.
+- **What a departure never touches:** an entry whose highest reader is another pin. So nothing is
+  re-tested, nothing restarts, and the entries a higher pin reads cost the departure nothing.
+- **Arrivals touch no bucket.** A new pin is at or above every recorded `s`, and an inherited pin
+  copies a live value. For the same reason, a departed value can only come back while its bucket is
+  empty. A `debug_assert` holds that.
+- **Budgets:** unchanged. `DEPARTURE_SWEEP_BUDGET` is spent per departure, `PUBLISH_SWEEP_BUDGET`
+  per publish, and every processed entry costs one unit.
+- **`retention.visits`** counts processed entries. It is the instrument that shows a departure
+  touched only its own bucket.
+- `add_pending` and the `(lo, hi]` interval queue are removed.
+
+### Two tests retired, and why
+
+They exercise the interval-queue API (`add_pending`, and `pending` as `(lo, hi]` pairs), which this
+design replaces. They no longer compile. Both were added in Amendment 12, as mutant-only tests, and
+neither was ever landed. Quoted as they stood at `0fdcd81`:
+
+```rust
+    fn version_history_sweep_budget_counts_empty_intervals() {
+        let mut st = State::default();
+        for i in 0..10u64 {
+            st.add_pending(10 * i, 10 * i + 5);
+        }
+        assert_eq!(st.retention.pending.len(), 10, "fixture: the intervals should be disjoint");
+        st.sweep_pending(2);
+        assert_eq!(
+            st.retention.pending.len(),
+            8,
+            "a sweep with budget 2 visited {} intervals",
+            10 - st.retention.pending.len()
+        );
+    }
+    fn version_history_pending_intervals_merge_when_they_overlap_or_touch() {
+        let mut st = State::default();
+        let queue = |st: &State| st.retention.pending.iter().map(|(&l, &h)| (l, h)).collect::<Vec<_>>();
+        st.add_pending(10, 20);
+        st.add_pending(30, 40);
+        assert_eq!(queue(&st), vec![(10, 20), (30, 40)], "disjoint intervals stay apart");
+        st.add_pending(15, 25);
+        assert_eq!(queue(&st), vec![(10, 25), (30, 40)], "an overlapping interval is absorbed");
+        st.add_pending(25, 30);
+        assert_eq!(queue(&st), vec![(10, 40)], "touching intervals on both sides become one");
+        st.add_pending(50, 60);
+        st.add_pending(70, 80);
+        st.add_pending(5, 75);
+        assert_eq!(queue(&st), vec![(5, 80)], "an interval spanning several absorbs them all");
+        st.add_pending(90, 90);
+        assert_eq!(queue(&st), vec![(5, 80)], "an empty interval queues nothing");
+    }
+```
+
+### Tests
+
+| test | at `9998180` | at the fix |
+|---|---|---|
+| **RED** `version_history_fifo_turnover_frees_what_only_departed_pins_read`. This is review 6's fixture, with cold = `DEPARTURE_SWEEP_BUDGET` + 1000 and hot = 100. P0, P1 and P2 are pinned as registered. P0 departs, then P1. It then checks that no hot version is held any longer, and that P2 still names each cold row's version | **FAILS**: all 100 hot versions are still held, because the strip sweep spends its budget re-testing cold entries that P1 and P2 read | passes |
+| `version_history_each_departure_touches_only_what_it_read_highest` (mutant-only; the visit counter). Same fixture. Across both departures `visits` grows by exactly 100 (P0's hot bucket), P1's departure touches nothing, and `pending` is empty | n/a | passes |
+| `version_history_sweep_charges_one_unit_per_entry_and_drains` (mutant-only; replaces the budget test). Ten entries sit in one departed pin's bucket. `sweep_pending(2)` processes exactly 2 (visits +2, 8 held, the pin still queued). `sweep_pending(100)` then processes 8 more, empties the queue, and costs nothing for the empty bucket | n/a | passes |
+| `version_history_hands_an_entry_down_to_its_next_reader` (mutant-only; replaces the interval-algebra test as the queue-structure test). P1 < P2 both read version `h` of one row. P2 departs: the entry is still held, P1 still names it, and it sits in P1's bucket. P1 departs: it is freed | n/a | passes |
+
+**Counts, replacing Amendment 13's:**
+- `cargo test --lib version_history`: **17** (15 − 2 retired + 4 new).
+- Run of record at default QoS: **59 result lines, 2185 passed (2183 − 2 + 4), 2 failed, 2 ignored**.
+- Under `-b`: 2184 / 3.
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M45 | the lead's re-testing mutant: `on_pin_departed` also queues the next HIGHER live pin | the counter test FAILS. Either `visits` exceeds 100 (P2's cold bucket is processed), or in debug the "a live pin's bucket was queued" assertion fires |
+| M46 | hand-down is replaced by free | the hand-down test FAILS (P1 no longer names `h`); W2 FAILS (the chain pin's version is freed) |
+| M47 | the bucket-emptied check is dropped, so drained pins stay queued | W4 FAILS (`pending` not empty after 50 publishes); `..._charges_one_unit_per_entry_and_drains` FAILS |
+| M48 | `sweep_pending` ignores its budget | W4 FAILS (0 left after the departure); `..._charges_one_unit...` FAILS |
+
+Amendment 12's M35 and M36 are retired with their tests.
