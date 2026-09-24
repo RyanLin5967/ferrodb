@@ -966,7 +966,8 @@ impl Reaper for TwoTierReaper {
         // steady-state sweep no longer runs. Armed here, any exit or panic from this point leaves
         // them in the residue. An exit before the mark records them too, which is harmless: their
         // owner reads `Reaping`, not gone, so the residue sweep examines them and frees nothing.
-        let own_arenas = DeferTouched::armed(self, rec.arenas.iter().copied().collect());
+        // MUTANT (fire-check only, never land): the seed is armed only after the Reaped mark.
+        let own_seed: BTreeSet<ArenaId> = rec.arenas.iter().copied().collect();
 
         if !self.catalog.has_live_children(rec.branch_id.id)? {
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
@@ -1003,6 +1004,7 @@ impl Reaper for TwoTierReaper {
         // `parent_id` and `fork_epoch`, none of which this transition touches, and a hand-applied
         // copy of the catalog's bookkeeping is a second place for it to drift.
         self.catalog.set_state(rec.branch_id, BranchState::Reaping, BranchState::Reaped)?;
+        let own_arenas = DeferTouched::armed(self, own_seed);
         self.detach_from_parent(&rec)?;
         self.catalog.release_id(rec.branch_id.id);
 
