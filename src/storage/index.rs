@@ -62,9 +62,10 @@
 //! exception, D233:** unlinking an emptied leaf write-latches its LEFT neighbour, then its RIGHT one
 //! while still holding the left, to splice the chain, all while holding the root-to-leaf path.
 //! `remove_and_unlink` argues why that cannot cycle, and states the premises the argument needs:
-//! no holder of a leaf latch waits on another page latch while holding it (it may wait inside the
-//! buffer pool, which takes none); every other writer that could first needs the root latch this
-//! thread holds, which requires one shared root cell; and the chain names no page twice.
+//! no READER and no fast-path writer waits on another page latch while holding a leaf latch (either
+//! may wait inside the buffer pool, which takes none); the two holders that do wait, a splitter on
+//! its `old_next` and another unlinker, first need the root latch this thread holds, which requires
+//! one shared root cell (review 3 L3); and the chain names no page twice, nor a page on the path.
 //!
 //! # What this does NOT make safe, stated rather than implied
 //!
@@ -337,7 +338,10 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// to say "leaves never go underfull", which was never what made it safe and stopped being
     /// true at D233: `delete` now takes an emptied leaf out of the tree, and it does so WITHOUT
     /// freeing the page (`delete_unlinking`), precisely so that this sentence keeps holding. A
-    /// reader that lands on an unlinked leaf finds it empty and walks its intact `next`.
+    /// reader that lands on an unlinked leaf finds it empty and walks its intact `next`. (After
+    /// D225 merges, `release_unpublished` also frees the pages of a refused split. They were never
+    /// published, so no reader ever held their ids, and the sentence holds for every page a reader
+    /// can reach; review 3 L8.)
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         const RESTARTS: usize = 16;
         const RIGHT_WALK: usize = 64;
@@ -769,8 +773,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     ///   `prev`. That is a cycle. It is unreachable today, because `delete`'s only caller is the
     ///   branch catalog, which owns one manager; see the module's "What this does NOT make safe".
     /// - The pool never takes a page latch (enforced in debug builds only, `page_latch.rs`).
-    /// - The chain is consistent: `prev != next`, and neither is the leaf. That one is checked
-    ///   above, before any latch, because latches are not re-entrant.
+    /// - The chain is consistent: `prev != next`, neither is the leaf, and neither is a page on the
+    ///   descent path (review 3 L2). That one is checked below, before any neighbour's latch, because
+    ///   latches are not re-entrant.
     fn remove_and_unlink(&self, leaf_id: u32, stack: &[u32], key: &K) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
         leaf.remove_entry(key)?;
@@ -787,6 +792,17 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             return Err(FerroError::Io(format!(
                 "page {leaf_id}'s neighbours are prev {:?} and next {:?}: a chain that names one page \
                  twice is inconsistent, so the unlink is refused and nothing is written",
+                leaf.prev, leaf.next
+            )));
+        }
+        // Review 3 L2: nor may a neighbour be a page on the descent path. This thread holds every
+        // page in `stack` in WRITE, so a neighbour naming one of them would wait on itself exactly as
+        // above. Only arbitrary corruption produces it (no tree page is freed and reused, so a leaf's
+        // id never becomes an internal page's); the check is O(height).
+        if let Some(on_path) = [leaf.prev, leaf.next].into_iter().flatten().find(|p| stack.contains(p)) {
+            return Err(FerroError::Io(format!(
+                "page {leaf_id}'s neighbours are prev {:?} and next {:?}, and page {on_path} is on its own \
+                 descent path: the chain is inconsistent, so the unlink is refused and nothing is written",
                 leaf.prev, leaf.next
             )));
         }

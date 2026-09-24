@@ -1020,26 +1020,30 @@ impl BranchCatalog for TableBranchCatalog {
                 }
                 // Stale, or (review 2 G9 (a)) unreadable: skipped, counted and removed. Never a
                 // reason to fail this fork, and with it every later fork that meets the same entry.
+                // Any `Err` counts, a transient I/O error included, so a VALID slot's FREE_ID can be
+                // removed here: that slot then leaks, silently but for `stale_free_ids_skipped`. It
+                // is the chosen side (review 3 L5): a leaked slot costs one record, and a refusal
+                // would repeat on every later fork that met the same entry.
                 Ok(None) | Err(_) => stale.push(k),
             }
-        }
-        for k in &stale {
-            self.stale_free_ids.fetch_add(1, Ordering::Relaxed);
-            self.remove_if_present(k)?;
         }
 
         // `reused` decides which writer runs below, and it is the whole safety condition for
         // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
         // deadline keys, so its keys are NOT new.
         // The record was read and the decision made above; every key removal comes after (A8).
-        let (child_num, generation, reused) = match recycled {
-            Some((id, rec)) => {
-                self.remove_if_present(&keys::free_id(id))?;
-                (id, rec.generation(), true)
-            }
+        let (child_num, generation, reused) = match &recycled {
+            Some((id, rec)) => (*id, rec.generation(), true),
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
         };
         let child_id = BranchId::new(child_num, generation);
+        // Review 3 §6 N1: the child is BUILT before any key is removed. `fork_child_from_core`
+        // refuses a parent that is not `Live`, and fork's own gate (`check_readable`) accepts
+        // `Quarantined`, so a removal made before it stayed in the pool when it refused: the chosen
+        // slot was stranded, neither live nor free, one more per retried fork. After this point
+        // nothing refuses on the parent's state; what can still fail after a removal is the catalog
+        // tree's own I/O, which has no WAL (D229). A refused FRESH fork still burns the id number
+        // `fetch_add` took above; that writes no key and strands no slot, as at `9aa6968`.
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
@@ -1047,6 +1051,14 @@ impl BranchCatalog for TableBranchCatalog {
                 fork_epoch,
                 lease,
             )?;
+
+        for k in &stale {
+            self.stale_free_ids.fetch_add(1, Ordering::Relaxed);
+            self.remove_if_present(k)?;
+        }
+        if reused {
+            self.remove_if_present(&keys::free_id(child_num))?;
+        }
 
             if reused {
                 self.write_record(&child, None)?;
