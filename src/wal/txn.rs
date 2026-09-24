@@ -2230,30 +2230,46 @@ use super::*;
             "an index undo failed and nothing counted it: the failure is silent"
         );
     }
-    /// **D234 — a checkpoint that a pin kept from truncating re-appends no declaration.**
+    /// **D234 — a checkpoint that a pin kept from truncating re-appends no run, and the schema only
+    /// once a pin has passed the last declaration of it.**
     ///
-    /// `WalManager::truncate` keeps the whole log while any pin sits below its end (a backup, a
+    /// `WalManager::truncate` keeps the whole log while any pin sits below its end (a base backup, a
     /// snapshot handoff, a change stream's cursor), and `checkpoint_locked` re-appended every DDL and
-    /// run declaration regardless. The kept log already holds them, so each such checkpoint only grew
-    /// the log, by every declaration: O(M) per checkpoint, O(M²) over a pinned period, and all of it
-    /// replayed by recovery. One committed transaction per round stands in for real work, and the
-    /// range the pinned checkpoints wrote must hold no declaration at all. Then the pin is released,
-    /// and the next checkpoint must truncate and re-declare every run and the table; otherwise
-    /// "re-declares nothing" would pass against a checkpoint that simply lost them. The table is
-    /// there so the DDL half is held to the rule separately from the run half (the D234
-    /// adversary's F1: with no table, `replay_schema` appended nothing either way).
+    /// run declaration regardless: O(M) per checkpoint, O(M²) over a pinned period, all of it replayed
+    /// by recovery. The lead's decisions: re-declare after a real truncation as before; at a kept
+    /// checkpoint never the runs (D227 run half, 09:44Z), and the schema only when a pin sits ABOVE
+    /// the last full schema declaration, because a reader starting there cannot see it (09:47Z, on
+    /// lane §10.2: a change-feed consumer following the log would otherwise never learn a table
+    /// declared before its cursor). So it costs O(T) per pin advance past a declaration.
     ///
-    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the pinned-range assertion (every
-    /// round re-appends all 40 run declarations and the table's).
+    /// One committed transaction per round stands in for real work. Phases:
+    /// 1. Under one pin, which sits just above the last declaration: the first kept checkpoint
+    ///    re-declares the schema once, and later ones nothing, because the pin is now below that
+    ///    re-declaration. No run, ever.
+    /// 2. A second pin past it, while the first still lags below: exactly one more schema
+    ///    re-declaration. That is the NEWEST pin deciding. The oldest pin alone would leave the newer
+    ///    reader without the schema (the lane's reading of "above the last declaration" for several
+    ///    readers, stated in the report).
+    /// 3. With the pins released, the checkpoint truncates and re-declares every run and the table,
+    ///    or "re-declares nothing" would pass against a checkpoint that lost them.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the phase-1 assertion: each of the
+    /// 5 rounds re-appends all 40 runs and the table, (200, 5) against (0, 1).
     #[test]
-    fn a_checkpoint_a_pin_kept_from_truncating_re_declares_nothing() {
+    fn a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it() {
         const RUNS: u32 = 40;
         const ROUNDS: usize = 5;
         let (_bp, wal, txn, _dir) = setup();
-        let declarations = |recs: &[LogRecord]| {
-            recs.iter()
-                .filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::RunIdentity { .. } | RecKind::Ddl { .. }))
-                .count()
+        let runs = |recs: &[LogRecord]| {
+            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::RunIdentity { .. })).count()
+        };
+        let tables = |recs: &[LogRecord]| {
+            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::Ddl { .. })).count()
+        };
+        let since = |lsn: u64| -> Vec<LogRecord> { walk_log(&wal).into_iter().filter(|r| r.lsn >= lsn).collect() };
+        let a_round = || {
+            let t = txn.begin().unwrap();
+            txn.commit(t).unwrap();
         };
         for prov in 1..=RUNS {
             txn.declare_run(a_run(prov, &format!("agent-{prov}"))).unwrap();
@@ -2267,46 +2283,65 @@ use super::*;
         })
         .unwrap();
         txn.checkpoint().unwrap();
-        let tables = |recs: &[LogRecord]| {
-            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::Ddl { .. })).count()
-        };
         assert_eq!(
-            (declarations(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
-            (RUNS as usize + 1, 1),
+            (runs(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize, 1),
             "premise failed: the unpinned checkpoint did not declare every run and the table"
         );
 
-        let pin = wal.pin_durable();
+        // Phase 1: one pin, just above the declaration the checkpoint wrote.
+        let lagging = wal.pin_durable();
         let base = wal.base_lsn.load(Ordering::SeqCst);
         let before = wal.next_lsn.load(Ordering::SeqCst);
         for _ in 0..ROUNDS {
-            let t = txn.begin().unwrap();
-            txn.commit(t).unwrap();
+            a_round();
             txn.checkpoint().unwrap();
         }
         assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise failed: a checkpoint truncated past a held pin");
-        let written: Vec<LogRecord> = walk_log(&wal).into_iter().filter(|r| r.lsn >= before).collect();
+        let written = since(before);
         assert!(!written.is_empty(), "premise failed: the rounds wrote nothing, so there is no range to inspect");
         assert_eq!(
-            (declarations(written.as_slice()), tables(written.as_slice())),
-            (0, 0),
-            "{ROUNDS} checkpoints under a held pin re-appended {} declarations, {} of them DDL ({} bytes of \
-             log in all), and the kept log already held every one",
-            declarations(written.as_slice()),
+            (runs(written.as_slice()), tables(written.as_slice())),
+            (0, 1),
+            "{ROUNDS} checkpoints under one held pin wrote (runs, tables) = ({}, {}) declarations in {} bytes: \
+             runs must never be re-declared under a pin, and the schema once, when the pin had passed its \
+             last declaration",
+            runs(written.as_slice()),
             tables(written.as_slice()),
             wal.next_lsn.load(Ordering::SeqCst) - before
         );
 
-        drop(pin);
+        // Phase 2: a newer reader past that re-declaration, while the first still lags below it.
+        a_round();
+        let newer = wal.pin_durable();
+        let before = wal.next_lsn.load(Ordering::SeqCst);
+        a_round();
+        txn.checkpoint().unwrap();
+        a_round();
+        txn.checkpoint().unwrap();
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise failed: a checkpoint truncated past a held pin");
+        let written = since(before);
+        assert_eq!(
+            (runs(written.as_slice()), tables(written.as_slice())),
+            (0, 1),
+            "with a reader past the last schema declaration and another lagging below it, two kept checkpoints \
+             wrote (runs, tables) = ({}, {}): the schema must be re-declared once, for the newer reader",
+            runs(written.as_slice()),
+            tables(written.as_slice())
+        );
+
+        // Phase 3: released, so the checkpoint truncates and re-declares everything retained.
+        drop(lagging);
+        drop(newer);
         txn.checkpoint().unwrap();
         assert!(
             wal.base_lsn.load(Ordering::SeqCst) > base,
-            "premise failed: with the pin released the checkpoint still did not truncate"
+            "premise failed: with the pins released the checkpoint still did not truncate"
         );
         assert_eq!(
-            (declarations(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
-            (RUNS as usize + 1, 1),
-            "the first checkpoint after the pin was released did not re-declare every run and the table"
+            (runs(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize, 1),
+            "the first checkpoint after the pins were released did not re-declare every run and the table"
         );
     }
 }
