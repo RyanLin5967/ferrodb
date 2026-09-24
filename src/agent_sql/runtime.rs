@@ -9232,4 +9232,359 @@ mod tests {
         st.retention.pins.clear();
         st.insert_workspace(BranchId::new(8, 0), ws("b_8", 101, &[]));
     }
+
+    // ---- D194 cost review (Amendment 10): retention by LIVE pins, whatever their age ----------
+    //
+    // `frontier/d194_cost_review.md` @ `9ab4e83`: with an old pin live, or a chain of children
+    // inheriting one pin, the history grew with merges at `4436e7f`. The flat SQL test above held no
+    // live pin between merges, which is the one regime where the oldest-pin rule frees anything.
+    // W1–W3 and C2 name only fields and functions that exist at `0570fe8`; they fail at `4436e7f`.
+
+    /// One statement, parsed.
+    fn parse_one(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// `(Σ entries, Σ capacity, every row's capacity within 2·len + 4)` over every row's history.
+    /// Capacity as well as length: a `Vec` that is drained keeps its allocation.
+    fn history_footprint(st: &State) -> (usize, usize, bool) {
+        let entries = st.version_history.values().map(Vec::len).sum();
+        let capacity = st.version_history.values().map(Vec::capacity).sum();
+        let tight = st.version_history.values().all(|h| h.capacity() <= 2 * h.len() + 4);
+        (entries, capacity, tight)
+    }
+
+    /// `t (id, v)` holding rows `1..=rows` with `v = 10·id`, and a runtime beside it.
+    #[allow(clippy::type_complexity)]
+    fn sql_fixture(
+        name: &str,
+        rows: i32,
+    ) -> (tempfile::TempDir, Arc<BufferPoolManager>, Catalog, Arc<TxnManager>, Arc<AgentRuntime>) {
+        let (dir, bp, mut catalog, txn) = txn_fixture(name);
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut sql = vec!["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);".to_string()];
+        sql.extend((1..=rows).map(|i| format!("INSERT INTO t VALUES ({i}, {});", i * 10)));
+        for q in sql {
+            let out = crate::execution::executor::run(
+                parse_one(&q),
+                &mut catalog,
+                bp.clone(),
+                txn.clone(),
+                &mut main,
+            );
+            if let Err(e) = out {
+                panic!("{q}: {e}");
+            }
+        }
+        (dir, bp, catalog, txn, rt)
+    }
+
+    /// One merge from trunk, the way the lane's harness makes them: fork a pinned branch, add 1 to
+    /// `v` in every row, merge.
+    fn merge_round(rt: &AgentRuntime, ctx: &mut ExecCtx, txn: &TxnManager, rows: i32, run_id: &str) {
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "w", run_id: Some(run_id), model: None, prompt: None },
+                BranchId::TRUNK,
+                txn,
+            )
+            .unwrap()
+            .branch;
+        for id in 1..=rows {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            let n = rt.write(ctx, b, parse_one(&sql)).unwrap();
+            assert_eq!(n, 1, "fixture: {run_id} staged nothing for row {id}");
+        }
+        let report = rt.merge(ctx, b).unwrap();
+        assert!(report.applied_to_target, "fixture: {run_id} did not publish: {:?}", report.outcome);
+    }
+
+    /// **W1: merges beside an OLD live pin leave the history flat.** OLD is pinned before any
+    /// version exists, so it reads none; each merge's own pin reads the version its merge
+    /// supersedes, and must take that entry with it when it seals, even though OLD is older.
+    ///
+    /// At `4436e7f` every merge left one entry per row behind: 20 after merge 10, 80 after 40.
+    #[test]
+    fn version_history_stays_flat_under_merges_beside_an_old_pin() {
+        const ROWS: i32 = 2;
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("w1", ROWS);
+        let old = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "old", run_id: Some("old"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        let census = || {
+            let st = rt.state.lock().unwrap();
+            (history_footprint(&st), st.versions.len(), st.workspaces.len())
+        };
+        let mut after_ten = None;
+        for i in 1..=40 {
+            merge_round(&rt, &mut ctx, &txn, ROWS, &format!("w{i}"));
+            if i == 10 {
+                after_ten = Some(census());
+            }
+        }
+        let ((e10, c10, tight10), ..) = after_ten.unwrap();
+        let ((e40, c40, tight40), rows, live) = census();
+        assert_eq!(live, 1, "fixture: OLD should be the one live branch");
+        assert!(rt.state.lock().unwrap().workspaces.contains_key(&old), "fixture: OLD is not live");
+        assert_eq!(rows, ROWS as usize, "fixture: every row should have a published version");
+        assert_eq!(
+            e40, e10,
+            "`version_history` went from {e10} entries after 10 merges to {e40} after 40, beside one \
+             old pin that reads none of them: it grows with merges"
+        );
+        assert!(e40 <= rows, "{e40} entries for {rows} rows, and no live pin reads an old version");
+        assert!(tight10 && tight40, "a row keeps capacity beyond 2·len + 4");
+        assert_eq!(c40, c10, "capacity grew from {c10} to {c40} with merges");
+    }
+
+    /// **W2: a chain of children inheriting ONE pin leaves the history flat.** Each round forks a
+    /// child from the chain's head, abandons the head and runs one merge from trunk, so never more
+    /// than three branches are live while the pin itself lives for every merge. The pin reads one
+    /// old version of each row; everything the merges' own pins read must go when they seal.
+    ///
+    /// At `4436e7f` the inherited pin held the horizon, and the history grew with every round.
+    #[test]
+    fn version_history_stays_flat_under_a_chain_that_inherits_one_pin() {
+        const ROWS: i32 = 2;
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("w2", ROWS);
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        merge_round(&rt, &mut ctx, &txn, ROWS, "w0");
+        let mut head = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "chain", run_id: Some("c0"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let s0 = rt.state.lock().unwrap().workspaces[&head].fork_seq;
+        let footprint = || history_footprint(&rt.state.lock().unwrap());
+        let mut at_ten = None;
+        for i in 1..=40 {
+            let run = format!("c{i}");
+            let child = rt
+                .begin_session_pinned(
+                    RunIdentity { agent_id: "chain", run_id: Some(&run), model: None, prompt: None },
+                    head,
+                    &txn,
+                )
+                .unwrap()
+                .branch;
+            rt.abandon(head).unwrap();
+            head = child;
+            merge_round(&rt, &mut ctx, &txn, ROWS, &format!("w{i}"));
+            if i == 10 {
+                at_ten = Some(footprint());
+            }
+        }
+        let (e10, _, tight10) = at_ten.unwrap();
+        let (e40, _, tight40) = footprint();
+        let st = rt.state.lock().unwrap();
+        assert_eq!(st.workspaces.len(), 1, "fixture: only the chain's head should be live");
+        assert_eq!(st.workspaces[&head].fork_seq, s0, "fixture: the head does not hold the inherited pin");
+        // Per row: the version the pin reads, the newest, and garbage below half the row.
+        let bound = 3 * ROWS as usize;
+        assert!(
+            e10 <= bound && e40 <= bound,
+            "`version_history` holds {e10} entries after 10 rounds and {e40} after 40; one live pin \
+             reads one old version per row, so at most {bound}"
+        );
+        assert!(tight10 && tight40, "a row keeps capacity beyond 2·len + 4");
+        // Bounded, and still exact for the pin that is live: the version it read is the newest one
+        // at or below it, read here from `applied`, not from the history under test.
+        let tbl = table_id("t");
+        for id in 1..=ROWS as u64 {
+            let want = st
+                .applied
+                .iter()
+                .filter(|a| a.tbl == tbl && a.row == RowId(id) && a.seq <= s0)
+                .map(|a| a.seq)
+                .max();
+            assert!(want.is_some(), "fixture: row {id} had no version before the pin");
+            assert_eq!(
+                st.version_seen(tbl, RowId(id), Some(s0)).map(|v| v.begin_ts),
+                want,
+                "the chain's pin no longer names the version of row {id} it read"
+            );
+        }
+    }
+
+    /// **W3: an entry goes when its LAST reader leaves, even with an older pin live, and its
+    /// capacity goes with it.** Fifty pins each read a different version of one row. Pins 50..2
+    /// leave; only pin 1's version and the newest are still read by anyone.
+    ///
+    /// At `4436e7f` nothing was freed while pin 1, the oldest, lived: 51 entries.
+    #[test]
+    fn version_history_frees_an_entry_when_its_last_reader_leaves_and_returns_the_capacity() {
+        let mut st = State::default();
+        publish_next(&mut st, 1);
+        for j in 1..=50u64 {
+            let at = st.apply_seq;
+            st.insert_workspace(BranchId::new(j, 0), pinned(&format!("b_{j}"), 100 + j, at));
+            publish_next(&mut st, 1);
+        }
+        // Premise: pin j was taken right after version j was published, so it reads version j.
+        for j in [1u64, 25, 50] {
+            assert_eq!(
+                st.version_seen(TableId(1), RowId(1), Some(j)).map(|v| v.begin_ts),
+                Some(j),
+                "fixture: pin {j} does not read version {j}"
+            );
+        }
+        for j in (2..=50u64).rev() {
+            assert!(st.remove_workspace(&BranchId::new(j, 0)).is_some(), "fixture: b_{j} not live");
+        }
+        let h = &st.version_history[&(1, 1)];
+        assert!(
+            h.len() <= 3,
+            "row 1 holds {} entries with one live pin; it reads version 1, and the newest is 51, so at \
+             most 3 (dead below half the row)",
+            h.len()
+        );
+        assert!(
+            h.capacity() <= 2 * h.len() + 4,
+            "row 1 keeps capacity {} for {} entries",
+            h.capacity(),
+            h.len()
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(1)).map(|v| v.begin_ts),
+            Some(1),
+            "freeing took the version pin 1 reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        let h = &st.version_history[&(1, 1)];
+        assert_eq!(h.len(), 1, "no pin left: the newest entry alone");
+        assert!(h.capacity() <= 6, "row 1 keeps capacity {} for one entry", h.capacity());
+    }
+
+    /// A provenance store whose `fail_at`-th `stamp_row` fails. Everything else is the in-memory
+    /// store's.
+    struct FailingStamps {
+        inner: MemProvenanceStore,
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl ProvenanceStore for FailingStamps {
+        fn intern(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+            self.inner.intern(run)
+        }
+        fn lookup(&self, id: ProvId) -> Result<RunEntity, FerroError> {
+            self.inner.lookup(id)
+        }
+        fn attribute(&self, rid: crate::storage::heap_file_manager::RecordId) -> Result<ProvId, FerroError> {
+            self.inner.attribute(rid)
+        }
+        fn stamp(
+            &self,
+            rid: crate::storage::heap_file_manager::RecordId,
+            id: ProvId,
+        ) -> Result<(), FerroError> {
+            self.inner.stamp(rid, id)
+        }
+        fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
+            self.inner.page_dictionary_lens()
+        }
+        fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.fail_at {
+                return Err(FerroError::Internal("injected stamp failure".into()));
+            }
+            self.inner.stamp_row(table, row, id)
+        }
+        fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+            self.inner.row_author(table, row)
+        }
+        fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+            self.inner.attributed_rows(table)
+        }
+        fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+            self.inner.forget_table(table)
+        }
+    }
+
+    /// **C2: an author stamp that fails after the publish committed leaves every version
+    /// recorded** (Amendment 10, decision 7). The stamp is the one fallible call in
+    /// `record_applied`, and it used to sit inside the loop that records versions, so an error
+    /// there left the rows committed and the later ones unnamed: exact reads of them would name
+    /// the version before, with nothing to refuse them.
+    ///
+    /// At `4436e7f` the second stamp's failure returned before row 3's version was recorded.
+    #[test]
+    fn record_applied_records_every_version_before_a_failed_stamp() {
+        let (_dir, bp, mut catalog, txn) = txn_fixture("c2");
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut run_main = |sql: &str, catalog: &mut Catalog| {
+            crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), &mut main)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        run_main("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog);
+        for id in 1..=3 {
+            run_main(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog);
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+        }
+        // Premise: the publish had committed, so main shows every update.
+        let rows = match run_main("SELECT id, v FROM t;", &mut catalog) {
+            crate::execution::executor::Outcome::Rows(r) => r,
+            _ => panic!("fixture: expected rows"),
+        };
+        for row in &rows {
+            match (&row[0], &row[1]) {
+                (Value::Integer(id), Value::Integer(v)) => {
+                    assert_eq!(*v, id * 10 + 1, "fixture: row {id} was not published")
+                }
+                other => panic!("fixture: not an (INTEGER, INTEGER) row: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 3, "fixture: expected three rows");
+        let st = rt.state.lock().unwrap();
+        let tbl = table_id("t");
+        for id in 1..=3u64 {
+            assert!(
+                st.versions.contains_key(&(tbl.0, id)),
+                "row {id} was published and committed, but its version was never recorded: an exact \
+                 read of it names the version before, and nothing refuses that read"
+            );
+        }
+    }
 }
