@@ -35,7 +35,10 @@ set -u
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=74de46bc41e2f7929a064fe5c0365cab0210347d
+# The source the control runs and every arm returns to: `bb7cd7c` (review 4 B3.1, the load_state hold) on
+# `74de46b`. Its src/ equals the tip's.
+SUBJECT_SHA=bb7cd7c158f1c1fce30a03c7833ee75f8eb800ae
+R4=74de46bc41e2f7929a064fe5c0365cab0210347d
 OUT=bench/d232/firecheck
 
 A=branch::arena::tests
@@ -104,7 +107,8 @@ ARMS=(
   "d232-mut-load-reserved-from-field|45c34569ceb23fda6ec10779d4cb2dbfb9cb7af7|d232|31|$B2_LOAD"
 )
 # The base each mutant sits on, for the reader: the first twelve on $D95, the next five on $AE3, the ladder
-# mutant on $T08, the last two on SUBJECT_SHA. Checked in the real mode (a mutant's parent must be its base).
+# mutant on $T08, the last two on $R4 (review 4's fix, one commit below SUBJECT_SHA). Checked in the real mode
+# (a mutant's parent must be its base).
 BASES=(
   "d232-mut-catalog-first|$D95" "d232-mut-publish-unpersisted|$D95" "d232-mut-refusal-memory-only|$D95"
   "d232-mut-no-takeback|$D95" "d232-mut-giveback-after|$D95" "d232-mut-no-owner-check|$D95"
@@ -113,7 +117,7 @@ BASES=(
   "d232-mut-reserve-after-persist|$AE3" "d232-mut-reserve-no-undo|$AE3" "d232-mut-rewrite-drops-flag|$AE3"
   "d232-mut-drain-no-owner-check|$AE3" "d232-mut-drain-releases-into-gone|$AE3"
   "d232-mut-rewrite-keeps-image-zero|$T08"
-  "d232-mut-image-reserved-from-counter|$SUBJECT_SHA" "d232-mut-load-reserved-from-field|$SUBJECT_SHA"
+  "d232-mut-image-reserved-from-counter|$R4" "d232-mut-load-reserved-from-field|$R4"
 )
 # label|test (full path)|text its panic block must contain. Registered where the failing claim was traced.
 MSGS=(

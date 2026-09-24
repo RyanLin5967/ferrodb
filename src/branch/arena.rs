@@ -1529,13 +1529,24 @@ impl ArenaPageStore {
         // restores is the one that means the accounting never has to be reasoned about from
         // outside: `image_bytes == 0` iff this process has not written the image, so the next
         // persist is a full rewrite and the file is ours again.
-        {
-            let mut g = self.persist.lock().unwrap();
-            g.image_bytes = 0;
-            // **D263.** The map being installed is the authority over every range now, so a range
-            // quarantined against the map it replaces has nothing left to wait for.
-            g.quarantine.clear();
-        }
+        //
+        // **D232 review 4 B3.1 (D263 review 1 F1): and HELD until this function returns.** It was
+        // a temporary, released at once, and everything below ran without it. A claim that took
+        // `persist` in between could reserve from the free list or watermark this call replaces
+        // and insert into whichever map was live, so two extents covered one range, and its own
+        // rewrite made that durable. A free could remove an extent from the replaced map and give
+        // its range to the installed free list. Held from here to the end, the whole install sits
+        // between two claims or frees. Everything above this line only parses `bytes`, so the
+        // O(image) checksum stays outside the hold. The order is a claim's: `persist`, then
+        // `state`, then `free_extents` and the grant counters.
+        let mut persist = self.persist.lock().unwrap();
+        persist.image_bytes = 0;
+        // **D263.** The map being installed is the authority over every range now, so a range
+        // quarantined against the map it replaces has nothing left to wait for. Cleared in the
+        // hold above, which lasts to the end of the install (D263 review 1 F1): cleared in a hold
+        // of its own, a free or claim failing after it and before the install pushed a range the
+        // clear never saw, and the next fold listed it free in the installed map.
+        persist.quarantine.clear();
         let mut st = self.state.lock().unwrap();
         *st =
             // **D85: every restored extent's fill is SUSPECT until probed.**
@@ -1573,6 +1584,8 @@ impl ArenaPageStore {
         // never returned to the leader — but it is re-stamped with the authority in force now, so
         // a later `join` still invalidates it.
         self.space.recycle_epoch.store(crate::cluster::epoch(), Ordering::SeqCst);
+        // Released only here: see B3.1 above.
+        drop(persist);
         Ok(())
     }
 
