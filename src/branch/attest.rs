@@ -800,8 +800,8 @@ pub struct AttestedHistory {
     /// without its head the only link on hand is genesis.
     /// Every reader of its history goes through `entries`: the chain walks, both proofs,
     /// `verify_against`, and the runtime's `attested_entries`. The only reader of `by_branch` was
-    /// `verify_branch`, which used one element per key and now finds it with a reverse scan
-    /// inside a walk that is already O(n). Size: O(live branches), including trunk.
+    /// `verify_branch`, which used one element per key and now tracks it in the one O(n) pass it
+    /// already makes over the log. Size: O(live branches), including trunk.
     heads: HashMap<BranchId, Tip>,
     /// Merkle levels; `levels[0]` is the leaf hashes. Maintained incrementally so that `append` is
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
@@ -1181,7 +1181,15 @@ impl AttestedHistory {
     ///
     /// The walk crosses fork boundaries: reaching a [`BranchOp::Fork`] continues at whichever entry
     /// produced the attestation it names, which is an entry of the **parent** branch. That is the
-    /// ancestry property, and it is O(depth of that branch's history), not O(log).
+    /// ancestry property. The walk is O(depth of that branch's history).
+    ///
+    /// **The function is O(n) in the whole log, and has to be.** Resolving a `prev` to the entry
+    /// that produced it needs an attestation → index map over every entry, since a walk can cross
+    /// into any ancestor. That map is built here, one hash per entry, because keeping it resident
+    /// would cost Θ(n) memory, the class wall #19 removed. The branch's last entry is found in
+    /// **the same pass** rather than through a per-branch index: a reaped branch has no entry in
+    /// the live index, and a positions index over every branch is exactly what wall #19 removed.
+    /// So no second scan exists (the lead's audit of `79b49de` found `rposition` as one).
     /// ⛔ **A branch with no entries is a finding, not a walk of length zero.** This used to
     /// return `Ok(0)` for an unknown branch, so `history.verify_branch(b)?` — the obvious way to
     /// ask "has b's history been tampered with" — answered *yes, verified* for a branch whose
@@ -1190,14 +1198,15 @@ impl AttestedHistory {
     pub fn verify_branch(&self, branch: BranchId) -> Result<usize, TamperFinding> {
         let genesis = Attestation::genesis();
         let mut produced: HashMap<[u8; 32], usize> = HashMap::new();
+        // The branch's last entry, tracked in the one pass that is required anyway (see above).
+        let mut last: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             produced.insert(e.attestation().0, i);
+            if e.branch == branch {
+                last = Some(i);
+            }
         }
-        // The branch's last entry, found by a reverse scan rather than an index (wall #19): a
-        // reaped branch has no head, and a per-branch index of positions grew with every event
-        // for the sake of this one lookup. The loop above already hashes every entry, so a scan
-        // that only compares ids does not change this function's O(n).
-        let last = match self.entries.iter().rposition(|e| e.branch == branch) {
+        let last = match last {
             Some(last) => last,
             None => return Err(TamperFinding::NoSuchBranch { branch }),
         };
