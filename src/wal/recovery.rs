@@ -535,7 +535,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // recent writes were not replayed, over pages the DROP may have freed. Removed from the catalog
     // WITHOUT freeing: the directory repair above may already have allocated a page the DROP freed,
     // and a second free would hit its new owner. Stated cost: pages the DROP had not freed yet leak,
-    // one table's worth per incomplete DROP (D229's deferred frees own the proper answer).
+    // one table's worth per incomplete DROP. No other mechanism reclaims them: D229 does not defer
+    // DROP's frees (the lead, 2026-09-24), so this cost is D250's, stated.
     for table in logged_drops_the_catalog_missed(&wal, &catalog)? {
         use std::io::Write;
         catalog.forget_dropped_table(&table)?;
