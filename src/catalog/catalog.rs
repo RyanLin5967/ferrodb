@@ -63,11 +63,6 @@ pub struct Catalog {
     /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
     /// write statement no longer invalidates every reader's cache.
     epoch: u64,
-    /// D230 review 3, F2: the transaction manager's catalog persist debt, when attached
-    /// (`owe_persists_to`; `open_recovered` does it). `persist` sets it on failure and clears it on
-    /// success, and every checkpoint keeps the log while it is set. `None` for a catalog built
-    /// outside `open_recovered` (tests), which then behaves as before.
-    persist_debt: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Catalog {
@@ -79,11 +74,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
         catalog.load()?;
         Ok(catalog)
     }
@@ -474,36 +469,12 @@ impl Catalog {
             Ok(()) => Ok(()),
             Err(e) => {
                 undo(self);
-                // D230 review 7, F-D: write the restored records back. The refused persist may have
-                // rewritten some catalog pages in the pool before it failed, and it left a persist
-                // owed (F2), which keeps every later log until some persist succeeds. This one
-                // usually does, since the entry that could not be written is gone; if it fails too,
-                // the debt stays set and the log stays kept, which is the safe direction.
-                let _ = self.persist();
                 Err(e)
             }
         }
     }
 
-    /// Share the transaction manager's catalog persist debt with this catalog (D230 review 3, F2).
-    /// From here on a failed `persist` marks a persist as owed and a successful one clears it, and
-    /// `TxnManager::checkpoint_or_keep_held` keeps the log while one is owed.
-    pub fn owe_persists_to(&mut self, debt: Arc<std::sync::atomic::AtomicBool>) {
-        self.persist_debt = Some(debt);
-    }
-
-    /// Write every table's record to the catalog pages, and settle the persist debt either way (D230
-    /// review 3, F2): owed after a failure, cleared after a success. A successful persist rewrites
-    /// every catalog page from the in-memory records, so the page it leaves in the pool is current.
     pub fn persist(&self) -> Result<(), FerroError> {
-        let written = self.write_pages();
-        if let Some(debt) = &self.persist_debt {
-            debt.store(written.is_err(), Ordering::SeqCst);
-        }
-        written
-    }
-
-    fn write_pages(&self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
         // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
@@ -516,16 +487,12 @@ impl Catalog {
         let mut iter = sorted.into_iter().peekable();
 
         loop {
-            // D230 review 8/9 (R8-1, R9-5): a `crate::cow::PageHandle`, the existing pin guard. Its own
-            // doc records that every pin leak in this codebase came from a hand-written unpin on an
-            // error path, and this loop had one on every `?` between a fetch and its unpin: one leaked
-            // pin per refused persist (`tests/d141_long_identifier.rs`). A pinned page cannot be freed,
-            // so a later `drop_table`,
-            // or a persist that orphans the page, failed with `PagePinned`. The handle unpins on every
-            // return, and marks the page dirty only through `write()`. In `h.write().data = x?` the
-            // right side is evaluated first, so a failed serialize never marks the page dirty.
-            let handle = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), curr_page_id)?;
-            let mut page = CatalogPage::deserialize(handle.read().data)?;
+            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
+
+            let mut page = {
+                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                CatalogPage::deserialize(frame.data)?
+            };
 
             page.entries.clear();
             page.num_entries = 0;
@@ -550,8 +517,12 @@ impl Catalog {
                     // byte 0 was never read; now that the byte is the format stamp (B8), the choice
                     // is between initialising the page here and teaching the format allowlist to
                     // accept all-zeroes, which would let a genuinely corrupt page through.
-                    let stamped = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), new_id)?;
-                    stamped.write().data = CatalogPage::new(new_id).serialize()?;
+                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
+                    {
+                        let mut frame = self.buffer_pool.frame_write(frame_i);
+                        frame.data = CatalogPage::new(new_id).serialize()?;
+                    }
+                    self.buffer_pool.unpin_page(new_id, true);
                     page.next_catalog_page = new_id;
                 }
             } else {
@@ -560,15 +531,23 @@ impl Catalog {
             }
 
             let next = page.next_catalog_page;
-            handle.write().data = page.serialize()?;
-            drop(handle);
+
+            {
+                let mut frame = self.buffer_pool.frame_write(frame_i);
+                frame.data = page.serialize()?;
+            }
+            self.buffer_pool.unpin_page(curr_page_id, true);
 
             if !has_more {
                 let mut free_id = orphan_head;
                 while free_id != 0 {
-                    let orphan = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), free_id)?;
-                    let next_orphan = CatalogPage::deserialize(orphan.read().data)?.next_catalog_page;
-                    drop(orphan);
+                    let frame_i = self.buffer_pool.fetch_page(free_id)?;
+                    let next_orphan = {
+                        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                        CatalogPage::deserialize(frame.data)?.next_catalog_page
+                    };
+
+                    self.buffer_pool.unpin_page(free_id, false);
                     self.buffer_pool.delete_page(free_id)?;
                     free_id = next_orphan;
                 }

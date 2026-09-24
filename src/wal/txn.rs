@@ -161,15 +161,6 @@ pub struct TxnManager {
     /// discard the release. A two-fault residual: a quarantine that could not be written, then a
     /// restart, then a page that cannot be read.
     unrecorded: Mutex<Vec<(u64, RetiredSlot, String)>>,
-    /// **D230 review 3, F2 (the lead's decision): a catalog persist is OWED.** A persist failed and
-    /// none has succeeded since, so the catalog page on disk may name a root the trees have left
-    /// (`sync_roots` records every moved root in memory even when its persist fails). A checkpoint
-    /// that flushed that page and truncated the log would leave the next open nothing to recover,
-    /// so it would not rebuild and would read the stale root. While this is set, every checkpoint
-    /// keeps the log (`checkpoint_or_keep_held`), and the next open recovers and rebuilds every index
-    /// from the heap. Shared with the catalog (`Catalog::owe_persists_to`, attached by
-    /// `open_recovered`), whose `persist` sets it on failure and clears it on success.
-    catalog_persist_owed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -249,11 +240,10 @@ pub fn stored_mismatch_lines() -> u64 {
     STORED_MISMATCH_LINES.load(Ordering::Relaxed)
 }
 
-/// Checkpoints that did not truncate the log, since process start. Four kinds are counted:
+/// Checkpoints that did not truncate the log, since process start. Three kinds are counted:
 /// - checkpoints that flushed every page and synced, but KEPT the log because releases are owed.
 ///   Any caller counts: the automatic trigger, a DDL, an open, or an explicit `checkpoint`, which
 ///   also returns its refusal.
-/// - the same, KEPT because a catalog persist is owed (D230 review 3, F2; `KeptForCatalog`).
 /// - automatic checkpoints that FAILED.
 /// - checkpoints whose truncation a WAL pin cancelled: `WalManager::truncate` keeps the log, and
 ///   answers `Ok`, while a pin is below its end (review 4's finding 5).
@@ -279,10 +269,6 @@ pub enum CheckpointOutcome {
     Truncated,
     /// The log was KEPT for this many releases still owed (F2).
     KeptForOwed(usize),
-    /// The log was KEPT because a catalog persist is owed and no release is: one failed and none
-    /// has succeeded since, so the catalog page on disk may name a root the trees have left (D230
-    /// review 3, F2). The next open recovers and rebuilds every index from the heap.
-    KeptForCatalog,
     /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
     /// and answers `Ok`, while one is held).
     KeptByPin,
@@ -498,7 +484,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), catalog_persist_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -995,7 +981,7 @@ impl TxnManager {
             match self.checkpoint_keeping_owed() {
                 Ok(CheckpointOutcome::Truncated) => {}
                 // Counted where the log was kept (`checkpoint_or_keep_held`).
-                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptForCatalog | CheckpointOutcome::KeptByPin) => {
+                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptByPin) => {
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst)
                 }
                 Err(e) => {
@@ -1696,15 +1682,11 @@ impl TxnManager {
     ///   `9aa6968` too (lane §21.6, `rollback-review4` and the D216 lane). New pins are held off
     ///   (`WalManager::fence_pins`) from this check through the truncation, so none can land between.
     /// - a poisoned log, whose flush is refused, so the checkpoint would fail after the drop.
-    /// - an owed catalog persist (D230 review 7, F-B): every checkpoint keeps the log while one is
-    ///   owed, so the DROP's truncation would hang on its own persist, which runs after its frees.
     ///
     /// **Stated:** while one table owes a release that never succeeds, or a reader stays pinned
-    /// behind the log's end, no OTHER table can be dropped; and while a catalog persist is owed, no
-    /// table can be dropped (under D249's ALTER wedge, that is until a restart). A checkpoint that
-    /// fails after the drop for a reason not visible beforehand (an I/O error in the flush or the
-    /// truncation) still leaves the dropped table's records in the log: D229, whose deferred frees
-    /// retire this interim rule.
+    /// behind the log's end, no OTHER table can be dropped. A checkpoint that fails after the drop
+    /// for a reason not visible beforehand (an I/O error in the flush or the truncation) still leaves
+    /// the dropped table's records in the log: D229, whose deferred frees retire this interim rule.
     pub fn drop_checkpointed<T>(
         &self,
         frees: &[u32],
@@ -1744,22 +1726,6 @@ impl TxnManager {
                      needs could not truncate it, and the next open would replay the dropped table's \
                      records onto pages the DROP freed; retry once the reader has moved on"
                 )));
-            }
-            // D230 review 7, F-B: while a catalog persist is owed, every checkpoint keeps the log
-            // (F2). A DROP's truncation then depends on its own persist clearing the debt, and
-            // `drop_table` frees its pages on disk BEFORE that persist. If it fails too, the kept log
-            // replays the dropped table's records onto the freed pages at the next open. So it is
-            // refused before its mutation, like the releases owed elsewhere below. (A DROP whose own
-            // persist is the FIRST to fail cannot be refused beforehand: that is `drop_table`'s
-            // free-before-persist order, D229's.)
-            if self.catalog_persist_owed() {
-                return Err(FerroError::Wal(
-                    "DROP refused: a catalog persist failed and none has succeeded since, so every \
-                     checkpoint keeps the log, and a DROP needs its checkpoint to truncate it, or the \
-                     next open would replay the dropped table's records onto pages the DROP freed; \
-                     retry after a statement whose catalog persist succeeds, or after a restart"
-                        .into(),
-                ));
             }
             let elsewhere =
                 self.pending_releases.lock().unwrap().iter().filter(|(_, r)| !frees.contains(&r.dir_root)).count();
@@ -1840,9 +1806,8 @@ impl TxnManager {
         self.checkpoint_or_keep_locked(true).map(|_| ())
     }
 
-    /// The body of `checkpoint`: a checkpoint that keeps the log for owed releases, or for an owed
-    /// catalog persist (D230 review 3, F2), is REFUSED here, after it flushed. Takes no `att`;
-    /// `checkpoint` asks it first.
+    /// The body of `checkpoint`: a checkpoint that keeps the log for owed releases is REFUSED here,
+    /// after it flushed. Takes no `att`; `checkpoint` asks it first.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
         match self.checkpoint_or_keep_locked(true)? {
             CheckpointOutcome::Truncated | CheckpointOutcome::KeptByPin => Ok(()),
@@ -1851,22 +1816,14 @@ impl TxnManager {
                  truncating the log would lose the record of the bytes they hold; every page was \
                  flushed and the log is kept, and the next checkpoint retries them"
             ))),
-            CheckpointOutcome::KeptForCatalog => Err(FerroError::Wal(
-                "checkpoint refused: a catalog persist failed and none has succeeded since, so the \
-                 catalog on disk may name a root the trees have left, and truncating the log would \
-                 leave the next open nothing to rebuild from; every page was flushed and the log is \
-                 kept, and the next successful persist clears this"
-                    .into(),
-            )),
         }
     }
 
     /// A checkpoint that answers what it did with the log instead of refusing (a [`CheckpointOutcome`]):
     /// `Truncated`, `KeptForOwed(n)` when every page was flushed and the log KEPT for `n` owed
-    /// releases (retried first), `KeptForCatalog` when it was kept because a catalog persist is owed
-    /// (D230 review 3, F2), or `KeptByPin` when a WAL pin cancelled the truncation. The automatic
-    /// trigger uses it; `checkpoint` turns `KeptForOwed` and `KeptForCatalog` into refusals. Refuses
-    /// while a transaction is open, as `checkpoint` does. (It answered `Ok(0)` for both "truncated" and "kept by a pin"
+    /// releases (retried first), or `KeptByPin` when a WAL pin cancelled the truncation. The automatic
+    /// trigger uses it; `checkpoint` turns `KeptForOwed` into a refusal. Refuses while a transaction
+    /// is open, as `checkpoint` does. (It answered `Ok(0)` for both "truncated" and "kept by a pin"
     /// until review 5's F4.)
     pub fn checkpoint_keeping_owed(&self) -> Result<CheckpointOutcome, FerroError> {
         if !self.att_read().is_empty() {
@@ -1885,17 +1842,6 @@ impl TxnManager {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
         self.checkpoint_or_keep_locked(false)
-    }
-
-    /// The catalog persist debt, to share with the catalog (`Catalog::owe_persists_to`). D230
-    /// review 3, F2; see the field.
-    pub fn catalog_persist_debt(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.catalog_persist_owed)
-    }
-
-    /// Whether a catalog persist is owed now: one failed and none has succeeded since (F2).
-    pub fn catalog_persist_owed(&self) -> bool {
-        self.catalog_persist_owed.load(Ordering::SeqCst)
     }
 
     /// How many releases are owed now: committed, failed, and waiting for a retry (F2). Reads only;
@@ -1945,24 +1891,6 @@ impl TxnManager {
             }
             return Ok(CheckpointOutcome::KeptForOwed(owed));
         }
-        // D230 review 3, F2 (the lead's decision): a catalog persist is owed. Read AFTER the flush, so
-        // a persist that failed while the flush ran is seen too. The flush has already written the
-        // stale catalog page, which is harmless while the log is kept: only the truncation would make
-        // the next open skip its rebuild and read that page, so only the truncation is refused.
-        if self.catalog_persist_owed.load(Ordering::SeqCst) {
-            DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-            if !self.keeping_log.swap(true, Ordering::SeqCst) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ferrodb: checkpoints now flush every page but keep the log: a catalog persist failed \
-                     and none has succeeded since, so the catalog on disk may name a root the trees have \
-                     left, and the next open recovers and rebuilds every index from the heap. This is \
-                     printed again when it clears; `deferred_checkpoints` counts every checkpoint that \
-                     kept the log meanwhile"
-                );
-            }
-            return Ok(CheckpointOutcome::KeptForCatalog);
-        }
         // Read before `truncate`, which keeps the log, and answers `Ok`, while a WAL pin is below its
         // end (review 4's finding 5).
         let base = self.wal.base_lsn.load(Ordering::SeqCst);
@@ -1983,11 +1911,7 @@ impl TxnManager {
             return Ok(CheckpointOutcome::KeptByPin);
         }
         if self.keeping_log.swap(false, Ordering::SeqCst) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "ferrodb: what the log was kept for (owed releases, an owed catalog persist) is settled, and \
-                 checkpoints truncate the log again"
-            );
+            let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");
         }
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.
@@ -3527,82 +3451,6 @@ use super::*;
             "a checkpoint that a pin kept answered as if it had truncated"
         );
         assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
-    }
-
-    /// **D230 review 3, F2 (the lead's decision): a failed catalog persist keeps the log until a
-    /// persist succeeds.** The debt is `TxnManager`'s and the catalog marks it (`open_recovered`
-    /// attaches it in production; this attaches it by hand). The fault is T3's: `first_catalog_page_id`
-    /// pointed at a B+tree page, which `CatalogPage::deserialize` refuses. Red only under a mutant:
-    /// the outcome and the attachment are new.
-    #[test]
-    fn a_failed_catalog_persist_keeps_the_log_until_a_persist_succeeds() {
-        let (_bp, _wal, txn, mut catalog, owned, _dir) = table_to_drop();
-        catalog.owe_persists_to(txn.catalog_persist_debt());
-        let page_one = catalog.first_catalog_page_id;
-        catalog.first_catalog_page_id = owned[2];
-        assert!(catalog.persist().is_err(), "premise failed: the persist did not fail on a B+tree page");
-        assert_eq!(
-            txn.checkpoint_keeping_owed().expect("the checkpoint itself failed"),
-            CheckpointOutcome::KeptForCatalog,
-            "a checkpoint after a failed catalog persist truncated the log: the next open would read the \
-             stale catalog page and rebuild nothing"
-        );
-
-        catalog.first_catalog_page_id = page_one;
-        catalog.persist().expect("premise failed: the persist still fails after the fault cleared");
-        assert_eq!(
-            txn.checkpoint_keeping_owed().expect("the checkpoint itself failed"),
-            CheckpointOutcome::Truncated,
-            "a successful persist must clear the debt, or every later checkpoint keeps the log and every \
-             later open rebuilds every index"
-        );
-    }
-
-    /// **D230 review 7, F-B: a DROP is refused BEFORE its mutation while a catalog persist is owed.**
-    /// Every checkpoint keeps the log while one is owed (F2), and `drop_table` frees its pages on
-    /// disk before its own persist. If that persist failed too, the next open would replay the dropped
-    /// table's records onto the freed pages. The shape of the pin refusal's test above.
-    #[test]
-    fn a_drop_is_refused_before_its_mutation_while_a_catalog_persist_is_owed() {
-        let (bp, _wal, txn, mut catalog, owned, _dir) = table_to_drop();
-        catalog.owe_persists_to(txn.catalog_persist_debt());
-        let page_one = catalog.first_catalog_page_id;
-        catalog.first_catalog_page_id = owned[2];
-        assert!(catalog.persist().is_err(), "premise failed: the persist did not fail on a B+tree page");
-        catalog.first_catalog_page_id = page_one; // the fault clears; the debt stays until a persist succeeds
-        assert!(txn.catalog_persist_owed(), "premise failed: the failed persist left no debt");
-
-        let e = match sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new()) {
-            Err(e) => e,
-            Ok(_) => panic!("DROP ran while a catalog persist was owed, so its checkpoint kept the log it freed pages under"),
-        };
-        assert!(e.to_string().contains("catalog persist"), "the DROP was refused, but not for the owed persist: {e}");
-        assert!(catalog.get_table("t").is_some(), "the refused DROP had already dropped the table");
-        let next = bp.disk_manager.allocate().unwrap();
-        assert!(!owned.contains(&next), "the refused DROP freed page {next} of `t`, which still names it");
-
-        catalog.persist().expect("premise failed: the persist still fails after the fault cleared");
-        sql("DROP TABLE t;", &mut catalog, &bp, &txn, &mut Session::new())
-            .unwrap_or_else(|e| panic!("DROP was refused after a persist cleared the debt: {e}"));
-    }
-
-    /// **D230 review 7, F-D: a refusal `persist_or_undo` undid does not leave a persist owed.** The
-    /// undo restores the in-memory records, and the persist after it rewrites the pages from them, so
-    /// the debt is cleared. Without that, one over-long `CREATE TABLE` (D141) would keep every later
-    /// log until some other persist succeeded: a later CREATE TABLE/INDEX or ALTER, a statement whose
-    /// split moves a root, or the clean exit. DML that splits no root never persists.
-    #[test]
-    fn an_undone_catalog_refusal_does_not_leave_a_persist_owed() {
-        let (bp, _wal, txn, mut catalog, _owned, _dir) = table_to_drop();
-        catalog.owe_persists_to(txn.catalog_persist_debt());
-        let long = "a".repeat(300);
-        let refused = sql(&format!("CREATE TABLE {long} (id INTEGER NOT NULL);"), &mut catalog, &bp, &txn, &mut Session::new());
-        assert!(refused.is_err(), "premise failed: a 300-byte table name was accepted, so nothing was refused and undone");
-        assert!(catalog.get_table(&long).is_none(), "premise failed: the refused table is still in the catalog");
-        assert!(
-            !txn.catalog_persist_owed(),
-            "an undone refusal left a catalog persist owed, so every later checkpoint keeps the log"
-        );
     }
 
     /// **Review 5's F3: a mismatch that is later released does not keep refusing the DROP of its

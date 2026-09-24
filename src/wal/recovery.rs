@@ -454,11 +454,6 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     } else {
         Catalog::create(bp.clone())?
     };
-    // D230 review 3, F2 (the lead's decision): from here on a failed catalog persist is owed on the
-    // transaction manager, and every checkpoint keeps the log until a persist succeeds. Attached
-    // before the rebuild below, whose own persist settles it too. This is the one production open
-    // (`tests/open_path_allowlist.rs`), so every production catalog carries the debt.
-    catalog.owe_persists_to(txn.catalog_persist_debt());
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
     // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
@@ -483,11 +478,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         // rebuild's on-disk frees and the sync (D229's window; lane §21.2). A kept log is counted,
         // and printed when the log-keeping state begins (`TxnManager::checkpoint_or_keep_held`).
         let kept = txn.checkpoint_after_frees()?;
-        if !matches!(
-            kept,
-            crate::wal::txn::CheckpointOutcome::KeptForOwed(_) | crate::wal::txn::CheckpointOutcome::KeptForCatalog
-        ) && stale
-        {
+        if !matches!(kept, crate::wal::txn::CheckpointOutcome::KeptForOwed(_)) && stale {
             if let Err(e) = std::fs::remove_file(&marker) {
                 let _ = writeln!(
                     std::io::stderr(),
