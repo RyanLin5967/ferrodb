@@ -2071,7 +2071,8 @@ fn main() {
                 }
                 // Every handle into the files goes before the child opens them.
                 drop(hd);
-                // What the child is about to replay (A7.1, A7.3), sized after the clean close.
+                // What the child is about to replay (A7.1, A7.3), sized after the close. That close
+                // may have failed since A21.1; its CLOSE line is then in `failures` (A22.7, B4).
                 let bytes = |ext: &str| {
                     std::fs::metadata(format!("{db_path_str}.{ext}")).map(|m| m.len()).unwrap_or(0)
                 };
