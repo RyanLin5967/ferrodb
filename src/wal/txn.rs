@@ -2952,7 +2952,8 @@ use super::*;
         let reader = handoff.txn_id;
 
         // Arm the failure for exactly the `TxnEnd` this close is about to write.
-        wal.fail_next_append.store(true, Ordering::SeqCst);
+        // `1`: the seam is a countdown since lane §21.18; 1 fails the next append, as `true` did.
+        wal.fail_next_append.store(1, Ordering::SeqCst);
 
         let err = txn.end_read_only(reader).expect_err("a failed TxnEnd was reported as success");
         assert!(format!("{err}").contains("injected"), "wrong reason: {err}");
@@ -3507,6 +3508,34 @@ use super::*;
             0,
             "the mismatch found again is still owed: recording it once failed, so no checkpoint truncates the log"
         );
+    }
+
+    /// **Review 7 §8 (lane §21.18 test T8): a commit whose `TxnEnd` cannot be written still ends the
+    /// transaction.** The `Commit` is durable, so the transaction HAS committed, and recovery counts a
+    /// `Commit` alone as ended. At `79483ff` the `TxnEnd` append's `?` returned `Err` before the
+    /// transaction left `att`: every checkpoint was then refused for the life of the process, the
+    /// caller read "not committed", and a ROLLBACK appended an `Abort` after the durable `Commit`.
+    #[test]
+    fn a_commit_whose_txn_end_cannot_be_written_still_ends_the_transaction() {
+        let (bp, wal, txn, _dir) = setup();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t);
+        heap.insert(Tuple::new(vec![1; 40])).unwrap();
+        // No retired slot and no bound run, so the commit appends `Commit`, then `TxnEnd`.
+        wal.fail_next_append.store(2, Ordering::SeqCst);
+        txn.commit(t).unwrap_or_else(|e| panic!("a transaction whose Commit is durable was reported as not committed: {e}"));
+        assert_eq!(wal.fail_next_append.load(Ordering::SeqCst), 0, "premise: the TxnEnd append was not the one that failed");
+        assert!(
+            !txn.att.lock().unwrap().contains_key(&t),
+            "the committed transaction stayed active, so every checkpoint and DDL is refused"
+        );
+        assert!(txn.abort(t).is_err(), "a ROLLBACK of the committed transaction was accepted");
+        assert!(
+            !walk_log(&wal).iter().any(|r| r.txn_id == t && matches!(r.kind, RecKind::Abort)),
+            "an Abort was appended after the durable Commit"
+        );
+        txn.checkpoint().unwrap_or_else(|e| panic!("a checkpoint was refused after the commit: {e}"));
     }
 
     /// **Review 7's F4 (lane §21.16 test F4): a `Retry` after a SUCCESSFUL read records what the page
