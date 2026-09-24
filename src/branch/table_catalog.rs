@@ -389,7 +389,7 @@ impl TableBranchCatalog {
     /// merely described here.
     fn durable(&self, seq: u64) -> Result<(), FerroError> {
         self.commit_group.wait_durable(seq, || {
-            self.publish_if_owed()?;
+            let _ = Self::publish_if_owed; // D244 MUTANT MG: the sync no longer publishes an owed root
             self.pool.flush_all()?;
             self.pool.disk_manager.sync()
         })
