@@ -2220,6 +2220,14 @@ fn main() {
             ));
         }
     }
+    // A18.2: the final close runs BEFORE the summary, and a failure goes into `failures`, so it
+    // suppresses "every guard held" and prints among the other NOT A RESULT lines.
+    if let Some(open) = db.take() {
+        let (_, closed) = open.close();
+        if let Err(e) = closed {
+            failures.push(format!("the production database did not close cleanly at the end: {e}"));
+        }
+    }
     if let Some(arms) = arms {
         // D61's space verdict is about ITS layout. The production file also holds the SQL catalog
         // and a 32,736-page hole below the arena floor, so bytes/branch here is not its question.
@@ -2241,15 +2249,7 @@ fn main() {
             println!("NOT A RESULT: {f}");
         }
     }
-    let mut code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
-    if let Some(open) = db.take() {
-        let (_, closed) = open.close();
-        if let Err(e) = closed {
-            println!("NOT A RESULT: the production database did not close cleanly at the end: {e}");
-            // A17.4: a failed close is a failure. The code was fixed above, so this used to exit 0.
-            code = 2;
-        }
-    }
+    let code = if failures.is_empty() && ns_void.is_empty() { 0 } else { 2 };
     drop(hd);
     // The run directory is removed by `_cleanup` — here, before a non-zero exit skips destructors,
     // and on the way out otherwise, panic or not.
