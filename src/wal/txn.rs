@@ -630,10 +630,14 @@ impl TxnManager {
         Ok(())
     }
 
-    /// `init`: this is the first tuple on its page, so redo resets the page first (D268; see
-    /// `RecKind::HeapInsert`).
-    pub fn log_insert(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16, tuple: &[u8], init: bool) -> Result<u64, FerroError> {
-        self.append_chained(txn_id, &RecKind::HeapInsert { dir_root, page_id, slot, tuple: tuple.to_vec(), init })
+    pub fn log_insert(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16, tuple: &[u8]) -> Result<u64, FerroError> {
+        self.append_chained(txn_id, &RecKind::HeapInsert { dir_root, page_id, slot, tuple: tuple.to_vec() })
+    }
+
+    /// D268: `page_id` was made for the heap at `dir_root` (see `RecKind::HeapInitPage`). On the
+    /// transaction's chain, where its undo skips it: nothing undoes a page's creation.
+    pub fn log_init_page(&self, txn_id: u64, dir_root: u32, page_id: u32) -> Result<u64, FerroError> {
+        self.append_chained(txn_id, &RecKind::HeapInitPage { dir_root, page_id })
     }
 
     pub fn log_delete(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16, old: &[u8]) -> Result<u64, FerroError> {
@@ -993,7 +997,7 @@ impl TxnManager {
                 }
                 RecKind::HeapDelete { dir_root, page_id, slot, old } => {
                     let clr = RecKind::Clr { undone_lsn: rec.lsn, undo_next: rec.prev_lsn, 
-                        redo: Box::new(RecKind::HeapInsert { dir_root, page_id, slot, tuple: old.to_vec(), init: false })
+                        redo: Box::new(RecKind::HeapInsert { dir_root, page_id, slot, tuple: old.to_vec() })
                     };
                     self.apply_then_log(txn_id, page_id, &clr, true, |page| undo_delete(page, slot, &old))?;
                 }
@@ -2548,7 +2552,7 @@ use super::*;
         {
             let wal = WalManager::new(path.clone()).unwrap();
             l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
-            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6], init: false }).unwrap();
+            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6] }).unwrap();
             wal.flush().unwrap();
             let f = OpenOptions::new().write(true).open(&path).unwrap();
             let len = f.metadata().unwrap().len();

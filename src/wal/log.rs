@@ -174,16 +174,7 @@ impl ColumnAlteration {
 #[derive(Debug, PartialEq)]
 pub enum RecKind {
     Begin, Commit, Abort, TxnEnd, 
-    /// `init`, **D268**: this insert is the first tuple on its page, so redo resets the page before
-    /// applying it (PostgreSQL's `XLOG_HEAP_INIT_PAGE`). Encoded as tag 12 with tag 5's payload, so
-    /// every older record keeps its meaning, and a log holding tag 5 only replays as before.
-    ///
-    /// A page freed and reused keeps its old owner's image on disk, with its own page id. When a
-    /// power loss drops the reuse's writes, redo met that image and applied the new owner's first
-    /// insert onto it (`restore_at` at slot 0), and the old owner's other rows became the new
-    /// table's. `HeapFileManager::insert_into` sets the flag when the page's slot array is empty;
-    /// `wal::recovery::redo_one` is the only reader of it.
-    HeapInsert { dir_root: u32, page_id: u32, slot: u16, tuple: Vec<u8>, init: bool },
+    HeapInsert { dir_root: u32, page_id: u32, slot: u16, tuple: Vec<u8> },
     HeapDelete { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8> }, 
     HeapUpdate { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8>, new: Vec<u8> },
     /// **D213: a committed transaction frees a slot its delete RETIRED.** Tag 11, the next free
@@ -198,6 +189,21 @@ pub enum RecKind {
     /// inserts would find no room. It carries no row, so it is not a change-feed event, and nothing
     /// ever undoes it: its transaction has committed.
     HeapRelease { dir_root: u32, page_id: u32, slot: u16 },
+    /// **D268: a heap page was made, and redo must initialise it before anything names it.** Tag 13.
+    /// Redo-only: nothing undoes it, and it carries no row, so it is not a change-feed event.
+    ///
+    /// `HeapFileManager::add_empty_page` appends it BEFORE the directory lists the page: on the
+    /// inserting transaction's chain, or, for a heap with no transaction (`catalog::alter`'s unlogged
+    /// rewrite and its reservation), unchained under transaction 0 through the pool's WAL. The page's
+    /// empty image carries this record's LSN, and so does the frame of every directory page that lists
+    /// it (`Frame::gate_lsn`), so the listing cannot reach the disk before this record is durable.
+    ///
+    /// A power loss can drop every page-file write since the last checkpoint and keep the log, which a
+    /// COMMIT syncs. A page freed and reused then reverted to its old owner's image, with its own id,
+    /// and redo applied the new owner's rows onto it; a listed page whose image never reached the disk
+    /// was zeros, or another structure. Redo (`wal::recovery::redo_one`) now resets such a page to
+    /// empty at this record, unless it already holds its own image at or past it.
+    HeapInitPage { dir_root: u32, page_id: u32 },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
     Checkpoint,
     /// A schema change, logged so the change feed can carry it.
@@ -388,8 +394,8 @@ impl RecKind {
             RecKind::Abort => buffer.push(2),
             RecKind::TxnEnd => buffer.push(3),
             RecKind::Checkpoint => buffer.push(4),
-            RecKind::HeapInsert { dir_root, page_id, slot, tuple, init } => {
-                buffer.push(if *init { 12 } else { 5 });
+            RecKind::HeapInsert { dir_root, page_id, slot, tuple } => {
+                buffer.push(5);
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
@@ -419,6 +425,11 @@ impl RecKind {
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
+            }
+            RecKind::HeapInitPage { dir_root, page_id } => {
+                buffer.push(13);
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&page_id.to_be_bytes());
             }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
                 buffer.push(9);
@@ -498,11 +509,10 @@ impl RecKind {
             2 => Ok(RecKind::Abort),
             3 => Ok(RecKind::TxnEnd),
             4 => Ok(RecKind::Checkpoint),
-            // Tag 12 is tag 5 with D268's init flag: the same payload, read by the same arm.
-            tag @ (5 | 12) => {
+            5 => {
                 let (dir_root, page_id, slot, length) = read_heap(bytes)?;
                 let tuple = bytes[15..15+length].to_vec();
-                Ok(RecKind::HeapInsert { dir_root, page_id, slot, tuple, init: tag == 12 })
+                Ok(RecKind::HeapInsert { dir_root, page_id, slot, tuple })
             }
             6 => {
                 let (dir_root, page_id, slot, length) = read_heap(bytes)?;
@@ -594,6 +604,17 @@ impl RecKind {
                 let page_id = take_u32(bytes, &mut at)?;
                 let slot = take_u16(bytes, &mut at)?;
                 Ok(RecKind::HeapRelease { dir_root, page_id, slot })
+            }
+            13 => {
+                if bytes.len() < 9 {
+                    return Err(FerroError::Corruption(format!(
+                        "log record of kind 13 is truncated: wanted 9 bytes but the record is {}",
+                        bytes.len()
+                    )));
+                }
+                let dir_root = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+                let page_id = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+                Ok(RecKind::HeapInitPage { dir_root, page_id })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -1232,7 +1253,7 @@ mod tests {
             RecKind::Abort,
             RecKind::TxnEnd,
             RecKind::Checkpoint,
-            RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 3, tuple: vec![4, 5, 6], init: false },
+            RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 3, tuple: vec![4, 5, 6] },
             RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 4, old: vec![7, 8, 9] },
             RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![1], new: vec![4,5] },
             RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) },
@@ -1265,7 +1286,6 @@ mod tests {
             l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
             l1 = wal.append(1, l0, &RecKind::HeapInsert {
                 dir_root: 5, page_id: 10, slot: 2, tuple: vec![0xAA, 0xBB],
-                init: false,
             }).unwrap();
             l2 = wal.append(1, l1, &RecKind::Commit).unwrap();
             wal.flush().unwrap();
@@ -1278,7 +1298,6 @@ mod tests {
         assert_eq!(&r0.kind, &RecKind::Begin);
         assert_eq!(&r1.kind, &RecKind::HeapInsert {
             dir_root: 5, page_id: 10, slot: 2, tuple: vec![0xAA, 0xBB],
-            init: false,
         });
         assert_eq!(&r2.kind, &RecKind::Commit);
         assert_eq!(r1.prev_lsn, l0);
@@ -1295,7 +1314,7 @@ mod tests {
         {
             let wal = WalManager::new(path.clone()).unwrap();
             let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
-            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6], init: false }).unwrap();
+            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6] }).unwrap();
             wal.flush().unwrap();
         }
 
@@ -1376,22 +1395,26 @@ mod tests {
         assert!(RecKind::deserialize(&buf[..10]).is_err(), "a truncated HeapRelease decoded");
     }
 
-    /// **D268: an init-flagged `HeapInsert` round-trips under tag 12, and a plain one still under
-    /// tag 5.** Tag 12 is the next free number and carries tag 5's payload byte for byte, so every
-    /// older record keeps its meaning and a log holding tag 5 only replays as before.
+    /// **D268: `HeapInitPage` round-trips under tag 13, and a truncated one is refused as corruption
+    /// naming its kind.** Tag 12 is D212's `RevertHistory` (`LANDING-QUEUE` @ `9c4a559`), so this takes
+    /// 13, and every older tag keeps its meaning. Lane report: artie-research
+    /// `frontier/lane_d268_power_loss_redo.md` §2.2, test 6'.
     #[test]
-    fn an_init_insert_round_trips_under_tag_12_and_a_plain_one_under_tag_5() {
-        let mut encoded = Vec::new();
-        for (init, tag) in [(false, 5u8), (true, 12u8)] {
-            let kind = RecKind::HeapInsert { dir_root: 7, page_id: 42, slot: 0, tuple: vec![1, 2, 3], init };
-            let mut buf = Vec::new();
-            kind.serialize(&mut buf).unwrap();
-            assert_eq!(buf[0], tag, "an insert with init={init} is not tag {tag}");
-            assert_eq!(buf.len(), 18, "an insert is its tag, a u32, a u32, a u16, a u32 length and the tuple");
-            assert_eq!(RecKind::deserialize(&buf).unwrap(), kind, "the insert with init={init} did not round-trip");
-            encoded.push(buf);
+    fn a_heap_init_page_round_trips_under_tag_13() {
+        let kind = RecKind::HeapInitPage { dir_root: 7, page_id: 42 };
+        let mut buf = Vec::new();
+        kind.serialize(&mut buf).unwrap();
+        assert_eq!(buf[0], 13, "HeapInitPage is not tag 13");
+        assert_eq!(buf.len(), 9, "a HeapInitPage is its tag, a u32 and a u32");
+        assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        for n in 1..buf.len() {
+            match RecKind::deserialize(&buf[..n]) {
+                Err(FerroError::Corruption(m)) => {
+                    assert!(m.contains("kind 13"), "a HeapInitPage cut to {n} bytes was refused without naming kind 13: {m}")
+                }
+                other => panic!("a HeapInitPage cut to {n} bytes was not refused as corruption: {other:?}"),
+            }
         }
-        assert_eq!(encoded[0][1..], encoded[1][1..], "tag 12's payload is not tag 5's");
     }
 
     /// **D277: a truncated heap or CLR record is refused as corruption naming its kind, never a

@@ -290,6 +290,13 @@ pub struct Frame {
     pub page_id: Option<u32>,
     pub pin_counter: AtomicU16,
     pub dirty_flag: AtomicBool,
+    /// **D268: an LSN the log must be durable past before this frame's bytes reach disk**, for a page
+    /// whose format carries no LSN of its own. A heap directory page is one: when it lists a new page,
+    /// `HeapFileManager` raises this to that page's init record, so the listing cannot reach disk
+    /// before the record that lets redo initialise the page. [`BufferPoolManager::wal_gate`] flushes to
+    /// the larger of this and the page's own LSN. Reset when the frame takes another page; a reset
+    /// missed would only flush the log early, never late.
+    pub gate_lsn: AtomicU64,
 }
 
 /// What happened when the pool tried to take a replacement victim's frame.
@@ -1004,6 +1011,7 @@ impl BufferPoolManager {
                 frame.page_id = Some(incoming);
                 frame.pin_counter = AtomicU16::new(1);
                 frame.dirty_flag = AtomicBool::new(false);
+                frame.gate_lsn = AtomicU64::new(0);
                 self.free_hint.store((i + 1) % n, Ordering::Relaxed);
                 return Some(i);
             }
@@ -1027,6 +1035,7 @@ impl BufferPoolManager {
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
         frame.dirty_flag = AtomicBool::new(false);
+        frame.gate_lsn = AtomicU64::new(0);
     }
 
     /// Evict `victim` and hand its frame to `incoming`, labelled and pinned.
@@ -1075,7 +1084,7 @@ impl BufferPoolManager {
                 return Ok(Evicted::Declined);
             }
             if frame.dirty_flag.load(Ordering::Relaxed) {
-                self.wal_gate(&frame.data)?;
+                self.wal_gate(&frame.data, frame.gate_lsn.load(Ordering::SeqCst))?;
                 self.disk_manager.write(victim, &frame.data)?;
                 frame.dirty_flag.store(false, Ordering::Relaxed);
             }
@@ -1098,6 +1107,7 @@ impl BufferPoolManager {
         frame.page_id = Some(incoming);
         frame.pin_counter = AtomicU16::new(1);
         frame.dirty_flag = AtomicBool::new(false);
+        frame.gate_lsn = AtomicU64::new(0);
         Ok(Evicted::Took(frame_i))
     }
 
@@ -1220,7 +1230,7 @@ impl BufferPoolManager {
 
         let frame = self.frames[frame_i].read().unwrap();
         if frame.dirty_flag.load(Ordering::Relaxed) {
-            self.wal_gate(&frame.data)?;
+            self.wal_gate(&frame.data, frame.gate_lsn.load(Ordering::SeqCst))?;
             self.disk_manager.write(page_id, &frame.data)?;
             frame.dirty_flag.store(false, Ordering::Relaxed);
         }
@@ -1259,7 +1269,7 @@ impl BufferPoolManager {
         for (page_id, frame_i) in pages {
             let frame = self.frames[frame_i].read().unwrap();
             if frame.dirty_flag.load(Ordering::Relaxed) {
-                self.wal_gate(&frame.data)?;
+                self.wal_gate(&frame.data, frame.gate_lsn.load(Ordering::SeqCst))?;
                 self.disk_manager.write(page_id, &frame.data)?;
                 frame.dirty_flag.store(false,Ordering::Relaxed);
             }
@@ -1300,6 +1310,7 @@ impl BufferPoolManager {
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
         frame.dirty_flag = AtomicBool::new(false);
+        frame.gate_lsn = AtomicU64::new(0);
         drop(frame);
 
         self.arc_locked().remove(page_id)?;
@@ -1333,6 +1344,7 @@ impl BufferPoolManager {
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
+            frame.gate_lsn = AtomicU64::new(0);
             drop(frame);
             self.arc_locked().remove(page_id)?;
         }
@@ -1408,6 +1420,7 @@ impl BufferPoolManager {
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
+            frame.gate_lsn = AtomicU64::new(0);
             drop(frame);
             // The cache and the table are being emptied together, so a page the table no longer
             // names cannot be `remove`d "wrongly" — an error here would say the cache had already
@@ -1422,9 +1435,11 @@ impl BufferPoolManager {
         let _ = self.wal.set(wal);
     }
 
-    fn wal_gate(&self, data: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
+    /// Make the log durable past the page's own LSN and past the frame's `gate` (D268,
+    /// [`Frame::gate_lsn`]), whichever is larger, before the frame's bytes are written.
+    fn wal_gate(&self, data: &[u8; PAGE_SIZE], gate: u64) -> Result<(), FerroError> {
         if let Some(wal) = self.wal.get() {
-            let plsn = page_lsn_of(data);
+            let plsn = page_lsn_of(data).max(gate);
             if plsn > 0 {
                 wal.flush_up_to(plsn)?;
             }
@@ -1443,7 +1458,7 @@ fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
 
 impl Frame {
     pub fn new() -> Self {
-        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false)}
+        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false), gate_lsn: AtomicU64::new(0)}
     }
 }
 #[cfg(test)]

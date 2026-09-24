@@ -90,7 +90,7 @@ fn a_replica_applies_a_batch_containing_run_identity_records() {
     let mut tuple = vec![0u8; 40];
     tuple[0] = 0xAB;
     wal.append(1, 0, &RecKind::Begin).unwrap();
-    wal.append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 10, slot: 0, tuple, init: false }).unwrap();
+    wal.append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 10, slot: 0, tuple }).unwrap();
     wal.append(1, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
     wal.append(1, 0, &RecKind::Commit).unwrap();
     wal.append(1, 0, &RecKind::TxnEnd).unwrap();

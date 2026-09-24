@@ -57,7 +57,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
                 }
             }
             RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. }
-            | RecKind::HeapRelease { dir_root, page_id, .. } => {
+            | RecKind::HeapRelease { dir_root, page_id, .. } | RecKind::HeapInitPage { dir_root, page_id } => {
                 touched.insert((*dir_root, *page_id));
             }
             RecKind::Clr { redo, .. } => {
@@ -108,7 +108,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     for rec in &records {
         match &rec.kind {
             RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
-            | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
+            | RecKind::HeapRelease { .. } | RecKind::HeapInitPage { .. } | RecKind::Clr { .. } => {
                 redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
             }
             _ => {}
@@ -209,30 +209,31 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
     };
     let page_id = match op {
         RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..}
-        | RecKind::HeapRelease { page_id, .. } => *page_id,
+        | RecKind::HeapRelease { page_id, .. } | RecKind::HeapInitPage { page_id, .. } => *page_id,
         _ => return Ok(())
     };
     let frame_i = bp.fetch_page(page_id)?;
     let mut frame = bp.frame_write(frame_i);
     let stored_id = u32::from_be_bytes(frame.data[1..5].try_into().unwrap());
     let mut page = match op {
-        // **D268: the first tuple on its page resets the page first**, unless the page already holds
-        // its own image at or past this record, which the LSN gate below then skips as usual.
+        // **D268: a page's init record resets the page**, unless it already holds its own image at or
+        // past this record, which the LSN gate below then skips as usual.
         //
-        // A reused page keeps its old owner's image on disk, with its own id. A power loss can drop
-        // every write of the reuse, and this parsed that image and applied the new owner's first
-        // insert onto it: a live slot 0 refused the restore at every open, and a free one took the
-        // row while the old owner's other rows stayed. Any image here that is not this page's own at
-        // or past this record predates the page's first insert: a previous owner's, zeros, or
-        // another structure's. So a refused parse is not an error in this arm; everywhere else it
-        // still is (D256).
+        // A reused page keeps its old owner's image on disk, with its own id, and a listed page whose
+        // image never reached disk is zeros. A power loss can drop every page write since the last
+        // checkpoint and keep the log. Redo parsed such an image and applied the new owner's first
+        // insert onto it: a live slot 0 refused the restore at every open, and a free one took the row
+        // while the old owner's other rows stayed. Any image here that is not this page's own at or
+        // past this record predates the page: a previous owner's, zeros, or another structure's. So a
+        // refused parse is not an error in this arm; everywhere else it still is (D256).
         //
         // Gated, not an unconditional reset (PostgreSQL's `XLogInitBufferForRedo`), because this
         // engine writes heap pages without logging in one place: `catalog::alter::rewrite_heap`
-        // through `HeapFileManager::open`. Under a kept log such a page carries rows that no record
-        // describes, over a retained init record, and a reset would drop them
-        // (`tests/d268_power_loss_redo.rs`, test 3).
-        RecKind::HeapInsert { init: true, .. } => match Page::deserialize_at(page_id, frame.data) {
+        // through `HeapFileManager::open`. Those writes never assign `lsn`, and the page's image
+        // carries this record's LSN from its creation (`HeapFileManager::add_empty_page`), so under a
+        // kept log a page holding such rows is its own image at this LSN, and is kept
+        // (`tests/d268_power_loss_redo.rs`, tests 3 and 11).
+        RecKind::HeapInitPage { .. } => match Page::deserialize_at(page_id, frame.data) {
             Ok(own) if own.page_id == page_id && own.lsn >= lsn => own,
             _ => Page::empty(page_id),
         },
@@ -259,6 +260,8 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
             }
         }
         RecKind::HeapUpdate { slot, new, .. } => page.update(*slot as usize, Tuple::new(new.to_vec()))?,
+        // The page selection above already made it empty; only its LSN moves.
+        RecKind::HeapInitPage { .. } => {}
         _ => unreachable!()
     }
     page.lsn = lsn;

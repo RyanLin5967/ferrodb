@@ -1113,9 +1113,10 @@ impl LogicalDecoder {
                 // whose buffer is discarded whole. `Begin`, `TxnEnd` and `Checkpoint` carry no row
                 // data, and neither does `HeapRelease`: it is a committed transaction freeing bytes
                 // its delete kept for a rollback that did not happen (D213), and the delete itself
-                // was already decoded. None of them produce events.
+                // was already decoded. Nor does `HeapInitPage` (D268): a page was made, and no row
+                // moved. None of them produce events.
                 RecKind::Begin | RecKind::TxnEnd | RecKind::Checkpoint | RecKind::Clr { .. }
-                | RecKind::HeapRelease { .. } => {}
+                | RecKind::HeapRelease { .. } | RecKind::HeapInitPage { .. } => {}
             }
 
             if next <= lsn {
@@ -1256,7 +1257,7 @@ mod tests {
         w.append(
             txn,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, Some(qty)), init: false },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, Some(qty)) },
         )
         .unwrap();
     }
@@ -1628,7 +1629,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)), init: false },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)) },
         )
         .unwrap();
         w.append(1, 0, &RecKind::Commit).unwrap();
@@ -1664,7 +1665,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 8, page_id: 9, slot: 0, tuple: tuple_bytes(3, Some(30)), init: false },
+            &RecKind::HeapInsert { dir_root: 8, page_id: 9, slot: 0, tuple: tuple_bytes(3, Some(30)) },
         )
         .unwrap();
         insert(&w, 1, 4, 40);
@@ -1685,7 +1686,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(4, None), init: false },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(4, None) },
         )
         .unwrap();
         w.append(1, 0, &RecKind::Commit).unwrap();
@@ -1707,7 +1708,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 404, page_id: 1, slot: 0, tuple: tuple_bytes(1, Some(1)), init: false },
+            &RecKind::HeapInsert { dir_root: 404, page_id: 1, slot: 0, tuple: tuple_bytes(1, Some(1)) },
         )
         .unwrap();
         insert(&w, 1, 2, 20);

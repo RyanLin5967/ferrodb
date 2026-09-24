@@ -739,7 +739,8 @@ impl ReplicaApplier {
                 crate::wal::log::RecKind::HeapInsert { page_id, .. }
                 | crate::wal::log::RecKind::HeapDelete { page_id, .. }
                 | crate::wal::log::RecKind::HeapUpdate { page_id, .. }
-                | crate::wal::log::RecKind::HeapRelease { page_id, .. } => Some(*page_id),
+                | crate::wal::log::RecKind::HeapRelease { page_id, .. }
+                | crate::wal::log::RecKind::HeapInitPage { page_id, .. } => Some(*page_id),
                 crate::wal::log::RecKind::Clr { redo, .. } => match redo.as_ref() {
                     crate::wal::log::RecKind::HeapInsert { page_id, .. }
                     | crate::wal::log::RecKind::HeapDelete { page_id, .. }
@@ -772,6 +773,7 @@ impl ReplicaApplier {
                 | crate::wal::log::RecKind::HeapDelete { .. }
                 | crate::wal::log::RecKind::HeapUpdate { .. }
                 | crate::wal::log::RecKind::HeapRelease { .. }
+                | crate::wal::log::RecKind::HeapInitPage { .. }
                 | crate::wal::log::RecKind::Clr { .. } => {
                     crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, &rec.kind)?;
                 }

@@ -58,7 +58,7 @@ fn primary_insert(wal: &WalManager, txn: u64, page_id: u32, slot: u16, n: u8) ->
         .append(
             txn,
             0,
-            &RecKind::HeapInsert { dir_root: 1, page_id, slot, tuple: tuple(n), init: false },
+            &RecKind::HeapInsert { dir_root: 1, page_id, slot, tuple: tuple(n) },
         )
         .expect("append");
     wal.flush().expect("flush");
