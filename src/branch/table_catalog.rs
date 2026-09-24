@@ -3131,13 +3131,12 @@ mod tests {
 
             // Make it a pre-D200 file: no UNRELEASED key and no marker, durably.
             let _g = c.logical.lock().unwrap();
-            for k in [
-                keys::unreleased(leaked.branch_id.id),
-                keys::unreleased(pinned.branch_id.id),
-                keys::unreleased_index_built(),
-            ] {
+            for k in [keys::unreleased(leaked.branch_id.id), keys::unreleased_index_built()] {
                 assert!(c.remove_if_present(&k).unwrap(), "fixture: set_state wrote no such key");
             }
+            // The pinned slot may or may not hold a key, depending on the build; a pre-D200 file
+            // holds none either way.
+            let _ = c.remove_if_present(&keys::unreleased(pinned.branch_id.id));
             let seq = c.stage().unwrap();
             drop(_g);
             c.durable(seq).unwrap();
@@ -3151,9 +3150,11 @@ mod tests {
         let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
         let mut got = c.unreleased_reaped_candidates().unwrap();
         got.sort_unstable();
-        let mut want = vec![leaked, pinned];
-        want.sort_unstable();
-        assert_eq!(got, want, "the first open did not put every unreleased slot on the span");
+        // Only the RELEASABLE slot. The pinned one cannot be released while its child lives, and
+        // a span that held it would make every later open pay for it (§8.6's amendment: this
+        // expected `[leaked, pinned]` at `17cbd4c`).
+        let _ = pinned;
+        assert_eq!(got, vec![leaked], "the first open did not put exactly the releasable slot on the span");
         assert!(c.tree.search(&keys::unreleased_index_built()).unwrap().is_some(), "no marker");
 
         // ONCE: with the marker in place the build returns without writing.

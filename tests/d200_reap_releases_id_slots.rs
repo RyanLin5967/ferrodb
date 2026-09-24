@@ -207,9 +207,10 @@ fn a_recycled_slot_leaves_the_reaped_span() {
 }
 
 /// Keys the open sweep's candidate query reads on a HEALTHY catalog: `released` reaped-and-freed
-/// leaves (forked first, so each holds its own slot), plus one pinned interior — the only slot a
-/// healthy catalog legitimately keeps unreleased.
-fn keys_read_by_a_healthy_open(released: usize) -> u64 {
+/// leaves (forked first, so each holds its own slot), plus a chain of `pinned` reaped interiors
+/// above one live leaf, reaped deepest first as the lease scan orders them. Nothing here is
+/// releasable, so a sweep that pays only for releasable slots reads nothing.
+fn keys_read_by_a_healthy_open(released: usize, pinned: usize) -> u64 {
     let f = fixture();
     let c = &*f.catalog;
     let leaves: Vec<BranchId> = (0..released)
@@ -218,9 +219,20 @@ fn keys_read_by_a_healthy_open(released: usize) -> u64 {
     for b in leaves {
         f.reaper.reap(b).unwrap();
     }
-    let p = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
-    let _child = c.fork(p.branch_id, LeaseDeadline(u64::MAX)).unwrap();
-    f.reaper.reap(p.branch_id).unwrap();
+    let mut chain = Vec::with_capacity(pinned);
+    let mut parent = BranchId::TRUNK;
+    for _ in 0..pinned {
+        parent = c.fork(parent, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        chain.push(parent);
+    }
+    let _leaf = c.fork(parent, LeaseDeadline(u64::MAX)).unwrap();
+    for b in chain.iter().rev() {
+        f.reaper.reap(*b).unwrap();
+    }
+    assert!(
+        f.catalog.has_live_children(BranchId::TRUNK.id).unwrap(),
+        "fixture: the leaf must still pin the chain"
+    );
 
     let before = f.concrete.candidate_keys_scanned();
     assert!(f.reaper.resume_interrupted_reaps().unwrap().is_empty());
@@ -228,23 +240,28 @@ fn keys_read_by_a_healthy_open(released: usize) -> u64 {
     f.concrete.candidate_keys_scanned() - before
 }
 
-/// **The open sweep is O(unreleased), not O(ever reaped).** A released slot stays a `Reaped`
-/// record until a fork recycles it, so a candidate query over the whole Reaped span (and the whole
-/// free list) reads one key per branch ever reaped, at every open — a branch-count wall at open,
-/// paid to find leaks that, once the cascade releases its ancestors, only a crash can make.
+/// **The open sweep pays for RELEASABLE slots only — not for released ones, and not for pinned.**
 ///
-/// PRE-REGISTERED at the commit that adds this test (the merge over both spans): 2N+1 keys, i.e.
-/// **17 at N=8 and 129 at N=64**; it fails at the first assertion. After the UNRELEASED span:
-/// **1 and 1** — the pinned interior's key, and nothing for any released slot.
+/// A released slot stays a `Reaped` record until a fork recycles it, and a pinned reaped interior
+/// stays unreleased for as long as anything below it lives — under MCTS pruning, up to live
+/// branches × chain depth. Neither can be released at this open, and this sweep runs under the
+/// statement lock at start (`LeaseThread::start` → `resume_interrupted_reaps`), so a candidate
+/// query that reads either pays a branch-count wall at every open.
+///
+/// PRE-REGISTRATION, amended append-only (`lane_wall21_reap_walk.md` §8.6). The first version of
+/// this test (`0928923`, released axis only) predicted 17/129 at `0928923` and 1/1 at `17cbd4c`,
+/// where the span still held the pinned interior. This version adds the pinned axis. Predicted at
+/// `17cbd4c`: one key per pinned interior, so it **fails at the first cell, (8, 1), reading 1**.
+/// Predicted after the fix: **0 in every cell**.
 #[test]
-fn a_healthy_open_reads_no_released_slot() {
-    let small = keys_read_by_a_healthy_open(8);
-    let large = keys_read_by_a_healthy_open(64);
-    eprintln!("d200 open sweep keys read: N=8 -> {small}, N=64 -> {large}");
-    assert_eq!(
-        large, small,
-        "the open sweep read {large} keys with 64 released slots against {small} with 8: it pays \
-         for every branch ever reaped, not for what is unreleased"
-    );
-    assert_eq!(small, 1, "a healthy catalog's only unreleased slot is its one pinned interior");
+fn a_healthy_open_reads_no_released_and_no_pinned_slot() {
+    for (released, pinned) in [(8, 1), (64, 1), (8, 8), (64, 8)] {
+        let read = keys_read_by_a_healthy_open(released, pinned);
+        eprintln!("d200 open sweep keys read: released={released} pinned={pinned} -> {read}");
+        assert_eq!(
+            read, 0,
+            "a healthy open read {read} candidate keys with {released} released and {pinned} pinned \
+             slots; none of them can be released now, so every key read is the wall this removes"
+        );
+    }
 }
