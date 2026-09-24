@@ -703,7 +703,11 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         // rebuild's on-disk frees and the sync (D229's window; lane §21.2). A kept log is counted,
         // and printed when the log-keeping state begins (`TxnManager::checkpoint_or_keep_held`).
         let kept = txn.checkpoint_after_frees()?;
-        if !matches!(kept, crate::wal::txn::CheckpointOutcome::KeptForOwed(_)) && stale {
+        if !matches!(
+            kept,
+            crate::wal::txn::CheckpointOutcome::KeptForOwed(_) | crate::wal::txn::CheckpointOutcome::KeptForHistory
+        ) && stale
+        {
             if let Err(e) = std::fs::remove_file(&marker) {
                 let _ = writeln!(
                     std::io::stderr(),

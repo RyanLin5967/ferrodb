@@ -266,6 +266,12 @@ pub enum CheckpointOutcome {
     /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
     /// and answers `Ok`, while one is held).
     KeptByPin,
+    /// **D212 (a') AMENDED 3, item 1:** REVERT's history could not be written to its store, so the
+    /// log, which holds the only other copy of what the store's queue holds, was KEPT. The queue keeps
+    /// every record and the next write is a full replace (`HistoryStore::drain`). A deferral like
+    /// `KeptForOwed`, not a failure: the open continues over the queue, whose records the runtime
+    /// reads with the store's (`HistoryStore::records`), and the explicit `checkpoint` refuses it.
+    KeptForHistory,
 }
 
 /// DROPs whose checkpoint a WAL pin kept from truncating, since process start (review 5's F4). The
@@ -1060,7 +1066,11 @@ impl TxnManager {
             match self.checkpoint_keeping_owed() {
                 Ok(CheckpointOutcome::Truncated) => {}
                 // Counted where the log was kept (`checkpoint_or_keep_held`).
-                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptByPin) => {
+                Ok(
+                    CheckpointOutcome::KeptForOwed(_)
+                    | CheckpointOutcome::KeptByPin
+                    | CheckpointOutcome::KeptForHistory,
+                ) => {
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst)
                 }
                 Err(e) => {
@@ -1870,6 +1880,12 @@ impl TxnManager {
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
         match self.checkpoint_or_keep_locked(true)? {
             CheckpointOutcome::Truncated | CheckpointOutcome::KeptByPin => Ok(()),
+            CheckpointOutcome::KeptForHistory => Err(FerroError::Wal(
+                "checkpoint refused: REVERT's history could not be written to its store, and truncating \
+                 the log would lose the only other copy of it; every page was flushed and the log is kept, \
+                 and the next checkpoint retries the write"
+                    .into(),
+            )),
             CheckpointOutcome::KeptForOwed(owed) => Err(FerroError::Wal(format!(
                 "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
                  truncating the log would lose the record of the bytes they hold; every page was \
@@ -1937,14 +1953,24 @@ impl TxnManager {
         self.bp.disk_manager.sync()?;
         // **D212 (a'): REVERT's history is made durable in its store BEFORE the log that holds its
         // only other copy is truncated**, and before the owed-release keep below, so a log kept for
-        // owed releases still drains the queue (review of `816321d`, finding 3). A failure returns
-        // here: the flushes above have run, and the truncation is refused, so the log keeps every
-        // history record the store does not.
+        // owed releases still drains the queue (review of `816321d`, finding 3). A failed write KEEPS
+        // the log, as an owed release does (AMENDED 3, item 1): the flushes above have run, the queue
+        // keeps every record, and the answer is a counted deferral, not an error, so the open that
+        // hits it continues over the queue rather than failing.
         // With no store there is no history in the log: `bind_history` refuses without one, and
         // `recover` refuses a log that holds some (AMENDED 3, item 4, which deleted AMENDED 2's
         // count of unstored records).
         if let Some(store) = self.history.get() {
-            store.drain()?;
+            if let Err(e) = store.drain() {
+                DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: a checkpoint flushed every page but kept the log: REVERT's history could not \
+                     be written to {} ({e}); it stays queued, and the next checkpoint retries",
+                    store.path().display()
+                );
+                return Ok(CheckpointOutcome::KeptForHistory);
+            }
         }
         if owed > 0 {
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
