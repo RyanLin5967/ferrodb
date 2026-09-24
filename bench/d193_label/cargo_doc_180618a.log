@@ -1,0 +1,1406 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d193-diff-label)
+ Documenting ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d193-diff-label)
+warning: public documentation for `AlterPlan` links to private item `prepare_rewrite`
+   --> src/catalog/alter.rs:344:19
+    |
+344 | /// write — and [`prepare_rewrite`]'s header argues at length why that split is the whole safety
+    |                   ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+    = note: `#[warn(rustdoc::private_intra_doc_links)]` on by default
+
+warning: public documentation for `AlterPlan` links to private item `prepare_rewrite`
+   --> src/catalog/alter.rs:356:66
+    |
+356 | /// the disk — but each step is still measured on its own (see [`prepare_rewrite`]), because the
+    |                                                                  ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `refuse_if_the_row_cannot_land` links to private item `serialize_and_measure`
+   --> src/catalog/alter.rs:404:62
+    |
+404 | /// - **arity and type**, from [`Tuple::serialize`] inside [`serialize_and_measure`], which is the
+    |                                                              ^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `refuse_if_the_row_cannot_land` links to private item `prepare_rewrite`
+   --> src/catalog/alter.rs:412:45
+    |
+412 | /// - **page fit**, which is the question [`prepare_rewrite`] asks of the rows already there.
+    |                                             ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `refuse_if_the_row_cannot_land` links to private item `serialize_and_measure`
+   --> src/catalog/alter.rs:414:34
+    |
+414 | /// **The second caller is why [`serialize_and_measure`] exists.** `AgentRuntime::merge` publishes
+    |                                  ^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `plan_alters` links to private item `carried_stats`
+   --> src/catalog/alter.rs:522:77
+    |
+522 |     /// shape rules in [`resulting_schema`], the statistics conversion in [`carried_stats`], and
+    |                                                                             ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `plan_alters` links to private item `prepare_rewrite`
+   --> src/catalog/alter.rs:524:11
+    |
+524 |     /// [`prepare_rewrite`] exists for. [`Catalog::apply_plan`] then writes what this decided.
+    |           ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `apply_plan` links to private item `prepare_rewrite`
+   --> src/catalog/alter.rs:599:73
+    |
+599 |     /// disk write that fails, a B+tree page that cannot be read. See [`prepare_rewrite`] for what
+    |                                                                         ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `crate::branch::BranchCatalog::all_branches`
+ --> src/catalog/system_views.rs:9:37
+  |
+9 | //! [`BranchCatalog::all_branches`](crate::branch::BranchCatalog::all_branches),
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `BranchCatalog` has no associated item named `all_branches`
+  |
+  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `ArenaPageStore`
+ --> src/storage/db_lock.rs:5:66
+  |
+5 | //! Two processes opening the same database file both build an [`ArenaPageStore`] from the same
+  |                                                                  ^^^^^^^^^^^^^^ no item named `ArenaPageStore` in scope
+  |
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `open_shared`
+   --> src/storage/index.rs:154:34
+    |
+154 |     /// a statement path wants [`open_shared`].
+    |                                  ^^^^^^^^^^^ no item named `open_shared` in scope
+    |
+    = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `read` links to private item `assert_page_latch_is_above_the_pool`
+   --> src/storage/page_latch.rs:237:11
+    |
+237 |     /// [`assert_page_latch_is_above_the_pool`].
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `write` links to private item `assert_page_latch_is_above_the_pool`
+   --> src/storage/page_latch.rs:256:11
+    |
+256 |     /// [`assert_page_latch_is_above_the_pool`].
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `append_durably` links to private item `REPLACE_LOCK`
+   --> src/storage/atomic_file.rs:150:24
+    |
+150 | /// **Under the same [`REPLACE_LOCK`] as a replace, and that is load-bearing.** An append that
+    |                        ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `buffer_pool` links to private item `BufferPoolManager::in_transit`
+  --> src/buffer/buffer_pool.rs:29:83
+   |
+29 | //! * **An in-transit marker, so faulters on the SAME page wait on THAT page.** [`BufferPoolManager::in_transit`]
+   |                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `buffer_pool` links to private item `BufferPoolManager::transit_done`
+  --> src/buffer/buffer_pool.rs:31:18
+   |
+31 | //!   waits on [`BufferPoolManager::transit_done`] instead of loading it a second time — which is the
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `buffer_pool` links to private item `BufferPoolManager::evict_into`
+  --> src/buffer/buffer_pool.rs:48:7
+   |
+48 | //! [`BufferPoolManager::evict_into`] — because the other order lets a concurrent fetch of the victim
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `buffer_pool` links to private item `TOUCH_BATCH`
+   --> src/buffer/buffer_pool.rs:261:40
+    |
+261 | //! batch sizes, sha256 and all. See [`TOUCH_BATCH`] for why no batch size can make ARC's decisions
+    |                                        ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ReadView`
+  --> src/execution/insert.rs:27:65
+   |
+27 | //! Read the version the entry points at and ask the caller's [`ReadView`] whether its deletion is
+   |                                                                 ^^^^^^^^ no item named `ReadView` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `retained_runs` links to private item `TxnManager::run_log`
+   --> src/wal/txn.rs:587:68
+    |
+587 |     /// How many run declarations a checkpoint would replay. See [`TxnManager::run_log`].
+    |                                                                    ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `log_ddl` links to private item `Self::replay_schema`
+   --> src/wal/txn.rs:720:12
+    |
+720 |     /// ([`Self::replay_schema`]), so whatever is in it is re-emitted to every consumer, repeatedly,
+    |            ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ConsensusCost`
+  |
+  = note: the link appears in this line:
+          
+          performance argument, and [`ConsensusCost`] exists so it is a *measurement* rather than a
+                                     ^^^^^^^^^^^^^^^
+  = note: no item named `ConsensusCost` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `moves_base`
+  |
+  = note: the link appears in this line:
+          
+          [`moves_base`] is the classification that decides it, and it is deliberately public: a rule
+           ^^^^^^^^^^^^
+  = note: no item named `moves_base` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `BranchLedger`
+  |
+  = note: the link appears in this line:
+          
+          Those must be agreed even though the rows they concern are not. [`BranchLedger`] is that
+                                                                           ^^^^^^^^^^^^^^
+  = note: no item named `BranchLedger` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ClusterBranchId`
+  |
+  = note: the link appears in this line:
+          
+          [`ClusterBranchId`] packs the node that owns a branch's pages beside that node's own id for it.
+           ^^^^^^^^^^^^^^^^^
+  = note: no item named `ClusterBranchId` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `BranchLedger`
+  |
+  = note: the link appears in this line:
+          
+          * a branch owned by a node other than this one holds **no rows here** — [`BranchLedger`] knows
+                                                                                     ^^^^^^^^^^^^^^
+  = note: no item named `BranchLedger` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `BranchLedger::orphans_of`
+  |
+  = note: the link appears in this line:
+          
+          * [`BranchLedger::orphans_of`] names the branches a dead node was working on, so they are
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `BranchLedger` in scope
+
+warning: unresolved link to `ClusterAgents::merge`
+  |
+  = note: the link appears in this line:
+          
+          never arrived. Nothing *acknowledged* is lost — [`ClusterAgents::merge`] returns only after the
+                                                             ^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ClusterAgents` in scope
+
+warning: public documentation for `rejections` links to private item `VERDICT_HISTORY`
+   --> src/agent_sql/cluster.rs:406:66
+    |
+406 |     /// Every op this ledger refused, oldest first. Bounded by [`VERDICT_HISTORY`] for the same
+    |                                                                  ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `live_runs` links to private item `State::workspaces`
+    --> src/agent_sql/runtime.rs:1833:44
+     |
+1833 |     /// most one workspace per slot (see [`State::workspaces`]); without that invariant a
+     |                                            ^^^^^^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `blind_writes` links to private item `blind_writes_of`
+    --> src/agent_sql/runtime.rs:2028:60
+     |
+2028 |     /// Rows this branch wrote without ever reading. See [`blind_writes_of`].
+     |                                                            ^^^^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `BranchRecord::restrict`
+    --> src/agent_sql/runtime.rs:2935:26
+     |
+2935 |     /// did not have — [`BranchRecord::restrict`] refuses any widening — because an envelope a
+     |                          ^^^^^^^^^^^^^^^^^^^^^^ no item named `BranchRecord` in scope
+
+warning: public documentation for `cherry_pick` links to private item `AgentRuntime::stage_all`
+    --> src/agent_sql/runtime.rs:3482:45
+     |
+3482 |     /// The staging door that gives it is [`AgentRuntime::stage_all`], which decides every refusal
+     |                                             ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `forget_reaped_branches` links to private item `FORGET_CHUNK`
+    --> src/agent_sql/runtime.rs:5506:80
+     |
+5506 |     /// **Not atomic, deliberately.** The walk releases the state lock every [`FORGET_CHUNK`]
+     |                                                                                ^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `fallback_syncs` links to private item `FALLBACK_SYNCS`
+  --> src/agent_sql/session.rs:76:12
+   |
+76 | /// Read [`FALLBACK_SYNCS`]. Process-wide and monotonic; compare two readings, never the absolute.
+   |            ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `grantable_extents` links to private item `ArenaSpaceManager::reserve`
+   --> src/branch/arena.rs:709:20
+    |
+709 |     /// guard in [`ArenaSpaceManager::reserve`], which already refuses.
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ArenaPageStore::stale_delta_base_count`
+   --> src/branch/arena.rs:902:14
+    |
+902 |     ///    [`ArenaPageStore::stale_delta_base_count`] counts any case where it did not.
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the struct `ArenaPageStore` has no field or associated item named `stale_delta_base_count`
+
+warning: public documentation for `checkpoint_to` links to private item `PersistState`
+    --> src/branch/arena.rs:1465:15
+     |
+1465 |     /// see [`PersistState`].
+     |               ^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `head_of` links to private item `Self::by_branch`
+   --> src/branch/attest.rs:777:51
+    |
+777 |     /// branches and must not share a head. See [`Self::by_branch`]'s note.
+    |                                                   ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `LogBranchCatalog::put`
+   --> src/branch/catalog.rs:141:59
+    |
+141 |     /// nothing else in this type can be told about it. [`LogBranchCatalog::put`] cannot be used for
+    |                                                           ^^^^^^^^^^^^^^^^^^^^^ the struct `LogBranchCatalog` has no field or associated item named `put`
+
+warning: public documentation for `live_count` links to private item `CatalogState::install`
+   --> src/branch/catalog.rs:338:38
+    |
+338 |     /// **S20: O(1), maintained by [`CatalogState::install`]. ⚠ AND IT WAS NEVER A WALL.**
+    |                                      ^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `TableBranchCatalog`
+   --> src/branch/catalog.rs:350:49
+    |
+350 |     /// `examples/live_count_reps.rs` against [`TableBranchCatalog`] — the system-table catalog D1
+    |                                                 ^^^^^^^^^^^^^^^^^^ no item named `TableBranchCatalog` in scope
+    |
+    = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `cherry` links to private item `divergence`
+   --> src/branch/cherry.rs:140:7
+    |
+140 | //! [`divergence`] rejects a composition that does not explain the target's value. That is stated
+    |       ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `crate::branch::arena::ArenaPageStore::cow_page`
+ --> src/branch/delta.rs:6:7
+  |
+6 | //! [`crate::branch::arena::ArenaPageStore::cow_page`] for the cost being attacked,
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the struct `ArenaPageStore` has no field or associated item named `cow_page`
+
+warning: unresolved link to `crate::branch::mod`
+ --> src/branch/delta.rs:7:7
+  |
+7 | //! [`crate::branch::mod`] invariant 2 for the cost this must not introduce, and
+  |       ^^^^^^^^^^^^^^^^^^ no item named `mod` in module `branch`
+
+warning: unresolved link to `delta_tests::the_read_amplification_bound_is_arithmetic_not_hope`
+   --> src/branch/delta.rs:146:26
+    |
+146 | /// under three pages. [`delta_tests::the_read_amplification_bound_is_arithmetic_not_hope`] asserts
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `delta_tests` in scope
+
+warning: public documentation for `lease_thread` links to private item `crate::agent_sql::runtime::AgentRuntime::seal`
+  --> src/branch/lease_thread.rs:16:7
+   |
+16 | //! [`crate::agent_sql::runtime::AgentRuntime::seal`] takes its no-reaper branch: it marks a merged
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `lease_thread` links to private item `scan_once`
+  --> src/branch/lease_thread.rs:47:29
+   |
+47 | //! body did not do that: [`scan_once`] held ONE acquisition across the clock read, the candidate
+   |                             ^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `lease_thread` links to private item `REAP_CHUNK`
+  --> src/branch/lease_thread.rs:54:82
+   |
+54 | //! It is true as written now, and it takes TWO bounds, not one. The reaps run [`REAP_CHUNK`] at a
+   |                                                                                  ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `lease_thread` links to private item `REAP_YIELD`
+  --> src/branch/lease_thread.rs:56:40
+   |
+56 | //! Between groups it stands off for [`REAP_YIELD`] — that bounds how long a statement WAITS for
+   |                                        ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `lease_thread` links to private item `crate::branch::reaper::TwoTierReaper::reap_if_still_expired`
+  --> src/branch/lease_thread.rs:69:7
+   |
+69 | //! [`crate::branch::reaper::TwoTierReaper::reap_if_still_expired`] re-reads each record inside the
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `lease_thread` links to private item `refusal_report`
+  --> src/branch/lease_thread.rs:90:74
+   |
+90 | //! [`LeaseStats::refused_branches`], and their reasons are printed by [`refusal_report`]. The
+   |                                                                          ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `with_runtime_lock` links to private item `with_lock`
+   --> src/branch/lease_thread.rs:183:57
+    |
+183 |     /// Exactly once is a contract, not a suggestion: [`with_lock`] refuses rather than inventing a
+    |                                                         ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scans` links to private item `REAP_CHUNK`
+   --> src/branch/lease_thread.rs:264:59
+    |
+264 |     /// lock, and one that finds many takes it once per [`REAP_CHUNK`]. It still separates "the
+    |                                                           ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `ReapOutcome` links to private item `TwoTierReaper::reap_if_still_expired`
+  --> src/branch/reaper.rs:55:7
+   |
+55 | /// [`TwoTierReaper::reap_if_still_expired`] answered `Ok(false)` both for *"the lease was renewed
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `collect_orphaned_extents` links to private item `Self::sweep_touched_extents`
+   --> src/branch/reaper.rs:386:14
+    |
+386 |     /// to [`Self::sweep_touched_extents`]. But a crash is its only producer, so the complete
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `collect_orphaned_extents` links to private item `Self::collect_orphans_if_due`
+   --> src/branch/reaper.rs:388:30
+    |
+388 |     /// bounded cadence in [`Self::collect_orphans_if_due`] for the residue of an in-process error
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `create_with_header` links to private item `HEADER_PAGE_MAGIC`
+  --> src/branch/table_catalog.rs:99:21
+   |
+99 |     /// bytes are [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the
+   |                     ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `key_hash` links to private item `boundary_from`
+   --> src/cow/chunker.rs:198:53
+    |
+198 | /// still shifts every boundary downstream of it. [`boundary_from`] compares against one entry's
+    |                                                     ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `tests::a_crash_between_the_increment_and_the_record_leaks_nothing`
+  --> src/cow/dedup.rs:75:10
+   |
+75 | //!    [`tests::a_crash_between_the_increment_and_the_record_leaks_nothing`] simulates it directly
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: public documentation for `diff` links to private item `PageVersion`
+  --> src/cow/diff.rs:97:34
+   |
+97 | //! file therefore carries the [`PageVersion`] it was taken from and is re-validated before it is
+   |                                  ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `diff` links to private item `PageVersion`
+  --> src/cow/diff.rs:98:21
+   |
+98 | //! trusted — see [`PageVersion`] for what that catches and, just as importantly, what it cannot.
+   |                     ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `SubtreeHash` links to private item `PageVersion`
+   --> src/cow/diff.rs:302:37
+    |
+302 | /// used to be on that page — see [`PageVersion`] for the two stores' own words on it. Every row
+    |                                     ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `SubtreeHash` links to private item `PageVersion`
+   --> src/cow/diff.rs:311:67
+    |
+311 | /// reuse a provider across a write to a branch it has stamped. [`PageVersion`] says why.
+    |                                                                   ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `MemoIdentity` links to private item `PageVersion`
+   --> src/cow/diff.rs:571:7
+    |
+571 | /// [`PageVersion`]. Every row carries the version it was computed at, so:
+    |       ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `MemoIdentity` links to private item `PageVersion`
+   --> src/cow/diff.rs:584:61
+    |
+584 | /// row is nevertheless validated against that one page's [`PageVersion`], and no page-local token
+    |                                                             ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `MemoIdentity` links to private item `PageVersion`
+   --> src/cow/diff.rs:593:34
+    |
+593 | /// The rule that covers it is [`PageVersion`]'s usage rule, not a check: **warm after the last
+    |                                  ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `warm` links to private item `PageVersion`
+   --> src/cow/diff.rs:632:70
+    |
+632 |     /// A page whose memoised row still matches the page's current [`PageVersion`] is stepped over;
+    |                                                                      ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `diff` links to private item `PageVersion`
+   --> src/cow/diff.rs:956:13
+    |
+956 | /// page ([`PageVersion`]). That buys the difference between a stale row *missing* and a stale row
+    |             ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `node` links to private item `NodeMut::restamp_after_refusal`
+  --> src/cow/node.rs:11:7
+   |
+11 | //! [`NodeMut::restamp_after_refusal`] rewrites those four bytes when a cell insert refuses, so
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `NodeMut` links to private item `NodeMut::payload`
+   --> src/cow/node.rs:252:7
+    |
+252 | /// [`NodeMut::payload`] / [`NodeMut::payload_mut`], so the header stays off limits to the node
+    |       ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `NodeMut` links to private item `NodeMut::payload_mut`
+   --> src/cow/node.rs:252:30
+    |
+252 | /// [`NodeMut::payload`] / [`NodeMut::payload_mut`], so the header stays off limits to the node
+    |                              ^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `insert_cell_at` links to private item `Self::restamp_after_refusal`
+   --> src/cow/node.rs:360:36
+    |
+360 |     /// guarantee is [`restamped`](Self::restamp_after_refusal): the page verifies on the way out.
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `log` links to private item `classify`
+  --> src/tel/log.rs:28:7
+   |
+28 | //! [`classify`] is that decision, as one function. **Both stores call it**, so the rule cannot be
+   |       ^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `MemEffectLog` links to private item `Frames::position`
+   --> src/tel/log.rs:212:7
+    |
+212 | /// [`Frames::position`]. See [`Frames`] for the precondition that makes storing positions legal.
+    |       ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `MemEffectLog` links to private item `Frames`
+   --> src/tel/log.rs:212:33
+    |
+212 | /// [`Frames::position`]. See [`Frames`] for the precondition that makes storing positions legal.
+    |                                 ^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `extended` links to private item `Connection::failed`
+  --> src/pgwire/extended.rs:27:54
+   |
+27 | //!    after a failure is discarded until `Sync` — [`Connection::failed`].
+   |                                                      ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `parse` links to private item `Connection::catalog_cache`
+   --> src/pgwire/extended.rs:176:42
+    |
+176 |     /// `conn` is here for one reason: [`Connection::catalog_cache`]. Parsing needs the schema —
+    |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `parse` links to private item `Statement::parse_one`
+   --> src/pgwire/extended.rs:178:64
+    |
+178 |     /// SNAPSHOT rather than from the exclusive catalog. See [`Statement::parse_one`].
+    |                                                                ^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `SetTransaction` links to private item `check_txn_modifiers`
+  --> src/pgwire/session.rs:53:50
+   |
+53 |     /// `SET TRANSACTION ...` — validated (see [`check_txn_modifiers`]) and then a no-op, because
+   |                                                  ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `BackupHandle`
+  |
+  = note: the link appears in this line:
+          
+          - **It holds the primary's WAL, and that has a cost.** A [`BackupHandle`] pins the log, so a
+                                                                    ^^^^^^^^^^^^^^
+  = note: no item named `BackupHandle` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `BackupLabel::assert_usable_with`
+  |
+  = note: the link appears in this line:
+          
+            [`BackupLabel::assert_usable_with`] turns that refusal into a message naming the real cause
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `BackupLabel` in scope
+
+warning: unresolved link to `Decoded::internal`
+  |
+  = note: the link appears in this line:
+          
+          counted in [`Decoded::internal`].
+                      ^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Decoded` in scope
+
+warning: unresolved link to `Decoded::unresolved`
+  |
+  = note: the link appears in this line:
+          
+          and returned in [`Decoded::unresolved`], alongside the aborted and still-open transaction ids.
+                           ^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Decoded` in scope
+
+warning: unresolved link to `super::logical`
+  |
+  = note: the link appears in this line:
+          
+          [`super::logical`] produces `ChangeEvent`s in memory, which only a Rust caller inside this
+           ^^^^^^^^^^^^^^^^
+  = note: no item named `logical` in module `ferrodb`
+
+warning: unresolved link to `Publication`
+  |
+  = note: the link appears in this line:
+          
+          Every rule above is about representing a value faithfully. A [`Publication`] is about whether the
+                                                                        ^^^^^^^^^^^^^
+  = note: no item named `Publication` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `row_into`
+  |
+  = note: the link appears in this line:
+          
+          is where a row becomes bytes: [`row_into`] holds the allowlist, so the WAL stream, the initial
+                                         ^^^^^^^^^^
+  = note: no item named `row_into` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Refusal`
+  |
+  = note: the link appears in this line:
+          
+          comes back as a [`Refusal`], and what the streaming caller must then do with its cursor is the
+                           ^^^^^^^^^
+  = note: no item named `Refusal` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `super::stream::FeedStreamer::pump`
+  |
+  = note: the link appears in this line:
+          
+          hard part — see [`super::stream::FeedStreamer::pump`].
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::stream`
+  |
+  = note: the link appears in this line:
+          
+          [`super::stream`], the boundary in [`super::snapshot`], the composite idempotence key in the Go
+           ^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::snapshot`
+  |
+  = note: the link appears in this line:
+          
+          [`super::stream`], the boundary in [`super::snapshot`], the composite idempotence key in the Go
+                                              ^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl`
+  |
+  = note: the link appears in this line:
+          
+          In [`super::jsonl`], through the mask handed to `row_into` — the one function that turns a **row**
+              ^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl::write_feed`
+  |
+  = note: the link appears in this line:
+          
+          [`super::jsonl::write_feed`] and [`super::jsonl::write_table_json`];
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl::write_table_json`
+  |
+  = note: the link appears in this line:
+          
+          [`super::jsonl::write_feed`] and [`super::jsonl::write_table_json`];
+                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl::to_json_line`
+  |
+  = note: the link appears in this line:
+          
+          [`super::jsonl::to_json_line`] is the single-event form the tests use. Not at the SQL layer, not in
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::stream::FeedStreamer::pump`
+  |
+  = note: the link appears in this line:
+          
+          * [`super::stream::FeedStreamer::pump`] decodes the WAL and streams it,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::snapshot::snapshot_table`
+  |
+  = note: the link appears in this line:
+          
+          * [`super::snapshot::snapshot_table`] scans the live table for an initial backfill,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl`
+  |
+  = note: the link appears in this line:
+          
+          All three reach the wire through the renderers in [`super::jsonl`], so that is where the
+                                                             ^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl`
+  |
+  = note: the link appears in this line:
+          
+            emitted image, and nothing on the wire names it — see [`super::jsonl`] for why no `withheld`
+                                                                     ^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `super::stream::Subscription`
+  |
+  = note: the link appears in this line:
+          
+          a refusal stops the cursor, a stopped cursor is a [`super::stream::Subscription`] whose pin sits on
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::stream::FeedStreamer::pump`
+  |
+  = note: the link appears in this line:
+          
+          Refusing an event stalls the feed at that event, on purpose. [`super::stream::FeedStreamer::pump`]
+                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::stream::Pumped::refusal`
+  |
+  = note: the link appears in this line:
+          
+          [`super::stream::Pumped::refusal`] and makes [`super::stream::Pumped::is_clean`] false; a feed
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `super::stream::Pumped::is_clean`
+  |
+  = note: the link appears in this line:
+          
+          [`super::stream::Pumped::refusal`] and makes [`super::stream::Pumped::is_clean`] false; a feed
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `Snapshot::concurrent_writes`
+  |
+  = note: the link appears in this line:
+          
+          [`Snapshot::concurrent_writes`] says whether the log moved during the scan, which is what
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Snapshot` in scope
+
+warning: unresolved link to `snapshot_table_exact`
+  |
+  = note: the link appears in this line:
+          
+          # [`snapshot_table_exact`]: the same handoff with the overlap removed
+             ^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot_table_exact` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `snapshot_table`
+  |
+  = note: the link appears in this line:
+          
+          Everything above is true of [`snapshot_table`], which brackets a read it knows nothing about and
+                                       ^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot_table` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `snapshot_table_exact`
+  |
+  = note: the link appears in this line:
+          
+          [`snapshot_table_exact`] is given the [`TxnManager`] as well, and that one extra thing is enough
+           ^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot_table_exact` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `TxnManager`
+  |
+  = note: the link appears in this line:
+          
+          [`snapshot_table_exact`] is given the [`TxnManager`] as well, and that one extra thing is enough
+                                                 ^^^^^^^^^^^^
+  = note: no item named `TxnManager` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `super::stream::FeedStreamer::resuming_after_snapshot`
+  |
+  = note: the link appears in this line:
+          
+          [`FeedStreamer::resuming_after_snapshot`](super::stream::FeedStreamer::resuming_after_snapshot)
+                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `stream` in module `ferrodb`
+
+warning: unresolved link to `snapshot_table_exact`
+  |
+  = note: the link appears in this line:
+          
+          - **Not a multi-table snapshot, as written.** [`snapshot_table_exact`] opens one reader per
+                                                         ^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot_table_exact` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `TxnManager::begin_snapshot_read`
+  |
+  = note: the link appears in this line:
+          
+            1. hand [`TxnManager::begin_snapshot_read`]'s result to [`SnapshotBoundaryBuilder::new`],
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `TxnManager` in scope
+
+warning: unresolved link to `SnapshotBoundaryBuilder::new`
+  |
+  = note: the link appears in this line:
+          
+            1. hand [`TxnManager::begin_snapshot_read`]'s result to [`SnapshotBoundaryBuilder::new`],
+                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotBoundaryBuilder` in scope
+
+warning: unresolved link to `SnapshotBoundaryBuilder::deliver`
+  |
+  = note: the link appears in this line:
+          
+               [`deliver`](SnapshotBoundaryBuilder::deliver),
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotBoundaryBuilder` in scope
+
+warning: unresolved link to `TxnManager::end_read_only`
+  |
+  = note: the link appears in this line:
+          
+            3. close the reader with [`TxnManager::end_read_only`],
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `TxnManager` in scope
+
+warning: unresolved link to `SnapshotBoundaryBuilder::finish`
+  |
+  = note: the link appears in this line:
+          
+            4. [`finish`](SnapshotBoundaryBuilder::finish) for the boundary and the pin,
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotBoundaryBuilder` in scope
+
+warning: unresolved link to `SnapshotBoundaryBuilder::delivered_elsewhere`
+  |
+  = note: the link appears in this line:
+          
+            through [`delivered_elsewhere`](SnapshotBoundaryBuilder::delivered_elsewhere), which at least
+                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotBoundaryBuilder` in scope
+
+warning: unresolved link to `super::logical`
+  |
+  = note: the link appears in this line:
+          
+          [`super::logical`] decodes a fixed LSN range and [`super::jsonl`] writes it out. A CDC consumer
+           ^^^^^^^^^^^^^^^^
+  = note: no item named `logical` in module `ferrodb`
+
+warning: unresolved link to `super::jsonl`
+  |
+  = note: the link appears in this line:
+          
+          [`super::logical`] decodes a fixed LSN range and [`super::jsonl`] writes it out. A CDC consumer
+                                                            ^^^^^^^^^^^^^^
+  = note: no item named `jsonl` in module `ferrodb`
+
+warning: unresolved link to `Publication`
+  |
+  = note: the link appears in this line:
+          
+          A [`Publication`] can refuse an event outright: an undecided table must not leave the database,
+             ^^^^^^^^^^^^^
+  = note: no item named `Publication` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `FeedStreamer::resuming_after_snapshot`
+  |
+  = note: the link appears in this line:
+          
+          [`FeedStreamer::resuming_after_snapshot`] takes the [`SnapshotBoundary`] a snapshot hands back
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `FeedStreamer` in scope
+
+warning: unresolved link to `SnapshotBoundary`
+  |
+  = note: the link appears in this line:
+          
+          [`FeedStreamer::resuming_after_snapshot`] takes the [`SnapshotBoundary`] a snapshot hands back
+                                                               ^^^^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotBoundary` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Subscription::following`
+  |
+  = note: the link appears in this line:
+          
+          Pair it with [`Subscription::following`], which takes the starting cursor from that same
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Subscription` in scope
+
+warning: unresolved link to `super::snapshot`
+  |
+  = note: the link appears in this line:
+          
+          boundary. See [`super::snapshot`] for why the decision has to be made per table and per
+                         ^^^^^^^^^^^^^^^^^
+  = note: no item named `snapshot` in module `ferrodb`
+
+warning: unresolved link to `AckTracker::record`
+  |
+  = note: the link appears in this line:
+          
+          [`AckTracker::record`] is fed from the primary's existing serve loop. Adding an `Ack` frame
+           ^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `AckTracker` in scope
+
+warning: unresolved link to `AckTracker::wait_for`
+  |
+  = note: the link appears in this line:
+          
+          is a guarantee that reports success while not holding. So [`AckTracker::wait_for`] does neither
+                                                                     ^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `AckTracker` in scope
+
+warning: public documentation for `election` links to private item `Consensus::on_tick`
+  --> src/consensus/election.rs:10:25
+   |
+10 | //! Two entry points, [`Consensus::on_tick`] and [`Consensus::on_vote_msg`], and the transitions
+   |                         ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `election` links to private item `Consensus::on_vote_msg`
+  --> src/consensus/election.rs:10:52
+   |
+10 | //! Two entry points, [`Consensus::on_tick`] and [`Consensus::on_vote_msg`], and the transitions
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `election` links to private item `Consensus::observe_quorum_watermark`
+  --> src/consensus/election.rs:21:9
+   |
+21 | //! * [`Consensus::observe_quorum_watermark`] — `replicate.rs` calls this with the `commit` carried
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `election` links to private item `Consensus::observe_config_at`
+  --> src/consensus/election.rs:23:9
+   |
+23 | //! * [`Consensus::observe_config_at`] — `replicate.rs`/`snapshot.rs` call this when a peer reports
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `election` links to private item `Consensus::apply_config`
+  --> src/consensus/election.rs:25:9
+   |
+25 | //! * [`Consensus::apply_config`] — the caller calls this when a `Command::Membership` commits. It
+   |         ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `membership` links to private item `super::Consensus::acked`
+  --> src/consensus/membership.rs:49:36
+   |
+49 | //! voters.** [`Consensus::acked`](super::Consensus::acked) holds a [`CfgAt`] — a `(version, term)`
+   |                                    ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `plan_change` links to private item `Consensus::begin_membership`
+   --> src/consensus/membership.rs:202:11
+    |
+202 |     /// [`Consensus::begin_membership`] re-checks every rule at the moment the change is begun. A
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `note_bootstrap_config` links to private item `Consensus::check_precondition`
+   --> src/consensus/membership.rs:245:11
+    |
+245 |     /// [`Consensus::check_precondition`] **refuses**: a guard that cannot see its input must ask
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `note_config_in_log` links to private item `Consensus::begin_membership`
+   --> src/consensus/membership.rs:268:56
+    |
+268 |     ///   `Body::Append { entries }`; on the leader, [`Consensus::begin_membership`] has already
+    |                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `Transport`
+  |
+  = note: the link appears in this line:
+          
+          * route [`Action::Send`] through the [`Transport`], and inbound frames back as [`Event::Recv`];
+                                                ^^^^^^^^^^^
+  = note: no item named `Transport` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `RoundLog`
+  |
+  = note: the link appears in this line:
+          
+          * fulfil [`Action::Persist`] against the durable [`RoundLog`], then feed [`Event::Persisted`]
+                                                            ^^^^^^^^^^
+  = note: no item named `RoundLog` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Node::perform`
+  |
+  = note: the link appears in this line:
+          
+          [`Node::perform`] is called in order and each action completes — fsync included — before the
+           ^^^^^^^^^^^^^^^
+  = note: no item named `Node` in scope
+
+warning: unresolved link to `NodeOptions::retain_rounds`
+  |
+  = note: the link appears in this line:
+          
+            floor, so state transfer is code that never runs. [`NodeOptions::retain_rounds`] is how many
+                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `NodeOptions` in scope
+
+warning: unresolved link to `SnapshotStore`
+  |
+  = note: the link appears in this line:
+          
+            completed spool is installed through [`SnapshotStore`] before — never after — the state
+                                                  ^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotStore` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `SnapshotStore`
+  |
+  = note: the link appears in this line:
+          
+          A node with no [`SnapshotStore`] configured **refuses loudly** where one would be needed rather
+                          ^^^^^^^^^^^^^^^
+  = note: no item named `SnapshotStore` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `tests_replicate`
+  --> src/consensus/replicate.rs:14:42
+   |
+14 | //!    and is not: [`the figure-8 test`](tests_replicate) plays out the sequence where a round that
+   |                                          ^^^^^^^^^^^^^^^ no item named `tests_replicate` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `replicate` links to private item `LogTail`
+  --> src/consensus/replicate.rs:57:16
+   |
+57 | //! lives in [`LogTail`], in the `progress` entry keyed by the node's **own** id. That is a
+   |                ^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `replicate` links to private item `Consensus::term_at`
+  --> src/consensus/replicate.rs:59:15
+   |
+59 | //! through [`Consensus::term_at`], [`Consensus::entries_from`] and their siblings, so moving it to
+   |               ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `replicate` links to private item `Consensus::entries_from`
+  --> src/consensus/replicate.rs:59:39
+   |
+59 | //! through [`Consensus::term_at`], [`Consensus::entries_from`] and their siblings, so moving it to
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `replicate` links to private item `Consensus::ensure_log`
+  --> src/consensus/replicate.rs:63:33
+   |
+63 | //! destroy the log silently. [`Consensus::ensure_log`] runs at the top of every entry point and
+   |                                 ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `replicate` links to private item `Consensus::init_leader_progress`
+  --> src/consensus/replicate.rs:65:7
+   |
+65 | //! [`Consensus::init_leader_progress`] to (re)initialise per-peer state; it preserves the log.
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `matched` links to private item `Consensus::acknowledgement`
+   --> src/consensus/replicate.rs:103:22
+    |
+103 |     /// sent — see [`Consensus::acknowledgement`].
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `Store`
+  |
+  = note: the link appears in this line:
+          
+            watermark *back*. So the sim's [`Store`] is the only complete record of what a node holds, and
+                                            ^^^^^^^
+  = note: no item named `Store` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Peer::boot`
+  |
+  = note: the link appears in this line:
+          
+            [`Peer::boot`] from the durable bytes alone. A restart that kept one field of volatile state
+             ^^^^^^^^^^^^
+  = note: no item named `Peer` in scope
+
+warning: unresolved link to `Violation`
+  |
+  = note: the link appears in this line:
+          
+          The rule strings are the ones that appear in a [`Violation`].
+                                                          ^^^^^^^^^^^
+  = note: no item named `Violation` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Store`
+  |
+  = note: the link appears in this line:
+          
+            omission.** [`Store`] requires rounds contiguous from 1 and refuses a write that leaves a
+                         ^^^^^^^
+  = note: no item named `Store` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Grants::take`
+  |
+  = note: the link appears in this line:
+          
+          There is exactly **one** way to obtain a value from any of these counters — [`Grants::take`],
+                                                                                         ^^^^^^^^^^^^^^
+  = note: no item named `Grants` in scope
+
+warning: unresolved link to `Authority::Standalone`
+  |
+  = note: the link appears in this line:
+          
+          * [`Authority::Standalone`] — no cluster is configured, so this node *is* the leader, and it
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Authority` in scope
+
+warning: unresolved link to `Authority::Member`
+  |
+  = note: the link appears in this line:
+          
+          * [`Authority::Member`] — this node is one of several. Ranges arrive only as applied
+             ^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Authority` in scope
+
+warning: unresolved link to `join`
+  |
+  = note: the link appears in this line:
+          
+          So [`join`] flips the whole process at once, and every counter reads [`authority`] at the
+              ^^^^^^
+  = note: no item named `join` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `authority`
+  |
+  = note: the link appears in this line:
+          
+          So [`join`] flips the whole process at once, and every counter reads [`authority`] at the
+                                                                                ^^^^^^^^^^^
+  = note: no item named `authority` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `AuthorityEpoch`
+  |
+  = note: the link appears in this line:
+          
+          else. So every held range records the [`AuthorityEpoch`] it was granted under, [`join`] and
+                                                 ^^^^^^^^^^^^^^^^
+  = note: no item named `AuthorityEpoch` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `join`
+  |
+  = note: the link appears in this line:
+          
+          else. So every held range records the [`AuthorityEpoch`] it was granted under, [`join`] and
+                                                                                          ^^^^^^
+  = note: no item named `join` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `leave`
+  |
+  = note: the link appears in this line:
+          
+          [`leave`] bump that epoch, and [`Grants::take`] discards any range from a stale one. A node
+           ^^^^^^^
+  = note: no item named `leave` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Grants::take`
+  |
+  = note: the link appears in this line:
+          
+          [`leave`] bump that epoch, and [`Grants::take`] discards any range from a stale one. A node
+                                          ^^^^^^^^^^^^^^
+  = note: no item named `Grants` in scope
+
+warning: unresolved link to `Grants::apply_grant`
+  |
+  = note: the link appears in this line:
+          
+          ([`Grants::apply_grant`], [`apply_lease_tick`]) are the receiving end of
+            ^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `Grants` in scope
+
+warning: unresolved link to `apply_lease_tick`
+  |
+  = note: the link appears in this line:
+          
+          ([`Grants::apply_grant`], [`apply_lease_tick`]) are the receiving end of
+                                     ^^^^^^^^^^^^^^^^^^
+  = note: no item named `apply_lease_tick` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `Applied` links to private item `Grants::apply_grant`
+   --> src/cluster/mod.rs:355:12
+    |
+355 | /// What [`Grants::apply_grant`] did with an entry.
+    |            ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `id_of` links to private item `PageVersion`
+   --> src/cow/diff.rs:425:49
+    |
+425 |     /// counter moving. Re-reading the page's [`PageVersion`] turns it into a fallback, which is
+    |                                                 ^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `frames_for` links to private item `Frames::by_key`
+   --> src/tel/log.rs:451:62
+    |
+451 |     /// stored frames, so it does not disturb any position [`Frames::by_key`] holds.
+    |                                                              ^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `<unknown>` links to private item `read_at`
+   --> src/consensus/log.rs:232:73
+    |
+232 | /// look for a bad checksum that does not exist. Those two go through [`read_at`]/[`write_at`]
+    |                                                                         ^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `<unknown>` links to private item `write_at`
+   --> src/consensus/log.rs:232:85
+    |
+232 | /// look for a bad checksum that does not exist. Those two go through [`read_at`]/[`write_at`]
+    |                                                                                     ^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: redundant explicit link target
+  --> src/storage/sim.rs:10:17
+   |
+10 | //! [`Storage`](crate::storage::storage::Storage), counts every operation, and breaks the one it is
+   |      ---------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |      |
+   |      because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+   = note: `#[warn(rustdoc::redundant_explicit_links)]` on by default
+help: remove explicit link target
+   |
+10 - //! [`Storage`](crate::storage::storage::Storage), counts every operation, and breaks the one it is
+10 + //! [`Storage`], counts every operation, and breaks the one it is
+   |
+
+warning: redundant explicit link target
+  --> src/storage/sim.rs:38:15
+   |
+38 | //! [`crc32`](crate::wal::log::crc32) — the same implementation the WAL trusts for record integrity.
+   |      -------  ^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |      |
+   |      because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+38 - //! [`crc32`](crate::wal::log::crc32) — the same implementation the WAL trusts for record integrity.
+38 + //! [`crc32`] — the same implementation the WAL trusts for record integrity.
+   |
+
+warning: redundant explicit link target
+  --> src/consensus/membership.rs:61:70
+   |
+61 | //! it does; an uncommitted entry is removed by [`Action::Truncate`](super::Action::Truncate). It is
+   |                                                  ------------------  ^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |                                                  |
+   |                                                  because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+61 - //! it does; an uncommitted entry is removed by [`Action::Truncate`](super::Action::Truncate). It is
+61 + //! it does; an uncommitted entry is removed by [`Action::Truncate`]. It is
+   |
+
+warning: `ferrodb` (lib doc) generated 170 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.40s
+   Generated /Users/idide/wt/ferrodb-d193-diff-label/target/doc/ferrodb/index.html

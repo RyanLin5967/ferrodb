@@ -1,10 +1,21 @@
-//! D103 — the production `DIFF` path descends the two roots together, and it is really that path.
+//! D103 — `AgentRuntime::page_changeset` descends the two roots together, and it is really that
+//! descent.
+//!
+//! ⚠ D193 (2026-09-23): the first line of this file used to read "the production `DIFF` path
+//! descends the two roots together". `page_changeset` is NOT the production `DIFF` path and never
+//! was: `DIFF <branch>` runs `AgentRuntime::diff`, which builds the changeset from the workspace's
+//! touched-rows map and descends no page tree, and `page_changeset` has no caller in `src/`. The
+//! file and test names keep the word "production" only because renaming them would change the
+//! suite's target and test lists; read it as "the page-derived changeset". What these tests prove
+//! is true of `page_changeset`; none of it is a statement about the cost of a `DIFF` statement.
 //!
 //! `cow::diff` had **zero external callers** before this row: a correct mechanism sitting beside a
-//! database that did not use it. `AgentRuntime::page_changeset` now calls it. These tests exist to
-//! make three separate claims falsifiable, because each of them can look true for a wrong reason:
+//! database that did not use it. `AgentRuntime::page_changeset` now calls it (and `page_changeset`
+//! itself has no production caller — see above). These tests exist to make three separate claims
+//! falsifiable, because each of them can look true for a wrong reason:
 //!
-//! 1. **The wiring is real.** `a_production_diff_reads_pages_in_proportion_to_depth` counts
+//! 1. **The wiring inside `page_changeset` is real.**
+//!    `a_production_diff_reads_pages_in_proportion_to_depth` counts
 //!    `PageStore::read_page` calls through a decorator, so it measures pages the engine actually
 //!    pulled rather than a counter the code chose to report. Rewire `page_changeset` back to
 //!    `CowTree::diff` and this fails: that path calls `walk_pages` on both roots first, so it
@@ -179,7 +190,10 @@ impl Fixture {
 // 1. The wiring is real
 // -------------------------------------------------------------------------------------------
 
-/// **Pages actually read by a production `DIFF` track DEPTH, not N.**
+/// **Pages actually read by `page_changeset_with_cost` track DEPTH, not N.**
+///
+/// (D193: this line used to say "a production `DIFF`", and the test's name still does; the
+/// function under test is not what `DIFF <branch>` runs — see the module doc.)
 ///
 /// Four rows change in a tree of 8000. The old path had to enumerate both roots before it could
 /// prune — more than 2·(tree nodes) reads — while reporting a `pages_examined` in the single
@@ -214,8 +228,9 @@ fn a_production_diff_reads_pages_in_proportion_to_depth() {
     );
     assert!(
         reads * 10 < nodes,
-        "a production DIFF of 4 rows read {reads} pages out of a {nodes}-node tree. The old path \
-         reads more than 2x that many; this one is supposed to read O(delta · depth)."
+        "a page-derived changeset of 4 rows read {reads} pages out of a {nodes}-node tree. \
+         The old path reads more than 2x that many; this one is supposed to read \
+         O(delta · depth)."
     );
     assert!(cost.skipped_subtrees > 0, "no subtree was skipped, so nothing was pruned");
 
@@ -322,7 +337,9 @@ fn every_leaf_differs_so_nothing_is_skipped() {
 }
 
 // -------------------------------------------------------------------------------------------
-// The provider that is deliberately NOT on the production path
+// The provider `page_changeset` deliberately does NOT use
+// (D193: this heading used to say "NOT on the production path"; `page_changeset` is not the
+// production `DIFF` path either — see the module doc.)
 // -------------------------------------------------------------------------------------------
 
 /// **`MemoIdentity` gives the same answer, must be warmed, and reports it when it was not.**

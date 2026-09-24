@@ -1,0 +1,3 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d193-diff-label)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.36s
+     Running tests/integration_production_diff_wiring.rs (target/debug/deps/integration_production_diff_wiring-fddd0eafc5e05abc)
