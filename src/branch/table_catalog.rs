@@ -5197,6 +5197,99 @@ mod f1_lease_grace {
         let _ = c.as_written_before_d198();
     }
 
+    /// **Review 5, C3: E1 over a catalog that carries evidence — the killer of the re-spelled M58.**
+    /// A soft mark stamped with the WALL clock can be spelled from any `FileWallStamp` the catalog
+    /// holds (`f.millis() + f.wall_age_millis()` is the wall reading), and the fresh catalog of the
+    /// E1 test holds none, so that test cannot see it. Here the writer opens a catalog no D198
+    /// build wrote, an hour after its last write, with its wall clock `S` ahead of its lease clock,
+    /// and forks a lease with 840 s left on ITS clock. The next start comes 10 s after the writer's
+    /// write, its lease clock anchored to the wall. A wall-stamped mark credits the writer's lease
+    /// `1 h + 10 s` and it expires; the lease-clock mark credits `1 h + S + 10 s` and it keeps at
+    /// least what it had (plus the pre-writer hour, review 4's route 3).
+    #[test]
+    fn a_lagging_writer_over_an_evidence_bearing_catalog_keeps_its_leases_across_the_next_start() {
+        use crate::cluster::wall_step;
+        const S: u64 = 2 * HOUR;
+        const LEFT: u64 = 840_000;
+        let path = sidecar("e1-with-evidence");
+        let t = LeaseDeadline::now_millis();
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+            c.as_written_before_d198().unwrap();
+        }
+        age_file(&path, t - HOUR);
+        let b = {
+            let _slept = wall_step::by(S as i64);
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            assert_no_d198_keys(&c);
+            c.fork(BranchId::TRUNK, LeaseDeadline(t + LEFT)).unwrap().branch_id
+        };
+        age_file(&path, t + S);
+        let now = t + S + 10_000;
+        let _next_start = wall_step::by((S + 10_000) as i64);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        c.resume_leases(now).unwrap();
+        let lease = c.enforced_lease(b).unwrap().expect("a live lease");
+        assert!(
+            !lease.is_expired_at(now),
+            "a lease with 840 s left on its writer's lease clock was expired at the next start: the \
+             writer's soft mark was not on its lease clock (review 5, C3; the re-spelled M58)"
+        );
+        assert!(
+            lease.0 - now + 60_000 >= LEFT,
+            "the lease kept {} ms; it had {LEFT} ms at its writer's commit",
+            lease.0 - now
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Review 5, T: the downtime a writer carries is fixed at its OPEN, not at its commit.** A
+    /// mutant that recomputed `accrued` from the evidence at each commit would credit the writer's
+    /// own run between its open and that commit, and no other test puts a lease-clock interval
+    /// there. The writer opens a catalog no D198 build wrote (an hour after its last write), waits
+    /// a second, commits, and stops; the next start resumes at once. The file's own time is then
+    /// put in the future, where it has no age, so the credit is exactly `accrued + (now − mark)`,
+    /// and program-order readings bound it with no slack: the writer's open lies in `[a0, a1]`,
+    /// its mark in `[b0, b1]`.
+    #[test]
+    fn an_unresumed_writers_accrued_downtime_is_fixed_at_its_open_not_at_its_commit() {
+        let path = sidecar("accrued-at-open");
+        let t = LeaseDeadline::now_millis();
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+            c.as_written_before_d198().unwrap();
+        }
+        let m = t - HOUR;
+        age_file(&path, m);
+        let (a0, a1, b0, b1) = {
+            let a0 = LeaseDeadline::now_millis();
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let a1 = LeaseDeadline::now_millis();
+            assert_no_d198_keys(&c);
+            std::thread::sleep(std::time::Duration::from_millis(1_000));
+            let b0 = LeaseDeadline::now_millis();
+            c.set_root(BranchId::TRUNK, 1).unwrap();
+            (a0, a1, b0, LeaseDeadline::now_millis())
+        };
+        age_file(&path, LeaseDeadline::now_millis() + 24 * HOUR);
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let now = LeaseDeadline::now_millis();
+        c.resume_leases(now).unwrap();
+        let (_, credited) = c.alive_state().unwrap().expect("the resume recorded a mark");
+        let (lo, hi) = ((a0 - m) + (now - b1), (a1 - m) + (now - b0));
+        assert!(
+            (lo..=hi).contains(&credited),
+            "credited {credited} ms; owed between {lo} and {hi} ms. Above means the writer's own \
+             second between its open and its commit was credited: its accrued downtime was taken \
+             at the commit, not at the open"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");
