@@ -217,7 +217,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
+    // D244 MUTANT ME: the base's inline exit, not exit_sequence
+    txn.checkpoint()?;
+    store.checkpoint(Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
 }
