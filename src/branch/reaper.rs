@@ -606,7 +606,8 @@ impl TwoTierReaper {
         let mut freed = 0u32;
         for (arena, owner) in self.store.live_arenas() {
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
-            if self.extent_is_collectable(arena, owner, MissingOwner::Gone)
+            // MUTANT (fire-check only, never land): absence is not evidence at open either.
+            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence)
                 && self.store.free_arena_if_present(arena)?
             {
                 freed += 1;
