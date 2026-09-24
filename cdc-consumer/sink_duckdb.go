@@ -214,8 +214,8 @@ func duckTypeOf(v any) string {
 // ensureDuckTable creates the destination table from a schema event.
 //
 // IF NOT EXISTS is load-bearing, not defensive habit: a CREATE_TABLE is re-emitted at every
-// checkpoint of the source, because a checkpoint truncates the log and has to re-establish the
-// schema at the new base. A sink that treated each one as "a new table appeared" would fail on the
+// checkpoint of the source that truncates its log, because the truncation discarded it and the
+// schema has to be re-established at the new base. A sink that treated each one as "a new table appeared" would fail on the
 // second checkpoint of every table's life.
 //
 // The key column is declared PRIMARY KEY, and that is not cosmetic in DuckDB: ON CONFLICT needs an
@@ -350,7 +350,7 @@ func (s *DuckSink) catchUpToDeclaredShape(table string, want, wantTypes, got, go
 // checkSchemaAgrees refuses when the destination table is not the table the event describes.
 //
 // Re-emission is the COMMON case, not the exception — a CREATE_TABLE is re-sent at every checkpoint
-// of the source — so agreement has to stay a silent no-op. Only a genuine difference is an error,
+// of the source that truncates its log — so agreement has to stay a silent no-op. Only a genuine difference is an error,
 // and the message names the column and both types, because "schema mismatch" alone sends the reader
 // to diff two schemas by hand.
 func (s *DuckSink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []string) error {

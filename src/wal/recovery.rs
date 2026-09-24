@@ -490,8 +490,9 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     //   non-empty log, so that could not happen;
     // - (D234) whenever there is a table to declare, so the declarations are in the log before
     //   anything can pin it. A checkpoint that a pin keeps from truncating re-declares nothing,
-    //   and at an open nothing holds a pin yet. Only a log written before D227 can be empty while
-    //   the catalog has tables; after D227 every checkpoint re-declares them.
+    //   and at an open nothing holds a pin yet. A log can be empty while the catalog has tables:
+    //   one written before D227, one cut by a crash between a truncation and its replay, or one a
+    //   snapshot install truncated (the D234 adversary's F4).
     let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
     if rebuild || holds_records || declares {
         txn.checkpoint()?;

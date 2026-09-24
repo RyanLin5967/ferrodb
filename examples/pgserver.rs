@@ -117,7 +117,7 @@ fn main() {
     );
 
     // D227, the same call the CLI makes: the runs this runtime's provenance store knows, declared
-    // so every checkpoint re-declares them. The store here is in memory, so after a restart it knows
+    // and written to the log, so every checkpoint that truncates re-declares them. The store here is in memory, so after a restart it knows
     // none and this declares none; it is here so the two entry points cannot drift apart on it.
     txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!("pgserver: {e}"));
 

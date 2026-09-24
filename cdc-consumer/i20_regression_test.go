@@ -27,8 +27,8 @@ import (
 // destination. The mirror case is not covered: a DECLARED shape checked against a GUESSED
 // destination. Both halves of the scenario are ones this code base says are ordinary — a consumer
 // that starts after its CREATE_TABLE was truncated away takes the inference path (that is why
-// `ensureFromRow` exists), and "a CREATE_TABLE is re-sent at every checkpoint of the source" is
-// `checkSchemaAgrees`'s own comment.
+// `ensureFromRow` exists), and "a CREATE_TABLE is re-sent at every checkpoint of the source that
+// truncates its log" is `checkSchemaAgrees`'s own comment.
 func TestI20RegressionInferredDestinationThenDeclaredCreateTable(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "out.sqlite")

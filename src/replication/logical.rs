@@ -98,9 +98,10 @@ pub enum ChangeOp {
     /// DDL actually occupied means the events before it describe the old shape and the ones after
     /// describe the new one, with no ambiguity to resolve.
     ///
-    /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint,
-    /// because a checkpoint truncates the log and must re-establish the schema at the new base for
-    /// the log to stay self-describing. So a consumer will see the same `CREATE_TABLE` many times
+    /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint that
+    /// truncates the log, because the truncation discarded it and the schema has to be re-established
+    /// at the new base for the log to stay self-describing. (Since D234, not at a checkpoint a pin kept
+    /// from truncating: nothing was discarded there.) So a consumer will see the same `CREATE_TABLE` many times
     /// for one table and must read it as "this table has this shape" rather than "a table was just
     /// created" — anything counting them is counting checkpoints. Measured at
     /// `FERRODB_CHECKPOINT_INTERVAL=1`, where 30 commits produced 61 events: 30 rows and 31
@@ -176,7 +177,7 @@ impl SchemaChange {
     ///
     /// The distinction a consumer needs is not "is this about shape" — all five are — but
     /// **"is this a declaration or is it news"**. `CREATE_TABLE` is re-emitted at every checkpoint
-    /// and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
+    /// that truncates the log and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
     /// set. The column-level three are delivered exactly once, in log order, at the position the
     /// DDL occupied, and a consumer that re-applies one has renamed a column twice.
     pub fn is_declaration(&self) -> bool {
@@ -669,8 +670,11 @@ impl LogicalDecoder {
     /// against the log's base, and a live subscription pins the base, so under a held pin nothing
     /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
     /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
-    /// for every table after every truncation, so a long-running database mints one entry per table
-    /// per checkpoint, all carrying the identical shape.
+    /// for every table after every truncation, and until D234 also at every checkpoint a pin kept
+    /// from truncating, so a long-running database minted one entry per table per checkpoint, all
+    /// carrying the identical shape. Since D234 a held pin stops that at the source; identical runs
+    /// still arrive across real truncations and in archived logs
+    /// (`tests/d234_decoder_history_still_collapses.rs`).
     ///
     /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
     /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one

@@ -28,8 +28,10 @@ package main
 //     the table's publishable columns are.
 //
 // The second check is opportunistic — it needs a CREATE_TABLE in the feed — and that is acceptable
-// because it is the non-security direction. The producer re-emits CREATE_TABLE at every checkpoint, so
-// a following consumer sees one.
+// because it is the non-security direction. The producer re-emits CREATE_TABLE at every checkpoint
+// that truncates its log. Since D234 a checkpoint a pin kept re-emits nothing, and a live
+// subscription's own claim keeps every checkpoint from truncating, so a following consumer sees one
+// only when the table's CREATE_TABLE is inside the range it reads.
 //
 // Both checks are wired into `decodeLine`, which every subcommand that reads events goes through, so
 // a mode added later cannot forget them.

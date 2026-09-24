@@ -95,7 +95,7 @@ pub struct TxnManager {
     /// name the database's writers.
     ///
     /// **Stated cost:** this grows with the number of distinct runs and is never pruned, and every
-    /// checkpoint rewrites all of it — the same unbounded shape `schema_log` has for tables, where
+    /// checkpoint that truncates the log rewrites all of it (since D234, not one a pin kept) — the same unbounded shape `schema_log` has for tables, where
     /// the bound is the schema and here it is the agent history. A database with a very large
     /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a
     /// caller sees the size; nothing here caps it, because dropping declarations would silently
@@ -626,6 +626,13 @@ impl TxnManager {
 
     /// The body of [`Self::declare_run`], answering whether `run` was new: `Ok(false)` for a run
     /// already retained under its slot (the same actor), `Err` for a different actor in that slot.
+    ///
+    /// ⚠ Retaining writes nothing (the D234 adversary's F6). Since D234 a checkpoint re-appends the
+    /// retained runs only after a real truncation, so a run that is only retained stays out of the
+    /// log for as long as a pin keeps every checkpoint from truncating. `bind_run`, the one production
+    /// caller of `declare_run`, is covered by the binding its commit writes (a rolled-back binding
+    /// described no committed row), and `declare_runs_of` writes each new run itself. A new caller must
+    /// do one of the two.
     fn retain_run(&self, run: RunEntity) -> Result<bool, FerroError> {
         let mut log = self.run_log.lock().unwrap();
         if let Some(existing) = log.get(&run.prov_id.0) {
@@ -648,7 +655,8 @@ impl TxnManager {
         Ok(true)
     }
 
-    /// Declare every run `store` knows, so the next checkpoint re-declares them. D227.
+    /// Declare every run `store` knows, writing each new one to the log now (D234), so the log names
+    /// them from here on and every checkpoint that truncates re-declares them. D227.
     ///
     /// `run_log` lives in memory and was filled only by the merges this process ran, so after a
     /// restart the log stopped naming the database's writers at its first checkpoint. Each entry

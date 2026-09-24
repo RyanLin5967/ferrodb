@@ -701,8 +701,9 @@ impl ReplicaApplier {
         }
         for (rec_lsn, rec) in &checked {
             // Scoped to `AlterColumn`. `CreateTable` and `DropTable` records are in every shipped
-            // stream already — the log re-declares every table at each checkpoint — and neither
-            // touches a heap page, so halting on those would stop every replica that exists.
+            // stream already — the log re-declares every table at each checkpoint that truncates
+            // it — and neither touches a heap page, so halting on those would stop every replica
+            // that exists.
             // A `Clr` is unwrapped as well. Nothing in this codebase can produce a `Clr` wrapping a
             // `Ddl` — DDL is refused inside a transaction and a `Clr` is only written while rolling
             // one back — so this arm is unreachable today. It is here because the cost of being
