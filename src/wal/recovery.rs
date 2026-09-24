@@ -408,11 +408,13 @@ pub struct OpenedDatabase {
 ///    marker says an earlier rollback's index undo failed (`TxnManager::mark_indexes_stale`), even
 ///    if the log holds no data record.
 ///
-/// **D216: a clean restart skips step 4.** A clean close ends in a checkpoint, and the log it leaves
-/// holds only that checkpoint's re-declarations of DDL and agent runs, which change no page. Step 4
-/// used to run for any non-empty log, so every restart after a process that ran DDL or bound a run
-/// paid a rebuild of every tree, O(rows). Now such an open rebuilds nothing, and leaves the log
-/// exactly as it found it.
+/// **D216: a clean restart skips the rebuild.** A clean close ends in a checkpoint, and the log it
+/// leaves holds only that checkpoint's re-declarations of DDL and agent runs, which change no page.
+/// Step 4 used to rebuild for any non-empty log, so every restart after a process that ran DDL or
+/// bound a run paid a rebuild of every tree, O(rows). Now such an open rebuilds nothing. It still
+/// checkpoints, because any non-empty log is checkpointed at open (the comment at that line says
+/// why), and (D227) that checkpoint re-declares every table in the catalog, which this process
+/// retained before taking it.
 ///
 /// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
 /// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
@@ -463,8 +465,28 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // the next open simply rebuilds again, which is harmless.
     let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
     let stale = marker.exists();
+    // D227: what every checkpoint from here on re-declares. `schema_log` lives in memory and was
+    // filled only by DDL this process ran, so a restarted process declared no table at all from its
+    // first checkpoint on. Before that checkpoint, so the one this open may take re-declares them.
+    for rec in table_declarations(&catalog) {
+        txn.retain_ddl(&rec);
+    }
     if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
+    }
+    // **D216: a checkpoint for any log that holds records, and a rebuild only for a stale one.**
+    // Before D216 the two went together, because any non-empty log counted as stale. The rebuild
+    // is the O(rows) half and is skipped for a log of re-declarations. The checkpoint costs a
+    // flush and a truncation, and is kept for two reasons:
+    // - after a rebuild, so the next open does not replay the same records and rebuild again
+    //   (reasoning from `b9a0a75`);
+    // - after a clean close, so the previous process's run declarations do not outlive it. A
+    //   provenance store kept in memory (pgserver's) hands out slot ids from 1 again after a
+    //   restart, and an old declaration of slot 1 left beside a new binding of slot 1 to another
+    //   actor is a log `LogicalDecoder` refuses whole. At 00f4c39 this checkpoint ran on every
+    //   non-empty log, so that could not happen.
+    let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
+    if recovered || stale || holds_records {
         txn.checkpoint()?;
         if stale {
             if let Err(e) = std::fs::remove_file(&marker) {
@@ -478,6 +500,29 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         }
     }
     Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
+}
+
+/// Every table in `catalog` as the declaration a checkpoint re-appends for it: a `CreateTable`
+/// carrying its current shape. D227; see [`TxnManager::retain_ddl`].
+///
+/// By table name, not `HashMap` order, for the reason `rebuild_indexes` gives: the order decides
+/// the bytes every later checkpoint writes.
+fn table_declarations(catalog: &Catalog) -> Vec<crate::wal::txn::DdlRecord> {
+    let mut names: Vec<&String> = catalog.tables.keys().collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| {
+            let entry = &catalog.tables[name];
+            crate::wal::txn::DdlRecord {
+                op: crate::wal::log::DdlOp::CreateTable,
+                table: name.clone(),
+                dir_root: entry.first_directory_page_id,
+                time_travel_root: entry.time_travel_root,
+                columns: entry.schema.columns.iter().map(|c| (c.name.clone(), c.data_type.clone(), c.nullable)).collect(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

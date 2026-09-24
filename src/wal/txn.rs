@@ -637,6 +637,21 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Declare every run `store` knows, so the next checkpoint re-declares them. D227.
+    ///
+    /// `run_log` lives in memory and was filled only by the merges this process ran, so after a
+    /// restart the log stopped naming the database's writers at its first checkpoint. Each entry
+    /// point calls this once its provenance store is open. The store and not the log is the source:
+    /// it is the store that hands out slots, so its runs are what the slot in every version header
+    /// means. A store kept in memory knows nothing after a restart and declares nothing, which is
+    /// right for it, because it hands the same slots out again.
+    pub fn declare_runs_of(&self, store: &dyn crate::provenance::ProvenanceStore) -> Result<(), FerroError> {
+        for run in store.runs()? {
+            self.declare_run(run)?;
+        }
+        Ok(())
+    }
+
     /// How many run declarations a checkpoint would replay. See [`TxnManager::run_log`].
     pub fn retained_runs(&self) -> usize {
         self.run_log.lock().unwrap().len()
@@ -980,28 +995,38 @@ impl TxnManager {
     /// for every op: `CreateTable` and `AlterColumn` both carry it, and `DropTable` carries none
     /// because there is no shape left to declare.
     pub fn log_ddl(&self, rec: DdlRecord) -> Result<(), FerroError> {
-        {
-            let mut log = self.schema_log.lock().unwrap();
-            match &rec.op {
-                DdlOp::CreateTable => {
-                    log.retain(|r| r.dir_root != rec.dir_root);
-                    log.push(rec.clone());
-                }
-                DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
-                DdlOp::AlterColumn(_) => {
-                    log.retain(|r| r.dir_root != rec.dir_root);
-                    log.push(DdlRecord {
-                        op: DdlOp::CreateTable,
-                        table: rec.table.clone(),
-                        dir_root: rec.dir_root,
-                        time_travel_root: rec.time_travel_root,
-                        columns: rec.columns.clone(),
-                    });
-                }
-            }
-        }
+        self.retain_ddl(&rec);
         self.append_ddl(&rec)?;
         self.wal.flush()
+    }
+
+    /// The retention half of [`Self::log_ddl`]: remember `rec` so every later checkpoint re-declares
+    /// it, and write nothing to the log.
+    ///
+    /// **D227: what an open calls to refill `schema_log`.** The list lives in memory, so a restarted
+    /// process began with it empty, and its first checkpoint left a log that declared no table.
+    /// `wal::recovery::open_recovered` hands every table in the catalog to this as a `CreateTable`
+    /// carrying its current shape, which is exactly what the retained list would hold for it
+    /// (an `AlterColumn` is retained as that same re-declaration, below).
+    pub fn retain_ddl(&self, rec: &DdlRecord) {
+        let mut log = self.schema_log.lock().unwrap();
+        match &rec.op {
+            DdlOp::CreateTable => {
+                log.retain(|r| r.dir_root != rec.dir_root);
+                log.push(rec.clone());
+            }
+            DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
+            DdlOp::AlterColumn(_) => {
+                log.retain(|r| r.dir_root != rec.dir_root);
+                log.push(DdlRecord {
+                    op: DdlOp::CreateTable,
+                    table: rec.table.clone(),
+                    dir_root: rec.dir_root,
+                    time_travel_root: rec.time_travel_root,
+                    columns: rec.columns.clone(),
+                });
+            }
+        }
     }
 
     /// The shape the log would re-declare for `dir_root` after a truncation, if any.

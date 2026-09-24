@@ -116,6 +116,11 @@ fn main() {
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
 
+    // D227, the same call the CLI makes: the runs this runtime's provenance store knows, declared
+    // so every checkpoint re-declares them. The store here is in memory, so after a restart it knows
+    // none and this declares none; it is here so the two entry points cannot drift apart on it.
+    txn.declare_runs_of(&**runtime.provenance()).unwrap_or_else(|e| panic!("pgserver: {e}"));
+
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));
 

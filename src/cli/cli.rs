@@ -146,6 +146,10 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
+    // D227: the runs the durable provenance store knows, declared so the next checkpoint (at the
+    // latest this session's exit) re-declares them. Without it, a restart's first checkpoint left
+    // a log that named none of the database's writers. See `TxnManager::declare_runs_of`.
+    txn.declare_runs_of(&**runtime.provenance())?;
     let mut session = Session::with_runtime(runtime.clone());
 
     // The catalog moves behind a mutex, and is locked for exactly one statement.
