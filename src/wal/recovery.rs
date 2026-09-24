@@ -22,9 +22,13 @@ use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, 
 ///
 /// A loser whose records are all transaction control undoes nothing, so it does not count either.
 /// That is sound on two conditions. No index page reaches the disk before the log records it
-/// depends on (`BufferPoolManager::wal_gate`). And every index write follows the heap record it
-/// indexes (`execution::insert`, `execution::update`). Together they mean an index page on disk
-/// that carries a transaction's change implies that change's heap record is in the log.
+/// depends on (`BufferPoolManager::wal_gate`). And every index write outside DDL follows the heap
+/// record it indexes: `execution::insert` and `execution::update` write the heap first, and D202's
+/// rollback undo (`TxnManager::abort`) takes back entries whose heap records were appended before
+/// it. Together they mean that an index page on disk carrying a transaction's change implies the
+/// change's heap record is in the log. (`rebuild_indexes` writes trees with no record at all, but
+/// it runs only when this function or the marker has already asked for it, and until its
+/// checkpoint completes the same trigger is still there for the next open.)
 ///
 /// Not covered: a crash inside a DDL statement. DDL is not logged, and no DDL here is
 /// crash-atomic (the ALTER arm of `execution::executor::run` says so). The old any-record rule
