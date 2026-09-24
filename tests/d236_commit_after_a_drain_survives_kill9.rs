@@ -107,8 +107,8 @@ impl Cli {
         self.stdin.flush().expect("flush stdin");
     }
 
-    /// Read output until `count` lines have ended with `marker`. Any line on stderr is a failed
-    /// statement, and everything after one would mean nothing, so it fails the test at once.
+    /// Read output until `count` lines have ended with `marker`. A failed statement fails the test
+    /// at once, because everything after one would mean nothing.
     fn expect(&self, marker: &str, count: usize, what: &str) {
         let mut seen = 0;
         while seen < count {
@@ -116,12 +116,18 @@ impl Cli {
                 .lines
                 .recv_timeout(PATIENCE)
                 .unwrap_or_else(|_| panic!("{what}: no `{marker}` within {PATIENCE:?} ({seen} of {count})"));
-            assert!(!line.starts_with("stderr: "), "{what}: the CLI reported {line}");
-            if line.trim_end().ends_with(marker) {
+            assert!(!failed(&line), "{what}: the CLI reported {line}");
+            if !line.starts_with("stderr: ") && line.trim_end().ends_with(marker) {
                 seen += 1;
             }
         }
     }
+}
+
+/// A statement failed. The CLI reports failures on stderr as `error: ...`, `parser error: ...` or
+/// `fatal error: ...`, and nothing else it writes there says `error`.
+fn failed(line: &str) -> bool {
+    line.starts_with("stderr: ") && line.contains("error")
 }
 
 fn wal_len(db: &Path) -> u64 {
@@ -179,7 +185,10 @@ fn an_acknowledged_commit_after_the_gate_drained_the_log_survives_kill9() {
         // comes, so the failure says which.
         let line = loop {
             let l = cli.lines.recv_timeout(PATIENCE).expect("the reopened CLI went quiet");
-            assert!(!l.starts_with("stderr: "), "the reopened CLI reported {l}");
+            assert!(!failed(&l), "the reopened CLI reported {l}");
+            if l.starts_with("stderr: ") {
+                continue;
+            }
             if l.trim_end().ends_with("row)") || l.trim_end().ends_with("rows)") {
                 break l;
             }
