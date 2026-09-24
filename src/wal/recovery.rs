@@ -1511,4 +1511,79 @@ use super::*;
              truncation loses that commit, and a pin's keep blames something that did not happen"
         );
     }
+
+    /// T7 (lane_d253 AMENDMENT 3 (b)): a fence keep is its OWN outcome and its OWN count. #16 read
+    /// every kept log whose base did not move as a pin's keep, so a fence keep would have been
+    /// counted as a pin, bumped `KEPT_LOG_DROPS` on a DROP, and printed a line blaming a pin.
+    /// Written against the new API, so its red is mutant-only. Exact deltas are safe because every
+    /// D253 test holds `d253_serial`, and nothing else in this process can make the fence keep.
+    #[test]
+    fn a_fence_keep_is_its_own_outcome_and_counter() {
+        use crate::wal::txn::{fence_kept_checkpoints, kept_log_drops, CheckpointOutcome};
+        let _serial = d253_serial();
+
+        // (i) The automatic trigger's entry, with a commit inside its window.
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, wal, txn) = setup(dir.path());
+        let t = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let dir_root = heap.first_directory_page_id;
+        heap.set_transaction(txn.clone(), t);
+        heap.insert(Tuple::new(vec![1])).unwrap();
+        txn.commit(t).unwrap();
+        let fenced = fence_kept_checkpoints();
+        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let a = {
+            let txn = txn.clone();
+            std::thread::spawn(move || txn.checkpoint_keeping_owed())
+        };
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("fixture: the checkpoint never reached the point before its truncation");
+        let t = txn.begin().unwrap();
+        let mut heap = HeapFileManager::open(dir_root, bp.clone());
+        heap.set_transaction(txn.clone(), t);
+        heap.insert(Tuple::new(vec![2])).unwrap();
+        let commit_starts = wal.next_lsn.load(Ordering::SeqCst);
+        let b = {
+            let txn = txn.clone();
+            std::thread::spawn(move || txn.commit(t))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while wal.flushed_lsn.load(Ordering::SeqCst) <= commit_starts {
+            assert!(std::time::Instant::now() < deadline, "fixture: B's Commit never became durable");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        release.send(()).unwrap();
+        let outcome = a.join().unwrap().expect("the checkpoint failed");
+        b.join().unwrap().expect("B's commit was not acknowledged");
+        assert_eq!(outcome, CheckpointOutcome::KeptByFence, "the fence's keep was reported as {outcome:?}");
+        assert_eq!(fence_kept_checkpoints() - fenced, 1, "the fence's keep was not counted once");
+
+        // (ii) A DROP whose window gets another thread's DDL record.
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, _wal, txn) = setup(dir.path());
+        let frees = vec![HeapFileManager::new(bp.clone()).unwrap().first_directory_page_id];
+        let (fenced, drops) = (fence_kept_checkpoints(), kept_log_drops());
+        let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
+        let x = {
+            let txn = txn.clone();
+            std::thread::spawn(move || txn.drop_checkpointed(&frees, || Ok(())))
+        };
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("fixture: the DROP's checkpoint never reached the point before its truncation");
+        txn.log_ddl(crate::wal::txn::DdlRecord {
+            op: crate::wal::log::DdlOp::CreateTable,
+            table: "d253_t7".into(),
+            dir_root: 9_998,
+            time_travel_root: 0,
+            columns: Vec::new(),
+        })
+        .unwrap();
+        release.send(()).unwrap();
+        x.join().unwrap().expect("the DROP failed");
+        assert_eq!(fence_kept_checkpoints() - fenced, 1, "the DROP's fence keep was not counted as one");
+        assert_eq!(kept_log_drops() - drops, 0, "the DROP's fence keep was counted as a pin's");
+    }
 }

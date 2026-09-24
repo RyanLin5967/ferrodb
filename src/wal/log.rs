@@ -52,6 +52,19 @@ pub static FSYNC_BYTES: AtomicU64 = AtomicU64::new(0);
 pub fn fsync_counters() -> (u64, u64) {
     (FSYNC_CALLS.load(Ordering::Relaxed), FSYNC_BYTES.load(Ordering::Relaxed))
 }
+/// What [`WalManager::truncate_fenced`] did with the log (D253). D216's `Truncation` answers the
+/// same question for `truncate`; merging the two makes them one type with a fence arm.
+#[must_use = "a checkpoint must not read a kept log as a truncated one, nor name the wrong cause"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FencedTruncation {
+    /// The log was discarded and restarted at its end.
+    Truncated,
+    /// A pin below the end kept the whole log.
+    KeptByPin,
+    /// Something was appended after the fence, so the whole log was kept.
+    KeptByFence,
+}
+
 
 pub struct WalManager {
     /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
@@ -933,6 +946,37 @@ impl WalManager {
     /// alternative, which is discarding records a replica has been promised and only finding out
     /// when the replica is refused.
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
+        self.truncate_fenced(next_txn_id, None).map(|_| ())
+    }
+
+    /// [`Self::truncate`], refusing to discard anything appended after `fence`, and answering what
+    /// it did.
+    ///
+    /// **D253.** A checkpoint may discard the log only up to what its page flush covers. It reads
+    /// `next_lsn` as the FENCE in the attach-table hold that found no transaction attached
+    /// (`TxnManager::checkpoint_or_keep_locked` for every non-DDL entry, `ddl_unit` for DDL). So every
+    /// record below the fence belongs to a transaction that had already ended, or is one of the
+    /// release retries run before that hold, and the checkpoint's later `flush_all` writes their pages;
+    /// or it is a txn-0 declaration, discarded as it always was and re-appended from the retained
+    /// lists. Anything appended since may belong to a transaction whose page change the flush missed
+    /// (a commit acknowledged inside the window), or whose uncommitted change it wrote (a transaction
+    /// that began inside it). Discarding those records loses the one or leaves the other impossible to
+    /// undo. If the end has moved, this keeps the whole log, exactly as a pin does: the checkpoint
+    /// succeeds and reclaims nothing this time.
+    ///
+    /// **The cost is the pin's, and it is stated for the same reason.** Writers that never pause
+    /// across a checkpoint's window keep every checkpoint from truncating, and the log grows without
+    /// bound. No production entry point reaches that on #16 (every appender runs under one statement
+    /// lock or one thread). Losing an acknowledged commit is the alternative.
+    ///
+    /// The pin is asked first, then the fence, both under the buffer lock, where `next_lsn` cannot
+    /// move. So the answer names the cause exactly, and an append that lands between this call's
+    /// `flush` and that lock (the D236 review's W5) is caught by the same comparison.
+    pub(crate) fn truncate_fenced(
+        &self,
+        next_txn_id: u64,
+        fence: Option<u64>,
+    ) -> Result<FencedTruncation, FerroError> {
         self.flush()?;
         // Taken first and held across the decision, so a pin cannot be registered against a range
         // this call is in the middle of discarding. `pin_durable` reads the frontier under this
@@ -945,8 +989,13 @@ impl WalManager {
         if let Some(&oldest) = pins.values().min() {
             if oldest < next {
                 // Something still needs records below the new base. Keep the log.
-                return Ok(());
+                return Ok(FencedTruncation::KeptByPin);
             }
+        }
+        // D253: something was appended after the fence, so the page flush may not cover it. Keep the
+        // log. `next_lsn` never decreases, so "moved" and "grew" are the same test.
+        if fence.is_some_and(|f| f != next) {
+            return Ok(FencedTruncation::KeptByFence);
         }
 
         let mut header = [0u8; HEADER_SIZE];
@@ -965,7 +1014,7 @@ impl WalManager {
         buffer.bytes.clear();
         buffer.start_lsn = next;
         self.flushed_lsn.store(next, Ordering::SeqCst);
-        Ok(())
+        Ok(FencedTruncation::Truncated)
 
     }
 
