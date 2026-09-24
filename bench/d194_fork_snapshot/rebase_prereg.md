@@ -702,3 +702,33 @@ and every mutant as pre-registered. Its Low findings are fixed here.
 - `cargo test --lib pin_seq`: **2**, debug only.
 - Run of record at default QoS: **58 result lines, 2164 passed (2152 + 12), 1 failed, 2 ignored**.
 - Under `-b`: 2163 / 2.
+
+## Amendment 9 (append-only, before any run; written BEFORE the test it describes): fourth fresh-context review, of `fa1193a..958a047`
+
+The review found nothing High or Medium. It derived every assertion by hand and confirmed that
+M19–M22 fail where Amendment 8 says they do. It left one Low finding and three Info notes.
+
+1. **Low.** The shape scoping of the "released" refusal had no test. M21 and M22 are caught only
+   through the "unrecorded" refusal. A mutant that changes only the `released` filter survived: for
+   example, reverting it to the purpose-only check, which over-refuses.
+   - **New test:** `version_history_released_pin_still_retains_reads_that_name_no_version`. It uses
+     the fixture of `..._never_names_a_version_a_read_did_not_see`: pin 3, publishes 4 and 5, re-pin
+     to 5.
+   - It reads twice with `Some(3)`: a FullScan inspection, and an IndexLookup row-targeting read. Both
+     must be `Ok`.
+   - It names nothing new, so it compiles at `0570fe8` and passes there. It is mutant-only red.
+   - **M23:** `released`'s filter uses `purpose == Inspection` in place of `names_versions`. Expected:
+     the new test FAILS at the FullScan read.
+2. **Info.** The gate goes by the shape's form, so an exact-shape read that matched no rows is still
+   refused, although it records a predicate. That is over-refusal and safe. The comment now says
+   "whose shape records exact versions" rather than "names versions".
+3. **Info.** The doc of `version_history_is_not_asked_...` said its pin's snapshot "contains the
+   merge". The `pinned()` fixture's snapshot does not include txn 99. `record_read` reads only the
+   seq, so no assertion depends on it. The doc is corrected to say so.
+4. **Info.** `register`'s "`locked` must come from `state`" cannot be enforced, because std offers no
+   way to ask a guard for its mutex. Its doc now says that.
+
+**Counts, replacing Amendment 8's:**
+- `cargo test --lib version_history`: **9**.
+- Run of record at default QoS: **58 result lines, 2165 passed (2152 + 13), 1 failed, 2 ignored**.
+- Under `-b`: 2164 / 2.
