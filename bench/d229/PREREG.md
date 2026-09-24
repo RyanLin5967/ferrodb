@@ -139,3 +139,26 @@ D229's order is unchanged: intent, then the record, then the mutation, with the 
 D250's new review-5 F3 test passes the pages argument (`Vec::new()`; assertions unchanged).
 No D229 test changes, and every expectation in amendment 3 stands.
 **The GREEN phase and mutant base is `9cc779f`**: 9 mutants, one site each there (PATTERNS_ONLY).
+
+**Amendment 5 (the lead: an intent left for a table that was re-created at its root; registered BEFORE the test).**
+The case: a DROP whose `DropTable` record stays in a kept log, a table re-created at the dropped heap's root with heap
+records above the DROP's LSN (so D250 F2 keeps it out of the open's completion), and an intent for the old table still
+pending at the next open. D229's replay must free none of the re-created table's pages.
+- **Reachability, stated:** D229's own code cannot produce this state. The intent is removed durably (A4) before its
+  pages leave the quarantine, so no table can take the dropped root while the intent is pending. The test therefore
+  PLANTS the intent, as a lost removal would leave it, and pins that the replay decides by identity.
+- **New test** `a_stale_intent_for_a_dropped_root_frees_nothing_of_the_table_re_created_there`. Setup: a fresh database;
+  `r` created and filled; `DROP TABLE r` under a WAL pin (D250: the DROP runs, and the pin keeps its record in the
+  log); `r` re-created, which takes the dropped root (asserted), and filled again; the old intent planted; the crash.
+  The open must:
+  - complete no DROP (`completed_drops` empty);
+  - keep the re-created `r`, whose rows are found by scan and by key;
+  - reach no page twice and none while free;
+  - leave no intent file.
+- **Predicted GREEN at the tip** (INFERRED): `decide_free_intents` finds a table at the intent's root, so it removes the
+  intent durably and releases its quarantine, freeing nothing.
+- **New mutant M13:** `decide_free_intents` treats every intent as decided (ignores the table's presence). Predicted RED
+  on this test: the open's checkpoint frees the old table's pages, the re-created table's directory root among them,
+  so a page is reached while its bit is clear.
+- **Blind spot:** the identity is the heap's first directory page. An intent whose OTHER pages a new table took, at a
+  different root, would be freed under it. The quarantine and A4 are what exclude that; no check at replay does.
