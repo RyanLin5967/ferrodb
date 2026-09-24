@@ -1748,11 +1748,9 @@ impl ArenaPageStore {
             payload.extend_from_slice(&start.to_be_bytes());
             payload.extend_from_slice(&pages.to_be_bytes());
             payload.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            // MUTANT (fire-check only, never land): the range goes back only after the persist.
+            self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload)?;
             self.space.give_back(start, pages);
-            if let Err(e) = self.persist_delta_locked(persist, Self::TAIL_EXTENT_FREED, &payload) {
-                self.space.take_back(start, pages);
-                return Err(e);
-            }
         }
         Ok(allocated)
     }
