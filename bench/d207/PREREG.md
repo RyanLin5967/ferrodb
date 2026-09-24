@@ -325,3 +325,82 @@ The fix:
 Predicted at the tip: **57 tests on macOS (56 elsewhere): 60 − D − E − H − I + X. All pass.** Q delivers
 the Append unchanged. Per-target: **2591** on macOS = 2579 (INFERRED, the lead's number) + A, B, C, F, G, J,
 K, L, P, W, Q and X.
+
+---
+
+## Amendment 5 — after amendment 4's fixes, BEFORE any run (still nothing built)
+
+Commits since amendment 4 (`576a7f9`):
+
+| commit | what |
+|---|---|
+| `e5bb853` | the registered test edits: D, E, H and I removed; C pinned; W's poll set to 200 ms |
+| `ad7442e` | the fix: `config::retain_absent`; the budget removed; the failed `try_clone` counted |
+| `ce0f3a6` | test **X** |
+
+**Counts at `ce0f3a6`:** 57 `#[test]` in `tests_transport.rs`, one of them macOS-only, so **57 on macOS**
+and 56 elsewhere, matching amendment 4.
+
+The codec half of `transport.rs`, everything before "Reading frames off a socket", differs from `9aa6968`
+in only two hunks: the `MAX_CONFIG_NODES` doc and its decoder refusal message (READ:
+`git diff 9aa6968 ce0f3a6 -- src/consensus/transport.rs`). MIL still finds "over the" and "limit" in
+the new message.
+
+### Run G3 — GREEN at `ce0f3a6` and at the tip
+
+- **57 passed, 0 failed** on macOS (56 elsewhere).
+- Q: the 64-entry Append is delivered unchanged.
+- X: `compared` is **at most 11,776**. INFERRED: std's `binary_search` makes 10 comparisons over 512
+  items, so about 10,240 + 511 = **10,751**. `kept` is the 512 odd ids.
+- All other values are as in amendments 1–3.
+
+### Collateral, restated
+
+The same command list as amendment 1. `--lib consensus::` now also covers the behaviour of
+`retain_absent`, through `tests_contract`, `tests_membership`, `tests_log` and `tests_replicate`, which
+all build learner lists: all pass. Per-target: **2591** on macOS.
+
+**New: a dead-code control**, `RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" timeout 1800
+cargo build --lib`, the CI gate. At the tip: **rc=0**. It is the negative control for M20.
+
+### The mutant table, re-cut for 57 tests (supersedes amendment 3's)
+
+Generated from `ce0f3a6`; every patch passes `git apply --check`. M9–M13 mutated the budget, which no
+longer exists, and are retired rather than renumbered. Same command per mutant, except M8 and M20.
+Every test not listed passes.
+
+| mutant | fails | notes |
+|---|---|---|
+| M1 | A, B | — |
+| M2 | A, B | — |
+| M3 | J, P | CAP may also fail, by timing; not scored |
+| M4 | C, G | — |
+| M5 | C, G | — |
+| M6 | F | — |
+| M7 | G | — |
+| M8 | G never returns | run alone: rc=124 |
+| M14 | **none: SURVIVES** | unkillable: needs `pthread_create` to fail |
+| M15 | K | — |
+| M16 | L | — |
+| M17 | P | on a loaded box, a pass here is a missed red |
+| M18 | W | very likely, not certain (amendment 4) |
+| M19 `retain_scans` | **X** | `compared` about **393,983** (393,472 + 511) against the 11,776 ceiling. Q still passes, just slower, which is the point: the defect is cost |
+| M20 `with_learners_scans_directly` | **none in the module run: SURVIVES** | Behaviour is identical, and X drives the helper, not `with_learners`. **Killed by the CI gate instead:** the dead-code build fails with "function `retain_absent` is never used", because nothing else in a non-test build calls it. The control at the tip is rc=0 |
+| M21 `try_clone_uncounted` | **none: SURVIVES** | unkillable: needs `dup` to fail (EMFILE) |
+| M22 `retain_inverted` | **X, Q** | X: the evens survive instead of the odds. Q: its fixture assertion `(1024, 1024)` reads `(1024, 0)`. The round-trip tests still pass, because `cfg()` loses its learner on both sides alike |
+
+**Per-target, restated:** 2591 passed, 0 failed on macOS. That is 2579 (INFERRED, the lead's number)
+plus A, B, C, F, G, J, K, L, P, W, Q and X.
+
+### Found while fixing F1, and outside D207 (READ at `9aa6968`, INFERRED reachability)
+
+The same stall, by a route that predates D207:
+
+- `slice_from` caps an `Append` at 64 entries by count only (`replicate.rs:209-215`);
+- each entry may be up to `MAX_ENTRY_BYTES` = 8 MiB − 4096 (`log.rs:105`);
+- the encoder refuses a frame over `MAX_FRAME_BYTES` (`transport.rs:181`);
+- `node.rs:742` discards that error.
+
+So a follower 64 entries behind, with entries averaging over 128 KiB, would be offered a batch that is
+refused on every turn. D207 removes only the route it added, the budget. Sizing a batch by bytes in
+the leader, or counting refused sends, is a separate row for the lead.

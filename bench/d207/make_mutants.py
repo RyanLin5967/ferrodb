@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write D207's mutants of src/consensus/transport.rs as `git apply`-able patches.
+"""Write D207's mutants of src/consensus/transport.rs and config.rs as `git apply`-able patches.
 
 Each mutant re-introduces one defect (or removes one guard) by an exact-string edit that must match
 exactly once, or the script refuses. Reads the file from a commit, never from the working tree, and
@@ -7,8 +7,8 @@ writes only into bench/d207/mutants/. Run from the worktree root:
 
     python3 bench/d207/make_mutants.py <sha>
 
-Predictions for every mutant are in bench/d207/PREREG.md: M1-M14 in amendment 1, all of them as
-re-cut in amendment 3.
+Predictions for every mutant are in bench/d207/PREREG.md; the current table is amendment 5's. M9-M13
+mutated the per-frame budget, which amendment 4 removed, and are retired rather than renumbered.
 """
 import difflib
 import pathlib
@@ -16,45 +16,13 @@ import subprocess
 import sys
 
 PATH = "src/consensus/transport.rs"
+CONFIG = "src/consensus/config.rs"
 
 SETUP_EXIT = """                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
-"""
-
-CAP_BLOCK = """    if count > MAX_CONFIG_NODES {
-        return Err(FerroError::Wal(format!(
-            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. A frame is \\
-             allowed to be large; the comparisons a configuration costs are quadratic in its two \\
-             list lengths, so a large one is a request for this node's CPU rather than a cluster"
-        )));
-    }
-"""
-
-BUDGET_BLOCK = """    if count > *budget {
-        return Err(FerroError::Wal(format!(
-            "a configuration claims {count} {what}s, but only {} of this frame's \\
-             {MAX_FRAME_CONFIG_NODES}-node budget is left. A configuration costs work quadratic in \\
-             its own size, so bounding one configuration bounds nothing about a frame that carries \\
-             a thousand of them",
-            *budget
-        )));
-    }
-"""
-
-ENCODE_BUDGET = """        if list.len() > *budget {
-            return Err(FerroError::Wal(format!(
-                "a configuration holds {} nodes, but only {} of this frame's \\
-                 {MAX_FRAME_CONFIG_NODES}-node budget is left; a peer would refuse this frame, so it \\
-                 is refused here where the cause is visible. Send fewer Membership entries per \\
-                 Append",
-                list.len(),
-                *budget
-            )));
-        }
-        *budget -= list.len();
 """
 
 # (name, [(old, new), ...]) — every `old` must occur exactly once in the file.
@@ -96,30 +64,6 @@ MUTANTS = [
         "        while !st.queue.is_empty()\n            && (st.queue.len() >= self.depth\n",
         "        while (st.queue.len() >= self.depth\n",
     )]),
-    # --- the per-frame config budget ------------------------------------------------------------
-    ("M9_decode_budget_not_charged", [(
-        "    *budget -= count;\n    // Not pre-allocated from `count`",
-        "    // Not pre-allocated from `count`",
-    )]),
-    ("M10_budget_checked_before_cap", [(
-        CAP_BLOCK,
-        "",
-    ), (
-        BUDGET_BLOCK + "    *budget -= count;\n",
-        BUDGET_BLOCK + CAP_BLOCK + "    *budget -= count;\n",
-    )]),
-    ("M11_learners_uncharged", [(
-        '    let learners = decode_node_list(bytes, at, "learner", budget)?;\n',
-        '    let learners = decode_node_list(bytes, at, "learner", &mut usize::MAX)?;\n',
-    )]),
-    ("M12_encoder_budget_removed", [(
-        ENCODE_BUDGET,
-        "        let _ = &budget;\n",
-    )]),
-    ("M13_fresh_budget_per_entry", [(
-        "        entries.push(decode_entry(bytes, at, budget).map_err(|e| {\n",
-        "        let _ = &budget;\n        entries.push(decode_entry(bytes, at, &mut { MAX_FRAME_CONFIG_NODES }).map_err(|e| {\n",
-    )]),
     ("M14_spawn_failure_uncounted", [(
         "                        // for the same reason — it is a connection this node closed unserved.\n                        counters.refused_conns.fetch_add(1, Ordering::SeqCst);\n",
         "                        // for the same reason — it is a connection this node closed unserved.\n",
@@ -141,6 +85,27 @@ MUTANTS = [
         "        if st.stopped || stop.load(Ordering::SeqCst) {\n            return;\n        }\n        let _ = self.woken.wait_timeout(st, delay);\n",
         "        let _ = stop;\n        let _ = self.woken.wait_timeout(st, delay);\n",
     )]),
+    # --- amendment 5: the review of dd9d1e1 -----------------------------------------------------
+    ("M21_try_clone_uncounted", [(
+        "                    // descriptor exhaustion these meters exist to show. Counted with the others.\n                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);\n",
+        "                    // descriptor exhaustion these meters exist to show. Counted with the others.\n",
+    )]),
+]
+
+# Mutants of config.rs, same shape.
+CONFIG_MUTANTS = [
+    ("M19_retain_scans", [(
+        "    items.retain(|n| sorted.binary_search(n).is_err());\n",
+        "    items.retain(|n| !sorted.contains(n));\n",
+    )]),
+    ("M20_with_learners_scans_directly", [(
+        "        retain_absent(&mut l, &self.members);\n",
+        "        l.retain(|n| !self.members.contains(n));\n",
+    )]),
+    ("M22_retain_inverted", [(
+        "    items.retain(|n| sorted.binary_search(n).is_err());\n",
+        "    items.retain(|n| sorted.binary_search(n).is_ok());\n",
+    )]),
 ]
 
 
@@ -149,12 +114,20 @@ def main() -> int:
         print("usage: make_mutants.py <sha>", file=sys.stderr)
         return 2
     sha = sys.argv[1]
-    src = subprocess.run(
-        ["git", "show", f"{sha}:{PATH}"], check=True, capture_output=True, text=True
-    ).stdout
     out = pathlib.Path("bench/d207/mutants")
     out.mkdir(parents=True, exist_ok=True)
-    for name, edits in MUTANTS:
+    for path, mutants in ((PATH, MUTANTS), (CONFIG, CONFIG_MUTANTS)):
+        rc = write(sha, path, mutants, out)
+        if rc:
+            return rc
+    return 0
+
+
+def write(sha: str, path: str, mutants, out: pathlib.Path) -> int:
+    src = subprocess.run(
+        ["git", "show", f"{sha}:{path}"], check=True, capture_output=True, text=True
+    ).stdout
+    for name, edits in mutants:
         text = src
         for old, new in edits:
             n = text.count(old)
@@ -168,8 +141,8 @@ def main() -> int:
         diff = difflib.unified_diff(
             src.splitlines(keepends=True),
             text.splitlines(keepends=True),
-            fromfile=f"a/{PATH}",
-            tofile=f"b/{PATH}",
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
             n=3,
         )
         (out / f"{name}.patch").write_text("".join(diff))

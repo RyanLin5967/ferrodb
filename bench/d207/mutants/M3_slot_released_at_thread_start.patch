@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2094,6 +2094,7 @@
+@@ -2028,6 +2028,7 @@
      // `shutdown` can reach a peer that connects and then goes silent, and it handed over the guard
      // that releases the slot. Owning it here is what makes every exit path below release it,
      // including the refused-handshake return.
