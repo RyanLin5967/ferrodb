@@ -1173,7 +1173,8 @@ struct Counters {
     /// Bytes of decoded messages sitting in the inbox, undelivered.
     inbox_bytes: AtomicUsize,
     /// Connections closed without being served: because `max_inbound_conns` were already
-    /// established, or because the accepted socket could not be configured (D207).
+    /// established, because the accepted socket could not be configured (D207), or because no
+    /// thread could be started for it.
     refused_conns: AtomicU64,
     /// Connections closed for going silent longer than `idle_deadline`.
     idle_closed: AtomicU64,
@@ -1669,8 +1670,8 @@ impl Transport {
     pub fn signs_its_traffic(&self) -> bool {
         self.key.is_some()
     }
-    /// Inbound connections closed without being served: the cap was full, or the accepted socket
-    /// could not be configured. F3-transport's `207d362` recorded the second as what a peer that
+    /// Inbound connections closed without being served: the cap was full, the accepted socket
+    /// could not be configured, or no thread could be started for it. F3-transport's `207d362` recorded the second as what a peer that
     /// connects and resets before `accept` leaves behind on macOS (D207), so on that platform this
     /// meter climbing while `live_inbound_conns` stays low reads as resets, not as a busy node.
     pub fn refused_conns(&self) -> u64 {
@@ -2013,7 +2014,9 @@ fn accept_loop(
                     Err(_) => {
                         // A failed spawn drops the closure it was given, and `registration` with
                         // it, so the slot is already released: no thread will ever run for it, and
-                        // no second release is needed here.
+                        // no second release is needed here. Counted like the failed setup above,
+                        // for the same reason — it is a connection this node closed unserved.
+                        counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                 }
