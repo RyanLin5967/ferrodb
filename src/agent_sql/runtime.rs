@@ -75,9 +75,10 @@ use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, predicate_to_bounds, Plan};
 use crate::optimizer::optimizer::split_and;
 use crate::catalog::column::DataType;
-use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
+use crate::provenance::capture::{TxnCapture, WriteRecord};
+use crate::provenance::capture_set::CaptureSet;
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
-use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
+use crate::provenance::revert::{RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
@@ -203,18 +204,17 @@ pub fn revert_applied_counters() -> (u64, u64) {
     )
 }
 
-/// **Wall #18 instrument — how many retained captures one `REVERT` folded into its dependency
-/// graph.**
+/// **Wall #18 instrument — how many retained captures one `REVERT`'s planner consulted.**
 ///
-/// `revert_merge` rebuilds the whole graph from `State::captures` on every call, and `captures`
-/// keeps every PUBLISHED transaction for the life of the process
+/// `captures` keeps every PUBLISHED transaction for the life of the process
 /// (`forget_captures_unless_published` is the only remover, and it drops only the unpublished).
-/// So this counts merged-branch history, not the size of the revert being planned. What the build
-/// then does with those captures is pairwise, and is counted separately by
-/// `provenance::revert::GRAPH_BUILD_PAIRS`.
+/// The full-graph planner folded ALL of them into one graph on every call, so this counted
+/// merged-branch history. Since wall #18's walk (`CaptureSet::plan_revert`) it counts the captures
+/// the walk VISITED: the target and each dependent reached, which is the size of the answer. The
+/// debug-build oracle that re-runs the full graph beside it is not counted.
 pub static REVERT_GRAPH_CAPTURES: AtomicU64 = AtomicU64::new(0);
 
-/// Captures folded since process start. Read twice and subtract to scope it to a phase.
+/// Captures consulted since process start. Read twice and subtract to scope it to a phase.
 pub fn revert_graph_captures() -> u64 {
     REVERT_GRAPH_CAPTURES.load(AtomicOrdering::Relaxed)
 }
@@ -225,8 +225,9 @@ pub fn revert_graph_captures() -> u64 {
 ///
 /// It exists so that a planner which walks out from the target cannot hide a linear scan: counting
 /// only the captures it visits would read 1 for a walk that then compares the target's writes
-/// against every read in the table. The full-graph planner examines no candidates (it compares
-/// pairs, counted by `GRAPH_BUILD_PAIRS`), so until a walk exists this reads 0.
+/// against every read in the table. Counted by `revert_merge` from `CaptureSet::plan_revert`'s
+/// `WalkCost`. (The full-graph planner that came before examined no candidates; it compared pairs,
+/// counted by `GRAPH_BUILD_PAIRS`.)
 pub static REVERT_GRAPH_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 
 /// Candidates examined since process start. Read twice and subtract to scope it to a phase.
@@ -938,7 +939,24 @@ struct State {
     /// Keyed by txn, and never dropped by `seal`: the dependency graph has to outlive the workspace
     /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
     /// become visible to everyone else, which is the moment they can start being read.
-    captures: BTreeMap<u64, TxnCapture>,
+    ///
+    /// **Wall #18: a `CaptureSet`, not a bare map, so REVERT can walk instead of join.** The set
+    /// indexes every READ as it is retained, and `revert_merge` walks out from the reverted merge
+    /// through that index instead of folding every capture into one graph per call — Θ(N²)
+    /// comparisons under this lock after N merged tasks. It owns the captures privately, so the two
+    /// retention sites below go through `CaptureSet::entry` and cannot retain without indexing.
+    /// The sites and the invariant each keeps:
+    ///
+    /// * fork (`insert`): a new, empty capture, keyed by its own txn — `insert` refuses otherwise;
+    /// * `record_read` (`entry` → `on_read` / `on_write_targeting_read`): what the capture now
+    ///   holds exactly, and every predicate read it appended, is indexed;
+    /// * `record_applied` (`entry` → `on_write`): nothing to index — the walk reads a txn's writes
+    ///   from its own capture;
+    /// * `forget_captures_unless_published` (`remove`), the only remover: every index entry of the
+    ///   capture goes with it;
+    /// * `revert_merge`: reads only — the walk, and in debug builds the full-graph oracle and an
+    ///   index audit beside it.
+    captures: CaptureSet,
     /// Txns whose staged writes reached the shared tables -- by their own `MERGE`, or by a
     /// DESCENDANT's merge publishing writes the descendant inherited at fork time.
     ///
@@ -2492,10 +2510,7 @@ impl AgentRuntime {
         // no error anywhere. There is one workspace-creation site and it opens a capture, so this
         // arm should be unreachable; it is written this way so that a second site cannot make
         // retention optional by forgetting.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, prov, reader));
+        let mut capture = state.captures.entry(txn, prov, reader);
         match purpose {
             ReadPurpose::Inspection => capture.on_read(shape, versions, Some(summary), observed_at),
             ReadPurpose::RowTargeting => capture.on_write_targeting_read(summary, observed_at),
@@ -5550,10 +5565,7 @@ impl AgentRuntime {
         // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
         // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
         // a merge that published nothing.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        let mut capture = state.captures.entry(txn, snapshot.prov, branch);
         for w in written {
             capture.on_write(w);
         }
@@ -5883,23 +5895,42 @@ impl AgentRuntime {
         merge_id: &str,
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
-        let (targets, rec_branch, graph) = {
+        let (target, plan) = {
             let state = self.state.lock().unwrap();
             let rec = state
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
-        };
-        let target = *targets
-            .first()
-            .ok_or_else(|| {
+            let target = *rec.txns.first().ok_or_else(|| {
                 FerroError::Merge(format!(
                     "merge {} of branch {} recorded no transaction",
-                    merge_id, rec_branch
+                    merge_id, rec.branch
                 ))
             })?;
-        let plan = graph.plan_revert(target, mode);
+            // **Wall #18: walk out from the target; do not join everything ever retained.** This
+            // was `dependency_graph_of(&state.captures)` — every capture cloned into one
+            // `ProvenanceLog` and joined pairwise, Θ(N²) after N merged tasks, under this lock —
+            // for the one target's transitive dependents. The walk finds the same set; see
+            // `provenance::capture_set` for the argument and for what it still costs.
+            let (plan, cost) = state.captures.plan_revert(target, mode);
+            REVERT_GRAPH_CAPTURES.fetch_add(cost.captures, AtomicOrdering::Relaxed);
+            REVERT_GRAPH_CANDIDATES.fetch_add(cost.candidates, AtomicOrdering::Relaxed);
+            // The differential, debug builds only: the full-graph plan the walk replaced, and an
+            // audit that the read index is exactly what rebuilding it from the captures gives. Both
+            // are OBSERVING checks, and neither is the only guard: the REVERT tests assert the
+            // answers themselves, and a release build — where these compile out — must still fail
+            // them for every broken walk (lane_wall18_revert.md Amendment 1, mutants W1-W5).
+            debug_assert!(
+                state.captures.index_is_consistent(),
+                "the REVERT read index disagrees with a rebuild from the captures it indexes"
+            );
+            debug_assert_eq!(
+                plan,
+                state.captures.plan_revert_by_full_graph(target, mode),
+                "the REVERT walk disagrees with the full-graph plan for {target:?} under {mode:?}"
+            );
+            (target, plan)
+        };
         if plan.is_blocked() {
             return Ok(plan);
         }
@@ -6460,12 +6491,6 @@ struct PublishedImages {
     post: BTreeMap<(u32, u64), Vec<Value>>,
 }
 
-/// The dependency graph over everything every task retained — exact and predicate-derived alike.
-///
-/// **One derivation, and it lives in `ProvenanceLog::dependency_graph`.** That function is the only
-/// code in the tree that composes read-after-write edges over exact versions with the edges derived
-/// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
-/// does not keep a second copy of it, which is the reconciliation this lane exists to make.
 /// Drop the captures of a workspace that is going away WITHOUT having published anything -- and of
 /// any ancestor whose protection lapsed at the same moment.
 ///
@@ -6559,17 +6584,6 @@ fn capture_is_protected(state: &State, txn: TxnId) -> bool {
         "txn_refs disagrees with a scan of workspaces about txn {txn:?}"
     );
     state.published_txns.contains(&txn.0) || indexed
-}
-
-fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
-    let mut log = ProvenanceLog::new();
-    let mut folded = 0u64;
-    for c in captures.values() {
-        folded += 1;
-        log.record(c.clone().finish());
-    }
-    REVERT_GRAPH_CAPTURES.fetch_add(folded, AtomicOrdering::Relaxed);
-    log.dependency_graph()
 }
 
 /// The region a range or full scan looked at, retained so that a write landing inside it later is a

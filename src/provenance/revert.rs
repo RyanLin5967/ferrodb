@@ -16,15 +16,16 @@ use crate::tel::ids::{ColId, TxnId};
 /// compared.**
 ///
 /// `build` joins every retained write against every retained read with two nested loops: exact
-/// writes × exact reads, and valued writes × predicate reads. `AgentRuntime::revert_merge` calls it
-/// once per `REVERT` over every capture the runtime has retained, so a history of N merged tasks of
-/// one fixed shape costs Θ(N²) comparisons per revert, however few of them become edges. This
-/// counts the comparisons, not the edges: a flat edge count beside a growing pair count is the
-/// join, not the answer, getting bigger.
+/// writes × exact reads, and valued writes × predicate reads. `AgentRuntime::revert_merge` used to
+/// call it once per `REVERT` over every capture the runtime had retained, so a history of N merged
+/// tasks of one fixed shape cost Θ(N²) comparisons per revert, however few became edges. Since
+/// wall #18 it walks `CaptureSet` instead and does not reach `build`; a REVERT window reading
+/// non-zero here means production is joining again. This counts the comparisons, not the edges.
 ///
 /// ⚠ One relaxed add of a local count per `build` call, so the instrument cannot create the slope
 /// it measures. `ProvenanceLog`'s own callers reach `build` too; scope a reading by subtracting
-/// around the one call being measured.
+/// around the one call being measured. The debug-build oracle beside the walk goes through
+/// `build_unobserved` and is deliberately NOT counted: it is a check, not production work.
 pub static GRAPH_BUILD_PAIRS: AtomicU64 = AtomicU64::new(0);
 
 /// Pairs compared since process start. Read twice and subtract to scope it to a phase.

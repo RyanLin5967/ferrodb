@@ -1,9 +1,10 @@
 //! Wall #18 — `REVERT` rescans the applied log and rebuilds the dependency graph, per call.
 //!
-//! # The defect
+//! # The defect (as it stood at `9aa6968`)
 //!
-//! `AgentRuntime::revert_merge` does two things whose cost is set by how many merges have EVER
-//! happened, not by the merge being reverted:
+//! `AgentRuntime::revert_merge` did two things whose cost was set by how many merges have EVER
+//! happened, not by the merge being reverted. The first is fixed by `State::applied_by_txn`, the
+//! second by walking `provenance::capture_set::CaptureSet`:
 //!
 //! * `undo_txn` finds one transaction's ops with `state.applied.iter().filter(|a| a.txn == txn)`.
 //!   `State::applied` is never pruned and gains one entry per cell any `MERGE` published, so this

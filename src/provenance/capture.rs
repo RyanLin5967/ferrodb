@@ -18,8 +18,10 @@
 //! `agent_sql::runtime` kept a second, narrower path of its own that retained exact versions only.
 //! Two implementations, and the one the runtime used was the one that could not answer
 //! `REVERT ... CASCADE` for a scan. The runtime now feeds a [`TxnCapture`] per agent task, so there
-//! is one retention type, one place edges are derived ([`ProvenanceLog::dependency_graph`]), and two
-//! *sources* that fill a capture:
+//! is one retention type and two *sources* that fill a capture. Edges are derived in two places, on
+//! purpose since wall #18: [`ProvenanceLog::dependency_graph`] joins everything, and
+//! [`crate::provenance::capture_set::CaptureSet::plan_revert`] walks out from one target through an
+//! index of reads. The second is checked against the first; see that module for how. The sources:
 //!
 //! - [`CapturingScan`], which wraps a Volcano operator and reads `begin_ts` out of the real 24-byte
 //!   version header (`tests/provenance_e2e.rs`);
@@ -155,8 +157,9 @@ impl TxnCapture {
     ///
     /// **Causality and inspection are different questions, and this is the one place they part.**
     /// `UPDATE ... WHERE id = 7` decided which row to write by naming it, so the write causally
-    /// depends on that row: a revert of whatever published it has a dependent here, and
-    /// [`ProvenanceLog::dependency_graph`] has to see the region. It inspected no *value*, so it must
+    /// depends on that row: a revert of whatever published it has a dependent here, and both edge
+    /// derivations — [`ProvenanceLog::dependency_graph`] and `CaptureSet`'s walk, which indexes it
+    /// as a point — have to see the region. It inspected no *value*, so it must
     /// not enter the read-set builder — `blind_writes` would stop reporting every
     /// `UPDATE ... WHERE <pk> = <lit>` as a blind write, which is the entire shape DESIGN.md
     /// section 4's metric exists to catch, and `ReadPremiseCheck` would downgrade itself to
