@@ -274,7 +274,7 @@ enum Fire {
     ControlCold,
     /// G6: the identity is checked against height + 1.
     WrongHeight,
-    /// G7: the control spins 2^checkpoint µs per read, so it grows with N.
+    /// G7: the control spins 10·2^checkpoint µs per read, so it grows with N.
     ControlDrift,
     /// H2: the parent expects one arena more than it counted.
     WrongArenas,
@@ -481,7 +481,9 @@ fn read_phase(
     let rows = runtime.storage().expect("the production runtime is page-backed");
     let tid = table_id(TABLE).0;
     let n = branches.len() as u64;
-    let drift = Duration::from_micros(1u64 << checkpoint_index.min(20));
+    // 10 µs doubling per checkpoint: already 2x between the first two, far past G7's 1.5 band even
+    // if the control read itself costs as much as the spin.
+    let drift = Duration::from_micros(10u64 << checkpoint_index.min(16));
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {

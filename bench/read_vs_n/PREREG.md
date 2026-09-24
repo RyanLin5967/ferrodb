@@ -281,3 +281,10 @@ where the implementation's protocol differs from the text above.**
    for a reason unrelated to the load. The historical path still passes N.
 4. Before timing, arm 1 flushes with `TxnManager::checkpoint`: WAL, then the whole pool, then fsync. Reads never
    dirty a page, so no timed window pays a write-back.
+
+**A2, 2026-09-24, before any build or run.** The first checkpoint is **256**, not 250. The fork phase forks
+`per × threads` branches with `per = segment / threads`, so with 8 threads a target of 250 would have measured N =
+248 and labelled it 250. The run's checkpoints are therefore 256, 1000, 4000, 16000, 64000, 256000, 1000000; each
+segment divides by 8. Every "250" in sections 2 and 3 now reads "256", and no prediction moves: 256 sits in the
+same regime (all resident, h = 2). The `control-drift` fire mode spins 10·2^checkpoint µs per read rather than
+2^checkpoint µs, so it clears G7's 1.5 band by construction between the first two checkpoints.
