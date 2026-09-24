@@ -5787,6 +5787,14 @@ impl AgentRuntime {
         self.seal(branch, false)
     }
 
+    /// `seal`, for tests outside this module. A MERGE is the only production caller that seals with
+    /// `published = true`, and reaching it needs a SQL catalog; D199's seal-route tests
+    /// (`branch/lease_thread/tests.rs`) need that bit without one. Not compiled outside tests.
+    #[cfg(test)]
+    pub(crate) fn seal_for_test(&self, branch: BranchId, published: bool) -> Result<(), FerroError> {
+        self.seal(branch, published)
+    }
+
     /// Retire a branch. `published` says whether its writes reached the shared tables, which is
     /// what decides the fate of any escrow it holds.
     fn seal(&self, branch: BranchId, published: bool) -> Result<(), FerroError> {
