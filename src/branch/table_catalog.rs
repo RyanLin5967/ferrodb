@@ -920,8 +920,9 @@ impl TableBranchCatalog {
     /// Valid means: filed under THIS incarnation of `of` (its fork epoch; a recycled id is forked
     /// at a fresh one), and naming a branch whose own record, read now, is the same incarnation
     /// (`reparent` rewrites the fork epoch too) and not `Reaped`. That record is the authority
-    /// `child_liveness` consults for a live child, so a valid witness is exactly the fact the
-    /// walk would have stopped on, read from the same place.
+    /// `child_liveness` consults for a live child, so a valid witness rests on the same fact the
+    /// walk stops on, read from the same place. (When the two can still differ is stated on the
+    /// `witnesses` field.)
     ///
     /// A record that cannot be read makes the witness invalid rather than an error: the walk that
     /// follows then runs exactly as it did before witnesses existed, so it reports whatever it
