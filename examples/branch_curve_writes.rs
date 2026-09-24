@@ -2257,25 +2257,36 @@ fn main() {
     }
 }
 
-/// G7's measure of the box (PREREG A15.1): arm 1's control ns, max over min across N, per thread
-/// count. It is the only drift instrument this harness has, so it is printed beside every time
-/// number the summary reports, and says so when arm 1 did not run.
-fn g7_drift(read_rows: &[ReadRow]) -> String {
+/// G7's measure of the box (PREREG A15.1, A16.3): arm 1's control ns, max over min across N, per
+/// thread count, with its row count. It is the only drift instrument this harness has, so it is
+/// printed beside every time number the summary reports, with what it cannot see: it samples only
+/// arm 1's read phases, and a max/min across N is blind to a shift common to every N.
+fn g7_drift(read_rows: &[ReadRow], arm_ran: bool) -> String {
+    if !arm_ran {
+        return "G7: not measured: arm 1 did not run, so no time here has a drift measure".into();
+    }
     let parts: Vec<String> = READ_THREADS
         .iter()
         .filter_map(|&t| {
             let cs: Vec<f64> =
                 read_rows.iter().filter(|r| r.threads == t).map(|r| r.arms[1].ns_per_read()).collect();
+            if cs.len() < 2 {
+                return (cs.len() == 1).then(|| format!("T={t}: 1 row, no across-N measure"));
+            }
             let lo = cs.iter().cloned().reduce(f64::min)?;
             let hi = cs.iter().cloned().reduce(f64::max)?;
-            Some(format!("T={t} {:.3}x", hi / lo))
+            Some(format!("T={t} {:.3}x over {} rows", hi / lo, cs.len()))
         })
         .collect();
     if parts.is_empty() {
-        "G7: not measured (arm 1 did not run), so no time here has a drift measure".into()
-    } else {
-        format!("G7, the box's drift (arm 1's control, max/min across N; band 1.5): {}", parts.join(", "))
+        return "G7: arm 1 ran but left no row, so no time here has a drift measure".into();
     }
+    format!(
+        "G7 (arm 1's control, max/min across N; band 1.5): {}. It sees only arm 1's read phases: axis (ii) \
+         runs after the last of them, arm 3's opens follow them rather than coincide, and a max/min across N \
+         cannot see a shift common to every N",
+        parts.join(", ")
+    )
 }
 
 /// The READ-VS-N summary: the per-N curves the pre-registration is judged against, the two guards
@@ -2308,7 +2319,7 @@ fn read_vs_n_summary(
             // commit more than once. Not over the printed blocks' checkpoint share either: axis
             // (ii)'s blocks end at multiples of 256 on purpose, so they over-sample that merge.
             println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN (reported, A13.3):");
-            println!("  {}", g7_drift(read_rows));
+            println!("  {}", g7_drift(read_rows, arms.read));
             println!(
                 "         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  \
                  seq tup  c.fault  ret runs  ckpts    ckpt ns  period   amort ns   typ ns ± SE"
@@ -2417,22 +2428,27 @@ fn read_vs_n_summary(
                     ));
                 }
             }
+            // A15.5: every slope column names its span, and the judged forms are said here.
+            println!(
+                "  T={t}: `slope(branch)` and `slope(ratio)` span the previous row to this one (N {}). \
+                 The CLASS is the verdict script's OLS over the saturated segment (d.fault >= 0.9): BOUNDED \
+                 only when the raw and ratio slopes are both < 0.3, INCONCLUSIVE when they disagree (A15.2). \
+                 KNEE is ratio(1e6)/ratio(256) at T=1 (A15.1); raw ns, RESIDENT and T8DIR are reported.",
+                rows.iter().map(|r| r.n.to_string()).collect::<Vec<_>>().join(" -> ")
+            );
             // G7: the control's ns across N. It cannot depend on N, so if it moved, the box did.
+            // A16.3: one row is no across-N measure, so no ratio is printed for it.
             let cs: Vec<f64> = rows.iter().map(|r| r.arms[1].ns_per_read()).collect();
-            if let (Some(lo), Some(hi)) = (
+            if cs.len() == 1 {
+                println!("  control ns at T={t}: 1 row, no across-N measure");
+            }
+            if let (true, Some(lo), Some(hi)) = (
+                cs.len() >= 2,
                 cs.iter().cloned().reduce(f64::min),
                 cs.iter().cloned().reduce(f64::max),
             ) {
                 let moved = hi / lo;
-                println!("  control ns max/min across N at T={t}: {moved:.3} (band 1.5)");
-                // A15.5: every slope column names its span, and the judged forms are said here.
-                println!(
-                    "  T={t}: `slope(branch)` and `slope(ratio)` span the previous row to this one (N {}). \
-                     The CLASS is the verdict script's OLS over the saturated segment (d.fault >= 0.9): BOUNDED \
-                     only when the raw and ratio slopes are both < 0.3, INCONCLUSIVE when they disagree (A15.2). \
-                     KNEE is ratio(1e6)/ratio(256) at T=1 (A15.1); raw ns, RESIDENT and T8DIR are reported.",
-                    rows.iter().map(|r| r.n.to_string()).collect::<Vec<_>>().join(" -> ")
-                );
+                println!("  control ns max/min across N at T={t}: {moved:.3} over {} rows (band 1.5)", cs.len());
                 if moved > 1.5 {
                     ns_void.push(format!(
                         "G7 T={t}: the control moved {moved:.2}x across N (band 1.5x); the box moved, \
@@ -2447,7 +2463,7 @@ fn read_vs_n_summary(
     }
     if arms.restart {
         println!("arm 3 (fresh-process open; microsecond timers in the child, printed here in ms):");
-        println!("  {}", g7_drift(read_rows));
+        println!("  {}", g7_drift(read_rows, arms.read));
         // A7.1/A9.3/A11.1: `recovered` judges D216's before/after pair. `wal B` = 24 judges only the
         // merge-OFF control, since after D216 a merge-on log still holds re-appended declarations.
         // `recover`, `rebuild` and `m rows` size it. A9.1: warmth is `child net` (total less recover
