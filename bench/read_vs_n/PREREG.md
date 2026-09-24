@@ -585,3 +585,43 @@ it changes:**
      one statement.
    * R2's `descents_total` counts `extent_is_collectable` calls, not B+tree descents. The census `c.desc/v` is the
      real check.
+
+**A8, 2026-09-24, before any build or run. H2's fire mode, re-aimed so that it discriminates on BOTH trees.**
+
+*Why.* Lane D209 (`d209-open-sweep-once` @ `afe44d9`, landing AFTER this lane) stamps the open's sweep, so the
+lease thread's first pass visits 0 arenas and `sweep_visits` after the first pass equals `open_sweep_visits`.
+A7.5's `wrong-sweep-read` reports that counter in place of `open_sweep_visits`. On a tree with D209 the two numbers
+are equal, so H2 could not fire and the fire would pass silently. **`wrong-sweep-read` is WITHDRAWN.** The harness now
+refuses its name.
+
+*The replacement, `extra-extent` (H2, in path).*
+
+* After the parent counts live arenas for H2 and before its clean close, it claims ONE more real extent, for trunk,
+  with `arena_for`.
+* The parent has just reopened, so `current` is cleared ("Never resume filling a restored extent"). At the first
+  checkpoint, trunk's one-page first extent is already full. Either way `arena_for` must claim a new extent.
+* The harness asserts that it did: `live_arenas()` must be the count + 1, or the fire panics rather than pass
+  unfired.
+* The child's OPEN sweep, which D209 does not change, then visits one arena more than the parent counted, and H2 fires.
+* The extent's owner is trunk, which is live. So H3 (live count), H4 (freed; an owner that is alive is never
+  collectable) and G1 are untouched.
+* It fires at every checkpoint. D209 changes only the FIRST LEASE PASS, and this fire never touches it.
+
+*R3 becomes a before/after pair, like D216's.* BEFORE D209: first-pass visits = N + 1. AFTER D209: 0.
+
+*Which tree each fire mode is proven on.* **None is proven yet: nothing has run (quiet mode).** FAN-QUEUE step (f)
+proves them on `read-vs-n` at its tip, which is before both D209 and D216. After D209 and D216 merge, step (f) must be
+re-run on the merged tree for the modes whose premise either fix touches. Each mode's sensitivity, INFERRED from the
+fix descriptions:
+
+| mode | guard | touched by D209? | touched by D216? | re-prove on the merged tree? |
+|---|---|---|---|---|
+| `extra-extent` | H2 | no: the open sweep is unchanged | no | yes, cheap |
+| `orphan-extent` | H4 | no: the orphan is collected by the open sweep | no | yes, cheap |
+| `no-cluster-time` | H5 | no: the refusal happens before the orphan sweep, in any pass | no | yes, cheap |
+| `child-locked` | H1 | no | no | no |
+| `extra-branch` | G1 | no | no | no |
+| every comparison-only mode (A7.5) | — | no | no | no |
+| the D216 control smoke (e2) and rebuild pair | A7.1 | no | **yes**: the AFTER half | yes: step (i) |
+
+The lane report's FAN-QUEUE row carries this as its re-run instruction.
