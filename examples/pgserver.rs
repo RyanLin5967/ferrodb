@@ -65,8 +65,8 @@ fn main() {
     // `ArenaPageStore::reserve_persisted_floor`. Panics like every other post-lock failure in
     // this file, so the `DbLock` is dropped on the way out.
     let arena_path = format!("{db}.arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))
-        .expect("reserve the arena region before recovery");
+    // MUTANT (fire-check only, never land): pgserver never reserves the floor before recovery.
+    let _ = &arena_path;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
