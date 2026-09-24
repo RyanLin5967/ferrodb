@@ -139,7 +139,7 @@ mod stored {
         }
     }
 
-    /// The `[0x08]` record: the last-alive mark and `D`, one 16-byte value so that no crash can
+    /// The `[0x09]` record: the last-alive mark and `D`, one 16-byte value so that no crash can
     /// separate them.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct AliveState {
@@ -516,7 +516,7 @@ pub struct TableBranchCatalog {
     /// refusal (`StoredRecord::inward_at_zero` at `D > 0`). What still compiles is listed, each with
     /// the behavioural test that kills it, in `bench/lease_grace/PREREG.md` (M24r, M24c, M25b).
     ///
-    /// Durable in the `[0x08]` key beside the last-alive mark, and loaded at `open`. A catalog that
+    /// Durable in the `[0x09]` key beside the last-alive mark, and loaded at `open`. A catalog that
     /// has never had one reads `D = 0`, which makes every stored deadline mean exactly what it meant
     /// before D198. Written only by `resume_leases`, at startup, before anything is served.
     lease_offset: OffsetCell,
@@ -555,7 +555,7 @@ pub struct TableBranchCatalog {
 const HEADER_PAGE_MAGIC: u32 = 0xFE44_0B01;
 
 /// **The magic of a catalog that may hold `D > 0`** (SCALE-DESIGN "D198 addendum 2", review 3 C2).
-/// Its deadlines are stored as `lease − D`; a binary that ignores the `[0x08]` key would read every
+/// Its deadlines are stored as `lease − D`; a binary that ignores the `[0x09]` key would read every
 /// one of them `D` early and reap live branches, silently. So before the first record holding
 /// `D > 0` is written, the header page takes this magic, durably, and such a binary refuses the
 /// catalog at open instead. Pre-registered as a literal in `bench/lease_grace/PREREG.md` amendment
@@ -581,7 +581,7 @@ fn sync_dir_of(path: &std::path::Path) -> std::io::Result<()> {
     OsFileOps.sync_dir(parent_dir(path))
 }
 
-/// **The soft mark, `[0x09]`** (the lead's decision after review 3, closing its schedule E1): what
+/// **The soft mark, `[0x0A]`** (the lead's decision after review 3, closing its schedule E1): what
 /// every commit of an unmarked catalog records, riding its `stage`.
 ///
 /// - `mark`: the writer's LEASE-clock reading at the commit. A lease written by that writer is on
@@ -592,7 +592,7 @@ fn sync_dir_of(path: &std::path::Path) -> std::io::Result<()> {
 ///   so the writer's own run, between its open and its last commit, is credited to the NEXT process
 ///   as neither.
 ///
-/// A mark supersedes it: once `[0x08]` is on disk this key is never READ again. A commit racing the
+/// A mark supersedes it: once `[0x09]` is on disk this key is never READ again. A commit racing the
 /// mark's own `durable` may still write one, which the next open ignores (review 5, Q4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SoftMark {
@@ -913,7 +913,7 @@ impl TableBranchCatalog {
         Ok(())
     }
 
-    /// The soft mark `[0x09]`, if any. See [`SoftMark`].
+    /// The soft mark `[0x0A]`, if any. See [`SoftMark`].
     fn soft_mark(&self) -> Result<Option<SoftMark>, FerroError> {
         match self.tree.search(&keys::first_start())? {
             None => Ok(None),
@@ -922,7 +922,7 @@ impl TableBranchCatalog {
     }
 
     /// **Test fixture only: this catalog's file as a build without D198 would have left it** — no
-    /// `[0x08]`, no `[0x09]` — made durable WITHOUT `stage`, which would write a soft mark again.
+    /// `[0x09]`, no `[0x0A]` — made durable WITHOUT `stage`, which would write a soft mark again.
     /// A fixture that stands for a pre-D198 catalog calls it LAST, and the test then asserts both
     /// keys absent after its reopen, as a premise (PREREG amendment 11).
     #[cfg(test)]
@@ -1191,7 +1191,7 @@ impl TableBranchCatalog {
     }
 
     /// **The soft mark: every commit of an unmarked catalog records the writer's lease-clock
-    /// reading and the downtime owed before it opened the catalog** (`[0x09]`; see [`SoftMark`]),
+    /// reading and the downtime owed before it opened the catalog** (`[0x0A]`; see [`SoftMark`]),
     /// in the same stage and the same fsync as whatever it is committing — no extra sync. It closes
     /// review 3's schedule E1: a writer with no mark whose host slept left leases on a lease clock
     /// that lagged the wall, and no file time says by how much. It also keeps the evidence of the
@@ -1780,7 +1780,7 @@ impl TableBranchCatalog {
         Ok(out)
     }
 
-    /// The durable `[0x08]` record, or `None` if none was ever written. See
+    /// The durable `[0x09]` record, or `None` if none was ever written. See
     /// [`crate::branch::LeaseResume`] and [`TableBranchCatalog::lease_offset`].
     fn alive_record(&self) -> Result<Option<AliveState>, FerroError> {
         match self.tree.search(&keys::alive())? {
@@ -1815,7 +1815,7 @@ impl TableBranchCatalog {
     /// A catalog with NO record answers as before D198, at `D = 0`. **That is not because it has no
     /// downtime it could be charging** — this said so until review 3 (C3), and since the FirstStart
     /// policy it is false: an unmarked catalog holding a live lease has an outage its resume WILL
-    /// credit (its file time, its `[0x09]` soft mark), and until that resume every expiry answer
+    /// credit (its file time, its `[0x0A]` soft mark), and until that resume every expiry answer
     /// charges it. Early answers, then, reachable by a process that asks before resuming: an
     /// embedder with no `LeaseThread`; neither shipped binary asks before it resumes. The
     /// narrowness is kept because the strict form (refuse every unresumed catalog) would turn a
@@ -4348,8 +4348,8 @@ mod f1_lease_grace {
     /// asserted after its reopen, before anything else, so a fixture that still carries either key
     /// fails here rather than passing through a path it does not name.
     fn assert_no_d198_keys(c: &TableBranchCatalog) {
-        assert_eq!(c.alive_state().unwrap(), None, "premise: the fixture carries a [0x08] mark");
-        assert_eq!(c.soft_mark().unwrap(), None, "premise: the fixture carries a [0x09] soft mark");
+        assert_eq!(c.alive_state().unwrap(), None, "premise: the fixture carries a [0x09] mark");
+        assert_eq!(c.soft_mark().unwrap(), None, "premise: the fixture carries a [0x0A] soft mark");
     }
 
     /// **The FirstStart policy (lead, SCALE-DESIGN "D198 addendum — the FirstStart policy"): a
@@ -4364,7 +4364,7 @@ mod f1_lease_grace {
         let t = LeaseDeadline::now_millis();
         let lapsed_in_outage = t - HOUR / 2;
         let b = {
-            // No `[0x08]` and no `[0x09]`: every catalog written before D198 looks like this, and
+            // No `[0x09]` and no `[0x0A]`: every catalog written before D198 looks like this, and
             // this one is made to (PREREG amendment 11).
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             let b = c.fork(BranchId::TRUNK, LeaseDeadline(lapsed_in_outage)).unwrap().branch_id;
@@ -4621,7 +4621,7 @@ mod f1_lease_grace {
     }
 
     /// **Review 3, C2 / SCALE-DESIGN "D198 addendum 2": a downgrade must refuse.** Once a deadline
-    /// is stored at `D > 0` it is `lease − D`, and a `main` binary — which ignores `[0x08]` — would
+    /// is stored at `D > 0` it is `lease − D`, and a `main` binary — which ignores `[0x09]` — would
     /// read it `D` early. `main` refuses any header magic but `0xFE44_0B01`, so a catalog that has
     /// left `D = 0` must carry another one on disk before its first such deadline. Red against
     /// `1ec2deb`, which never changes the magic.
@@ -4664,7 +4664,7 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The crash the addendum names: the `[0x08]` record with `D > 0` reached disk and the header
+    /// The crash the addendum names: the `[0x09]` record with `D > 0` reached disk and the header
     /// page did not. A reopen must put the new magic on disk before anything can store a deadline
     /// at that `D`. Red against `1ec2deb`.
     #[test]
@@ -5105,7 +5105,7 @@ mod f1_lease_grace {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **M54/M55's killer: a marked catalog writes no soft mark.** Once `[0x08]` exists the soft
+    /// **M54/M55's killer: a marked catalog writes no soft mark.** Once `[0x09]` exists the soft
     /// mark is never read, so writing it would be a cost on every commit of every catalog both
     /// binaries serve, for no reader. Neither the heartbeat that creates the mark, nor the resume,
     /// nor a later commit writes one — in this instance, or in a reopened one that learns it is
@@ -5220,7 +5220,7 @@ mod f1_lease_grace {
     }
 
     /// **Review 4, C7(a): the pre-D198 fixture helper refuses a catalog that is not at `D = 0`.**
-    /// Stripping `[0x08]` and `[0x09]` from a catalog whose offset left 0 would leave deadlines
+    /// Stripping `[0x09]` and `[0x0A]` from a catalog whose offset left 0 would leave deadlines
     /// stored as `lease − D` under the new magic — not a pre-D198 catalog, silently. The helper's
     /// guard, forced to fire. Red against `012f65c`, where the helper has no guard.
     #[test]

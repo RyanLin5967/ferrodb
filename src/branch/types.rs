@@ -308,7 +308,7 @@ pub enum LeaseResume {
     /// and there is evidence of the outage before this start. `D` starts at `credited_millis`
     /// instead of 0:
     /// - `recorded_millis`: the downtime the last D198 writer that wrote this catalog and never
-    ///   resumed it found owed when it opened it, carried in its soft mark (`[0x09]`) — 0 if none;
+    ///   resumed it found owed when it opened it, carried in its soft mark (`[0x0A]`) — 0 if none;
     /// - plus the larger of two measures of the time since:
     ///   - `now_millis − writer_mark`, where `writer_mark` is that writer's LEASE-clock reading at
     ///     its last commit — a mark's own arithmetic, lease clock minus lease clock, exact whatever

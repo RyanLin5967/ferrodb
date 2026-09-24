@@ -1,7 +1,7 @@
 //! What does the D198 soft mark cost a commit? (review 4, C6; pre-registered in
 //! `bench/lease_grace/PREREG.md` amendment 12)
 //!
-//! Every commit of a branch catalog with no last-alive mark writes the soft mark `[0x09]`: one
+//! Every commit of a branch catalog with no last-alive mark writes the soft mark `[0x0A]`: one
 //! acquisition of the process lock for the lease clock, and one upsert, inside `logical`, which is
 //! fork's serial section. A catalog with a mark writes none. So the two arms below differ by
 //! exactly the soft mark, over the same code path, with no switch that disables anything:
