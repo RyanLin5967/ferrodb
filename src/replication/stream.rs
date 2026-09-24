@@ -2059,4 +2059,53 @@ mod tests {
         assert!(p.refused >= 1, "the refusal was not reported: {p:?}");
         assert_eq!(p.cursor, first, "the cursor passed the open transaction's first row: {p:?}");
     }
+
+    /// **D276: a pump delivers what its window holds before it grows (review 5).**
+    ///
+    /// A small transaction A commits inside the first window of a large, still-open X. The pump
+    /// must write A and stop there: growing first would read past a bounded batch for nothing and,
+    /// at the cap, would have failed without delivering A. The next pump, with A already delivered,
+    /// grows and delivers X.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the assertion that X arrives (the
+    /// base wedges after A); the first pump's assertions hold there.
+    #[test]
+    fn a_pump_delivers_what_its_window_holds_before_growing() {
+        const MAX: u64 = 300;
+        let (_d, w) = wal("deliver_first");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 201) })
+            .unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 50, 250);
+        let a_commit = w.append(2, 0, &RecKind::Commit).unwrap();
+        for id in 2..=10 {
+            insert(&w, 1, id, 200 + id);
+        }
+        let x_commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(
+            a_commit < first + MAX && x_commit > first + MAX,
+            "premise failed: A must commit inside the first window and X past it"
+        );
+
+        let s = streamer().with_max_bytes(MAX);
+        let mut feed = Vec::new();
+        let p1 = s.pump(&w, first, 0, &mut feed).unwrap();
+        assert_eq!(p1.emitted, 1, "the first pump did not deliver exactly A: {p1:?}");
+        assert_eq!(p1.cursor, first, "the cursor passed X's first row: {p1:?}");
+        let (mut cursor, mut through, mut emitted) = (p1.cursor, p1.emitted_through, p1.emitted);
+        for _ in 0..100 {
+            let p = s.pump(&w, cursor, through, &mut feed).unwrap();
+            let moved = p.cursor != cursor;
+            cursor = p.cursor;
+            through = p.emitted_through;
+            emitted += p.emitted;
+            if p.emitted == 0 && !moved {
+                break;
+            }
+        }
+        assert_eq!(emitted, 11, "X never arrived after A: the feed wedged behind it: {}", String::from_utf8_lossy(&feed));
+    }
 }
