@@ -206,8 +206,10 @@ fn git_state_paths(git: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<PathBu
     }
     let answer = git(&args)?;
     let paths: Vec<PathBuf> = answer.lines().map(|l| PathBuf::from(l.trim())).collect();
-    // One absolute path per question, or it is not an answer. `--path-format` needs git 2.31
-    // (release notes), and whatever an older git prints instead is not that.
+    // One absolute path per question, or it is not an answer. `rev-parse` prints an argument it
+    // does not understand back as a line of output and still exits 0 (measured, git 2.50.1), so
+    // a git older than `--path-format` (2.31, from the release notes) answers with the wrong
+    // lines rather than failing.
     if paths.len() != 1 + asked.len() || !paths.iter().all(|p| p.is_absolute()) {
         return None;
     }
