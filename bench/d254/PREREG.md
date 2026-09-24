@@ -138,3 +138,74 @@ D254's run script runs E1 and E4 on `d249_alter_encodable` to confirm the moved 
   - `git diff 06b0188 1654b9b` adds 4, and from `9aa6968` it adds 13, with 0 removed.
 - **Per-target: 2579 + 13 = 2592** (2579 measured on main's tree).
 - **The list step is the authority:** `cargo test --test d254_catalog_persist_bound -- --list` is predicted to show 4.
+
+---
+
+## Amendment 2 — review 1's R3, R6 and R7: text, one message string, and CI/CF's page assertion (nothing built)
+
+Source: `artie-research frontier/d254_review1.md` @ `8ecc169`, which reviews `1eb4da3`. Verdict: SOUND for the
+scoped claim. These are the lead's decisions. **No logic changes.** One error-message string is reworded, and CI and
+CF gain an assertion.
+
+### R7: the cost, restated
+
+The PREREG's "every `persist` serializes each entry twice … a constant factor of 2 on DDL" is wrong on two counts.
+
+- **The pre-pass costs more per entry than a second serialize.** It builds a fresh `CatalogPage`, makes a deep
+  `entry.clone()` (the name, every column name, both index vectors), and calls a `serialize` that zero-fills a whole
+  4096-byte page for that one entry. For clones and entry bytes the factor is 2. For buffer traffic it is about
+  4073 / mean entry bytes: about 115× for a 35-byte entry (review R7).
+- **It is paid on DML too, not only on DDL.** `persist` also runs whenever a DML statement moves a root: `sync_roots`
+  or `sync_fulltext_roots` (`executor.rs:516-552`, from `insert`, `update` and `delete`) call
+  `update_{primary,index,fulltext}_root`, which call `persist` (`catalog.rs:406`, `:419`, `:433`).
+- **Still O(tables).** Nothing grows with rows or branches, and T (tables) is not one of this project's scale axes.
+- **D270 removes it:** the page images serialized once ARE the encoder's answer.
+
+### R3: every route by which `persist` can still fail after its first page write
+
+D254 closes the ENCODER routes. The non-encoder routes remain, and there are five (review 1, READ at `1eb4da3`,
+`catalog.rs:518-586`):
+
+1. `new_page` refuses (the table region is full) at the old chain's end (`:541`). **This is reachable, not merely
+   environmental.** With the catalog on k ≥ 2 pages and the region holding exactly what the DDL itself allocates,
+   a statement that makes the catalog need page k+1 rewrites pages 1..k-1 and then fails.
+2. `fetch_page(curr)` fails at turn 2 or later (`:519`).
+3. `CatalogPage::deserialize` of an existing chain page fails at turn 2 or later (`:523`).
+4. `fetch_page(new_id)` fails after `new_page` succeeded (`:549`). That leaves a partial image, and a page
+   allocated but never linked.
+5. The orphan tail (`fetch_page`, `deserialize` or `delete_page`, `:571-582`) fails AFTER the whole new image was
+   written. This is the reverse divergence: the pages hold the new image, the refused object included, while
+   `persist_or_undo` rolls memory back.
+
+**What each leaves.** Routes 1–4 rewrite pages 1..k-1 and leave page k and the old tail. Entries can be lost from the
+image, and the refused object can be recorded on the pages. D254's claim is scoped to SIZE refusals, and holds.
+**D270** (the child branch) closes routes 1–4 and moves route 5's fetches ahead of every write.
+
+### R6: edges, recorded
+
+- **The v1 → v2 exactly-full-entry wedge** (INFERRED, pre-existing in effect).
+  - A v1 catalog page carries no full-text count byte. So an entry written in v1 at exactly 4,073 bytes is 4,074 in
+    v2, and 23 + 4,074 = 4,097.
+  - On such a database, `persist`'s pre-pass refuses EVERY persist, including `rebuild_indexes` at open, so the
+    database will not open.
+  - Before D254 the same persist looped and truncated the image. D254 turns damage into a clean refusal, but the
+    result is still a hard wedge.
+  - It is also the one case where a DDL's own check passes and the pre-pass refuses on ANOTHER entry, which leaks
+    the DDL's pages. No test is registered, because it needs a hand-built v1 page at the exact size.
+- **The refusal's wording.** `refuse_unless_encodable`'s message ends "refused before anything was written", which
+  is false when `persist`'s pre-pass is what fires: an ALTER's heap, or a DDL's pages, may already be written. It
+  becomes **"refused before any catalog page was written"**, which is true at every call site. The one string
+  changes. The tests match "catalog page" and the table's quoted name, both of which the new text still carries.
+- **CI and CF passed `absent = "m"` to `assert_catalog_intact`**, a table that exists in neither test, so that half
+  was vacuous.
+  - The helper's `absent` becomes `Option<&str>`: CT and CP pass `Some("m")`, and CI and CF pass `None`.
+  - CI and CF gain the assertion that was missing: the refused index is absent ON THE PAGES. They check
+    `Catalog::open(..)`'s entry for `t`: `indexes` is empty for CI, and `fulltext_indexes` is empty for CF.
+  - These strengthen assertions and weaken none. Predictions are unchanged: they pass at the tip, and no registered
+    mutant changes outcome, because every mutant's refusal still comes before any page write.
+- **D249's E3 patch no longer applies to this tree** after the wording change. Its context includes the message's
+  second line. It is registered as not run here (amendment 1), and it still applies to D249's own tree.
+
+### Counts
+
+No test is added or removed. The target has 4 tests, and per-target stays 2592.
