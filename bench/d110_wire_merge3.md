@@ -1,3 +1,42 @@
+> ## ⛔⛔ D193 CORRECTION — 2026-09-23. THIS FILE'S HEADLINE REASON IS FALSE. ITS VERDICT DOES NOT REST ON IT.
+>
+> This file says `DIFF` "has no delta in hand"; that `cow::diff` "*is* wired there, at
+> `runtime.rs:1850`"; that it is "reached by `DIFF <branch>`" and "already realised in
+> production"; that "the structural mechanism was wired to the one operation that needed it"; and
+> it ends by pointing at "`DIFF`'s precedent, which is where the structural descent has already
+> paid". **Each of those is false, and was false when written.** Read from source at `fc9556a`,
+> by symbol:
+>
+> * `dispatch::exec_agent`, arm `BoundAgentStmt::Diff` → `AgentRuntime::diff`, and nothing else.
+> * `AgentRuntime::diff` builds the changeset from the workspace's own touched-rows map (`ws.rows`,
+>   `ws.base_rows`, `ws.frame`). It calls neither `cow_diff`, nor `page_changeset*`, nor
+>   `CowTree::diff`. **`DIFF` has its delta in hand** — from the same kind of workspace map this
+>   file's Deflation question 1 says `MERGE` enumerates.
+> * The one `cow_diff` call (the `runtime.rs:1850` cited below) sits inside
+>   `AgentRuntime::page_changeset_with_cost`, which has **no caller in `src/`** outside
+>   `page_changeset`, which has none either — integration tests and
+>   `examples/d103_production_diff_curve.rs` only. `git log -S page_changeset -- src/` finds no
+>   commit that ever routed `DIFF` to it.
+> * `bench/d103_production_diff_curve.txt`, quoted below as the production `DIFF` curve, measures
+>   `page_changeset_with_cost`. It carries its own D193 correction, and its generator is fixed.
+>
+> ⇒ **`cow::diff` is in the same position as `merge3`**: a correct structural descent with no
+> production caller, because neither `DIFF` nor `MERGE` derives its delta from the CoW tree. There
+> is no `DIFF` precedent to re-open this row against. If base tables ever move into the CoW tree,
+> re-open **both** — a page-derived `DIFF` and `merge3` — as new questions; neither has a banked
+> production curve.
+>
+> **What stands, and on what.** The recommendation — do not wire `merge3` into `MERGE` — does not
+> need the false reason. It rests on the two legs the header below calls "each sufficient on its
+> own": (1) a `MERGE;` reads zero branch-engine pages at every table size (measured by D110 with
+> `examples/d110_merge_page_reads.rs`, fire-checked), and (2) the row-level merge is already
+> O(delta · log N) (read from source by D110 at `e7588cc`). **D193 did not re-verify either leg**;
+> it corrected only the `DIFF` premise.
+>
+> ⛔⛔ END D193 CORRECTION — everything below is the original file, unedited.
+
+---
+
 # D110 — should `cow::merge3` be wired into the production merge path?
 
 # ⛔ ROW RETIRED. DO NOT WIRE IT. This file is the reason.

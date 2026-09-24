@@ -1,3 +1,9 @@
+> **⛔ D193 correction (2026-09-23), PREPENDED — the original below is byte-for-byte unedited.** Line 8's premise
+> *"`MERGE` has a delta in hand and `DIFF` does not"* is **false**: `DIFF <branch>` reaches `AgentRuntime::diff`
+> (via `dispatch::exec_agent`'s `BoundAgentStmt::Diff` arm), which iterates `ws.rows` — the workspace's own
+> touched-rows map, the same kind of delta `MERGE` has. The conclusion (merge3 stays retired) does not depend on it.
+> Same correction as `bench/d110_wire_merge3.md`'s D193 block.
+
 # D92-merge3-fix — state
 
 Branch `D92-merge3-fix`, worktree `/Users/idide/wt/ferrodb-D92-merge3-fix`.

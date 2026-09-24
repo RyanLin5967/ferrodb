@@ -296,16 +296,23 @@ impl CowTree {
     /// expensive half — is proportional to what actually changed.
     ///
     /// ⚠ **BOTH halves are now reported, and the second one is why.** `pages_examined` alone is
-    /// O(delta), so a reader who trusted it read this O(N) operation as cheap — including the
-    /// production `DIFF` path, which used to call this and report a handful of decoded pages
-    /// while the two `walk_pages` calls below had just enumerated a million. `pages_walked` is
-    /// that enumeration, and it is the number to compare against
+    /// O(delta), so a reader who trusted it read this O(N) operation as cheap — `tests/prop_cow_diff.rs`
+    /// did exactly that while the two `walk_pages` calls below had just enumerated a million.
+    /// (D193: `AgentRuntime::page_changeset` called this before D103, but it consumed only `deltas`
+    /// and never surfaced `pages_examined`, so it was not the reader that was misled.) `pages_walked`
+    /// is that enumeration, and it is the number to compare against
     /// [`crate::cow::diff::DiffReport::visited`].
     ///
-    /// **The production `DIFF` path no longer calls this** — `AgentRuntime::page_changeset` uses
-    /// `cow::diff::diff`, whose synchronised descent never enumerates either side. This is kept
-    /// for the callers that want a `BTreeMap`-shaped answer and for the control arm of the
-    /// measurement in `examples/d103_production_diff_curve.rs`.
+    /// **`AgentRuntime::page_changeset` no longer calls this** — it uses `cow::diff::diff`, whose
+    /// synchronised descent never enumerates either side. This is kept for the callers that want a
+    /// `BTreeMap`-shaped answer and for the control arm of the measurement in
+    /// `examples/d103_production_diff_curve.rs`.
+    ///
+    /// ⚠ D193: this paragraph used to say "the production `DIFF` path" where it now says
+    /// `page_changeset`. That was never true: `DIFF <branch>` runs `AgentRuntime::diff`, which
+    /// reads the workspace's touched-rows map and calls neither this nor `cow::diff::diff`, and
+    /// `page_changeset` has no caller in `src/`. Neither diff here is on the path of a `DIFF`
+    /// statement.
     pub fn diff(&self, base_root: PageId, head_root: PageId) -> Result<TreeDiff, FerroError> {
         // Same root is the common case for an agent that read but never wrote, and it is the
         // cleanest statement of the invariant: identical pointer, identical tree, nothing read.
