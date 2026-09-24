@@ -11,9 +11,14 @@
 //! - **A1:** a mutator published only through `stage()`, after its last `?`. A fault after a root
 //!   split returned before publishing, and the next flush wrote the split pages without page 1.
 //!
-//! Either way, the next open reads the old root and searches for the header key `[0x07]`. That is
-//! the tree's maximum key, and after a split it never sits under the old root, so the open REFUSES:
-//! "branch catalog header key is missing". Every branch becomes unreachable.
+//! Either way, the next open reads the old root and searches for the header key `[0x07]`. At
+//! `9aa6968` that is the tree's maximum key, so after a split it sits in the new right part, never
+//! under the old root, and the open REFUSES: "branch catalog header key is missing". Every branch
+//! becomes unreachable. (Branches that add keys above `[0x07]` keep this only while fewer keys lie
+//! above the header than below it: D244 review 2, R2-8.)
+//!
+//! A3 covers a third route, found by D244 review 2 (R2-2): after a failed publish, ANY later sync
+//! flushed the split pages without page 1, whatever exit followed. `durable()` now publishes first.
 //!
 //! # The fault injector, and why it is not `sim::SimStorage`
 //!
@@ -246,6 +251,54 @@ fn a_failed_read_of_page_one_at_a_root_splits_publish_is_retried_by_the_next_mut
     assert_reopens_with(&storage, &ids);
 }
 
+/// A3 (D244 review 2, R2-2): a failed publish, no further mutation, then a sync, then no clean exit.
+///
+/// Forks are staged, not awaited, so no sync runs until the end. The first fork that splits the
+/// root is the first whose publish reads page 1, and that read fails. Then the last GOOD fork's
+/// ticket is awaited: its `durable()` is the next sync, and it flushes the split pages. The catalog
+/// is then dropped with no exit path at all, which is what a kill, a panic or pgserver amounts to.
+///
+/// At `9aa6968` the failed publish had already swapped the new root in, so nothing was owed. Up to
+/// the D244 exit fix, the failed publish left the root owed but `durable()` never paid it. Either
+/// way the sync writes the split pages under the old header, and the reopen refuses. With
+/// `durable()` publishing first, page 1 is written in that same flush.
+#[test]
+fn a_sync_after_a_failed_publish_writes_the_root_before_the_split_pages() {
+    let storage = FlakyStorage::new();
+    let cat = create(&storage);
+    let root_before = cat.root_page_id();
+    let mut ids = Vec::new();
+    let mut last_ticket = None;
+
+    storage.arm(Rule::ReadAt { offset: PAGE_ONE });
+    let refused = loop {
+        assert!(ids.len() < 5_000, "premise failed: {} forks never moved the root", ids.len());
+        cold(&cat);
+        match cat.fork_staged(BranchId::TRUNK, LEASE) {
+            Ok((rec, seq)) => {
+                ids.push(rec.branch_id.id);
+                last_ticket = seq;
+            }
+            Err(e) => break e.to_string(),
+        }
+    };
+    storage.disarm();
+    let fired = storage.fired();
+    assert!(
+        fired.len() == 1 && fired[0].contains("the read of page 1 "),
+        "premise failed: exactly one read of page 1 must have been failed; fired: {fired:?}"
+    );
+    assert!(refused.contains(INJECTED), "premise failed: the fork failed for another reason: {refused}");
+    assert_ne!(cat.root_page_id(), root_before, "premise failed: the root did not split before the failed publish");
+    let ticket = last_ticket.expect("premise failed: no fork was staged before the failed publish");
+
+    // No further mutation. The earlier fork's sync: no sync has run in this test, so it flushes.
+    cat.await_fork_durable(Some(ticket)).expect("the earlier fork's sync");
+    drop(cat);
+
+    assert_reopens_with(&storage, &ids);
+}
+
 /// The leaf an insert of `key` would land in, and its free bytes, found the way the tree finds it:
 /// down from the root through `BPlusTreeInternalPage::find_child`. A leaf splits on an insert of `E`
 /// bytes once `27 + keys + values + E >= PAGE_SIZE` (`index_page.rs`, `BPlusTreeLeafPage::is_full`),
@@ -283,8 +336,13 @@ fn right_of(cat: &TableBranchCatalog, page: u32) -> Option<u32> {
 const CHILD_ENTRY: usize = 4 + 17 + 4 + 8;
 const DEADLINE_ENTRY: usize = 4 + 17 + 4;
 
-/// A1: a fork that faults AFTER it split the root, flushed by an earlier staged fork's `durable()`,
-/// then a reopen with no further mutation.
+/// A1: a fork that faults AFTER it split the root, then a whole-pool flush that does NOT go through
+/// `durable()`, then a reopen with no further mutation.
+///
+/// Why not a sync: since D244 review 2 (R2-2) `durable()` publishes an owed root before it flushes,
+/// so a sync would heal a missing exit publish and this test could not see one. What the error
+/// exit's publish still buys is page 1 current in the pool from the failure on, so a write-back
+/// outside `durable()` carries it. The direct `flush_all` is that write-back.
 ///
 /// A fork writes, in order: its record key, its Live state key, its deadline key, its child key in
 /// the parent's live set, and the header key. The first two always append to the tails of their
@@ -307,15 +365,14 @@ const DEADLINE_ENTRY: usize = 4 + 17 + 4;
 ///
 /// Phases:
 /// 1. **Grow.** 200 parents forked from trunk, then forks round-robin across them, every fork with
-///    its own lease, until the root is an internal node with under 150 bytes of room. The last of
-///    these is staged and never awaited: its ticket is the vehicle.
+///    its own lease, until the root is an internal node with under 150 bytes of room.
 /// 2. **Steer.** Staged forks on a cold pool with the rule armed, until one faults. None is
-///    awaited, so the previous one's ticket is still unsynced when the failure comes.
+///    awaited, so no sync runs in this phase.
 ///
-/// Then that earlier ticket is awaited: its `durable()` flushes every dirty page, the split ones
-/// included. At `9aa6968` the failed fork returned before `stage()`, page 1 still names the old
-/// root, and the reopen refuses. With the fix the error exit published the new root, and the reopen
-/// finds every branch.
+/// Then one `flush_all` writes every dirty page, the split ones included. At `9aa6968` the failed
+/// fork returned before `stage()`, page 1 still names the old root, and the reopen refuses. With
+/// the fix the error exit published the new root into the pool, the flush carries it, and the
+/// reopen finds every branch.
 #[test]
 fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
     const PARENTS: u64 = 200;
@@ -340,7 +397,6 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
         parents.push(rec.branch_id);
     }
     let mut first_internal_root = None;
-    let mut vehicle = None;
     for i in 0.. {
         assert!(i < 30_000, "premise failed: {i} forks never filled the root");
         let l = lease();
@@ -361,13 +417,12 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
             // bytes (its record, state, deadline and child inserts can each split a leaf, while
             // the leases still rise), so the root is not full yet, and a few tail splits will fill it.
             if room < 150 {
-                vehicle = seq;
+                cat.await_fork_durable(seq).expect("sync the last growing fork");
                 break;
             }
         }
         cat.await_fork_durable(seq).expect("sync a growing fork");
     }
-    let mut vehicle = vehicle.expect("premise failed: the last growing fork handed back no ticket");
 
     // ---- 2. Staged forks, steered, on a cold pool, until one faults ---------------------------
     let root_before = cat.root_page_id();
@@ -415,7 +470,7 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
         let fired = storage.fired();
         storage.disarm();
         match (result, fired.is_empty()) {
-            (Ok((rec, seq)), true) => {
+            (Ok((rec, _)), true) => {
                 assert_eq!(rec.branch_id.id, id, "premise failed: the fork did not take the id its deadline key was steered for");
                 assert_eq!(
                     cat.root_page_id(),
@@ -423,7 +478,6 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
                     "premise failed: a fork split the root and read nothing from storage after the split"
                 );
                 ids.push(id);
-                vehicle = seq.expect("a staged fork hands back its ticket");
             }
             (Err(e), false) => {
                 failure = Some(e.to_string());
@@ -437,8 +491,9 @@ fn a_fork_that_faults_after_splitting_the_root_still_publishes_it() {
     assert!(failure.contains(INJECTED), "premise failed: the fork failed for another reason: {failure}");
     assert_ne!(cat.root_page_id(), root_before, "premise failed: the fault fired before the root moved");
 
-    // The earlier staged fork's durable(): no sync has run since it was staged, so this one flushes.
-    cat.await_fork_durable(Some(vehicle)).expect("the earlier fork's sync");
+    // A write-back that does not go through `durable()`: it carries page 1 only if the failed
+    // fork's own exit published it.
+    cat.pool_handle().flush_all().expect("flush the pool");
     drop(cat);
 
     assert_reopens_with(&storage, &ids);

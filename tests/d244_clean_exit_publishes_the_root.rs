@@ -3,9 +3,10 @@
 //!
 //! Since D244 a publish that fails on a mutation's exit records nothing, and the NEXT mutation
 //! retries it (`tests/d244_publish_root.rs`, A2). A process that makes no further mutation never
-//! gets that retry. Meanwhile another writer's `durable()` or an eviction may write the split pages
-//! to disk. Page 1 was never even dirty, so it keeps naming the old root. The next open searches for
-//! the header key `[0x07]` under that root, which never holds it after a split, and refuses.
+//! gets that retry. Meanwhile an eviction may write the split pages to disk. (A sync would not: since
+//! D244 review 2, R2-2, `durable()` publishes an owed root before it flushes; `d244_publish_root.rs`,
+//! A3.) Page 1 was never even dirty, so it keeps naming the old root. The next open searches for the
+//! header key `[0x07]` under that root, which never holds it after a split, and refuses.
 //!
 //! `cli::exit_sequence` is the function `run_cli` calls once its REPL ends. It now publishes the
 //! branch catalog's root and syncs it before the database and arena checkpoints.
@@ -174,8 +175,9 @@ fn a_clean_exit_after_a_failed_publish_leaves_a_catalog_that_opens() {
     assert!(refused.contains(INJECTED), "premise failed: the fork failed for another reason: {refused}");
     assert_ne!(branches.root_page_id(), root_before, "premise failed: the root did not split before the failed publish");
 
-    // 2. No further mutation. What another writer's `durable()` or an eviction would do: the split
-    //    pages reach the file. Page 1 does not, because the failed publish never wrote it.
+    // 2. No further mutation. What an eviction would do: the split pages reach the file. Page 1
+    //    does not, because the failed publish never wrote it. (A `durable()` here would publish
+    //    first, which is A3's case, not this one.)
     branches.pool_handle().flush_all().expect("flush");
     match open_branches(&storage.copy()) {
         Ok(_) => panic!(
@@ -187,7 +189,8 @@ fn a_clean_exit_after_a_failed_publish_leaves_a_catalog_that_opens() {
         ),
     }
 
-    // 3. The clean exit, through the function `run_cli` calls, then every handle dropped.
+    // 3. The clean exit, through the function `run_cli` calls, then the arena and the branch
+    //    catalog dropped. Nothing else holds the branch catalog's pool.
     exit_sequence(&branches, &txn, &store, &dir.path().join("f7.arena")).expect("the clean exit");
     drop(store);
     drop(branches);
