@@ -1464,6 +1464,23 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
             // If it ever gains a field of its own, or a second writer, that reasoning lapses and
             // this decision has to be made again.
             "applied_by_cell",
+            // **Wall #17 / D191: DECIDED, as this guard requires.** `applied_row_high` maps
+            // `(tbl, row)` to the highest `seq` pushed onto `applied`. `AgentRuntime::diff` reads
+            // it in place of scanning the whole log once per changed row. It is NOT a second
+            // funnel, on the same three grounds as `applied_by_cell`:
+            //   * it holds no information `applied` does not already hold. It is one `max` over
+            //     that Vec per row, and the lib unit test
+            //     `the_row_high_water_is_the_max_over_every_push_on_that_row` diffs it against
+            //     the scan it replaced;
+            //   * it is keyed by ROW, not by branch, so there is no per-branch state in it for an
+            //     envelope to govern;
+            //   * its only writer is `State::push_applied`, the same single call that appends to
+            //     `applied`. Only `record_applied` on the merge-publication path reaches it, so
+            //     no statement reaches it outside that.
+            // It is monotone by design. If `applied` is ever pruned, this map keeps facts the log
+            // no longer holds, and the first ground lapses. If it gains a second writer, the
+            // third lapses. Either way, this decision has to be made again.
+            "applied_row_high",
             "merges", "quarantine_reasons", "escrow", "versions", "captures",
             // `runs` and `row_author` were REMOVED by E79c (`ee01420`), and a removal gets the
             // same determination an addition does — the difference is which way it can be wrong.
