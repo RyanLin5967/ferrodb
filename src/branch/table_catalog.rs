@@ -400,14 +400,27 @@ impl TableBranchCatalog {
     /// under a header naming the old root. Before this, the next `durable()` from ANY writer flushed
     /// them without page 1, and the file refused to open after any exit that came before the next
     /// successful publish: a kill, a panic, an error return, or pgserver, whose `serve` never returns
-    /// `Ok`. So the leader publishes first, and a failed publish fails the sync before anything is
-    /// flushed.
+    /// `Ok`. So the leader publishes first, and a failed publish fails the sync before `flush_all`
+    /// runs. (The publish's own fetch of page 1 may first evict one dirty page to make room; that is
+    /// the eviction case, which a sync cannot close.)
     ///
     /// It runs inside `wait_durable`'s sync closure, which runs after the group-commit mutex is
     /// dropped (`group_commit.rs`). No `durable()` caller holds `logical`, so taking it here is
-    /// `mutate`'s lock order. When nothing is owed it is two atomic loads: `mutate` publishes on
-    /// every exit, so this path runs only after a failed publish. A catalog with no header page
-    /// (`create`) never owes one.
+    /// `mutate`'s lock order, and no code may call `durable()` while holding `logical`: the mutex
+    /// is not re-entrant. When nothing is owed it is three atomic loads and no lock. The lock is
+    /// taken after a failed publish, after a mutation body that panicked, after writes made outside
+    /// `mutate` (`migrate_from`), and briefly when the check lands between an in-flight split and
+    /// that mutation's own publish, where it only waits for the mutation to finish. A catalog with
+    /// no header page (`create`) never owes one.
+    ///
+    /// A poisoned `logical` is an ERROR here, never a panic. A panic in this closure would unwind
+    /// past `wait_durable`'s `syncing = false`, and since nothing is poisoned by it, every later sync
+    /// on this catalog would wait for ever (D244 review 6, R6-1). An `Err` clears `syncing` and
+    /// wakes the followers, who each retry and fail the same way.
+    ///
+    /// While a publish is owed and keeps failing, every sync fails, so unrelated mutations return
+    /// `Err` for changes that are already in the pool and that a later successful sync makes
+    /// durable: A2's second effect, widened to every caller.
     ///
     /// `mutate`'s own publish on a failed exit stays, and it is not redundant with this one. It puts
     /// the current page 1 in the pool at the failure itself, so a write-back that does not go
@@ -419,18 +432,25 @@ impl TableBranchCatalog {
         if header_page == 0 || self.published_root.load(Ordering::SeqCst) == root {
             return Ok(());
         }
-        let _g = self.logical.lock().unwrap();
+        let _g = self.logical.lock().map_err(|_| {
+            FerroError::Branch(
+                "branch catalog: the logical lock is poisoned by a panicked mutation, so the root it \
+                 owes cannot be published and nothing is flushed"
+                    .to_string(),
+            )
+        })?;
         self.publish_root()
     }
 
     /// **D244 review F7: the publish a clean exit owes.** Writes the tree's root into the header
     /// page if the last publish did not, then syncs this catalog's file.
     ///
-    /// A publish that fails on a mutation's exit records nothing, so the NEXT mutation retries it.
-    /// A process that makes no further mutation never gets that retry. Meanwhile another writer's
-    /// `durable()` or an eviction may already have put the split pages on disk, and the next open
-    /// then reads a root the tree has left and refuses. So both production exits call this before
-    /// their checkpoints: `cli::exit_sequence` and `examples/pgserver.rs`.
+    /// A publish that fails on a mutation's exit records nothing, so the NEXT mutation retries it,
+    /// or the next sync (`durable()` publishes an owed root first). A process that makes neither
+    /// may still have had the split pages put on disk by an eviction, and the next open then reads
+    /// a root the tree has left and refuses. So the CLI's clean exit calls this before its
+    /// checkpoints (`cli::exit_sequence`). pgserver has no reachable exit: `serve` returns only on
+    /// an error, which its `unwrap()` turns into a panic.
     pub fn publish_root_durably(&self) -> Result<(), FerroError> {
         let ((), seq) = self.mutate(|| Ok(()))?;
         self.durable(seq)

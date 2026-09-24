@@ -10,8 +10,9 @@
 //! This test reads `src/cli/cli.rs`, with `//` comments stripped, and fails on it.
 //!
 //! pgserver is not checked here: its code after `serve(..).unwrap()` is unreachable, because
-//! `serve` returns only `Err` (D244 review 2, R2-2). A check on it would guard dead code. The
-//! server is covered by `durable()`'s own publish instead (`d244_publish_root.rs`, A3).
+//! `serve` returns only on an error (inferred from `TcpListener::incoming` never ending; D244
+//! review 2, R2-2). A check on it would guard dead code. On the sync route the server is covered by
+//! `durable()`'s own publish (`d244_publish_root.rs`, A3); its eviction route stays open.
 //!
 //! # Blind spots
 //!

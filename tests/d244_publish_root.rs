@@ -258,9 +258,9 @@ fn a_failed_read_of_page_one_at_a_root_splits_publish_is_retried_by_the_next_mut
 /// ticket is awaited: its `durable()` is the next sync, and it flushes the split pages. The catalog
 /// is then dropped with no exit path at all, which is what a kill, a panic or pgserver amounts to.
 ///
-/// At `9aa6968` the failed publish had already swapped the new root in, so nothing was owed. Up to
-/// the D244 exit fix, the failed publish left the root owed but `durable()` never paid it. Either
-/// way the sync writes the split pages under the old header, and the reopen refuses. With
+/// At `9aa6968` the failed publish had already swapped the new root in, so nothing was owed. From
+/// `dd021cd` until `0e89af6`, the failed publish left the root owed but `durable()` never paid it.
+/// Either way the sync writes the split pages under the old header, and the reopen refuses. With
 /// `durable()` publishing first, page 1 is written in that same flush.
 #[test]
 fn a_sync_after_a_failed_publish_writes_the_root_before_the_split_pages() {

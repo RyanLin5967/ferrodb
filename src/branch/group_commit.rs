@@ -21,7 +21,9 @@
 //!
 //! What must NOT move out of the lock: every B+tree mutation. `BPlusTreeManager` is not safe for
 //! concurrent compound mutations, and a child that exists but is not listed in its parent is a GC
-//! correctness hole. Only `flush_all + sync` is shareable.
+//! correctness hole. Only the sync is shareable: `flush_all + sync`, preceded since D244 by the
+//! publish of a root a failed mutation left owed, which takes the logical lock itself
+//! (`TableBranchCatalog::publish_if_owed`) and so is never run with it held.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -201,8 +203,10 @@ mod tests {
     /// the natural test HANGS -- and a guard that detects a bug by deadlocking is a bad guard,
     /// because in CI it burns the job timeout and reports nothing. The obvious production fix,
     /// letting a waiter steal leadership after a while, was REJECTED: the only way `syncing` stays
-    /// set is a code bug (a panicking leader poisons the mutex instead), so that would be
-    /// production complexity added to make a mutant convenient to test, which is the wrong trade.
+    /// set is a code bug, a sync closure that panics (the state mutex is not held during `sync()`,
+    /// so the panic unwinds past the reset and poisons nothing; closures must return errors, as
+    /// D244's `publish_if_owed` does for a poisoned lock). Stealing would be production complexity
+    /// added to make a mutant convenient to test, which is the wrong trade.
     /// Bounding it here gets the fast failure without paying for it in the write path.
     #[test]
     fn a_failed_sync_leaves_the_group_usable() {
