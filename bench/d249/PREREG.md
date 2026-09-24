@@ -106,3 +106,42 @@ asserted: `name.len() > u8::MAX`. Each test checks three things:
   - Only then does it return an error. For CREATE TABLE, `persist_or_undo` undoes the entry, but the chain of empty
     catalog pages stays.
 - ALTER is covered by U1's arm above. CREATE TABLE is D141's path, and needs its own row.
+
+---
+
+## Amendment 1 — a third red test, and E2's prediction corrected, before the fix (nothing built)
+
+**The error.** The PREREG above predicts that AA kills E2 (the check moved into `finish`, after the rewrite), at
+AA's row assertion. That is wrong (READ `storage/tuple.rs`):
+
+- A NULL still occupies its type's width (`:110-118`).
+- The null bitmap is `(ncols + 7) / 8` bytes (`:26`, `:147`).
+- So AA's row, rewritten from `(1, 7)` to `(1, 7, NULL)`, is the same one-byte bitmap followed by `id`, `v` and four
+  zero bytes, and reads back as `(1, 7)` under `[id, v]`.
+
+**AA therefore survives E2 (INFERRED), and so does AR.**
+
+**The new test, `d42549f` (additions only, `47 0`).** **A9** =
+`an_added_ninth_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten`.
+
+- An 8-column table with the row `(1..=8)`, then `ADD COLUMN <300 bytes> INTEGER`.
+- It must be refused by name, the catalog must keep 8 columns, `SELECT *` must return exactly `(1..=8)`, and a later
+  CREATE TABLE must succeed.
+- A ninth column makes the bitmap two bytes. A row rewritten under nine columns is then misread under eight, or
+  refused by `deserialize`.
+- **So A9 is the test that pins WHERE the refusal happens, not only that it does.**
+
+**Run R, amended (predicted): at `d42549f`, 0 passed, 3 failed.**
+
+- AR and AA fail as registered.
+- A9 fails at its column-count assertion: the base's in-memory schema holds 9 columns.
+
+**Mutant table, amended:**
+
+| mutant | fails |
+|---|---|
+| E1 `precheck_removed` | AR, AA, A9 |
+| E2 `precheck_in_finish` | **A9 only**, at its row assertion (or its `SELECT` erroring) |
+| E3 `oversize_arm_removed` | U1 |
+
+**Per-target, amended: 2579 + 5 = 2584** (AR, AA, A9, U1, U2).
