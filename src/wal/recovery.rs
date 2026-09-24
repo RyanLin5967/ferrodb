@@ -609,8 +609,9 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // recent writes were not replayed, over pages the DROP may have freed. Removed from the catalog
     // WITHOUT freeing: the directory repair above may already have allocated a page the DROP freed,
     // and a second free would hit its new owner. Stated cost: pages the DROP had not freed yet leak,
-    // one table's worth per incomplete DROP. No other mechanism reclaims them: D229 does not defer
-    // DROP's frees (the lead, 2026-09-24), so this cost is D250's, stated.
+    // one table's worth per incomplete DROP. Nothing on this branch reclaims them, so the cost is
+    // D250's, stated. On the D229 merge the DROP's page intent frees them after the open's
+    // checkpoint (`d208-rootcell`, D229 PREREG amendment 15), and this sentence is D229's to word.
     let (logged_drops, completed_drops) = logged_drops_the_catalog_missed(&wal, &catalog)?;
     for table in &completed_drops {
         use std::io::Write;
