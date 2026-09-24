@@ -59,10 +59,12 @@
 //!
 //! Acquisition order is **down** the tree and **rightward** along the leaf chain, never upward or
 //! leftward, so the wait-for graph is ordered by depth and then by key and cannot cycle. **One
-//! exception, D233:** unlinking an emptied leaf write-latches its LEFT neighbour to splice the
-//! chain, while holding the root-to-leaf path. `remove_and_unlink` argues why that cannot cycle:
-//! no holder of a leaf latch waits on anything, and every other writer that could, first needs the
-//! root latch this thread holds.
+//! exception, D233:** unlinking an emptied leaf write-latches its LEFT neighbour, then its RIGHT one
+//! while still holding the left, to splice the chain, all while holding the root-to-leaf path.
+//! `remove_and_unlink` argues why that cannot cycle, and states the premises the argument needs:
+//! no holder of a leaf latch waits on another page latch while holding it (it may wait inside the
+//! buffer pool, which takes none); every other writer that could first needs the root latch this
+//! thread holds, which requires one shared root cell; and the chain names no page twice.
 //!
 //! # What this does NOT make safe, stated rather than implied
 //!
@@ -686,9 +688,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// - A range that never refills, such as the catalog's DEADLINE span (deadlines only grow),
     ///   uses no more disk than before D233, where the same drained pages stayed allocated in the
     ///   chain.
-    /// - A range that refills does use more. The catalog's FREE_ID span (fork pops its head) and the
-    ///   STATE span of recycled ids are like this. Before D233 a drained leaf there took the refill
-    ///   in place. Now the drained leaf is leaked and the refill splits a neighbour into a new page,
+    /// - A range that refills does use more. The catalog's FREE_ID span (fork pops the highest free
+    ///   id: the key stores `u64::MAX - id`) and the STATE span of recycled ids are like this.
+    ///   Before D233 a drained leaf there took the refill in place. Now the drained leaf is leaked and the refill splits a neighbour into a new page,
     ///   so such a span grows from O(max live) pages to O(splits), without bound, until D229 frees
     ///   unlinked pages.
     fn delete_unlinking(&self, key: &K) -> Result<(), FerroError> {
@@ -758,6 +760,17 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// releases it without waiting on anything this thread holds, and the wait cannot close a
     /// cycle. The branch catalog also serialises every writer under `TableBranchCatalog::logical`,
     /// but this argument does not rely on that.
+    ///
+    /// **Its premises, stated** (review 2 Q2, G6, G7):
+    /// - **Every writer on this tree shares one root cell** (`open_shared` / the catalog's one
+    ///   manager). Two handles with private root cells (`open`) break "a pessimistic writer needs
+    ///   the root latch this thread holds": a splitter descending from a stale root can hold `prev`
+    ///   and wait on this leaf as its `old_next`, while this thread holds the leaf and waits on
+    ///   `prev`. That is a cycle. It is unreachable today, because `delete`'s only caller is the
+    ///   branch catalog, which owns one manager; see the module's "What this does NOT make safe".
+    /// - The pool never takes a page latch (enforced in debug builds only, `page_latch.rs`).
+    /// - The chain is consistent: `prev != next`, and neither is the leaf. That one is checked
+    ///   above, before any latch, because latches are not re-entrant.
     fn remove_and_unlink(&self, leaf_id: u32, stack: &[u32], key: &K) -> Result<(), FerroError> {
         let mut leaf = self.read_leaf_raw(leaf_id)?;
         leaf.remove_entry(key)?;
@@ -766,6 +779,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         let unlink = Self::would_unlink(&leaf);
         if !unlink {
             return self.write_page(leaf_id, leaf.serialize()?);
+        }
+        // Review 2 G6: page latches are not re-entrant, and this thread already holds the leaf's and
+        // will hold `prev`'s while it takes `next`'s. A chain that names one page twice would make it
+        // wait on itself, holding the root, which stalls the whole tree. Refused before either latch.
+        if (leaf.prev.is_some() && leaf.prev == leaf.next) || leaf.prev == Some(leaf_id) || leaf.next == Some(leaf_id) {
+            return Err(FerroError::Io(format!(
+                "page {leaf_id}'s neighbours are prev {:?} and next {:?}: a chain that names one page \
+                 twice is inconsistent, so the unlink is refused and nothing is written",
+                leaf.prev, leaf.next
+            )));
         }
         // `prev`/`next` are stable here: they change only in a split or an unlink, and both hold
         // the root's write latch, which this thread holds. Their KEYS may still change under a

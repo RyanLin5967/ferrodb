@@ -344,9 +344,13 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
-    /// FREE_ID keys `fork` skipped because the slot's record was not `Reaped`, counted once per
-    /// skip (D233 review F5, ledger D243). Non-zero means a torn flush left a stale free-list entry;
-    /// a phantom no descent can reach is skipped, and counted, by every fork.
+    /// FREE_ID keys `fork` skipped, counted once per skip (D233 review F5, ledger D243; review 2
+    /// G9): a slot `reusable_slot` refuses, a slot whose record cannot be read, or a key that does
+    /// not decode. Non-zero means a torn flush, or corruption, left a bad free-list entry.
+    ///
+    /// What it is not: it lives in memory only and restarts at zero when the catalog is reopened; it
+    /// counts SKIPS, so a phantom no descent can remove is counted again by every fork (forks ×
+    /// phantoms, not phantoms); and nothing outside tests reads it today.
     pub fn stale_free_ids_skipped(&self) -> u64 {
         self.stale_free_ids.load(Ordering::Relaxed)
     }
@@ -550,6 +554,29 @@ impl TableBranchCatalog {
         match self.tree.search(&keys::envelope(id))? {
             Some(b) => Ok(Some(CapabilityEnvelope::deserialize(&b).map_err(FerroError::from)?)),
             None => Ok(None),
+        }
+    }
+
+    /// **The one answer to "may slot `id` be handed out again?"** (D233 review 2, G2): its record
+    /// is `Reaped`, and no live child is listed under it. Returns the slot's generation if so.
+    ///
+    /// Both halves are needed. A branch that is not `Reaped` still owns its slot. So does a `Reaped`
+    /// one whose child is still live: CHILD keys carry the parent's id without its generation
+    /// (`tree_keys::child`), so a new occupant would inherit the old one's children, and that set
+    /// decides the fate of pages parked under this branch's name. `release_id` asks this before it
+    /// writes a FREE_ID key, and `fork` asks it again before reusing one, because a FREE_ID can
+    /// outlive the state it was written for (a torn flush, review 1 F5). Errors are the caller's to
+    /// judge. Call with `logical` held.
+    fn reusable_slot(&self, id: u64) -> Result<Option<u32>, FerroError> {
+        match self.core(id)? {
+            Some(rec) if rec.state() == BranchState::Reaped => {
+                if self.has_live_children(id)? {
+                    Ok(None)
+                } else {
+                    Ok(Some(rec.generation()))
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -961,9 +988,9 @@ impl BranchCatalog for TableBranchCatalog {
         // generation comes from the slot's history, never from zero — a reused id whose generation
         // restarted would make a stale handle look current.
         //
-        // **Only a slot whose record is `Reaped` is reused** (D233 review F5, ledger D243).
-        // `release_id` writes a FREE_ID key only for a `Reaped` record, so a FREE_ID over any other
-        // record is stale. The tree has no WAL, and a torn flush can leave one:
+        // **Only a slot `reusable_slot` accepts is reused** (D233 review F5, ledger D243; review 2
+        // G2): `Reaped`, with no live child, which is exactly what `release_id` requires before it
+        // writes a FREE_ID key. So a FREE_ID over any other slot is stale. The tree has no WAL, and a torn flush can leave one:
         // - a fork that reused the id became durable, and its FREE_ID removal did not;
         // - an unlink of the FREE_ID leaf was torn, leaving a key that the chain still lists and no
         //   descent reaches.
@@ -977,13 +1004,19 @@ impl BranchCatalog for TableBranchCatalog {
         let mut stale = Vec::new();
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
             let (k, _) = entry?;
-            let Some(id) = keys::free_id_from_key(&k) else { continue };
-            match self.core(id)? {
-                Some(rec) if rec.state() == BranchState::Reaped => {
-                    recycled = Some((id, rec.generation()));
+            let Some(id) = keys::free_id_from_key(&k) else {
+                // Review 2 G9 (b): not a key this span can hold. Counted and removed like a stale one.
+                stale.push(k);
+                continue;
+            };
+            match self.reusable_slot(id) {
+                Ok(Some(generation)) => {
+                    recycled = Some((id, generation));
                     break;
                 }
-                _ => stale.push(k),
+                // Stale, or (review 2 G9 (a)) unreadable: skipped, counted and removed. Never a
+                // reason to fail this fork, and with it every later fork that meets the same entry.
+                Ok(None) | Err(_) => stale.push(k),
             }
         }
         for k in &stale {
@@ -1352,10 +1385,7 @@ impl BranchCatalog for TableBranchCatalog {
         // parked under this branch's name. Errors are swallowed to match the inherent method's
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
-        let reusable = match (self.core(id), self.has_live_children(id)) {
-            (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
-            _ => false,
-        };
+        let reusable = matches!(self.reusable_slot(id), Ok(Some(_)));
         if reusable {
             let _ = self.upsert(keys::free_id(id), Vec::new());
             // Same as the others: release the lock before the fsync. Errors stay swallowed
