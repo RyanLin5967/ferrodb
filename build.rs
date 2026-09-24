@@ -23,14 +23,17 @@
 //! # When the stamp is taken, and therefore what it can see
 //!
 //! The stamp is two facts read from git **when this script runs**: the commit `HEAD` resolves to,
-//! and whether any tracked file differs from it, staged or not. Cargo re-runs the script only when
-//! something it was told to watch has changed, so the stamp is exactly as fresh as the watch list,
-//! and the list is the whole of the mechanism:
+//! and whether the tree differs from it. "Differs" is three questions, OR-ed: `git status` over
+//! the tracked files; the BYTES of every tracked build input against HEAD's blobs; and any
+//! untracked file among the build inputs that cargo could compile. Cargo re-runs the script only
+//! when something it was told to watch has changed, so the stamp is exactly as fresh as the watch
+//! list, and the list is the whole of the mechanism:
 //!
 //! * **The build's inputs**: `src/`, `examples/`, `tests/` and `benches/` (each scanned whole, and
-//!   each only if it exists), `build.rs`, `Cargo.toml` and `Cargo.lock`. An edit to any of them is
-//!   an edit to what is being compiled, so it re-stamps. This is what makes an unstaged edit say
-//!   `+DIRTY`.
+//!   each only if it exists), `build.rs`, `Cargo.toml` and `Cargo.lock`, and the package root's
+//!   `.cargo/`, `rust-toolchain` and `rust-toolchain.toml`, which change the build without changing
+//!   a line of source. An edit to any of them is an edit to what is being compiled, so it
+//!   re-stamps. This is what makes an unstaged edit say `+DIRTY`.
 //! * **The git state**: this worktree's `HEAD` and index, and the ref file of every link from
 //!   `HEAD` to the branch it resolves to, normally just the checked-out branch's (or, on a
 //!   repository that keeps its refs in reftable, its `reftable/` directories). Each is
@@ -70,7 +73,15 @@
 //! * Cargo detects a change by mtime alone, against the time this script last ran. A change that
 //!   leaves a file's mtime no newer than that is invisible: an edit that preserves the mtime, or
 //!   an older copy put back with `cp -p` or `rsync -a`.
-//! * It cannot see a dirty SUBMODULE or an untracked file that is not on the build path.
+//! * Submodules: a submodule that is modified, or checked out at another commit, shows in
+//!   `git status` and stamps `+DIRTY`. What hides one is `submodule.<name>.ignore = all` in the
+//!   tracked `.gitmodules`, or an untracked file inside it (measured by D231's review 5, which
+//!   corrected this sentence). A submodule among the build INPUTS stamps `unknown`, because it has
+//!   no bytes to compare. ferrodb has no submodules.
+//! * Untracked files that are NOT build inputs, and ignored files among the inputs that do not end
+//!   in `.rs`, are not counted: nothing compiles them. A `.cargo/` or `rust-toolchain*` in a parent
+//!   directory is not seen at all, and one that appears at the package root where none existed is
+//!   seen only at the next re-stamp for another reason, like a new `benches/`.
 //! * **Every re-stamp rebuilds the crate, and so everything that links it.** The Cargo FAQ lists a
 //!   re-running build script as a cause of rebuilds; that the dependents follow is inferred. So an
 //!   edit to one test or example rebuilds the library and every target, where cargo alone would
@@ -98,8 +109,9 @@
 //!   keeps the old branch's sha (measured by D231's review 4). A known limit: the option is not
 //!   set on this machine, and git has deprecated it.
 //! * The sha and the dirty bit are read before rustc compiles anything. An edit that lands after
-//!   this script's `git status` and before rustc reads the file is compiled and not stamped; the
-//!   next build re-stamps.
+//!   this script reads the tree and before rustc reads the file is compiled and not stamped; the
+//!   next build re-stamps, on a filesystem with sub-second mtimes. On one with 1 s or 2 s mtimes an
+//!   edit in the same tick as the script's start is not newer than its `output`, and is not seen.
 //!
 //! # When it says `unknown`, which is never a guess in the direction that invites trust
 //!
@@ -117,11 +129,12 @@
 //! * **An index entry is told to hide changes** (N2): assume-unchanged (a lowercase `ls-files -v`
 //!   tag), skip-worktree (`S`), or `core.ignoreStat`. `git status` skips such entries by design,
 //!   so an edited, compiled file would read clean.
-//! * **`git status` fails** (N4). "Dirty" with the old sha would still name a commit, and nothing
-//!   here was able to compare the tree with it.
-//! * **HEAD moved while the two facts were being read** (N6). The sha is read, then `status` runs,
-//!   then the sha is read again. A commit landing between them would otherwise pair the parent's
-//!   sha with the child's status.
+//! * **`git status` fails** (N4), or one of the byte comparison's questions does (U2), or a build
+//!   input is a submodule, which has no bytes to compare. "Dirty" with the old sha would still
+//!   name a commit, and nothing here was able to compare the tree with it.
+//! * **HEAD moved while the two facts were being read** (N6). The sha is read, then `status`
+//!   and the byte comparison run, then the sha is read again. A commit landing between them would
+//!   otherwise pair the parent's sha with the child's tree.
 //!
 //! None of these fails the build: refusing to compile ferrodb because git is missing or odd would
 //! be a worse failure than an honest `unknown`.
@@ -131,8 +144,9 @@
 //! rest) is cleared before git is asked. A git hook exports those for the repository the hook is
 //! about, and `tools/prepush.sh` builds the checkout it lives in, which need not be that one.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// What the crate is compiled from, relative to the package root. Anything the crate compiles in
 /// from elsewhere must be added here, or an edit to it never re-stamps.
@@ -141,9 +155,20 @@ use std::process::Command;
 /// on every build (the Cargo FAQ, "Why is Cargo rebuilding my code?"), and this package has no
 /// `benches/`. One that appears later is picked up at the next re-stamp, and adding a tracked file
 /// to it rewrites the index, which is watched. `build.rs` is listed for completeness: cargo
-/// already re-runs a script whose source changed.
-const INPUTS: &[&str] =
-    &["src", "examples", "tests", "benches", "build.rs", "Cargo.toml", "Cargo.lock"];
+/// already re-runs a script whose source changed. `.cargo/` and the `rust-toolchain` files change
+/// the build without changing a line of source (D231 review 5, R1).
+const INPUTS: &[&str] = &[
+    "src",
+    "examples",
+    "tests",
+    "benches",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+];
 
 fn main() {
     let root = PathBuf::from(
@@ -159,20 +184,27 @@ fn main() {
 
     let local_env = local_git_env();
     let git = |args: &[&str]| -> Option<String> {
-        let mut cmd = Command::new("git");
-        // `--no-optional-locks`: a plain `git status` refreshes the index and writes it back
-        // (git-status(1), BACKGROUND REFRESH). That takes the index lock out from under whoever
-        // is committing in this worktree, and it rewrites a file this script watches, so the
-        // script would schedule its own re-run.
-        //
-        // `--no-replace-objects`: the stamped sha names the real commit, so `dirty` must compare
-        // against the real commit's tree. With `git replace` honoured, a replacement object
-        // changes the comparison without changing any file this script watches (D231 review).
-        cmd.args(["--no-optional-locks", "--no-replace-objects"]).args(args).current_dir(&root);
-        for var in &local_env {
-            cmd.env_remove(var);
+        let out = git_command(&root, &local_env, args).output().ok()?;
+        if !out.status.success() {
+            return None;
         }
-        let out = cmd.output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    // The same, with `input` on stdin. Written from a thread: git writes its answers while it
+    // reads, and a caller that wrote everything before reading would deadlock once the answers
+    // filled the pipe.
+    let git_in = |args: &[&str], input: &str| -> Option<String> {
+        let mut child = git_command(&root, &local_env, args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let input = input.to_string();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let out = child.wait_with_output().ok()?;
+        writer.join().ok()?.ok()?;
         if !out.status.success() {
             return None;
         }
@@ -198,30 +230,118 @@ fn main() {
         return;
     }
 
-    // `--porcelain` over TRACKED files only, and that is a deliberate trade with a real hole in it.
+    // "Dirty" is three questions, OR-ed. `git status` covers every TRACKED file, build input or
+    // not. The byte comparison covers the build inputs without trusting git's opinion of them.
+    // The untracked check covers what `status --untracked-files=no` leaves out.
     //
-    // ⚠ **AN UNTRACKED FILE ON THE BUILD PATH STAMPS CLEAN, AND THIS WAS DEMONSTRATED, NOT
-    // GUESSED.** Proving the flag fires in both directions needed a throwaway `examples/*.rs`; it
-    // was untracked, it compiled and ran, and the stamp read clean. So the honest statement is not
-    // "untracked files cannot change compiled behaviour" — they plainly can — it is that counting
-    // them would mark the tree dirty for every stray scratch file and the flag would mean nothing
-    // within a day. A flag nobody believes catches nothing at all.
+    // The untracked check replaces a trade this comment used to defend: that counting untracked
+    // files "would mark the tree dirty for every stray scratch file". D231's review 5 measured it
+    // across all 72 ferrodb worktrees on this machine. One had an untracked file among the inputs,
+    // and it was a true positive: three adversarial test files that cargo compiled, in a tree whose
+    // tracked files were clean, so its stamp read clean over code no commit holds.
     //
-    // The hole that remains is narrow and worth naming precisely: a NEW file that is on the build
-    // path and has never been committed. An edit to any file the crate already tracks IS caught,
-    // and that is the case the mechanism exists for.
-    //
-    // The sha is read on both sides of `status`: two git processes are two moments, and a commit
-    // landing between them would pair one commit's sha with another's status.
+    // The sha is read on both sides: separate git processes are separate moments, and a commit
+    // landing between them would pair one commit's sha with another tree's answer.
     let before = git(&["rev-parse", "--short=12", "HEAD"]);
     let status = git(&["status", "--porcelain", "--untracked-files=no"]);
+    let inputs = inputs_differ_from_head(&git, &git_in, &root);
     let after = git(&["rev-parse", "--short=12", "HEAD"]);
-    match (before, status, after) {
-        (Some(sha), Some(changes), Some(again)) if sha == again => stamp(&sha, !changes.is_empty()),
-        // No sha, a status that failed, or a HEAD that moved in between. "Dirty" beside a sha
+    match (before, status, inputs, after) {
+        (Some(sha), Some(changes), Some(differ), Some(again)) if sha == again => {
+            stamp(&sha, !changes.is_empty() || differ)
+        }
+        // No sha, a question that failed, or a HEAD that moved in between. "Dirty" beside a sha
         // would still name a commit nothing here compared the tree with.
         _ => stamp("unknown", true),
     }
+}
+
+/// `git`, run at the package root, with the flags and the cleared environment every question
+/// here needs.
+///
+/// `--no-optional-locks`: a plain `git status` refreshes the index and writes it back
+/// (git-status(1), BACKGROUND REFRESH). That takes the index lock out from under whoever is
+/// committing in this worktree, and it rewrites a file this script watches, so the script would
+/// schedule its own re-run.
+///
+/// `--no-replace-objects`: the stamped sha names the real commit, so `dirty` must compare against
+/// the real commit's tree. With `git replace` honoured, a replacement object changes the
+/// comparison without changing any file this script watches (D231 review).
+fn git_command(root: &Path, local_env: &[String], args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["--no-optional-locks", "--no-replace-objects"]).args(args).current_dir(root);
+    for var in local_env {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Whether the build inputs on disk differ from HEAD, by their BYTES (D231 review 5, U1 and U2).
+/// `Some(true)` differs, `Some(false)` is identical, `None` could not tell.
+///
+/// `git status` answers from the index: its stat cache, its assume-unchanged and skip-worktree
+/// bits, an fsmonitor's report, clean filters, and whatever configuration supplies them,
+/// `GIT_CONFIG_GLOBAL` included, which the environment clearing above does not reach. Review 5
+/// made each of those hide an edit that was compiled. This asks none of them. It hashes each
+/// tracked input as it is on disk (`hash-object --no-filters`) and compares that with HEAD's blob
+/// id (`ls-tree`). Measured by review 5 on this package: 386 files, 9.8 MB, 0.162 s.
+///
+/// Then the inputs HEAD does not have. An untracked file that is not ignored counts, whatever it
+/// is. An ignored one counts only if it ends in `.rs`, because cargo's target discovery compiles
+/// `examples/*.rs` and `tests/*.rs` whether git ignores them or not, and ignored noise such as
+/// `tests/pg/__pycache__` must not make every stamp dirty.
+fn inputs_differ_from_head(
+    git: &dyn Fn(&[&str]) -> Option<String>,
+    git_in: &dyn Fn(&[&str], &str) -> Option<String>,
+    root: &Path,
+) -> Option<bool> {
+    // HEAD's entries under the inputs, NUL-separated: `<mode> <type> <id>\t<path>`.
+    let mut args = vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--"];
+    args.extend(INPUTS.iter().copied());
+    let tree = git(&args)?;
+    let mut paths: Vec<&str> = Vec::new();
+    let mut ids: Vec<&str> = Vec::new();
+    for entry in tree.split('\0').filter(|e| !e.is_empty()) {
+        let (meta, path) = entry.split_once('\t')?;
+        let mut fields = meta.split(' ');
+        let (_mode, kind, id) = (fields.next()?, fields.next()?, fields.next()?);
+        // A submodule has no bytes to compare, and a path with a newline cannot be handed to
+        // `--stdin-paths`. Neither exists in ferrodb; either is refused rather than skipped.
+        if kind != "blob" || path.contains('\n') {
+            return None;
+        }
+        paths.push(path);
+        ids.push(id);
+    }
+    // A tracked input missing from the disk differs.
+    if paths.iter().any(|p| !root.join(p).is_file()) {
+        return Some(true);
+    }
+    if !paths.is_empty() {
+        let mut list = paths.join("\n");
+        list.push('\n');
+        let disk = git_in(&["hash-object", "--no-filters", "--stdin-paths"], &list)?;
+        let disk: Vec<&str> = disk.lines().collect();
+        if disk.len() != ids.len() {
+            return None;
+        }
+        if disk.iter().zip(&ids).any(|(on_disk, in_head)| on_disk != in_head) {
+            return Some(true);
+        }
+    }
+
+    let present: Vec<&str> = INPUTS.iter().copied().filter(|i| root.join(i).exists()).collect();
+    if present.is_empty() {
+        return Some(false);
+    }
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+    args.extend(present.iter().copied());
+    if !git(&args)?.is_empty() {
+        return Some(true);
+    }
+    let mut args = vec!["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"];
+    args.extend(present.iter().copied());
+    Some(git(&args)?.split('\0').any(|p| p.ends_with(".rs")))
 }
 
 fn watch(p: &Path) {

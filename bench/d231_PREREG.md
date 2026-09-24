@@ -356,3 +356,37 @@ depth cap, and preferSymlinkRefs (N7).
 
 The exit condition becomes: exit 0 requires FAIL = 0 and PASS = 104, and a run that reaches anything other than 104
 verdicts exits 2.
+
+## Amendment 3a (before any run of steps 33-52, stub model included): two instrument corrections
+
+Found while writing the steps. Neither changes a predicted outcome; the totals above stand (tip 104 PASS / 0 FAIL,
+exit 0; base PASS 51-61 / FAIL 43-53, exit 1).
+
+* **Step 45's shim refuses `git ls-files` only when the call carries `-v`**, not every `ls-files` as amendment 3's
+  table says. A blanket refusal also fails the U1 question (`ls-files --others`), which stamps `unknown` by itself.
+  Then `lsfailopen` (an `ls-files -v` that fails, read as "nothing hidden") stamps `unknown` too and survives: two
+  guards, and the step could test neither (review 5 said the same: "a state where `ls-files -v` fails but `status`
+  succeeds is needed"). Premises, asserted before the build through the shim: `ls-files -v` fails, and both
+  `ls-files --others --exclude-standard` and `status` succeed. A `D231 NOTE` line records whether the shim refused a
+  call during the build. It is an observation, not a premise, because the base never asks `ls-files -v`.
+* **Step 49 packs with `git pack-refs --include $first`, not `--all`.** In the clone arm, `--all` packs every loose
+  ref in the shared common directory, including the linked arm's branch `d231-probe-linked`. The linked arm's
+  first build would then watch a missing path and re-run on every build, and its step 2 would fail at the tip. That
+  would be an artefact of the arms sharing refs, not a finding. MEASURED on a toy repository with this machine's
+  git (2.50.1, Apple Git-155): `pack-refs --include refs/heads/main` packed only `main`, the checked-out branch. It
+  left a second branch, a linked worktree's branch and a symbolic ref loose. The step asserts that premise: `$first`'s
+  loose file is gone, and in the clone arm the linked arm's branch file exists before and after.
+
+Premises added beyond amendment 3's table, each an exit 2 if false:
+* 33 and 47: HEAD resolves to S0 before the build.
+* 37: no untracked, not-ignored file exists anywhere in the checkout, so the step isolates the ignored-`.rs` rule
+  from U1's untracked rule.
+* 43: no index entry carries a lower-case or `S` tag, so only the `core.ignoreStat` rule can see the step.
+* 47: after the build, the shim's `update-ref` returned 0 and HEAD resolves to Q0.
+* 51: the probe crate is not inside the checkout.
+
+**Real runs.** Ryan lifted quiet mode on 2026-09-24 ("ok you can resume literally everything, including using
+fans"). Both commits are now run for real, under the fleet lock (`~/wt/logs/lead-lanes-0924/lockrun.sh`). Each arm
+builds in its own target directory under `$WORK`, never a shared one. That is the lead's instruction, after the
+lease-grace lane measured, on toy crates, a shared target running one tree's code with another tree's stamp. The
+result files are committed before they are read.
