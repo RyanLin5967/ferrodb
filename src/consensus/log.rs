@@ -86,7 +86,26 @@ use super::{BranchOp, Command, Entry, NodeId, Round, Term};
 /// `0xF3EE_DB0*` is this codebase's file family; `03` is this log. `01` is the WAL and `02` is
 /// unused, left alone rather than recycled so a mistyped path is refused instead of half-parsed.
 const MAGIC: u32 = 0xF3EE_DB03;
-const VERSION: u32 = 1;
+
+/// The format this build writes once a log holds a frame over [`LEGACY_READ_BOUND`].
+///
+/// **Its whole job is to make an older build refuse** (D223 review F2). Every build before D223
+/// reads version 1 only, and refuses any other with an error at open (`Header::decode`). What it
+/// does with a version-1 log whose frame is longer than its read bound is far worse: its scan takes
+/// that frame for a torn tail, and `open` trims the file there, silently, taking every round after
+/// it, committed rounds included. D223 raised the frame this log may write above that bound
+/// ([`MAX_ENTRY_BYTES`]), so a log that holds such a frame must not be version 1.
+const VERSION: u32 = 2;
+
+/// The format every build before D223 reads, and the one this build still writes while every frame
+/// fits [`LEGACY_READ_BOUND`]. A log that never held a large frame can still be opened by an older
+/// build, and so can still be downgraded.
+const LEGACY_VERSION: u32 = 1;
+
+/// The read bound of every build before D223. Their `MAX_FRAME` was `MAX_ENTRY_BYTES + 64`, with
+/// `MAX_ENTRY_BYTES = MAX_FRAME_BYTES − 4096`, which is 8,384,576 bytes (READ at `9aa6968`). A
+/// literal, because it is a fact about binaries already shipped, not something this build can move.
+const LEGACY_READ_BOUND: usize = 8_384_576;
 
 /// `magic | version | generation | snapshot_round | snapshot_term | crc32(the previous 32 bytes)`.
 const HEADER_SIZE: usize = 36;
@@ -117,9 +136,28 @@ const MIN_FRAME: usize = 4 + 8 + 8 + 1 + 4;
 /// other's failures; each is tested at its own layer.
 pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES;
 
-/// The largest frame a scan will read from disk. A corrupt length field is a request to allocate,
-/// and an unbounded one is a denial of service triggered by four bad bytes.
-const MAX_FRAME: usize = MAX_ENTRY_BYTES + 64;
+/// The largest frame a scan will read from disk, **a constant of format version 2** (D223 review
+/// F2).
+///
+/// A corrupt length field is a request to allocate, and an unbounded one is a denial of service
+/// triggered by four bad bytes. It is checked together with `offset + total > file_len`, so the real
+/// ceiling is the file's own size.
+///
+/// A literal, and no longer `MAX_ENTRY_BYTES + 64`, because a read bound that follows the write
+/// bound is how the downgrade hazard happened. Whatever one build writes, an older build must
+/// either read or refuse. A read bound that moved with the write bound let a newer build write
+/// frames an older build trimmed. Raising the write bound past this now fails the build below. The
+/// fix for that is a new format version, not a larger constant here.
+const MAX_FRAME: usize = 8_388_672;
+
+// This build must be able to read back everything it writes.
+const _: () = assert!(
+    MAX_ENTRY_BYTES + 64 <= MAX_FRAME,
+    "MAX_ENTRY_BYTES exceeds format version 2's read bound; that needs a new format version"
+);
+// And the legacy bound must sit below it, or version 1 would already cover every frame and the
+// version-2 mark would never be needed.
+const _: () = assert!(LEGACY_READ_BOUND < MAX_FRAME, "the legacy read bound is not below MAX_FRAME");
 
 /// Bytes buffered before a compaction flushes them to the spare file. Bounds the memory a rewrite
 /// costs to something unrelated to how long the log is.
@@ -274,6 +312,8 @@ fn write_at(file: &dyn Storage, bytes: &[u8], offset: u64) -> Result<(), LogErro
 /// is greatest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Header {
+    /// [`LEGACY_VERSION`] or [`VERSION`]. See [`VERSION`] for what the difference protects.
+    version: u32,
     generation: u64,
     snapshot_round: Round,
     snapshot_term: Term,
@@ -283,7 +323,7 @@ impl Header {
     fn encode(&self) -> [u8; HEADER_SIZE] {
         let mut h = [0u8; HEADER_SIZE];
         h[0..4].copy_from_slice(&MAGIC.to_be_bytes());
-        h[4..8].copy_from_slice(&VERSION.to_be_bytes());
+        h[4..8].copy_from_slice(&self.version.to_be_bytes());
         h[8..16].copy_from_slice(&self.generation.to_be_bytes());
         h[16..24].copy_from_slice(&self.snapshot_round.to_be_bytes());
         h[24..32].copy_from_slice(&self.snapshot_term.to_be_bytes());
@@ -308,12 +348,14 @@ impl Header {
             return Ok(None);
         }
         let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
-        if version != VERSION {
+        if version != VERSION && version != LEGACY_VERSION {
             return Err(LogError::Corrupt(format!(
-                "a round log written at format version {version}; this build reads version {VERSION}"
+                "a round log written at format version {version}; this build reads versions \
+                 {LEGACY_VERSION} and {VERSION}"
             )));
         }
         Ok(Some(Header {
+            version,
             generation: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
             snapshot_round: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
             snapshot_term: u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
@@ -349,6 +391,9 @@ pub struct RoundLog {
     files: [Arc<dyn Storage>; 2],
     live: usize,
     generation: u64,
+    /// The live header's format version. It moves from [`LEGACY_VERSION`] to [`VERSION`] before the
+    /// first frame over [`LEGACY_READ_BOUND`] is written, and never back.
+    version: u32,
 
     snapshot_round: Round,
     snapshot_term: Term,
@@ -371,9 +416,10 @@ impl std::fmt::Debug for RoundLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RoundLog {{ live: {}, generation: {}, floor: {}@{}, rounds: {}..={}, durable: {}{} }}",
+            "RoundLog {{ live: {}, generation: {}, version: {}, floor: {}@{}, rounds: {}..={}, durable: {}{} }}",
             if self.live == 0 { "a" } else { "b" },
             self.generation,
+            self.version,
             self.snapshot_round,
             self.snapshot_term,
             self.first_round(),
@@ -448,7 +494,14 @@ impl RoundLog {
                         lens[0], lens[1]
                     )));
                 }
-                let h = Header { generation: 1, snapshot_round: 0, snapshot_term: 0 };
+                // Born at the legacy version: nothing large is in it yet, and an older build can
+                // still open it. The first large frame raises it (`RoundLog::append`).
+                let h = Header {
+                    version: LEGACY_VERSION,
+                    generation: 1,
+                    snapshot_round: 0,
+                    snapshot_term: 0,
+                };
                 // No truncate first, and that is provable rather than hopeful: this arm is only
                 // reached when both files are at most `HEADER_SIZE` bytes, and the write below is
                 // exactly `HEADER_SIZE` bytes at offset 0, so every byte of whatever a torn earlier
@@ -496,6 +549,7 @@ impl RoundLog {
             files,
             live,
             generation: h.generation,
+            version: h.version,
             snapshot_round: h.snapshot_round,
             snapshot_term: h.snapshot_term,
             index: scan.frames,
@@ -654,6 +708,15 @@ impl RoundLog {
             prev_term = e.term;
         }
 
+        // **Before the first frame an older build would trim, stop that build opening this log at
+        // all** (D223 review F2). This must happen before the frame is written: the switch makes
+        // the version-2 header durable first, so no crash can leave a large frame under a header
+        // an older build accepts. It runs before the offsets below are taken, because the switch
+        // moves the live file.
+        if self.version == LEGACY_VERSION && frames.iter().any(|f| f.len() > LEGACY_READ_BOUND) {
+            self.raise_version()?;
+        }
+
         let mut buf = Vec::with_capacity(frames.iter().map(|f| f.len()).sum::<usize>() + 4);
         let mut placed = Vec::with_capacity(frames.len());
         let mut at = self.end_offset;
@@ -781,6 +844,24 @@ impl RoundLog {
             Vec::new()
         };
 
+        self.switch(survivors, through, term, self.version, "checkpoint")
+    }
+
+    /// **The two-file switch**, the one copy of it: `survivors` are written into the spare file and
+    /// fsynced, then a header at `generation + 1` carrying `version`, `through` and `term` is written
+    /// and fsynced, which makes the spare live, and then the old file is retired. The module header
+    /// explains why nothing is lost at any point. `what` names the caller in errors.
+    ///
+    /// Extracted from `discard_prefix` unchanged, so that raising the format version (D223 review
+    /// F2) goes through the same ordering rather than a second copy of it.
+    fn switch(
+        &mut self,
+        survivors: Vec<Frame>,
+        through: Round,
+        term: Term,
+        version: u32,
+        what: &str,
+    ) -> Result<(), LogError> {
         let spare = 1 - self.live;
         let dst = Arc::clone(&self.files[spare]);
 
@@ -824,6 +905,7 @@ impl RoundLog {
         //    holding neither. Refusing everything from here and letting a reopen re-derive the
         //    truth from the bytes is the only answer that cannot lose a round.
         let h = Header {
+            version,
             generation: self.generation + 1,
             snapshot_round: through,
             snapshot_term: term,
@@ -831,7 +913,7 @@ impl RoundLog {
         if let Err(e) = write_at(&*dst, &h.encode(), 0).and_then(|()| dst.sync_all().map_err(io))
         {
             let why = format!(
-                "a checkpoint at round {through} could not be made durable, so whether the \
+                "a {what} at round {through} could not be made durable, so whether the \
                  generation-{} header is live is no longer knowable from this handle: {e}",
                 h.generation
             );
@@ -842,6 +924,7 @@ impl RoundLog {
         let stale = self.live;
         self.live = spare;
         self.generation = h.generation;
+        self.version = version;
         self.snapshot_round = through;
         self.snapshot_term = term;
         self.index = moved;
@@ -866,13 +949,25 @@ impl RoundLog {
             .and_then(|()| self.files[stale].sync_all());
         if let Err(e) = retire {
             let why = format!(
-                "the checkpoint at round {through} is durable, but the superseded file could not be \
+                "the {what} at round {through} is durable, but the superseded file could not be \
                  retired, so it is still a candidate the recovery could fall back to: {e}"
             );
             self.poisoned = Some(why.clone());
             return Err(LogError::Poisoned(why));
         }
         Ok(())
+    }
+
+    /// Mark this log as format [`VERSION`] before it holds a frame an older build would trim.
+    ///
+    /// A full switch with the floor unchanged: every current frame is copied to the spare under a
+    /// version-2 header, and the old file is retired. It is paid once per log, at its first frame
+    /// over [`LEGACY_READ_BOUND`], and never by a log that has no such frame. The switch happens
+    /// BEFORE that frame is written, so no crash can leave it under a header an older build
+    /// accepts.
+    fn raise_version(&mut self) -> Result<(), LogError> {
+        let all = self.index.clone();
+        self.switch(all, self.snapshot_round, self.snapshot_term, VERSION, "format upgrade")
     }
 
     // -- internals ----------------------------------------------------------------------------
