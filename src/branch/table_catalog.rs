@@ -4871,7 +4871,8 @@ mod f1_lease_grace {
 
     /// **Review 3, C6, with no recorded evidence.** A catalog finished by a build that records no
     /// soft mark — `main` migrates too; the fixture strips the one a D198 build leaves (PREREG
-    /// amendment 11) — found with a legacy log beside it. Either file may be the later one, so the credit is from the EARLIER.
+    /// amendment 11) — found with a legacy log beside it. Either file may be the later one, so the
+    /// credit is from the EARLIER.
     /// Red against `1ec2deb`, which prefers the log.
     #[test]
     fn a_switchover_with_no_recorded_evidence_credits_from_the_earlier_file() {
