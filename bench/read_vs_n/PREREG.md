@@ -724,3 +724,83 @@ The lane report's FAN-QUEUE row carries this as its re-run instruction.
   * On (e), `wrong-ckpt-flag` fires M6 on every applied merge. No merge there checkpoints, and the inverted flag
     claims each one did while `base_lsn` stayed put.
   * The guard's other direction, silence on a merge that checkpoints, is carried by run (g).
+
+**A11, 2026-09-24, before any build or run. Review 3 of `a039bab..1b8676b` (artie-research
+`frontier/read_vs_n_review3.md` @ `ad854e9`) returned SOUND-WITH-CAVEATS. Each finding, and what changes:**
+
+1. **E1: D216's AFTER half is judged on `recovered = 0` alone.**
+   * **Withdrawn:** A9.1's "`recovered = 0` and `wal B = 24`" for the AFTER half. D216's fix
+     (`d216-clean-restart` @ `a46b7d1`) still re-appends the retained DDL and run declarations at every checkpoint
+     (`txn.rs` `checkpoint_locked`). So a correct merge-on row prints `recovered = 0` with `wal B > 24`. A9.3 and
+     FAN-QUEUE row (i) already say `recovered = 0` only; that now holds everywhere.
+   * **`wal B = 24` judges the merge-OFF control only.**
+   * **A9.1's reason for `recover_us ≤ 5,000` was wrong for merge-on rows.** It said "a stat and a 24-byte header
+     read". After D216 the child's `recover` still analyses every record in the log, and a merge-on log holds the
+     re-appended declarations: the runs bound since the parent's last open (K per axis-(i) batch: 8 in (e), 64 in
+     (h)) plus any retained DDL. The bound stands (INFERRED: at most one DDL record and 64 run declarations). The
+     RESTART row's `wal B` prints that input.
+   * **E4.** After D216, `recovered` is the fixed `recover`'s own verdict. So `rebuild_us < 1,000` is the
+     independent cross-check. A row with `recovered = 0` and `rebuild_us ≥ 1,000` is a finding against D216, not a
+     pass.
+   * `OpenDatabase::recovered`'s doc no longer says it is "whether it rebuilt". The stale-index marker also forces a
+     rebuild, with `recovered` false. Nothing in this harness writes the marker (INFERRED, per review 3).
+2. **E2: the test parks the first pass INSIDE its sweep.** The 10 ms poll almost never landed inside a µs sweep. Now
+   `tests/read_vs_n_lease_census.rs` gives the reaper a delegating `BranchCatalog`, `ParkFirstPassSweep`.
+   * **The seam.** It holds the first `get_raw` made off the thread that built it. `LeaseThread::start` runs the
+     open sweep on the caller's thread, and a pass with nothing expired reaches `get_raw` only in the orphan sweep.
+     So the parked call is the first pass's sweep, first extent. `tests/w4_sweep_slot_recycle.rs` uses the same
+     shape.
+   * **While parked, the test asserts:**
+     * its premise, `sweep_visits == live + 1` (the open sweep's `live`, plus the extent counted just before
+       `get_raw`);
+     * `finished == 0`.
+   * **After release,** it asserts that the pass finished, then `sweep_visits == 2 × live` (review 3's minor point on
+     the order).
+   * **The mutant it must kill:** `finished.fetch_add` moved above `collect_orphans_if_due`. While parked, that
+     mutant shows `finished = 1`.
+   * The wait is bounded by `PATIENCE` on both sides.
+   * **D209:** the first pass sweeps nothing, so it never parks and `wait_parked` fails. D209's red test replaces
+     this block (A9.5 already assigned it the change).
+3. **E3: linearity of the checkpoint's excess is judged on a linear fit WITH AN INTERCEPT, over every checkpoint.**
+   * **Withdrawn:**
+     * A9.1's log-log band [0.5, 1.2]. For `c + a·M` the log-log slope is `aM/(c + aM)` < 1, and it drops below 0.5
+       whenever the fixed cost exceeds the replay's.
+     * The summary's per-row `slope(ckpt-med)` column. Its M = 1024 row spanned 256→1024, outside the stated range,
+       so removing the column removes the mis-span.
+   * **Why a fit rather than subtracting the M-independent term first.** That term is the WAL flush, `bp.flush_all`,
+     the disk sync, `truncate`'s two syncs and the replay flushes. It runs inside the same commit as the replay, so
+     the harness cannot time it apart. The intercept estimates it from the data.
+   * **Why every checkpoint.** Each printed row holds ONE checkpointing merge, so a row's excess carries a single
+     fsync's jitter. Axis (ii) has one checkpoint per 256 merges, 64 at M = 16,384, and the fit averages them.
+   * **Each point** is excess = the checkpointing merge's ns − the median ns of the applied merges in its own period
+     that did not checkpoint, i.e. the typical merge at that M. The points print raw (`CKPT M= ns= period_median_ns=
+     excess_ns= period=`). Then come the fit over all points and the fits over the lower and upper halves (split at
+     the middle point).
+   * **Judged:**
+     * the all-points slope `a` > 0;
+     * `a_hi / a_lo` in [0.5, 2.0]: the slope does not drift with M, so the excess is linear.
+   * **Reading the outcomes:**
+     * A ratio outside that range, with both halves' `a` > 0, says the replay is not linear in M.
+     * `a` ≤ 0 says the replay's growth is below the jitter at these M. That is inconclusive, not flat.
+     * The magnitude of `a` is not pre-registered.
+   * `amort ns` (A10.1) is unchanged.
+4. **E6: a fire mode without `CURVE_ARMS` is refused.** It panics at startup, because every mode breaks a READ-VS-N
+   guard. The historical path also prints `failures` itself, so a non-zero exit always carries its reason.
+5. **E5: the `Fire` taxonomy has three kinds.**
+   * COMPARISON: an offset, swap or dropped delta at the harness's own comparison.
+   * CONTROL: changes what the timed control arm does. These are `control-catalog`, `control-cold` and
+     `control-drift`. The branch path is untouched.
+   * IN PATH: a real state change the measured code sees. `merge-quarantined` moves here: its quarantine is real,
+     and MERGE sees it.
+6. **E7, ADDED: an in-path fire for M6, `pinned-checkpoint`.**
+   * **What it does.** Axis (ii) holds a real `wal.pin_durable()` for the whole axis. Each auto-checkpoint then
+     resets the commit counter while `truncate` keeps the log: A10.2's one legitimate disagreement, produced by the
+     engine.
+   * **Why add it.** M6's only fire so far inverted a flag at the comparison.
+   * **Its run** needs an M target of at least one checkpoint interval:
+     `CURVE_FIRECHECK=pinned-checkpoint CURVE_ARMS=merge CURVE_MERGE_K=8 CURVE_MERGE_M=256,512` on checkpoints
+     `256,2048`.
+   * **Expected:** rc = 2, M6 at `axis ii M=256` and `axis ii M=512`, and no other guard. The fit prints
+     "not computable" (two points).
+   * **Refusal.** If no axis-(ii) merge checkpointed under the pin, it prints NOT A RESULT naming that. So it is not
+     in the (f) list, whose M targets stop at 128.
