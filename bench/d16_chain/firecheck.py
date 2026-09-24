@@ -426,14 +426,16 @@ def stable_lines(stdout):
     return [l for l in stdout.splitlines() if l.startswith(("measured ", "slots ", "verdict "))]
 
 
-# The file this script has mutated and not yet restored, and the exact text it read from that file.
-# `restore` writes back ONLY that text, to ONLY that file, and only while it is set.
+# The file this script has mutated and not yet restored, and the exact BYTES it read from that file.
+# `restore` writes back ONLY those bytes, to ONLY that file, and only while it is set. Bytes, not
+# text: the sources hold non-ASCII, and a text round trip depends on the locale's encoding and on
+# newline translation, either of which could make the "restored" file differ from HEAD.
 APPLIED = None
-APPLIED_TEXT = None
+APPLIED_BYTES = None
 
 
 def restore():
-    global APPLIED, APPLIED_TEXT
+    global APPLIED, APPLIED_BYTES
     if APPLIED is None:
         return
     # Ignore a second SIGTERM/SIGHUP while writing back: an unwind here is the one that strands the
@@ -441,8 +443,8 @@ def restore():
     old_term = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     old_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
-        pathlib.Path(APPLIED).write_text(APPLIED_TEXT)
-        APPLIED, APPLIED_TEXT = None, None
+        pathlib.Path(APPLIED).write_bytes(APPLIED_BYTES)
+        APPLIED, APPLIED_BYTES = None, None
     finally:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGHUP, old_hup)
@@ -479,7 +481,7 @@ def baseline(outdir, label, expect_slots, head):
 
 
 def main():
-    global APPLIED, APPLIED_TEXT
+    global APPLIED, APPLIED_BYTES
     top = git("rev-parse", "--show-toplevel")
     here = pathlib.Path.cwd().resolve()
     if here != pathlib.Path(top).resolve() or not pathlib.Path("build.rs").is_file():
@@ -525,15 +527,15 @@ def main():
                   f"{dirty or git('rev-parse', 'HEAD') + ' / ' + path}", flush=True)
             return 2
         p = pathlib.Path(path)
-        original = p.read_text()
-        n = original.count(old)
+        original = p.read_bytes()
+        n = original.count(old.encode())
         if n != 1:
             print(f"{label}: NOT RUN, the anchor occurs {n}x in {path}, not once. The source moved; "
                   f"re-register this mutant.", flush=True)
             return 2
         try:
-            APPLIED, APPLIED_TEXT = path, original
-            p.write_text(original.replace(old, new))
+            APPLIED, APPLIED_BYTES = path, original
+            p.write_bytes(original.replace(old.encode(), new.encode()))
             rc, out = build(outdir, label)
             if rc != 0:
                 print(f"{label}: BUILD FAILED, so the mutant never ran\n{out[-2000:]}", flush=True)
