@@ -1427,3 +1427,54 @@ fn d221_a_slice_find_is_printed_not_only_counted() {
         quiet.text()
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D232 — two more readings whose healthy value is zero, and which must reach a reader.
+// -------------------------------------------------------------------------------------------
+
+/// **D232.** An unreadable owner record makes the sweep leave an extent alone, and an arena a
+/// reaped branch's record lists but the store charges to another branch is skipped. Both are
+/// counted on the reaper and both must be printed, D127's rule: a counter only a test reads is a
+/// real event that reaches nobody. One pass forces both to fire; a second pass with nothing new
+/// prints neither.
+#[test]
+fn d232_unreadable_owners_and_foreign_arenas_are_printed_not_only_counted() {
+    use crate::branch::tests_faulty_catalog::FaultyCatalog;
+    let f = fixture();
+    let faulty = FaultyCatalog::new(Arc::clone(&f.h.catalog));
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&faulty) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+
+    // Y is live and owns a written extent; expired X's record also lists it (the alias).
+    let y = branch_with_pages(&f, FAR_FUTURE, 1);
+    let ya = f.h.catalog.get(y).unwrap().arenas[0];
+    let x = f.h.catalog.fork(BranchId::TRUNK, EXPIRED).unwrap().branch_id;
+    f.h.catalog.add_arena(x, ya).unwrap();
+    // Z is live with a fresh, empty extent, and its record cannot be read.
+    let z = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+    let za = f.h.store.arena_for(z).unwrap();
+    faulty.fail_get_raw_for(z.id);
+
+    let counters = Counters::default();
+    let printed = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| printed.push(m));
+    let text = printed.text();
+    assert_eq!(state_of(&f, x), BranchState::Reaped, "fixture: expired X was not reaped");
+    assert_eq!(reaper.foreign_arenas_skipped(), 1, "the foreign arena was not counted");
+    assert_eq!(f.h.store.arena_owner(ya), Some(y), "reaping X freed Y's extent");
+    assert_eq!(reaper.unreadable_owners(), 1, "the unreadable owner was not counted");
+    assert_eq!(f.h.store.arena_owner(za), Some(z), "the sweep freed Z's live extent");
+    assert!(
+        text.contains("1 arena(s) listed under a reaped branch were NOT freed"),
+        "the foreign-arena skip reached no reader: {text:?}"
+    );
+    assert!(
+        text.contains("could not read the owning branch's record"),
+        "the unreadable owner reached no reader: {text:?}"
+    );
+
+    let quiet = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| quiet.push(m));
+    let quiet = quiet.text();
+    assert!(!quiet.contains("NOT freed"), "a pass with nothing new reported: {quiet:?}");
+}

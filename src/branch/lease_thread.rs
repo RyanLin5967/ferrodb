@@ -326,6 +326,11 @@ struct Counters {
     refused_branches: AtomicU64,
     failed: AtomicU64,
     finished: AtomicU64,
+    /// **D232.** The reaper's `unreadable_owners` as of the last report, so a later pass reports
+    /// only what is new, including increments a statement thread's reap made between passes.
+    reported_unreadable: AtomicU64,
+    /// **D232.** The reaper's `foreign_arenas_skipped` as of the last report.
+    reported_foreign: AtomicU64,
 }
 
 impl Counters {
@@ -828,7 +833,35 @@ fn scan_once(
             "lease: the orphan sweep's slice freed {slice_found} extent(s) that no in-process \
              producer recorded. They are collected, so nothing is lost now, but the producer \
              list at `TwoTierReaper::collect_orphans_if_due` is missing a case, or one of its \
-             stated cases has occurred (a no-reaper seal, a snapshot install). Expected: never."
+             stated cases has occurred (a no-reaper seal, a snapshot install, a crash between a \
+             claim's map record and its catalog write). Expected: never on a healthy run."
+        ));
+    }
+    // **D232 — two more readings that are ZERO on a healthy database, and must reach a reader.**
+    // Both are counted where they happen, which includes a statement thread's reap between
+    // passes, so each is reported against what was last reported rather than against this pass.
+    let unreadable = reaper.unreadable_owners();
+    let seen = counters.reported_unreadable.swap(unreadable, Ordering::SeqCst);
+    if unreadable > seen {
+        out(format!(
+            "lease: {} orphan-sweep verdict(s) could not read the owning branch's record, so \
+             those extents were NOT freed. Nothing is lost; the space stays charged. A healthy \
+             catalog reads every record, so this is a storage fault or a corrupt catalog, the \
+             same class a refused reap reports (D127). An unreadable owner is never taken as a \
+             gone one (D232).",
+            unreadable - seen
+        ));
+    }
+    let foreign = reaper.foreign_arenas_skipped();
+    let seen = counters.reported_foreign.swap(foreign, Ordering::SeqCst);
+    if foreign > seen {
+        out(format!(
+            "lease: {} arena(s) listed under a reaped branch were NOT freed, because the store \
+             charges them to a different branch. That is an aliased catalog key: a claim whose \
+             catalog write outlived a crash that lost its map record, before D232 put the map \
+             record first, after which a restart issued the same arena id again. The other \
+             branch's data is intact because of this refusal.",
+            foreign - seen
         ));
     }
     // Last statement of the pass, so a reader that sees it knows the sweep above is over.

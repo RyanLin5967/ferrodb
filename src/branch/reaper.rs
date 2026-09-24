@@ -89,6 +89,26 @@ pub(crate) const ORPHAN_SWEEP_SLICE: usize = 1024;
 /// node that cannot read the lease clock yet.
 const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 
+/// **D232.** What an extent's owner record being ABSENT means, which depends on where the sweep
+/// runs. Every other failure to read the record means "not collectable" everywhere.
+///
+/// An unreadable record was taken as "owner gone" (`Err(_) => true`). Since D126 no benign error
+/// reaches that read, so every `Err` is a storage fault or a corrupt catalog, and on a live branch
+/// whose current extent is empty (a fresh claim, or one its own frees emptied) the verdict freed an
+/// extent the branch was about to write into. The two other "is this owner live?" sites already
+/// refuse on any error: `free_page`'s `get_raw(owner.id)?` and `drain_pending_seeded`'s
+/// `Err(e) => Err(e)` (D124). This makes the sweep the third.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingOwner {
+    /// At open, before any statement runs: an owner with NO record at all is a branch that never
+    /// became durable (a claim record can outlive a staged fork's, D232), and nothing can refill
+    /// its extent concurrently. ⚠ Not proof against a torn catalog split after kill -9, which can
+    /// hide a live record from a point lookup; that belongs to D229's crash-safety design.
+    Gone,
+    /// Anywhere else. Nothing ever deletes a record, so an absent one is corruption, not evidence.
+    NotEvidence,
+}
+
 /// What one branch's turn in a lease sweep actually did.
 ///
 /// # D127 — this was a `bool`, and `false` meant two unrelated things
@@ -215,6 +235,12 @@ pub struct TwoTierReaper {
     /// to bump is a counter the next caller forgets. `scan_once` additionally *reports* the text;
     /// this is the floor that makes a refusal impossible to drop entirely, whoever asked for it.
     refused_reaps: AtomicU64,
+    /// **D232.** Sweep verdicts refused because the owner's record could not be read. See
+    /// [`Self::unreadable_owners`].
+    unreadable_owners: AtomicU64,
+    /// **D232.** Arenas a reap refused to free because the store charges them to another branch.
+    /// See [`Self::foreign_arenas_skipped`].
+    foreign_arenas_skipped: AtomicU64,
 }
 
 impl TwoTierReaper {
@@ -229,6 +255,8 @@ impl TwoTierReaper {
             open_sweep_freed: AtomicU64::new(0),
             open_sweep_visits: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
+            unreadable_owners: AtomicU64::new(0),
+            foreign_arenas_skipped: AtomicU64::new(0),
             slice_cursor: AtomicU32::new(0),
             rotation_end: AtomicU32::new(0),
             in_flight: Mutex::new(BTreeMap::new()),
@@ -281,6 +309,28 @@ impl TwoTierReaper {
     /// which has no reporter of its own.
     pub fn refused_reaps(&self) -> u64 {
         self.refused_reaps.load(Ordering::Relaxed)
+    }
+
+    /// **D232.** How many times a sweep could not read an extent's owner record and therefore left
+    /// the extent alone, over this reaper's life.
+    ///
+    /// The expected count is ZERO: a healthy catalog reads every record. Anything above it is a
+    /// storage fault or a corrupt catalog, the class D127's refusals belong to, and the extents
+    /// involved stay charged (a leak) rather than being freed on a guess. `scan_once` reports new
+    /// ones.
+    pub fn unreadable_owners(&self) -> u64 {
+        self.unreadable_owners.load(Ordering::Relaxed)
+    }
+
+    /// **D232.** Arenas a reap found in the branch's catalog record but which the store charges to
+    /// a DIFFERENT branch, and so did not free, over this reaper's life.
+    ///
+    /// The expected count is ZERO. A non-zero one is an aliased catalog key: a claim whose catalog
+    /// write survived a crash that lost its map record, from before D232 made the map record go
+    /// first, and a restart that then issued the same arena id to another branch. The other
+    /// branch's data is intact because of this refusal. `scan_once` reports new ones.
+    pub fn foreign_arenas_skipped(&self) -> u64 {
+        self.foreign_arenas_skipped.load(Ordering::Relaxed)
     }
 
     /// Arenas currently recorded as needing a narrowed sweep. Test/diagnostic read.
@@ -434,11 +484,25 @@ impl TwoTierReaper {
     /// One catalog descent. Both the narrowed sweep and the orphan collector ask exactly this
     /// question; the only thing that ever differed between them is **which arenas it is asked
     /// about**, and stating it once is what keeps them from drifting apart.
-    fn extent_is_collectable(&self, arena: ArenaId, owner: BranchId) -> bool {
+    ///
+    /// **D232.** Only a record that READS as reaped or regenerated makes the owner gone. A record
+    /// that cannot be read never does, and is counted in `unreadable_owners`. A record that is
+    /// absent does only where `missing` says so, which is the open-time sweep. See
+    /// [`MissingOwner`].
+    fn extent_is_collectable(
+        &self,
+        arena: ArenaId,
+        owner: BranchId,
+        missing: MissingOwner,
+    ) -> bool {
         self.sweep_descents.fetch_add(1, Ordering::Relaxed);
         let owner_gone = match self.catalog.get_raw(owner.id) {
             Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
-            Err(_) => true,
+            Err(_) if missing == MissingOwner::Gone && self.record_is_absent(owner.id) => true,
+            Err(_) => {
+                self.unreadable_owners.fetch_add(1, Ordering::Relaxed);
+                false
+            }
         };
         if !owner_gone {
             return false;
@@ -450,6 +514,20 @@ impl TwoTierReaper {
         // and never at all for a database that did not crash.
         self.store.resolve_fill(arena);
         self.store.extent_is_empty(arena)
+    }
+
+    /// **D232.** Is there provably no record for `id`, as opposed to one that could not be read?
+    ///
+    /// `get_raw`'s error cannot say: `From<BranchError> for FerroError` flattens `NotFound` into
+    /// `Branch(String)`, and a discriminator built on the wording is walked around by a reword.
+    /// `scan_ids(id, id)` answers presence with an iterator instead, so an empty answer is
+    /// "absent" and anything else, including an error, is not. Asked only after `get_raw` has
+    /// already failed, and only by the open-time sweep.
+    fn record_is_absent(&self, id: u64) -> bool {
+        match self.catalog.scan_ids(id, id) {
+            Ok(mut records) => records.next().is_none(),
+            Err(_) => false,
+        }
     }
 
     /// Free the extents that **this drain just emptied**. Freeing them is what returns the
@@ -489,7 +567,7 @@ impl TwoTierReaper {
             // `free_arena` may already have removed the extent, in which case there is nothing to
             // collect and `owner_of` says so.
             let Some(owner) = self.store.arena_owner(arena) else { continue };
-            if self.extent_is_collectable(arena, owner) {
+            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence) {
                 self.store.free_arena(arena)?;
                 freed += 1;
             }
@@ -515,11 +593,17 @@ impl TwoTierReaper {
     /// `get_raw` across the scan — was rejected in D40 for shrinking a constant while leaving
     /// O(branches x arenas) intact, and for caching *liveness*, the one value that must not go
     /// stale.
+    ///
+    /// **D232 — call it only where no statement can run.** It is the one sweep that treats an
+    /// owner with no record at all as gone (`MissingOwner::Gone`). That is sound only when
+    /// nothing can claim or refill an extent concurrently, which is what open guarantees:
+    /// `resume_interrupted_reaps` runs it under the runtime lock before the lease thread exists
+    /// and before any client is served.
     pub fn collect_orphaned_extents(&self) -> Result<u32, FerroError> {
         let mut freed = 0u32;
         for (arena, owner) in self.store.live_arenas() {
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
-            if self.extent_is_collectable(arena, owner) {
+            if self.extent_is_collectable(arena, owner, MissingOwner::Gone) {
                 self.store.free_arena(arena)?;
                 freed += 1;
             }
@@ -557,7 +641,8 @@ impl TwoTierReaper {
     /// first due-check after an open waits a full interval instead of repeating it.
     ///
     /// **D221 — what the residue must hold, producer by producer.** An extent is collectable when
-    /// its owner is gone (`Reaped`, regenerated, or unreadable) and it holds no page. In a running
+    /// its owner is gone (`Reaped` or regenerated; since D232 never merely unreadable) and it holds
+    /// no page. In a running
     /// process that state arises only in the ways below. Each one either records the extent in
     /// `deferred` or cannot occur:
     ///
@@ -590,9 +675,14 @@ impl TwoTierReaper {
     ///   its `Reaping` mark, so an extent claimed in between is freed by nobody. `RuntimeLock`
     ///   serialises both today. W4 removes that lock and must supply the barrier; until then the
     ///   slice covers it.
+    /// * **A crash between a claim's map record and its catalog write (D232).** `alloc_arena`
+    ///   writes the record first, so the crash leaves an extent the map reserves and the owner's
+    ///   record never listed. While the owner lives nothing touches it; once the owner is reaped,
+    ///   whose seed is its record's list, only the slice or the next open finds it. That is the
+    ///   leak D232 chose over the alias the other order made.
     ///
     /// `slice_freed` counts what the slice finds, and the expected count is zero outside the last
-    /// two cases.
+    /// three cases.
     ///
     /// `now_millis` is the cluster's time as the lease thread read it, not a local clock — the
     /// same reading `reap_expired` is deciding expiry on, so the cadence cannot disagree with the
@@ -704,7 +794,7 @@ impl TwoTierReaper {
                 continue;
             }
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
-            if self.extent_is_collectable(arena, owner) {
+            if self.extent_is_collectable(arena, owner, MissingOwner::NotEvidence) {
                 self.store.free_arena(arena)?;
                 self.slice_freed.fetch_add(1, Ordering::Relaxed);
                 freed += 1;
@@ -966,6 +1056,26 @@ impl Reaper for TwoTierReaper {
         // steady-state sweep no longer runs. Armed here, any exit or panic from this point leaves
         // them in the residue. An exit before the mark records them too, which is harmless: their
         // owner reads `Reaping`, not gone, so the residue sweep examines them and frees nothing.
+        // **D232 — free only what the store charges to THIS branch.** `rec.arenas` is the
+        // catalog's list, and `free_arena` checks no owner, so a catalog key naming another
+        // branch's extent freed that branch's live pages here (fast path) or released them onto
+        // its own recycled list (`retire_arenas_by_rule`, slow path). Such a key is what a crash
+        // between a claim's catalog write and its map record left behind before D232 reordered
+        // the claim; a database that already carries one needs this whatever the order is now.
+        // One filter, here, for both paths and the seed: `retire_arenas_by_rule` has no other
+        // production caller. An arena the store no longer has at all is kept: freeing it is a
+        // no-op, not a foreign free. Sound without a lock across check and free, because an arena
+        // id's owner never changes within a process: ids are never reissued in-process.
+        let (owned, foreign): (Vec<ArenaId>, Vec<ArenaId>) =
+            rec.arenas.iter().copied().partition(|a| match self.store.arena_owner(*a) {
+                Some(holder) => holder == branch,
+                None => true,
+            });
+        if !foreign.is_empty() {
+            self.foreign_arenas_skipped.fetch_add(foreign.len() as u64, Ordering::Relaxed);
+        }
+        rec.arenas = owned;
+
         let own_arenas = DeferTouched::armed(self, rec.arenas.iter().copied().collect());
 
         if !self.catalog.has_live_children(rec.branch_id.id)? {
@@ -3318,6 +3428,83 @@ mod tests {
              to live branch Y"
         );
         assert_eq!(h.store.arena_owner(ya), Some(y), "D232: Y's extent is no longer Y's");
+    }
+
+    /// **D232: an owner with NO record is gone at open, and is not evidence anywhere else.**
+    ///
+    /// The map below charges an empty extent to a branch the catalog has never recorded: what a
+    /// claim record that outlived its branch's fork record leaves after a crash. The open-time
+    /// sweep, which runs before any statement can claim or refill anything, collects it. The
+    /// steady-state sweep over the same state does not, and counts the verdict it refused,
+    /// because away from open "absent" is corruption, not proof.
+    #[test]
+    fn d232_an_absent_owner_is_gone_at_open_and_not_evidence_after_it() {
+        let (h, _r) = setup();
+        let x =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let a = h.store.arena_for(x).unwrap();
+        let image = h.store.state_bytes();
+        // A catalog of the same kind that has never heard of X.
+        let other = Harness::new_with($table);
+        assert!(other.catalog.get_raw(x.id).is_err(), "fixture: the other catalog knows X");
+
+        let at_open = h.fresh_store_over(Arc::clone(&other.catalog));
+        at_open.load_state(&image).unwrap();
+        let reaper = TwoTierReaper::new(Arc::clone(&other.catalog), Arc::clone(&at_open));
+        reaper.collect_orphaned_extents().unwrap();
+        assert_eq!(
+            at_open.arena_owner(a),
+            None,
+            "D232: at open, an extent whose owner has no record at all was not collected"
+        );
+        assert_eq!(reaper.unreadable_owners(), 0, "an absent record is not an unreadable one");
+
+        let steady = h.fresh_store_over(Arc::clone(&other.catalog));
+        steady.load_state(&image).unwrap();
+        let reaper = TwoTierReaper::new(Arc::clone(&other.catalog), Arc::clone(&steady));
+        reaper.collect_orphans_if_due(1_000_000).unwrap();
+        assert!(
+            steady.arena_owner(a).is_some(),
+            "D232: the steady-state sweep treated an absent owner record as a gone branch"
+        );
+        assert_eq!(reaper.unreadable_owners(), 1, "the refused verdict was not counted");
+    }
+
+    /// **D232: at open too, an owner that EXISTS but cannot be read is not gone.** Only absence
+    /// counts at open. The fixture is a crash orphan the open sweep does collect when its owner
+    /// reads (the control), and does not when the same record read fails.
+    #[test]
+    fn d232_an_unreadable_owner_is_not_gone_even_at_open() {
+        use crate::branch::tests_faulty_catalog::FaultyCatalog;
+        let (h, _r) = setup();
+        let x =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let a = h.store.arena_for(x).unwrap();
+        h.catalog.set_state(x, BranchState::Live, BranchState::Reaped).unwrap();
+        let image = h.store.state_bytes();
+
+        let faulty = FaultyCatalog::new(Arc::clone(&h.catalog));
+        faulty.fail_get_raw_for(x.id);
+        let unreadable = h.fresh_store();
+        unreadable.load_state(&image).unwrap();
+        let reaper = TwoTierReaper::new(
+            Arc::clone(&faulty) as Arc<dyn BranchCatalog>,
+            Arc::clone(&unreadable),
+        );
+        reaper.collect_orphaned_extents().unwrap();
+        assert!(
+            unreadable.arena_owner(a).is_some(),
+            "D232: the open-time sweep freed an extent whose owner record exists but could not \
+             be read"
+        );
+        assert_eq!(reaper.unreadable_owners(), 1, "the refused verdict was not counted");
+
+        let readable = h.fresh_store();
+        readable.load_state(&image).unwrap();
+        TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&readable))
+            .collect_orphaned_extents()
+            .unwrap();
+        assert_eq!(readable.arena_owner(a), None, "control: the orphan is collected when it reads");
     }
 
             }

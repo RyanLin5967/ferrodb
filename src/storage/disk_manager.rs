@@ -177,6 +177,30 @@ impl DiskManager{
         Ok(buffer)
     }
 
+    /// **D232.** [`Self::read`], except that a page that starts at or past the end of the file is
+    /// `Ok(None)` rather than an error, so a caller can tell "never written" from "unreadable"
+    /// without matching on an error's wording. A page that ENDS past the end of the file (a torn
+    /// extension) is still an error: part of it was written.
+    pub fn read_or_eof(&self, page_id: u32) -> Result<Option<[u8; PAGE_SIZE]>, FerroError> {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let mut total_read = 0;
+        while total_read < PAGE_SIZE {
+            let size = match self.storage.pread(&mut buffer[total_read..], offset + total_read as u64) {
+                Ok(s) => s,
+                Err(e) => return Err(FerroError::Io(e.to_string())),
+            };
+            if size == 0 {
+                if total_read == 0 {
+                    return Ok(None);
+                }
+                return Err(FerroError::Io(String::from("eof before finished reading")));
+            }
+            total_read += size;
+        }
+        Ok(Some(buffer))
+    }
+
     // sets a page as free/unused
     pub fn deallocate(&self, page_id: u32) -> Result<(), FerroError>{
         let _guard = self.bitmap_lock.lock().unwrap();
