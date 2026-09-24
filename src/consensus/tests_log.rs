@@ -1626,3 +1626,206 @@ fn the_largest_entry_one_frame_can_carry_is_storable_and_reads_back() {
     let log = open_on(&restarted).unwrap();
     assert_eq!(log.last_round(), 1, "the stored entry did not survive a reopen");
 }
+
+// ---------------------------------------------------------------------------------------------
+// D223 review F2 — a frame over the pre-D223 read bound must make an older build REFUSE the log,
+// never silently trim it. And F6 — the disk must store the largest entry an UNSIGNED frame carries.
+// Written against 1b8d290.
+// ---------------------------------------------------------------------------------------------
+
+/// The read bound of every build before D223. Its `MAX_FRAME` was `MAX_ENTRY_BYTES + 64`, with
+/// `MAX_ENTRY_BYTES = MAX_FRAME_BYTES − 4096`. Such a build treats a longer frame as a torn tail
+/// and trims it, along with every round after it. A literal, because it is a fact about binaries
+/// already shipped, not something this build can move.
+const PRE_D223_READ_BOUND: usize = 8_388_608 - 4096 + 64;
+
+/// The largest entry a proposal can admit: at the signed frame budget, 8,388,531 wire bytes. As a
+/// disk frame it is 8,388,539 bytes, over the pre-D223 read bound.
+fn over_the_old_bound(term: Term, round: Round) -> Entry {
+    Entry { term, round, command: Command::WalBatch { start_lsn: 0, bytes: vec![0u8; 8_388_531 - 29] } }
+}
+
+/// Whether a pre-D223 build would accept `img`'s header: magic, CRC, and version 1, the only
+/// version such a build reads. Its `Header::decode` refuses any other version with an error
+/// (`log.rs` at `9aa6968`).
+fn accepted_by_a_pre_d223_build(img: &[u8]) -> bool {
+    if img.len() < HEADER_SIZE {
+        return false;
+    }
+    let stored = u32::from_be_bytes(img[32..36].try_into().unwrap());
+    crc32(&img[0..32]) == stored
+        && u32::from_be_bytes(img[0..4].try_into().unwrap()) == MAGIC
+        && u32::from_be_bytes(img[4..8].try_into().unwrap()) == 1
+}
+
+/// The invariant F2 is about, read off the bytes rather than asked of the log: no file that a
+/// pre-D223 build would open holds a frame that build would trim.
+fn assert_no_frame_an_older_build_would_trim(images: &BTreeMap<String, Vec<u8>>, where_: &str) {
+    for (name, img) in images {
+        if !accepted_by_a_pre_d223_build(img) {
+            continue;
+        }
+        for (at, len) in frames_in(img) {
+            assert!(
+                len <= PRE_D223_READ_BOUND,
+                "{where_}: file {name} has a header a pre-D223 build accepts and a {len}-byte frame \
+                 at {at}, over that build's {PRE_D223_READ_BOUND}-byte read bound. Such a build would \
+                 trim it and every round after it, committed rounds included"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_frame_over_the_pre_d223_read_bound_makes_an_older_build_refuse_the_log() {
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=2);
+    log.append(&[over_the_old_bound(1, 3)]).unwrap();
+    log.sync().unwrap();
+    drop(log);
+
+    let images = fabric.durable_image();
+    let live = live_file(&images);
+    assert!(
+        frames_in(&images[live]).iter().any(|(_, len)| *len > PRE_D223_READ_BOUND),
+        "the fixture never stored a frame over the old bound, so this tests nothing"
+    );
+    assert!(
+        !accepted_by_a_pre_d223_build(&images[live]),
+        "the live file holds a frame a pre-D223 build would trim, under a header that build \
+         accepts: a downgrade would silently cut round 3 and everything after it"
+    );
+    assert_no_frame_an_older_build_would_trim(&images, "after one large append");
+
+    // ...and this build still reads it.
+    let restarted = fabric.restart();
+    let back = open_on(&restarted).unwrap();
+    assert_eq!(back.last_round(), 3);
+    assert_eq!(back.entry(3).unwrap(), over_the_old_bound(1, 3));
+}
+
+#[test]
+fn a_log_of_ordinary_frames_stays_readable_by_an_older_build() {
+    // The other side of the mark. Only a log that needs it pays: one that never held a large frame
+    // can still be downgraded across D223, through a checkpoint as well.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=10);
+    log.discard_prefix(4, 1).unwrap();
+    fill(&mut log, 1, 11..=12);
+    drop(log);
+    let images = fabric.durable_image();
+    assert!(
+        accepted_by_a_pre_d223_build(&images[live_file(&images)]),
+        "a log that never held a large frame was made unreadable to an older build"
+    );
+}
+
+#[test]
+fn a_checkpoint_keeps_the_mark_while_a_large_frame_survives() {
+    // A checkpoint rewrites the log into the other file, with a fresh header. It must not write
+    // that header in a form an older build accepts while a large frame survives it.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=2);
+    log.append(&[over_the_old_bound(1, 3)]).unwrap();
+    fill(&mut log, 1, 4..=5);
+    log.discard_prefix(2, 1).unwrap(); // rounds 3..=5 survive, the large frame among them
+    drop(log);
+    let images = fabric.durable_image();
+    assert!(
+        !accepted_by_a_pre_d223_build(&images[live_file(&images)]),
+        "a checkpoint rewrote a large frame under a header an older build accepts"
+    );
+    assert_no_frame_an_older_build_would_trim(&images, "after a checkpoint");
+    let restarted = fabric.restart();
+    let back = open_on(&restarted).unwrap();
+    assert_eq!((back.snapshot_round(), back.last_round()), (2, 5));
+}
+
+#[test]
+fn no_crash_can_leave_a_large_frame_under_a_header_an_older_build_accepts() {
+    // The ordering. A large frame must never reach a file whose header an older build accepts, not
+    // for an instant a crash could catch. So the header must change BEFORE the frame is written.
+    // This sweeps a fault across every operation of the first large append, in both durability
+    // models, and checks the bytes each crash leaves.
+    let mut ran = 0usize;
+    for durability in [Durability::WriteThrough, Durability::SyncOnly] {
+        let fabric = SimFabric::clean(durability);
+        let mut log = open_on(&fabric).unwrap();
+        fill(&mut log, 1, 1..=3);
+        drop(log);
+        let base = fabric.restart().durable_image();
+
+        let census = SimFabric::from_images(base.clone(), None, durability);
+        let mut l = open_on(&census).unwrap();
+        let mark = census.op_count();
+        l.append(&[over_the_old_bound(1, 4)]).unwrap();
+        l.sync().unwrap();
+        drop(l);
+        let points: Vec<u64> = census.faultable_ops().into_iter().filter(|i| *i >= mark).collect();
+        assert!(points.len() >= 2, "a large append under {durability:?} made {} faultable operations", points.len());
+
+        // Anti-vacuity: the run with no fault does store the large frame, and it is the case the
+        // invariant is about.
+        let whole = census.restart().durable_image();
+        assert!(
+            whole.values().any(|img| frames_in(img).iter().any(|(_, len)| *len > PRE_D223_READ_BOUND)),
+            "{durability:?}: the unfaulted run never stored the large frame"
+        );
+        assert_no_frame_an_older_build_would_trim(&whole, &format!("{durability:?}, no fault"));
+
+        for at in points {
+            for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
+                let plan = FaultPlan::at_shaped(at, 0xD223, shape);
+                let f = SimFabric::from_images(base.clone(), Some(plan), durability);
+                let mut broken = open_on(&f).unwrap();
+                let _ = broken
+                    .append(&[over_the_old_bound(1, 4)])
+                    .and_then(|()| broken.sync().map(|_| ()));
+                let where_ = format!("{durability:?} op {at} {shape:?}");
+                assert!(f.fired().is_some(), "{where_}: no fault fired, so this point tested nothing");
+                drop(broken);
+                assert_no_frame_an_older_build_would_trim(&f.restart().durable_image(), &where_);
+                ran += 1;
+            }
+        }
+    }
+    assert!(ran >= 12, "the sweep ran {ran} points across both models, which is not a sweep");
+}
+
+#[test]
+fn the_largest_entry_an_unsigned_frame_carries_is_delivered_and_stored() {
+    // **D223 review F6.** The disk must store whatever a peer's frame can deliver, and an UNSIGNED
+    // frame carries 32 bytes more than a signed one: an entry of up to `MAX_FRAME_BYTES − 45` on the
+    // wire. That is a `WalBatch` payload of 8,388,563 − 29, and a disk frame of 8,388,571. The
+    // signed-maximum test pins only 8,388,539, so a disk bound between the two would pass it and
+    // still refuse what a default, unsigned cluster delivers.
+    const WIRE: usize = 8_388_608 - 45;
+    let e = Entry { term: 1, round: 1, command: Command::WalBatch { start_lsn: 0, bytes: vec![3u8; WIRE - 29] } };
+    assert_eq!(crate::consensus::transport::entry_wire_len(&e), WIRE, "the fixture is not the unsigned maximum");
+
+    // Delivered: framed unsigned, as a default cluster sends it, and read back by the peer's codec.
+    let m = crate::consensus::Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: crate::consensus::Body::Append { prev_round: 0, prev_term: 0, entries: vec![e.clone()], commit: 0 },
+    };
+    let frame = crate::consensus::transport::encode(&m).expect("the unsigned maximum fits one frame");
+    let got = crate::consensus::transport::decode(&frame[5..]).expect("and decodes");
+    let crate::consensus::Body::Append { entries, .. } = got.body else { panic!("shape changed") };
+
+    // Stored, and read back after a restart.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    if let Err(err) = log.append(&entries) {
+        panic!("the log refused an entry an unsigned frame delivered: {err:?}");
+    }
+    log.sync().unwrap();
+    drop(log);
+    let restarted = fabric.restart();
+    let back = open_on(&restarted).unwrap();
+    assert_eq!(back.entry(1).unwrap(), e);
+}
