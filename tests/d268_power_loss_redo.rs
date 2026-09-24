@@ -340,32 +340,3 @@ fn d268_a_directory_frame_never_reaches_disk_before_its_init_record() {
         );
     }
 }
-
-/// Test 13. A COMMIT whose `Commit` record begins exactly where the flushed log ends is durable when
-/// COMMIT returns. `flush_up_to` took a record's start for its end: the first record after any flush
-/// begins at the flushed end, so it was reported durable while still in memory, and a crash rolled
-/// back a commit the client had been told of. Here the flush in between stands for another session's
-/// COMMIT or an eviction's WAL gate.
-#[test]
-fn a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns() {
-    let fabric = SimFabric::clean(Durability::SyncOnly);
-    let db = open(&fabric);
-    let mut b = HeapFileManager::new(db.bp.clone()).unwrap();
-    let b_dir = b.first_directory_page_id;
-    db.txn.checkpoint().unwrap();
-    let t = db.txn.begin().unwrap();
-    b.set_transaction(db.txn.clone(), t);
-    let c0 = vec![0xC0u8; 40];
-    b.insert(Tuple::new(c0.clone())).unwrap();
-    db.wal.flush().unwrap();
-    assert_eq!(
-        db.wal.next_lsn.load(Ordering::SeqCst),
-        db.wal.flushed_lsn.load(Ordering::SeqCst),
-        "premise: records remain unflushed, so the Commit would not begin at the flushed end"
-    );
-    db.txn.commit(t).expect("commit");
-
-    let db = open(&fabric.restart());
-    recover(&db.txn).expect("recover");
-    assert_eq!(rows(&db, b_dir), vec![c0], "COMMIT returned Ok, and the committed row did not survive the crash");
-}

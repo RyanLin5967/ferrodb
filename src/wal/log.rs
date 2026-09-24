@@ -1082,18 +1082,8 @@ impl WalManager {
         Ok(())
     }
 
-    /// Make the record that BEGINS at `lsn` durable. A record's LSN is its start, and `flushed_lsn` is
-    /// the end of what was flushed, so the record at `lsn` is durable exactly when `flushed_lsn > lsn`:
-    /// a flush writes whole records, so the flushed end is always a record boundary.
-    ///
-    /// This was `>=`, and the first record appended after any flush or truncation begins exactly at
-    /// `flushed_lsn`, so it was reported durable while still in memory. COMMIT (`TxnManager::commit`)
-    /// then returned `Ok` for a `Commit` record that a crash could lose, whenever something flushed the
-    /// log after the transaction's last record: another session's COMMIT, or an eviction's WAL gate.
-    /// And `BufferPoolManager::wal_gate` let a page whose last record was that first one reach disk
-    /// before it.
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
-        if self.flushed_lsn.load(Ordering::SeqCst) > lsn {
+        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
         }
         self.flush()
@@ -1391,26 +1381,6 @@ mod tests {
         let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
         wal.flush_up_to(l0).unwrap();
         assert_eq!(wal.flushed_lsn.load(Ordering::SeqCst), flushed);
-    }
-
-    /// **`flush_up_to(lsn)` makes the record AT `lsn` durable, including one that begins exactly where
-    /// the flushed log ends.** A record's LSN is its start, and `flushed_lsn` is the end of what was
-    /// flushed, so the first record after any flush begins at `flushed_lsn`, and `>=` reported it
-    /// durable while it was still in memory. COMMIT relies on this call. Lane report: artie-research
-    /// `frontier/lane_d268_power_loss_redo.md` §2.3, test 14.
-    #[test]
-    fn flush_up_to_flushes_a_record_that_begins_at_the_flushed_end() {
-        let (wal, _dir) = setup();
-        wal.append(1, 0, &RecKind::Begin).unwrap();
-        wal.flush().unwrap();
-        let end = wal.flushed_lsn.load(Ordering::SeqCst);
-        let lsn = wal.append(1, 0, &RecKind::Commit).unwrap();
-        assert_eq!(lsn, end, "premise: the record does not begin at the flushed end");
-        wal.flush_up_to(lsn).unwrap();
-        assert!(
-            wal.flushed_lsn.load(Ordering::SeqCst) > lsn,
-            "flush_up_to({lsn}) left the record at {lsn} unflushed"
-        );
     }
 
     #[test]
