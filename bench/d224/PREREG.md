@@ -701,3 +701,18 @@ run):
 - **Commands:**
   - N1–N6, N9 and N10 on the transport module;
   - N7, N8, N11 and N12 on `consensus::node::tests_node::`.
+
+---
+
+## Amendment 10 — the retransmission bound's condition (the lead, after review 3; before any run, nothing built)
+
+Amendment 6's G2 statement of the bound says "a pre-candidate re-campaigns every election timeout until it hears a
+leader". **That holds only while `may_campaign()` is true** (READ: `voter_tick`, `election.rs:53-61`, calls
+`start_precampaign` only `if self.may_campaign()`; `may_campaign` is `!behind && !unjoined && cfg.contains(self_id)`,
+`consensus/mod.rs:511-513`). When it is false, the countdown restarts and nothing is sent. No campaign was due, so no
+lost campaign frame goes unresent. Amendment 8 recorded the condition. This amendment attaches it to amendment 6's
+statement, which stands as written (append-only).
+
+- **The code comment names it:** `idle_probe_gap`'s doc, commit `5ace333`, comment only. No code line in
+  `transport.rs` has changed since `bf1fd63`.
+- Lane §2 and the FAN-QUEUE row are updated to say the same.
