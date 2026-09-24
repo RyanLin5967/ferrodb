@@ -544,4 +544,48 @@ mod tests {
         assert_eq!(tuples.unwrap().len(), 5);
     }
 
+    /// D256: `what`'s outcome on a page it must refuse as corrupt, naming it with `named`.
+    fn refused_naming(what: &str, named: &str, got: std::thread::Result<Result<(), FerroError>>) {
+        match got {
+            Ok(Err(FerroError::Corruption(msg))) => {
+                assert!(msg.contains(named), "{what} refused the page without naming it ({named:?}): {msg}")
+            }
+            Ok(Err(e)) => panic!("{what} failed, but not as corruption: {e}"),
+            Ok(Ok(())) => panic!("{what} SUCCEEDED on an all-zero page"),
+            Err(p) => panic!(
+                "{what} PANICKED ({}) on an all-zero page instead of refusing it",
+                p.downcast_ref::<String>().map(String::as_str).or(p.downcast_ref::<&str>().copied()).unwrap_or("no text")
+            ),
+        }
+    }
+
+    /// D256: a data page the directory lists, whose bytes are all zero: what the page holds when its
+    /// write never reached disk. Every reader and writer of the heap must refuse it, naming the page
+    /// (a zero page's header names page 0), and none may panic. Lane report: artie-research
+    /// `frontier/lane_d256_heap_page.md` §2, test 11.
+    #[test]
+    fn a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let (hfm, _dir) = setup();
+        let schema = test_schema();
+        let row = |id: i32| Tuple::serialize(&[Value::Integer(id), Value::Varchar("hello".into())], &schema, 0).unwrap();
+        let rid = hfm.insert(row(1)).unwrap();
+        assert_ne!(rid.page_id, 0, "premise: page 0 is the allocation bitmap, so a zero page's header names another page");
+        let bp = hfm.buffer_pool_manager.clone();
+        let frame_i = bp.fetch_page(rid.page_id).unwrap();
+        let mut frame = bp.frame_write(frame_i);
+        frame.data = [0u8; PAGE_SIZE];
+        drop(frame);
+        bp.unpin_page(rid.page_id, true);
+
+        let named = format!("heap page {} ", rid.page_id);
+        refused_naming("a scan", &named, catch_unwind(AssertUnwindSafe(|| hfm.scan().collect::<Result<Vec<_>, _>>().map(|_| ()))));
+        refused_naming("a read", &named, catch_unwind(AssertUnwindSafe(|| hfm.read(rid).map(|_| ()))));
+        refused_naming("an update", &named, catch_unwind(AssertUnwindSafe(|| hfm.update(rid, row(2)).map(|_| ()))));
+        refused_naming("a delete", &named, catch_unwind(AssertUnwindSafe(|| hfm.delete(rid))));
+        // The directory still lists the page with the room it had, so the insert is sent to it.
+        refused_naming("an insert", &named, catch_unwind(AssertUnwindSafe(|| hfm.insert(row(3)).map(|_| ()))));
+    }
+
 }
