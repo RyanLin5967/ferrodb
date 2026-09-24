@@ -206,3 +206,8 @@ Premise, asserted: the re-created `t`'s first directory page is not the dropped 
 **Predicted GREEN at the tip.** **New mutant M14:** `allocate` ignores the quarantine. `u`'s new pages and the new `t`
 then take the old `t`'s pages (the lowest clear bits), the open frees them under their owners, and the test goes red
 (a page reached while free). Base and counts follow in the amendment after the test lands.
+
+**Amendment 8 (after `1ef22d1`).** `1ef22d1` adds amendment 7's test, as registered, with one addition: it also asserts
+that the intent was carried out (none of the old `t`'s pages is left allocated and unnamed), which amendment 7 listed.
+The GREEN phase and mutant base is `1ef22d1`: `wal::recovery::tests_crash_frees::` **15 run, 15 passed**, predicted.
+`lane_d229_run.sh` carries 11 mutants (M1, M2, M4-M7, M9-M11, M13, M14), one site each at `1ef22d1` (PATTERNS_ONLY).
