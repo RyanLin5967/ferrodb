@@ -83,7 +83,10 @@ tree_for() {
     sha=$(sha_of "$phase")
     full=$(git -C "$WT" rev-parse --verify "$sha^{commit}") || { echo "cannot resolve $sha"; return 1; }
     if [ "$sha" = "$TIP" ]; then
-        [ "$(git -C "$WT" rev-parse HEAD)" = "$full" ] || { echo "REFUSING: $WT HEAD is not $TIP"; return 1; }
+        # HEAD may be past the tip only by this lane's run records under bench/lease_grace/.
+        git -C "$WT" merge-base --is-ancestor "$full" HEAD || { echo "REFUSING: $TIP is not an ancestor of HEAD"; return 1; }
+        git -C "$WT" diff --quiet "$full" HEAD -- . ':(exclude)bench/lease_grace' \
+            || { echo "REFUSING: HEAD differs from $TIP outside bench/lease_grace"; return 1; }
         [ -z "$(git -C "$WT" status --porcelain --untracked-files=no)" ] || { echo "REFUSING: $WT has tracked changes"; return 1; }
         DIR=$WT
     else
