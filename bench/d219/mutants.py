@@ -152,12 +152,32 @@ MUTANTS = {
         "        if file.pending.is_empty() {\n            return Ok(());\n        }\n        self.refuse_if_poisoned()?;\n",
         "        self.refuse_if_poisoned()?;\n        if file.pending.is_empty() {\n            return Ok(());\n        }\n",
     ),
-    # A rewrite returns with its stamps still pending, so they wait for the merge's final sync
+    # ---- the rewrite's own flush (6f22427, placed after finish by 77bddcb) ------------------------
+    # A rewrite's stamps are never flushed at install, so they wait for the merge's final sync
     # (review 2 F1) and one table's wait for the next table's rewrite (review 3 F1).
     "M19_rewrite_does_not_flush": (
         ALTER,
-        "    if let Some(store) = prov {\n        store.flush()?;\n    }\n",
+        "        if stamped {\n            if let Some(store) = &prov {\n                store.flush()?;\n            }\n        }\n",
         "",
+    ),
+    # The flush runs whether or not this rewrite stamped: a store poisoned with someone else's
+    # pending records fails a plain ALTER of an unattributed table (review 4 F1).
+    "M20_flush_even_if_nothing_stamped": (
+        ALTER,
+        "        if stamped {\n            if let Some(store) = &prov {\n                store.flush()?;\n            }\n        }\n",
+        "        if let Some(store) = &prov {\n            store.flush()?;\n        }\n",
+    ),
+    # The flush runs BEFORE finish: a failed flush leaves the rewrite under the old catalog (I19).
+    "M21_flush_before_finish": (
+        ALTER,
+        "    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))\n",
+        "    if stamped {\n        if let Some(store) = prov {\n            store.flush()?;\n        }\n    }\n    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))\n",
+    ),
+    # A failed flush swallowed: the ALTER reports success with its stamps not durable.
+    "M22_flush_error_swallowed": (
+        ALTER,
+        "                store.flush()?;\n",
+        "                let _ = store.flush();\n",
     ),
 }
 

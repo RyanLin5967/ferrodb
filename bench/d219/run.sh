@@ -22,8 +22,9 @@ BASE=9aa6968     # main when the lane was cut
 HARNESS=3b9a39e  # instrument + first red test + harness, NO fix: the BEFORE tree
 ROWONLY=bf10eec  # row authorship batched (871846a) + the whole-exit red test, stamps NOT batched
 DEFERALL=882e475 # every stamp deferred to the final sync (86e1762) + the schema-phase red test
-ONEFLUSH=b875ab3 # one schema-phase flush after every rewrite (eff03e8) + the two-table red test
-FIX=6f22427      # the whole fix: harness labels (39fd5a5) + each rewrite flushes its own stamps
+ONEFLUSH=b875ab3 # ONE flush after all the rewrites (eff03e8) + the two-table red test
+ALTERRED=789d1da # the two catalog::alter tests on 6f22427's code (flush before finish, unconditional)
+FIX=77bddcb      # the whole fix: a rewrite's stamps flushed after finish, only if it stamped
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -73,6 +74,10 @@ step b3_red_$DEFERALL timeout 3600 cargo test --test "$T"
 git -C "$FIRE" checkout --detach -q "$ONEFLUSH" || exit 3
 step b4_red_$ONEFLUSH timeout 3600 cargo test --test "$T"
 
+# ---- (b5) the catalog::alter red tests, on the tree that flushed before finish, unconditionally ---
+git -C "$FIRE" checkout --detach -q "$ALTERRED" || exit 3
+step b5_red_$ALTERRED timeout 3600 cargo test --lib catalog::alter::tests
+
 # ---- (c) AFTER: the fix --------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -q "$FIX" || exit 3
 step c_build_after timeout 3600 cargo build --release --example "$EX"
@@ -80,6 +85,7 @@ cp "$CARGO_TARGET_DIR/release/examples/$EX" "$WT/target/d219_after_bin" || exit 
 step c_curve_after_$FIX timeout 7200 "$WT/target/d219_after_bin"
 step c_green_$FIX timeout 3600 cargo test --test "$T"
 step c_lib_provenance_$FIX timeout 3600 cargo test --lib provenance::
+step c_lib_alter_$FIX timeout 3600 cargo test --lib catalog::alter::tests
 step c_lib_list_$FIX timeout 3600 cargo test --lib provenance:: -- --list
 git -C "$FIRE" checkout --detach -q "$BASE" || exit 3
 step c_lib_list_$BASE timeout 3600 cargo test --lib provenance:: -- --list
@@ -119,7 +125,10 @@ mutant M15_store_drop_does_not_flush provenance::durable::tests::a_store_dropped
 mutant M16_pending_never_cleared provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
 mutant M17_pending_ignores_the_poison provenance::durable::tests::a_poisoned_store_refuses_a_pending_stamp
 mutant M18_flush_checks_poison_first provenance::durable::tests::an_empty_flush_is_not_a_write_even_on_a_poisoned_store
-mutant M19_rewrite_does_not_flush INTEGRATION
+mutant M19_rewrite_does_not_flush INTEGRATION catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
+mutant M20_flush_even_if_nothing_stamped catalog::alter::tests::an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store
+mutant M21_flush_before_finish catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
+mutant M22_flush_error_swallowed catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"
