@@ -5881,4 +5881,128 @@ mod tests {
             "D232 review 4 B2: a store loaded from the short image writes a different image"
         );
     }
+
+    /// Whether `store`'s free list holds the range `start` of `pages` pages.
+    fn d263_free_list_holds(store: &ArenaPageStore, start: PageId, pages: u32) -> bool {
+        store.space.free_extents.lock().unwrap().get(&pages).is_some_and(|v| v.contains(&start))
+    }
+
+    /// **D263: a free whose record failed to persist gets its range back at the next rewrite.**
+    /// D232 keeps the range out of reuse while the durable map may still charge it to the freed
+    /// extent (`d232_a_free_whose_record_fails_to_persist_does_not_hand_its_range_out_again`), but
+    /// it kept it out for good: nothing ever put it back. The first rewrite that succeeds writes an
+    /// image of live memory, with no extent on the range and the whole old tail gone, so from then
+    /// on no durable record charges it to anyone and it can be handed out again. The next claim
+    /// cannot receive it, because it reserves before its own persist runs; the claim after can.
+    #[test]
+    fn d263_a_free_that_failed_to_persist_returns_its_range_at_the_next_rewrite() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-free-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        h.store.checkpoint_to(good.clone());
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+        let a = claim().unwrap();
+        let (r, pages) = h.store.extent_range(a).unwrap();
+
+        let (blocker, target) = d232_blocked_path("d263-free");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        h.store.checkpoint_to(good.clone());
+
+        let b = claim().unwrap();
+        assert_ne!(
+            h.store.extent_range(b).unwrap().0,
+            r,
+            "D232: the claim right after the failed free received its range before any durable \
+             record freed it"
+        );
+        let restored = h.fresh_store();
+        assert!(restored.restore(&good).unwrap(), "fixture: nothing was restored");
+        assert!(
+            d263_free_list_holds(&restored, r, pages),
+            "D263: the rewrite after the failed free did not record its range as free"
+        );
+        let c = claim().unwrap();
+        assert_eq!(
+            h.store.extent_range(c).unwrap(),
+            (r, pages),
+            "D263: once a rewrite recorded the failed free's range as free, the next claim of that \
+             size did not receive it: the range leaked"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D263: a claim whose record failed to persist (H2b) gets its range back at the next
+    /// rewrite.** The range comes straight off the watermark, so it is the watermark read before
+    /// the claim.
+    #[test]
+    fn d263_a_claim_that_failed_to_persist_returns_its_range_at_the_next_rewrite() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-claim-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+
+        let (blocker, target) = d232_blocked_path("d263-claim");
+        h.store.checkpoint_to(target);
+        let r = h.store.space.extent_starts.issued_through() as PageId;
+        claim().expect_err("fixture: the claim's record must fail to persist");
+        h.store.checkpoint_to(good.clone());
+
+        let b = claim().unwrap();
+        let (b_start, pages) = h.store.extent_range(b).unwrap();
+        assert_ne!(b_start, r, "D232: the failed claim's range went to the very next claim");
+        let c = claim().unwrap();
+        assert_eq!(
+            h.store.extent_range(c).unwrap(),
+            (r, pages),
+            "D263: once a rewrite recorded the failed claim's range as free, the next claim of \
+             that size did not receive it: the range leaked"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// **D263: a rewrite that fails keeps a quarantined range out of reuse.** The rewrite puts the
+    /// range on the free list only so that its image lists it free. If the write then fails, the
+    /// durable map may still charge the range to its old extent, so it must come back off the
+    /// list before any claim can reserve it.
+    #[test]
+    fn d263_a_rewrite_that_fails_keeps_the_range_out() {
+        let h = Harness::new();
+        let good =
+            std::env::temp_dir().join(format!("ferro-arena-d263-keep-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&good);
+        h.store.checkpoint_to(good.clone());
+        let claim = || {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+            h.store.alloc_arena(b)
+        };
+        let a = claim().unwrap();
+        let (r, _) = h.store.extent_range(a).unwrap();
+
+        let (blocker, target) = d232_blocked_path("d263-keep");
+        h.store.checkpoint_to(target);
+        h.store.free_arena(a).expect_err("fixture: the free's record must fail to persist");
+        claim().expect_err("fixture: the rewrite after it must fail while the path is blocked");
+        h.store.checkpoint_to(good.clone());
+
+        let z = claim().unwrap();
+        assert_ne!(
+            h.store.extent_range(z).unwrap().0,
+            r,
+            "D263: a range a failed rewrite had put on the free list was handed to a claim before \
+             any rewrite that recorded it free had succeeded"
+        );
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
+    }
 }
