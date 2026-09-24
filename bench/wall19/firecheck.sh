@@ -11,7 +11,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=da1811b           # the tree these mutants were written against (1db848e before §11)
+SUBJECT_SHA=2673674           # the tree these mutants were written against (1db848e before §11)
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -47,6 +47,8 @@ MUTANTS=(
   "M16_first_entry_not_last|$A|"'"            if e.branch == branch {\n                last = Some(i);\n"|"            if e.branch == branch && last.is_none() {\n                last = Some(i);\n"'
   "M17_seal_attests_behind_the_fallible_step|$R|"'"        let retired = self.retire(branch);\n"|"        let retired = Ok::<(), FerroError>(self.retire(branch)?);\n"'
   "M18_seal_attests_a_flip_it_did_not_make|$R|"'"            .filter(\u007cr\u007c r.generation == branch.generation && r.state != BranchState::Reaped);\n"|"            ;\n"'
+  "M19_seal_unreadable_not_counted|$R|"'"            Err(_) => {\n                let mut h = self.attested.lock().unwrap();\n                if h.head_of(branch).is_some() {\n                    h.count_refusal();\n                }\n            }\n"|"            Err(_) => {}\n"'
+  "M20_seal_unreadable_guessed_landed|$R|"'"            Err(_) => {\n                let mut h = self.attested.lock().unwrap();\n                if h.head_of(branch).is_some() {\n                    h.count_refusal();\n                }\n            }\n"|"            Err(_) => {\n                let _ = self.attest_reap(branch, fork_epoch, published);\n            }\n"'
 )
 
 run_targets() { # $1 = label
