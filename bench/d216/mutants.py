@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """D216 / D227 / D234 / D247 / D252 mutants, each applied ALONE to a throwaway checkout of the tip.
 
-Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,M27,...]
+Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,...] [--skip M26,...]
 
-A mutant whose pattern or `--test` target the tip does not have is reported NOT-AT-TIP and left out
-of everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else.
+At `d216-clean-restart`, run with
+`--skip M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound`:
+those four mutate D252-branch code or tests.
+
+A mutant whose `--test` target the tip does not have is reported NOT-AT-TIP and left out of
+everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else. A pattern
+that matches anything but once, where the targets exist, is a PATTERN-MISMATCH, never an absence.
 
 `--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
-`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves`
+`d252-caught-up-pin`, run `--only M26_cursor_stops_at_the_commit,M27_txn_end_after_the_flush,M28_pin_never_moves,M29_history_covers_to_the_bound`
 until the lead rules on the lane report's D252 ⚖: that branch's commit change takes away the
 buffered `TxnEnd` two D216 gate negative controls use as their premise, so they fail there, a full
 CONTROL is not clean, and every verdict would be VOID.
@@ -42,6 +47,8 @@ LIB = ("--lib", "wal::")
 D227 = ("--test", "d227_restart_keeps_declarations")
 HISTORY = ("--test", "d234_decoder_history_still_collapses")
 ARENA = ("--test", "d247_arena_page_write_back_flushes_no_log")
+STREAM = ("--lib", "replication::stream::")
+S = "replication::stream::tests::"
 D252 = ("--test", "d252_caught_up_subscription_lets_the_log_truncate")
 # Not a cargo-test argument list: `cargo build --examples`, for targets that spawn example binaries
 # (the staleness guard refuses a binary older than src/).
@@ -170,6 +177,12 @@ MUTANTS = [
      "",
      [D252], ["a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate",
               "a_subscription_passes_a_durable_rollback_after_the_last_commit"], "KILL"),
+    # The D252 review's B1: the decoder's history covered through a bound inside a record.
+    ("M29_history_covers_to_the_bound", "src/replication/logical.rs",
+     "            history.covered_through = history.covered_through.max(out.walked_to);\n",
+     "            history.covered_through = history.covered_through.max(to_lsn);\n",
+     [STREAM], [S + "a_bound_inside_a_commit_does_not_break_the_next_pump",
+                S + "a_large_backlog_is_delivered_in_bounded_batches"], "KILL"),
 ]
 
 FAILED_LINE = re.compile(r"^test (\S+) \.\.\. FAILED$")
@@ -233,12 +246,14 @@ def main():
         sys.exit(__doc__)
     tip = sys.argv[1]
     mutants = MUTANTS
-    if "--only" in sys.argv:
-        wanted = sys.argv[sys.argv.index("--only") + 1].split(",")
-        unknown = [w for w in wanted if w not in {m[0] for m in MUTANTS}]
-        if unknown or not wanted:
-            sys.exit(f"refusing: --only names no mutant or unknown ones: {unknown}")
-        mutants = [m for m in MUTANTS if m[0] in wanted]
+    for flag in ("--only", "--skip"):
+        if flag in sys.argv:
+            named = sys.argv[sys.argv.index(flag) + 1].split(",")
+            unknown = [w for w in named if w not in {m[0] for m in MUTANTS}]
+            if unknown or not named:
+                sys.exit(f"refusing: {flag} names no mutant or unknown ones: {unknown}")
+            keep = flag == "--only"
+            mutants = [m for m in mutants if (m[0] in named) == keep]
     env = dict(os.environ)
     if "--target-dir" in sys.argv:
         env["CARGO_TARGET_DIR"] = sys.argv[sys.argv.index("--target-dir") + 1]
@@ -258,8 +273,11 @@ def main():
             count = open(os.path.join(TREE, path)).read().count(old)
             missing = [t[1] for t in m[4] if t != BUILD_EXAMPLES and t[0] == "--test"
                        and not os.path.exists(os.path.join(TREE, "tests", t[1] + ".rs"))]
-            if missing or count == 0:
-                summary.append(f"{name} NOT-AT-TIP (pattern matches {count}, absent targets {missing}) expect={m[6]}")
+            # Only a missing TEST TARGET makes a mutant absent by design; a pattern that matches
+            # nothing where its targets exist is drift, and is reported as a mismatch (the D252
+            # review's m5: counting 0 as absent would hide a D216 pattern that had stopped matching).
+            if missing:
+                summary.append(f"{name} NOT-AT-TIP (absent targets {missing}; pattern matches {count}) expect={m[6]}")
             elif count != 1:
                 summary.append(f"{name} PATTERN-MISMATCH ({count} matches) expect={m[6]}")
             else:
