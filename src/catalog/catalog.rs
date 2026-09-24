@@ -165,6 +165,10 @@ impl Catalog {
     /// key, since the step above never overwrites. Retiring by whole table covered `DROP TABLE`
     /// only. By key it also covers one index leaving while the other kind on the same column stays:
     /// that one's cell is still wanted, so it is kept, `Arc` and all (D208).
+    ///
+    /// ⚠ **The retire runs only when this does.** A DROP that fails at its persist returns before
+    /// its sync, and the dead key keeps its cell. The CREATE side is what closes that
+    /// (`install_fresh_cell`, F4 of the D208 review), not this.
     pub fn sync_root_cells(&mut self) {
         let mut want: Vec<(RootKey, u32)> = Vec::new();
         for (name, entry) in self.tables.iter() {
@@ -180,6 +184,30 @@ impl Catalog {
         self.roots.retain(|key, _| live.contains(key));
         for (key, root) in want {
             self.roots.entry(key).or_insert_with(|| Arc::new(AtomicU32::new(root)));
+        }
+    }
+
+    /// Install a FRESH shared cell for a tree the caller has just created and made durable (F4 of
+    /// the D208 review).
+    ///
+    /// `sync_root_cells` never overwrites, and it retires a dead key only when it runs. A DROP
+    /// whose persist fails returns before its sync, and so leaves the dead tree's cell under the
+    /// key. A CREATE of the same key then inherited that cell and descended a FREED tree. A
+    /// brand-new tree has no legitimate holder, so replacing whatever is there is always right,
+    /// and it makes the inheritance unrepresentable instead of depending on a retire having run.
+    ///
+    /// The root is read from the RECORD the caller has just written, so the cell cannot disagree
+    /// with it, however the caller computed it. A missing record installs nothing:
+    /// `sync_root_cells` then retires the key.
+    fn install_fresh_cell(&mut self, table: &str, index: Option<IndexTree<&str>>) {
+        let Some(entry) = self.tables.get(table) else { return };
+        let root = match index {
+            None => Some(entry.primary_index_root),
+            Some(IndexTree::Secondary(c)) => entry.indexes.iter().find(|i| i.column_name == c).map(|i| i.root_page_id),
+            Some(IndexTree::FullText(c)) => entry.fulltext_indexes.iter().find(|i| i.column_name == c).map(|i| i.root_page_id),
+        };
+        if let Some(root) = root {
+            self.roots.insert((table.to_string(), index.map(|i| i.owned())), Arc::new(AtomicU32::new(root)));
         }
     }
 
@@ -250,6 +278,8 @@ impl Catalog {
         self.persist_or_undo(|c| {
             c.tables.remove(&name);
         })?;
+        // A brand-new tree gets a brand-new cell, whatever a dead tree left under the key.
+        self.install_fresh_cell(&name, None);
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -329,6 +359,7 @@ impl Catalog {
                 e.indexes.pop();
             }
         })?;
+        self.install_fresh_cell(&table, Some(IndexTree::Secondary(column)));
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -402,6 +433,7 @@ impl Catalog {
                 e.fulltext_indexes.pop();
             }
         })?;
+        self.install_fresh_cell(&table, Some(IndexTree::FullText(column)));
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();

@@ -713,7 +713,9 @@ impl Catalog {
     /// back here, in the same `persist` as the schema, rather than through
     /// [`Catalog::update_primary_root`] — two persists would be two chances to store one half of an
     /// alteration. It is stored into the primary index's SHARED cell here too (D214), because
-    /// every statement descends from the cell, not the record (D53).
+    /// every statement descends from the cell, not the record (D53). That store happens only if the
+    /// cell still names the root the rewrite started from: a cell already ahead of a lagging record
+    /// is left alone (F1 of the D208 review).
     ///
     /// **Nothing in here may be fallible except the `persist` itself**, and that is a property to
     /// preserve rather than a coincidence. This function runs after `rewrite_heap` has converted
@@ -732,18 +734,34 @@ impl Catalog {
             stats.columns = columns;
         }
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
+        // The root the rewrite STARTED from, read before the record is overwritten. It is the
+        // plan's root: `plan_alters` read this same record, and nothing writes the catalog between
+        // planning and applying (`alter_table` calls one after the other; the merge path only reads
+        // in between).
+        let planned = entry.primary_index_root;
         entry.schema = new_schema;
         entry.primary_index_root = primary_root_now;
         let shape = shape_of(&entry.schema);
-        // D214 — the SHARED cell as well as the record. `commit_rewrite` repoints rows through a
-        // PRIVATE handle, so nothing else tells the cell where the tree now is, and a cell left on
-        // the old root would have every later statement descend a tree the record no longer names.
-        // Stored beside the record, before the persist: both describe where the tree IS, which the
-        // rewrite has already made true whether or not the persist succeeds. It is a store into an
-        // existing `Arc` (holders follow it, as D205's rebuild does) and it is infallible, so the
-        // persist is still the one fallible step and the only persist.
+        // D214 — the SHARED cell follows a root the rewrite moved. `commit_rewrite` repoints rows
+        // through a PRIVATE handle, so nothing else would tell the cell.
+        //
+        // ⛔ **Only if the cell still names the root the rewrite started from (F1 of the D208
+        // review).** The record can LAG the cell. An INSERT whose primary upsert split the root has
+        // already stored the new root into the cell, and it reaches `sync_roots` only after its
+        // index maintenance. If that fails, the record stays behind, and this ALTER was planned
+        // from it. The first D214 stored unconditionally, and so pinned every handle to that stale
+        // root: `sync_roots` then saw cell == record and never repaired it, and a latched write
+        // from a stale root (no right walk) puts keys in the wrong leaf.
+        //
+        // One compare-exchange covers every case:
+        // - the root moved and the cell is where the rewrite found it: it follows;
+        // - the cell is ahead: it is left alone;
+        // - the root did not move: the swap is `planned -> planned`, which changes nothing.
+        //
+        // It sits beside the record and before the persist, because both describe where the tree
+        // IS. It is infallible, so the persist is still the one fallible step and the only persist.
         if let Some(cell) = self.root_cell(table, None) {
-            cell.store(primary_root_now, Ordering::Release);
+            let _ = cell.compare_exchange(planned, primary_root_now, Ordering::AcqRel, Ordering::Acquire);
         }
         self.persist()?;
         Ok(shape)
@@ -1132,9 +1150,11 @@ mod tests {
     /// `upsert`s a key the tree already holds (its `search` guard), with a fixed-size `RecordId`,
     /// and `BPlusTreeManager::try_write_without_split` documents that a same-size replacement
     /// cannot reach a split (READ). The three shapes `commit_rewrite`'s own comment lists never
-    /// moved it. So this pins `finish`'s contract rather than a reachable SQL schedule: whatever
-    /// root the rewrite hands back, the record and the cell every statement descends from (D53)
-    /// must agree afterwards, and the cell must still be the same `Arc`.
+    /// moved it. So this pins `finish`'s contract rather than a reachable SQL schedule: when the
+    /// rewrite hands back a root that moved, and the cell every statement descends from (D53) still
+    /// names the root the rewrite started from, the cell follows it, and it is still the same `Arc`.
+    /// A cell that is already AHEAD of the record is left alone: that is the next test, F1 of the
+    /// D208 review.
     ///
     /// FAILS before D214's fix (INFERRED) at the cell == record assertion: `finish` wrote the
     /// record only, and the cell kept naming the pre-ALTER tree.
