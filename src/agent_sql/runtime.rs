@@ -1446,7 +1446,8 @@ impl AgentRuntime {
         self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, FerroError> {
-        Ok(self.with_provenance_store(Arc::new(crate::provenance::DurableProvenanceStore::open(path)?)))
+        // One store per file per process (D250 review 4's N4).
+        Ok(self.with_provenance_store(crate::provenance::DurableProvenanceStore::shared(path)?))
     }
 
     /// Install a provenance store someone else opened: `wal::recovery::OpenedDatabase::attach_runtime`
@@ -2020,14 +2021,12 @@ impl AgentRuntime {
     /// record answering "which agent wrote this", which is criterion 9, and it outliving the row is
     /// the point; a dropped *table* is different, because the name can come back attached to
     /// different data.
-    pub fn forget_table(&self, table: &str) {
-        let tbl = table_id(table).0;
-        // The signature returns `()` and a durable store's append can fail, but the failure is not
-        // swallowed: `DurableProvenanceStore::forget_table` poisons ITSELF when the record does not
-        // reach the file, so every later call through that store refuses rather than reporting a
-        // forget a reopen would silently undo. Discarding the value here loses nothing that is not
-        // already recorded somewhere louder.
-        let _ = self.prov_store.forget_table(tbl);
+    pub fn forget_table(&self, table: &str) -> Result<(), FerroError> {
+        // D250 review 4's N1: the store's answer is returned, not discarded. A durable store that
+        // could not append its FORGET has already poisoned ITSELF, and the executor's DROP runs this
+        // inside its unit (`TxnManager::drop_checkpointed`), where the `Err` poisons the log too, so the
+        // next open forgets from the durable `DropTable` instead of a reopen silently undoing this.
+        self.prov_store.forget_table(table_id(table).0)
     }
 
     // ---- reads -----------------------------------------------------------------------------

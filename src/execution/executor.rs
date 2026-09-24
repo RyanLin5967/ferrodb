@@ -353,17 +353,24 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 time_travel_root: tt_root,
                 columns: Vec::new(),
             };
-            txn.drop_checkpointed(record, || catalog.drop_table(&table))?;
             // B9: the agent layer keys row authorship and version stamps by a hash of the table
             // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
             // would attribute the new table's rows to an agent that never touched it. See
             // `AgentRuntime::forget_table`.
             //
-            // AFTER the barrier's `?`, deliberately: a refused DROP must not forget a table that is
-            // still there. B9's own `txn.checkpoint()?` is dropped rather than kept — the wrapper
-            // above already checkpoints (`drop_checkpointed`), and a second
-            // one would take a lock the first still holds.
-            session.runtime.forget_table(&table);
+            // **D250 review 4's N1 (lane §3.17): INSIDE the unit, right after the drop and before any
+            // fallible step of the barrier** (its checkpoint's flush, sync and truncation, the replays,
+            // the re-append). At `43864d7` it ran after the barrier's `?`, so an `Err` from the
+            // checkpoint, with the table already gone and the log writable, skipped it, and a table
+            // later created under the name inherited the dropped one's authors. A refused DROP never
+            // reaches `f`, so a table that is still there is never forgotten. A failed durable forget is
+            // `f`'s `Err`, which poisons the log, and the next open forgets from the durable
+            // `DropTable`. B9's own `txn.checkpoint()?` is dropped rather than kept: the wrapper already
+            // checkpoints, and a second one would take a lock the first still holds.
+            txn.drop_checkpointed(record, || {
+                catalog.drop_table(&table)?;
+                session.runtime.forget_table(&table)
+            })?;
             return Ok(Outcome::Ok)
         }
         // B11 — the column-level half of DDL. Same shape as `CreateTable` and `DropTable` above,

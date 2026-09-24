@@ -426,8 +426,9 @@ pub struct OpenedDatabase {
     /// store. PRIVATE for the same reason.
     dropped_tables: Vec<String>,
     /// The database's provenance file, when this open opened it to forget `dropped_tables` in it
-    /// (D250 review 3's A). Handed to the runtime by [`OpenedDatabase::attach_runtime`], so the file
-    /// has one owner per process.
+    /// (D250 review 3's A). Handed to the runtime by [`OpenedDatabase::attach_runtime`]. Held here so
+    /// the store stays live from the open to the attach: [`DurableProvenanceStore::shared`] keeps one
+    /// store per file per process only while someone holds it (D250 review 4's N4).
     provenance: Option<Arc<DurableProvenanceStore>>,
     /// Where that file lives: [`provenance_path`] of the database.
     provenance_path: PathBuf,
@@ -443,8 +444,9 @@ pub fn provenance_path(db_path: &Path) -> PathBuf {
 }
 
 /// DROPs whose table's authors `open_recovered` could not forget in the provenance file, since
-/// process start (D250 review 3's A). The store poisons itself on such a failure, so every later
-/// provenance call refuses; this counts and the open prints it.
+/// process start (D250 review 3's A). Such an open is refused before its rebuild and checkpoint, so the
+/// log keeps the `DropTable` and the next open retries (D250 review 4's N2); this counts and the open
+/// prints it.
 pub static PROVENANCE_FORGET_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PROVENANCE_FORGET_FAILURES`].
@@ -470,9 +472,9 @@ impl OpenedDatabase {
     ///
     /// - [`ProvenanceBacking::Durable`] installs the database's provenance file.
     ///   [`open_recovered`] forgot the dropped tables in it BEFORE its checkpoint truncated their
-    ///   records (D250 review 3's A), so nothing is left to do here but hand it over. The file is
-    ///   opened once per process: the open's store, or opened here when the open had nothing to
-    ///   forget.
+    ///   records (D250 review 3's A), so nothing is left to do here but hand it over. One store per
+    ///   file per process ([`DurableProvenanceStore::shared`], D250 review 4's N4): the open's store,
+    ///   or the live one another attach already holds, or opened here.
     /// - [`ProvenanceBacking::InMemory`] keeps the runtime's own store and forgets the dropped tables
     ///   in it, which is a stated no-op in production (pgserver's store starts empty).
     ///
@@ -488,13 +490,13 @@ impl OpenedDatabase {
             ProvenanceBacking::Durable => {
                 let store = match &self.provenance {
                     Some(store) => store.clone(),
-                    None => Arc::new(DurableProvenanceStore::open(&self.provenance_path)?),
+                    None => DurableProvenanceStore::shared(&self.provenance_path)?,
                 };
                 runtime.with_provenance_store(store)
             }
             ProvenanceBacking::InMemory => {
                 for table in &self.dropped_tables {
-                    runtime.forget_table(table);
+                    runtime.forget_table(table)?;
                 }
                 runtime
             }
@@ -686,10 +688,19 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // and the forget is idempotent: nothing is re-declared, and no later open is left to finish it.
     // `dd939ab` re-declared each such `DropTable` after the checkpoint instead, and `recover` counts
     // any non-empty log as recovered, so every open of a process that never truncated after its open
-    // (pgserver always, a killed CLI) rebuilt every index. The same record covers a crash between
-    // the executor's DROP and its own forget (B9): `ddl_unit` re-appends the DROP after its
-    // truncation, for the change feed, and the next open finds it. The store is handed to the
-    // runtime through `attach_runtime`, so the file is opened once per process.
+    // (pgserver always, a killed CLI) rebuilt every index. The executor's own forget (B9) runs inside
+    // the DROP's unit, before its barrier's truncation (D250 review 4's N1): so either it has run, or
+    // the log still holds the `DropTable` and this finds it. The store is handed to the runtime
+    // through `attach_runtime`, one store per file per process (`DurableProvenanceStore::shared`).
+    //
+    // **D250 review 4's N2: a forget that fails REFUSES the open, here, before the rebuild and the
+    // checkpoint.** Counted and continued (as at `43864d7`), the open's checkpoint truncated the
+    // `DropTable`, the only input from which a later open computes what to forget; and a process that
+    // went on could truncate it at its next checkpoint, or re-create the table under the name, which
+    // takes it out of that computation. Refused here, nothing has run past `recover`, the same state a
+    // failed `DurableProvenanceStore::open` leaves, and every later open retries the forget. Stated
+    // cost: while the file cannot be appended, no entry point opens a database whose retained log holds
+    // a DROP, pgserver included (review 4's N3).
     let mut dropped_tables: Vec<String> = logged_drops
         .into_iter()
         .filter(|(table, ..)| catalog.get_table(table).is_none())
@@ -701,19 +712,19 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let provenance = if dropped_tables.is_empty() || !provenance_path.exists() {
         None
     } else {
-        let store = Arc::new(DurableProvenanceStore::open(&provenance_path)?);
+        let store = DurableProvenanceStore::shared(&provenance_path)?;
         inject_open_forget_failure(&store, &provenance_path);
         for table in &dropped_tables {
             if let Err(e) = store.forget_table(table_id(table).0) {
                 use std::io::Write;
                 PROVENANCE_FORGET_FAILURES.fetch_add(1, Ordering::Relaxed);
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ferrodb: the DROP of `{table}` is in the log, but its authors could not be forgotten in {} ({e}); \
-                     the provenance store now refuses every call, and a table created under the name would \
-                     inherit them",
+                let why = format!(
+                    "the DROP of `{table}` is in the log, but its authors could not be forgotten in {} ({e}); \
+                     the open is refused and the log kept, so the next open retries the forget",
                     provenance_path.display()
                 );
+                let _ = writeln!(std::io::stderr(), "ferrodb: {why}");
+                return Err(FerroError::Provenance(format!("refusing to open {}: {why}", db_path.display())));
             }
         }
         Some(store)
@@ -2490,6 +2501,66 @@ use super::*;
             store.row_author(table_id("t").0, 1).unwrap(),
             ProvId::NONE,
             "the dropped `t`'s authors survived the open that retried the forget"
+        );
+        assert_ne!(
+            store.row_author(table_id("keep").0, 1).unwrap(),
+            ProvId::NONE,
+            "the retried forget took the authors of `keep`, which was never dropped"
+        );
+    }
+
+    /// **D250 review 4's N1, its durable half (lane §3.17 test 23, a guard added with the fix, because it
+    /// needs `DurableProvenanceStore::shared`): a DROP whose durable forget fails poisons the log, and the
+    /// next open forgets.** The forget runs inside the DROP's unit, so its failure is the unit's `Err`:
+    /// the log is poisoned, and the next open completes the DROP and forgets the table in the file
+    /// itself. Its discrimination is FGEm, which discards the forget's answer.
+    #[test]
+    fn a_drop_whose_durable_forget_fails_poisons_the_log_and_the_next_open_forgets() {
+        use crate::{agent_sql::runtime::table_id, branch::types::BranchId, provenance::{ProvId, RunEntity}};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("drop_forget_fails.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let runtime = o.attach_runtime(AgentRuntime::new(), ProvenanceBacking::Durable).unwrap();
+            let mut session = Session::with_runtime(runtime.clone());
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (1, 10);",
+            ] {
+                run_sql_in(sql, &mut o.catalog, &o.bp, &o.txn, &mut session).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+            let author = runtime.provenance().intern(&run).unwrap();
+            for table in ["t", "keep"] {
+                runtime.provenance().stamp_row(table_id(table).0, 1, author).unwrap();
+            }
+            let store = DurableProvenanceStore::shared(provenance_path(&db)).unwrap();
+            assert!(
+                std::ptr::eq(Arc::as_ptr(&store) as *const u8, Arc::as_ptr(runtime.provenance()) as *const u8),
+                "premise failed: the runtime's store is not the file's one store, so arming it arms nothing the DROP uses"
+            );
+            store.fail_next_append.store(true, Ordering::SeqCst);
+            let e = run_sql_in("DROP TABLE t;", &mut o.catalog, &o.bp, &o.txn, &mut session)
+                .expect_err("the DROP answered Ok although its durable forget failed");
+            assert!(
+                o.wal.poisoned().is_some(),
+                "a DROP whose durable forget failed left the log writable ({e}): the process can go on, and truncate the \
+                 DropTable the next open needs to retry the forget"
+            );
+            // The crash.
+        }
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).expect("the open after the DROP whose forget failed");
+            assert!(o.catalog.get_table("t").is_none(), "premise failed: `t` came back");
+        }
+        let store = DurableProvenanceStore::open(provenance_path(&db)).unwrap();
+        assert_eq!(
+            store.row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "the dropped `t`'s authors survived: the DROP's failed forget was not retried by the next open"
         );
         assert_ne!(
             store.row_author(table_id("keep").0, 1).unwrap(),
