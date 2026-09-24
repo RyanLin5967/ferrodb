@@ -73,7 +73,7 @@ fn declares_agent(out: &Decoded, agent: &str) -> bool {
 }
 
 #[test]
-fn a_restarted_process_still_declares_its_tables_and_runs() {
+fn a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("d227.db");
 
