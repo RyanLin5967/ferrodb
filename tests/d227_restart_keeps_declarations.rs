@@ -1,5 +1,5 @@
-//! D227 — a restarted process still declares every table and every run at its checkpoints, through
-//! the shipped binary.
+//! D227 — a restarted process still declares every table at its checkpoints, through the shipped
+//! binary, and does NOT re-declare every run it ever knew.
 //!
 //! A checkpoint truncates the WAL and then re-appends what the running process retained:
 //! `replay_schema` for DDL, `replay_runs` for agent runs. Both lists were filled only by `log_ddl`
@@ -11,10 +11,21 @@
 //!
 //! The first process creates a table and merges one agent's write, and its clean exit (a checkpoint)
 //! declares both. The second process runs no DDL and no agent session. It writes one plain row and
-//! exits cleanly, and its exit checkpoint must declare both again.
+//! exits cleanly, and its exit checkpoint must declare the table again.
 //!
-//! Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the table assertion. The second
-//! process's checkpoints re-declare nothing, so its log holds no declaration at all.
+//! **The run half is the lead's decision of 09:44Z (SCALE-DESIGN "D227 run half"), not a refill.**
+//! This test first required the run to be re-declared too, and `TxnManager::declare_runs_of` did
+//! that from the provenance store. But that made every open append, and every later checkpoint
+//! re-append, a declaration for every run ever interned: one per branch ever created (new-wall
+//! audit round 2). An event's writer travels in its own transaction's `RunIdentity` binding, so a
+//! txn-0 declaration serves only `Decoded::runs` and the slot-collision check. Runs are declared as
+//! they are bound, in the process that binds them, and the assertion is now that the second
+//! process re-declares NONE of the first process's runs. That is the guard against the wall coming
+//! back.
+//!
+//! Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the table assertion (the second
+//! process's checkpoints re-declare nothing). The run assertion holds at `00f4c39`, FAILS at
+//! `6553e67` (where `declare_runs_of` re-declared every run), and holds again once it is removed.
 
 use std::io::Write;
 use std::path::Path;
@@ -62,7 +73,7 @@ fn declares_agent(out: &Decoded, agent: &str) -> bool {
 }
 
 #[test]
-fn a_restarted_process_still_declares_its_tables_and_runs() {
+fn a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("d227.db");
 
@@ -91,8 +102,9 @@ fn a_restarted_process_still_declares_its_tables_and_runs() {
         after_second.schema_changes
     );
     assert!(
-        declares_agent(&after_second, "restock-agent"),
-        "after a restart, the exit checkpoint declared no run: {:?}",
+        !declares_agent(&after_second, "restock-agent"),
+        "a process that bound no run re-declared one it never saw: an open or a checkpoint is re-declaring every \
+         run ever interned (the D227 run half, withdrawn at 09:44Z): {:?}",
         after_second.runs
     );
 }

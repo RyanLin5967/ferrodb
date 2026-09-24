@@ -1040,8 +1040,8 @@ use super::*;
     /// An old declaration of slot 1 left in the log beside a new binding of slot 1 to another actor
     /// is a range `LogicalDecoder` refuses whole. The open's checkpoint discards the old
     /// declarations before this process can bind anything. It re-declares only what this process
-    /// retained: the catalog's tables (D227), and runs once an entry point declares its store's
-    /// (`TxnManager::declare_runs_of`), which `open_recovered` alone does not.
+    /// retained: the catalog's tables (D227). Runs are declared as they are bound, in the process
+    /// that binds them (the lead's 09:44Z decision on D227's run half).
     ///
     /// Passes at `00f4c39`, where the open rebuilt and checkpointed every non-empty log, and must
     /// keep passing: an open that skipped the checkpoint without a rebuild fails it.
