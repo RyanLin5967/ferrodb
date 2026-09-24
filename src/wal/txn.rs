@@ -230,6 +230,29 @@ pub fn deferred_checkpoints() -> u64 {
     DEFERRED_CHECKPOINTS.load(Ordering::Relaxed)
 }
 
+/// What a checkpoint did with the log. Every outcome has flushed every page and synced. Review 5's
+/// F4: "a pin kept the log" must not read as "truncated", which is what a bare `Ok(0)` said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    /// The log was truncated.
+    Truncated,
+    /// The log was KEPT for this many releases still owed (F2).
+    KeptForOwed(usize),
+    /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate` keeps the log,
+    /// and answers `Ok`, while one is held).
+    KeptByPin,
+}
+
+/// DROPs whose checkpoint a WAL pin kept from truncating, since process start (review 5's F4). The
+/// dropped table's records then stay in the log. On this branch the pin refusal and its fence make
+/// this unreachable; it is counted so that, if it ever happens, it is not silent.
+pub static KEPT_LOG_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`KEPT_LOG_DROPS`].
+pub fn kept_log_drops() -> u64 {
+    KEPT_LOG_DROPS.load(Ordering::Relaxed)
+}
+
 /// Every failure counter this module keeps that is not zero, as one line, or `None` when all are
 /// zero. The CLI prints it at exit (review 2: the counters had no reader outside tests).
 ///
@@ -244,6 +267,7 @@ pub fn failure_counters_line() -> Option<String> {
         ("release mismatches", release_mismatches()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
+        ("drops that kept the log", kept_log_drops()),
     ];
     let nonzero: Vec<String> = counts.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k} {n}")).collect();
     (!nonzero.is_empty()).then(|| format!("ferrodb: {}", nonzero.join(", ")))
@@ -908,9 +932,11 @@ impl TxnManager {
         if due && !crate::cluster::is_clustered() {
             use std::io::Write;
             match self.checkpoint_keeping_owed() {
-                Ok(0) => {}
+                Ok(CheckpointOutcome::Truncated) => {}
                 // Counted where the log was kept (`checkpoint_or_keep_held`).
-                Ok(_owed) => self.commits_since_checkpoint.store(0, Ordering::SeqCst),
+                Ok(CheckpointOutcome::KeptForOwed(_) | CheckpointOutcome::KeptByPin) => {
+                    self.commits_since_checkpoint.store(0, Ordering::SeqCst)
+                }
                 Err(e) => {
                     DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst);
@@ -1191,6 +1217,8 @@ impl TxnManager {
         use std::io::Write;
         match self.release_one(txn_id, &r) {
             Ok(page) => {
+                // Review 5's F3: released after all, so no longer an unrecorded mismatch.
+                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
                 self.tell_directory(&r, &page);
                 false
             }
@@ -1233,6 +1261,9 @@ impl TxnManager {
                 false
             }
             Err(ReleaseError::Retry(e)) => {
+                // Review 5's F3 (the lead's decision): a retryable failure is not a mismatch now, so
+                // the entry leaves `unrecorded`; the release stays owed.
+                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
                 if first {
                     RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
                     let _ = writeln!(
@@ -1345,7 +1376,15 @@ impl TxnManager {
         for w in writes.into_iter().rev() {
             let tree = BPlusTreeManager::<Value, RecordId>::open_shared(w.root, self.bp.clone());
             let undone = match w.prev {
-                // Replacing a present key never grows the leaf, so this cannot split and move the root.
+                // Replacing a present key never grows the leaf, so it does not split, EXCEPT on a
+                // leaf already exactly full (4069 bytes of entries), which the count split
+                // (`BPlusTreeLeafPage::split`, before D225) can leave. The same-size image is then
+                // full, `try_write_without_split` answers `Ok(false)`, and the upsert splits once,
+                // which can cascade and move the root. `open_shared` publishes a moved root through
+                // the cell, so the move is safe; before D225 the split is the count split, with
+                // D225's own defect. After D225 (`d225-byte-split`, its review 5 R6), a legacy full
+                // leaf holding an entry over `MAX_ENTRY_BYTES` can find no cut, and the upsert
+                // refuses: reported below as an undo failure (`first_err`, then `mark_indexes_stale`).
                 Some(rid) => tree.upsert(w.key, rid),
                 // A net removal, which nothing did before D202. `delete` never rebalances
                 // (`handle_underflow` has no caller) and the descent already walks past an
@@ -1597,7 +1636,18 @@ impl TxnManager {
         if !frees.is_empty() {
             self.discard_releases_on(frees);
         }
-        self.checkpoint_or_keep_held(false)?;
+        let outcome = self.checkpoint_or_keep_held(false)?;
+        if !frees.is_empty() && outcome == CheckpointOutcome::KeptByPin {
+            // Review 5's F4. Unreachable on this branch (the pin refusal and the fence run first), and
+            // counted and printed so that it is not silent if that ever changes.
+            use std::io::Write;
+            KEPT_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in \
+                 the log, and the next open would replay them onto pages the DROP freed"
+            );
+        }
         Ok(out)
     }
 
@@ -1644,8 +1694,8 @@ impl TxnManager {
     /// after it flushed. Takes no `att`; `checkpoint` asks it first.
     fn checkpoint_locked(&self) -> Result<(), FerroError> {
         match self.checkpoint_or_keep_locked(true)? {
-            0 => Ok(()),
-            owed => Err(FerroError::Wal(format!(
+            CheckpointOutcome::Truncated | CheckpointOutcome::KeptByPin => Ok(()),
+            CheckpointOutcome::KeptForOwed(owed) => Err(FerroError::Wal(format!(
                 "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
                  truncating the log would lose the record of the bytes they hold; every page was \
                  flushed and the log is kept, and the next checkpoint retries them"
@@ -1653,11 +1703,13 @@ impl TxnManager {
         }
     }
 
-    /// A checkpoint that answers how many releases are still owed instead of refusing: `Ok(0)` when
-    /// the log was truncated, `Ok(n)` when every page was flushed and the log KEPT for `n` owed
-    /// releases, retried first. The automatic trigger uses it; `checkpoint` turns `n > 0` into a
-    /// refusal. Refuses while a transaction is open, as `checkpoint` does.
-    pub fn checkpoint_keeping_owed(&self) -> Result<usize, FerroError> {
+    /// A checkpoint that answers what it did with the log instead of refusing (a [`CheckpointOutcome`]):
+    /// `Truncated`, `KeptForOwed(n)` when every page was flushed and the log KEPT for `n` owed
+    /// releases (retried first), or `KeptByPin` when a WAL pin cancelled the truncation. The automatic
+    /// trigger uses it; `checkpoint` turns `KeptForOwed` into a refusal. Refuses while a transaction
+    /// is open, as `checkpoint` does. (It answered `Ok(0)` for both "truncated" and "kept by a pin"
+    /// until review 5's F4.)
+    pub fn checkpoint_keeping_owed(&self) -> Result<CheckpointOutcome, FerroError> {
         if !self.att_read().is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
@@ -1669,7 +1721,7 @@ impl TxnManager {
     /// `finish_releases` has just tried every owed release, so a retry here would only put page reads
     /// and log writes between those frees and the sync. The window then holds what `9aa6968`'s
     /// checkpoint held: the log flush, the pool flush and the sync (lane §21.2).
-    pub fn checkpoint_after_frees(&self) -> Result<usize, FerroError> {
+    pub fn checkpoint_after_frees(&self) -> Result<CheckpointOutcome, FerroError> {
         if !self.att_read().is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
@@ -1683,7 +1735,7 @@ impl TxnManager {
     }
 
     /// [`TxnManager::checkpoint_or_keep_held`], taking `release_retry` for it.
-    fn checkpoint_or_keep_locked(&self, retry: bool) -> Result<usize, FerroError> {
+    fn checkpoint_or_keep_locked(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
         let _retry = self.release_retry.lock().unwrap();
         self.checkpoint_or_keep_held(retry)
     }
@@ -1702,7 +1754,7 @@ impl TxnManager {
     /// A kept log is counted in `DEFERRED_CHECKPOINTS`. The stderr line is printed only when the
     /// log-keeping state CHANGES: once when a checkpoint first keeps the log, and once when one
     /// truncates again (review 3's decision 3).
-    fn checkpoint_or_keep_held(&self, retry: bool) -> Result<usize, FerroError> {
+    fn checkpoint_or_keep_held(&self, retry: bool) -> Result<CheckpointOutcome, FerroError> {
         use std::io::Write;
         let owed = if retry { self.retry_pending_releases_held() } else { self.owed_releases() };
         self.wal.flush()?;
@@ -1721,7 +1773,7 @@ impl TxnManager {
                     checkpoint_interval()
                 );
             }
-            return Ok(owed);
+            return Ok(CheckpointOutcome::KeptForOwed(owed));
         }
         // Read before `truncate`, which keeps the log, and answers `Ok`, while a WAL pin is below its
         // end (review 4's finding 5).
@@ -1736,9 +1788,11 @@ impl TxnManager {
             // second copy of every declaration into the kept log), the owed state is not "settled",
             // and it is counted as the deferral it is. **Residual, stated:** an empty log that gets an
             // append between the reads above and `truncate` can be misread as truncated;
-            // `truncate` does not report its decision.
+            // `truncate` does not report its decision. The log IS empty after every restart until the
+            // first DDL (review 5's F5), and `consensus/snapshot.rs` detects the same fact with the
+            // opposite residual: D216's `Truncation` result is to replace both.
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-            return Ok(0);
+            return Ok(CheckpointOutcome::KeptByPin);
         }
         if self.keeping_log.swap(false, Ordering::SeqCst) {
             let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");
@@ -1749,7 +1803,7 @@ impl TxnManager {
         // And every run declaration, for the same reason: a reader starting at the new base would
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
-        Ok(0)
+        Ok(CheckpointOutcome::Truncated)
     }
 
     /// The transaction's snapshot, which every read and write inside it goes through, so this is also
@@ -1970,6 +2024,30 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
     let mut marker = wal_path.as_os_str().to_os_string();
     marker.push(".stale-indexes");
     PathBuf::from(marker)
+}
+
+/// **Review 5's F6: a fresh log starts a fresh quarantine.** The dedupe key (`append_once_durably`)
+/// has no database incarnation, and a database created again at the same path reissues transaction
+/// ids, so an earlier database's quarantine would make a colliding record of the new one look
+/// already recorded. The earlier file is moved aside to `<quarantine>.before-<nanoseconds>`, not
+/// deleted: it is evidence. `WalManager::with_storage` calls this when it writes a fresh log's
+/// header. Stated: a database restored together with its non-empty log keeps its quarantine, which is
+/// that incarnation's own.
+pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
+    let current = release_quarantine(wal_path);
+    match std::fs::symlink_metadata(&current) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut aside = current.as_os_str().to_os_string();
+    aside.push(format!(".before-{nanos}"));
+    std::fs::rename(&current, PathBuf::from(aside))?;
+    sync_directory_of(&current)
 }
 
 /// Where a release that can never succeed is recorded before it is dropped: beside the log,
@@ -3181,6 +3259,78 @@ use super::*;
         bp.unpin_page(r.page_id, true);
         txn.commit(t2).expect("a commit whose release is a mismatch was reported as failed");
         (bp, wal, txn, t2, r, quarantine, dir)
+    }
+
+    /// **Review 5's F4: a checkpoint that a pin kept answers `KeptByPin`, not "truncated".** Until
+    /// then it answered `Ok(0)` for both, so a DROP reached the kept-log state with the detector's
+    /// answer in hand and threw it away. Red only under a mutant: the type is new.
+    #[test]
+    fn a_checkpoint_that_a_pin_kept_answers_kept_by_pin() {
+        let (_bp, wal, txn, _catalog, _owned, _dir) = table_to_drop();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let _pin = wal.pin(base).expect("pin the log at its base");
+        assert!(base < wal.next_lsn.load(Ordering::SeqCst), "premise: the pin is not below the log's end");
+        assert_eq!(
+            txn.checkpoint_keeping_owed().expect("a checkpoint under a pin failed"),
+            CheckpointOutcome::KeptByPin,
+            "a checkpoint that a pin kept answered as if it had truncated"
+        );
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+    }
+
+    /// **Review 5's F3: a mismatch that is later released does not keep refusing the DROP of its
+    /// table.** An unrecorded mismatch stays owed and is retried at every checkpoint. If its slot
+    /// later becomes free (its live tuple deleted, committed and released), the retry releases it and
+    /// the `Ok` arm drops it. At `246f14f` the entry stayed in `unrecorded`, so every DROP of the table
+    /// was refused, for the rest of the process, with a message saying a mismatch could not be written.
+    #[test]
+    fn a_mismatch_that_later_releases_does_not_block_a_drop() {
+        let (bp, _wal, txn, _t2, r, quarantine, _dir) = committed_mismatch(true);
+        assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
+        let frame_i = bp.fetch_page(r.page_id).unwrap();
+        {
+            let mut frame = bp.frame_write(frame_i);
+            let mut page = Page::deserialize(frame.data).unwrap();
+            page.slot_arr[r.slot as usize] = crate::storage::heap_page::SlotEntry { offset: 0, length: 0 };
+            frame.data = page.serialize().unwrap();
+        }
+        bp.unpin_page(r.page_id, true);
+        assert_eq!(txn.retry_pending_releases(), 0, "premise: the retry did not release the slot, which is free now");
+        std::fs::remove_dir(&quarantine).unwrap();
+        let ran = std::cell::Cell::new(false);
+        txn.drop_checkpointed(&[r.dir_root], || {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("a mismatch that has since been released still refuses the DROP of its table: {e}"));
+        assert!(ran.get(), "the DROP answered Ok without running its mutation");
+    }
+
+    /// **Review 5's F6: a fresh log starts a fresh quarantine.** The dedupe key (`txn=`, `dir_root=`,
+    /// `page=`, `slot=`) has no database incarnation, and a database created again at the same path
+    /// reissues transaction ids. So a quarantine left by the earlier database would make a colliding
+    /// record of the new one look already recorded. The earlier file is moved aside, not deleted: it
+    /// is evidence.
+    #[test]
+    fn a_fresh_log_starts_a_fresh_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("fresh.wal");
+        let quarantine = dir.path().join("fresh.wal.release-quarantine");
+        let old = "txn=5 dir_root=3 page=7 slot=1 found=live error=an earlier database's mismatch\n";
+        std::fs::write(&quarantine, old).unwrap();
+        let _wal = WalManager::new(wal_path).unwrap();
+        assert!(
+            !quarantine.exists(),
+            "a fresh log kept an earlier database's quarantine at its path, so a colliding record of the new \
+             database would be taken as already recorded"
+        );
+        let aside: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("fresh.wal.release-quarantine.before-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the earlier quarantine was not moved aside once: {aside:?}");
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), old, "the earlier quarantine's evidence was not kept");
     }
 
     /// **Review 4's finding 3: a mismatch is recorded once, however often it is found.** A dropped
