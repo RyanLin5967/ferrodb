@@ -206,13 +206,29 @@ impl LogTail {
         Some(self.digests[(round - self.base - 1) as usize])
     }
 
-    fn slice_from(&self, round: Round, limit: usize) -> Vec<Entry> {
+    /// Entries from `round` upward: at most `limit` of them, and no more than `max_bytes` of them
+    /// as the wire encodes them (`transport::entry_wire_len`).
+    ///
+    /// **Always at least one**, even if it alone would exceed `max_bytes`. An empty batch would
+    /// read as a heartbeat and the peer would never advance; sending the entry at least puts the
+    /// refusal, if there is one, where the encoder names it. For an entry the log admitted, it never
+    /// binds: `MAX_ENTRY_BYTES` leaves the `Append` envelope and the MAC about 4 KiB of room.
+    fn slice_from(&self, round: Round, limit: usize, max_bytes: usize) -> Vec<Entry> {
         if round <= self.base || round > self.last_round() {
             return Vec::new();
         }
         let from = (round - self.base - 1) as usize;
-        let to = (from + limit).min(self.entries.len());
-        self.entries[from..to].to_vec()
+        let mut taken: Vec<Entry> = Vec::new();
+        let mut bytes = 0usize;
+        for e in self.entries[from..].iter().take(limit) {
+            let len = super::transport::entry_wire_len(e);
+            if !taken.is_empty() && bytes.saturating_add(len) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(len);
+            taken.push(e.clone());
+        }
+        taken
     }
 
     fn push(&mut self, e: Entry) {
@@ -609,10 +625,22 @@ impl Consensus {
         self.tail()?.digest_at(round)
     }
 
-    /// Entries from `round` upward, capped at [`MAX_ENTRIES_PER_APPEND`].
+    /// Entries from `round` upward, capped at [`MAX_ENTRIES_PER_APPEND`] **and** at what one
+    /// `Append` frame can carry.
+    ///
+    /// The byte cap is D220. A count alone is not a bound on a frame: one entry may be up to
+    /// `MAX_ENTRY_BYTES`, so 64 of them made an `Append` the encoder refused. `node.rs` drops a
+    /// refused send, and the next heartbeat rebuilt the same batch, so a follower that far behind
+    /// never caught up and no meter moved. The budget is the encoder's own
+    /// (`transport::append_entries_budget`), signed frames included, so it cannot drift from what
+    /// the encoder will accept.
     pub(crate) fn entries_from(&self, round: Round) -> Vec<Entry> {
         match self.tail() {
-            Some(t) => t.slice_from(round, MAX_ENTRIES_PER_APPEND),
+            Some(t) => t.slice_from(
+                round,
+                MAX_ENTRIES_PER_APPEND,
+                super::transport::append_entries_budget(),
+            ),
             None => Vec::new(),
         }
     }

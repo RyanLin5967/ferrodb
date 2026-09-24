@@ -177,6 +177,22 @@ pub fn encode(m: &Message) -> Result<Vec<u8>, FerroError> {
 /// term being in there is the point of the row: a tag over anything less would leave the one field
 /// an attacker wants to change outside it.
 pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroError> {
+    let body = message_body(m)?;
+    let body = match key {
+        Some(k) => signing::sign_frame(k, &body)?,
+        None => body,
+    };
+
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.push(CONSENSUS_TAG);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// The unsigned frame body for `m` — `from | to | term | kind | fields` — refused over the frame
+/// limit. Everything [`encode_signed`] frames, and what [`append_entries_budget`] measures.
+fn message_body(m: &Message) -> Result<Vec<u8>, FerroError> {
     let mut body = Vec::new();
     put_u32(&mut body, m.from.0);
     put_u32(&mut body, m.to.0);
@@ -188,17 +204,44 @@ pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroErr
     if body.len() > MAX_FRAME_BYTES {
         return Err(too_big(body.len()));
     }
+    Ok(body)
+}
 
-    let body = match key {
-        Some(k) => signing::sign_frame(k, &body)?,
-        None => body,
+/// How many bytes of entries one `Append` may carry and still be framed, **signed or not**.
+///
+/// For the leader's batching (D220). An `Append` used to be capped by entry count alone, while one
+/// entry may be up to `log::MAX_ENTRY_BYTES`, so 64 large entries made an `Append` this encoder
+/// refused on every heartbeat — and `node.rs` discards a refused send, so that follower was stuck
+/// with no meter moving.
+///
+/// Taken from the encoder rather than recomputed beside it: the frame limit, less the body of an
+/// `Append` that carries no entries (encoded here to measure it), less the MAC a signing transport
+/// adds. The state machine that builds a batch cannot know whether its transport signs, so it
+/// always leaves room for one.
+pub(crate) fn append_entries_budget() -> usize {
+    let empty = Message {
+        from: NodeId(0),
+        to: NodeId(0),
+        term: 0,
+        body: Body::Append { prev_round: 0, prev_term: 0, entries: Vec::new(), commit: 0 },
     };
+    // Every field around the entries is fixed-width, so these values do not change the length.
+    // An empty `Append` cannot fail to encode; if it somehow did, a zero budget still sends one
+    // entry per `Append` (see `replicate.rs`), which degrades rather than stalls.
+    message_body(&empty)
+        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))
+}
 
-    let mut out = Vec::with_capacity(body.len() + 5);
-    out.push(CONSENSUS_TAG);
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
+/// The bytes the encoder writes for one entry inside an `Append`, measured by writing it.
+///
+/// Measured rather than computed so that it cannot drift from [`encode_entry`]. An entry the encoder
+/// cannot write at all reports `usize::MAX`: it fits nothing, which is the truth.
+pub(crate) fn entry_wire_len(e: &Entry) -> usize {
+    let mut b = Vec::new();
+    match encode_entry(&mut b, e) {
+        Ok(()) => b.len(),
+        Err(_) => usize::MAX,
+    }
 }
 
 fn too_big(n: usize) -> FerroError {
