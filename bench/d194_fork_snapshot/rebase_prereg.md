@@ -732,3 +732,149 @@ M19–M22 fail where Amendment 8 says they do. It left one Low finding and three
 - `cargo test --lib version_history`: **9**.
 - Run of record at default QoS: **58 result lines, 2165 passed (2152 + 13), 1 failed, 2 ignored**.
 - Under `-b`: 2164 / 2.
+
+## Amendment 10 (append-only; written BEFORE the tests and code it describes): the D194 cost review, and the lead's decisions
+
+`frontier/d194_cost_review.md` @ `9ab4e83` found term 1 **narrowed, not closed**. The lead verified the
+reasons at `4436e7f`:
+- `record_applied` runs before `seal`, so the merging branch's own pin keeps every superseded entry it
+  touches.
+- A child inherits its parent's pin.
+- Entries are freed only when the OLDEST pin rises.
+- `drain` never returns capacity.
+
+So an old live pin (W1), or a chain that inherits one pin (W2), makes the history grow with merges.
+The flat SQL test passed only because it holds no live pin. The lead's decisions 1–7 are implemented
+as follows.
+
+### 1. Retention is O(rows × live pins), with no merge term
+
+- **Invariant.** A retained entry `h` that is not a row's newest is kept only while a LIVE pin lies in
+  `[h, s)`, where `s` is the version that superseded it.
+- **Index.** `retention.readers: BTreeMap<h, (tbl, row, s)>` is keyed by the entry's value.
+  `begin_ts` values are unique, because every op gets its own seq.
+- **At supersession** (in sequence order), `h` gets an entry in `readers` if `pins.range(h..s)` is
+  non-empty. Otherwise it is popped.
+- **At ANY pin's departure** (its count reaching 0 in `drop_pin`), with `a` the next lower live pin
+  (0 if there is none):
+  - Only entries with `h ∈ (a, p]` can have lost their last reader. An entry with `h <= a` still
+    contains `a`.
+  - That range is added to `retention.pending`, and each entry in it is re-tested locally with
+    `pins.range(h..s)`. The test is exact whatever pins came or went in between, because a new pin
+    is at or above every published `begin_ts`.
+- **Freeing.** A freed entry leaves `readers` and is counted in `retention.garbage[row]`. It stays in
+  the row's `Vec` until that row's garbage reaches half the vector. The row is then compacted to its
+  newest entry plus the entries still in `readers`.
+  - A garbage entry never changes a live pin's answer: the newest version at or below a live pin is
+    always retained, and nothing retained lies between it and the pin.
+- **Removed:** the oldest-pin horizon, `trimmable`, and `reclaim_history`.
+- **Bound per row:** the newest entry, plus one entry per distinct live pin value that reads an older
+  version, plus garbage below half the row.
+- **Not bounded, stated:**
+  - Entries still waiting in `pending` (item 3).
+  - One `version_history` key per row ever published, the same class as `versions`.
+
+### 2. Capacity is returned
+
+After a compaction, and after a pop at publish, a row's `Vec` is shrunk to fit whenever
+`capacity > 2·len + 4`. The tests assert capacity as well as `len()`.
+
+### 3. The departure stall is bounded, and chunked
+
+- **Each departure** sweeps at most `DEPARTURE_SWEEP_BUDGET = 4096` entries from `pending`.
+- **Each publish** sweeps `PUBLISH_SWEEP_BUDGET = 2`.
+- A departure's own work is the entries in `(a, p]`. These are the entries the departing pin reads
+  that its lower neighbour does not, plus garbage that is still pending. Anything beyond the budget
+  waits in `pending`, whose intervals are merged, so the queue holds disjoint intervals only.
+- **Stall under the state lock:** at most 4096 × O(log n) per departure, and 2 × O(log n) per
+  publish, plus the amortised compactions.
+- **Stated:** with no publishes and no departures, pending garbage waits.
+
+### 4. `VISIBILITY_HOPS` follows D176's rule
+
+- `resolve_visibility` no longer writes a global. `resolve_visibility_counted` adds hops into a
+  per-scan `HopCount`, whose `Drop` adds ONE relaxed `fetch_add` to `VISIBILITY_HOPS`, and only when
+  the count is non-zero.
+- `SeqScan`, `IndexScan` and `SecondaryIndexScan` each hold one `HopCount`. Full-text search holds one
+  local per call.
+- The harness integers are unchanged: the flush happens when the plan root drops, inside the
+  statement.
+
+### 5. Corrections to the lane report
+
+§9.1's "memory with live pins" bullet is corrected to item 1's bound. §9.2 now states the secondary-index
+cost: a pinned range scan through a secondary index resolves visibility once per index ENTRY. That is
+O(d_ever × u_since_pin) hops per row, against O(d_ever) checks for a fresh reader. `d_ever` is the
+distinct indexed values the row ever held, and `u_since_pin` its versions since the pin.
+
+### 6. C1 is D197's gap, so D194 lands after #16
+
+A key that main deletes and reuses after a pin makes a pinned INDEX read miss the fork-time row. D197's
+chain fix (`4296723` and `52b66d6`) is in #16's lineage: `git merge-base --is-ancestor` holds for both
+against `2c10f17`.
+
+**New test:** `tests/d194_pinned_key_reuse.rs`,
+`a_pinned_index_read_after_main_deletes_and_reuses_the_key_returns_the_fork_image`.
+
+| step | on this branch alone | after merging #16 |
+|---|---|---|
+| (a) the full scan returns `(1, 10)` and not `(1, 99)` | passes | passes |
+| (b) premise: the point read took the index path (`INDEX_SCANS` delta ≥ 1) | passes | passes |
+| (c) the point read returns `[(1, 10)]` | **FAILS**, returning `[]` | passes |
+
+### 7. C2: a failed author stamp after the publish commits
+
+**Choice: record every version BEFORE any fallible call.** `record_applied` becomes two passes:
+1. The first pass is infallible, and completes all in-memory recording: `push_applied`,
+   `publish_version`, the valued writes, the capture, and the merge record.
+2. Only then does the second pass make the `stamp_row` calls. They are still under the lock, as before.
+
+The alternative, marking the merge so exact reads refuse, would add a second state to maintain.
+
+**Red test:** `record_applied_records_every_version_before_a_failed_stamp`.
+- **Setup:** an `AgentRuntime` whose `prov_store` fails its 2nd `stamp_row`, and three fresh rows, each
+  updated and merged.
+- **Before the fix:** the merge returns the injected error after commit, and row 3's version is
+  missing from `versions`, so the test FAILS.
+- **At the fix:** all three versions are recorded, and the error still surfaces.
+- **Premises:** the error is the injected one, and main shows all three updates, so the publish did
+  commit.
+
+### Tests: W1–W3 and C2 compile at `0570fe8` and at `4436e7f`; W4 is mutant-only
+
+| test | at the tests-only commit (`4436e7f` code) | at the fix |
+|---|---|---|
+| W1 `version_history_stays_flat_under_merges_beside_an_old_pin`: OLD pinned before any publish, 40 × (pinned fork, UPDATE 2 rows, MERGE) | **FAILS**: held 20 after merge 10 vs 80 after merge 40 | passes: 2 == 2 == `versions.len()`, and Σcapacity ≤ Σ(2·len + 4) at both |
+| W2 `version_history_stays_flat_under_a_chain_that_inherits_one_pin`: one merge, P0 pinned, then 40 rounds of (fork a child from the chain head, ABANDON the head, a merge from trunk) | **FAILS** the bound: held grows with the round | passes: held ≤ 3 × rows at rounds 10 and 40; the head's pin still names versions 1 and 2 |
+| W3 `version_history_frees_an_entry_when_its_last_reader_leaves_and_returns_the_capacity` (State level): 50 pins each read one version of row 1; pins 50..2 depart | **FAILS**: len 51, bound 3 | passes: len ≤ 3 with cap ≤ 2·len + 4. After pin 1 departs, len 1 with cap ≤ 6 |
+| W4 `version_history_departure_sweep_is_chunked_and_finishes_under_later_publishes` (mutant-only; names `DEPARTURE_SWEEP_BUDGET`): 4196 rows re-published under one pin, then the pin departs | n/a | passes: 100 entries left in `readers` and `pending` non-empty; after 50 publishes, both empty |
+| C2 `record_applied_records_every_version_before_a_failed_stamp` | **FAILS**: row 3 has no version | passes |
+
+**Prediction for the tests-only commit:** `cargo test --lib version_history_stays_flat_under_merges_beside version_history_stays_flat_under_a_chain version_history_frees_an_entry record_applied_records_every_version`
+is the four names, run as separate filters: **4 FAILED**. The earlier nine `version_history` tests keep their Amendment 9 outcomes
+at every commit (derived again for the new rules: B1 len 2, B2 len 1, the unrecorded and
+released tests unchanged).
+
+### Mutants
+
+| id | edit | expected |
+|---|---|---|
+| M24 | `on_pin_departed` does nothing | W1, W2 and W3 FAIL; `..._is_freed_when_the_oldest_pin_is_sealed` FAILS (len 2) |
+| M25 | the sweep frees only when the departing pin was the oldest (`below` computed but skipped whenever `a` exists) | W1 and W3 FAIL |
+| M26 | `free_entry` never compacts | W3 FAILS (len 26, then more); `..._is_freed_when_the_oldest_pin_is_sealed` FAILS (len 2) |
+| M27 | no `shrink_to_fit` | W3 FAILS on capacity (64 > 2·len + 4) |
+| M28 | `sweep_pending` ignores its budget | W4 FAILS: 0 left in `readers` after the departure |
+| M29 | `publish_version` does not sweep | W4 FAILS: 100 still in `readers` after the 50 publishes |
+| M30 | the stamps moved back inside the first pass | C2 FAILS |
+
+### Counts, replacing Amendment 9's
+
+- `cargo test --lib version_history`: **13**, all pass (W4 included).
+- Run of record at default QoS: **59 result lines** (the new `d194_pinned_key_reuse` matches the agent
+  grep), **2170 passed** (2165 + 5 lib tests), **2 failed**, **2 ignored**. The failures are:
+  - the envelope tripwire, `get_mut(` still **5**, whose State allowlist now needs `version_history`,
+    `retention` and `publishing`;
+  - `a_pinned_index_read_...`, which passes after merging #16.
+- Under `-b`: 2169 / 3.
+- The harness gains a history census (`version_history_census`: rows, entries, capacity). At every k,
+  Part 1 must print `entries == 256` and `capacity ≤ 2·entries + 4·256`, and it refuses otherwise.
