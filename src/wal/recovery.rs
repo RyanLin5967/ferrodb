@@ -1222,6 +1222,11 @@ use super::*;
 
     /// Every heap `(dir_root, page)` the retained log writes, looking through a CLR to what it redoes.
     fn heap_writes(wal: &WalManager) -> Vec<(u32, u32)> {
+        heap_writes_at(wal).into_iter().map(|(dir, page, _)| (dir, page)).collect()
+    }
+
+    /// [`heap_writes`], with the LSN of the record that writes each.
+    fn heap_writes_at(wal: &WalManager) -> Vec<(u32, u32, u64)> {
         fn heap_page(kind: &RecKind) -> Option<(u32, u32)> {
             match kind {
                 RecKind::HeapInsert { dir_root, page_id, .. }
@@ -1237,7 +1242,7 @@ use super::*;
         let end = wal.next_lsn.load(Ordering::SeqCst);
         while lsn < end {
             let (rec, next) = wal.read_record(lsn).unwrap();
-            out.extend(heap_page(&rec.kind));
+            out.extend(heap_page(&rec.kind).map(|(dir, page)| (dir, page, lsn)));
             lsn = next;
         }
         out
@@ -1786,5 +1791,98 @@ use super::*;
             author,
             "attaching the runtime forgot the authors of `keep`, which was never dropped"
         );
+    }
+
+    /// **D250, the D229 merge review's finding 3 (lane §3.8 test 13): after a pinned DROP whose freed
+    /// pages a new table took, and a crash, the new table holds only its own row.** Test 1's hazard is
+    /// a freed page that was never flushed. On the D229 tree every page is flushed before the free, so
+    /// redo would skip the dropped table's records by page LSN, skip or no skip. REUSE is the hazard
+    /// both trees share: `new_page` writes a zero page (LSN 0) to disk when it hands a page out, so the
+    /// dropped table's records apply to it whatever was flushed before the free. Here `u` takes `t`'s
+    /// freed heap page and its time-travel page under the pin, and nothing flushes `u`'s writes before
+    /// the crash. `u` holds ONE row, so a replayed `t` row cannot hide under it. A sibling of test 1,
+    /// which keeps its own assertions. A guard on this branch; killed by SKIPm, TTm, CLRm and LSNm on
+    /// d250 alone and on the D229 merge (INFERRED).
+    #[test]
+    fn after_a_pinned_drop_whose_freed_pages_a_new_table_took_and_a_crash_the_new_table_holds_only_its_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pinned_drop_reused.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            let ok = |sql: &str, o: &mut OpenedDatabase| {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            };
+            ok("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            for id in 1..=3 {
+                ok(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut o);
+            }
+            ok("UPDATE t SET v = 11 WHERE id = 1;", &mut o);
+            let mut s = Session::new();
+            for sql in ["BEGIN;", "INSERT INTO t VALUES (7, 70);", "ROLLBACK;"] {
+                run_sql_in(sql, &mut o.catalog, &o.bp, &o.txn, &mut s).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            assert!(has_clr(&o.wal), "premise: the rolled-back INSERT left no CLR");
+            let (t_heap, t_tt) = {
+                let e = o.catalog.get_table("t").unwrap();
+                (e.first_directory_page_id, e.time_travel_root)
+            };
+            let base = o.wal.base_lsn.load(Ordering::SeqCst);
+            let pin = o.wal.pin(base).expect("pin the log at its base");
+            // Every record of `t` is below this, and every record of `u` above it.
+            let dropped_at = o.wal.next_lsn.load(Ordering::SeqCst);
+            ok("DROP TABLE t;", &mut o);
+            ok("CREATE TABLE u (id INTEGER NOT NULL, v INTEGER);", &mut o);
+            ok("INSERT INTO u VALUES (101, 1010);", &mut o);
+            ok("UPDATE u SET v = 1011 WHERE id = 101;", &mut o);
+            assert_eq!(o.wal.base_lsn.load(Ordering::SeqCst), base, "premise: the pin did not keep the log");
+            let (u_heap, u_tt) = {
+                let e = o.catalog.get_table("u").unwrap();
+                (e.first_directory_page_id, e.time_travel_root)
+            };
+            let writes = heap_writes_at(&o.wal);
+            // The pages `u` writes that `t`'s records also write, and that are older on disk than the
+            // first of those records: redo without the skip would apply `t`'s records to each.
+            let exposed = |t_root: u32, u_root: u32| -> Vec<u32> {
+                let mut pages: Vec<u32> = writes
+                    .iter()
+                    .filter(|(d, _, at)| *d == u_root && *at > dropped_at)
+                    .map(|(_, p, _)| *p)
+                    .filter(|p| {
+                        let first_of_t =
+                            writes.iter().filter(|(d, q, at)| *d == t_root && q == p && *at < dropped_at).map(|(_, _, at)| *at).min();
+                        let on_disk = o.bp.disk_manager.read(*p).unwrap();
+                        let disk_lsn = u64::from_be_bytes(on_disk[11..19].try_into().unwrap());
+                        first_of_t.is_some_and(|first| disk_lsn < first)
+                    })
+                    .collect();
+                pages.sort_unstable();
+                pages.dedup();
+                pages
+            };
+            assert!(
+                !exposed(t_heap, u_heap).is_empty(),
+                "premise failed: no heap page of `u` is one `t`'s records write and would take them on disk, so \
+                 redo without the skip meets nothing here: {writes:?}"
+            );
+            assert!(
+                !exposed(t_tt, u_tt).is_empty(),
+                "premise failed: no time-travel page of `u` is one `t`'s time-travel records write and would take \
+                 them on disk: {writes:?}"
+            );
+            drop(pin);
+            // The crash: every handle goes, and nothing flushed `u`'s writes.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock)
+            .unwrap_or_else(|e| panic!("the open after a pinned DROP whose pages were reused failed: redo replayed the dropped table onto `u`'s pages: {e}"));
+        assert!(o.catalog.get_table("t").is_none(), "the dropped table came back");
+        let mut rows = |sql: &str| match run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}")) {
+            crate::execution::executor::Outcome::Rows(rows) => rows,
+            _ => panic!("`{sql}` did not return rows"),
+        };
+        let only = vec![vec![Value::Integer(101), Value::Integer(1011)]];
+        assert_eq!(rows("SELECT id, v FROM u;"), only, "`u` after the reopen: a row of the dropped `t` was replayed into it, or its own was lost");
+        assert_eq!(rows("SELECT id, v FROM u WHERE id = 101;"), only, "`u` by key after the reopen");
     }
 }
