@@ -13,7 +13,7 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
-use crate::storage::index_page::admit_entry;
+use crate::storage::index_page::{admit_entry, LEGACY_ENTRY_REMEDY};
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -99,8 +99,18 @@ impl Modify for Update {
             let pk = &old_values[0];
             // The primary re-point, `upsert(pk, new_rid)`, happens only if the heap moves the row,
             // which is not known until it is written, so it is asked for every row. This build
-            // cannot write a key over the bound; an earlier build could.
-            admit_entry(pk, &RecordId::new(0, 0))?;
+            // cannot write a key over the bound; an earlier build could. The refusal names the one
+            // remedy that works for a key (review 5): a primary key cannot be UPDATEd, and DELETE
+            // then INSERT would leave the deleted tuple under the key for good.
+            admit_entry(pk, &RecordId::new(0, 0)).map_err(|e| {
+                let shown: String = format!("{pk:?}").chars().take(60).collect();
+                FerroError::Constraint(format!(
+                    "this UPDATE would re-point the primary-index entry of the row whose key is \
+                     {shown}, and that entry is over the B+tree entry bound ({e}). A build before \
+                     D225 could store such a key; this one cannot re-point it. Nothing has been \
+                     written. {LEGACY_ENTRY_REMEDY}"
+                ))
+            })?;
             for handle in &self.secondary_indexes {
                 let new_v = &new_values[handle.col_index];
                 if &old_values[handle.col_index] != new_v {

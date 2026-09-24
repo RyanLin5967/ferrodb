@@ -77,7 +77,7 @@ use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
-use crate::storage::index_page::admit_entry;
+use crate::storage::index_page::{admit_entry, LEGACY_ENTRY_REMEDY};
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
 
@@ -974,8 +974,7 @@ fn prepare_rewrite(
                     "this ALTER would re-point the primary-index entry of the row whose first \
                      column is {shown}, and that entry is over the B+tree entry bound ({e}). A \
                      build before D225 could store such a key; this one cannot re-point it. \
-                     Nothing has been written; rewrite that row under a shorter key with the build \
-                     that wrote it, then run the ALTER again."
+                     Nothing has been written. {LEGACY_ENTRY_REMEDY} Then run the ALTER again."
                 ))
             })?;
         }

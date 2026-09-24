@@ -88,16 +88,43 @@ const LEAF_HEADER_SIZE: usize = 27;
 ///   **D225 therefore lands after D202**; `a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry`
 ///   is red without it;
 /// - a heap row whose entry is over the bound, met by the crash-recovery rebuild: refused before
-///   any tree is freed (`wal::recovery`), and the database does not open until that row is
-///   shortened or deleted with the build that wrote it;
+///   any tree is freed (`wal::recovery`), and the database does not open until the remedy below
+///   has been applied;
 /// - a primary key over the bound, met by an ALTER that rewrites rows or an UPDATE of that row:
 ///   refused before the first row is written (`catalog::alter::prepare_rewrite`, the UPDATE
 ///   pre-pass), because either may have to re-point the key's entry;
 /// - a branch whose stored capability envelope is over the bound: rewrites of its record that
 ///   leave the envelope unchanged go through (`TableBranchCatalog::envelope_write`), so its lease
 ///   can be renewed and it can be reaped; a CHANGED envelope is refused, which includes
-///   `charge_row_writes` and `restrict_envelope`.
+///   `charge_row_writes` and `restrict_envelope`;
+/// - such a branch cannot be **forked**: the child inherits the envelope at the same encoded size
+///   (`CapabilityEnvelope::inherited` changes only fixed-width counters), so `write_record_new`
+///   refuses it, and on a recycled id `envelope_write` does;
+/// - a branch-catalog leaf left exactly full around an over-bound entry refuses **mid-record**:
+///   `write_record` removes the branch's old state and deadline keys before it upserts the new
+///   ones, so a no-cut refusal there leaves the branch in neither span. D202's undo does not cover
+///   the branch catalog;
+/// - a `LogBranchCatalog` holding an over-bound envelope **fails to open**: `open` migrates it
+///   through `migrate_from`, whose `write_record` puts the envelope into a fresh tree and is
+///   refused.
+///
+/// **The remedy, for the rows of a table: [`LEGACY_ENTRY_REMEDY`].** It is the only one that
+/// works. A deleted row cannot take any other: DELETE stamps the tuple and leaves it, nothing in
+/// this build purges it, and a deleted row can be neither updated nor deleted again, so it is
+/// scanned, and refused, until its table is dropped. That makes DELETE followed by INSERT a
+/// remedy that CREATES the problem for a key. The branch-catalog cases above have no remedy in
+/// this build.
 pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
+
+/// What a refusal of a legacy entry over [`MAX_ENTRY_BYTES`] tells the user to do. D225, review 5.
+///
+/// One text, so the ALTER, UPDATE and crash-recovery refusals cannot drift apart, and none of them
+/// can suggest the DELETE + INSERT that leaves a permanent tuple under the key.
+pub const LEGACY_ENTRY_REMEDY: &str = "The one remedy is to use the build that wrote it: copy the \
+    table's live rows into a new table, shortening any key or indexed value over the bound as they \
+    are copied, and DROP the old table. This build has no in-place remedy: a deleted row's tuple is \
+    never purged, so deleting the row leaves its entry behind for good, and a primary key cannot be \
+    updated.";
 
 /// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry
 /// bound cannot disagree about what an entry costs.

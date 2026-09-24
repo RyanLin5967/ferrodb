@@ -479,8 +479,14 @@ fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
     let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
     assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
+    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row is relocated to a new heap page and its old version goes to the
+    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
+    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err(&format!("UPDATE u SET v = '{}' WHERE n < 3;", "z".repeat(2020)));
     assert!(e.contains("index entry too large: 2046 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.bp.disk_manager.high_water().unwrap(), pages_before, "the refused UPDATE allocated a page: it wrote a row first");
     assert_eq!(d.ids("SELECT n FROM u WHERE v = 'x';"), vec![1, 2], "the refused update changed a row");
     assert_eq!(d.ids("SELECT n FROM u WHERE id = 'a';"), vec![1], "row 'a' is unreachable by its key");
     assert_eq!(d.ids(&format!("SELECT n FROM u WHERE id = '{long_key}';")), vec![2]);
@@ -508,8 +514,14 @@ fn a_multi_row_update_refused_for_not_null_writes_no_row_first() {
     let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
     assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
+    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row is relocated to a new heap page and its old version goes to the
+    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
+    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err("UPDATE u SET a = b WHERE n < 3;");
     assert!(e.contains("is declared NOT NULL"), "not the NOT NULL refusal: {}", abbreviate(&e));
+    assert_eq!(d.bp.disk_manager.high_water().unwrap(), pages_before, "the refused UPDATE allocated a page: it wrote a row first");
     assert_eq!(d.ids("SELECT n FROM u WHERE id = 'a';"), vec![1], "row 'a' is unreachable by its key");
     assert_eq!(d.ids("SELECT n FROM u WHERE a = 'x';"), vec![1, 2], "the refused update changed a row");
 }
@@ -633,6 +645,8 @@ fn an_alter_that_would_repoint_a_legacy_oversized_key_is_refused_before_any_row_
         "not the named refusal: {}",
         abbreviate(&e)
     );
+    // Review 5: the one remedy that works, also for a deleted row.
+    assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
     assert_eq!(
         d.catalog.get_table("k").unwrap().schema.columns[1].data_type,
         DataType::Integer,
@@ -655,6 +669,10 @@ fn an_update_of_a_row_under_a_legacy_oversized_key_is_refused_before_it_is_writt
 
     let e = d.err("UPDATE k SET n = 3 WHERE n = 2;");
     assert!(e.contains("index entry too large: 2109 bytes"), "not the named refusal: {}", abbreviate(&e));
+    // Review 5: a key cannot be UPDATEd, and DELETE then INSERT would leave the deleted tuple
+    // under the key for good, so the message names the one remedy and never suggests that.
+    assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
+    assert!(!e.contains("DELETE"), "the refusal suggests DELETE, which creates the problem for a key: {e}");
     assert_eq!(d.ids("SELECT n FROM k;"), vec![1, 2], "the refused UPDATE changed a row");
 }
 
@@ -743,8 +761,14 @@ fn an_update_whose_new_posting_is_over_the_bound_is_refused_before_the_row_moves
     let plan = d.plan(&format!("SELECT n FROM g WHERE id = '{pk}';"));
     assert!(plan.contains("Index scan on g (col 0"), "premise failed: the key lookup is not a primary index scan: {}", abbreviate(&plan));
 
+    // Review 4 R4, allocator probe: the refused statement must write nothing. Under a late
+    // refusal the first row is relocated to a new heap page and its old version goes to the
+    // time-travel heap before the refusal, and the abort gives neither page back, so the file's
+    // high-water mark rises. D202's undo does not change that, so this holds on main (INFERRED).
+    let pages_before = d.bp.disk_manager.high_water().unwrap();
     let e = d.err(&format!("UPDATE g SET body = '{}' WHERE n = 1;", "y".repeat(255)));
     assert!(e.contains("index entry too large: 2061 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.bp.disk_manager.high_water().unwrap(), pages_before, "the refused UPDATE allocated a page: it wrote the row first");
     assert_eq!(d.ids(&format!("SELECT n FROM g WHERE id = '{pk}';")), vec![1], "the row is unreachable by its key");
     assert_eq!(d.ids("SELECT n FROM g WHERE body = 'short';"), vec![1], "the refused UPDATE changed the row");
 }
@@ -771,6 +795,7 @@ fn a_rebuild_over_a_legacy_oversized_primary_key_is_refused_before_anything_is_f
         "not the named refusal: {}",
         abbreviate(&msg)
     );
+    assert!(msg.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {msg}");
     assert_eq!(d.catalog.get_table("k").unwrap().primary_index_root, root, "the primary tree was rebuilt");
     let primary = BPlusTreeManager::<Value, RecordId>::open(root, d.bp.clone());
     assert!(primary.search(&Value::Varchar("a".into())).unwrap().is_some(), "the old primary tree lost key 'a'");

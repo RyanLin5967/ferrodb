@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::admit_entry, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::{admit_entry, LEGACY_ENTRY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -206,8 +206,8 @@ fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolMana
                 FerroError::Constraint(format!(
                     "cannot rebuild the indexes of '{name}' after recovery: the row with primary key \
                      {pk} makes {what} that no rebuilt tree admits ({e}). A build before D225 could \
-                     store it. Nothing has been freed or rewritten; shorten or delete that row with \
-                     the build that wrote it, then reopen"
+                     store it. Nothing has been freed or rewritten. {LEGACY_ENTRY_REMEDY} Then \
+                     reopen."
                 ))
             };
             admit_entry(&vals[0], &RecordId::new(0, 0)).map_err(|e| refuse("its primary entry", e))?;

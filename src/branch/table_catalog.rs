@@ -633,9 +633,15 @@ impl TableBranchCatalog {
     /// refused, and that includes `charge_row_writes` and `restrict_envelope`, which write through
     /// `upsert` directly.
     ///
-    /// The comparison is of the stored bytes against this record's encoding, which is canonical
-    /// (`CapabilityEnvelope::serialize`), so a hydrated envelope handed back re-encodes to exactly
-    /// what was read. Callers hold `logical`, and every writer of the envelope key does too.
+    /// The comparison is of the stored bytes against this record's encoding. A hydrated envelope
+    /// handed back re-encodes to exactly what was read **when the stored bytes are this encoder's
+    /// own output**. They need not be: `CapabilityEnvelope::deserialize` normalises. `allow` sorts
+    /// and deduplicates tables, `TableCapability::new` sorts and deduplicates columns, a tag-0
+    /// floor's payload is discarded, and trailing bytes are not checked. So a non-canonical stored
+    /// envelope reads as CHANGED, is admitted, and is refused if it is over the bound. That fails
+    /// closed, but this relief does not reach it. Byte equality is still the right test: anything
+    /// weaker (a length, a field subset) would let a genuinely changed envelope pass unwritten.
+    /// Callers hold `logical`, and every writer of the envelope key does too.
     fn envelope_write(&self, rec: &BranchRecord) -> Result<EnvelopeWrite, FerroError> {
         let key = keys::envelope(rec.branch_id.id);
         Ok(match &rec.envelope {
@@ -1824,7 +1830,12 @@ mod d225_envelope_bound {
 
     /// An envelope granting `columns` open columns on one table: 21 + 8 + 13 per column bytes.
     fn envelope_of(columns: u32) -> CapabilityEnvelope {
-        CapabilityEnvelope::new(Verb::ALL, 10).allow(1, (0..columns).map(ColumnCapability::open).collect())
+        envelope_with_budget(columns, 10)
+    }
+
+    /// The same shape with a different row-write budget: a fixed-width field, so the same length.
+    fn envelope_with_budget(columns: u32, max_row_writes: u64) -> CapabilityEnvelope {
+        CapabilityEnvelope::new(Verb::ALL, max_row_writes).allow(1, (0..columns).map(ColumnCapability::open).collect())
     }
 
     /// **An envelope too large for a B+tree entry refuses the whole record, before any key of it
@@ -1915,6 +1926,24 @@ mod d225_envelope_bound {
             "the refused write stored its record before refusing the envelope"
         );
         assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused write changed the envelope");
+
+        // M26b (review 5): a change of the SAME length is still a change. `fork_staged`'s
+        // recycled-id path hands `write_record` exactly this: the child's envelope is `inherited()`,
+        // which keeps the tables and changes only fixed-width counters. Only the budget differs.
+        let same_length = envelope_with_budget(153, 11).serialize();
+        assert_eq!(same_length.len(), legacy.len(), "premise: the same encoded length");
+        assert_ne!(same_length, legacy, "premise: different bytes");
+        let mut rebudgeted = cat.get_raw(id).unwrap();
+        rebudgeted.envelope = Some(envelope_with_budget(153, 11));
+        rebudgeted.lease_deadline = LeaseDeadline(8);
+        let e = cat.write_record(&rebudgeted, Some(&old)).expect_err("a same-length changed over-bound envelope must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(
+            cat.core(id).unwrap().unwrap().lease_deadline(),
+            LeaseDeadline(1_000_000),
+            "the refused same-length write stored its record"
+        );
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused same-length write changed the envelope");
 
         cat.set_state(child.branch_id, BranchState::Live, BranchState::Reaping).expect("Live -> Reaping");
         cat.set_state(child.branch_id, BranchState::Reaping, BranchState::Reaped).expect("Reaping -> Reaped");
