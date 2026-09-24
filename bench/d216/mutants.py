@@ -205,6 +205,12 @@ MUTANTS = [
      "        if let crate::wal::log::Truncation::Kept { oldest_pin, .. } = { let _ = self.wal.truncate(0)?; crate::wal::log::Truncation::Truncated } {\n",
      [("--test", "integration_cluster_snapshot", "an_install_under_a_wal_pin_is_refused_and_names_the_pin")],
      ["an_install_under_a_wal_pin_is_refused_and_names_the_pin"], "KILL"),
+    # Review 4's third finding: with two pins the refusal must name the OLDEST.
+    ("M38_install_names_the_newest_pin", "src/consensus/snapshot.rs",
+     "        if let crate::wal::log::Truncation::Kept { oldest_pin, .. } = self.wal.truncate(0)? {\n",
+     "        if let crate::wal::log::Truncation::Kept { newest_pin: oldest_pin, .. } = self.wal.truncate(0)? {\n",
+     [("--test", "integration_cluster_snapshot", "an_install_under_a_wal_pin_is_refused_and_names_the_pin")],
+     ["an_install_under_a_wal_pin_is_refused_and_names_the_pin"], "KILL"),
     ("M33_gap_fill_covers_to_the_cursor", "src/replication/logical.rs",
      "                history.covered_through = scanned_to;\n",
      "                history.covered_through = from_lsn;\n                let _ = scanned_to;\n",
