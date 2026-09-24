@@ -1853,9 +1853,7 @@ impl ArenaPageStore {
                 Ok(written)
             }
             Err(e) => {
-                for q in &g.quarantine {
-                    self.space.take_back(q.start, q.pages);
-                }
+                // MUTANT (fire-check only, never land): a failed rewrite leaves the folded ranges on the free list.
                 Err(e)
             }
         }
