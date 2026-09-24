@@ -267,9 +267,11 @@ pub fn fence_kept_checkpoints() -> u64 {
 }
 
 /// DROPs whose checkpoint a WAL pin kept from truncating, since process start (review 5's F4). The
-/// dropped table's records then stay in the log. On this branch the pin refusal and its fence make
-/// this unreachable; it is counted so that, if it ever happens, it is not silent. A DROP that the
-/// D253 fence kept is counted in [`FENCE_KEPT_CHECKPOINTS`] instead, and its stderr line says so.
+/// dropped table's records then stay in the log. On this branch the pin refusal and its fence are
+/// believed to make this unreachable (artie-research `frontier/d253on16_review.md` F5 questions a pin
+/// at exactly the end read before `f`); it is counted so that, if it ever happens, it is not
+/// silent. A DROP that the D253 fence kept is counted in [`FENCE_KEPT_CHECKPOINTS`] instead, and its
+/// stderr line says so.
 pub static KEPT_LOG_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// See [`KEPT_LOG_DROPS`].
@@ -307,15 +309,17 @@ fn injected_release_failure() -> bool {
 
 /// Where a checkpoint can pause for a test (D253). A parked checkpoint still holds what the point
 /// names, so a closure must not wait on anything that needs it: every `commit` takes
-/// `release_retry` (`release_retired`), as do `retry_pending_releases` and every DDL, and `begin`
-/// takes `att`.
+/// `release_retry` (`release_retired`), as do `retry_pending_releases` and every DDL checkpoint
+/// (`ddl_unit`, `ddl_checkpoint`), and `begin` takes `att`. `log_ddl` takes neither, and ALTER
+/// logs without a checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheckpointPausePoint {
     /// In `checkpoint_or_keep_locked`, after the fence is read and `att` is let go, before the
     /// flush. Holds `release_retry`. (Not the function's entry: the retry and the fence come first.)
     AtEntry,
-    /// In `checkpoint_or_keep_held`, after the sync, immediately before the truncation. Holds
-    /// `release_retry`; on the DDL path also `att`, and for a DROP the pin fence's write guard.
+    /// In `checkpoint_or_keep_held`, after the sync, before the owed-release check and the
+    /// truncation. Holds `release_retry`; on the DDL path also `att`, and for a DROP the pin
+    /// fence's write guard.
     BeforeTruncate,
 }
 
@@ -1629,8 +1633,9 @@ impl TxnManager {
     ///   once the drop has succeeded, which lets a table holding a page that permanently fails be
     ///   dropped: the part of review 2's Q3 this can grant.
     /// - a WAL pin below the log's end (a replication stream, a base backup, a snapshot handoff).
-    ///   `WalManager::truncate` keeps the log, and answers `Ok`, while one is held; this was so at
-    ///   `9aa6968` too (lane §21.6, `rollback-review4` and the D216 lane). New pins are held off
+    ///   The truncation keeps the log while one is held (`WalManager::truncate_fenced` answers
+    ///   `KeptByPin`; plain `truncate` answers `Ok`); this was so at `9aa6968` too (lane §21.6,
+    ///   `rollback-review4` and the D216 lane). New pins are held off
     ///   (`WalManager::fence_pins`) from this check through the truncation, so none can land between.
     /// - a poisoned log, whose flush is refused, so the checkpoint would fail after the drop.
     ///
@@ -1715,9 +1720,10 @@ impl TxnManager {
         if !frees.is_empty() && kept {
             // Review 5's F4. Believed unreachable on this branch (the pin refusal and its pin fence
             // run first, and `att` is held, so no transaction appends), and counted and printed so
-            // that it is not silent if it happens. `frontier/d253on16_review.md` F5 questions a pin
-            // at exactly the end read before `f`; that is #16's to settle. A fence keep is counted in
-            // FENCE_KEPT_CHECKPOINTS (in `checkpoint_or_keep_held`), never as a pin's.
+            // that it is not silent if it happens. artie-research `frontier/d253on16_review.md` F5
+            // questions a pin at exactly the end read before `f`; that is #16's to settle. A fence
+            // keep is counted in FENCE_KEPT_CHECKPOINTS (in `checkpoint_or_keep_held`), never as a
+            // pin's.
             use std::io::Write;
             let why = if outcome == CheckpointOutcome::KeptByPin {
                 KEPT_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -3760,7 +3766,9 @@ type CheckpointPauseHook = (u64, CheckpointPausePoint, Box<dyn FnOnce() + Send>)
 
 /// Closures tests handed to one manager's next checkpoint, keyed by the manager's `id` and the point.
 /// Process-wide, because the checkpoint that runs one is on another thread than the test that set
-/// it; keyed by manager, so a test can only pause its own.
+/// it; keyed by manager, so a test can only pause its own. Unlike the per-manager slot it replaced,
+/// a second closure for the same point queues behind the first, and one whose checkpoint never
+/// reaches its point stays here (ids are never reused, so it can never fire on another manager).
 #[cfg(test)]
 static CHECKPOINT_PAUSES: Mutex<Vec<CheckpointPauseHook>> = Mutex::new(Vec::new());
 
