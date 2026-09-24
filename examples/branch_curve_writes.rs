@@ -2424,6 +2424,14 @@ fn read_vs_n_summary(
             ) {
                 let moved = hi / lo;
                 println!("  control ns max/min across N at T={t}: {moved:.3} (band 1.5)");
+                // A15.5: every slope column names its span, and the judged forms are said here.
+                println!(
+                    "  T={t}: `slope(branch)` and `slope(ratio)` span the previous row to this one (N {}). \
+                     The CLASS is the verdict script's OLS over the saturated segment (d.fault >= 0.9): BOUNDED \
+                     only when the raw and ratio slopes are both < 0.3, INCONCLUSIVE when they disagree (A15.2). \
+                     KNEE is ratio(1e6)/ratio(256) at T=1 (A15.1); raw ns, RESIDENT and T8DIR are reported.",
+                    rows.iter().map(|r| r.n.to_string()).collect::<Vec<_>>().join(" -> ")
+                );
                 if moved > 1.5 {
                     ns_void.push(format!(
                         "G7 T={t}: the control moved {moved:.2}x across N (band 1.5x); the box moved, \
@@ -2516,6 +2524,16 @@ fn read_vs_n_summary(
             );
             prev = Some((r.n, total, lease));
         }
+        println!(
+            "  arm 3: the `total` and `lease_start` slopes span the previous row to this one (N {}); both are \
+             REPORTED (A14.2), as are R6 and R8-share (A15.1).",
+            restart_rows
+                .iter()
+                .filter(|r| !r.child.is_empty())
+                .map(|r| r.n.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        );
         println!(
             "  arm 3: load0/load1 = the child's 1-min load at its start and end; L2 = 1 when the row's larger \
              reading exceeds 1.5 x the run's median reading ({}), H6 rows left out of the median and printed `H6` \
