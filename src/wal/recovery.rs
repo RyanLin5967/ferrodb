@@ -972,29 +972,28 @@ use super::*;
     /// **D216 — a clean restart after DDL must not rebuild the indexes.**
     ///
     /// A `Ddl` record changes no page (recovery does not replay DDL; the catalog lives outside the
-    /// WAL), so there is nothing for a tree to be stale against. Observed through `recovered` and
-    /// through the log's bounds: the open must neither truncate the log (the rebuild's checkpoint)
-    /// nor append to it. It used to do both: recovery took transaction 0, which is not a
-    /// transaction, for a loser and "aborted" it, writing an `Abort` and a `TxnEnd` under id 0 that
-    /// the rebuild's checkpoint then discarded. Then the trees the open left alone must answer.
+    /// WAL), so there is nothing for a tree to be stale against. Observed through `recovered`, which
+    /// is what `open_recovered` rebuilds on (with the marker, absent here). Then the trees the open
+    /// did not rebuild must answer.
+    ///
+    /// ⚖ Amended in this lane before landing: the first version also asserted that the open left
+    /// the log's bounds unchanged. The open now checkpoints any non-empty log without rebuilding
+    /// (see `open_recovered`, D216 and D227), so that instrument no longer tells a rebuild from no
+    /// rebuild. Its other job, that recovery appends nothing under transaction 0, moved to
+    /// `recovery_appends_nothing_for_a_log_of_declarations`, which calls `recover` directly.
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
     #[test]
     fn a_clean_restart_after_ddl_does_not_rebuild_the_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("clean.db");
-        let closed = d216_cleanly_closed(&db);
+        d216_cleanly_closed(&db);
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(
             !o.recovered,
             "a clean restart whose log held only DDL re-declarations reported a recovery, so the open rebuilt every index (D216)"
-        );
-        assert_eq!(
-            d216_bounds(&o.wal),
-            closed,
-            "the open changed the log a clean close left: a rebuild's checkpoint truncates it, and undoing transaction 0 appends to it"
         );
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
         assert_eq!(d216_rows(&mut o, "SELECT id FROM t WHERE v = 10;"), vec![vec![Value::Integer(1)]], "a lookup by the indexed value");
@@ -1011,6 +1010,9 @@ use super::*;
     /// DDL, so a process that served one attributed MERGE also left a non-empty log at a clean
     /// close. The middle process here runs no DDL, so the log it leaves holds run declarations only.
     ///
+    /// ⚖ Amended in this lane before landing: the log-bounds assertion is withdrawn for the reason
+    /// given on `a_clean_restart_after_ddl_does_not_rebuild_the_indexes`.
+    ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at `!o.recovered`.
     #[test]
     fn a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes() {
@@ -1019,7 +1021,7 @@ use super::*;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("runs.db");
         d216_cleanly_closed(&db);
-        let closed = {
+        {
             let lock = DbLock::acquire(&db).unwrap();
             let o = open_recovered(&db, &lock).unwrap();
             let run = RunEntity::new(ProvId(1), "restock-agent", "run-1", "a-model", "v1", [0u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
@@ -1031,8 +1033,7 @@ use super::*;
                 "premise failed: the clean close re-declared no run: {log:?}"
             );
             assert!(d216_only_declarations(&log), "premise failed: the clean close left more than re-declarations: {log:?}");
-            d216_bounds(&o.wal)
-        };
+        }
 
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
@@ -1040,7 +1041,6 @@ use super::*;
             !o.recovered,
             "a clean restart whose log held only run declarations reported a recovery, so the open rebuilt every index (D216)"
         );
-        assert_eq!(d216_bounds(&o.wal), closed, "the open changed the log a clean close left");
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 1;"), vec![vec![Value::Integer(10)]], "a lookup by key");
     }
 
@@ -1091,7 +1091,10 @@ use super::*;
     /// `tests/pgserver_crash_rebuilds_indexes.rs`).
     ///
     /// Passes at `00f4c39`, where any non-empty log rebuilt, and must keep passing: the loser's
-    /// `HeapInsert` and the CLR that undoes it are data records.
+    /// `HeapInsert` and the CLR that undoes it are data records. (⚖ Amended before landing: a
+    /// `base == end` check for "the rebuild's checkpoint ran" is withdrawn. The open now checkpoints
+    /// without a rebuild too, and D227 re-declares the tables at that checkpoint. The INSERT and
+    /// the lookup below are what prove the rebuild.)
     #[test]
     fn a_crashed_uncommitted_heap_write_still_forces_the_rebuild() {
         let dir = tempfile::tempdir().unwrap();
@@ -1112,8 +1115,6 @@ use super::*;
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(o.recovered, "a crash left an uncommitted heap write in the log, and the open reported no recovery");
-        let (base, end) = d216_bounds(&o.wal);
-        assert_eq!(base, end, "the rebuild's checkpoint did not run");
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 3;"), Vec::<Vec<Value>>::new(), "the undone row is visible by key");
         d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 31);")
             .unwrap_or_else(|e| panic!("key 3 was never committed, and inserting it after the crash failed: {e}"));
@@ -1192,7 +1193,9 @@ use super::*;
     /// the empty log; this covers the non-empty one. The marker is planted by hand, since only
     /// where it lives matters to the open.
     ///
-    /// Passes at `00f4c39`, where the log alone rebuilt, and must keep passing.
+    /// Passes at `00f4c39`, where the log alone rebuilt, and must keep passing. (⚖ Amended before
+    /// landing: a `base == end` check is withdrawn for the reason given on the loser control. The
+    /// marker is removed only inside the rebuild's branch, so its absence is the proof.)
     #[test]
     fn the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations() {
         let dir = tempfile::tempdir().unwrap();
@@ -1204,8 +1207,6 @@ use super::*;
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
-        let (base, end) = d216_bounds(&o.wal);
-        assert_eq!(base, end, "the rebuild's checkpoint did not run");
         assert_eq!(d216_rows(&mut o, "SELECT v FROM t WHERE id = 2;"), vec![vec![Value::Integer(20)]], "a lookup by key");
     }
 
@@ -1389,6 +1390,68 @@ use super::*;
             "a heap page reached the disk while its own HeapInsert was still only in memory"
         );
         txn.abort(t).unwrap();
+    }
+
+    /// **D216 — recovery appends nothing to a log of declarations: transaction 0 is not a loser.**
+    ///
+    /// DDL and run declarations are logged under id 0, which never commits, so recovery took it for
+    /// a loser and "aborted" it: an `Abort` and a `TxnEnd` under id 0 that undid nothing. `recover`
+    /// is called directly, because `open_recovered` checkpoints a non-empty log straight after it
+    /// and would discard both records. A change-feed decoder reading them first reported
+    /// transaction 0 as aborted (`Decoded::aborted`).
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the second bounds assertion.
+    #[test]
+    fn recovery_appends_nothing_for_a_log_of_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("zero.db");
+        let closed = d216_cleanly_closed(&db);
+        let file = OpenOptions::new().read(true).write(true).open(&db).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp.clone());
+        bp.attach_wal(wal.clone());
+        assert_eq!(d216_bounds(&wal), closed, "premise failed: the reopened log is not the one the clean close left");
+        let found = recover(&txn).unwrap();
+        assert_eq!(
+            d216_bounds(&wal),
+            closed,
+            "recovery appended to a log of declarations: it took transaction 0 for a loser and aborted it"
+        );
+        assert!(!found, "recovery reported work for a log of declarations");
+    }
+
+    /// **D227 — after a restart, a checkpoint still declares every table.**
+    ///
+    /// `schema_log` was filled only by `log_ddl` in the running process, so a restarted process's
+    /// checkpoints re-declared nothing, and a reader starting at such a base met rows of a table the
+    /// log never named. The shipped feeds seed their decoders from the catalog
+    /// (`LogicalDecoder::new`) and resolve anyway. A blank decoder, which is what reading an
+    /// archived log or a log whose database is gone amounts to, reported every such row as
+    /// unresolved.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `unresolved` assertion.
+    #[test]
+    fn a_checkpoint_after_a_restart_still_declares_every_table() {
+        use crate::replication::logical::LogicalDecoder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("declared.db");
+        d216_cleanly_closed(&db);
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        // The restarted process's own checkpoint, before it has run any DDL.
+        o.txn.checkpoint().unwrap();
+        d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+        let (base, end) = d216_bounds(&o.wal);
+        let out = LogicalDecoder::blank().decode(&o.wal, base, end).unwrap();
+        assert!(
+            out.unresolved.is_empty(),
+            "a reader starting at a checkpoint taken after the restart cannot name the table its rows belong to: {:?}",
+            out.unresolved
+        );
+        assert!(out.events.iter().any(|e| e.table == "t"), "premise failed: the INSERT did not decode as a change to t");
     }
 
     /// **D216 adversary F3: transaction id 0 is never handed out.**
