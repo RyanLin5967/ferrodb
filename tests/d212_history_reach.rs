@@ -12,6 +12,7 @@
 //! | `a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids` | 1: the runtime reads history only through store ∪ queue | `HistoryStore::records` returns the durable window only |
 //! | `a_fresh_log_moves_the_old_history_aside` | 10: a fresh log is a new database, and the history goes aside | `WalManager::with_storage` skips the history move |
 //! | `another_databases_history_is_refused_at_open` | 10a: the store's incarnation, checked at open against the one the log declares | `recover` skips the incarnation check |
+//! | `a_database_with_no_history_refuses_another_databases_history_at_open` | 10a for a database that never published: every attached store is declared (review F1) | `declare_history` skips a store with no file |
 //!
 //! A "crash" here drops every handle with no checkpoint, so the history queued in memory is lost
 //! and the log is its only copy.
@@ -296,6 +297,46 @@ fn another_databases_history_is_refused_at_open() {
     std::fs::write(history_of(&a), &written[1]).unwrap();
     match Db::try_open(&a) {
         Ok(_) => panic!("an open read another database's REVERT history as its own"),
+        Err(e) => assert!(e.to_string().contains("incarnation"), "refused, but not for the incarnation: {e}"),
+    }
+}
+
+/// **Item 10a, for a database that holds no history of its own** (review of `c9d1e6e`, F1; the lead's
+/// decision: declare the incarnation whenever a store is attached; lane PREREG R4). B never
+/// publishes, so while only a store that held history was declared, B's log declared nothing,
+/// `recover` found no declaration to check, and the open then declared whatever store it loaded: a
+/// history file copied in from database A became B's. Now B's own opens declare B's incarnation, so
+/// A's history is refused at B's next open, before any history write can land.
+///
+/// RED at `928352e`: B's open succeeds and declares A's incarnation into B's log.
+#[test]
+fn a_database_with_no_history_refuses_another_databases_history_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let history_of = |db: &Path| {
+        let mut p = db.as_os_str().to_os_string();
+        p.push(".history");
+        PathBuf::from(p)
+    };
+    // A publishes, so its store's file exists and names A's incarnation.
+    let a = dir.path().join("reach10f1_a.db");
+    let mut db = Db::open(&a);
+    db.seed(&[(1, 10)]);
+    let _ = db.task("a", "UPDATE inventory SET qty = 11 WHERE id = 1;");
+    db.o.txn.checkpoint().unwrap();
+    drop(db);
+    let a_history = std::fs::read(history_of(&a)).expect("premise: A's checkpoint wrote its store");
+
+    // B never publishes, and exits cleanly.
+    let b = dir.path().join("reach10f1_b.db");
+    let mut db = Db::open(&b);
+    db.seed(&[(1, 10)]);
+    db.o.txn.checkpoint().unwrap();
+    drop(db);
+    assert!(!history_of(&b).exists(), "premise: B wrote a REVERT history of its own");
+
+    std::fs::write(history_of(&b), &a_history).unwrap();
+    match Db::try_open(&b) {
+        Ok(_) => panic!("a database with no history read another database's REVERT history as its own"),
         Err(e) => assert!(e.to_string().contains("incarnation"), "refused, but not for the incarnation: {e}"),
     }
 }
