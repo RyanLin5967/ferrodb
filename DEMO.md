@@ -207,6 +207,11 @@ step runs just after the revert commits, because authorship lives in the provena
 the WAL: a crash between the two leaves the reverted run still named, exactly as a crash just after a
 merge's commit leaves its rows naming the author they had before it.
 
+One runtime drives a database's REVERT history. A second runtime that finds the history moved since
+it read it refuses MERGE and REVERT, rather than filing its merges under txn ids the first one already
+used. A history write that fails inside its transaction refuses both until the database is reopened,
+which reads the history back from disk.
+
 ---
 
 ## What this does not do yet
