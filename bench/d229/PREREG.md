@@ -166,3 +166,43 @@ pending at the next open. D229's replay must free none of the re-created table's
 **Amendment 6 (after `cb648be`).** `cb648be` adds amendment 5's test, unchanged from its registration. The GREEN phase
 and mutant base is `cb648be`: `wal::recovery::tests_crash_frees::` **14 run, 14 passed**, predicted. `lane_d229_run.sh`
 carries 10 mutants (M1, M2, M4-M7, M9-M11, M13), one site each at `cb648be` (PATTERNS_ONLY).
+
+**Amendment 7 (the lead's 10:47Z schedule, re-stated at 11:0xZ; registered BEFORE its test).** The schedule:
+1. `DROP t` records an intent;
+2. a crash comes while that intent is still pending;
+3. before the crash, `t` is re-created, in a CREATE whose checkpoint sync succeeded or failed;
+4. D250's completion skips the DROP;
+5. D229 then decides the intent against the catalog.
+
+**Where the re-created table's first directory page lands:** it is NOT the dropped one, and cannot be. Every page of a
+pending intent is quarantined from the DROP until the intent is durably gone (A4), and the dropped first directory page
+is one of them; A1 re-establishes the quarantine before `recover`. So D229's decision ("a table's first directory page
+is the intent's root, so the intent is dropped") answers "absent" here, and the intent is carried out. That is correct
+ONLY because no page of the intent can belong to the new table. The identity check does not protect a table at another
+root that holds intent pages; the quarantine does. The same-root case is reachable only by planting (amendment 5's test).
+
+**New test** `an_intent_left_pending_by_a_crash_frees_nothing_of_the_table_re_created_after_its_drop`, two arms (the
+CREATE's checkpoint sync succeeds / fails; failing, the table exists and the statement reports failure, A8's shape).
+Setup, on a fresh database:
+- `t` is created with rows (1, 10), (2, 20), (3, 30), and `u` with one row of one page.
+- `DROP t` runs with the sync after its frees failing once, so the bits are clear, the intent pending and the pages
+  quarantined.
+- One freed page is then pinned, so every later retry of the batch is refused and the intent is still pending at the
+  crash.
+- `u` gains two one-page rows (two new heap pages).
+- `t` is re-created, with rows (1, 100), (2, 200), (3, 300).
+- The crash.
+
+The open must:
+- complete no DROP;
+- leave every page the new `t` and `u` reference allocated;
+- read row 2 back by key (`SELECT v FROM t WHERE id = 2` gives 200), and every row by scan and by key;
+- reach no page twice and none while free;
+- carry the intent out (no old `t` page left allocated and unnamed);
+- remove the intent file.
+
+Premise, asserted: the re-created `t`'s first directory page is not the dropped one.
+
+**Predicted GREEN at the tip.** **New mutant M14:** `allocate` ignores the quarantine. `u`'s new pages and the new `t`
+then take the old `t`'s pages (the lowest clear bits), the open frees them under their owners, and the test goes red
+(a page reached while free). Base and counts follow in the amendment after the test lands.
