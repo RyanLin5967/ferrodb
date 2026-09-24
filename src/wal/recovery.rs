@@ -452,7 +452,6 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // pages and wrote over live branch data. See `ArenaPageStore::reserve_persisted_floor`.
     let mut arena_path = db_path.as_os_str().to_os_string();
     arena_path.push(".arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push(".wal");
@@ -479,6 +478,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
     }
+    // MUTANT (fire-check only, never land): the floor is reserved after the rebuild.
+    ArenaPageStore::reserve_persisted_floor(&bp.disk_manager, Path::new(&arena_path))?;
     if recovered || stale || legacy {
         use std::io::Write;
         // Review 2's N1 (the lead's decision): the checkpoint ALWAYS runs, and always flushes every
